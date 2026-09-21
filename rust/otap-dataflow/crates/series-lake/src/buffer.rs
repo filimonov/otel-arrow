@@ -52,6 +52,14 @@ impl SortedTableBuffer {
     /// sees the bytes that `seal` releases when the building batches are replaced
     /// by one concatenated run. `Block::seal` recomputes the truth.
     ///
+    /// Deduplication is scoped to the run being built, never wider. `seen` holds
+    /// raw buffer addresses, which are only meaningful while the buffers they
+    /// name are alive; every batch it has measured is still held in `building`,
+    /// so no address in it can have been freed and handed back out by the
+    /// allocator. A set that outlived a seal could match a freed address against
+    /// a fresh batch, report zero bytes for it and stall `building_bytes` below
+    /// `run_target` forever.
+    ///
     /// # Errors
     /// Propagates an Arrow failure from the concatenate-and-sort of a sealed run.
     pub fn append(&mut self, batch: RecordBatch) -> Result<usize> {
@@ -67,6 +75,11 @@ impl SortedTableBuffer {
 
     /// Sort and seal the building batches into one run.
     ///
+    /// With sorting disabled the spec is empty and there is nothing to order, so
+    /// the building batches become runs as they are: concatenating them would
+    /// copy every row to no purpose. A sorted seal instead produces exactly one
+    /// run, which is what the k-way merge downstream consumes.
+    ///
     /// No re-accounting happens here: recomputing the pinned bytes of every run
     /// on every seal would be quadratic in the number of runs. `Block::seal`
     /// performs one deduplicated recount over the whole block instead.
@@ -77,12 +90,20 @@ impl SortedTableBuffer {
         let Some(first) = self.building.first() else {
             return Ok(());
         };
-        let schema = first.schema();
-        let merged = concat_batches(&schema, &self.building)?;
-        let sorted = sort_batch(&merged, &self.spec)?;
-        self.runs.push(sorted);
-        self.building.clear();
+        if self.spec.is_empty() {
+            self.runs.append(&mut self.building);
+        } else {
+            let schema = first.schema();
+            let merged = concat_batches(&schema, &self.building)?;
+            let sorted = sort_batch(&merged, &self.spec)?;
+            self.runs.push(sorted);
+            self.building.clear();
+        }
         self.building_bytes = 0;
+        // The addresses in `seen` name buffers this buffer no longer measures
+        // against. Start the next run with an empty set so a reused address
+        // cannot silently zero out a fresh batch.
+        self.seen = CountedAllocations::default();
         Ok(())
     }
 
@@ -248,14 +269,23 @@ impl<T> Block<T> {
     /// Descriptor rows are held, not written: `seal` stamps them with the block's
     /// `emitted_at` and builds the `series` batch then.
     ///
+    /// A sealed block takes nothing more. Its `emitted_at` is already fixed, so a
+    /// late descriptor would be stamped with a time before it arrived, and its
+    /// `bytes` is already the exact recount, which a reservation's upper-bound
+    /// estimate would corrupt. The caller rotates to a new block instead.
+    ///
     /// # Errors
-    /// Propagates an Arrow failure from sealing a run inside a table buffer.
+    /// Refuses a block that has already been sealed, and propagates an Arrow
+    /// failure from sealing a run inside a table buffer.
     pub fn admit(
         &mut self,
         extracted: Extracted,
         reservation: Reservation,
         token: T,
     ) -> Result<()> {
+        if self.emitted_at_us.is_some() {
+            return Err(Error::invalid("block already sealed"));
+        }
         let signal = extracted.signal;
         if !reservation.new_series.is_empty() {
             let ds = Dataset::series_of(signal);
@@ -321,6 +351,10 @@ impl<T> Block<T> {
     }
 
     /// One deduplicated pass over everything the block retains.
+    ///
+    /// Called only from `seal`, after the pending descriptor rows have been
+    /// drained into the series table, so the Arrow batches below already account
+    /// for them and there is nothing left in `pending_descriptors` to add.
     fn recount(&self) -> usize {
         let mut seen = CountedAllocations::default();
         let mut bytes = 0usize;
@@ -328,9 +362,6 @@ impl<T> Block<T> {
             for b in t.iter_snapshots() {
                 bytes += record_batch_pinned_bytes(b, &mut seen);
             }
-        }
-        for rows in self.pending_descriptors.values() {
-            bytes += rows.iter().map(|r| r.approx_bytes).sum::<usize>();
         }
         bytes += self.pending_series.len() * self.cfg.ingress.pending_series_entry_bytes;
         bytes + self.token_bytes
@@ -356,8 +387,24 @@ impl<T> Block<T> {
     }
 
     /// Take the block apart after a flush result.
+    ///
+    /// Call this on a sealed block. Descriptor rows only become Arrow rows in
+    /// the series table when `seal` stamps them, so an unsealed block would drop
+    /// them here. The sink always seals before it flushes and only takes the
+    /// block apart once the flush has resolved, so the debug assertion below
+    /// catches a caller that has stepped outside that order.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<T>, HashSet<SeriesId>, BTreeMap<Dataset, SortedTableBuffer>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<T>,
+        HashSet<SeriesId>,
+        BTreeMap<Dataset, SortedTableBuffer>,
+    ) {
+        debug_assert!(
+            self.pending_descriptors.is_empty(),
+            "into_parts on an unsealed block drops its descriptor rows"
+        );
         (self.requests, self.pending_series, self.tables)
     }
 }
@@ -366,7 +413,7 @@ impl<T> Block<T> {
 mod tests {
     use super::*;
     use crate::cache::SeriesCache;
-    use crate::config::LakeConfig;
+    use crate::config::{LakeConfig, Nulls, SortKey, SortOrder};
     use crate::error::RefuseReason;
     use crate::extract::extract;
     use arrow::array::AsArray;
@@ -533,7 +580,9 @@ mod tests {
         let mut cache = SeriesCache::new(100);
         let mut block: Block<u32> = Block::new(0, 1, &cfg);
         let first = extracted(&cfg, "h", 4);
-        let r = block.reserve(&first, &mut cache, 16, &cfg).expect("reserve");
+        let r = block
+            .reserve(&first, &mut cache, 16, &cfg)
+            .expect("reserve");
         block.admit(first, r, 1).expect("admit");
         let before_bytes = block.bytes;
 
@@ -590,8 +639,195 @@ mod tests {
         let first = buf.append(batch.clone()).expect("first append");
         let second = buf.append(batch.clone()).expect("second append");
         assert!(first > 0, "the first append retains the batch's buffers");
-        assert_eq!(second, 0, "the clone shares them, so nothing new is retained");
+        assert_eq!(
+            second, 0,
+            "the clone shares them, so nothing new is retained"
+        );
         assert_eq!(buf.rows(), batch.num_rows() * 2);
+    }
+
+    /// Scenario: a buffer seals a run, then receives a batch built from the very
+    /// buffers the previous run's accounting already saw.
+    /// Guarantees: the dedup set is reset at each seal, so the batch is counted in
+    /// full and `building_bytes` climbs towards `run_target` again. A set that
+    /// survived the seal would report zero here and the next run would never seal.
+    #[test]
+    fn seal_resets_the_dedup_set_so_the_next_run_accounts_again() {
+        let cfg = LakeConfig::default();
+        let e = extracted(&cfg, "h", 8);
+        let (ds, batches) = e.values.into_iter().next().expect("values");
+        let batch = batches.into_iter().next().expect("batch");
+        let mut buf =
+            SortedTableBuffer::new(ds, SortSpec::new(cfg.logs.values_sort.clone()), usize::MAX);
+        let first = buf.append(batch.clone()).expect("first append");
+        assert!(first > 0);
+        assert_eq!(buf.building_bytes, first);
+        buf.seal().expect("seal");
+        assert_eq!(buf.building_bytes, 0);
+        // `batch` is still alive, so its buffers keep the addresses the first
+        // append recorded. Only a reset set can count them again.
+        let second = buf.append(batch.clone()).expect("append after seal");
+        assert_eq!(second, first, "the new run accounts the batch in full");
+        assert!(buf.building_bytes > 0, "building_bytes grows again");
+    }
+
+    /// Scenario: a buffer whose run target is crossed repeatedly, over batches
+    /// that are dropped once their run is sealed.
+    /// Guarantees: every seal is reached, so the run count tracks the appends
+    /// rather than stalling once freed addresses start being reused.
+    #[test]
+    fn repeated_seals_keep_firing_on_the_run_target() {
+        let cfg = LakeConfig::default();
+        let mut buf = SortedTableBuffer::new(
+            Dataset::LogsValues,
+            SortSpec::new(cfg.logs.values_sort.clone()),
+            1,
+        );
+        for _ in 0..8 {
+            let e = extracted(&cfg, "h", 4);
+            let (_, batches) = e.values.into_iter().next().expect("values");
+            for b in batches {
+                let pinned = buf.append(b).expect("append");
+                assert!(pinned > 0, "each fresh batch is accounted");
+            }
+            assert!(buf.building().is_empty(), "the run target sealed the batch");
+        }
+        assert_eq!(buf.runs().len(), 8);
+        assert_eq!(buf.rows(), 32);
+    }
+
+    /// Scenario: a buffer with an empty sort spec, as configured when sorting is off.
+    /// Guarantees: sealing keeps the appended batches as separate runs instead of
+    /// concatenating them, and every row survives.
+    #[test]
+    fn unsorted_seal_keeps_batches_as_runs() {
+        let cfg = LakeConfig::default();
+        let e = extracted(&cfg, "h", 6);
+        let (ds, batches) = e.values.into_iter().next().expect("values");
+        let batch = batches.into_iter().next().expect("batch");
+        let rows = batch.num_rows();
+        let mut buf = SortedTableBuffer::new(ds, SortSpec::new(vec![]), usize::MAX);
+        let _ = buf.append(batch.clone()).expect("append 1");
+        let _ = buf.append(batch).expect("append 2");
+        buf.seal().expect("seal");
+        assert_eq!(
+            buf.runs().len(),
+            2,
+            "no concatenation happens without a sort"
+        );
+        assert!(buf.building().is_empty());
+        assert_eq!(buf.rows(), rows * 2);
+        assert_eq!(
+            buf.runs().iter().map(RecordBatch::num_rows).sum::<usize>(),
+            rows * 2
+        );
+    }
+
+    /// Scenario: `spec_for` asked for each dataset, with logs and metrics given
+    /// different values sorts and with sorting switched off.
+    /// Guarantees: series datasets always take the fixed series sort, values
+    /// datasets take their own signal's configured keys, and disabling sorting
+    /// empties the values specs without touching the series ones.
+    #[test]
+    fn spec_for_maps_each_dataset_to_its_configured_sort() {
+        let mut cfg = LakeConfig::default();
+        cfg.metrics.values_sort = vec![SortKey {
+            column: "series_id".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }];
+        assert_ne!(cfg.logs.values_sort, cfg.metrics.values_sort);
+        let block: Block<u32> = Block::new(0, 1, &cfg);
+
+        assert_eq!(
+            block.spec_for(Dataset::LogsSeries),
+            SortSpec::series(),
+            "logs series takes the fixed series sort"
+        );
+        assert_eq!(
+            block.spec_for(Dataset::MetricsSeries),
+            SortSpec::series(),
+            "metrics series takes the fixed series sort"
+        );
+        assert_eq!(
+            block.spec_for(Dataset::LogsValues).keys(),
+            cfg.logs.values_sort.as_slice()
+        );
+        for ds in [Dataset::MetricsNumber, Dataset::MetricsHistogram] {
+            assert_eq!(
+                block.spec_for(ds).keys(),
+                cfg.metrics.values_sort.as_slice(),
+                "{} follows the metrics sort",
+                ds.name()
+            );
+        }
+
+        let mut off = cfg.clone();
+        off.sorting.enabled = false;
+        let block: Block<u32> = Block::new(0, 1, &off);
+        for ds in [
+            Dataset::LogsValues,
+            Dataset::MetricsNumber,
+            Dataset::MetricsHistogram,
+        ] {
+            assert!(
+                block.spec_for(ds).is_empty(),
+                "{} is unsorted when sorting is disabled",
+                ds.name()
+            );
+        }
+        assert_eq!(block.spec_for(Dataset::LogsSeries), SortSpec::series());
+    }
+
+    /// Scenario: the runs a block actually produces, with logs values sorted by
+    /// the configured keys and with sorting disabled.
+    /// Guarantees: `spec_for` is the spec the runs are really sealed under, not
+    /// just a value the block reports.
+    #[test]
+    fn block_runs_are_sealed_under_the_spec_spec_for_reports() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let e = extracted(&cfg, "h", 40);
+        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+        block.admit(e, r, 1).expect("admit");
+        block.seal(SEAL_AT_US).expect("seal");
+        for t in block.tables() {
+            assert_eq!(t.spec(), &block.spec_for(t.dataset()));
+            for run in t.runs() {
+                assert!(
+                    crate::sort::is_sorted(run, t.spec()).expect("is_sorted"),
+                    "{} runs are sorted by its spec",
+                    t.dataset().name()
+                );
+            }
+        }
+    }
+
+    /// Scenario: a request offered to a block that has already been sealed.
+    /// Guarantees: `admit` refuses rather than restamping the descriptor with the
+    /// earlier seal time or adding estimated bytes to the exact recount.
+    #[test]
+    fn admit_after_seal_is_rejected() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let e1 = extracted(&cfg, "h", 2);
+        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("reserve 1");
+        block.admit(e1, r1, 1).expect("admit");
+        block.seal(SEAL_AT_US).expect("seal");
+        let sealed_bytes = block.bytes;
+
+        let e2 = extracted(&cfg, "h2", 2);
+        let r2 = block.reserve(&e2, &mut cache, 16, &cfg).expect("reserve 2");
+        let err = block
+            .admit(e2, r2, 2)
+            .expect_err("a sealed block admits nothing");
+        assert!(matches!(err, Error::Refused(RefuseReason::Invalid(_))));
+        assert!(err.to_string().contains("already sealed"));
+        assert_eq!(block.bytes, sealed_bytes);
+        assert_eq!(block.request_count(), 1);
+        assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
     }
 
     /// Scenario: a buffer with a tiny run target receives several batches.
@@ -615,7 +851,10 @@ mod tests {
         for r in buf.runs() {
             assert!(crate::sort::is_sorted(r, buf.spec()).expect("sorted"));
         }
-        assert_eq!(buf.iter_snapshots().map(|b| b.num_rows()).sum::<usize>(), 50);
+        assert_eq!(
+            buf.iter_snapshots().map(|b| b.num_rows()).sum::<usize>(),
+            50
+        );
         buf.seal().expect("seal");
         assert!(buf.building().is_empty());
     }
