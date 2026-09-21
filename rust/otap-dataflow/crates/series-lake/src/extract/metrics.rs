@@ -195,8 +195,9 @@ impl Common<'_> {
     /// key, and the copy is charged to `budget` *before* it is made: a request
     /// whose metrics all share one large resource attribute list is refused at
     /// the charge rather than after allocating a copy per metric. The charge is
-    /// an over-estimate of the copy alone, so it is given back once
-    /// [`descriptor_row`] has charged the whole row.
+    /// released as soon as the copy exists and before [`descriptor_row`]
+    /// charges the whole row, which already includes that copy; counting the
+    /// two together would refuse a request that fits its budget.
     fn series_for(
         &mut self,
         metric_id: u32,
@@ -227,8 +228,11 @@ impl Common<'_> {
             metric: Some(m.metric.clone()),
             attrs: attrs.to_vec(),
         };
-        let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats, budget)?;
+        // The copy exists now and `descriptor_row` charges the whole row that
+        // holds it, so the provisional charge is released first rather than
+        // stacked on top of the row charge.
         budget.uncharge(copy_bytes);
+        let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats, budget)?;
         let id = dr.series_id;
         if self.seen.insert(id) {
             self.descriptors.push(dr);
@@ -701,6 +705,42 @@ mod tests {
             extract_metrics(&records, &small, &mut budget),
             Err(Error::Refused(RefuseReason::RequestTooLarge))
         ));
+    }
+
+    /// Scenario: one metric under a resource carrying a 64 KiB attribute, with
+    /// `max_extracted_bytes` set just above what the request actually retains.
+    /// Guarantees: the request is accepted. The provisional charge for the
+    /// attribute copy is released before the descriptor row -- which already
+    /// includes that copy -- is charged, so the two are never counted together
+    /// and a request that fits its budget is not refused transiently.
+    #[test]
+    fn the_copy_charge_is_released_before_the_descriptor_row_is_charged() {
+        // Large enough that the provisional copy charge outweighs the fixed
+        // Arrow builder overhead the values batch adds at the end, so the
+        // descriptor charge is the peak the limit below binds on.
+        const ATTR_BYTES: usize = 256 << 10;
+        let d = many_metrics_one_big_resource(1, ATTR_BYTES);
+
+        // Measure what the request retains, under a budget that cannot bind.
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&encode_metrics(&d), &cfg, &mut budget).expect("measure");
+        let retained: usize = out
+            .descriptors
+            .iter()
+            .map(|r| r.approx_bytes)
+            .sum::<usize>()
+            + out.pinned_bytes;
+        // The premise: the copy alone is a large fraction of the retained size,
+        // so counting it twice would take the request past the limit below.
+        assert!(retained > ATTR_BYTES);
+
+        let mut tight = LakeConfig::default();
+        tight.ingress.max_extracted_bytes = retained + 4096;
+        let mut budget = Budget::new(&tight);
+        let out = extract_metrics(&encode_metrics(&d), &tight, &mut budget)
+            .expect("a request that fits its budget is accepted");
+        assert_eq!(out.descriptors.len(), 1);
     }
 
     /// Scenario: a gauge with two series and a cumulative histogram.
