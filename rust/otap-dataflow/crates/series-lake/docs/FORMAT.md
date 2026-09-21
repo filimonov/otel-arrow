@@ -68,9 +68,14 @@ Rules:
 - Nested values come from the OTAP `ser` column and are decoded from CBOR
   before encoding. Nesting deeper than `max_nesting_depth` (default 32)
   makes the request invalid.
-- A duplicate key inside any attribute list of the request (identity or not)
-  makes the request invalid: permanent nack with `NackCause::Refused`,
-  `nacks{reason=invalid}`.
+- A duplicate key inside any attribute list this writer actually reads --
+  resource attributes, scope attributes, the log record's own attributes
+  (logs), or a supported data point's attributes (metrics: number and
+  histogram points) -- makes the request invalid: permanent nack with
+  `NackCause::Refused`, `nacks{reason=invalid}`. This applies whether or not
+  the list is part of the identity. Metric metadata attributes and exemplar
+  attribute payloads are never decoded at all, so a duplicate key inside
+  either goes undetected (see Limitations).
 - A sum or histogram whose temporality is `Unspecified` is invalid (same
   outcome). Gauges encode temporality as the empty string.
 - Missing string fields are encoded as empty strings; unset attribute values
@@ -93,7 +98,11 @@ Rules:
 - Nothing else is part of the identity: timestamps, values, exemplars, body,
   severity, trace and span ids, flags, dropped counts, metric description,
   log attributes outside the allow-list.
-- The encoder never panics on any input; this is a fuzz target.
+- The encoder never panics on a well-formed `Descriptor` (any string, bytes,
+  int, double, bool, array or kvlist value in any field); this is a fuzz
+  target. Debug builds additionally assert the invariant
+  `metric.is_some() == (signal == Metrics)`, which every descriptor built by
+  `extract` upholds by construction.
 
 Every semantic field stored in a `series` row is either part of the identity
 or explicitly listed as non-identity metadata. Non-identity metadata:
@@ -117,13 +126,20 @@ Later additions (`dataset=exp_histogram`, `dataset=summary`,
 
 `series_id FIXED_LEN_BYTE_ARRAY(16)` (required) is present in every
 dataset. `producer_id STRING` (required, `""` when absent) is present in
-every values dataset and absent from `series`, because one `series_id` can
-legitimately be produced by several producers and the canonical view of
-section 6 keeps one row per id.
+every values dataset and absent from `series`.
 
 `producer_id` is the value of the resource attribute named by
 `producer_id_attribute`. Header-based producer ids are a future extension.
-The README states the semantic requirement: it should be stable across
+That same resource attribute is part of the identity (section 1), so in this
+configuration `producer_id` is functionally determined by `series_id`: two
+requests that hash to the same `series_id` carry the same value for the
+attribute, barring a hash collision. `producer_id` is nonetheless a
+values-only column rather than something a reader always joins out of
+`series`: it lets a reader filter or group values rows by producer without
+a join, and it stays meaningful even if a future writer configuration ever
+excludes the producer attribute from the identity, at which point several
+producers genuinely could share one `series_id`. The README states the
+semantic requirement on the attribute itself: it should be stable across
 producer restarts and unique among concurrently running producers (the role
 Thanos external labels play), because future compaction, deduplication and
 replay extensions rely on it.
@@ -159,7 +175,7 @@ observed_time            TIMESTAMP(us, UTC) null
 observed_time_unix_nano  INT64 null
 severity_number          INT32
 severity_text            STRING
-body                     STRING               # rendering below
+body                     STRING null          # rendering below; null for an unset body
 event_name               STRING
 trace_id                 FIXED_LEN_BYTE_ARRAY(16)  null when absent
 span_id                  FIXED_LEN_BYTE_ARRAY(8)   null when absent
@@ -187,13 +203,19 @@ value_double          DOUBLE null          # set when the point carries as_doubl
 `metrics/histogram`:
 
 ```text
-metric_name, time, time_unix_nano, start_time, start_time_unix_nano, flags
-count            INT64
-sum              DOUBLE null
-min              DOUBLE null
-max              DOUBLE null
-bucket_counts    LIST<INT64>             # empty when the point has no distribution
-explicit_bounds  LIST<DOUBLE>            # empty when the point has no distribution
+metric_name           STRING               # required, dictionary encoded
+time                  TIMESTAMP(us, UTC) null
+time_unix_nano        INT64 null
+start_time            TIMESTAMP(us, UTC) null
+start_time_unix_nano  INT64 null
+flags                 INT32
+count                 INT64
+sum                   DOUBLE null
+min                   DOUBLE null
+max                   DOUBLE null
+bucket_counts         LIST<INT64>   # required list, non-null items
+explicit_bounds       LIST<DOUBLE>  # required list, non-null items
+# both lists are empty when the point has no distribution
 # denormalized columns
 ```
 
@@ -261,7 +283,9 @@ logs:
 - `path` is `resource.<key>`, `scope.<key>` or `attrs.<key>`.
 - `column` defaults to the path with `.` replaced by `_` and the prefix
   dropped. Collisions between denormalized columns, or with intrinsic column
-  names, case-insensitively, are a startup configuration error.
+  names, case-insensitively, are a startup configuration error, checked
+  independently within each dataset's own column set (a column name may be
+  reused across different datasets without conflict).
 - `type` is one of `string`, `int64`, `double`, `bool`. A value of another
   type is rendered as the attribute-map string when `type: string`,
   otherwise stored as null and counted
@@ -274,9 +298,14 @@ logs:
 Schema contract per dataset: within one `base_uri`, changes are additive
 only (new denormalized columns, new nullable intrinsic columns). Changing the
 type or path of an existing column, or reusing a column name for a different
-path, requires a new `base_uri`. Each file carries `schema_fingerprint`
-(xxh3_64 of that dataset's ordered column names and types; the series and
-values datasets of a signal have different fingerprints) in its metadata.
+path, requires a new `base_uri`. Each file carries `schema_fingerprint` in
+its metadata: xxh3_64 over the string `name:type;` repeated for every field
+of that dataset's Arrow schema, in field order, where `type` is the Arrow
+data type's canonical text form (so `Utf8`, `Int64`,
+`Timestamp(Microsecond, Some("UTC"))`, and so on); the hash is rendered as
+16 lowercase hex digits, zero-padded. A change to a column's name, its type,
+or its position, changes the fingerprint, and the series and values
+datasets of a signal have different fingerprints.
 Readers use union-by-name (`union_by_name = true` in DuckDB,
 `mergeSchema` in Spark) so additive changes read as nulls; the README shows
 both recipes and how to detect incompatible mixes.
@@ -292,7 +321,8 @@ both recipes and how to detect incompatible mixes.
   `window_start` (ingest time), never from event timestamps.
 - `writer_id` from config, validated to be non-empty and to contain no `/`;
   `boot_id` is a UUIDv4 generated at exporter start; `seq` is a per-worker
-  monotonic counter, zero-padded to 8 digits. Names are frozen when the
+  monotonic counter, zero-padded to a minimum of 8 digits (not truncated if
+  `seq` itself ever needs more). Names are frozen when the
   block is sealed and reused verbatim across retries. Retries overwrite the
   same names with the same content; `boot_id` makes collisions with other
   blocks or processes impossible in practice. No conditional-put semantics
@@ -324,13 +354,17 @@ dictionary encoding for strings. Key/value metadata: `format_version=1`,
 `series_id:asc:nulls_last`), `writer_id`, `boot_id`, `seq`, `window_start`,
 `window_end` (`window_start + interval`, also for blocks rotated
 mid-window), `row_count`, `min_time_unix_nano`, `max_time_unix_nano`
-(values datasets only). Together `(signal, dataset, partition,
+(values datasets only, and only when the file has at least one row with a
+valid, non-null `time_unix_nano`; a values file whose every row's timestamp
+is null or out of range omits both keys rather than writing them as zero
+or empty). Together `(signal, dataset, partition,
 format_version, schema_fingerprint, sort_key)` defines a compaction scope:
 files in the same scope with `sort_key != none` can later be merged by a
 k-way merge without re-sorting; files with `sort_key=none` must be
 re-sorted; files in different scopes are never merged together. Compaction
-itself is out of scope for this crate: v1 only writes files, one writer
-process at a time, and never merges or rewrites existing ones.
+itself is out of scope for this crate: v1 only writes new files (any number
+of writer processes may run concurrently) and never merges or rewrites
+existing ones.
 
 ## 6. Reading the data
 
@@ -357,17 +391,28 @@ what it read.
 
 - Exponential histograms and summaries are not stored. Depending on the
   `unsupported` policy the whole request is rejected, or the points are
-  dropped and counted.
-- Exemplars are not stored. Their rows are counted as dropped, and their own
-  attribute payloads are neither read nor validated.
-- Metric metadata attributes are not read. Duplicate keys inside a payload
-  that version 1 ignores are therefore not detected, while duplicate keys in
-  any identity attribute list (resource, scope, log record, data point) make
-  the request invalid.
+  dropped and counted one per dropped data point row (`dropped_unsupported`).
+- Exemplars are not stored. Their rows are counted as dropped, one per
+  exemplar row, and their own attribute payloads are neither read nor
+  validated.
+- Metric metadata attributes and exemplar attribute payloads are never read,
+  so a duplicate key inside either goes undetected. Duplicate-key validation
+  covers only the attribute lists this writer actually decodes: resource,
+  scope, the log record's own attributes (logs), and a supported data
+  point's attributes (metrics: number and histogram); it applies to the
+  whole list, not just the part of it that is part of the identity.
 - Attribute maps are lossy for readers: values are rendered to strings by
   `render_v1`, so a string `"42"` and an integer `42` are indistinguishable in
   the `attrs` map. The identity encoding is not lossy; `series_id`
-  distinguishes them.
+  distinguishes them. Bytes values render as a lowercase-hex string (quoted
+  JSON when not the sole top-level value, as in an attribute map cell); a
+  dedicated `body_bytes BINARY` column for the log body is deferred to a
+  later format version.
+- A cancellation (for example, exporter shutdown) that lands after a file's
+  Parquet finalization has begun cannot abort that file's in-flight
+  multipart upload; `BufWriter::abort` is only safe before finalization
+  starts. The leftover parts are reclaimed by a bucket lifecycle rule for
+  incomplete multipart uploads, not by this crate.
 - Traces are refused.
 
 ## Compatibility rules
@@ -380,7 +425,8 @@ what it read.
 - `series_id` values are comparable across writers, versions of this writer,
   and languages, as long as `format_version` matches.
 - A reader that joins `series` and values files from different writers must
-  compare the `schema_fingerprint` metadata key. Two files of the same dataset
-  with different fingerprints have different column sets; read them with
-  union-by-name and treat missing columns as null rather than assuming a
-  single schema.
+  compare the `schema_fingerprint` metadata key (16 lowercase hex digits;
+  section 3). Two files of the same dataset with different fingerprints
+  disagree on the column set, a column's type, or column order; read them
+  with union-by-name and treat missing columns as null rather than assuming
+  a single schema.
