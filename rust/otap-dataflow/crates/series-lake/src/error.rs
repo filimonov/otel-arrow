@@ -6,8 +6,8 @@
 /// Why a request is permanently refused (spec section 8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
-    /// Input, extracted output, a row or the block reservation exceeds a budget.
-    TooLarge,
+    /// The request itself, its extracted output or one of its rows exceeds a budget.
+    RequestTooLarge,
     /// Malformed content: duplicate keys, nesting too deep, bad histogram, ...
     Invalid(String),
     /// Unsupported signal or point kind under the reject policy.

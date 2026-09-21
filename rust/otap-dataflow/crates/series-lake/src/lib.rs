@@ -10,6 +10,7 @@ pub mod attrs;
 pub mod canonical;
 pub mod config;
 pub mod error;
+pub mod extract;
 pub mod schema;
 pub mod value;
 

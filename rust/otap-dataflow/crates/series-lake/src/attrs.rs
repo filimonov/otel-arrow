@@ -43,6 +43,88 @@ pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Op
     Ok(Some(cast(col, to)?))
 }
 
+/// The seven `AnyValue` columns (type, str, int, double, bool, bytes, ser) of an
+/// attribute batch or a log body struct, cast to plain types.
+pub(crate) struct AnyValueColumns {
+    types: ArrayRef,
+    strs: Option<ArrayRef>,
+    ints: Option<ArrayRef>,
+    doubles: Option<ArrayRef>,
+    bools: Option<ArrayRef>,
+    bytes: Option<ArrayRef>,
+    sers: Option<ArrayRef>,
+}
+
+impl AnyValueColumns {
+    /// Build from a column lookup (a `RecordBatch` or a `StructArray`).
+    ///
+    /// Keeps its own cast helper because it takes a column *lookup*, not a
+    /// `RecordBatch`; [`plain`] stays the single batch-column helper.
+    pub(crate) fn new(get: &dyn Fn(&str) -> Option<ArrayRef>) -> Result<Self> {
+        let cast_opt = |name: &str, to: &DataType| -> Result<Option<ArrayRef>> {
+            match get(name) {
+                None => Ok(None),
+                Some(c) if c.data_type() == to => Ok(Some(c)),
+                Some(c) => Ok(Some(cast(&c, to)?)),
+            }
+        };
+        Ok(Self {
+            types: cast_opt("type", &DataType::UInt8)?
+                .ok_or_else(|| Error::invalid("missing type column"))?,
+            strs: cast_opt("str", &DataType::Utf8)?,
+            ints: cast_opt("int", &DataType::Int64)?,
+            doubles: cast_opt("double", &DataType::Float64)?,
+            bools: cast_opt("bool", &DataType::Boolean)?,
+            bytes: cast_opt("bytes", &DataType::Binary)?,
+            sers: cast_opt("ser", &DataType::Binary)?,
+        })
+    }
+
+    /// Typed value at a row; nulls in the value column become [`Value::Null`].
+    pub(crate) fn value_at(&self, row: usize, max_depth: usize) -> Result<Value> {
+        if !self.types.is_valid(row) {
+            return Ok(Value::Null);
+        }
+        let ty = self.types.as_primitive::<UInt8Type>().value(row);
+        Ok(match ty {
+            TYPE_EMPTY => Value::Null,
+            TYPE_STR => match &self.strs {
+                Some(a) if a.is_valid(row) => {
+                    Value::Str(a.as_string::<i32>().value(row).to_string())
+                }
+                _ => Value::Null,
+            },
+            TYPE_INT => match &self.ints {
+                Some(a) if a.is_valid(row) => Value::Int(a.as_primitive::<Int64Type>().value(row)),
+                _ => Value::Null,
+            },
+            TYPE_DOUBLE => match &self.doubles {
+                Some(a) if a.is_valid(row) => {
+                    Value::Double(a.as_primitive::<Float64Type>().value(row))
+                }
+                _ => Value::Null,
+            },
+            TYPE_BOOL => match &self.bools {
+                Some(a) if a.is_valid(row) => Value::Bool(a.as_boolean().value(row)),
+                _ => Value::Null,
+            },
+            TYPE_BYTES => match &self.bytes {
+                Some(a) if a.is_valid(row) => {
+                    Value::Bytes(a.as_binary::<i32>().value(row).to_vec())
+                }
+                _ => Value::Null,
+            },
+            TYPE_MAP | TYPE_SLICE => match &self.sers {
+                Some(a) if a.is_valid(row) => {
+                    decode_cbor(a.as_binary::<i32>().value(row), max_depth)?
+                }
+                _ => Value::Null,
+            },
+            other => return Err(Error::invalid(format!("attribute type {other}"))),
+        })
+    }
+}
+
 fn required(batch: &RecordBatch, name: &str, to: &DataType) -> Result<ArrayRef> {
     plain(batch, name, to)?.ok_or_else(|| Error::invalid(format!("attribute batch lacks {name}")))
 }
@@ -58,48 +140,12 @@ impl AttrTable {
         let parent_ids = read_parent_ids(batch)?;
         let keys = required(batch, "key", &DataType::Utf8)?;
         let keys = keys.as_string::<i32>();
-        let types = required(batch, "type", &DataType::UInt8)?;
-        let types = types.as_primitive::<UInt8Type>();
-        let strs = plain(batch, "str", &DataType::Utf8)?;
-        let strs = strs.as_ref().map(|a| a.as_string::<i32>());
-        let ints = plain(batch, "int", &DataType::Int64)?;
-        let ints = ints.as_ref().map(|a| a.as_primitive::<Int64Type>());
-        let doubles = plain(batch, "double", &DataType::Float64)?;
-        let doubles = doubles.as_ref().map(|a| a.as_primitive::<Float64Type>());
-        let bools = plain(batch, "bool", &DataType::Boolean)?;
-        let bools = bools.as_ref().map(|a| a.as_boolean());
-        let bytes = plain(batch, "bytes", &DataType::Binary)?;
-        let bytes = bytes.as_ref().map(|a| a.as_binary::<i32>());
-        let sers = plain(batch, "ser", &DataType::Binary)?;
-        let sers = sers.as_ref().map(|a| a.as_binary::<i32>());
+        let any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;
 
         let mut groups: HashMap<u32, Vec<(String, Value)>> = HashMap::new();
         for (row, &parent_id) in parent_ids.iter().enumerate() {
             let key = keys.value(row).to_string();
-            let ty = types.value(row);
-            let value = match ty {
-                TYPE_EMPTY => Value::Null,
-                TYPE_STR => strs
-                    .and_then(|a| a.is_valid(row).then(|| a.value(row).to_string()))
-                    .map_or(Value::Null, Value::Str),
-                TYPE_INT => ints
-                    .and_then(|a| a.is_valid(row).then(|| a.value(row)))
-                    .map_or(Value::Null, Value::Int),
-                TYPE_DOUBLE => doubles
-                    .and_then(|a| a.is_valid(row).then(|| a.value(row)))
-                    .map_or(Value::Null, Value::Double),
-                TYPE_BOOL => bools
-                    .and_then(|a| a.is_valid(row).then(|| a.value(row)))
-                    .map_or(Value::Null, Value::Bool),
-                TYPE_BYTES => bytes
-                    .and_then(|a| a.is_valid(row).then(|| a.value(row).to_vec()))
-                    .map_or(Value::Null, Value::Bytes),
-                TYPE_MAP | TYPE_SLICE => match sers {
-                    Some(a) if a.is_valid(row) => decode_cbor(a.value(row), max_depth)?,
-                    _ => Value::Null,
-                },
-                other => return Err(Error::invalid(format!("attribute type {other}"))),
-            };
+            let value = any.value_at(row, max_depth)?;
             groups.entry(parent_id).or_default().push((key, value));
         }
         for list in groups.values_mut() {

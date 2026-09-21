@@ -358,16 +358,29 @@ impl Default for LakeConfig {
 
 impl LakeConfig {
     /// Validate cross-field constraints (spec sections 5.2, 6.2, 7.4).
+    ///
+    /// Rules enforced: `max_row_bytes <= run_target_bytes / 4`;
+    /// `max_requests_per_block >= 1`; `max_block_bytes >= max_extracted_bytes`;
+    /// `upload.part_bytes >= 5 MiB` (the S3 multipart minimum part size, below
+    /// which every upload would fail at flush time); `upload.concurrency >= 1`
+    /// (otherwise no part could ever be sent); denormalized and intrinsic
+    /// column names do not collide (case-insensitively) within a dataset;
+    /// each signal's `values_sort` columns exist in that signal's values
+    /// dataset schema; and every `denormalize` path has a valid
+    /// `resource.`/`scope.`/`attrs.` prefix.
     pub fn validate(&self) -> Result<()> {
         if self.ingress.max_row_bytes > self.sorting.run_target_bytes / 4 {
             return Err(Error::invalid(
                 "max_row_bytes must be at most run_target_bytes / 4",
             ));
         }
-        if self.upload.concurrency == 0 || self.upload.part_bytes < 5 << 20 {
+        if self.upload.part_bytes < 5 << 20 {
             return Err(Error::invalid(
-                "upload.part_bytes must be >= 5MiB and concurrency >= 1",
+                "upload.part_bytes must be at least 5MiB (S3 multipart minimum)",
             ));
+        }
+        if self.upload.concurrency == 0 {
+            return Err(Error::invalid("upload.concurrency must be at least 1"));
         }
         if self.ingress.max_requests_per_block == 0 {
             return Err(Error::invalid("max_requests_per_block must be >= 1"));
@@ -414,5 +427,131 @@ impl LakeConfig {
             let _ = d.source()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: `max_row_bytes` exceeds a quarter of `run_target_bytes`.
+    /// Guarantees: `validate` refuses the configuration and names the rule.
+    #[test]
+    fn max_row_bytes_over_quarter_of_run_target_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_row_bytes = cfg.sorting.run_target_bytes;
+        let err = cfg.validate().expect_err("max_row_bytes exceeds the bound");
+        assert!(err.to_string().contains("run_target_bytes / 4"));
+    }
+
+    /// Scenario: `max_requests_per_block` is zero.
+    /// Guarantees: `validate` refuses, since a block needs at least one ack token.
+    #[test]
+    fn max_requests_per_block_zero_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_requests_per_block = 0;
+        let err = cfg.validate().expect_err("max_requests_per_block is 0");
+        assert!(err.to_string().contains("max_requests_per_block"));
+    }
+
+    /// Scenario: `max_block_bytes` is smaller than `max_extracted_bytes`.
+    /// Guarantees: `validate` refuses, since a block could never hold one request's output.
+    #[test]
+    fn max_block_bytes_below_extracted_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_block_bytes = cfg.ingress.max_extracted_bytes - 1;
+        let err = cfg
+            .validate()
+            .expect_err("max_block_bytes < max_extracted_bytes");
+        assert!(err.to_string().contains("max_block_bytes"));
+    }
+
+    /// Scenario: `upload.part_bytes` is below the S3 multipart minimum part size.
+    /// Guarantees: `validate` refuses at config time rather than deferring to an
+    /// upload-time failure.
+    #[test]
+    fn upload_part_bytes_below_5mib_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.upload.part_bytes = (5 << 20) - 1;
+        let err = cfg.validate().expect_err("part_bytes below 5MiB");
+        assert!(err.to_string().contains("part_bytes"));
+    }
+
+    /// Scenario: `upload.concurrency` is zero.
+    /// Guarantees: `validate` refuses, since no part could ever be uploaded.
+    #[test]
+    fn upload_concurrency_zero_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.upload.concurrency = 0;
+        let err = cfg.validate().expect_err("concurrency is 0");
+        assert!(err.to_string().contains("concurrency"));
+    }
+
+    /// Scenario: the spec-example default configuration.
+    /// Guarantees: `validate` accepts it outright.
+    #[test]
+    fn default_config_validates() {
+        assert!(LakeConfig::default().validate().is_ok());
+    }
+
+    /// Scenario: a denormalized column given as a bare string.
+    /// Guarantees: the path is kept verbatim, the column name defaults to the
+    /// path's last segment, and the type defaults to string.
+    #[test]
+    fn denormalize_deserializes_from_bare_string() {
+        let d: Denormalize = serde_json::from_str("\"resource.service.name\"").expect("valid json");
+        assert_eq!(d.path, "resource.service.name");
+        assert_eq!(d.column, "service_name");
+        assert_eq!(d.ty, DenormType::String);
+    }
+
+    /// Scenario: a denormalized column given as the full object form.
+    /// Guarantees: `path`, `column` and `type` are all taken from the object.
+    #[test]
+    fn denormalize_deserializes_from_object_form() {
+        let d: Denormalize = serde_json::from_str(
+            r#"{"path": "attrs.http.status_code", "column": "http_status", "type": "int64"}"#,
+        )
+        .expect("valid json");
+        assert_eq!(d.path, "attrs.http.status_code");
+        assert_eq!(d.column, "http_status");
+        assert_eq!(d.ty, DenormType::Int64);
+    }
+
+    /// Scenario: a sort key given as a bare string.
+    /// Guarantees: it means ascending order with nulls last.
+    #[test]
+    fn sort_key_deserializes_from_bare_string() {
+        let k: SortKey = serde_json::from_str("\"my_col\"").expect("valid json");
+        assert_eq!(k.column, "my_col");
+        assert_eq!(k.order, SortOrder::Asc);
+        assert_eq!(k.nulls, Nulls::Last);
+    }
+
+    /// Scenario: a sort key given as the full object form with `desc`/`first`.
+    /// Guarantees: both are read from the object rather than defaulted.
+    #[test]
+    fn sort_key_deserializes_from_object_form() {
+        let k: SortKey =
+            serde_json::from_str(r#"{"column": "my_col", "order": "desc", "nulls": "first"}"#)
+                .expect("valid json");
+        assert_eq!(k.column, "my_col");
+        assert_eq!(k.order, SortOrder::Desc);
+        assert_eq!(k.nulls, Nulls::First);
+    }
+
+    /// Scenario: a `LakeConfig` snippet sets `window_interval` and
+    /// `upload.abort_timeout` as humantime strings.
+    /// Guarantees: both parse through `humantime_serde` to the given
+    /// durations, and fields left unset keep their spec defaults.
+    #[test]
+    fn lake_config_deserializes_humantime_durations() {
+        let cfg: LakeConfig = serde_json::from_str(
+            r#"{"window_interval": "30s", "upload": {"abort_timeout": "10s"}}"#,
+        )
+        .expect("valid json");
+        assert_eq!(cfg.window_interval, Duration::from_secs(30));
+        assert_eq!(cfg.upload.abort_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.upload.part_bytes, UploadConfig::default().part_bytes);
     }
 }
