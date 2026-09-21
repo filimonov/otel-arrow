@@ -7,6 +7,7 @@
 //! repository root for the architecture.
 
 pub mod attrs;
+pub mod buffer;
 pub mod cache;
 pub mod canonical;
 pub mod clock;

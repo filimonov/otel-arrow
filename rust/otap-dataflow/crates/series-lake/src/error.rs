@@ -8,6 +8,10 @@
 pub enum RefuseReason {
     /// The request itself, its extracted output or one of its rows exceeds a budget.
     RequestTooLarge,
+    /// The active block cannot take this request; the caller rotates and retries.
+    BlockFull,
+    /// The active block already holds `max_requests_per_block` tokens.
+    TooManyRequests,
     /// Malformed content: duplicate keys, nesting too deep, bad histogram, ...
     Invalid(String),
     /// Unsupported signal or point kind under the reject policy.
