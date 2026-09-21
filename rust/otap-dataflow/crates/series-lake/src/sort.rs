@@ -375,7 +375,7 @@ pub fn is_sorted(batch: &RecordBatch, spec: &SortSpec) -> Result<bool> {
     }
     let converter = key_converter(&batch.schema(), spec)?;
     let rows = key_rows(batch, spec, &converter)?;
-    Ok((1..rows.num_rows()).all(|i| rows.row(i - 1) <= rows.row(i)))
+    Ok(rows.iter().is_sorted())
 }
 
 #[cfg(test)]

@@ -9,6 +9,10 @@ use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use otel_arrow_dfe_pdata::schema::consts::{
+    BODY, EVENT_NAME, FLAGS, ID, NAME, OBSERVED_TIME_UNIX_NANO, RESOURCE, SCHEMA_URL, SCOPE,
+    SEVERITY_NUMBER, SEVERITY_TEXT, SPAN_ID, TIME_UNIX_NANO, TRACE_ID, VERSION,
+};
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, any_value_col,
@@ -59,22 +63,22 @@ pub(crate) fn extract_logs(
     let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, depth)?;
 
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
-    let time = plain(logs, "time_unix_nano", &ts_ns)?;
-    let observed = plain(logs, "observed_time_unix_nano", &ts_ns)?;
-    let id = plain(logs, "id", &DataType::UInt16)?;
-    let severity_number = plain(logs, "severity_number", &DataType::Int32)?;
-    let severity_text = plain(logs, "severity_text", &DataType::Utf8)?;
-    let event_name = plain(logs, "event_name", &DataType::Utf8)?;
-    let flags_col = plain(logs, "flags", &DataType::UInt32)?;
-    let trace_id = plain(logs, "trace_id", &DataType::FixedSizeBinary(16))?;
-    let span_id = plain(logs, "span_id", &DataType::FixedSizeBinary(8))?;
-    let res_id = struct_child(logs, "resource", "id", &DataType::UInt16)?;
-    let res_schema = struct_child(logs, "resource", "schema_url", &DataType::Utf8)?;
-    let scope_id = struct_child(logs, "scope", "id", &DataType::UInt16)?;
-    let scope_name = struct_child(logs, "scope", "name", &DataType::Utf8)?;
-    let scope_version = struct_child(logs, "scope", "version", &DataType::Utf8)?;
-    let scope_schema = plain(logs, "schema_url", &DataType::Utf8)?;
-    let body = any_value_col(logs, "body")?;
+    let time = plain(logs, TIME_UNIX_NANO, &ts_ns)?;
+    let observed = plain(logs, OBSERVED_TIME_UNIX_NANO, &ts_ns)?;
+    let id = plain(logs, ID, &DataType::UInt16)?;
+    let severity_number = plain(logs, SEVERITY_NUMBER, &DataType::Int32)?;
+    let severity_text = plain(logs, SEVERITY_TEXT, &DataType::Utf8)?;
+    let event_name = plain(logs, EVENT_NAME, &DataType::Utf8)?;
+    let flags_col = plain(logs, FLAGS, &DataType::UInt32)?;
+    let trace_id = plain(logs, TRACE_ID, &DataType::FixedSizeBinary(16))?;
+    let span_id = plain(logs, SPAN_ID, &DataType::FixedSizeBinary(8))?;
+    let res_id = struct_child(logs, RESOURCE, ID, &DataType::UInt16)?;
+    let res_schema = struct_child(logs, RESOURCE, SCHEMA_URL, &DataType::Utf8)?;
+    let scope_id = struct_child(logs, SCOPE, ID, &DataType::UInt16)?;
+    let scope_name = struct_child(logs, SCOPE, NAME, &DataType::Utf8)?;
+    let scope_version = struct_child(logs, SCOPE, VERSION, &DataType::Utf8)?;
+    let scope_schema = plain(logs, SCHEMA_URL, &DataType::Utf8)?;
+    let body = any_value_col(logs, BODY)?;
 
     let allow: &[String] = &cfg.logs.series_attributes;
     let values_denorm = denorm_columns(Dataset::LogsValues, cfg);

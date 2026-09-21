@@ -222,7 +222,7 @@ pub fn series_id(identity_bytes: &[u8]) -> SeriesId {
 /// Lowercase hex rendering of a series id.
 #[must_use]
 pub fn hex(id: &SeriesId) -> String {
-    crate::value::hex_lower(id)
+    hex::encode(id)
 }
 
 #[cfg(test)]

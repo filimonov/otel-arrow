@@ -95,7 +95,7 @@ pub fn render_v1(v: &Value) -> serde_json::Value {
     match v {
         Value::Null => J::Null,
         Value::Str(s) => J::String(s.clone()),
-        Value::Bytes(b) => J::String(hex_lower(b)),
+        Value::Bytes(b) => J::String(hex::encode(b)),
         Value::Int(i) => J::from(*i),
         Value::Double(d) => render_double(*d),
         Value::Bool(b) => J::Bool(*b),
@@ -120,20 +120,6 @@ fn render_double(d: f64) -> serde_json::Value {
         // serde_json renders finite f64 with the shortest round-trip form.
         serde_json::Number::from_f64(d).map_or(serde_json::Value::Null, serde_json::Value::Number)
     }
-}
-
-/// Lowercase hex digits, indexed by nibble value.
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-/// Lowercase hex of a byte slice.
-#[must_use]
-pub fn hex_lower(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        s.push(HEX_DIGITS[(byte >> 4) as usize] as char);
-        s.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    s
 }
 
 /// Attribute-map entry point: raw string for strings, `None` for unset,

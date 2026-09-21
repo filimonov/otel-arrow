@@ -62,6 +62,11 @@ fn utc_stamp(unix_secs: i64) -> String {
 }
 
 /// Object path of a dataset file (spec section 5.3).
+///
+/// Built as one [`Path::from_iter`] over path segments, not a single
+/// delimiter-joined string: a `/` inside `naming.writer_id` or
+/// `naming.boot_id` is then percent-encoded into the file-name segment
+/// instead of splitting it into extra directory levels.
 #[must_use]
 pub fn object_path(
     ds: Dataset,
@@ -70,16 +75,19 @@ pub fn object_path(
     naming: &FileNaming,
     seq: u64,
 ) -> Path {
-    Path::from(format!(
-        "v=1/signal={}/dataset={}/date={}/hour={}/part-{}-{}-{}-{seq:08}.parquet",
-        ds.signal().as_str(),
-        ds.name(),
-        partition.date_string(),
-        partition.hour_string(),
-        utc_stamp(window_start_secs),
-        naming.writer_id,
-        naming.boot_id,
-    ))
+    Path::from_iter([
+        "v=1".to_string(),
+        format!("signal={}", ds.signal().as_str()),
+        format!("dataset={}", ds.name()),
+        format!("date={}", partition.date_string()),
+        format!("hour={}", partition.hour_string()),
+        format!(
+            "part-{}-{}-{}-{seq:08}.parquet",
+            utc_stamp(window_start_secs),
+            naming.writer_id,
+            naming.boot_id,
+        ),
+    ])
 }
 
 /// Files written for one block.
@@ -791,6 +799,33 @@ mod tests {
             p.as_ref(),
             "v=1/signal=logs/dataset=values/date=2026-09-21/hour=03/part-20260921T031500Z-w1-b-00000042.parquet"
         );
+    }
+
+    /// Scenario: a `writer_id` containing `/` reaches `object_path` despite
+    /// `LakeConfig::validate` refusing it (e.g. a caller that skips
+    /// validation).
+    /// Guarantees: the `/` is encoded into the file-name segment rather than
+    /// splitting it into extra path segments: the path still has exactly the
+    /// five Hive directory levels plus the file name, and the encoded segment
+    /// round-trips back to the original `writer_id` once decoded.
+    #[test]
+    fn object_path_encodes_slash_in_writer_id_as_one_segment() {
+        let p = object_path(
+            Dataset::LogsValues,
+            PartitionId::from_unix_secs(WINDOW_START),
+            WINDOW_START,
+            &naming("team/writer", "b"),
+            42,
+        );
+        let raw = p.as_ref();
+        assert_eq!(raw.matches('/').count(), 5, "path: {raw}");
+        let file_name = raw.rsplit('/').next().expect("at least one segment");
+        assert!(
+            file_name.contains("team%2Fwriter"),
+            "file name: {file_name}"
+        );
+        let parts: Vec<String> = p.parts().map(|part| part.as_ref().to_string()).collect();
+        assert_eq!(parts.len(), 6, "parts: {parts:?}");
     }
 
     /// Scenario: a block with 30 log rows written to a local directory, then read back.

@@ -10,18 +10,14 @@ use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt8Type, UInt16Type, UInt32Type};
 use arrow::record_batch::RecordBatch;
+use otel_arrow_dfe_pdata::otlp::attributes::AttributeValueType;
+use otel_arrow_dfe_pdata::schema::consts::{
+    ATTRIBUTE_BOOL, ATTRIBUTE_BYTES, ATTRIBUTE_DOUBLE, ATTRIBUTE_INT, ATTRIBUTE_KEY, ATTRIBUTE_SER,
+    ATTRIBUTE_STR, ATTRIBUTE_TYPE, PARENT_ID,
+};
 
 use crate::error::{Error, Result};
 use crate::value::{Value, decode_cbor, sort_kvlist, value_bytes};
-
-const TYPE_EMPTY: u8 = 0;
-const TYPE_STR: u8 = 1;
-const TYPE_INT: u8 = 2;
-const TYPE_DOUBLE: u8 = 3;
-const TYPE_BOOL: u8 = 4;
-const TYPE_MAP: u8 = 5;
-const TYPE_SLICE: u8 = 6;
-const TYPE_BYTES: u8 = 7;
 
 /// Attributes of one OTAP attribute batch, grouped by parent id.
 #[derive(Debug, Default)]
@@ -69,14 +65,14 @@ impl AnyValueColumns {
             }
         };
         Ok(Self {
-            types: cast_opt("type", &DataType::UInt8)?
+            types: cast_opt(ATTRIBUTE_TYPE, &DataType::UInt8)?
                 .ok_or_else(|| Error::invalid("missing type column"))?,
-            strs: cast_opt("str", &DataType::Utf8)?,
-            ints: cast_opt("int", &DataType::Int64)?,
-            doubles: cast_opt("double", &DataType::Float64)?,
-            bools: cast_opt("bool", &DataType::Boolean)?,
-            bytes: cast_opt("bytes", &DataType::Binary)?,
-            sers: cast_opt("ser", &DataType::Binary)?,
+            strs: cast_opt(ATTRIBUTE_STR, &DataType::Utf8)?,
+            ints: cast_opt(ATTRIBUTE_INT, &DataType::Int64)?,
+            doubles: cast_opt(ATTRIBUTE_DOUBLE, &DataType::Float64)?,
+            bools: cast_opt(ATTRIBUTE_BOOL, &DataType::Boolean)?,
+            bytes: cast_opt(ATTRIBUTE_BYTES, &DataType::Binary)?,
+            sers: cast_opt(ATTRIBUTE_SER, &DataType::Binary)?,
         })
     }
 
@@ -86,41 +82,42 @@ impl AnyValueColumns {
             return Ok(Value::Null);
         }
         let ty = self.types.as_primitive::<UInt8Type>().value(row);
+        let ty = AttributeValueType::try_from(ty)
+            .map_err(|_| Error::invalid(format!("attribute type {ty}")))?;
         Ok(match ty {
-            TYPE_EMPTY => Value::Null,
-            TYPE_STR => match &self.strs {
+            AttributeValueType::Empty => Value::Null,
+            AttributeValueType::Str => match &self.strs {
                 Some(a) if a.is_valid(row) => {
                     Value::Str(a.as_string::<i32>().value(row).to_string())
                 }
                 _ => Value::Null,
             },
-            TYPE_INT => match &self.ints {
+            AttributeValueType::Int => match &self.ints {
                 Some(a) if a.is_valid(row) => Value::Int(a.as_primitive::<Int64Type>().value(row)),
                 _ => Value::Null,
             },
-            TYPE_DOUBLE => match &self.doubles {
+            AttributeValueType::Double => match &self.doubles {
                 Some(a) if a.is_valid(row) => {
                     Value::Double(a.as_primitive::<Float64Type>().value(row))
                 }
                 _ => Value::Null,
             },
-            TYPE_BOOL => match &self.bools {
+            AttributeValueType::Bool => match &self.bools {
                 Some(a) if a.is_valid(row) => Value::Bool(a.as_boolean().value(row)),
                 _ => Value::Null,
             },
-            TYPE_BYTES => match &self.bytes {
+            AttributeValueType::Bytes => match &self.bytes {
                 Some(a) if a.is_valid(row) => {
                     Value::Bytes(a.as_binary::<i32>().value(row).to_vec())
                 }
                 _ => Value::Null,
             },
-            TYPE_MAP | TYPE_SLICE => match &self.sers {
+            AttributeValueType::Map | AttributeValueType::Slice => match &self.sers {
                 Some(a) if a.is_valid(row) => {
                     decode_cbor(a.as_binary::<i32>().value(row), max_depth)?
                 }
                 _ => Value::Null,
             },
-            other => return Err(Error::invalid(format!("attribute type {other}"))),
         })
     }
 }
@@ -138,7 +135,7 @@ impl AttrTable {
     /// a parent has a duplicate attribute key.
     pub fn from_batch(batch: &RecordBatch, max_depth: usize) -> Result<Self> {
         let parent_ids = read_parent_ids(batch)?;
-        let keys = required(batch, "key", &DataType::Utf8)?;
+        let keys = required(batch, ATTRIBUTE_KEY, &DataType::Utf8)?;
         let keys = keys.as_string::<i32>();
         let any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;
 
@@ -176,7 +173,7 @@ impl AttrTable {
 /// than silently attributing the row to the first parent (spec 9.3).
 fn read_parent_ids(batch: &RecordBatch) -> Result<Vec<u32>> {
     let col = batch
-        .column_by_name("parent_id")
+        .column_by_name(PARENT_ID)
         .ok_or_else(|| Error::invalid("attribute batch lacks parent_id"))?;
     let ids = match col.data_type() {
         DataType::Dictionary(_, _) => cast(col, &DataType::UInt32)?,

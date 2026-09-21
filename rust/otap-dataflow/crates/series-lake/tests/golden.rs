@@ -51,10 +51,7 @@ fn kv_from_json(j: &serde_json::Value) -> Vec<(String, Value)> {
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-        .collect()
+    ::hex::decode(s).expect("hex")
 }
 
 fn str_field(j: &serde_json::Value, k: &str) -> String {

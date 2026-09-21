@@ -365,16 +365,26 @@ impl Default for LakeConfig {
 impl LakeConfig {
     /// Validate cross-field constraints (spec sections 5.2, 6.2, 7.4).
     ///
-    /// Rules enforced: `max_row_bytes <= run_target_bytes / 4`;
-    /// `max_requests_per_block >= 1`; `max_block_bytes >= max_extracted_bytes`;
-    /// `upload.part_bytes >= 5 MiB` (the S3 multipart minimum part size, below
-    /// which every upload would fail at flush time); `upload.concurrency >= 1`
-    /// (otherwise no part could ever be sent); denormalized and intrinsic
-    /// column names do not collide (case-insensitively) within a dataset;
-    /// each signal's `values_sort` columns exist in that signal's values
-    /// dataset schema; and every `denormalize` path has a valid
-    /// `resource.`/`scope.`/`attrs.` prefix.
+    /// Rules enforced: `writer_id` is non-empty and contains no `/` (it is
+    /// interpolated into the file-name segment of [`crate::sink::object_path`],
+    /// and a delimiter there must not be read as extra path segments; the
+    /// boot id is generated internally from a UUIDv4 and is not
+    /// user-configurable, so it needs no such rule); `max_row_bytes <=
+    /// run_target_bytes / 4`; `max_requests_per_block >= 1`; `max_block_bytes
+    /// >= max_extracted_bytes`; `upload.part_bytes >= 5 MiB` (the S3
+    /// multipart minimum part size, below which every upload would fail at
+    /// flush time); `upload.concurrency >= 1` (otherwise no part could ever
+    /// be sent); denormalized and intrinsic column names do not collide
+    /// (case-insensitively) within a dataset; each signal's `values_sort`
+    /// columns exist in that signal's values dataset schema; and every
+    /// `denormalize` path has a valid `resource.`/`scope.`/`attrs.` prefix.
     pub fn validate(&self) -> Result<()> {
+        if self.writer_id.is_empty() {
+            return Err(Error::invalid("writer_id must not be empty"));
+        }
+        if self.writer_id.contains('/') {
+            return Err(Error::invalid("writer_id must not contain '/'"));
+        }
         if self.ingress.max_row_bytes > self.sorting.run_target_bytes / 4 {
             return Err(Error::invalid(
                 "max_row_bytes must be at most run_target_bytes / 4",
@@ -498,6 +508,32 @@ mod tests {
     #[test]
     fn default_config_validates() {
         assert!(LakeConfig::default().validate().is_ok());
+    }
+
+    /// Scenario: `writer_id` is the empty string.
+    /// Guarantees: `validate` refuses it, since it is interpolated into every
+    /// written file name.
+    #[test]
+    fn writer_id_empty_is_rejected() {
+        let cfg = LakeConfig {
+            writer_id: String::new(),
+            ..LakeConfig::default()
+        };
+        let err = cfg.validate().expect_err("writer_id is empty");
+        assert!(err.to_string().contains("writer_id"));
+    }
+
+    /// Scenario: `writer_id` contains a `/`.
+    /// Guarantees: `validate` refuses it, since an unescaped `/` would inject
+    /// extra path segments into `object_path`'s file-name segment.
+    #[test]
+    fn writer_id_with_slash_is_rejected() {
+        let cfg = LakeConfig {
+            writer_id: "team/writer".into(),
+            ..LakeConfig::default()
+        };
+        let err = cfg.validate().expect_err("writer_id contains '/'");
+        assert!(err.to_string().contains("writer_id"));
     }
 
     /// Scenario: a denormalized column given as a bare string.

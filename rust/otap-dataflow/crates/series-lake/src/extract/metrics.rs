@@ -9,6 +9,12 @@ use arrow::array::{Array, AsArray, ListArray};
 use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UInt64Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use otel_arrow_dfe_pdata::schema::consts::{
+    AGGREGATION_TEMPORALITY, DESCRIPTION, DOUBLE_VALUE, FLAGS, HISTOGRAM_BUCKET_COUNTS,
+    HISTOGRAM_COUNT, HISTOGRAM_EXPLICIT_BOUNDS, HISTOGRAM_MAX, HISTOGRAM_MIN, HISTOGRAM_SUM, ID,
+    INT_VALUE, IS_MONOTONIC, METRIC_TYPE, NAME, PARENT_ID, RESOURCE, SCHEMA_URL, SCOPE,
+    START_TIME_UNIX_NANO, TIME_UNIX_NANO, UNIT, VERSION,
+};
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
@@ -56,19 +62,19 @@ fn metric_rows(
     let Some(m) = records.get(ArrowPayloadType::UnivariateMetrics) else {
         return Ok(HashMap::new());
     };
-    let id = plain(m, "id", &DataType::UInt16)?;
-    let kind = plain(m, "metric_type", &DataType::UInt8)?;
-    let name = plain(m, "name", &DataType::Utf8)?;
-    let temporality = plain(m, "aggregation_temporality", &DataType::Int32)?;
-    let description = plain(m, "description", &DataType::Utf8)?;
-    let is_monotonic = plain(m, "is_monotonic", &DataType::Boolean)?;
-    let unit = plain(m, "unit", &DataType::Utf8)?;
-    let scope_schema = plain(m, "schema_url", &DataType::Utf8)?;
-    let res_id = struct_child(m, "resource", "id", &DataType::UInt16)?;
-    let res_schema = struct_child(m, "resource", "schema_url", &DataType::Utf8)?;
-    let scope_id = struct_child(m, "scope", "id", &DataType::UInt16)?;
-    let scope_name = struct_child(m, "scope", "name", &DataType::Utf8)?;
-    let scope_version = struct_child(m, "scope", "version", &DataType::Utf8)?;
+    let id = plain(m, ID, &DataType::UInt16)?;
+    let kind = plain(m, METRIC_TYPE, &DataType::UInt8)?;
+    let name = plain(m, NAME, &DataType::Utf8)?;
+    let temporality = plain(m, AGGREGATION_TEMPORALITY, &DataType::Int32)?;
+    let description = plain(m, DESCRIPTION, &DataType::Utf8)?;
+    let is_monotonic = plain(m, IS_MONOTONIC, &DataType::Boolean)?;
+    let unit = plain(m, UNIT, &DataType::Utf8)?;
+    let scope_schema = plain(m, SCHEMA_URL, &DataType::Utf8)?;
+    let res_id = struct_child(m, RESOURCE, ID, &DataType::UInt16)?;
+    let res_schema = struct_child(m, RESOURCE, SCHEMA_URL, &DataType::Utf8)?;
+    let scope_id = struct_child(m, SCOPE, ID, &DataType::UInt16)?;
+    let scope_name = struct_child(m, SCOPE, NAME, &DataType::Utf8)?;
+    let scope_version = struct_child(m, SCOPE, VERSION, &DataType::Utf8)?;
     let mut out = HashMap::with_capacity(m.num_rows());
     for row in 0..m.num_rows() {
         let kind_u8 = kind
@@ -351,13 +357,13 @@ pub(crate) fn extract_metrics(
     // Number points.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, depth)?;
-        let parent = plain(b, "parent_id", &DataType::UInt16)?;
-        let pid = plain(b, "id", &DataType::UInt32)?;
-        let start = plain(b, "start_time_unix_nano", &ts_ns)?;
-        let time = plain(b, "time_unix_nano", &ts_ns)?;
-        let iv = plain(b, "int_value", &DataType::Int64)?;
-        let dv = plain(b, "double_value", &DataType::Float64)?;
-        let fl = plain(b, "flags", &DataType::UInt32)?;
+        let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
+        let pid = plain(b, ID, &DataType::UInt32)?;
+        let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
+        let time = plain(b, TIME_UNIX_NANO, &ts_ns)?;
+        let iv = plain(b, INT_VALUE, &DataType::Int64)?;
+        let dv = plain(b, DOUBLE_VALUE, &DataType::Float64)?;
+        let fl = plain(b, FLAGS, &DataType::UInt32)?;
         let mut sink = RowSink::new(Dataset::MetricsNumber, cfg)?;
         for row in 0..b.num_rows() {
             let metric_id = opt_u16_at(&parent, row)
@@ -408,17 +414,17 @@ pub(crate) fn extract_metrics(
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, depth)?;
-        let parent = plain(b, "parent_id", &DataType::UInt16)?;
-        let pid = plain(b, "id", &DataType::UInt32)?;
-        let start = plain(b, "start_time_unix_nano", &ts_ns)?;
-        let time = plain(b, "time_unix_nano", &ts_ns)?;
-        let count = plain(b, "count", &DataType::UInt64)?;
-        let sum = plain(b, "sum", &DataType::Float64)?;
-        let min = plain(b, "min", &DataType::Float64)?;
-        let max = plain(b, "max", &DataType::Float64)?;
-        let fl = plain(b, "flags", &DataType::UInt32)?;
-        let bc = list_col(b, "bucket_counts")?;
-        let eb = list_col(b, "explicit_bounds")?;
+        let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
+        let pid = plain(b, ID, &DataType::UInt32)?;
+        let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
+        let time = plain(b, TIME_UNIX_NANO, &ts_ns)?;
+        let count = plain(b, HISTOGRAM_COUNT, &DataType::UInt64)?;
+        let sum = plain(b, HISTOGRAM_SUM, &DataType::Float64)?;
+        let min = plain(b, HISTOGRAM_MIN, &DataType::Float64)?;
+        let max = plain(b, HISTOGRAM_MAX, &DataType::Float64)?;
+        let fl = plain(b, FLAGS, &DataType::UInt32)?;
+        let bc = list_col(b, HISTOGRAM_BUCKET_COUNTS)?;
+        let eb = list_col(b, HISTOGRAM_EXPLICIT_BOUNDS)?;
         let mut sink = RowSink::new(Dataset::MetricsHistogram, cfg)?;
         for row in 0..b.num_rows() {
             let metric_id = opt_u16_at(&parent, row)
