@@ -1,0 +1,74 @@
+# OTLP/gRPC to a local series/values Parquet lake.
+#
+# Pipeline topology:
+#
+#   otlp receiver --> series_parquet exporter --> local files
+#
+# The receiver is connected directly to the exporter with
+# `wait_for_result: true`, so an OK OTLP response means the request's rows are
+# already durable in the configured storage. Build with
+# `--features series_parquet` and create the base directory before starting.
+#
+# Usage:
+#   mkdir -p /tmp/series-parquet
+#   df_engine --config configs/series-parquet-local.yaml \
+#     --http-admin-bind 127.0.0.1:8080
+version: otel_dataflow/v1
+policies:
+  resources:
+    core_allocation: {type: core_count, count: 1}
+engine:
+  telemetry: {reporting_interval: 1s}
+groups:
+  default:
+    pipelines:
+      main:
+        policies:
+          channel_capacity:
+            control: {node: 100, pipeline: 100, completion: 100}
+            pdata: 128
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+                  timeout: 180s
+                  max_concurrent_requests: 128
+          exporter:
+            type: exporter:series_parquet
+            config:
+              storage: {file: {base_uri: /tmp/series-parquet}}
+              writer_id: local-1
+              producer_id_attribute: host.id
+              window:
+                interval: 15s
+                max_block_bytes: 500MiB
+                max_requests_per_block: 4096
+                flush_retry_deadline: 60s
+              ingress:
+                max_request_bytes: 16MiB
+                max_extracted_bytes: 32MiB
+                max_row_bytes: 1MiB
+                max_nesting_depth: 32
+              series_cache: {max_entries: 200000}
+              sorting: {enabled: true, run_target_bytes: 8MiB, merge_chunk_bytes: 16MiB}
+              upload: {part_bytes: 8MiB, concurrency: 2, abort_timeout: 5s}
+              parquet: {compression: zstd, row_group_bytes: 64MiB, writer_limit_bytes: 96MiB}
+              notify_batch: 64
+              unsupported: reject
+              logs:
+                series_attributes: [logger.name]
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc, nulls: last}
+              metrics:
+                denormalize: [resource.service.name]
+                values_sort:
+                  - {column: series_id, order: asc}
+                  - {column: time_unix_nano, order: asc}
+        connections:
+          - {from: receiver, to: exporter}

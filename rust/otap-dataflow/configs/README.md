@@ -245,6 +245,18 @@ OTLP receiver with performance metrics:
 - Measures and exports performance metrics
 - View metrics at: `http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false`
 
+### `series-parquet-local.yaml`
+
+OTLP/gRPC receiver writing a local series/values Parquet lake:
+
+- Receives OTLP logs on `127.0.0.1:4317` with `wait_for_result: true`
+- Writes series and values Parquet datasets under `/tmp/series-parquet`
+
+Requires a binary built with `--features series_parquet`. Create the base
+directory before starting. An OK OTLP response means the request's rows are
+already durable, so clients should retry timeouts and transient failures and
+tolerate duplicates. Only logs are accepted; metrics and traces are refused.
+
 ### `syslog-perf.yaml`
 
 Syslog/CEF receiver with performance metrics:

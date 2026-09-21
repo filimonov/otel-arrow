@@ -24,6 +24,7 @@ otel-arrow-dfe-otap = { workspace = true }
 otel-arrow-dfe-pdata = { workspace = true }
 otel-arrow-dfe-pdata-views = { workspace = true }
 otel-arrow-dfe-query-engine = { workspace = true, optional = true }
+otel-arrow-dfe-series-lake = { workspace = true, optional = true }
 otel-arrow-dfe-quiver = { workspace = true, optional = true }
 otel-arrow-dfe-telemetry = { workspace = true }
 otel-arrow-dfe-telemetry-macros = { workspace = true }
@@ -98,6 +99,7 @@ core-exporters = [
     "otap",
     "otlp",
     "parquet",
+    "series_parquet",
     "topic",
 ]
 
@@ -130,6 +132,10 @@ parquet = [
     "dep:object_store",
     "dep:parquet",
 ]
+series_parquet = [
+    "dep:object_store",
+    "dep:otel-arrow-dfe-series-lake",
+]
 
 # Cross-cutting features may imply a node when they have no meaning on their
 # own; for example, Azure storage implies the Parquet exporter.
@@ -142,6 +148,7 @@ dev-tools = []
 
 [dev-dependencies]
 arrow-ipc.workspace = true
+serde_yaml.workspace = true
 arrow-schema.workspace = true
 fluke-hpack.workspace = true
 flume.workspace = true
