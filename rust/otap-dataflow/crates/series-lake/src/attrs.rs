@@ -76,7 +76,25 @@ impl AnyValueColumns {
         })
     }
 
-    /// Typed value at a row; nulls in the value column become [`Value::Null`].
+    /// Typed value at a row.
+    ///
+    /// The type tag decides the variant; the value column only supplies the
+    /// payload. An absent column, or a null cell within it, therefore means
+    /// "this type's default value", not "null": pdata's OTAP encoder omits a
+    /// value column whose every entry is the default, so a batch of nothing but
+    /// empty strings carries no `str` column at all. Reading that back as
+    /// [`Value::Null`] would make a series identity depend on how requests
+    /// happen to be batched, and would collide with a genuinely null attribute,
+    /// which the canonical encoding keeps distinct (`Empty` below, and the
+    /// `null_value` golden vector).
+    ///
+    /// Map and slice values are the exception: they arrive CBOR-encoded, and
+    /// even an empty map is a non-empty CBOR payload, so an absent or null
+    /// `ser` cell under those tags is malformed content rather than a default.
+    ///
+    /// # Errors
+    /// Returns [`Error::Refused`] for an unknown type tag, for a map or slice
+    /// whose `ser` payload is missing, and for a malformed CBOR payload.
     pub(crate) fn value_at(&self, row: usize, max_depth: usize) -> Result<Value> {
         if !self.types.is_valid(row) {
             return Ok(Value::Null);
@@ -90,33 +108,37 @@ impl AnyValueColumns {
                 Some(a) if a.is_valid(row) => {
                     Value::Str(a.as_string::<i32>().value(row).to_string())
                 }
-                _ => Value::Null,
+                _ => Value::Str(String::new()),
             },
             AttributeValueType::Int => match &self.ints {
                 Some(a) if a.is_valid(row) => Value::Int(a.as_primitive::<Int64Type>().value(row)),
-                _ => Value::Null,
+                _ => Value::Int(0),
             },
             AttributeValueType::Double => match &self.doubles {
                 Some(a) if a.is_valid(row) => {
                     Value::Double(a.as_primitive::<Float64Type>().value(row))
                 }
-                _ => Value::Null,
+                _ => Value::Double(0.0),
             },
             AttributeValueType::Bool => match &self.bools {
                 Some(a) if a.is_valid(row) => Value::Bool(a.as_boolean().value(row)),
-                _ => Value::Null,
+                _ => Value::Bool(false),
             },
             AttributeValueType::Bytes => match &self.bytes {
                 Some(a) if a.is_valid(row) => {
                     Value::Bytes(a.as_binary::<i32>().value(row).to_vec())
                 }
-                _ => Value::Null,
+                _ => Value::Bytes(Vec::new()),
             },
             AttributeValueType::Map | AttributeValueType::Slice => match &self.sers {
                 Some(a) if a.is_valid(row) => {
                     decode_cbor(a.as_binary::<i32>().value(row), max_depth)?
                 }
-                _ => Value::Null,
+                _ => {
+                    return Err(Error::invalid(
+                        "map or slice attribute without a ser payload",
+                    ));
+                }
             },
         })
     }
@@ -305,5 +327,93 @@ mod tests {
             AttrTable::from_batch(&b, 32),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
+    }
+
+    /// Build a batch of one attribute per row with the given type tags and NO
+    /// value columns at all, the shape pdata emits when every value in a batch
+    /// is that type's default.
+    fn batch_without_value_columns(tags: &[u8]) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+        ]);
+        let keys: Vec<String> = (0..tags.len()).map(|i| format!("k{i}")).collect();
+        let parents: Vec<u16> = vec![0; tags.len()];
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(parents)),
+            Arc::new(StringArray::from(keys)),
+            Arc::new(UInt8Array::from(tags.to_vec())),
+        ];
+        RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
+    }
+
+    /// Scenario: a batch whose value columns are all absent, one row per typed
+    /// tag, as pdata emits when every value of a column is that type's default.
+    /// Guarantees: each attribute decodes to its type's default value, never to
+    /// [`Value::Null`]. Reading them as null would make a series identity depend
+    /// on how requests are batched and would collide with a genuinely null
+    /// attribute, which stays [`Value::Null`] under the `Empty` tag.
+    #[test]
+    fn absent_value_column_decodes_as_the_type_default() {
+        // Tags: str, int, double, bool, bytes, empty.
+        let b = batch_without_value_columns(&[1, 2, 3, 4, 7, 0]);
+        let t = AttrTable::from_batch(&b, 32).expect("table");
+        assert_eq!(
+            t.get(0),
+            &[
+                ("k0".to_string(), Value::Str(String::new())),
+                ("k1".to_string(), Value::Int(0)),
+                ("k2".to_string(), Value::Double(0.0)),
+                ("k3".to_string(), Value::Bool(false)),
+                ("k4".to_string(), Value::Bytes(Vec::new())),
+                ("k5".to_string(), Value::Null),
+            ]
+        );
+    }
+
+    /// Scenario: a typed value column that is present but null in this row.
+    /// Guarantees: a null cell is the type's default too, for the same reason an
+    /// absent column is -- the type tag, not the cell, decides the variant.
+    #[test]
+    fn null_value_cell_decodes_as_the_type_default() {
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new("str", DataType::Utf8, true),
+            Field::new("int", DataType::Int64, true),
+        ]);
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(vec![0u16, 0])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(UInt8Array::from(vec![1u8, 2])),
+            Arc::new(StringArray::from(vec![None::<&str>, None])),
+            Arc::new(Int64Array::from(vec![None::<i64>, None])),
+        ];
+        let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
+        let t = AttrTable::from_batch(&b, 32).expect("table");
+        assert_eq!(
+            t.get(0),
+            &[
+                ("a".to_string(), Value::Str(String::new())),
+                ("b".to_string(), Value::Int(0)),
+            ]
+        );
+    }
+
+    /// Scenario: a map or slice attribute whose `ser` payload is absent.
+    /// Guarantees: the batch is refused. Unlike the scalar types, a map has no
+    /// empty encoding to fall back on -- even an empty CBOR map is a non-empty
+    /// payload -- so a missing one is malformed content, not a default.
+    #[test]
+    fn map_or_slice_without_a_ser_payload_is_refused() {
+        for tag in [5u8, 6] {
+            let b = batch_without_value_columns(&[tag]);
+            assert!(matches!(
+                AttrTable::from_batch(&b, 32),
+                Err(Error::Refused(RefuseReason::Invalid(_)))
+            ));
+        }
     }
 }

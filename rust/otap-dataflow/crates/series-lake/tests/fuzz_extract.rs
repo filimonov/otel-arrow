@@ -30,20 +30,6 @@ fn attr() -> impl Strategy<Value = Attr> {
     ("[a-z.]{1,6}", "[a-zA-Z0-9]{0,6}").prop_map(|(key, value)| Attr { key, value })
 }
 
-/// Like [`attr`], but never produces an empty attribute value.
-///
-/// pdata's OTAP encoder omits a value column whose every entry is the type's
-/// default, so a batch in which every string attribute is `""` carries no `str`
-/// column at all, and extraction reads those attributes back as
-/// `Value::Null` instead of `Value::Str("")`. That makes an identity depend on
-/// how requests are framed, which
-/// `empty_string_attribute_identity_depends_on_request_framing` pins down.
-/// Until that is fixed, the cross-framing property below uses non-empty values;
-/// widen this back to `attr()` once it is.
-fn nonempty_attr() -> impl Strategy<Value = Attr> {
-    ("[a-z.]{1,6}", "[a-zA-Z0-9]{1,6}").prop_map(|(key, value)| Attr { key, value })
-}
-
 fn kv(a: &Attr) -> KeyValue {
     KeyValue {
         key: a.key.clone(),
@@ -164,8 +150,8 @@ proptest! {
     /// attribute order nor request framing reaches the identity.
     #[test]
     fn identity_is_independent_of_attribute_order_and_framing(
-        resource in prop::collection::vec(nonempty_attr(), 1..4),
-        records in prop::collection::vec(prop::collection::vec(nonempty_attr(), 1..4), 2..8),
+        resource in prop::collection::vec(attr(), 1..4),
+        records in prop::collection::vec(prop::collection::vec(attr(), 1..4), 2..8),
     ) {
         let resource = unique(&resource);
         let records: Vec<Vec<Attr>> = records.iter().map(|r| unique(r)).collect();
@@ -216,17 +202,14 @@ fn one_attr_records(records: &[(&str, &str)]) -> LogsData {
 
 /// Scenario: one log record whose only identity attribute has the empty string as
 /// its value, extracted alone and again alongside a record with a non-empty value.
-/// Guarantees: the record's series id is the same either way. It is NOT today --
-/// this test is ignored because it reproduces a library defect, not a test defect.
-/// pdata's OTAP encoder drops a value column whose entries are all the type's
-/// default, so a batch of nothing but empty strings has no `str` column, and
-/// `AnyValueColumns::value_at` turns "type says Str, no str column" into
-/// `Value::Null`. Identity then depends on request framing, and an empty-string
-/// attribute collides with a null-valued one, although the golden vectors
-/// `empty_string_attr` and `null_value` give those two distinct series ids.
+/// Guarantees: the record's series id is the same either way. pdata's OTAP encoder
+/// drops a value column whose entries are all the type's default, so a batch of
+/// nothing but empty strings carries no `str` column; `AnyValueColumns::value_at`
+/// must read that as `Str("")`, the default the tag names, rather than as
+/// `Value::Null`, which would both make the identity depend on request framing and
+/// collide with the distinct identity the `null_value` golden vector pins down.
 #[test]
-#[ignore = "known library defect: an all-empty str column is decoded as Null, see the doc comment"]
-fn empty_string_attribute_identity_depends_on_request_framing() {
+fn empty_string_attribute_identity_does_not_depend_on_request_framing() {
     let cfg = cfg_with(vec!["a".into()]);
     let alone = logs_series_ids(&one_attr_records(&[("a", "")]), &cfg);
     let together = logs_series_ids(&one_attr_records(&[("a", ""), ("a", "A")]), &cfg);

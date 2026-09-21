@@ -8,6 +8,7 @@ import xxhash
 
 TAG = dict(str=1, bytes=2, int=3, double=4, bool=5, null=6, array=7, kvlist=8)
 CANONICAL_NAN = 0x7FF8000000000000
+NEGATIVE_ZERO = 0x8000000000000000
 
 
 def put(tag, payload):
@@ -33,7 +34,12 @@ def enc_value(v):
         exp = bits >> 52 & 0x7FF
         mant = bits & ((1 << 52) - 1)
         if exp == 0x7FF and mant != 0:
+            # Every NaN collapses to the canonical quiet NaN.
             bits = CANONICAL_NAN
+        elif bits == NEGATIVE_ZERO:
+            # -0.0 collapses to +0.0: OTAP cannot carry the sign of a zero, so
+            # an identity must not depend on it (spec section 4).
+            bits = 0
         return put(TAG["double"], struct.pack(">Q", bits))
     if t == "bool":
         return put(TAG["bool"], bytes([1 if v["value"] else 0]))
@@ -98,6 +104,8 @@ cases = [
     ("missing_scope", {**base_logs, "scope_name": "", "scope_version": ""}),
     ("int_zero", {**base_logs, "attrs": [kv("k", I(0))]}),
     ("neg_zero_double", {**base_logs, "attrs": [kv("k", DB(0x8000000000000000))]}),
+    # Same canonical bytes and series id as neg_zero_double: golden.rs asserts it.
+    ("pos_zero_double", {**base_logs, "attrs": [kv("k", DB(0x0000000000000000))]}),
     ("int_min", {**base_logs, "attrs": [kv("k", I(-2**63))]}),
     ("int_max", {**base_logs, "attrs": [kv("k", I(2**63 - 1))]}),
     ("int_42", {**base_logs, "attrs": [kv("k", I(42))]}),

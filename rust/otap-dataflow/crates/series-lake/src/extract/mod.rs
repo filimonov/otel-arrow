@@ -815,8 +815,12 @@ mod tests {
         let any = any_value_col(&b, "body")
             .expect("struct body")
             .expect("present");
-        // type 1 is TYPE_STR with no `str` column, so the value is null.
-        assert_eq!(any.value_at(0, 32).expect("value"), Value::Null);
+        // Type 1 is TYPE_STR with no `str` column: the tag names the variant and
+        // the missing column means the type's default, so this is `Str("")`.
+        assert_eq!(
+            any.value_at(0, 32).expect("value"),
+            Value::Str(String::new())
+        );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
     }
 }

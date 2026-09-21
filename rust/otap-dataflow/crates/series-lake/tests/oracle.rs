@@ -200,6 +200,19 @@ fn string_at(b: &RecordBatch, name: &str, row: usize) -> String {
         .to_string()
 }
 
+/// A nullable Utf8 cell, keeping null distinct from the empty string.
+///
+/// The distinction matters: pdata omits a value column whose entries are all the
+/// default, so an all-empty-body request is exactly the shape that used to decode
+/// as null. `StringArray::value` would report both as `""` and hide that.
+fn opt_string_at(b: &RecordBatch, name: &str, row: usize) -> Option<String> {
+    let a = b
+        .column_by_name(name)
+        .expect("utf8 column")
+        .as_string::<i32>();
+    a.is_valid(row).then(|| a.value(row).to_string())
+}
+
 /// Assert the values file is globally ordered when sorting is on.
 fn check_order(
     cfg: &LakeConfig,
@@ -304,13 +317,13 @@ async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(
     let (files, _dir) = round_trip(&cfg, requests).await?;
 
     // Model, computed without extraction.
-    let mut model: Vec<(Vec<u8>, Option<i64>, String)> = recs
+    let mut model: Vec<(Vec<u8>, Option<i64>, Option<String>)> = recs
         .iter()
         .map(|r| {
             (
                 logs_series_id(r.host, r.logger).to_vec(),
                 (r.time > 0).then_some(r.time as i64),
-                r.body.clone(),
+                Some(r.body.clone()),
             )
         })
         .collect();
@@ -320,13 +333,13 @@ async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(
         .collect();
 
     let values = files.get(&Dataset::LogsValues).expect("values file");
-    let mut actual: Vec<(Vec<u8>, Option<i64>, String)> = Vec::new();
+    let mut actual: Vec<(Vec<u8>, Option<i64>, Option<String>)> = Vec::new();
     for b in values {
         for row in 0..b.num_rows() {
             actual.push((
                 series_id_at(b, row),
                 time_at(b, row),
-                string_at(b, "body", row),
+                opt_string_at(b, "body", row),
             ));
         }
     }

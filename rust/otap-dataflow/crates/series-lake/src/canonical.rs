@@ -155,8 +155,16 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
         Value::Bytes(b) => put(out, TAG_BYTES, b),
         Value::Int(i) => put(out, TAG_INT, &i.to_be_bytes()),
         Value::Double(d) => {
+            // Two normalizations, both so that an identity never depends on a
+            // bit pattern the transport cannot carry: every NaN collapses to the
+            // canonical quiet NaN, and -0.0 collapses to +0.0. OTAP drops a
+            // value column whose entries are all zero, so the sign of a zero
+            // does not survive conversion and an identity that depended on it
+            // would change with request batching.
             let bits = if d.is_nan() {
                 CANONICAL_NAN
+            } else if *d == 0.0 {
+                0
             } else {
                 d.to_bits()
             };
@@ -308,6 +316,27 @@ mod tests {
             Value::Double(f64::from_bits(0xFFF8_0000_0000_0000)),
         )];
         assert_eq!(canonical_bytes(&a), canonical_bytes(&b));
+    }
+
+    /// Scenario: negative zero and positive zero as attribute values.
+    /// Guarantees: both hash identically. The sign of a zero does not survive
+    /// OTAP conversion, so it must not reach the identity (spec section 4).
+    #[test]
+    fn negative_zero_is_canonicalized() {
+        let mut a = logs_desc();
+        a.attrs = vec![("x".into(), Value::Double(-0.0))];
+        let mut b = logs_desc();
+        b.attrs = vec![("x".into(), Value::Double(0.0))];
+        assert_eq!(canonical_bytes(&a), canonical_bytes(&b));
+        assert_eq!(
+            series_id(&canonical_bytes(&a)),
+            series_id(&canonical_bytes(&b))
+        );
+
+        // Normalization is confined to zero: a neighbouring value still differs.
+        let mut c = logs_desc();
+        c.attrs = vec![("x".into(), Value::Double(f64::from_bits(1)))];
+        assert_ne!(canonical_bytes(&a), canonical_bytes(&c));
     }
 
     /// Scenario: xxh3_128 of a known input.

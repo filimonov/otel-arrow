@@ -110,7 +110,7 @@ fn golden_vectors_match() {
     let raw = include_str!("golden/canonical_v1.json");
     let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
     let vectors = doc["vectors"].as_array().expect("vectors");
-    assert_eq!(vectors.len(), 33);
+    assert_eq!(vectors.len(), 34);
     let names: Vec<&str> = vectors
         .iter()
         .map(|v| v["name"].as_str().expect("name"))
@@ -119,6 +119,8 @@ fn golden_vectors_match() {
         "nan_quiet",
         "nan_payload",
         "nan_negative",
+        "neg_zero_double",
+        "pos_zero_double",
         "metrics_exp_histogram_delta",
         "metrics_summary",
     ] {
@@ -139,6 +141,37 @@ fn golden_vectors_match() {
             "id of {name}"
         );
     }
+}
+
+/// Scenario: the vector pair that differs only in the sign of a zero double.
+/// Guarantees: -0.0 and +0.0 produce identical canonical bytes and the same
+/// series id, so the sign of a zero never reaches the identity. OTAP drops a
+/// value column whose entries are all zero, so the sign does not survive
+/// conversion and an identity that depended on it would change with request
+/// batching (spec section 4).
+#[test]
+fn zero_sign_does_not_change_identity() {
+    let raw = include_str!("golden/canonical_v1.json");
+    let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
+    let find = |n: &str| {
+        doc["vectors"]
+            .as_array()
+            .expect("v")
+            .iter()
+            .find(|v| v["name"] == n)
+            .expect("vector")
+            .clone()
+    };
+    let neg = find("neg_zero_double");
+    let pos = find("pos_zero_double");
+    // The two vectors really do start from different bit patterns.
+    assert_ne!(
+        neg["descriptor"]["attrs"][0]["value"]["bits"],
+        pos["descriptor"]["attrs"][0]["value"]["bits"],
+        "the pair must differ before normalization"
+    );
+    assert_eq!(neg["canonical_hex"], pos["canonical_hex"]);
+    assert_eq!(neg["series_id_hex"], pos["series_id_hex"]);
 }
 
 /// Scenario: the vector pair that differs only in the producer attribute.

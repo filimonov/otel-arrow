@@ -198,8 +198,8 @@ tag  type     payload
 0x01 string   UTF-8 bytes as received (no normalization)
 0x02 bytes    raw bytes
 0x03 int64    8 bytes, two's complement, big-endian
-0x04 double   8 bytes, IEEE 754 binary64, big-endian; any NaN is encoded as
-              the canonical quiet NaN 0x7FF8000000000000; -0.0 is preserved
+0x04 double   8 bytes, IEEE 754 binary64, big-endian; any NaN is normalized
+              to 0x7FF8000000000000 and -0.0 is normalized to +0.0
 0x05 bool     1 byte, 0x00 or 0x01
 0x06 null     empty payload (unset or absent value)
 0x07 array    count:u32_be ++ values*         (elements keep their order)

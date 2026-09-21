@@ -183,21 +183,6 @@ fn metrics_for(d: &serde_json::Value) -> MetricsData {
     }
 }
 
-/// Vectors whose identity is NOT preserved by the OTLP -> OTAP -> extract path today.
-///
-/// All three share one root cause: pdata's OTAP encoder omits a value column
-/// whose every entry is that type's default, and
-/// `AnyValueColumns::value_at` turns "the type tag says Str/Int/Double but the
-/// value column is absent" into `Value::Null`. So `""`, `0`, `-0.0` and an
-/// empty byte string all decode as null, which is a different canonical value
-/// -- the `null_value` vector has its own distinct series id. These vectors
-/// exist precisely to pin those distinctions down, so the deviation is a
-/// library defect, not a test artifact. The list is asserted exactly: a new
-/// deviation fails the test, and so does a deviation that disappears once the
-/// defect is fixed. `all_golden_vectors_survive_otlp_to_otap_conversion` holds
-/// the unweakened assertion.
-const KNOWN_DEVIATIONS: [&str; 3] = ["empty_string_attr", "int_zero", "neg_zero_double"];
-
 /// Run every golden vector through OTLP -> OTAP -> extract and name the ones
 /// whose `series_id` differs from the Python generator's.
 fn deviating_vectors() -> Vec<String> {
@@ -249,25 +234,9 @@ fn deviating_vectors() -> Vec<String> {
 /// Scenario: every golden vector rebuilt as OTLP, converted to OTAP by pdata and
 /// run through the real extraction path.
 /// Guarantees: the converted representation produces exactly the `series_id` the
-/// independent Python generator recorded for every vector except the three
-/// listed in `KNOWN_DEVIATIONS`, so conversion is identity preserving elsewhere
-/// (spec section 4 and 9.1). The exception list is asserted exactly, in both
-/// directions, so nothing is skipped silently.
+/// independent Python generator recorded, for every vector, so conversion is
+/// identity preserving (spec sections 4 and 9.1).
 #[test]
-fn golden_vectors_survive_otlp_to_otap_conversion() {
-    assert_eq!(
-        deviating_vectors(),
-        KNOWN_DEVIATIONS.map(str::to_string).to_vec(),
-        "the set of vectors that do not survive the round trip changed"
-    );
-}
-
-/// Scenario: the same round trip, with the assertion the spec actually requires.
-/// Guarantees: EVERY golden vector keeps its `series_id` through OTLP -> OTAP ->
-/// extract. This fails today; it is ignored because it reproduces a library
-/// defect, not a test defect. See `KNOWN_DEVIATIONS` for the mechanism.
-#[test]
-#[ignore = "known library defect: default-valued attributes decode as Null, see KNOWN_DEVIATIONS"]
 fn all_golden_vectors_survive_otlp_to_otap_conversion() {
     assert_eq!(
         deviating_vectors(),
