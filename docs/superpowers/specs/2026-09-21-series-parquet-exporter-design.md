@@ -258,6 +258,10 @@ producer_id  STRING                     required, "" when absent
 
 `producer_id` is the value of the configured resource attribute
 (`producer_id_attribute`). Header-based producer ids are a future extension.
+It is not part of the identity hash, but the README states the semantic
+requirement: it should be stable across producer restarts and unique among
+concurrently running producers (the role Thanos external labels play), because
+future compaction, deduplication and replay extensions rely on it.
 
 `series` (both signals), always sorted by `series_id`:
 
@@ -427,8 +431,14 @@ explains how to detect mixed fingerprints under one dataset.
 
 ZSTD, target row group about 64 MiB, statistics enabled, dictionary encoding
 for strings. Key/value metadata: `format_version=1`,
-`series_hash=xxh3_128/canonical_v1`, `schema_fingerprint`, `writer_id`,
-`boot_id`, `seq`, `window_start`, `window_end`.
+`series_hash=xxh3_128/canonical_v1`, `schema_fingerprint`,
+`sort_key` (comma-separated `column:asc|desc:nulls_first|nulls_last`, or
+`none`), `writer_id`, `boot_id`, `seq`, `window_start`, `window_end`,
+`row_count`, `min_time_unix_nano`, `max_time_unix_nano` (values tables).
+Together `(signal, table, partition, format_version, schema_fingerprint,
+sort_key)` defines a compaction scope: files in the same scope can later be
+merged by a k-way merge without re-sorting, files in different scopes are
+never merged together.
 
 ### 5.5 Reading the data
 
@@ -712,6 +722,12 @@ fixed-size bytes lexicographic, nulls per `nulls: first|last` (default
 `last`). Descriptor re-emission is tied to the `date/hour` partition and has
 no separate interval.
 
+Sort key guidance for the README: `series_id, time_unix_nano` is a good
+locality and compression default. When the dominant queries filter on a
+denormalized column (`service_name`, `environment`), placing those columns
+first (`service_name, series_id, time_unix_nano`) gives Parquet row-group
+statistics real pruning power, at some cost in per-series locality.
+
 Example pipeline in `configs/series-parquet-s3.yaml`: `receiver:otlp`
 (`wait_for_result: true`, `timeout: 180s`) connected directly to
 `exporter:series_parquet`, with an explicit `core_allocation`.
@@ -938,7 +954,15 @@ the buffer-removal point.
   and the storage conventions; spans are not forced into the "series" shape.
 - Exponential histograms and summaries (rejected by default in v1) and
   exemplars (dropped in v1).
-- Second-level file coalescing for low-volume deployments.
+- A separate stateless `series-lake-compactor` batch job that merges
+  small files within one compaction scope (section 5.4) into larger ones,
+  with a Quickwit-style policy (target size, max merge factor, max merge
+  rounds, maturation age after which a partition is never rewritten). The
+  writer stays unaware of it; the current layout, metadata and sort keys
+  are designed so that it needs nothing from the writer.
+- Optional discovery metadata (a per-hour file index) built asynchronously if
+  object listing ever becomes the bottleneck; never a correctness
+  dependency.
 - Producer id from transport headers.
 - Idempotent replay based on producer batch ids.
 - Commit manifests or a commit index for block-atomic reads (may return as an
