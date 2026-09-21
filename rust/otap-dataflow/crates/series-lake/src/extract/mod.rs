@@ -263,11 +263,9 @@ pub(crate) enum Col {
     Fixed(Option<Vec<u8>>),
     /// Map<Utf8, Utf8>.
     Map(Vec<(String, Option<String>)>),
-    /// List<Int64>. Constructed by the histogram dataset (task 7).
-    #[allow(dead_code)]
+    /// List<Int64>. Constructed by the histogram dataset.
     ListI64(Vec<i64>),
-    /// List<Float64>. Constructed by the histogram dataset (task 7).
-    #[allow(dead_code)]
+    /// List<Float64>. Constructed by the histogram dataset.
     ListF64(Vec<f64>),
     /// Binary.
     Bytes(Vec<u8>),
