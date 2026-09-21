@@ -8,7 +8,9 @@
 
 pub mod attrs;
 pub mod canonical;
+pub mod config;
 pub mod error;
+pub mod schema;
 pub mod value;
 
 pub use error::{Error, RefuseReason, Result};
