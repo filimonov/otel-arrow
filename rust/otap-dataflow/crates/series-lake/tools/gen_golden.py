@@ -78,6 +78,9 @@ def kv(key, value):
 
 S = lambda s: {"type": "str", "value": s}
 I = lambda i: {"type": "int", "value": i}
+# D takes a finite Python float; non-finite doubles must use DB(bits) so that
+# json.dump(allow_nan=False) never emits bare Infinity/NaN, which serde_json rejects.
+D = lambda f: {"type": "double", "value": f}
 DB = lambda bits: {"type": "double", "bits": bits}
 B = lambda hexs: {"type": "bytes", "value": hexs}
 BOOL = lambda b: {"type": "bool", "value": b}
@@ -131,6 +134,7 @@ for name, d in cases:
     b = canonical(d)
     vectors.append({"name": name, "descriptor": d, "canonical_hex": b.hex(),
                     "series_id_hex": xxhash.xxh3_128_hexdigest(b)})
-with open(sys.argv[1], "w") as f:
-    json.dump({"format": "canonical_v1", "vectors": vectors}, f, indent=1, ensure_ascii=True, allow_nan=False)
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump({"format": "canonical_v1", "vectors": vectors}, fh,
+              indent=1, ensure_ascii=False, allow_nan=False)
 print(f"wrote {len(vectors)} vectors")

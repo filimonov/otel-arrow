@@ -100,8 +100,12 @@ pub struct MetricDescriptor {
 /// Everything that identifies a series, plus `description`.
 ///
 /// Attribute lists must be sorted by raw key bytes with unique keys
-/// (see [`crate::value::sort_kvlist`]). `metric` must be `Some` if and only
-/// if `signal` is [`Signal::Metrics`].
+/// (see [`crate::value::sort_kvlist`]).
+///
+/// Invariant: `metric.is_some()` exactly when `signal == Signal::Metrics`.
+/// The canonical encoder gates the metric block on `metric.is_some()`, while
+/// the independent Python generator gates it on `signal == "metrics"`; the
+/// invariant makes the two gates the same condition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Descriptor {
     /// Signal.
@@ -182,14 +186,12 @@ fn encode_kvlist(out: &mut Vec<u8>, entries: &[(String, Value)]) {
 }
 
 /// Build the canonical identity bytes of a descriptor.
-///
-/// `debug_assert!`s that `d.metric.is_some()` iff `d.signal == Signal::Metrics`
-/// (see [`Descriptor`]).
 #[must_use]
 pub fn canonical_bytes(d: &Descriptor) -> Vec<u8> {
-    debug_assert!(
-        d.metric.is_some() == (d.signal == Signal::Metrics),
-        "metric must be Some iff signal is Metrics"
+    debug_assert_eq!(
+        d.metric.is_some(),
+        d.signal == Signal::Metrics,
+        "metric fields are present exactly for the metrics signal",
     );
     let mut out = Vec::with_capacity(256);
     put_str(&mut out, "OTEL-SERIES/1");
@@ -314,5 +316,31 @@ mod tests {
     fn series_id_is_xxh3_128_big_endian() {
         let id = series_id(b"");
         assert_eq!(hex(&id), "99aa06d3014798d86001c324468d497f");
+    }
+
+    /// Scenario: a logs descriptor and a metrics descriptor built the way extraction builds them.
+    /// Guarantees: `metric.is_some()` holds exactly for the metrics signal, so the Rust gate
+    /// (`metric.is_some()`) and the Python generator gate (`signal == "metrics"`) agree.
+    #[test]
+    fn metric_block_is_gated_on_the_metrics_signal() {
+        let logs = logs_desc();
+        assert_eq!(logs.signal, Signal::Logs);
+        assert!(logs.metric.is_none());
+        let _ = canonical_bytes(&logs);
+
+        let metrics = Descriptor {
+            signal: Signal::Metrics,
+            metric: Some(MetricDescriptor {
+                name: "cpu.usage".into(),
+                unit: "s".into(),
+                kind: MetricKind::Gauge,
+                temporality: Temporality::Unspecified,
+                is_monotonic: false,
+                description: String::new(),
+            }),
+            ..logs_desc()
+        };
+        assert_eq!(metrics.metric.is_some(), metrics.signal == Signal::Metrics);
+        let _ = canonical_bytes(&metrics);
     }
 }
