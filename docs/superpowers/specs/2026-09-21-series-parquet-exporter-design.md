@@ -895,8 +895,9 @@ grows with the number of blocks per hour.
 
 Example pipeline in `configs/series-parquet-s3.yaml`: `receiver:otlp`
 (`wait_for_result: true`, `timeout: 180s`) connected directly to
-`exporter:series_parquet`, with an explicit `core_allocation` and a
-pipeline shutdown deadline satisfying section 7.1.
+`exporter:series_parquet`, with an explicit `core_allocation`; the shutdown
+deadline of section 7.1 is passed through the admin shutdown API timeout in
+v1 (see section 6.5).
 
 ### 7.5 Telemetry
 
