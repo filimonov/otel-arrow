@@ -27,7 +27,7 @@ use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signa
 use crate::config::{LakeConfig, UnsupportedPolicy};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, denorm_columns};
-use crate::value::Value;
+use crate::value::{DecodeLimits, Value};
 
 /// Per-metric fields read once from the `UnivariateMetrics` batch.
 ///
@@ -328,9 +328,9 @@ pub(crate) fn extract_metrics(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let depth = cfg.ingress.max_nesting_depth;
-    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, depth)?;
-    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, depth)?;
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
+    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits)?;
+    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits)?;
     let metrics = metric_rows(records, cfg)?;
     let mut c = Common {
         cfg,
@@ -379,7 +379,7 @@ pub(crate) fn extract_metrics(
 
     // Number points.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
-        let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, depth)?;
+        let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, limits)?;
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let pid = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -440,7 +440,7 @@ pub(crate) fn extract_metrics(
 
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
-        let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, depth)?;
+        let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, limits)?;
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let pid = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -1092,7 +1092,7 @@ mod tests {
         let table = attr_table(
             &records,
             ArrowPayloadType::NumberDpAttrs,
-            cfg.ingress.max_nesting_depth,
+            DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes),
         )
         .expect("attrs");
         assert_eq!(table.get(0).len(), 1);

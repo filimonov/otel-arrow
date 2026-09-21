@@ -4,7 +4,7 @@
 //! Fuzz-style property tests for the canonical encoder and CBOR decoder (spec section 9.3).
 
 use otel_arrow_dfe_series_lake::canonical::{Descriptor, Signal, canonical_bytes, series_id};
-use otel_arrow_dfe_series_lake::value::{Value, decode_cbor, sort_kvlist};
+use otel_arrow_dfe_series_lake::value::{DecodeLimits, Value, decode_cbor, sort_kvlist};
 use proptest::prelude::*;
 
 fn value_strategy() -> impl Strategy<Value = Value> {
@@ -80,7 +80,7 @@ proptest! {
     fn cbor_round_trip_never_panics(v in value_strategy()) {
         let mut buf = Vec::new();
         ciborium::into_writer(&to_cbor(&v), &mut buf).expect("encode");
-        let decoded = decode_cbor(&buf, 32).expect("decode");
+        let decoded = decode_cbor(&buf, DecodeLimits::new(32, usize::MAX)).expect("decode");
         let a = canonical_bytes(&desc(vec![("k".into(), canon_nan(&v))]));
         let b = canonical_bytes(&desc(vec![("k".into(), canon_nan(&decoded))]));
         prop_assert_eq!(a, b);
@@ -96,19 +96,19 @@ proptest! {
         v in value_strategy(),
         cut in 0usize..64,
     ) {
-        if let Ok(value) = decode_cbor(&junk, 32) {
+        if let Ok(value) = decode_cbor(&junk, DecodeLimits::new(32, usize::MAX)) {
             let _ = canonical_bytes(&desc(vec![("k".into(), value)]));
         }
 
         let mut buf = Vec::new();
         ciborium::into_writer(&to_cbor(&v), &mut buf).expect("encode");
         let truncated = &buf[..cut.min(buf.len())];
-        if let Ok(value) = decode_cbor(truncated, 32) {
+        if let Ok(value) = decode_cbor(truncated, DecodeLimits::new(32, usize::MAX)) {
             let _ = canonical_bytes(&desc(vec![("k".into(), value)]));
         }
 
         // A depth budget of zero refuses every container instead of recursing.
-        let _ = decode_cbor(&buf, 0);
+        let _ = decode_cbor(&buf, DecodeLimits::new(0, usize::MAX));
     }
 
     /// Scenario: an attribute list of at least two distinct keys, handed to the encoder

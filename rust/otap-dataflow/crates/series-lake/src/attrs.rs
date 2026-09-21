@@ -17,7 +17,7 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use crate::error::{Error, Result};
-use crate::value::{Value, decode_cbor, sort_kvlist, value_bytes};
+use crate::value::{DecodeLimits, Value, decode_cbor, sort_kvlist, value_bytes};
 
 /// Attributes of one OTAP attribute batch, grouped by parent id.
 #[derive(Debug, Default)]
@@ -95,7 +95,7 @@ impl AnyValueColumns {
     /// # Errors
     /// Returns [`Error::Refused`] for an unknown type tag, for a map or slice
     /// whose `ser` payload is missing, and for a malformed CBOR payload.
-    pub(crate) fn value_at(&self, row: usize, max_depth: usize) -> Result<Value> {
+    pub(crate) fn value_at(&self, row: usize, limits: DecodeLimits) -> Result<Value> {
         if !self.types.is_valid(row) {
             return Ok(Value::Null);
         }
@@ -131,9 +131,7 @@ impl AnyValueColumns {
                 _ => Value::Bytes(Vec::new()),
             },
             AttributeValueType::Map | AttributeValueType::Slice => match &self.sers {
-                Some(a) if a.is_valid(row) => {
-                    decode_cbor(a.as_binary::<i32>().value(row), max_depth)?
-                }
+                Some(a) if a.is_valid(row) => decode_cbor(a.as_binary::<i32>().value(row), limits)?,
                 _ => {
                     return Err(Error::invalid(
                         "map or slice attribute without a ser payload",
@@ -155,7 +153,7 @@ impl AttrTable {
     /// Refuses the batch when `parent_id` is missing or null, a required
     /// column is absent, an attribute type or CBOR payload is malformed, or
     /// a parent has a duplicate attribute key.
-    pub fn from_batch(batch: &RecordBatch, max_depth: usize) -> Result<Self> {
+    pub fn from_batch(batch: &RecordBatch, limits: DecodeLimits) -> Result<Self> {
         let parent_ids = read_parent_ids(batch)?;
         let keys = required(batch, ATTRIBUTE_KEY, &DataType::Utf8)?;
         let keys = keys.as_string::<i32>();
@@ -164,7 +162,7 @@ impl AttrTable {
         let mut groups: HashMap<u32, Vec<(String, Value)>> = HashMap::new();
         for (row, &parent_id) in parent_ids.iter().enumerate() {
             let key = keys.value(row).to_string();
-            let value = any.value_at(row, max_depth)?;
+            let value = any.value_at(row, limits)?;
             groups.entry(parent_id).or_default().push((key, value));
         }
         for list in groups.values_mut() {
@@ -228,6 +226,11 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    /// Depth 32, no cell-size bound: the size limit has its own tests.
+    fn limits() -> DecodeLimits {
+        DecodeLimits::new(32, usize::MAX)
+    }
+
     fn batch() -> RecordBatch {
         let mut ser = Vec::new();
         ciborium::into_writer(
@@ -265,7 +268,7 @@ mod tests {
     /// Guarantees: each parent gets a sorted, typed attribute list; absent parents are empty.
     #[test]
     fn groups_and_sorts_by_parent() {
-        let t = AttrTable::from_batch(&batch(), 32).expect("table");
+        let t = AttrTable::from_batch(&batch(), limits()).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -301,7 +304,7 @@ mod tests {
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
         assert!(matches!(
-            AttrTable::from_batch(&b, 32),
+            AttrTable::from_batch(&b, limits()),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
     }
@@ -324,7 +327,7 @@ mod tests {
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
         assert!(matches!(
-            AttrTable::from_batch(&b, 32),
+            AttrTable::from_batch(&b, limits()),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
     }
@@ -358,7 +361,7 @@ mod tests {
     fn absent_value_column_decodes_as_the_type_default() {
         // Tags: str, int, double, bool, bytes, empty.
         let b = batch_without_value_columns(&[1, 2, 3, 4, 7, 0]);
-        let t = AttrTable::from_batch(&b, 32).expect("table");
+        let t = AttrTable::from_batch(&b, limits()).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -392,7 +395,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![None::<i64>, None])),
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
-        let t = AttrTable::from_batch(&b, 32).expect("table");
+        let t = AttrTable::from_batch(&b, limits()).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -411,7 +414,7 @@ mod tests {
         for tag in [5u8, 6] {
             let b = batch_without_value_columns(&[tag]);
             assert!(matches!(
-                AttrTable::from_batch(&b, 32),
+                AttrTable::from_batch(&b, limits()),
                 Err(Error::Refused(RefuseReason::Invalid(_)))
             ));
         }

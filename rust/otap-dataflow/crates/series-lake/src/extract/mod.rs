@@ -27,7 +27,7 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
-use crate::value::{Value, map_string, value_bytes};
+use crate::value::{DecodeLimits, Value, map_string, value_bytes};
 
 /// The single "cast this batch column to a plain type" helper of the crate.
 ///
@@ -595,10 +595,10 @@ pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<An
 pub(crate) fn attr_table(
     records: &OtapArrowRecords,
     pt: ArrowPayloadType,
-    max_depth: usize,
+    limits: DecodeLimits,
 ) -> Result<AttrTable> {
     match records.get(pt) {
-        Some(b) => AttrTable::from_batch(b, max_depth),
+        Some(b) => AttrTable::from_batch(b, limits),
         None => Ok(AttrTable::default()),
     }
 }
@@ -898,7 +898,8 @@ mod tests {
         // Type 1 is TYPE_STR with no `str` column: the tag names the variant and
         // the missing column means the type's default, so this is `Str("")`.
         assert_eq!(
-            any.value_at(0, 32).expect("value"),
+            any.value_at(0, DecodeLimits::new(32, usize::MAX))
+                .expect("value"),
             Value::Str(String::new())
         );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
@@ -979,9 +980,14 @@ mod tests {
 
         let any = any_value_col(&b, "body").expect("body").expect("present");
         assert_eq!(
-            any.value_at(0, 32).expect("row 0"),
+            any.value_at(0, DecodeLimits::new(32, usize::MAX))
+                .expect("row 0"),
             Value::Str("kept".into())
         );
-        assert_eq!(any.value_at(1, 32).expect("row 1"), Value::Null);
+        assert_eq!(
+            any.value_at(1, DecodeLimits::new(32, usize::MAX))
+                .expect("row 1"),
+            Value::Null
+        );
     }
 }

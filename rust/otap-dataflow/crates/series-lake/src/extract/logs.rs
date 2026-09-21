@@ -23,7 +23,7 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
-use crate::value::{Value, body_string};
+use crate::value::{DecodeLimits, Value, body_string};
 
 /// Memo key for a logs series.
 ///
@@ -47,7 +47,7 @@ pub(crate) fn extract_logs(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let depth = cfg.ingress.max_nesting_depth;
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
     let mut stats = ExtractStats::default();
     let Some(logs) = records.get(ArrowPayloadType::Logs) else {
         return Ok(Extracted {
@@ -58,9 +58,9 @@ pub(crate) fn extract_logs(
             stats,
         });
     };
-    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, depth)?;
-    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, depth)?;
-    let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, depth)?;
+    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits)?;
+    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits)?;
+    let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, limits)?;
 
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let time = plain(logs, TIME_UNIX_NANO, &ts_ns)?;
@@ -149,7 +149,7 @@ pub(crate) fn extract_logs(
         let (t_ns, t_us) = timestamp_pair(i64_at(&time, row), &mut stats);
         let (o_ns, o_us) = timestamp_pair(i64_at(&observed, row), &mut stats);
         let body_value = match &body {
-            Some(b) => b.value_at(row, depth)?,
+            Some(b) => b.value_at(row, limits)?,
             None => Value::Null,
         };
         let body_str = body_string(&body_value);

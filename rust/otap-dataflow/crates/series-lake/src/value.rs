@@ -4,7 +4,27 @@
 //! Owned attribute value tree, CBOR decoding of the OTAP `ser` column and the
 //! `render_v1` storage rendering (spec section 5.1).
 
-use crate::error::{Error, Result};
+use crate::error::{Error, RefuseReason, Result};
+
+/// Limits applied while decoding one CBOR `ser` cell (spec section 5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Maximum nesting depth of the decoded value.
+    pub max_depth: usize,
+    /// Maximum encoded byte length of one `ser` cell.
+    pub max_cell_bytes: usize,
+}
+
+impl DecodeLimits {
+    /// Limits from a depth and an encoded-cell byte bound.
+    #[must_use]
+    pub fn new(max_depth: usize, max_cell_bytes: usize) -> Self {
+        Self {
+            max_depth,
+            max_cell_bytes,
+        }
+    }
+}
 
 /// An OTLP AnyValue in owned form.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,11 +50,30 @@ pub enum Value {
 /// Decode a CBOR blob from the OTAP `ser` column into a [`Value`].
 ///
 /// Kvlist keys are sorted by raw bytes; duplicate keys and nesting deeper
-/// than `max_depth` are refused as invalid content.
-pub fn decode_cbor(bytes: &[u8], max_depth: usize) -> Result<Value> {
-    let raw: ciborium::Value =
-        ciborium::from_reader(bytes).map_err(|e| Error::invalid(format!("cbor decode: {e}")))?;
-    convert(raw, max_depth)
+/// than `limits.max_depth` are refused as invalid content.
+///
+/// Both limits are applied before the work they bound. An encoded cell longer
+/// than `limits.max_cell_bytes` is refused without being decoded at all: its
+/// decoded tree is a multiple of the encoding, and a cell that cannot fit a row
+/// must never be expanded into one first. The depth is handed to ciborium's own
+/// parser, whose default cap is a fixed 256 and does not know this crate's
+/// configuration, so a deeply nested payload is refused during parsing rather
+/// than after its whole tree has been allocated.
+///
+/// # Errors
+/// Refuses an oversized cell as `RequestTooLarge`, and a malformed payload,
+/// a duplicate key or excessive nesting as invalid content.
+pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
+    if bytes.len() > limits.max_cell_bytes {
+        return Err(Error::Refused(RefuseReason::RequestTooLarge));
+    }
+    // One recursion level per container, plus one so that a payload exactly at
+    // `max_depth` is settled by the conversion below rather than by the parser:
+    // `convert` is the definition of this crate's depth rule.
+    let recursion = limits.max_depth.saturating_add(1);
+    let raw: ciborium::Value = ciborium::de::from_reader_with_recursion_limit(bytes, recursion)
+        .map_err(|e| Error::invalid(format!("cbor decode: {e}")))?;
+    convert(raw, limits.max_depth)
 }
 
 fn convert(raw: ciborium::Value, depth_left: usize) -> Result<Value> {
@@ -175,7 +214,7 @@ mod tests {
             ),
         ]);
         ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
-        let got = decode_cbor(&buf, 32).expect("decode");
+        let got = decode_cbor(&buf, DecodeLimits::new(32, usize::MAX)).expect("decode");
         assert_eq!(
             got,
             Value::KvList(vec![
@@ -186,6 +225,25 @@ mod tests {
                 ("b".into(), Value::Int(2)),
             ])
         );
+    }
+
+    /// Scenario: an encoded `ser` cell longer than `max_cell_bytes`, holding a
+    /// payload that is otherwise perfectly valid CBOR.
+    /// Guarantees: the cell is refused as too large before it is decoded, so a
+    /// cell that could never fit a row is never expanded into a value tree.
+    #[test]
+    fn decode_cbor_refuses_an_oversized_cell_before_decoding() {
+        use crate::error::{Error, RefuseReason};
+        let mut buf = Vec::new();
+        let v = ciborium::Value::Array(vec![ciborium::Value::Bytes(vec![0u8; 4096])]);
+        ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
+        assert!(buf.len() > 4096);
+        assert!(matches!(
+            decode_cbor(&buf, DecodeLimits::new(32, 1024)),
+            Err(Error::Refused(RefuseReason::RequestTooLarge))
+        ));
+        // The same payload decodes once the cell fits the limit.
+        assert!(decode_cbor(&buf, DecodeLimits::new(32, buf.len())).is_ok());
     }
 
     /// Scenario: a CBOR map repeats a key.
@@ -206,7 +264,7 @@ mod tests {
         ]);
         ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
         assert!(matches!(
-            decode_cbor(&buf, 32),
+            decode_cbor(&buf, DecodeLimits::new(32, usize::MAX)),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
     }
@@ -221,8 +279,8 @@ mod tests {
         }
         let mut buf = Vec::new();
         ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
-        assert!(decode_cbor(&buf, 3).is_err());
-        assert!(decode_cbor(&buf, 5).is_ok());
+        assert!(decode_cbor(&buf, DecodeLimits::new(3, usize::MAX)).is_err());
+        assert!(decode_cbor(&buf, DecodeLimits::new(5, usize::MAX)).is_ok());
     }
 
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.
