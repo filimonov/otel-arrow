@@ -60,6 +60,11 @@ pub enum Value {
 /// configuration, so a deeply nested payload is refused during parsing rather
 /// than after its whole tree has been allocated.
 ///
+/// There is no separate node budget: the decoded tree is bounded by the cell
+/// cap, because every CBOR item costs at least one encoded byte and expands to
+/// at most a small constant of decoded bytes, so a tree from a cell of at most
+/// `max_cell_bytes` is at most that many bytes times that constant.
+///
 /// # Errors
 /// Refuses an oversized cell as `RequestTooLarge`, and a malformed payload,
 /// a duplicate key or excessive nesting as invalid content.

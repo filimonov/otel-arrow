@@ -58,7 +58,13 @@ names and file metadata and is never part of the identity.
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload.
 - `merge_chunk_bytes` is an average-based approximation: a chunk of rows
-  much wider than the table's average overshoots it.
+  much wider than the table's average overshoots it, and with sorting
+  disabled it is ignored altogether -- runs go to the writer as they are,
+  each at most `run_target_bytes`.
+- A histogram `sum` of zero is stored as null when no point of the same
+  request has a non-zero sum: the OTAP transport omits a column whose every
+  entry is the type default, so an absent sum and a zero sum arrive the same
+  way. The same holds for any optional metrics column.
 - Sealing a block's series table holds that block's whole descriptor volume
   and the Arrow batch built from it at the same time.
 - One Parquet row group can start several multipart upload parts at once

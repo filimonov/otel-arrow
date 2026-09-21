@@ -427,6 +427,13 @@ what it read.
 - Merge chunk sizing is an approximation from an average row width, so a chunk
   whose rows are much wider than the table's average overshoots
   `merge_chunk_bytes`.
+- With sorting disabled, `merge_chunk_bytes` is ignored entirely: the buffered
+  runs are handed to the writer as they are, each at most `run_target_bytes`.
+- A histogram `sum` of exactly zero cannot be told apart from an absent sum
+  after an OTAP round trip: the transport omits a column whose every entry in
+  a request is the type default, so when no point of a request carries a
+  non-zero sum, every one of those sums is stored as null. The same holds for
+  any optional metrics column under the same condition.
 - Peak transient memory when a block's series table is sealed is proportional
   to the block's whole descriptor volume, not to one run: a dataset's
   descriptor rows and the Arrow batch built from them are resident together.
