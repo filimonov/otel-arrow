@@ -395,6 +395,11 @@ what it read.
 
 ## Limitations of version 1
 
+Descriptors become bounded series runs during request admission. Final sealing
+replaces only emitted_at with the block timestamp, sharing every other column;
+old/new timestamp storage is at most eight additional bytes per series row.
+The first successful seal timestamp remains fixed across flush retries.
+
 - Exponential histograms and summaries are not stored. Depending on the
   `unsupported` policy the whole request is rejected, or the points are
   dropped and counted one per dropped data point row (`dropped_unsupported`).
@@ -434,9 +439,6 @@ what it read.
   a request is the type default, so when no point of a request carries a
   non-zero sum, every one of those sums is stored as null. The same holds for
   any optional metrics column under the same condition.
-- Peak transient memory when a block's series table is sealed is proportional
-  to the block's whole descriptor volume, not to one run: a dataset's
-  descriptor rows and the Arrow batch built from them are resident together.
 - A single Parquet row group can start several multipart upload parts at once,
   regardless of `upload.concurrency`: the writer hands the object store one
   whole encoded row group, and every part that fits in the buffer is launched

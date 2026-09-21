@@ -332,10 +332,11 @@ impl Sink {
         block: &Block<T>,
         cancel: &CancellationToken,
     ) -> Result<FlushReport> {
-        // Descriptor rows only become Arrow rows in the series table when
-        // `seal` stamps them, so writing an unsealed block would silently drop
-        // every series row. This is a runtime check, not a debug assertion: the
-        // rows would be lost just as silently in a release build.
+        // Series rows exist from admission onwards, but they carry a
+        // placeholder `emitted_at` of zero until the block's stamp transaction
+        // commits. Writing an unsealed block would therefore publish unstamped
+        // data. This is a runtime check, not a debug assertion: the files would
+        // be just as wrong in a release build.
         if !block.is_sealed() {
             return Err(Error::invalid("unsealed block"));
         }
@@ -1036,9 +1037,10 @@ mod tests {
     }
 
     /// Scenario: a block that was never sealed.
-    /// Guarantees: the sink refuses to write a block whose descriptor rows have not
-    /// been materialized, which would otherwise silently drop every series row.
-    /// The refusal is an error in every build profile, not a debug assertion.
+    /// Guarantees: the sink refuses to write a block whose series rows still
+    /// carry the placeholder `emitted_at` of zero, which would otherwise publish
+    /// unstamped data. The refusal is an error in every build profile, not a
+    /// debug assertion.
     #[tokio::test]
     async fn write_block_rejects_an_unsealed_block() {
         let dir = tempfile::tempdir().expect("tmp");

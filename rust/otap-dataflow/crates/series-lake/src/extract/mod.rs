@@ -63,6 +63,20 @@ pub struct DescriptorRow {
     pub approx_bytes: usize,
 }
 
+impl DescriptorRow {
+    /// Conservative Arrow series-row estimate, including stamp-swap headroom.
+    #[must_use]
+    pub fn series_row_bytes(&self) -> usize {
+        let decoded = kv_bytes(&self.descriptor.resource_attrs)
+            + kv_bytes(&self.descriptor.scope_attrs)
+            + kv_bytes(&self.descriptor.attrs);
+        let columns = 10 + usize::from(self.descriptor.metric.is_some()) * 6 + self.denorm.len();
+        // Builder growth, offsets and validity are charged here; decoded
+        // attribute trees die at admission and are not charged to the block.
+        2 * (self.approx_bytes.saturating_sub(decoded) + columns * 64) + 8
+    }
+}
+
 /// Counters produced by extraction.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ExtractStats {
@@ -494,8 +508,8 @@ pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
 ///
 /// Measured by rendering, because the expansion is serde_json's escaping and
 /// `render_v1`'s hex encoding and cannot be predicted from the value tree. Used
-/// where the cell itself is built later (a descriptor row becomes a `series`
-/// row only at seal time) and only its size is needed now.
+/// where the cell itself is built later (a descriptor is rendered when its
+/// request is admitted) and only its size is needed now.
 pub(crate) fn rendered_kv_bytes(list: &[(String, Value)]) -> usize {
     list.iter()
         .map(|(k, v)| k.len() + 24 + map_string(v).map_or(0, |s| s.len()))
@@ -758,7 +772,20 @@ pub fn series_batch(
             append(b, c)?;
         }
     }
-    let arrays: Vec<ArrayRef> = builders.iter_mut().map(finish).collect();
+    // The builders start with room for 1024 rows. A request-sized batch is
+    // usually far smaller, so release the unused capacity here: the block
+    // charges what it retains, and a run is measured against `run_target_bytes`
+    // straight after this call. `Array::shrink_to_fit` on an `ArrayRef` shrinks
+    // through `Arc::get_mut`, which succeeds because `finish` has just produced
+    // a uniquely owned array.
+    let arrays: Vec<ArrayRef> = builders
+        .iter_mut()
+        .map(|builder| {
+            let mut array = finish(builder);
+            array.shrink_to_fit();
+            array
+        })
+        .collect();
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
@@ -791,10 +818,10 @@ pub(crate) fn descriptor_row(
     // series row: series_id + identity_bytes + emitted_at + the four schema/scope
     // strings + three attribute maps + the metric block + denormalized columns.
     //
-    // Each attribute list is counted twice on purpose: the `DescriptorRow` keeps
-    // the decoded value tree until the block seals (`kv_bytes`), and the `series`
-    // row it becomes holds the rendered map cell (`rendered_kv_bytes`), which
-    // hex encoding and JSON escaping can make much larger than the tree.
+    // Each attribute list is counted twice on purpose: extraction temporarily
+    // retains both the decoded tree and its future rendered series row;
+    // admission drops the tree. The rendered map cell (`rendered_kv_bytes`) can
+    // be much larger than the tree, through hex encoding and JSON escaping.
     let approx_bytes = 16
         + identity_bytes.len()
         + 8

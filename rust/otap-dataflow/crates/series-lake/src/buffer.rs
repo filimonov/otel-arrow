@@ -4,8 +4,11 @@
 //! Sorted run buffers and the ACTIVE/FLUSHING block (spec sections 6.1 to 6.3).
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
+use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 
@@ -143,6 +146,94 @@ impl SortedTableBuffer {
         &self.spec
     }
 
+    /// Append request-local descriptors as independently bounded sorted series runs.
+    ///
+    /// A request may produce several runs; each is built, sorted and measured on
+    /// its own, so at most one candidate run plus the sort's own scratch is live
+    /// at a time. A candidate whose measured size overshoots `run_target` is
+    /// halved and rebuilt. No block-sized series batch is ever constructed.
+    ///
+    /// A single row that is itself larger than `run_target` becomes its own
+    /// oversized run rather than a refusal, exactly as `append` does for a
+    /// values batch: `run_target_bytes` is a packing target, not an admission
+    /// limit, and the row was already checked against `max_row_bytes` during
+    /// extraction and against `max_block_bytes` during reservation. A validated
+    /// configuration cannot reach this case at all, because `validate` requires
+    /// `max_row_bytes <= run_target_bytes / 4`.
+    ///
+    /// # Errors
+    /// Propagates a series-batch or sort failure.
+    fn append_series(&mut self, rows: &[&DescriptorRow], cfg: &LakeConfig) -> Result<()> {
+        let mut start = 0;
+        while start < rows.len() {
+            let mut end = start;
+            let mut estimated = 0usize;
+            while end < rows.len() {
+                let next = rows[end].series_row_bytes();
+                if end > start && estimated.saturating_add(next) > self.run_target {
+                    break;
+                }
+                estimated = estimated.saturating_add(next);
+                end += 1;
+                if estimated >= self.run_target {
+                    break;
+                }
+            }
+            let sorted = loop {
+                let batch = series_batch(&rows[start..end], 0, self.dataset, cfg)?;
+                let sorted = sort_batch(&batch, &self.spec)?;
+                drop(batch);
+                let bytes = record_batch_pinned_bytes(&sorted, &mut CountedAllocations::default());
+                if bytes <= self.run_target || end == start + 1 {
+                    break sorted;
+                }
+                drop(sorted);
+                end = start + (end - start) / 2;
+            };
+            self.rows += sorted.num_rows();
+            self.runs.push(sorted);
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// Prepare every stamp replacement without mutating the retained batches.
+    ///
+    /// Returns the replacement runs and building batches. Every fallible step
+    /// happens here, so a caller that gets an error has a buffer that is still
+    /// exactly what it was.
+    ///
+    /// # Errors
+    /// Rejects a series batch whose `emitted_at` is not a UTC microsecond
+    /// timestamp, and propagates an Arrow failure from rebuilding the batch.
+    fn stamped(&self, stamp: i64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+        let replace = |batch: &RecordBatch| -> Result<RecordBatch> {
+            let schema = batch.schema();
+            let index = schema.index_of("emitted_at")?;
+            let expected = DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")));
+            if schema.field(index).data_type() != &expected {
+                return Err(Error::invalid(
+                    "series emitted_at must be a UTC microsecond timestamp",
+                ));
+            }
+            // One i64 per row, wrapped in the timestamp type without a cast or a
+            // copy: every other column of the batch is shared with the original.
+            let ints = Int64Array::from(vec![stamp; batch.num_rows()]);
+            let values =
+                TimestampMicrosecondArray::new(ints.values().clone(), None).with_timezone("UTC");
+            let mut columns = batch.columns().to_vec();
+            columns[index] = Arc::new(values) as ArrayRef;
+            Ok(RecordBatch::try_new(schema, columns)?)
+        };
+        let runs = self.runs.iter().map(replace).collect::<Result<Vec<_>>>()?;
+        let building = self
+            .building
+            .iter()
+            .map(replace)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((runs, building))
+    }
+
     /// Building batches then sealed runs, for bounded snapshot copies.
     pub fn iter_snapshots(&self) -> impl Iterator<Item = &RecordBatch> {
         self.building.iter().chain(self.runs.iter())
@@ -175,8 +266,6 @@ pub struct Block<T> {
     pub bytes: usize,
     /// Request tokens.
     pub requests: Vec<T>,
-    /// Descriptor rows waiting for the seal timestamp, keyed by series dataset.
-    pending_descriptors: BTreeMap<Dataset, Vec<DescriptorRow>>,
     token_bytes: usize,
     emitted_at_us: Option<i64>,
     cfg: LakeConfig,
@@ -194,7 +283,6 @@ impl<T> Block<T> {
             pending_series: HashSet::new(),
             bytes: 0,
             requests: Vec::new(),
-            pending_descriptors: BTreeMap::new(),
             token_bytes: 0,
             emitted_at_us: None,
             cfg: cfg.clone(),
@@ -242,7 +330,7 @@ impl<T> Block<T> {
             let committed_here = cache.is_committed(&d.series_id, self.partition);
             if !committed_here && !self.pending_series.contains(&d.series_id) {
                 new_series.push(i);
-                bytes += d.approx_bytes + limits.pending_series_entry_bytes;
+                bytes += d.series_row_bytes() + limits.pending_series_entry_bytes;
             }
         }
         if bytes > limits.max_block_bytes {
@@ -264,26 +352,33 @@ impl<T> Block<T> {
         })
     }
 
-    /// Admit a reserved request (spec section 6.2 step 6).
+    /// Admit a reserved request, materializing series rows with a zero stamp
+    /// (spec section 6.2 step 6).
     ///
-    /// Descriptor rows are held, not written: `seal` stamps them with the block's
-    /// `emitted_at` and builds the `series` batch then.
+    /// Descriptor rows become Arrow series rows here, in bounded sorted runs,
+    /// with `emitted_at` left at zero until the block seals. Values batches are
+    /// sorted into runs here as well, so that sealing never has to sort or copy
+    /// a non-stamp column.
     ///
-    /// A sealed block takes nothing more. Its `emitted_at` is already fixed, so a
-    /// late descriptor would be stamped with a time before it arrived, and its
+    /// A sealed block takes nothing more. Its `emitted_at` is already fixed, so
+    /// a late descriptor would be stamped with a time before it arrived, and its
     /// `bytes` is already the exact recount, which a reservation's upper-bound
     /// estimate would corrupt. The caller rotates to a new block instead.
     ///
+    /// An admission that fails leaves the block partially updated on purpose:
+    /// the caller's contract is to discard the whole ACTIVE block, and it owns
+    /// the request's ack token separately.
+    ///
     /// # Errors
-    /// Refuses a block that has already been sealed, and propagates an Arrow
-    /// failure from sealing a run inside a table buffer.
+    /// Refuses a sealed block, and propagates a series-construction or run
+    /// sorting failure.
     pub fn admit(
         &mut self,
         extracted: Extracted,
         reservation: Reservation,
         token: T,
     ) -> Result<()> {
-        if self.emitted_at_us.is_some() {
+        if self.is_sealed() {
             return Err(Error::invalid("block already sealed"));
         }
         let Extracted {
@@ -294,19 +389,25 @@ impl<T> Block<T> {
         } = extracted;
         if !reservation.new_series.is_empty() {
             let ds = Dataset::series_of(signal);
-            let slot = self.pending_descriptors.entry(ds).or_default();
-            // `new_series` holds ascending indices into `descriptors`, which this
-            // call owns: move the chosen rows out instead of cloning them, and
-            // drop the rest with the vector.
-            let mut wanted = reservation.new_series.iter().copied().peekable();
-            for (i, row) in descriptors.into_iter().enumerate() {
-                if wanted.peek() == Some(&i) {
-                    let _ = wanted.next();
-                    let _ = self.pending_series.insert(row.series_id);
-                    slot.push(row);
-                }
+            let rows: Vec<&DescriptorRow> = reservation
+                .new_series
+                .iter()
+                .map(|&i| &descriptors[i])
+                .collect();
+            // Take the table out for the call so that `append_series` can borrow
+            // it mutably while `self.cfg` is read, then put it straight back --
+            // including on the error path, so the block stays well formed.
+            let mut table = self.tables.remove(&ds).unwrap_or_else(|| {
+                SortedTableBuffer::new(ds, SortSpec::series(), self.cfg.sorting.run_target_bytes)
+            });
+            let result = table.append_series(&rows, &self.cfg);
+            let _ = self.tables.insert(ds, table);
+            result?;
+            for row in rows {
+                let _ = self.pending_series.insert(row.series_id);
             }
         }
+        drop(descriptors);
         for (ds, batches) in values {
             let run_target = self.cfg.sorting.run_target_bytes;
             let spec = self.spec_for(ds);
@@ -314,8 +415,12 @@ impl<T> Block<T> {
                 .tables
                 .entry(ds)
                 .or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
-            for b in batches {
-                let _ = table.append(b)?;
+            for batch in batches {
+                let _ = table.append(batch)?;
+                // Seal here rather than at block seal: sealing a run sorts and
+                // copies every column, which the block's stamp transaction must
+                // never do.
+                table.seal()?;
             }
         }
         self.bytes += reservation.bytes;
@@ -324,72 +429,51 @@ impl<T> Block<T> {
         Ok(())
     }
 
-    /// Stamp `emitted_at`, write the descriptor rows and seal every table.
+    /// Replace only `emitted_at` buffers, committing the sealed state after all
+    /// swaps succeed.
     ///
-    /// Idempotent: a flush retry re-seals the same block and reuses the first
+    /// Idempotent: a flush retry re-seals the same block and keeps the first
     /// stamp, so the file bytes are identical across attempts (spec 5.3).
     ///
-    /// All or nothing. Every step is fallible, so the descriptor rows are taken
-    /// into a local for the duration and put straight back if any step fails:
-    /// a block whose seal failed still holds every row it was given, still
-    /// reports `is_sealed() == false`, and can be sealed again once whatever
-    /// caused the failure is gone. `emitted_at` is stamped only after the last
-    /// fallible step, so the sink refuses to write a block that never finished
-    /// sealing rather than silently dropping its series rows.
+    /// All or nothing. Every replacement batch is prepared before any retained
+    /// batch is touched, so a failure leaves every batch, the accounting and the
+    /// seal state exactly as they were, and the block can be sealed again once
+    /// whatever caused the failure is gone. `emitted_at` is committed last, so
+    /// the sink refuses to write a block that never finished sealing rather than
+    /// writing unstamped series rows.
     ///
-    /// Descriptor rows are moved into their `series` batch, never copied, but
-    /// they stay alive until the seal has succeeded. Peak transient memory
-    /// during a series seal is therefore proportional to the block's whole
-    /// descriptor volume: the pending rows and the Arrow batches built from
-    /// them are resident at the same time. Materializing descriptors into
-    /// bounded incremental runs instead is a deferred v1 limitation (see
-    /// `docs/FORMAT.md`).
+    /// Peak transient memory is the block's retained bytes plus one new eight
+    /// byte timestamp per series row: every other column is shared between the
+    /// old batch and its replacement.
     ///
     /// # Errors
-    /// Propagates a failure from building the `series` batch or sealing a run.
+    /// A bad series schema leaves all retained batches, accounting and seal
+    /// state unchanged.
     pub fn seal(&mut self, emitted_at_us: i64) -> Result<()> {
-        // Reuse the first stamp, but do not commit it to the block until the
-        // end: an `emitted_at` set by a seal that then failed would make
-        // `is_sealed()` report a block that never finished sealing.
-        let stamp = self.emitted_at_us.unwrap_or(emitted_at_us);
-        let pending = std::mem::take(&mut self.pending_descriptors);
-        if let Err(e) = self.materialize(&pending, stamp) {
-            self.pending_descriptors = pending;
-            return Err(e);
+        if self.is_sealed() {
+            return Ok(());
+        }
+        let mut replacements = Vec::new();
+        for (ds, table) in &self.tables {
+            if ds.is_series() {
+                replacements.push((*ds, table.stamped(emitted_at_us)?));
+            }
+        }
+        // All fallible Arrow work has finished. The transaction holds only shared
+        // non-stamp columns and one new eight-byte timestamp per series row.
+        for (ds, (runs, building)) in replacements {
+            let table = self.tables.get_mut(&ds).expect("prepared table exists");
+            table.runs = runs;
+            table.building = building;
+        }
+        for table in self.tables.values_mut() {
+            // Admission sorted each batch already; moving it cannot copy a column.
+            table.runs.append(&mut table.building);
+            table.building_bytes = 0;
+            table.seen = CountedAllocations::default();
         }
         self.bytes = self.recount();
-        self.emitted_at_us = Some(stamp);
-        Ok(())
-    }
-
-    /// Build every pending descriptor set into its `series` batch, append the
-    /// batches and seal every table.
-    ///
-    /// Split out of [`Block::seal`] so that the descriptor rows can be held in
-    /// a local across all of it: each step here can fail, and the caller puts
-    /// the rows back and leaves the block unsealed when one does.
-    fn materialize(
-        &mut self,
-        pending: &BTreeMap<Dataset, Vec<DescriptorRow>>,
-        stamp: i64,
-    ) -> Result<()> {
-        for (ds, rows) in pending {
-            if rows.is_empty() {
-                continue;
-            }
-            let refs: Vec<&DescriptorRow> = rows.iter().collect();
-            let batch = series_batch(&refs, stamp, *ds, &self.cfg)?;
-            let run_target = self.cfg.sorting.run_target_bytes;
-            let spec = self.spec_for(*ds);
-            let table = self
-                .tables
-                .entry(*ds)
-                .or_insert_with(|| SortedTableBuffer::new(*ds, spec, run_target));
-            let _ = table.append(batch)?;
-        }
-        for t in self.tables.values_mut() {
-            t.seal()?;
-        }
+        self.emitted_at_us = Some(emitted_at_us);
         Ok(())
     }
 
@@ -399,24 +483,23 @@ impl<T> Block<T> {
         self.emitted_at_us
     }
 
-    /// Whether `seal` has already run to completion on this block.
+    /// Whether all timestamp swaps have committed successfully.
     ///
-    /// The seal stamp is set and no descriptor row is still waiting to be
-    /// materialized into a series batch, which is the same condition
-    /// `into_parts` asserts on. A consumer that walks `tables()` of an unsealed
-    /// block would silently miss every descriptor row, so the sink checks this
-    /// before it writes. `seal` stamps `emitted_at` only after it has succeeded,
-    /// so a block whose seal failed reports false here.
+    /// Series rows exist from admission onwards, but they carry a placeholder
+    /// `emitted_at` of zero until the stamp transaction commits. A consumer that
+    /// walked `tables()` of an unsealed block would read unstamped data, so the
+    /// sink checks this before it writes. `seal` commits `emitted_at` only after
+    /// every swap has been prepared, so a block whose seal failed reports false
+    /// here.
     #[must_use]
     pub fn is_sealed(&self) -> bool {
-        self.emitted_at_us.is_some() && self.pending_descriptors.values().all(Vec::is_empty)
+        self.emitted_at_us.is_some()
     }
 
     /// One deduplicated pass over everything the block retains.
     ///
-    /// Called only from `seal`, after the pending descriptor rows have been
-    /// drained into the series table, so the Arrow batches below already account
-    /// for them and there is nothing left in `pending_descriptors` to add.
+    /// Every row of the block, series rows included, is already an Arrow row by
+    /// the time this runs, so the batches below are the whole payload.
     fn recount(&self) -> usize {
         let mut seen = CountedAllocations::default();
         let mut bytes = 0usize;
@@ -435,11 +518,10 @@ impl<T> Block<T> {
         self.tables.values()
     }
 
-    /// Whether the block holds no rows.
+    /// Whether the block holds no materialized rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending_descriptors.values().all(Vec::is_empty)
-            && self.tables.values().all(SortedTableBuffer::is_empty)
+        self.tables.values().all(SortedTableBuffer::is_empty)
     }
 
     /// Number of admitted requests.
@@ -448,13 +530,12 @@ impl<T> Block<T> {
         self.requests.len()
     }
 
-    /// Take the block apart after a flush result.
+    /// Take apart a successfully sealed block after its flush result.
     ///
-    /// Call this on a sealed block. Descriptor rows only become Arrow rows in
-    /// the series table when `seal` stamps them, so an unsealed block would drop
-    /// them here. The sink always seals before it flushes and only takes the
-    /// block apart once the flush has resolved, so the debug assertion below
-    /// catches a caller that has stepped outside that order.
+    /// The series rows of an unsealed block still carry their placeholder
+    /// `emitted_at` of zero. The sink always seals before it flushes and only
+    /// takes the block apart once the flush has resolved, so the debug assertion
+    /// below catches a caller that has stepped outside that order.
     #[must_use]
     pub fn into_parts(
         self,
@@ -464,8 +545,8 @@ impl<T> Block<T> {
         BTreeMap<Dataset, SortedTableBuffer>,
     ) {
         debug_assert!(
-            self.pending_descriptors.is_empty(),
-            "into_parts on an unsealed block drops its descriptor rows"
+            self.is_sealed(),
+            "into_parts requires a successfully sealed block"
         );
         (self.requests, self.pending_series, self.tables)
     }
@@ -521,6 +602,120 @@ mod tests {
         extract(&mut records, cfg).expect("extract")
     }
 
+    fn snapshot_bytes<'a>(batches: impl Iterator<Item = &'a RecordBatch>) -> usize {
+        let mut seen = CountedAllocations::default();
+        batches
+            .map(|batch| record_batch_pinned_bytes(batch, &mut seen))
+            .sum()
+    }
+
+    /// Scenario: many distinct requests fill a block before its final timestamp is known.
+    /// Guarantees: descriptors are already bounded sorted series runs and carry zero timestamps.
+    #[test]
+    fn admission_materializes_bounded_series_runs() {
+        let mut cfg = LakeConfig::default();
+        cfg.sorting.run_target_bytes = 64 * 1024;
+        cfg.ingress.max_row_bytes = 16 * 1024;
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        for i in 0..64 {
+            let e = extracted(&cfg, &format!("host-{i:03}"), 1);
+            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+            block.admit(e, r, ()).expect("admit");
+        }
+        let table = block
+            .tables()
+            .find(|t| t.dataset().is_series())
+            .expect("series");
+        assert_eq!(table.rows(), 64);
+        assert!(!block.is_sealed());
+        for batch in table.iter_snapshots() {
+            assert!(snapshot_bytes(std::iter::once(batch)) <= cfg.sorting.run_target_bytes);
+            assert!(crate::sort::is_sorted(batch, &SortSpec::series()).expect("sorted"));
+            let stamps = batch
+                .column_by_name("emitted_at")
+                .expect("stamp")
+                .as_primitive::<TimestampMicrosecondType>();
+            assert!((0..stamps.len()).all(|i| stamps.value(i) == 0));
+        }
+    }
+
+    /// Scenario: retained series include both completed runs and a final building batch.
+    /// Guarantees: seal adds at most eight bytes per series row plus 64 bytes of buffer slack.
+    #[test]
+    fn seal_peak_retained_bytes_only_adds_timestamp_values() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        for i in 0..32 {
+            let e = extracted(&cfg, &format!("{}-{i}", "x".repeat(4096)), 1);
+            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+            block.admit(e, r, ()).expect("admit");
+        }
+        let table = block.tables.get_mut(&Dataset::LogsSeries).expect("series");
+        let last = table.runs.pop().expect("last run");
+        table.building.push(last);
+        let before: Vec<_> = block
+            .tables()
+            .flat_map(|t| t.runs().iter().chain(t.building()))
+            .cloned()
+            .collect();
+        let rows = block
+            .tables()
+            .filter(|t| t.dataset().is_series())
+            .map(SortedTableBuffer::rows)
+            .sum::<usize>();
+        let retained = snapshot_bytes(before.iter());
+        block.seal(SEAL_AT_US).expect("seal");
+        // Holding every old batch keeps the complete old/new overlap resident;
+        // this bounds the transaction's peak, not just its net memory change.
+        let peak = snapshot_bytes(
+            before
+                .iter()
+                .chain(block.tables().flat_map(SortedTableBuffer::iter_snapshots)),
+        );
+        assert!(
+            peak <= retained + rows * 8 + 64,
+            "peak={peak}, before={retained}, rows={rows}"
+        );
+        let after: Vec<_> = block
+            .tables()
+            .flat_map(SortedTableBuffer::iter_snapshots)
+            .collect();
+        for (old, new) in before.iter().zip(after) {
+            for (index, field) in old.schema().fields().iter().enumerate() {
+                if field.name() != "emitted_at" {
+                    assert!(Arc::ptr_eq(old.column(index), new.column(index)));
+                }
+            }
+        }
+        assert!(block.is_sealed());
+        let (_, ids, tables) = block.into_parts();
+        assert_eq!(ids.len(), rows);
+        assert_eq!(tables[&Dataset::LogsSeries].rows(), rows);
+    }
+
+    /// Scenario: an extracted descriptor lacks a configured denormalized cell.
+    /// Guarantees: admission refuses malformed series content before retaining any descriptor or token.
+    #[test]
+    fn malformed_descriptor_fails_during_admission() {
+        let mut cfg = LakeConfig::default();
+        cfg.logs.denormalize.push(crate::config::Denormalize {
+            path: "resource.host.id".into(),
+            column: "host_col".into(),
+            ty: crate::config::DenormType::String,
+        });
+        let mut e = extracted(&cfg, "host", 1);
+        e.descriptors[0].denorm.clear();
+        let mut cache = SeriesCache::new(10);
+        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+        assert!(block.admit(e, r, ()).is_err());
+        assert!(block.is_empty());
+        assert!(!block.is_sealed());
+        assert_eq!(block.request_count(), 0);
+    }
+
     /// Scenario: two requests for the same series in one block, then the same series after commit.
     /// Guarantees: the descriptor is reserved once per block and not at all once committed in the partition.
     #[test]
@@ -567,80 +762,54 @@ mod tests {
         );
     }
 
-    /// Scenario: a block whose configuration declares one denormalized column
-    /// while the admitted descriptor row carries no denormalized cell, so the
-    /// `series` batch cannot be built. The fault is then removed and the seal
-    /// retried.
-    /// Guarantees: the failed seal leaves the block exactly as it was. No stamp
-    /// is set, `is_sealed()` is false, the descriptor row is still pending and
-    /// no table was created from a half-written batch. Once the fault is gone
-    /// the retry seals the same block and the descriptor row reaches the series
-    /// table, so nothing was discarded by the failure.
+    /// Scenario: the second retained series batch has an invalid emitted_at type, then is repaired.
+    /// Guarantees: failed sealing changes no batch or stamp; retry commits all rows with one frozen stamp.
     #[test]
     fn a_failed_seal_keeps_the_block_intact_and_a_retry_succeeds() {
-        use crate::canonical::{Descriptor, Signal, canonical_bytes, series_id};
-        use crate::config::{DenormType, Denormalize};
-        use crate::extract::{DescriptorRow, ExtractStats};
-
-        let mut cfg = LakeConfig::default();
-        cfg.logs.denormalize = vec![Denormalize {
-            path: "resource.host.id".into(),
-            column: "host_col".into(),
-            ty: DenormType::String,
-        }];
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
-        let descriptor = Descriptor {
-            signal: Signal::Logs,
-            resource_attrs: vec![],
-            resource_schema_url: String::new(),
-            scope_name: String::new(),
-            scope_version: String::new(),
-            scope_schema_url: String::new(),
-            scope_attrs: vec![],
-            metric: None,
-            attrs: vec![],
-        };
-        let identity_bytes = canonical_bytes(&descriptor);
-        // The injected fault: the schema has a denormalized column, the row has
-        // no cell for it, so the built arrays have different lengths.
-        let e = Extracted {
-            signal: Signal::Logs,
-            descriptors: vec![DescriptorRow {
-                series_id: series_id(&identity_bytes),
-                identity_bytes,
-                descriptor,
-                denorm: vec![],
-                approx_bytes: 64,
-            }],
-            values: vec![],
-            pinned_bytes: 0,
-            stats: ExtractStats::default(),
-        };
-        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
-        assert_eq!(r.new_series, vec![0]);
-        block.admit(e, r, 1).expect("admit");
-
-        let err = block
-            .seal(SEAL_AT_US)
-            .expect_err("the series batch cannot be built");
-        assert!(!err.to_string().is_empty());
+        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        for host in ["first", "second"] {
+            let e = extracted(&cfg, host, 1);
+            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+            block.admit(e, r, ()).expect("admit");
+        }
+        let table = block.tables.get_mut(&Dataset::LogsSeries).expect("table");
+        let good = table.runs[1].clone();
+        let index = good.schema().index_of("emitted_at").expect("field");
+        let mut fields = good.schema().fields().to_vec();
+        fields[index] = Arc::new(Field::new("emitted_at", DataType::Int64, false));
+        let mut columns = good.columns().to_vec();
+        columns[index] = Arc::new(Int64Array::from(vec![0; good.num_rows()]));
+        table.runs[1] =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("bad batch");
+        let before: Vec<_> = block
+            .tables()
+            .flat_map(SortedTableBuffer::iter_snapshots)
+            .cloned()
+            .collect();
+        let bytes = block.bytes;
+        assert!(block.seal(SEAL_AT_US).is_err());
         assert!(!block.is_sealed());
         assert_eq!(block.emitted_at_us(), None);
-        // The descriptor row survived the failure and no table was created.
-        assert!(!block.is_empty(), "the descriptor row is still pending");
-        assert_eq!(block.tables().count(), 0);
-
-        // Remove the fault and seal again: the same block completes.
-        block.cfg.logs.denormalize.clear();
-        block.seal(SEAL_AT_US).expect("the retry seals");
-        assert!(block.is_sealed());
-        assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
-        let series = block
-            .tables()
-            .find(|t| t.dataset().is_series())
-            .expect("series table");
-        assert_eq!(series.rows(), 1);
+        assert_eq!(block.bytes, bytes);
+        for (old, new) in before
+            .iter()
+            .zip(block.tables().flat_map(SortedTableBuffer::iter_snapshots))
+        {
+            assert_eq!(old, new);
+        }
+        block
+            .tables
+            .get_mut(&Dataset::LogsSeries)
+            .expect("table")
+            .runs[1] = good;
+        block.seal(SEAL_AT_US + 1).expect("retry");
+        block.seal(SEAL_AT_US + 2).expect("idempotent retry");
+        assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US + 1));
+        assert_eq!(block.tables[&Dataset::LogsSeries].rows(), 2);
     }
 
     /// Scenario: `emitted_at` on a block sealed once and then sealed again, as a flush retry does.
@@ -740,16 +909,32 @@ mod tests {
         assert_eq!(block.request_count(), 1);
     }
 
-    /// Scenario: two requests that share the same Arrow buffers are admitted into one block.
-    /// Guarantees: the seal-time recount deduplicates shared allocations, so the block's
-    /// byte count is at most the sum of the per-request reservations and at least one copy.
+    /// Scenario: a request whose values batches carry builder slack is admitted
+    /// into a block, and the block is sealed.
+    /// Guarantees: the seal-time recount deduplicates shared allocations and
+    /// replaces the reservation estimate, so the block's byte count is at most
+    /// the sum of the per-request reservations, is exactly the measured bytes of
+    /// every batch the block retains plus its pending-series and token
+    /// overheads, and still counts at least one logical copy of the admitted
+    /// values data rather than deduplicating it away.
     #[test]
     fn seal_recounts_shared_buffers_once() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
         let mut block: Block<u32> = Block::new(0, 1, &cfg);
         let e1 = extracted(&cfg, "h", 8);
-        let one_request_pinned = e1.pinned_bytes;
+        // The logical payload of the request, free of the builder capacity slack
+        // that `pinned_bytes` also counts.
+        let one_request_logical: usize = e1
+            .values
+            .iter()
+            .flat_map(|(_, batches)| batches.iter())
+            .map(|b| {
+                otel_arrow_dfe_pdata::otap::memory::record_batch_logical_bytes(b)
+                    .expect("logical bytes")
+            })
+            .sum();
+        assert!(one_request_logical > 0);
         let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("r1");
         block.admit(e1, r1, 1).expect("admit");
         let reserved = block.bytes;
@@ -758,8 +943,14 @@ mod tests {
             block.bytes <= reserved,
             "the recount is never above the reservation upper bound"
         );
+        let retained = snapshot_bytes(block.tables().flat_map(SortedTableBuffer::iter_snapshots));
+        assert_eq!(
+            block.bytes,
+            retained + block.pending_series.len() * cfg.ingress.pending_series_entry_bytes + 16,
+            "the recount is every retained buffer counted once, plus the pending-series and token overheads"
+        );
         assert!(
-            block.bytes >= one_request_pinned / 2,
+            block.bytes >= one_request_logical,
             "one copy of the data is still counted"
         );
     }

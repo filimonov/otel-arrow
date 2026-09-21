@@ -38,6 +38,11 @@ names and file metadata and is never part of the identity.
 
 ## Limitations in version 1
 
+Descriptors become bounded series runs during request admission. Final sealing
+replaces only emitted_at with the block timestamp, sharing every other column;
+old/new timestamp storage is at most eight additional bytes per series row.
+The first successful seal timestamp remains fixed across flush retries.
+
 - Exponential histograms and summaries are not stored (`unsupported` decides
   between rejecting the request and dropping the points; drops are counted
   one per dropped data point row).
@@ -65,8 +70,6 @@ names and file metadata and is never part of the identity.
   request has a non-zero sum: the OTAP transport omits a column whose every
   entry is the type default, so an absent sum and a zero sum arrive the same
   way. The same holds for any optional metrics column.
-- Sealing a block's series table holds that block's whole descriptor volume
-  and the Arrow batch built from it at the same time.
 - One Parquet row group can start several multipart upload parts at once
   whatever `upload.concurrency` says; the burst is bounded by
   `parquet.row_group_bytes`.
