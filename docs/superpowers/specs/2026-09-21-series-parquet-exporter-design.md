@@ -31,6 +31,25 @@ store as Parquet, with these properties:
 - Selected attributes can be denormalized into the values tables as typed
   columns.
 
+### 1.1 Non-negotiable invariants
+
+Every change to this component is checked against these four properties:
+
+1. No persistent local state. A restart starts from an empty process.
+2. Never more than ACTIVE plus FLUSHING. There is no third block and no
+   spill.
+3. The series cache is an optimization, never correctness state. Losing it
+   (restart, eviction, or deleting it outright) can only increase the volume
+   of the `series` dataset, never lose or corrupt data.
+4. No producer ACK before its block is durable in object storage.
+
+Sorting is likewise an optimization: with `sorting.enabled: false` every
+guarantee above and every schema stays the same, only file order changes.
+
+The engine-independent boundary of `series-lake` (section 3.1) is part of
+the design: a standalone binary of the shape "OTLP receiver, `series-lake`,
+S3" must remain possible without rewriting the storage engine.
+
 ## 2. What the repository already provides
 
 Verified on `main` at commit `5588c3e0d`:
@@ -199,9 +218,12 @@ or explicitly listed as non-identity metadata. Non-identity metadata:
 `description` (metrics), `emitted_at`, `producer_id`. Consumers must not
 expect them to be constant per `series_id`.
 
-The specification lives in `crates/series-lake/docs/canonical-v1.md` with
-golden vectors in `crates/series-lake/tests/golden/*.json` (input descriptor,
-hex canonical bytes, hex hash). Float inputs in vectors are given as bit
+The encoding is specified in `crates/series-lake/docs/FORMAT.md`, the
+implementation-independent format document (canonical identity, dataset
+schemas, partition layout, file and delivery semantics, compatibility rules;
+no Rust, Dataflow or buffer internals), with golden vectors in
+`crates/series-lake/tests/golden/*.json` (input descriptor, hex canonical
+bytes, hex hash). Float inputs in vectors are given as bit
 patterns. Vectors must cover: empty string, missing field, int 0 and -0.0,
 INT64_MIN and INT64_MAX, `42` vs `"42"`, several NaN bit patterns hashing
 equal, +Inf, -Inf, non-ASCII UTF-8 including supplementary planes, embedded
@@ -477,7 +499,9 @@ so the loop is blocked for at most the work of one request.
    - append each values slice to its `SortedTableBuffer`; a building batch
      that reaches `run_target_bytes` is sorted (permutation plus `take`) and
      sealed as a run, the unsorted batch dropped. A run is at most
-     `run_target_bytes + one slice`, so at most `2 * run_target_bytes`;
+     `run_target_bytes + one slice`, so at most `2 * run_target_bytes`.
+     With `sorting.enabled: false` runs are sealed without sorting and the
+     flush concatenates them in arrival order;
    - push the `AckToken`.
    A request that produced zero rows is acked immediately and never enters a
    block.
@@ -653,6 +677,7 @@ config:
     max_entries: 20000
     max_bytes: 100MiB
   sorting:
+    enabled: true
     run_target_bytes: 8MiB
     merge_chunk_bytes: 16MiB
   upload:
@@ -706,7 +731,16 @@ acks, nacks{reason=storage|too_large|invalid|unsupported|shutdown}
 oldest_unacked_seconds
 dropped_unsupported{kind}, denormalize.type_mismatch{column},
 timestamp.out_of_range, notify.failures
+memory.budget_bytes, memory.accounted_bytes, memory.unaccounted_rss_bytes
 ```
+
+`memory.budget_bytes` is the section 6.6 bound computed from configuration,
+`memory.accounted_bytes` is the live sum of the enforced terms, and
+`memory.unaccounted_rss_bytes` is process RSS (sampled the same way the
+memory limiter samples it) minus `accounted_bytes` summed over workers. A
+growing unaccounted value is the signal that the invariant is being bypassed
+by Arrow, the allocator or `object_store`. The README states the memory
+bound as part of the public contract, with the process-level formula.
 
 ## 8. Error handling
 
@@ -899,7 +933,9 @@ the buffer-removal point.
 
 ### 10.2 Other deferred items
 
-- Traces (`signal=traces/table=series|spans`).
+- Traces (`signal=traces/table=series|spans`). The trace spec may choose a
+  different descriptor model for spans while reusing the hashing mechanism
+  and the storage conventions; spans are not forced into the "series" shape.
 - Exponential histograms and summaries (rejected by default in v1) and
   exemplars (dropped in v1).
 - Second-level file coalescing for low-volume deployments.
@@ -917,5 +953,11 @@ the buffer-removal point.
 2. Vertical slice for logs: `receiver:otlp` to `exporter:series_parquet` to
    `LocalFileSystem`, read with DuckDB, real gRPC producer, real ack. Then
    the same against MinIO.
-3. Metrics (`number`, `histogram`) reusing the same machinery.
-4. Chaos, soak and benchmark suites; quality gates.
+3. The chaos and soak harness (9.5, 9.6) starts running against the logs
+   slice immediately, before metrics exist: continuous load, random storage
+   delays and resets, periodic exporter restarts, cardinality changes, RSS
+   inspection. The emergent behavior of Arrow ownership, allocator, async
+   S3, retry, slow producers, shutdown and timer boundaries is the main
+   risk, and unit tests cannot cover it.
+4. Metrics (`number`, `histogram`) reusing the same machinery.
+5. Benchmark suite and quality gates.
