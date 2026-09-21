@@ -16,8 +16,8 @@ default = []
 [dependencies]
 otel-arrow-dfe-pdata.workspace = true
 arrow.workspace = true
-parquet.workspace = true
-object_store.workspace = true
+parquet = { workspace = true, features = ["zstd"] }
+object_store = { workspace = true, features = ["fs"] }
 ciborium.workspace = true
 xxhash-rust.workspace = true
 lru.workspace = true
@@ -28,13 +28,14 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 humantime-serde.workspace = true
-futures.workspace = true
 
 [dev-dependencies]
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile.workspace = true
+futures.workspace = true
+async-trait.workspace = true
 
 [lints]
 workspace = true

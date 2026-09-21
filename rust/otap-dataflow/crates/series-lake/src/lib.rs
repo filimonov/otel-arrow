@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod extract;
 pub mod schema;
+pub mod sink;
 pub mod sort;
 pub mod value;
 

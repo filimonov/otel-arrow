@@ -36,9 +36,21 @@ pub enum Error {
     /// pdata failure.
     #[error("pdata: {0}")]
     Pdata(String),
-    /// Flush cancelled.
-    #[error("cancelled")]
-    Cancelled,
+    /// Flush cancelled. `abort_error` is set when the best-effort multipart
+    /// abort also failed or timed out.
+    #[error("cancelled{}", match abort_error { Some(e) => format!(" (multipart abort failed: {e})"), None => String::new() })]
+    Cancelled {
+        /// Why the cleanup abort did not succeed, if it did not.
+        abort_error: Option<String>,
+    },
+    /// A write failed and the best-effort multipart abort failed as well.
+    #[error("{source}; multipart abort failed: {abort_error}")]
+    AbortFailed {
+        /// The original failure.
+        source: Box<Error>,
+        /// Why the cleanup abort did not succeed.
+        abort_error: String,
+    },
 }
 
 /// Crate result.
