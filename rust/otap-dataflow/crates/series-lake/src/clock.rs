@@ -146,10 +146,13 @@ impl WindowClock {
     /// timestamps (before 1970) are not a supported wall-clock input for
     /// this crate, mirroring `PartitionId::from_unix_secs`'s day-0 clamp.
     ///
-    /// `interval` is truncated to whole seconds and raised to at least 1 s:
-    /// a zero or sub-second interval (e.g. `Duration::from_millis(500)` or
-    /// `Duration::ZERO`) becomes a 1 s window rather than causing a
-    /// division by zero.
+    /// `interval` is truncated to whole seconds and raised to at least 1 s.
+    /// A validated configuration never reaches this clamp:
+    /// `LakeConfig::validate` refuses a `window_interval` that is not a whole
+    /// number of seconds of at least one, because the sink's `window_secs`
+    /// metadata records whole seconds too and the two must agree. The clamp
+    /// stays as a guard for a `WindowClock` built directly, so a zero interval
+    /// cannot divide by zero.
     #[must_use]
     pub fn new(interval: Duration, start_unix_secs: i64) -> Self {
         let interval_secs = i64::try_from(interval.as_secs()).unwrap_or(15).max(1);

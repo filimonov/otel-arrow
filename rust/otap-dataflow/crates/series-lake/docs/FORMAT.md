@@ -299,10 +299,16 @@ Schema contract per dataset: within one `base_uri`, changes are additive
 only (new denormalized columns, new nullable intrinsic columns). Changing the
 type or path of an existing column, or reusing a column name for a different
 path, requires a new `base_uri`. Each file carries `schema_fingerprint` in
-its metadata: xxh3_64 over the string `name:type;` repeated for every field
-of that dataset's Arrow schema, in field order, where `type` is the Arrow
-data type's canonical text form (so `Utf8`, `Int64`,
-`Timestamp(Microsecond, Some("UTC"))`, and so on); the hash is rendered as
+its metadata: xxh3_64 over the concatenation, in field order, of
+`<len>:<name><len>:<type>` for every field of that dataset's Arrow schema,
+where each `<len>` is the decimal byte length of the string that follows and
+`type` is the Arrow data type's canonical text form (so `Utf8`, `Int64`,
+`Timestamp(Microsecond, Some("UTC"))`, and so on). The `logs_values` schema
+with no denormalized columns fingerprints to `af2f139c9bdf7b07`. The length
+prefixes make the serialization unambiguous: a plain `name:type;` join is
+not, because one column named `a:Utf8;b` and two columns named `a` and `b`
+would produce the same string. Denormalized column names may not contain
+`:` or `;` either, and intrinsic names never do. The hash is rendered as
 16 lowercase hex digits, zero-padded. A change to a column's name, its type,
 or its position, changes the fingerprint, and the series and values
 datasets of a signal have different fingerprints.
@@ -414,6 +420,20 @@ what it read.
   multipart upload; `BufWriter::abort` is only safe before finalization
   starts. The leftover parts are reclaimed by a bucket lifecycle rule for
   incomplete multipart uploads, not by this crate.
+- Every merge key of a table being merged is resident for the whole merge:
+  the k-way merge materializes the encoded sort keys of all of a table's rows
+  up front, so sorting by a wide column such as `body` can hold close to a
+  second copy of the table's payload.
+- Merge chunk sizing is an approximation from an average row width, so a chunk
+  whose rows are much wider than the table's average overshoots
+  `merge_chunk_bytes`.
+- Peak transient memory when a block's series table is sealed is proportional
+  to the block's whole descriptor volume, not to one run: a dataset's
+  descriptor rows and the Arrow batch built from them are resident together.
+- A single Parquet row group can start several multipart upload parts at once,
+  regardless of `upload.concurrency`: the writer hands the object store one
+  whole encoded row group, and every part that fits in the buffer is launched
+  from it. The burst is bounded by `parquet.row_group_bytes`.
 - Traces are refused.
 
 ## Compatibility rules

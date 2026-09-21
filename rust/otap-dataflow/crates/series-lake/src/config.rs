@@ -374,9 +374,12 @@ impl LakeConfig {
     /// >= max_extracted_bytes`; `upload.part_bytes >= 5 MiB` (the S3
     /// multipart minimum part size, below which every upload would fail at
     /// flush time); `upload.concurrency >= 1` (otherwise no part could ever
-    /// be sent); denormalized and intrinsic column names do not collide
-    /// (case-insensitively) within a dataset; each signal's `values_sort`
-    /// columns exist in that signal's values dataset schema; and every
+    /// be sent); `window_interval` is a whole number of seconds and at least
+    /// 1 s; denormalized and intrinsic column names do not collide
+    /// (case-insensitively) within a dataset and hold no `:` or `;` (the
+    /// schema fingerprint's field separators; intrinsic names never do); each
+    /// signal's `values_sort` columns exist in that signal's values dataset
+    /// schema and have a type Arrow's row converter can sort; and every
     /// `denormalize` path has a valid `resource.`/`scope.`/`attrs.` prefix.
     pub fn validate(&self) -> Result<()> {
         if self.writer_id.is_empty() {
@@ -406,6 +409,28 @@ impl LakeConfig {
                 "max_block_bytes must be at least max_extracted_bytes",
             ));
         }
+        // The window boundary arithmetic and the `window_secs` file metadata
+        // both work in whole seconds. A sub-second interval would be silently
+        // rounded in one place and recorded as zero in the other, so refuse it
+        // here rather than letting the two disagree.
+        if self.window_interval.subsec_nanos() != 0 || self.window_interval.as_secs() == 0 {
+            return Err(Error::invalid(
+                "window_interval must be a whole number of seconds and at least 1s",
+            ));
+        }
+        for d in self
+            .logs
+            .denormalize
+            .iter()
+            .chain(self.metrics.denormalize.iter())
+        {
+            if d.column.contains(':') || d.column.contains(';') {
+                return Err(Error::invalid(format!(
+                    "denormalized column name must not contain ':' or ';': {}",
+                    d.column
+                )));
+            }
+        }
         for ds in crate::schema::Dataset::ALL {
             let schema = crate::schema::dataset_schema(ds, self);
             let mut seen = HashSet::new();
@@ -424,11 +449,23 @@ impl LakeConfig {
                     &self.metrics
                 };
                 for key in &sig.values_sort {
-                    if schema.column_with_name(&key.column).is_none() {
+                    let Some((_, field)) = schema.column_with_name(&key.column) else {
                         return Err(Error::invalid(format!(
                             "sort key {} not in {}",
                             key.column,
                             ds.name()
+                        )));
+                    };
+                    // Sorting goes through Arrow's row format, which cannot
+                    // encode every type (a Map, for instance). Refuse here
+                    // rather than at the first admission, seal or flush.
+                    let sort_field = arrow::row::SortField::new(field.data_type().clone());
+                    if !arrow::row::RowConverter::supports_fields(std::slice::from_ref(&sort_field))
+                    {
+                        return Err(Error::invalid(format!(
+                            "sort key {} has type {}, which Arrow's row converter cannot sort",
+                            key.column,
+                            field.data_type()
                         )));
                     }
                 }
@@ -468,6 +505,62 @@ mod tests {
         cfg.ingress.max_requests_per_block = 0;
         let err = cfg.validate().expect_err("max_requests_per_block is 0");
         assert!(err.to_string().contains("max_requests_per_block"));
+    }
+
+    /// Scenario: `values_sort` names the logs `attrs` column, whose Arrow type
+    /// is a Map.
+    /// Guarantees: `validate` refuses it. Arrow's row converter cannot encode a
+    /// Map, so the configuration would otherwise be accepted and then fail at
+    /// the first admission, seal or flush.
+    #[test]
+    fn a_sort_key_the_row_converter_cannot_sort_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.logs.values_sort = vec![SortKey {
+            column: "attrs".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }];
+        let err = cfg.validate().expect_err("a Map sort key is unsortable");
+        assert!(err.to_string().contains("row converter cannot sort"));
+    }
+
+    /// Scenario: `window_interval` set to 500 ms, and to zero.
+    /// Guarantees: both are refused. Boundary arithmetic rounds a sub-second
+    /// interval up to one second while the file metadata records zero, so the
+    /// two would disagree about the window a file belongs to.
+    #[test]
+    fn a_sub_second_window_interval_is_rejected() {
+        for interval in [Duration::from_millis(500), Duration::ZERO] {
+            let cfg = LakeConfig {
+                window_interval: interval,
+                ..Default::default()
+            };
+            let err = cfg.validate().expect_err("sub-second window interval");
+            assert!(err.to_string().contains("window_interval"));
+        }
+        let cfg = LakeConfig {
+            window_interval: Duration::from_secs(1),
+            ..Default::default()
+        };
+        cfg.validate().expect("a one second window is valid");
+    }
+
+    /// Scenario: a denormalized column name holding the schema fingerprint's
+    /// field separators.
+    /// Guarantees: `validate` refuses it, so no configuration can produce a
+    /// column name that the fingerprint's serialization has to disambiguate.
+    #[test]
+    fn a_denormalized_column_name_with_fingerprint_separators_is_rejected() {
+        for column in ["a:Utf8;b", "a;b", "a:b"] {
+            let mut cfg = LakeConfig::default();
+            cfg.logs.denormalize = vec![Denormalize {
+                path: "resource.service.name".into(),
+                column: column.into(),
+                ty: DenormType::String,
+            }];
+            let err = cfg.validate().expect_err("separator in a column name");
+            assert!(err.to_string().contains("must not contain"));
+        }
     }
 
     /// Scenario: `max_block_bytes` is smaller than `max_extracted_bytes`.

@@ -54,6 +54,16 @@ names and file metadata and is never part of the identity.
 - A cancellation that lands after a file's Parquet finalization has begun
   (for example, exporter shutdown) can leave an orphaned multipart upload;
   it is reclaimed by a bucket lifecycle rule, not by this crate.
+- A merge holds the encoded sort keys of every row of the table it is
+  merging, so sorting by a wide column such as `body` can hold close to a
+  second copy of the table's payload.
+- `merge_chunk_bytes` is an average-based approximation: a chunk of rows
+  much wider than the table's average overshoots it.
+- Sealing a block's series table holds that block's whole descriptor volume
+  and the Arrow batch built from it at the same time.
+- One Parquet row group can start several multipart upload parts at once
+  whatever `upload.concurrency` says; the burst is bounded by
+  `parquet.row_group_bytes`.
 - Traces are refused.
 
 ## Reading the data

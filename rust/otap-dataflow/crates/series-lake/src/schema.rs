@@ -212,15 +212,23 @@ pub fn dataset_schema(ds: Dataset, cfg: &LakeConfig) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// xxh3_64 over `name:type;` of every field, in order.
+/// xxh3_64 over a length-prefixed `name` and Arrow type of every field, in
+/// order: `<len>:<name><len>:<type>` per field, concatenated.
+///
+/// The prefixes make the serialization unambiguous. A plain `name:type;` join
+/// is not: one string column named `a:Utf8;b` produces exactly the same string
+/// as two string columns named `a` and `b`, so two genuinely different schemas
+/// would share a fingerprint without any hash collision, defeating the mismatch
+/// detection the fingerprint exists for. `LakeConfig::validate` separately
+/// rejects denormalized column names holding `:` or `;`, but the encoding does
+/// not rely on that rule.
 #[must_use]
 pub fn schema_fingerprint(schema: &Schema) -> u64 {
     let mut s = String::new();
     for f in schema.fields() {
-        s.push_str(f.name());
-        s.push(':');
-        s.push_str(&f.data_type().to_string());
-        s.push(';');
+        let name = f.name();
+        let ty = f.data_type().to_string();
+        s.push_str(&format!("{}:{}{}:{}", name.len(), name, ty.len(), ty));
     }
     xxhash_rust::xxh3::xxh3_64(s.as_bytes())
 }
@@ -229,6 +237,34 @@ pub fn schema_fingerprint(schema: &Schema) -> u64 {
 mod tests {
     use super::*;
     use crate::config::{DenormType, Denormalize, LakeConfig};
+
+    /// Scenario: the default `logs_values` schema, whose column set and types
+    /// are frozen for format version 1.
+    /// Guarantees: the fingerprint is exactly this value. A change to any
+    /// column's name, type or position changes it, so this test pins the
+    /// serialization the readers in `docs/FORMAT.md` are told to compare.
+    #[test]
+    fn golden_fingerprint_of_the_default_logs_values_schema() {
+        let cfg = LakeConfig::default();
+        let fp = schema_fingerprint(&dataset_schema(Dataset::LogsValues, &cfg));
+        assert_eq!(fp, 0xaf2f_139c_9bdf_7b07_u64, "{fp:#018x}");
+    }
+
+    /// Scenario: one string column literally named `a:Utf8;b`, against two
+    /// string columns named `a` and `b`. Under a `name:type;` join both
+    /// serialize to `a:Utf8;b:Utf8;`.
+    /// Guarantees: the length-prefixed serialization keeps them apart, so a
+    /// column name holding the old delimiters cannot forge another schema's
+    /// fingerprint.
+    #[test]
+    fn delimiter_bearing_names_do_not_collide() {
+        let one = Schema::new(vec![Field::new("a:Utf8;b", DataType::Utf8, true)]);
+        let two = Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        assert_ne!(schema_fingerprint(&one), schema_fingerprint(&two));
+    }
 
     /// Scenario: default config, every dataset.
     /// Guarantees: the intrinsic column lists of spec section 5.1 are produced in order.
