@@ -363,3 +363,121 @@ proptest! {
         }
     }
 }
+
+// ------------------------------------------------- deterministic regression
+//
+// The defect these pin down is fixed, but a fixed defect keeps its minimal
+// deterministic case. pdata's OTAP encoder omits a value column whose every entry
+// is that type's default, so a request of nothing but default values carries no
+// value column at all while the type tag still names the type. Reading that as
+// null made a series identity depend on how requests happened to be batched, and
+// collided with a genuinely null attribute. The property tests above would
+// rediscover it only by chance; these two do not.
+
+/// One log record carrying a single attribute `a` with the given value.
+fn one_attr(value: AnyValue) -> Vec<Attr> {
+    vec![Attr {
+        key: "a".into(),
+        value,
+    }]
+}
+
+/// The identity set of a logs request whose only identity attribute is `a`.
+fn ids_for(records: Vec<Vec<Attr>>) -> BTreeSet<String> {
+    let cfg = cfg_with(vec!["a".to_string()]);
+    logs_ids(&logs_of(&records, &[]), &cfg)
+}
+
+/// The identity of a single record carrying exactly one attribute value.
+fn single_id(value: AnyValue) -> String {
+    let ids = ids_for(vec![one_attr(value)]);
+    assert_eq!(ids.len(), 1, "one record is one series");
+    ids.into_iter().next().expect("one id")
+}
+
+/// Every type's default value, paired with a non-default value of the same type.
+///
+/// A request holding only the left-hand value has no value column at all; a
+/// request holding both has one. The identity must not notice the difference.
+fn default_and_other() -> Vec<(&'static str, AnyValue, AnyValue)> {
+    vec![
+        ("empty string", any_str(""), any_str("A")),
+        (
+            "int zero",
+            wrap(any_value::Value::IntValue(0)),
+            wrap(any_value::Value::IntValue(7)),
+        ),
+        (
+            "double zero",
+            wrap(any_value::Value::DoubleValue(0.0)),
+            wrap(any_value::Value::DoubleValue(1.5)),
+        ),
+        (
+            "double negative zero",
+            wrap(any_value::Value::DoubleValue(-0.0)),
+            wrap(any_value::Value::DoubleValue(1.5)),
+        ),
+        (
+            "empty bytes",
+            wrap(any_value::Value::BytesValue(Vec::new())),
+            wrap(any_value::Value::BytesValue(vec![1])),
+        ),
+    ]
+}
+
+/// Scenario: a record whose only identity attribute holds its type's default value,
+/// extracted alone and then again alongside a record holding a non-default value of
+/// the same type. One case per default: empty string, int zero, double zero, double
+/// negative zero and the empty byte string.
+/// Guarantees: the record keeps the same series id either way, so an identity never
+/// depends on what else happens to share its request. This is the minimal case
+/// proptest shrank the framing property down to before the decoder was fixed.
+#[test]
+fn default_valued_attribute_identity_does_not_depend_on_request_framing() {
+    for (name, default, other) in default_and_other() {
+        let alone = single_id(default.clone());
+        let together = ids_for(vec![one_attr(default), one_attr(other)]);
+        assert!(
+            together.contains(&alone),
+            "{name}: the series id changed with request framing, alone {alone} not in {together:?}"
+        );
+    }
+}
+
+/// Scenario: the same default values, compared against an attribute that is unset and
+/// against a record carrying no attribute at all.
+/// Guarantees: a default value is not a null value. The canonical encoding keeps them
+/// distinct -- the `empty_string_attr` and `null_value` golden vectors have different
+/// series ids -- so collapsing a default into null would silently merge two different
+/// series.
+#[test]
+fn default_valued_attribute_differs_from_an_unset_or_absent_one() {
+    let unset = single_id(AnyValue { value: None });
+    let absent = {
+        let ids = ids_for(vec![vec![]]);
+        assert_eq!(ids.len(), 1, "one record is one series");
+        ids.into_iter().next().expect("one id")
+    };
+    assert_ne!(unset, absent, "an unset value is not an absent attribute");
+
+    for (name, default, _) in default_and_other() {
+        let id = single_id(default);
+        assert_ne!(id, unset, "{name} must not collide with an unset value");
+        assert_ne!(
+            id, absent,
+            "{name} must not collide with an absent attribute"
+        );
+    }
+}
+
+/// Scenario: the two signed zeros as an attribute value, through the real extraction
+/// path rather than the canonical encoder alone.
+/// Guarantees: they share one series id, because the sign of a zero cannot survive OTAP
+/// transport and the canonical encoding normalizes -0.0 to +0.0 (spec section 4).
+#[test]
+fn both_signed_zeros_share_one_identity() {
+    assert_eq!(
+        single_id(wrap(any_value::Value::DoubleValue(-0.0))),
+        single_id(wrap(any_value::Value::DoubleValue(0.0))),
+    );
+}
