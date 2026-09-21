@@ -252,11 +252,24 @@ impl Sink {
         // failure aborts the multipart upload.
         let mut rows = 0usize;
         let mut failure: Option<Error> = None;
-        let merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
-        for chunk in merged {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
+        let mut merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        loop {
+            // Yield before every chunk. `AsyncArrowWriter::write` usually
+            // completes synchronously, and so does a buffered upload whose store
+            // is ready, so a highly compressible table could otherwise run from
+            // the first chunk to the last without ever returning to the runtime:
+            // the cancellation token and every other task on the same runtime
+            // would be starved. The yield also precedes producing the next
+            // chunk, whose merge-key work is unbounded CPU time of its own.
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(Error::Cancelled { abort_error: None });
+                break;
+            }
+            let chunk = match merged.next() {
+                None => break,
+                Some(Ok(c)) => c,
+                Some(Err(e)) => {
                     failure = Some(e);
                     break;
                 }
@@ -1090,6 +1103,32 @@ mod tests {
             Err(Error::Cancelled { .. })
         ));
         assert_eq!(walkdir_count(dir.path()), 0);
+    }
+
+    /// Scenario: a block written to an in-memory object store that is ready the
+    /// instant it is asked, on a current-thread runtime, while another task on
+    /// that same runtime cancels the token.
+    /// Guarantees: the chunk loop yields between chunks, so the cancelling task
+    /// gets to run and the write stops as cancelled. Without the yield, a store
+    /// that never suspends lets the loop write every chunk of every table before
+    /// the runtime ever schedules the cancelling task.
+    #[tokio::test]
+    async fn cancellation_is_observed_with_an_immediately_ready_store() {
+        let mut cfg = LakeConfig::default();
+        // One row per chunk, so the loop makes many passes over a small block.
+        cfg.sorting.merge_chunk_bytes = 1;
+        cfg.validate().expect("valid config");
+        let b = sealed_block(&cfg, 200);
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancel() })
+        };
+        let got = sink.write_block(&b, &token).await;
+        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        canceller.await.expect("cancelling task");
     }
 
     /// Scenario: the store cancels the token the moment the values object is opened,
