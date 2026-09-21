@@ -111,33 +111,46 @@ proptest! {
         let _ = decode_cbor(&buf, 0);
     }
 
-    /// Scenario: the same attribute list handed to the encoder in two different orders,
-    /// one already sorted and one shuffled and then normalized by `sort_kvlist`.
-    /// Guarantees: the two encodings are byte-identical, so key order in the input never
-    /// reaches the identity, and the shuffled input really is a different order before
-    /// normalization whenever the list has at least two keys.
+    /// Scenario: an attribute list of at least two distinct keys, handed to the encoder
+    /// twice -- once already sorted, once in a proptest-generated shuffle that is
+    /// rejected unless it really is a different order, then normalized by `sort_kvlist`
+    /// as the extractor does.
+    /// Guarantees: the two encodings and their series ids are byte-identical, so key
+    /// order in the input never reaches the identity. The two-distinct-key floor and the
+    /// explicit order-differs assertion are what stop the test from silently comparing a
+    /// list with itself and proving nothing.
     #[test]
     fn encoding_is_order_independent(
-        kvs in prop::collection::vec((any::<String>(), value_strategy()), 0..6),
-        rotate in 0usize..6,
+        (sorted, shuffled) in prop::collection::vec((any::<String>(), value_strategy()), 2..7)
+            .prop_map(|kvs| {
+                let mut sorted = kvs;
+                sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                sorted.dedup_by(|a, b| a.0 == b.0);
+                sorted
+            })
+            // Duplicate keys are removed above, so a short list can fall below the floor.
+            .prop_filter("at least two distinct keys", |s| s.len() >= 2)
+            .prop_flat_map(|sorted| {
+                let shuffled = Just(sorted.clone()).prop_shuffle();
+                (Just(sorted), shuffled)
+            })
+            .prop_filter("the two orders must differ", |(sorted, shuffled)| {
+                let a: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
+                let b: Vec<&str> = shuffled.iter().map(|(k, _)| k.as_str()).collect();
+                a != b
+            }),
     ) {
-        let mut sorted = kvs;
-        sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        sorted.dedup_by(|a, b| a.0 == b.0);
-
-        let mut shuffled = sorted.clone();
-        if shuffled.len() > 1 {
-            // A non-zero rotation of a list of distinct keys is never the identity, so the
-            // shuffled input is guaranteed to reach the encoder in a different order.
-            // (The brief's rotate-then-reverse is the identity for a two-key list.)
-            let by = 1 + rotate % (shuffled.len() - 1);
-            shuffled.rotate_left(by);
-            let sorted_keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
-            let shuffled_keys: Vec<&str> = shuffled.iter().map(|(k, _)| k.as_str()).collect();
-            prop_assert_ne!(sorted_keys, shuffled_keys, "the shuffled input must differ before sorting");
-        }
+        prop_assert!(sorted.len() >= 2, "the property needs at least two keys to mean anything");
+        let sorted_keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
+        let shuffled_keys: Vec<&str> = shuffled.iter().map(|(k, _)| k.as_str()).collect();
+        prop_assert_ne!(
+            &sorted_keys,
+            &shuffled_keys,
+            "the shuffled input must reach the encoder in a different order"
+        );
 
         // Encode the shuffled list as the extractor would: normalize, then encode.
+        let mut shuffled = shuffled;
         sort_kvlist(&mut shuffled).expect("unique keys");
         let a = canonical_bytes(&desc(sorted));
         let b = canonical_bytes(&desc(shuffled));

@@ -10,18 +10,28 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
     LogRecord, LogsData, ResourceLogs, ScopeLogs,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
-    AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, MetricsData,
-    NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+    AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+    HistogramDataPoint, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+    Summary, SummaryDataPoint, metric, number_data_point,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
 use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
 use otel_arrow_dfe_series_lake::canonical::hex;
-use otel_arrow_dfe_series_lake::config::LakeConfig;
+use otel_arrow_dfe_series_lake::config::{LakeConfig, UnsupportedPolicy};
 use otel_arrow_dfe_series_lake::extract::extract;
 
-/// Kinds with no values dataset: `extract` drops them under the default policy,
-/// so no descriptor reaches the output and there is nothing to compare.
+/// Kinds with no values dataset in format v1.
+///
+/// Exponential histograms and summaries have no `number` or `histogram` schema to
+/// land in, so by design `extract` never emits a descriptor for them: under the
+/// `Drop` policy their points are counted and discarded, and under `Reject` the
+/// whole request is refused. There is therefore no `series_id` to compare against
+/// the golden vector, and `unsupported_kinds_are_dropped_or_rejected` pins that
+/// behavior down instead. Every other vector round-trips with no exception.
 const UNSUPPORTED_KINDS: [&str; 2] = ["exp_histogram", "summary"];
+
+/// The vector names the round trip is allowed to skip, and only these.
+const EXPECTED_SKIPS: [&str; 2] = ["metrics_exp_histogram_delta", "metrics_summary"];
 
 fn hex_decode(s: &str) -> Vec<u8> {
     ::hex::decode(s).expect("hex")
@@ -155,7 +165,31 @@ fn metrics_for(d: &serde_json::Value) -> MetricsData {
                 ..Default::default()
             }],
         }),
-        other => panic!("golden vector uses unsupported metric kind {other}"),
+        // The two kinds format v1 cannot store are still built here, so that
+        // `unsupported_kinds_are_dropped_or_rejected` can put them through the real
+        // extraction path rather than the test simply looking away from them.
+        "exp_histogram" => metric::Data::ExponentialHistogram(ExponentialHistogram {
+            aggregation_temporality: temporality,
+            data_points: vec![ExponentialHistogramDataPoint {
+                time_unix_nano: 1_000,
+                attributes: kvs_from_json(&d["attrs"]),
+                count: 1,
+                sum: Some(1.0),
+                scale: 0,
+                zero_count: 1,
+                ..Default::default()
+            }],
+        }),
+        "summary" => metric::Data::Summary(Summary {
+            data_points: vec![SummaryDataPoint {
+                time_unix_nano: 1_000,
+                attributes: kvs_from_json(&d["attrs"]),
+                count: 1,
+                sum: 1.0,
+                ..Default::default()
+            }],
+        }),
+        other => panic!("golden vector uses an unknown metric kind {other}"),
     };
     MetricsData {
         resource_metrics: vec![ResourceMetrics {
@@ -220,12 +254,15 @@ fn deviating_vectors() -> Vec<String> {
         }
         checked += 1;
     }
-    // Pin the skips: a new vector of an unsupported kind must be noticed, not
-    // silently ignored.
+    // Pin the skips exactly: a new vector of an unsupported kind must be noticed,
+    // not silently ignored, and a vector must never drop out of the comparison for
+    // any other reason.
     assert_eq!(
         skipped,
-        vec!["metrics_exp_histogram_delta", "metrics_summary"],
-        "only the kinds with no values dataset may be skipped"
+        EXPECTED_SKIPS.to_vec(),
+        "only exponential histograms and summaries may be skipped, because format v1 has no \
+         values dataset for them so extraction emits no descriptor to compare; see \
+         unsupported_kinds_are_dropped_or_rejected. Every other vector must round-trip."
     );
     assert_eq!(checked, vectors.len() - skipped.len());
     deviations
@@ -243,4 +280,71 @@ fn all_golden_vectors_survive_otlp_to_otap_conversion() {
         Vec::<String>::new(),
         "every golden vector must survive the OTLP to OTAP conversion"
     );
+}
+
+/// The two golden vectors whose metric kind has no values dataset, rebuilt as OTLP.
+fn unsupported_vector_requests() -> Vec<(String, MetricsData)> {
+    let raw = include_str!("golden/canonical_v1.json");
+    let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
+    doc["vectors"]
+        .as_array()
+        .expect("vectors")
+        .iter()
+        .filter(|v| EXPECTED_SKIPS.contains(&v["name"].as_str().expect("name")))
+        .map(|v| {
+            (
+                v["name"].as_str().expect("name").to_string(),
+                metrics_for(&v["descriptor"]),
+            )
+        })
+        .collect()
+}
+
+/// Scenario: the two golden vectors the round trip skips, exponential histogram and
+/// summary, run through the real extraction path under both unsupported policies.
+/// Guarantees: they are skipped because format v1 genuinely cannot carry them, not
+/// because the test looks away. Under `Drop` extraction succeeds, emits no descriptor
+/// at all and counts the discarded points; under `Reject` it refuses the request.
+#[test]
+fn unsupported_kinds_are_dropped_or_rejected() {
+    let requests = unsupported_vector_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "both unsupported vectors must be present"
+    );
+
+    for (name, data) in requests {
+        let drop_cfg = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            producer_id_attribute: "__absent__".into(),
+            ..Default::default()
+        };
+        let mut records = encode_metrics(&data);
+        let out = extract(&mut records, &drop_cfg).expect("drop policy must not refuse");
+        assert!(
+            out.descriptors.is_empty(),
+            "{name} must produce no descriptor under Drop"
+        );
+        assert!(
+            out.stats.dropped_unsupported > 0,
+            "{name} must count its discarded points under Drop"
+        );
+        assert_eq!(
+            out.values.iter().map(|(_, b)| b.len()).sum::<usize>(),
+            0,
+            "{name} must produce no values rows under Drop"
+        );
+
+        let reject_cfg = LakeConfig {
+            unsupported: UnsupportedPolicy::Reject,
+            producer_id_attribute: "__absent__".into(),
+            ..Default::default()
+        };
+        let mut records = encode_metrics(&data);
+        assert!(
+            extract(&mut records, &reject_cfg).is_err(),
+            "{name} must be refused under Reject"
+        );
+    }
 }

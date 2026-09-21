@@ -3,12 +3,13 @@
 
 //! Reference-oracle property test (spec section 9.1).
 //!
-//! The oracle computes the expected identities independently of `extract`: it
-//! builds a [`Descriptor`] straight from the generated OTLP input and hashes it
-//! with `canonical_bytes` plus `series_id`. Nothing in the reference path calls
+//! The oracle computes the expected output independently of `extract`: it builds
+//! [`Descriptor`]s straight from the generated OTLP input and hashes them with
+//! `canonical_bytes` plus `series_id`, and it builds the expected descriptor
+//! *content* from the same generated strings. Nothing in the reference path calls
 //! extraction, so the two implementations can genuinely disagree.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
@@ -25,7 +26,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
     AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, MetricsData,
-    NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
 use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
@@ -35,7 +36,7 @@ use otel_arrow_dfe_series_lake::canonical::{
     Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_bytes,
     series_id,
 };
-use otel_arrow_dfe_series_lake::config::LakeConfig;
+use otel_arrow_dfe_series_lake::config::{DenormType, Denormalize, LakeConfig};
 use otel_arrow_dfe_series_lake::extract::extract;
 use otel_arrow_dfe_series_lake::schema::Dataset;
 use otel_arrow_dfe_series_lake::sink::{FileNaming, Sink};
@@ -47,6 +48,42 @@ use tokio_util::sync::CancellationToken;
 
 const WINDOW_START: i64 = 1_789_960_500;
 const SEAL_AT_US: i64 = 1_789_960_500_000_000;
+
+// --------------------------------------------------------------- naming
+//
+// Every identity-bearing string of the generated input comes from one of these,
+// so the model and the OTLP builder cannot drift apart without the test noticing.
+
+fn host_name(h: u8) -> String {
+    format!("h{h}")
+}
+fn resource_schema(h: u8) -> String {
+    format!("https://r{h}")
+}
+fn scope_name(s: u8) -> String {
+    format!("sc{s}")
+}
+fn scope_version(s: u8) -> String {
+    format!("v{s}")
+}
+fn scope_schema(s: u8) -> String {
+    format!("https://s{s}")
+}
+fn scope_attr_value(s: u8) -> String {
+    format!("sa{s}")
+}
+fn logger_name(l: u8) -> String {
+    format!("L{l}")
+}
+fn dp_name(d: u8) -> String {
+    format!("d{d}")
+}
+fn metric_name(m: u8) -> String {
+    format!("m{m}")
+}
+fn metric_unit(m: u8) -> String {
+    format!("u{m}")
+}
 
 fn kv(k: &str, v: &str) -> KeyValue {
     KeyValue {
@@ -61,9 +98,29 @@ fn attr(k: &str, v: &str) -> (String, Value) {
     (k.to_string(), Value::Str(v.to_string()))
 }
 
+fn denorm(path: &str, column: &str) -> Denormalize {
+    Denormalize {
+        path: path.to_string(),
+        column: column.to_string(),
+        ty: DenormType::String,
+    }
+}
+
+/// Denormalized columns of the logs and metrics series datasets, in schema order.
+const LOGS_DENORM: [&str; 2] = ["host_col", "logger_col"];
+const METRICS_DENORM: [&str; 2] = ["host_col", "dp_col"];
+
 fn base_cfg(sorting: bool) -> LakeConfig {
     let mut cfg = LakeConfig::default();
     cfg.logs.series_attributes = vec!["logger.name".into()];
+    cfg.logs.denormalize = vec![
+        denorm("resource.host.id", LOGS_DENORM[0]),
+        denorm("attrs.logger.name", LOGS_DENORM[1]),
+    ];
+    cfg.metrics.denormalize = vec![
+        denorm("resource.host.id", METRICS_DENORM[0]),
+        denorm("attrs.dp", METRICS_DENORM[1]),
+    ];
     cfg.sorting.enabled = sorting;
     // Seal a run per request: maximal merge pressure. `validate()` is not called
     // here, so the run_target/max_row relation does not apply.
@@ -73,47 +130,91 @@ fn base_cfg(sorting: bool) -> LakeConfig {
     cfg
 }
 
-/// The reference identity of a logs series, built without touching `extract`.
-fn logs_series_id(host: u8, logger: u8) -> SeriesId {
-    series_id(&canonical_bytes(&Descriptor {
-        signal: Signal::Logs,
-        resource_attrs: vec![attr("host.id", &format!("h{host}"))],
-        resource_schema_url: String::new(),
-        scope_name: String::new(),
-        scope_version: String::new(),
-        scope_schema_url: String::new(),
-        scope_attrs: vec![],
-        metric: None,
-        attrs: vec![attr("logger.name", &format!("L{logger}"))],
-    }))
+// ------------------------------------------------- the expected descriptor
+//
+// The full content of one `series` row, built from the generator's own strings on
+// the model side and read back from Parquet on the actual side. Comparing whole
+// maps of these, keyed by the series id the file itself carries, checks every
+// field exactly *and* that each descriptor hashes to the identity its values rows
+// were written under.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedMetric {
+    name: String,
+    unit: String,
+    metric_type: String,
+    temporality: String,
+    is_monotonic: bool,
+    description: String,
 }
 
-/// The reference identity of a metrics series, built without touching `extract`.
-fn metrics_series_id(
-    host: u8,
-    name: &str,
-    kind: MetricKind,
-    temporality: Temporality,
-    dp: u8,
-) -> SeriesId {
-    series_id(&canonical_bytes(&Descriptor {
-        signal: Signal::Metrics,
-        resource_attrs: vec![attr("host.id", &format!("h{host}"))],
-        resource_schema_url: String::new(),
-        scope_name: String::new(),
-        scope_version: String::new(),
-        scope_schema_url: String::new(),
-        scope_attrs: vec![],
-        metric: Some(MetricDescriptor {
-            name: name.to_string(),
-            unit: String::new(),
-            kind,
-            temporality,
-            is_monotonic: false,
-            description: String::new(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedSeries {
+    resource_attrs: Vec<(String, String)>,
+    resource_schema_url: String,
+    scope_name: String,
+    scope_version: String,
+    scope_schema_url: String,
+    scope_attrs: Vec<(String, String)>,
+    attrs: Vec<(String, String)>,
+    metric: Option<ExpectedMetric>,
+    denorm: Vec<(String, Option<String>)>,
+}
+
+/// Read one `series` row back into the same shape the model produces.
+fn read_series_row(b: &RecordBatch, row: usize, denorm_cols: &[&str]) -> ExpectedSeries {
+    let is_metrics = b.schema().column_with_name("metric_name").is_some();
+    ExpectedSeries {
+        resource_attrs: map_at(b, "resource_attrs", row),
+        resource_schema_url: string_at(b, "resource_schema_url", row),
+        scope_name: string_at(b, "scope_name", row),
+        scope_version: string_at(b, "scope_version", row),
+        scope_schema_url: string_at(b, "scope_schema_url", row),
+        scope_attrs: map_at(b, "scope_attrs", row),
+        attrs: map_at(b, "attrs", row),
+        metric: is_metrics.then(|| ExpectedMetric {
+            name: string_at(b, "metric_name", row),
+            unit: string_at(b, "unit", row),
+            metric_type: string_at(b, "metric_type", row),
+            temporality: string_at(b, "temporality", row),
+            is_monotonic: b
+                .column_by_name("is_monotonic")
+                .expect("is_monotonic")
+                .as_boolean()
+                .value(row),
+            description: string_at(b, "description", row),
         }),
-        attrs: vec![attr("dp", &format!("d{dp}"))],
-    }))
+        denorm: denorm_cols
+            .iter()
+            .map(|c| ((*c).to_string(), opt_string_at(b, c, row)))
+            .collect(),
+    }
+}
+
+/// Every descriptor of a series file, keyed by the `series_id` the file carries.
+fn read_series_map(
+    batches: &[RecordBatch],
+    denorm_cols: &[&str],
+) -> Result<BTreeMap<Vec<u8>, ExpectedSeries>, TestCaseError> {
+    let mut out: BTreeMap<Vec<u8>, ExpectedSeries> = BTreeMap::new();
+    for b in batches {
+        for row in 0..b.num_rows() {
+            let id = series_id_at(b, row);
+            let seen = out.insert(id, read_series_row(b, row, denorm_cols));
+            prop_assert!(seen.is_none(), "a series is described at most once");
+        }
+    }
+    Ok(out)
+}
+
+/// Sorted key/value pairs of a map column, as the reader sees them.
+fn pairs(kvs: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = kvs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Admit every request into one block, seal it, write it and read the files back.
@@ -203,8 +304,8 @@ fn string_at(b: &RecordBatch, name: &str, row: usize) -> String {
 /// A nullable Utf8 cell, keeping null distinct from the empty string.
 ///
 /// The distinction matters: pdata omits a value column whose entries are all the
-/// default, so an all-empty-body request is exactly the shape that used to decode
-/// as null. `StringArray::value` would report both as `""` and hide that.
+/// default, so an all-empty-body request is exactly the shape that would decode as
+/// null if the decoder got it wrong. `StringArray::value` reports both as `""`.
 fn opt_string_at(b: &RecordBatch, name: &str, row: usize) -> Option<String> {
     let a = b
         .column_by_name(name)
@@ -236,63 +337,18 @@ fn check_order(
     Ok(())
 }
 
-// ---------------------------------------------------------------- logs
-
-#[derive(Debug, Clone)]
-struct LogRec {
-    host: u8,
-    logger: u8,
-    time: u64,
-    body: String,
-}
-
-fn log_rec() -> impl Strategy<Value = LogRec> {
-    (
-        0u8..3,
-        0u8..3,
-        prop_oneof![Just(0u64), 1u64..1_000_000],
-        "[a-z]{0,8}",
-    )
-        .prop_map(|(host, logger, time, body)| LogRec {
-            host,
-            logger,
-            time,
-            body,
-        })
-}
-
-fn logs_request(recs: &[LogRec]) -> OtapArrowRecords {
-    let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
-    hosts.sort_unstable();
-    hosts.dedup();
-    encode_logs(&LogsData {
-        resource_logs: hosts
-            .iter()
-            .map(|h| ResourceLogs {
-                resource: Some(Resource {
-                    attributes: vec![kv("host.id", &format!("h{h}"))],
-                    ..Default::default()
-                }),
-                scope_logs: vec![ScopeLogs {
-                    scope: Some(InstrumentationScope::default()),
-                    log_records: recs
-                        .iter()
-                        .filter(|r| r.host == *h)
-                        .map(|r| LogRecord {
-                            time_unix_nano: r.time,
-                            body: Some(AnyValue {
-                                value: Some(any_value::Value::StringValue(r.body.clone())),
-                            }),
-                            attributes: vec![kv("logger.name", &format!("L{}", r.logger))],
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })
-            .collect(),
-    })
+/// Timestamps, weighted towards small values but reaching both boundaries.
+///
+/// 0 means "absent" in OTLP, and `i64::MAX` is the largest nanosecond stamp the
+/// storage column can hold; anything above it is refused as out of range.
+fn any_time() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        2 => Just(0u64),
+        1 => Just(1u64),
+        8 => 1u64..1_000_000,
+        1 => 1_000_000_000_000_000_000u64..(i64::MAX as u64),
+        1 => Just(i64::MAX as u64),
+    ]
 }
 
 fn split<T: Clone>(items: &[T], sizes: &[u8]) -> Vec<Vec<T>> {
@@ -308,6 +364,125 @@ fn split<T: Clone>(items: &[T], sizes: &[u8]) -> Vec<Vec<T>> {
     out
 }
 
+// ---------------------------------------------------------------- logs
+
+#[derive(Debug, Clone)]
+struct LogRec {
+    host: u8,
+    scope: u8,
+    logger: u8,
+    time: u64,
+    body: String,
+}
+
+fn log_rec() -> impl Strategy<Value = LogRec> {
+    (0u8..3, 0u8..2, 0u8..3, any_time(), "[a-z]{0,8}").prop_map(
+        |(host, scope, logger, time, body)| LogRec {
+            host,
+            scope,
+            logger,
+            time,
+            body,
+        },
+    )
+}
+
+/// The reference identity of a logs series, built without touching `extract`.
+fn logs_descriptor(r: &LogRec) -> Descriptor {
+    Descriptor {
+        signal: Signal::Logs,
+        resource_attrs: vec![attr("host.id", &host_name(r.host))],
+        resource_schema_url: resource_schema(r.host),
+        scope_name: scope_name(r.scope),
+        scope_version: scope_version(r.scope),
+        scope_schema_url: scope_schema(r.scope),
+        scope_attrs: vec![attr("sa", &scope_attr_value(r.scope))],
+        metric: None,
+        attrs: vec![attr("logger.name", &logger_name(r.logger))],
+    }
+}
+
+fn logs_series_id(r: &LogRec) -> SeriesId {
+    series_id(&canonical_bytes(&logs_descriptor(r)))
+}
+
+/// The reference descriptor content of a logs series.
+fn logs_expected(r: &LogRec) -> ExpectedSeries {
+    ExpectedSeries {
+        resource_attrs: pairs(&[("host.id", host_name(r.host))]),
+        resource_schema_url: resource_schema(r.host),
+        scope_name: scope_name(r.scope),
+        scope_version: scope_version(r.scope),
+        scope_schema_url: scope_schema(r.scope),
+        scope_attrs: pairs(&[("sa", scope_attr_value(r.scope))]),
+        attrs: pairs(&[("logger.name", logger_name(r.logger))]),
+        metric: None,
+        denorm: vec![
+            (LOGS_DENORM[0].to_string(), Some(host_name(r.host))),
+            (LOGS_DENORM[1].to_string(), Some(logger_name(r.logger))),
+        ],
+    }
+}
+
+fn scopes_of<T, F: Fn(&T) -> (u8, u8)>(recs: &[T], host: u8, key: F) -> Vec<u8> {
+    let mut out: Vec<u8> = recs
+        .iter()
+        .map(&key)
+        .filter(|(h, _)| *h == host)
+        .map(|(_, s)| s)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn hosts_of<T, F: Fn(&T) -> (u8, u8)>(recs: &[T], key: F) -> Vec<u8> {
+    let mut out: Vec<u8> = recs.iter().map(&key).map(|(h, _)| h).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn logs_request(recs: &[LogRec]) -> OtapArrowRecords {
+    let key = |r: &LogRec| (r.host, r.scope);
+    encode_logs(&LogsData {
+        resource_logs: hosts_of(recs, key)
+            .into_iter()
+            .map(|h| ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", &host_name(h))],
+                    ..Default::default()
+                }),
+                schema_url: resource_schema(h),
+                scope_logs: scopes_of(recs, h, key)
+                    .into_iter()
+                    .map(|s| ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: scope_name(s),
+                            version: scope_version(s),
+                            attributes: vec![kv("sa", &scope_attr_value(s))],
+                            ..Default::default()
+                        }),
+                        schema_url: scope_schema(s),
+                        log_records: recs
+                            .iter()
+                            .filter(|r| r.host == h && r.scope == s)
+                            .map(|r| LogRecord {
+                                time_unix_nano: r.time,
+                                body: Some(AnyValue {
+                                    value: Some(any_value::Value::StringValue(r.body.clone())),
+                                }),
+                                attributes: vec![kv("logger.name", &logger_name(r.logger))],
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
 async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(), TestCaseError> {
     let cfg = base_cfg(sorting);
     let requests: Vec<OtapArrowRecords> = split(&recs, &sizes)
@@ -321,15 +496,15 @@ async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(
         .iter()
         .map(|r| {
             (
-                logs_series_id(r.host, r.logger).to_vec(),
+                logs_series_id(r).to_vec(),
                 (r.time > 0).then_some(r.time as i64),
                 Some(r.body.clone()),
             )
         })
         .collect();
-    let model_series: BTreeSet<Vec<u8>> = recs
+    let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs
         .iter()
-        .map(|r| logs_series_id(r.host, r.logger).to_vec())
+        .map(|r| (logs_series_id(r).to_vec(), logs_expected(r)))
         .collect();
 
     let values = files.get(&Dataset::LogsValues).expect("values file");
@@ -352,48 +527,48 @@ async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(
     );
     check_order(&cfg, values, Signal::Logs)?;
 
-    // Descriptor content, per series.
     let series = files.get(&Dataset::LogsSeries).expect("series file");
-    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for b in series {
-        for row in 0..b.num_rows() {
-            let id = series_id_at(b, row);
-            prop_assert!(
-                seen.insert(id.clone()),
-                "a series is described at most once"
-            );
-            let host_attr = map_at(b, "resource_attrs", row);
-            let ident = map_at(b, "attrs", row);
-            prop_assert_eq!(host_attr.len(), 1);
-            prop_assert_eq!(ident.len(), 1);
-            let expected = logs_series_id(
-                host_attr[0]
-                    .1
-                    .trim_start_matches('h')
-                    .parse::<u8>()
-                    .expect("host"),
-                ident[0]
-                    .1
-                    .trim_start_matches('L')
-                    .parse::<u8>()
-                    .expect("logger"),
-            );
-            prop_assert_eq!(
-                id,
-                expected.to_vec(),
-                "descriptor content hashes to its series_id"
-            );
-        }
-    }
-    prop_assert_eq!(seen, model_series, "descriptor set");
+    let actual_series = read_series_map(series, &LOGS_DENORM)?;
+    prop_assert_eq!(
+        actual_series,
+        model_series,
+        "every logs descriptor, field by field, keyed by its own series id"
+    );
     Ok(())
 }
 
 // ------------------------------------------------------- metric numbers
 
+/// Kind, temporality and monotonicity are a function of the metric index, because
+/// every data point of one OTLP metric shares them.
+fn number_kind(m: u8) -> (MetricKind, Temporality, bool) {
+    match m % 3 {
+        0 => (MetricKind::Gauge, Temporality::Unspecified, false),
+        1 => (MetricKind::Sum, Temporality::Delta, true),
+        _ => (MetricKind::Sum, Temporality::Cumulative, false),
+    }
+}
+
+fn hist_kind(m: u8) -> (MetricKind, Temporality) {
+    if m.is_multiple_of(2) {
+        (MetricKind::Histogram, Temporality::Delta)
+    } else {
+        (MetricKind::Histogram, Temporality::Cumulative)
+    }
+}
+
+fn temporality_proto(t: Temporality) -> i32 {
+    match t {
+        Temporality::Delta => AggregationTemporality::Delta as i32,
+        Temporality::Cumulative => AggregationTemporality::Cumulative as i32,
+        Temporality::Unspecified => AggregationTemporality::Unspecified as i32,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NumRec {
     host: u8,
+    scope: u8,
     metric: u8,
     dp: u8,
     time: u64,
@@ -401,83 +576,199 @@ struct NumRec {
     double_value: Option<f64>,
 }
 
+/// Integers weighted towards small values but including both boundaries and zero.
+fn any_int() -> impl Strategy<Value = i64> {
+    prop_oneof![
+        8 => -1000i64..1000,
+        2 => Just(0i64),
+        1 => Just(i64::MIN),
+        1 => Just(i64::MAX),
+    ]
+}
+
+/// Doubles weighted towards small values but including zero of both signs, the
+/// smallest subnormal, the smallest normal and both extremes.
+fn any_double() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        8 => -1000.0f64..1000.0,
+        1 => Just(0.0f64),
+        1 => Just(-0.0f64),
+        1 => Just(f64::from_bits(1)),
+        1 => Just(f64::MIN_POSITIVE),
+        1 => Just(f64::MAX),
+        1 => Just(f64::MIN),
+    ]
+}
+
 fn num_rec() -> impl Strategy<Value = NumRec> {
     (
         0u8..2,
         0u8..2,
         0u8..3,
-        prop_oneof![Just(0u64), 1u64..1_000_000],
+        0u8..3,
+        any_time(),
         any::<bool>(),
-        -1000i64..1000,
+        any_int(),
+        any_double(),
     )
-        .prop_map(|(host, metric, dp, time, is_int, v)| NumRec {
+        .prop_map(|(host, scope, metric, dp, time, is_int, i, d)| NumRec {
             host,
+            scope,
             metric,
             dp,
             time,
-            int_value: is_int.then_some(v),
-            double_value: (!is_int).then_some(v as f64),
+            int_value: is_int.then_some(i),
+            double_value: (!is_int).then_some(d),
         })
 }
 
-fn metrics_request(build: impl Fn(u8) -> Vec<Metric>, hosts: &[u8]) -> OtapArrowRecords {
+fn metrics_descriptor(
+    host: u8,
+    scope: u8,
+    m: u8,
+    kind: MetricKind,
+    temporality: Temporality,
+    is_monotonic: bool,
+    dp: u8,
+) -> Descriptor {
+    Descriptor {
+        signal: Signal::Metrics,
+        resource_attrs: vec![attr("host.id", &host_name(host))],
+        resource_schema_url: resource_schema(host),
+        scope_name: scope_name(scope),
+        scope_version: scope_version(scope),
+        scope_schema_url: scope_schema(scope),
+        scope_attrs: vec![attr("sa", &scope_attr_value(scope))],
+        metric: Some(MetricDescriptor {
+            name: metric_name(m),
+            unit: metric_unit(m),
+            kind,
+            temporality,
+            is_monotonic,
+            description: String::new(),
+        }),
+        attrs: vec![attr("dp", &dp_name(dp))],
+    }
+}
+
+fn metrics_expected(
+    host: u8,
+    scope: u8,
+    m: u8,
+    kind: MetricKind,
+    temporality: Temporality,
+    is_monotonic: bool,
+    dp: u8,
+) -> ExpectedSeries {
+    ExpectedSeries {
+        resource_attrs: pairs(&[("host.id", host_name(host))]),
+        resource_schema_url: resource_schema(host),
+        scope_name: scope_name(scope),
+        scope_version: scope_version(scope),
+        scope_schema_url: scope_schema(scope),
+        scope_attrs: pairs(&[("sa", scope_attr_value(scope))]),
+        attrs: pairs(&[("dp", dp_name(dp))]),
+        metric: Some(ExpectedMetric {
+            name: metric_name(m),
+            unit: metric_unit(m),
+            metric_type: kind.as_str().to_string(),
+            temporality: temporality.as_str().to_string(),
+            is_monotonic,
+            description: String::new(),
+        }),
+        denorm: vec![
+            (METRICS_DENORM[0].to_string(), Some(host_name(host))),
+            (METRICS_DENORM[1].to_string(), Some(dp_name(dp))),
+        ],
+    }
+}
+
+fn metrics_request(
+    build: impl Fn(u8, u8) -> Vec<Metric>,
+    recs_key: &[(u8, u8)],
+) -> OtapArrowRecords {
+    let key = |p: &(u8, u8)| *p;
     encode_metrics(&MetricsData {
-        resource_metrics: hosts
-            .iter()
+        resource_metrics: hosts_of(recs_key, key)
+            .into_iter()
             .map(|h| ResourceMetrics {
                 resource: Some(Resource {
-                    attributes: vec![kv("host.id", &format!("h{h}"))],
+                    attributes: vec![kv("host.id", &host_name(h))],
                     ..Default::default()
                 }),
-                scope_metrics: vec![ScopeMetrics {
-                    scope: Some(InstrumentationScope::default()),
-                    metrics: build(*h),
-                    ..Default::default()
-                }],
-                ..Default::default()
+                schema_url: resource_schema(h),
+                scope_metrics: scopes_of(recs_key, h, key)
+                    .into_iter()
+                    .map(|s| ScopeMetrics {
+                        scope: Some(InstrumentationScope {
+                            name: scope_name(s),
+                            version: scope_version(s),
+                            attributes: vec![kv("sa", &scope_attr_value(s))],
+                            ..Default::default()
+                        }),
+                        schema_url: scope_schema(s),
+                        metrics: build(h, s),
+                    })
+                    .collect(),
             })
             .collect(),
     })
 }
 
+fn metric_indices<T, F: Fn(&T) -> (u8, u8, u8)>(recs: &[T], h: u8, s: u8, key: F) -> Vec<u8> {
+    let mut out: Vec<u8> = recs
+        .iter()
+        .map(&key)
+        .filter(|(rh, rs, _)| *rh == h && *rs == s)
+        .map(|(_, _, m)| m)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn number_request(recs: &[NumRec]) -> OtapArrowRecords {
-    let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
-    hosts.sort_unstable();
-    hosts.dedup();
+    let keys: Vec<(u8, u8)> = recs.iter().map(|r| (r.host, r.scope)).collect();
     metrics_request(
-        |h| {
-            let mut names: Vec<u8> = recs
-                .iter()
-                .filter(|r| r.host == h)
-                .map(|r| r.metric)
-                .collect();
-            names.sort_unstable();
-            names.dedup();
-            names
-                .iter()
-                .map(|m| Metric {
-                    name: format!("m{m}"),
-                    data: Some(metric::Data::Gauge(Gauge {
-                        data_points: recs
-                            .iter()
-                            .filter(|r| r.host == h && r.metric == *m)
-                            .map(|r| NumberDataPoint {
-                                time_unix_nano: r.time,
-                                attributes: vec![kv("dp", &format!("d{}", r.dp))],
-                                value: Some(match (r.int_value, r.double_value) {
-                                    (Some(i), _) => number_data_point::Value::AsInt(i),
-                                    (_, Some(d)) => number_data_point::Value::AsDouble(d),
-                                    _ => number_data_point::Value::AsInt(0),
-                                }),
-                                ..Default::default()
+        |h, s| {
+            metric_indices(recs, h, s, |r| (r.host, r.scope, r.metric))
+                .into_iter()
+                .map(|m| {
+                    let (kind, temporality, is_monotonic) = number_kind(m);
+                    let points: Vec<NumberDataPoint> = recs
+                        .iter()
+                        .filter(|r| r.host == h && r.scope == s && r.metric == m)
+                        .map(|r| NumberDataPoint {
+                            time_unix_nano: r.time,
+                            attributes: vec![kv("dp", &dp_name(r.dp))],
+                            value: Some(match (r.int_value, r.double_value) {
+                                (Some(i), _) => number_data_point::Value::AsInt(i),
+                                (_, Some(d)) => number_data_point::Value::AsDouble(d),
+                                _ => number_data_point::Value::AsInt(0),
+                            }),
+                            ..Default::default()
+                        })
+                        .collect();
+                    Metric {
+                        name: metric_name(m),
+                        unit: metric_unit(m),
+                        data: Some(if kind == MetricKind::Gauge {
+                            metric::Data::Gauge(Gauge {
+                                data_points: points,
                             })
-                            .collect(),
-                    })),
-                    ..Default::default()
+                        } else {
+                            metric::Data::Sum(Sum {
+                                aggregation_temporality: temporality_proto(temporality),
+                                is_monotonic,
+                                data_points: points,
+                            })
+                        }),
+                        ..Default::default()
+                    }
                 })
                 .collect()
         },
-        &hosts,
+        &keys,
     )
 }
 
@@ -493,25 +784,43 @@ async fn number_case(
         .collect();
     let (files, _dir) = round_trip(&cfg, requests).await?;
 
+    let identity = |r: &NumRec| {
+        let (kind, temporality, is_monotonic) = number_kind(r.metric);
+        (
+            series_id(&canonical_bytes(&metrics_descriptor(
+                r.host,
+                r.scope,
+                r.metric,
+                kind,
+                temporality,
+                is_monotonic,
+                r.dp,
+            )))
+            .to_vec(),
+            metrics_expected(
+                r.host,
+                r.scope,
+                r.metric,
+                kind,
+                temporality,
+                is_monotonic,
+                r.dp,
+            ),
+        )
+    };
+
     let mut model: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = recs
         .iter()
         .map(|r| {
             (
-                metrics_series_id(
-                    r.host,
-                    &format!("m{}", r.metric),
-                    MetricKind::Gauge,
-                    Temporality::Unspecified,
-                    r.dp,
-                )
-                .to_vec(),
+                identity(r).0,
                 (r.time > 0).then_some(r.time as i64),
                 r.int_value,
-                r.double_value.map(|d| d.to_string()),
+                r.double_value.map(|d| format!("{:016x}", d.to_bits())),
             )
         })
         .collect();
-    let model_series: BTreeSet<Vec<u8>> = model.iter().map(|m| m.0.clone()).collect();
+    let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
 
     let values = files.get(&Dataset::MetricsNumber).expect("number file");
     let mut actual: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = Vec::new();
@@ -529,7 +838,8 @@ async fn number_case(
                 series_id_at(b, row),
                 time_at(b, row),
                 vi.is_valid(row).then(|| vi.value(row)),
-                vd.is_valid(row).then(|| vd.value(row).to_string()),
+                vd.is_valid(row)
+                    .then(|| format!("{:016x}", vd.value(row).to_bits())),
             ));
         }
     }
@@ -538,46 +848,17 @@ async fn number_case(
     prop_assert_eq!(
         actual,
         model,
-        "number rows as a multiset of (series_id, time, int, double)"
+        "number rows as a multiset of (series_id, time, int, double bits)"
     );
     check_order(&cfg, values, Signal::Metrics)?;
 
     let series = files.get(&Dataset::MetricsSeries).expect("series file");
-    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for b in series {
-        for row in 0..b.num_rows() {
-            let id = series_id_at(b, row);
-            prop_assert!(
-                seen.insert(id.clone()),
-                "a series is described at most once"
-            );
-            prop_assert_eq!(string_at(b, "metric_type", row), "gauge".to_string());
-            prop_assert_eq!(string_at(b, "temporality", row), String::new());
-            let host_attr = map_at(b, "resource_attrs", row);
-            let ident = map_at(b, "attrs", row);
-            let expected = metrics_series_id(
-                host_attr[0]
-                    .1
-                    .trim_start_matches('h')
-                    .parse::<u8>()
-                    .expect("host"),
-                &string_at(b, "metric_name", row),
-                MetricKind::Gauge,
-                Temporality::Unspecified,
-                ident[0]
-                    .1
-                    .trim_start_matches('d')
-                    .parse::<u8>()
-                    .expect("dp"),
-            );
-            prop_assert_eq!(
-                id,
-                expected.to_vec(),
-                "descriptor content hashes to its series_id"
-            );
-        }
-    }
-    prop_assert_eq!(seen, model_series, "descriptor set");
+    let actual_series = read_series_map(series, &METRICS_DENORM)?;
+    prop_assert_eq!(
+        actual_series,
+        model_series,
+        "every number descriptor, field by field, keyed by its own series id"
+    );
     Ok(())
 }
 
@@ -586,67 +867,70 @@ async fn number_case(
 #[derive(Debug, Clone)]
 struct HistRec {
     host: u8,
+    scope: u8,
     metric: u8,
     dp: u8,
     time: u64,
-    count: u32,
+    count: u64,
+}
+
+/// Counts weighted small but reaching the largest value the `Int64` storage
+/// column can hold; anything above it is refused as out of range.
+fn any_count() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        8 => 0u64..100,
+        1 => Just(0u64),
+        1 => Just(u64::from(u32::MAX)),
+        1 => Just(i64::MAX as u64),
+    ]
 }
 
 fn hist_rec() -> impl Strategy<Value = HistRec> {
-    (
-        0u8..2,
-        0u8..2,
-        0u8..3,
-        prop_oneof![Just(0u64), 1u64..1_000_000],
-        0u32..100,
-    )
-        .prop_map(|(host, metric, dp, time, count)| HistRec {
+    (0u8..2, 0u8..2, 0u8..2, 0u8..3, any_time(), any_count()).prop_map(
+        |(host, scope, metric, dp, time, count)| HistRec {
             host,
+            scope,
             metric,
             dp,
             time,
             count,
-        })
+        },
+    )
 }
 
 fn histogram_request(recs: &[HistRec]) -> OtapArrowRecords {
-    let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
-    hosts.sort_unstable();
-    hosts.dedup();
+    let keys: Vec<(u8, u8)> = recs.iter().map(|r| (r.host, r.scope)).collect();
     metrics_request(
-        |h| {
-            let mut names: Vec<u8> = recs
-                .iter()
-                .filter(|r| r.host == h)
-                .map(|r| r.metric)
-                .collect();
-            names.sort_unstable();
-            names.dedup();
-            names
-                .iter()
-                .map(|m| Metric {
-                    name: format!("m{m}"),
-                    data: Some(metric::Data::Histogram(Histogram {
-                        aggregation_temporality: AggregationTemporality::Delta as i32,
-                        data_points: recs
-                            .iter()
-                            .filter(|r| r.host == h && r.metric == *m)
-                            .map(|r| HistogramDataPoint {
-                                time_unix_nano: r.time,
-                                attributes: vec![kv("dp", &format!("d{}", r.dp))],
-                                count: u64::from(r.count),
-                                sum: Some(f64::from(r.count)),
-                                bucket_counts: vec![u64::from(r.count), 0],
-                                explicit_bounds: vec![1.0],
-                                ..Default::default()
-                            })
-                            .collect(),
-                    })),
-                    ..Default::default()
+        |h, s| {
+            metric_indices(recs, h, s, |r| (r.host, r.scope, r.metric))
+                .into_iter()
+                .map(|m| {
+                    let (_, temporality) = hist_kind(m);
+                    Metric {
+                        name: metric_name(m),
+                        unit: metric_unit(m),
+                        data: Some(metric::Data::Histogram(Histogram {
+                            aggregation_temporality: temporality_proto(temporality),
+                            data_points: recs
+                                .iter()
+                                .filter(|r| r.host == h && r.scope == s && r.metric == m)
+                                .map(|r| HistogramDataPoint {
+                                    time_unix_nano: r.time,
+                                    attributes: vec![kv("dp", &dp_name(r.dp))],
+                                    count: r.count,
+                                    sum: Some(r.count as f64),
+                                    bucket_counts: vec![r.count, 0],
+                                    explicit_bounds: vec![1.0],
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }
                 })
                 .collect()
         },
-        &hosts,
+        &keys,
     )
 }
 
@@ -662,24 +946,34 @@ async fn histogram_case(
         .collect();
     let (files, _dir) = round_trip(&cfg, requests).await?;
 
+    let identity = |r: &HistRec| {
+        let (kind, temporality) = hist_kind(r.metric);
+        (
+            series_id(&canonical_bytes(&metrics_descriptor(
+                r.host,
+                r.scope,
+                r.metric,
+                kind,
+                temporality,
+                false,
+                r.dp,
+            )))
+            .to_vec(),
+            metrics_expected(r.host, r.scope, r.metric, kind, temporality, false, r.dp),
+        )
+    };
+
     let mut model: Vec<(Vec<u8>, Option<i64>, i64)> = recs
         .iter()
         .map(|r| {
             (
-                metrics_series_id(
-                    r.host,
-                    &format!("m{}", r.metric),
-                    MetricKind::Histogram,
-                    Temporality::Delta,
-                    r.dp,
-                )
-                .to_vec(),
+                identity(r).0,
                 (r.time > 0).then_some(r.time as i64),
-                i64::from(r.count),
+                r.count as i64,
             )
         })
         .collect();
-    let model_series: BTreeSet<Vec<u8>> = model.iter().map(|m| m.0.clone()).collect();
+    let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
 
     let values = files
         .get(&Dataset::MetricsHistogram)
@@ -704,19 +998,12 @@ async fn histogram_case(
     check_order(&cfg, values, Signal::Metrics)?;
 
     let series = files.get(&Dataset::MetricsSeries).expect("series file");
-    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for b in series {
-        for row in 0..b.num_rows() {
-            let id = series_id_at(b, row);
-            prop_assert!(
-                seen.insert(id.clone()),
-                "a series is described at most once"
-            );
-            prop_assert_eq!(string_at(b, "metric_type", row), "histogram".to_string());
-            prop_assert_eq!(string_at(b, "temporality", row), "delta".to_string());
-        }
-    }
-    prop_assert_eq!(seen, model_series, "descriptor set");
+    let actual_series = read_series_map(series, &METRICS_DENORM)?;
+    prop_assert_eq!(
+        actual_series,
+        model_series,
+        "every histogram descriptor, field by field, keyed by its own series id"
+    );
     Ok(())
 }
 
@@ -727,43 +1014,60 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("rt")
 }
 
+/// Every generated dataset is run twice, once with sorting off and once on,
+/// rather than on a random coin flip, so no case escapes either mode.
+const SORTING_MODES: [bool; 2] = [false, true];
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
-    /// Scenario: random log records split into random requests, sorting on and off.
+    /// Scenario: random log records over several resources and scopes, split into
+    /// random requests, run with sorting off and then on.
     /// Guarantees: the values file equals the independently computed model as a multiset of
-    /// (series_id, time, body), the descriptor set matches and each descriptor's content
-    /// hashes back to its own series_id; with sorting on the file is globally ordered.
+    /// (series_id, time, body), and the whole descriptor map -- keyed by the series id the
+    /// file itself carries -- equals the model field by field, including resource and scope
+    /// attributes, all three schema urls, the identity attributes and the denormalized
+    /// columns; with sorting on the file is globally ordered.
     #[test]
     fn oracle_logs(
         recs in prop::collection::vec(log_rec(), 1..40),
         sizes in prop::collection::vec(1u8..6, 1..8),
-        sorting in any::<bool>(),
     ) {
-        rt().block_on(logs_case(recs, sizes, sorting))?;
+        for sorting in SORTING_MODES {
+            rt().block_on(logs_case(recs.clone(), sizes.clone(), sorting))?;
+        }
     }
 
-    /// Scenario: random gauge data points split into random requests, sorting on and off.
+    /// Scenario: random gauge and sum data points, of both temporalities and both
+    /// monotonicities, over several resources and scopes, split into random requests,
+    /// run with sorting off and then on.
     /// Guarantees: the number file equals the independently computed model as a multiset of
-    /// (series_id, time, value_int, value_double) and the descriptors match.
+    /// (series_id, time, value_int, value_double bits), doubles compared by bit pattern so
+    /// the sign of a zero is not lost, and the whole descriptor map equals the model field
+    /// by field, including metric name, unit, type, temporality, monotonicity and
+    /// description.
     #[test]
     fn oracle_metric_numbers(
         recs in prop::collection::vec(num_rec(), 1..30),
         sizes in prop::collection::vec(1u8..6, 1..8),
-        sorting in any::<bool>(),
     ) {
-        rt().block_on(number_case(recs, sizes, sorting))?;
+        for sorting in SORTING_MODES {
+            rt().block_on(number_case(recs.clone(), sizes.clone(), sorting))?;
+        }
     }
 
-    /// Scenario: random delta histogram points split into random requests, sorting on and off.
-    /// Guarantees: the histogram file equals the independently computed model as a multiset of
-    /// (series_id, time, count) and the descriptors carry kind and temporality.
+    /// Scenario: random histogram points of both temporalities over several resources and
+    /// scopes, split into random requests, run with sorting off and then on.
+    /// Guarantees: the histogram file equals the independently computed model as a multiset
+    /// of (series_id, time, count), and the whole descriptor map equals the model field by
+    /// field.
     #[test]
     fn oracle_metric_histograms(
         recs in prop::collection::vec(hist_rec(), 1..30),
         sizes in prop::collection::vec(1u8..6, 1..8),
-        sorting in any::<bool>(),
     ) {
-        rt().block_on(histogram_case(recs, sizes, sorting))?;
+        for sorting in SORTING_MODES {
+            rt().block_on(histogram_case(recs.clone(), sizes.clone(), sorting))?;
+        }
     }
 }
