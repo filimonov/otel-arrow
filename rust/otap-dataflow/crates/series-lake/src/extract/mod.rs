@@ -11,15 +11,15 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder,
     Float64Builder, Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    StructArray, TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimestampNanosecondType, UInt16Type};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::attrs::AttrTable;
+use crate::attrs::{AnyValueColumns, AttrTable};
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
@@ -97,6 +97,9 @@ pub struct Extracted {
 /// `decode_transport_optimized_ids` before any `parent_id` is read. Decoding is
 /// idempotent, so a request whose ids are already plain is unaffected.
 ///
+/// `cfg.ingress.max_extracted_bytes` is enforced on the measured extracted
+/// output: see [`Budget`] for how row estimates are replaced by measurements.
+///
 /// # Errors
 /// Refuses traces, a malformed request, or a request past its budgets.
 pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted> {
@@ -119,12 +122,17 @@ pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extra
 /// The single byte accountant of one request (spec section 6.2 step 4).
 ///
 /// One `Budget` is created in [`extract`] and threaded through every descriptor
-/// row, every values row and every sealed values batch, so that a request with
-/// many small datasets cannot spend the whole limit once per dataset. It is a
-/// deliberate upper bound: a row is charged both when it is built (its
-/// approximate size) and again through the pinned bytes of the batch it is
-/// sealed into. Ledger: the over-count is bounded by one Arrow copy of the
-/// request and is revisited in plan 3 with the memory benchmarks.
+/// row and every values row, so that a request with many small datasets cannot
+/// spend the whole limit once per dataset.
+///
+/// A values row is charged its approximate size while the run is being built,
+/// because nothing is measurable until the run is sealed. When the run *is*
+/// sealed, [`RowSink::seal`] replaces that estimate with the measured pinned
+/// bytes of the Arrow batch: it uncharges the run's accumulated estimate and
+/// charges the measurement, so the estimate is never counted alongside the
+/// measurement. `max_extracted_bytes` therefore bounds the measured extracted
+/// output plus the descriptor rows, which are estimated throughout because they
+/// are never sealed into an Arrow batch here.
 pub(crate) struct Budget {
     limit: usize,
     max_row: usize,
@@ -159,6 +167,14 @@ impl Budget {
             return Err(Error::Refused(RefuseReason::RequestTooLarge));
         }
         Ok(())
+    }
+
+    /// Give bytes back, saturating at zero.
+    ///
+    /// Used when an estimate is superseded by a measurement, and when a row
+    /// that was charged turns out to be a duplicate that is not retained.
+    pub(crate) fn uncharge(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
     }
 }
 
@@ -299,7 +315,7 @@ fn builder_for(dt: &DataType) -> Result<AnyBuilder> {
         DataType::Int32 => AnyBuilder::Int32(Int32Builder::new()),
         DataType::Float64 => AnyBuilder::Double(Float64Builder::new()),
         DataType::Boolean => AnyBuilder::Bool(BooleanBuilder::new()),
-        DataType::Timestamp(_, tz) => {
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             AnyBuilder::TsUs(TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()))
         }
         DataType::FixedSizeBinary(n) => AnyBuilder::Fixed(FixedSizeBinaryBuilder::new(*n)),
@@ -436,6 +452,9 @@ impl RowSink {
         let batch = RecordBatch::try_new(self.schema.clone(), cols)?;
         let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
         self.pinned += pinned;
+        // The run's rows were charged as estimates while it was being built;
+        // now that it is measurable, swap the estimate for the measurement.
+        budget.uncharge(self.slice_bytes);
         budget.charge(pinned)?;
         self.batches.push(batch);
         self.slice_bytes = 0;
@@ -469,12 +488,35 @@ pub(crate) fn struct_child(
     let Some(col) = batch.column_by_name(parent) else {
         return Ok(None);
     };
-    let s = col.as_struct();
+    let s = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| Error::invalid(format!("column {parent} is not a struct")))?;
     match s.column_by_name(child) {
         None => Ok(None),
         Some(c) if c.data_type() == to => Ok(Some(c.clone())),
         Some(c) => Ok(Some(arrow::compute::cast(c, to)?)),
     }
+}
+
+/// The `AnyValue` struct column `name` of a batch, or `None` when it is absent.
+///
+/// The downcast is checked: a column that is present but is not a struct
+/// refuses the request instead of panicking. `OtapArrowRecords` validates the
+/// OTAP schema on the way in, so this can only be reached by a batch built
+/// outside that validation.
+pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<AnyValueColumns>> {
+    let Some(col) = batch.column_by_name(name) else {
+        return Ok(None);
+    };
+    let s = col
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| Error::invalid(format!("column {name} is not an AnyValue struct")))?
+        .clone();
+    Ok(Some(AnyValueColumns::new(&|n| {
+        s.column_by_name(n).cloned()
+    })?))
 }
 
 /// Attribute table for a payload type, empty when the payload is absent.
@@ -640,4 +682,64 @@ pub(crate) fn descriptor_row(
         denorm,
         approx_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::RefuseReason;
+    use arrow::array::{StringArray, UInt8Array};
+    use arrow::datatypes::{Field, Schema};
+
+    fn batch_with_utf8(name: &str) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new(name, DataType::Utf8, true)]);
+        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["x"]))];
+        RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
+    }
+
+    /// Scenario: `struct_child` is given a batch whose `resource` column is a
+    /// string column rather than a struct.
+    /// Guarantees: the request is refused as invalid content, not panicked on by
+    /// an unchecked downcast.
+    #[test]
+    fn struct_child_refuses_a_non_struct_column() {
+        let b = batch_with_utf8("resource");
+        assert!(matches!(
+            struct_child(&b, "resource", "id", &DataType::UInt16),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        // An absent parent column is simply absent, not an error.
+        assert!(
+            struct_child(&b, "scope", "id", &DataType::UInt16)
+                .expect("absent parent")
+                .is_none()
+        );
+    }
+
+    /// Scenario: `any_value_col` is given a batch whose `body` column is a string
+    /// column rather than the OTAP `AnyValue` struct.
+    /// Guarantees: the request is refused as invalid content, not panicked on by
+    /// an unchecked downcast; a real struct body is accepted.
+    #[test]
+    fn any_value_col_refuses_a_non_struct_body() {
+        assert!(matches!(
+            any_value_col(&batch_with_utf8("body"), "body"),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+
+        let inner = Field::new("type", DataType::UInt8, false);
+        let body = Field::new("body", DataType::Struct(vec![inner.clone()].into()), false);
+        let struct_col: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(inner),
+            Arc::new(UInt8Array::from(vec![1u8])) as ArrayRef,
+        )]));
+        let b = RecordBatch::try_new(Arc::new(Schema::new(vec![body])), vec![struct_col])
+            .expect("batch");
+        let any = any_value_col(&b, "body")
+            .expect("struct body")
+            .expect("present");
+        // type 1 is TYPE_STR with no `str` column, so the value is null.
+        assert_eq!(any.value_at(0, 32).expect("value"), Value::Null);
+        assert!(any_value_col(&b, "absent").expect("absent").is_none());
+    }
 }

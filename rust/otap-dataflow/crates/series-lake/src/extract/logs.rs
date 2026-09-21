@@ -11,11 +11,10 @@ use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
-    denorm_bytes, denorm_lookup, descriptor_row, fixed_at, i64_at, map_col, opt_u16_at, plain,
-    producer_id, str_at, struct_child, timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, any_value_col,
+    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at, i64_at, map_col,
+    opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
-use crate::attrs::AnyValueColumns;
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
@@ -39,9 +38,6 @@ struct MemoKey {
     identity_attrs: Vec<u8>,
 }
 
-// `flags as i32` is a bit reinterpretation of the OTLP `u32` flags into the
-// signed storage column; stored as received; readers treat it as a bit set.
-#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn extract_logs(
     records: &OtapArrowRecords,
     cfg: &LakeConfig,
@@ -78,13 +74,7 @@ pub(crate) fn extract_logs(
     let scope_name = struct_child(logs, "scope", "name", &DataType::Utf8)?;
     let scope_version = struct_child(logs, "scope", "version", &DataType::Utf8)?;
     let scope_schema = plain(logs, "schema_url", &DataType::Utf8)?;
-    let body = match logs.column_by_name("body") {
-        Some(c) => {
-            let s = c.as_struct().clone();
-            Some(AnyValueColumns::new(&|n| s.column_by_name(n).cloned())?)
-        }
-        None => None,
-    };
+    let body = any_value_col(logs, "body")?;
 
     let allow: &[String] = &cfg.logs.series_attributes;
     let values_denorm = denorm_columns(Dataset::LogsValues, cfg);
@@ -142,6 +132,10 @@ pub(crate) fn extract_logs(
                 let id = dr.series_id;
                 if seen.insert(id) {
                     descriptors.push(dr);
+                } else {
+                    // Two memo keys can hash to the same series: the duplicate
+                    // is not retained, so give its charge back.
+                    budget.uncharge(dr.approx_bytes);
                 }
                 let _ = memo.insert(key, id);
                 id
@@ -175,6 +169,9 @@ pub(crate) fn extract_logs(
                     .then(|| a.as_primitive::<Int32Type>().value(row))
             })
             .unwrap_or(0);
+        // `flags as i32` below is a bit reinterpretation of the OTLP `u32` flags
+        // into the signed storage column: stored as received; readers treat it
+        // as a bit set.
         let flags_bits = flags
             .as_ref()
             .and_then(|a| {
@@ -195,7 +192,11 @@ pub(crate) fn extract_logs(
             Col::Str(Some(event_name_str)),
             Col::Fixed(fixed_at(&trace_id, row)),
             Col::Fixed(fixed_at(&span_id, row)),
-            Col::Int32(Some(flags_bits as i32)),
+            Col::Int32(Some({
+                #[allow(clippy::cast_possible_wrap)]
+                let flags_i32 = flags_bits as i32;
+                flags_i32
+            })),
             map_col(&residual),
         ];
         for d in &values_denorm {
@@ -237,8 +238,9 @@ mod tests {
     use crate::error::{Error, RefuseReason};
     use crate::extract::{extract, series_batch};
     use crate::schema::Dataset;
-    use arrow::array::{Array, AsArray};
-    use otel_arrow_dfe_pdata::otap::transform::transport_optimize::apply_transport_optimized_encodings;
+    use arrow::array::{Array, ArrayRef, AsArray, StringArray};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
@@ -246,6 +248,7 @@ mod tests {
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
+    use std::sync::Arc;
 
     fn kv(k: &str, v: &str) -> KeyValue {
         KeyValue {
@@ -266,6 +269,10 @@ mod tests {
                 value: Some(any_value::Value::StringValue(body.into())),
             }),
             attributes: attrs,
+            event_name: "ev".into(),
+            flags: 0x0000_0101,
+            trace_id: vec![0xAA; 16],
+            span_id: vec![0xBB; 8],
             ..Default::default()
         };
         LogsData {
@@ -350,6 +357,39 @@ mod tests {
         let attrs = b.column_by_name("attrs").expect("attrs").as_map();
         // row 0 residual attrs: only request_id (logger.name is identity)
         assert_eq!(attrs.value_length(0), 1);
+        let body = b.column_by_name("body").expect("body").as_string::<i32>();
+        assert_eq!(body.value(0), "a");
+        assert_eq!(body.value(1), "b");
+        let sev_num = b
+            .column_by_name("severity_number")
+            .expect("sev num")
+            .as_primitive::<Int32Type>();
+        assert_eq!(sev_num.value(0), 9);
+        let sev_text = b
+            .column_by_name("severity_text")
+            .expect("sev text")
+            .as_string::<i32>();
+        assert_eq!(sev_text.value(0), "INFO");
+        let event = b
+            .column_by_name("event_name")
+            .expect("event_name")
+            .as_string::<i32>();
+        assert_eq!(event.value(0), "ev");
+        let trace = b
+            .column_by_name("trace_id")
+            .expect("trace_id")
+            .as_fixed_size_binary();
+        assert_eq!(trace.value(0), [0xAA; 16]);
+        let span = b
+            .column_by_name("span_id")
+            .expect("span_id")
+            .as_fixed_size_binary();
+        assert_eq!(span.value(0), [0xBB; 8]);
+        let flags = b
+            .column_by_name("flags")
+            .expect("flags")
+            .as_primitive::<Int32Type>();
+        assert_eq!(flags.value(0), 0x0000_0101);
         assert_eq!(out.stats.rows, 3);
         assert!(out.pinned_bytes > 0);
         // descriptor denorm: only the identity-path column (service_name)
@@ -415,18 +455,10 @@ mod tests {
         let plain = extract(&mut plain_records, &cfg()).expect("extract plain");
 
         let mut optimized = encode_logs(&logs_data());
-        for pt in [
-            ArrowPayloadType::ResourceAttrs,
-            ArrowPayloadType::ScopeAttrs,
-            ArrowPayloadType::LogAttrs,
-        ] {
-            let Some(batch) = optimized.get(pt).cloned() else {
-                continue;
-            };
-            let (encoded, _remap) =
-                apply_transport_optimized_encodings(&pt, &batch).expect("encode");
-            optimized.set(pt, encoded).expect("set");
-        }
+        // The whole-record encoder covers the Logs payload's own resource.id and
+        // scope.id delta encoding as well as the three attribute payloads, so
+        // both halves of the decode are exercised.
+        optimized.encode_transport_optimized().expect("encode");
         let got = extract(&mut optimized, &cfg()).expect("extract optimized");
 
         let ids = |e: &Extracted| {
@@ -502,5 +534,117 @@ mod tests {
             .expect("unattributed descriptor");
         assert_eq!(with_attrs.descriptor.attrs.len(), 1);
         assert_ne!(with_attrs.series_id, without.series_id);
+    }
+
+    /// Scenario: the Logs payload's `body` column is replaced by a plain string
+    /// column and handed back to `OtapArrowRecords`.
+    /// Guarantees: pdata validates the OTAP schema on the way in and refuses it,
+    /// so a non-struct body cannot reach `extract` through the public API. The
+    /// checked downcast that backs this up is covered directly by
+    /// `extract::tests::any_value_col_refuses_a_non_struct_body`.
+    #[test]
+    fn pdata_refuses_a_non_struct_body_column() {
+        let mut records = encode_logs(&logs_data());
+        let logs = records.get(ArrowPayloadType::Logs).expect("logs").clone();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut cols: Vec<ArrayRef> = Vec::new();
+        for (i, f) in logs.schema().fields().iter().enumerate() {
+            if f.name() == "body" {
+                fields.push(Field::new("body", DataType::Utf8, true));
+                cols.push(Arc::new(StringArray::from(vec!["x"; logs.num_rows()])) as ArrayRef);
+            } else {
+                fields.push(f.as_ref().clone());
+                cols.push(logs.column(i).clone());
+            }
+        }
+        let patched =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("patched batch");
+        assert!(records.set(ArrowPayloadType::Logs, patched).is_err());
+    }
+
+    /// Scenario: the same request extracted with `max_extracted_bytes` set to
+    /// exactly what the run measures, and to one byte less.
+    /// Guarantees: the limit is enforced on the measured extracted output, so a
+    /// values row is charged its estimate or its measurement but never both.
+    #[test]
+    fn budget_is_enforced_on_the_measured_output() {
+        let mut probe = encode_logs(&logs_data());
+        let out = extract(&mut probe, &cfg()).expect("extract");
+        // What the budget holds once the run is sealed: the estimated descriptor
+        // rows plus the measured pinned bytes of the values batches. The values
+        // rows' estimates were uncharged when their run was sealed.
+        let measured: usize = out
+            .descriptors
+            .iter()
+            .map(|d| d.approx_bytes)
+            .sum::<usize>()
+            + out.pinned_bytes;
+
+        let mut exact = cfg();
+        exact.ingress.max_extracted_bytes = measured;
+        let mut records = encode_logs(&logs_data());
+        let _accepted = extract(&mut records, &exact).expect("accepted at the measured size");
+
+        let mut tight = cfg();
+        tight.ingress.max_extracted_bytes = measured - 1;
+        let mut records = encode_logs(&logs_data());
+        assert!(matches!(
+            extract(&mut records, &tight),
+            Err(Error::Refused(RefuseReason::RequestTooLarge))
+        ));
+    }
+
+    /// Scenario: a denormalized column declared `int64` over a string resource
+    /// attribute.
+    /// Guarantees: the cell is stored as null and `denorm_type_mismatch` counts it.
+    #[test]
+    fn denorm_type_mismatch_is_counted() {
+        let mut cfg = cfg();
+        cfg.logs.denormalize = vec![Denormalize {
+            path: "resource.service.name".into(),
+            column: "service_name".into(),
+            ty: DenormType::Int64,
+        }];
+        let mut records = encode_logs(&logs_data());
+        let out = extract(&mut records, &cfg).expect("extract");
+        assert!(out.stats.denorm_type_mismatch > 0);
+        let (_, batches) = &out.values[0];
+        let svc = batches[0]
+            .column_by_name("service_name")
+            .expect("service_name");
+        assert!(svc.is_null(0));
+    }
+
+    /// Scenario: a log record whose `time_unix_nano` is above `i64::MAX`, so it
+    /// arrives as a negative nanosecond count.
+    /// Guarantees: both timestamp columns are null and `timestamp_out_of_range`
+    /// counts the record once.
+    #[test]
+    fn timestamp_out_of_range_is_counted() {
+        let data = LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", "h1")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: u64::MAX,
+                        observed_time_unix_nano: 1_000,
+                        attributes: vec![kv("logger.name", "L1")],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut records = encode_logs(&data);
+        let out = extract(&mut records, &cfg()).expect("extract");
+        assert_eq!(out.stats.timestamp_out_of_range, 1);
+        let (_, batches) = &out.values[0];
+        let b = &batches[0];
+        assert!(b.column_by_name("time_unix_nano").expect("t").is_null(0));
+        assert!(b.column_by_name("time").expect("time").is_null(0));
     }
 }

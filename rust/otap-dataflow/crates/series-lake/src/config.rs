@@ -209,7 +209,13 @@ impl Default for SignalConfig {
 pub struct IngressLimits {
     /// Logical input size limit.
     pub max_request_bytes: usize,
-    /// Extracted output limit.
+    /// Extracted output limit, enforced on the *measured* extracted output.
+    ///
+    /// Values rows are charged as estimates only while their run is being
+    /// built; sealing a run replaces that estimate with the measured pinned
+    /// bytes of the Arrow batch, so a row is never counted twice. Descriptor
+    /// rows, which are not sealed into Arrow batches during extraction, stay
+    /// charged at their estimated size.
     pub max_extracted_bytes: usize,
     /// Single row limit.
     pub max_row_bytes: usize,
