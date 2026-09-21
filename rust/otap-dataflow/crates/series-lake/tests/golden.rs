@@ -74,7 +74,8 @@ fn descriptor_from_json(j: &serde_json::Value) -> Descriptor {
             "sum" => MetricKind::Sum,
             "histogram" => MetricKind::Histogram,
             "exp_histogram" => MetricKind::ExpHistogram,
-            _ => MetricKind::Summary,
+            "summary" => MetricKind::Summary,
+            other => panic!("unknown kind {other}"),
         },
         temporality: match str_field(m, "temporality").as_str() {
             "delta" => Temporality::Delta,
@@ -112,7 +113,20 @@ fn golden_vectors_match() {
     let raw = include_str!("golden/canonical_v1.json");
     let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
     let vectors = doc["vectors"].as_array().expect("vectors");
-    assert!(vectors.len() >= 30);
+    assert_eq!(vectors.len(), 33);
+    let names: Vec<&str> = vectors
+        .iter()
+        .map(|v| v["name"].as_str().expect("name"))
+        .collect();
+    for expect in [
+        "nan_quiet",
+        "nan_payload",
+        "nan_negative",
+        "metrics_exp_histogram_delta",
+        "metrics_summary",
+    ] {
+        assert!(names.contains(&expect), "missing vector {expect}");
+    }
     for v in vectors {
         let name = v["name"].as_str().expect("name");
         let d = descriptor_from_json(&v["descriptor"]);

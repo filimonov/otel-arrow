@@ -343,4 +343,30 @@ mod tests {
         assert_eq!(metrics.metric.is_some(), metrics.signal == Signal::Metrics);
         let _ = canonical_bytes(&metrics);
     }
+
+    /// Scenario: two metrics descriptors that differ only in `MetricDescriptor::description`.
+    /// Guarantees: `description` is excluded from the identity, so the canonical bytes and
+    /// series id are identical.
+    #[test]
+    fn description_does_not_change_identity() {
+        let make = |description: &str| Descriptor {
+            signal: Signal::Metrics,
+            metric: Some(MetricDescriptor {
+                name: "cpu.usage".into(),
+                unit: "s".into(),
+                kind: MetricKind::Gauge,
+                temporality: Temporality::Unspecified,
+                is_monotonic: false,
+                description: description.into(),
+            }),
+            ..logs_desc()
+        };
+        let a = make("a short description");
+        let b = make("a completely different, much longer description");
+        assert_eq!(canonical_bytes(&a), canonical_bytes(&b));
+        assert_eq!(
+            series_id(&canonical_bytes(&a)),
+            series_id(&canonical_bytes(&b))
+        );
+    }
 }

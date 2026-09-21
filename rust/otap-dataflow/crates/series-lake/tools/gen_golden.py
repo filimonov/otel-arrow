@@ -122,6 +122,8 @@ cases = [
     ("metrics_gauge", base_metrics),
     ("metrics_sum_delta_monotonic", {**base_metrics, "metric": dict(name="req", unit="1", kind="sum", temporality="delta", is_monotonic=True)}),
     ("metrics_histogram_cumulative", {**base_metrics, "metric": dict(name="lat", unit="ms", kind="histogram", temporality="cumulative", is_monotonic=False)}),
+    ("metrics_exp_histogram_delta", {**base_metrics, "metric": dict(name="lat", unit="ms", kind="exp_histogram", temporality="delta", is_monotonic=False)}),
+    ("metrics_summary", {**base_metrics, "metric": dict(name="lat", unit="ms", kind="summary", temporality="", is_monotonic=False)}),
     ("metrics_dp_attrs", {**base_metrics, "attrs": [kv("cpu", I(3)), kv("mode", S("user"))]}),
     ("metrics_scope_attrs", {**base_metrics, "scope_attrs": [kv("s", S("v"))], "scope_name": "m", "scope_version": "2"}),
     ("producer_a", {**base_logs, "resource_attrs": [kv("host.id", S("a"))]}),
