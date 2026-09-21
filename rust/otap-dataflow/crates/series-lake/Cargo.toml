@@ -1,0 +1,40 @@
+[package]
+name = "otel-arrow-dfe-series-lake"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = "README.md"
+publish.workspace = true
+rust-version.workspace = true
+description = "Series/values normalization and Parquet sink for OTAP telemetry"
+
+[features]
+default = []
+
+[dependencies]
+otel-arrow-dfe-pdata.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+object_store.workspace = true
+ciborium.workspace = true
+xxhash-rust.workspace = true
+lru.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+humantime-serde.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
