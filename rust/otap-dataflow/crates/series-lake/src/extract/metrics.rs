@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::{Array, AsArray, ListArray};
 use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UInt64Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
+use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::schema::consts::{
     AGGREGATION_TEMPORALITY, DESCRIPTION, DOUBLE_VALUE, FLAGS, HISTOGRAM_BUCKET_COUNTS,
@@ -18,8 +19,8 @@ use otel_arrow_dfe_pdata::schema::consts::{
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
-    denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, list_col, opt_f64, opt_i64,
-    opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child, timestamp_pair,
+    denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, kv_bytes, list_col, opt_f64,
+    opt_i64, opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
 use crate::attrs::AttrTable;
 use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
@@ -30,10 +31,22 @@ use crate::value::Value;
 
 /// Per-metric fields read once from the `UnivariateMetrics` batch.
 ///
-/// Only the finished `descriptor_base` is kept: the resource and scope ids were
-/// already resolved into attribute lists here, so nothing downstream reads them.
+/// The resource and scope attribute *ids* are kept, not their attribute lists:
+/// many metrics of one request share a single resource, and copying that list
+/// per metric here would allocate a multiple of the request's attribute volume
+/// before any [`Budget`] charge could refuse it. The lists are resolved and
+/// copied once per distinct series, in [`Common::series_for`], after the copy
+/// has been charged.
 struct MetricRow {
-    descriptor_base: Descriptor,
+    /// Resource attribute parent id, `None` when the metric carries none.
+    resource_id: Option<u32>,
+    /// Scope attribute parent id, `None` when the metric carries none.
+    scope_id: Option<u32>,
+    resource_schema_url: String,
+    scope_name: String,
+    scope_version: String,
+    scope_schema_url: String,
+    metric: MetricDescriptor,
 }
 
 /// Memo key for a metrics series: the metric and the point's attribute parent.
@@ -53,12 +66,7 @@ struct MemoKey {
     attrs_id: Option<u32>,
 }
 
-fn metric_rows(
-    records: &OtapArrowRecords,
-    resource_attrs: &AttrTable,
-    scope_attrs: &AttrTable,
-    cfg: &LakeConfig,
-) -> Result<HashMap<u32, MetricRow>> {
+fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u32, MetricRow>> {
     let Some(m) = records.get(ArrowPayloadType::UnivariateMetrics) else {
         return Ok(HashMap::new());
     };
@@ -80,13 +88,18 @@ fn metric_rows(
         let kind_u8 = kind
             .as_ref()
             .map_or(0, |a| a.as_primitive::<UInt8Type>().value(row));
-        let kind = match kind_u8 {
-            1 => MetricKind::Gauge,
-            2 => MetricKind::Sum,
-            3 => MetricKind::Histogram,
-            4 => MetricKind::ExpHistogram,
-            5 => MetricKind::Summary,
-            other => return Err(Error::invalid(format!("metric_type {other}"))),
+        // pdata already owns the OTAP metric type tags; reuse its enum rather
+        // than a second copy of the same numbering. `Empty` has no kind of its
+        // own and is refused exactly like an unknown tag.
+        let kind = match MetricType::try_from(kind_u8) {
+            Ok(MetricType::Gauge) => MetricKind::Gauge,
+            Ok(MetricType::Sum) => MetricKind::Sum,
+            Ok(MetricType::Histogram) => MetricKind::Histogram,
+            Ok(MetricType::ExponentialHistogram) => MetricKind::ExpHistogram,
+            Ok(MetricType::Summary) => MetricKind::Summary,
+            Ok(MetricType::Empty) | Err(_) => {
+                return Err(Error::invalid(format!("metric_type {kind_u8}")));
+            }
         };
         let temporality = match temporality.as_ref().and_then(|a| {
             a.is_valid(row)
@@ -120,17 +133,14 @@ fn metric_rows(
             }
             MetricKind::Gauge => {}
         }
-        let rid = opt_u16_at(&res_id, row);
-        let sid = opt_u16_at(&scope_id, row);
-        let descriptor_base = Descriptor {
-            signal: Signal::Metrics,
-            resource_attrs: attrs_of(resource_attrs, rid).to_vec(),
+        let row_out = MetricRow {
+            resource_id: opt_u16_at(&res_id, row),
+            scope_id: opt_u16_at(&scope_id, row),
             resource_schema_url: str_at(&res_schema, row),
             scope_name: str_at(&scope_name, row),
             scope_version: str_at(&scope_version, row),
             scope_schema_url: str_at(&scope_schema, row),
-            scope_attrs: attrs_of(scope_attrs, sid).to_vec(),
-            metric: Some(MetricDescriptor {
+            metric: MetricDescriptor {
                 name: str_at(&name, row),
                 unit: str_at(&unit, row),
                 kind,
@@ -144,12 +154,11 @@ fn metric_rows(
                         .as_ref()
                         .is_some_and(|a| a.is_valid(row) && a.as_boolean().value(row)),
                 description: str_at(&description, row),
-            }),
-            attrs: vec![],
+            },
         };
         let metric_id =
             opt_u16_at(&id, row).ok_or_else(|| Error::invalid("metric row without id"))?;
-        let _ = out.insert(metric_id, MetricRow { descriptor_base });
+        let _ = out.insert(metric_id, row_out);
     }
     Ok(out)
 }
@@ -157,6 +166,8 @@ fn metric_rows(
 struct Common<'a> {
     cfg: &'a LakeConfig,
     metrics: &'a HashMap<u32, MetricRow>,
+    resource_attrs: &'a AttrTable,
+    scope_attrs: &'a AttrTable,
     descriptors: Vec<DescriptorRow>,
     seen: HashSet<SeriesId>,
     memo: HashMap<MemoKey, SeriesId>,
@@ -179,6 +190,13 @@ impl Common<'_> {
     /// Without the memo, `canonical_bytes` plus XXH3 plus the denormalized
     /// lookups would run once per data point instead of once per series, and
     /// `stats.denorm_type_mismatch` would count points rather than series.
+    ///
+    /// The descriptor's attribute lists are copied here, once per distinct memo
+    /// key, and the copy is charged to `budget` *before* it is made: a request
+    /// whose metrics all share one large resource attribute list is refused at
+    /// the charge rather than after allocating a copy per metric. The charge is
+    /// an over-estimate of the copy alone, so it is given back once
+    /// [`descriptor_row`] has charged the whole row.
     fn series_for(
         &mut self,
         metric_id: u32,
@@ -193,9 +211,24 @@ impl Common<'_> {
         if let Some(id) = self.memo.get(&key) {
             return Ok(*id);
         }
-        let mut d = metric_of(self.metrics, metric_id)?.descriptor_base.clone();
-        d.attrs = attrs.to_vec();
+        let m = metric_of(self.metrics, metric_id)?;
+        let resource = attrs_of(self.resource_attrs, m.resource_id);
+        let scope = attrs_of(self.scope_attrs, m.scope_id);
+        let copy_bytes = kv_bytes(resource) + kv_bytes(scope) + kv_bytes(attrs);
+        budget.charge_row(copy_bytes)?;
+        let d = Descriptor {
+            signal: Signal::Metrics,
+            resource_attrs: resource.to_vec(),
+            resource_schema_url: m.resource_schema_url.clone(),
+            scope_name: m.scope_name.clone(),
+            scope_version: m.scope_version.clone(),
+            scope_schema_url: m.scope_schema_url.clone(),
+            scope_attrs: scope.to_vec(),
+            metric: Some(m.metric.clone()),
+            attrs: attrs.to_vec(),
+        };
         let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats, budget)?;
+        budget.uncharge(copy_bytes);
         let id = dr.series_id;
         if self.seen.insert(id) {
             self.descriptors.push(dr);
@@ -246,6 +279,7 @@ fn explicit_bounds_at(a: &Option<ListArray>, row: usize) -> Result<Vec<f64>> {
 fn common_cols(
     id: SeriesId,
     m: &MetricRow,
+    resource: &[(String, Value)],
     cfg: &LakeConfig,
     t_ns: i64,
     s_ns: i64,
@@ -254,16 +288,8 @@ fn common_cols(
 ) -> (Vec<Col>, usize) {
     let (t_ns, t_us) = timestamp_pair(t_ns, stats);
     let (s_ns, s_us) = timestamp_pair(s_ns, stats);
-    let producer = producer_id(
-        &m.descriptor_base.resource_attrs,
-        &cfg.producer_id_attribute,
-    );
-    let name = m
-        .descriptor_base
-        .metric
-        .as_ref()
-        .map(|x| x.name.clone())
-        .unwrap_or_default();
+    let producer = producer_id(resource, &cfg.producer_id_attribute);
+    let name = m.metric.name.clone();
     let bytes = 16 + producer.len() + name.len() + 8 * 5 + 48;
     let cols = vec![
         Col::Fixed(Some(id.to_vec())),
@@ -282,20 +308,15 @@ fn common_cols(
 fn push_denorm(
     cols: &mut Vec<Col>,
     ds: Dataset,
-    m: &MetricRow,
+    resource: &[(String, Value)],
+    scope: &[(String, Value)],
     attrs: &[(String, Value)],
     cfg: &LakeConfig,
     stats: &mut ExtractStats,
 ) -> usize {
     let mut bytes = 0;
     for d in denorm_columns(ds, cfg) {
-        let v = denorm_lookup(
-            d,
-            &m.descriptor_base.resource_attrs,
-            &m.descriptor_base.scope_attrs,
-            attrs,
-            stats,
-        );
+        let v = denorm_lookup(d, resource, scope, attrs, stats);
         bytes += denorm_bytes(&v);
         cols.push(Col::from(v));
     }
@@ -310,10 +331,12 @@ pub(crate) fn extract_metrics(
     let depth = cfg.ingress.max_nesting_depth;
     let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, depth)?;
     let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, depth)?;
-    let metrics = metric_rows(records, &resource_attrs, &scope_attrs, cfg)?;
+    let metrics = metric_rows(records, cfg)?;
     let mut c = Common {
         cfg,
         metrics: &metrics,
+        resource_attrs: &resource_attrs,
+        scope_attrs: &scope_attrs,
         descriptors: Vec::new(),
         seen: HashSet::new(),
         memo: HashMap::new(),
@@ -375,9 +398,12 @@ pub(crate) fn extract_metrics(
             };
             let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
             let m = metric_of(&metrics, metric_id)?;
+            let resource = attrs_of(&resource_attrs, m.resource_id);
+            let scope = attrs_of(&scope_attrs, m.scope_id);
             let (mut cols, mut approx) = common_cols(
                 id,
                 m,
+                resource,
                 cfg,
                 i64_at(&time, row),
                 i64_at(&start, row),
@@ -390,7 +416,8 @@ pub(crate) fn extract_metrics(
             approx += push_denorm(
                 &mut cols,
                 Dataset::MetricsNumber,
-                m,
+                resource,
+                scope,
                 point_attrs,
                 cfg,
                 &mut c.stats,
@@ -453,9 +480,12 @@ pub(crate) fn extract_metrics(
                 .unwrap_or(0);
             let cnt =
                 i64::try_from(cnt).map_err(|_| Error::invalid("histogram count above i64::MAX"))?;
+            let resource = attrs_of(&resource_attrs, m.resource_id);
+            let scope = attrs_of(&scope_attrs, m.scope_id);
             let (mut cols, mut approx) = common_cols(
                 id,
                 m,
+                resource,
                 cfg,
                 i64_at(&time, row),
                 i64_at(&start, row),
@@ -472,7 +502,8 @@ pub(crate) fn extract_metrics(
             approx += push_denorm(
                 &mut cols,
                 Dataset::MetricsHistogram,
-                m,
+                resource,
+                scope,
                 point_attrs,
                 cfg,
                 &mut c.stats,
@@ -615,6 +646,61 @@ mod tests {
                 ..Default::default()
             },
         ])
+    }
+
+    /// Many metrics under one resource whose single attribute is `bytes` long.
+    fn many_metrics_one_big_resource(count: usize, bytes: usize) -> MetricsData {
+        let metrics = (0..count)
+            .map(|i| Metric {
+                name: format!("m{i}"),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![dp(10, number_data_point::Value::AsInt(1), vec![])],
+                })),
+                ..Default::default()
+            })
+            .collect();
+        MetricsData {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv("big", &"x".repeat(bytes))],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Scenario: forty metrics share one resource carrying a 64 KiB attribute,
+    /// so the descriptors together copy roughly 2.5 MiB of attributes.
+    /// Guarantees: the copies are charged to the extracted budget, one per
+    /// distinct series, and nothing is copied before the charge. Under the
+    /// default 32 MiB budget all forty descriptors are produced; under a 1 MiB
+    /// budget the request is refused as too large instead of allocating forty
+    /// copies first.
+    #[test]
+    fn shared_resource_attributes_are_charged_before_they_are_copied() {
+        const METRICS: usize = 40;
+        const ATTR_BYTES: usize = 64 << 10;
+        let d = many_metrics_one_big_resource(METRICS, ATTR_BYTES);
+
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        let records = encode_metrics(&d);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("within the default budget");
+        assert_eq!(out.descriptors.len(), METRICS);
+
+        let mut small = LakeConfig::default();
+        small.ingress.max_extracted_bytes = 1 << 20;
+        let mut budget = Budget::new(&small);
+        let records = encode_metrics(&d);
+        assert!(matches!(
+            extract_metrics(&records, &small, &mut budget),
+            Err(Error::Refused(RefuseReason::RequestTooLarge))
+        ));
     }
 
     /// Scenario: a gauge with two series and a cumulative histogram.

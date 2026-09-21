@@ -479,7 +479,48 @@ pub(crate) fn map_col(list: &[(String, Value)]) -> Col {
     )
 }
 
+/// The children of a struct column with the parent's validity applied.
+///
+/// A null struct row has no children at all, but a valid Arrow array may still
+/// hold arbitrary values in the child buffers underneath it. Reading a child
+/// directly would therefore fabricate a resource id, a scope name or a log body
+/// that the request never carried. `StructArray::flatten` unions the parent's
+/// null buffer into every child, which is exactly the masking wanted here; a
+/// struct with no null buffer needs no masking and its children are returned
+/// unchanged.
+fn flat_children(s: &StructArray) -> Vec<(String, ArrayRef)> {
+    if s.nulls().is_none() {
+        return s
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .zip(s.columns().iter().map(Arc::clone))
+            .collect();
+    }
+    let (fields, columns) = s.flatten();
+    fields
+        .iter()
+        .map(|f| f.name().clone())
+        .zip(columns)
+        .collect()
+}
+
+/// One child of a struct column with the parent's validity applied.
+///
+/// See [`flat_children`] for why the parent's null buffer matters.
+fn flat_child(s: &StructArray, child: &str) -> Option<ArrayRef> {
+    if s.nulls().is_none() {
+        return s.column_by_name(child).map(Arc::clone);
+    }
+    let (fields, columns) = s.flatten();
+    let idx = fields.iter().position(|f| f.name() == child)?;
+    columns.get(idx).map(Arc::clone)
+}
+
 /// Child of a struct column, cast to a plain type, or `None` when absent.
+///
+/// The parent struct's validity is applied first: a child value under a null
+/// parent reads as null, never as a fabricated value.
 pub(crate) fn struct_child(
     batch: &RecordBatch,
     parent: &str,
@@ -493,10 +534,10 @@ pub(crate) fn struct_child(
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| Error::invalid(format!("column {parent} is not a struct")))?;
-    match s.column_by_name(child) {
+    match flat_child(s, child) {
         None => Ok(None),
-        Some(c) if c.data_type() == to => Ok(Some(c.clone())),
-        Some(c) => Ok(Some(arrow::compute::cast(c, to)?)),
+        Some(c) if c.data_type() == to => Ok(Some(c)),
+        Some(c) => Ok(Some(arrow::compute::cast(&c, to)?)),
     }
 }
 
@@ -506,6 +547,10 @@ pub(crate) fn struct_child(
 /// refuses the request instead of panicking. `OtapArrowRecords` validates the
 /// OTAP schema on the way in, so this can only be reached by a batch built
 /// outside that validation.
+///
+/// The struct's own validity is applied to its children (see
+/// [`flat_children`]), so a null body row reads as a null type tag and becomes
+/// [`Value::Null`] rather than whatever the child buffers happen to hold.
 pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<AnyValueColumns>> {
     let Some(col) = batch.column_by_name(name) else {
         return Ok(None);
@@ -513,10 +558,13 @@ pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<An
     let s = col
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| Error::invalid(format!("column {name} is not an AnyValue struct")))?
-        .clone();
+        .ok_or_else(|| Error::invalid(format!("column {name} is not an AnyValue struct")))?;
+    let children = flat_children(s);
     Ok(Some(AnyValueColumns::new(&|n| {
-        s.column_by_name(n).cloned()
+        children
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, a)| Arc::clone(a))
     })?))
 }
 
@@ -747,7 +795,8 @@ pub(crate) fn descriptor_row(
 mod tests {
     use super::*;
     use crate::error::RefuseReason;
-    use arrow::array::{StringArray, UInt8Array};
+    use arrow::array::{StringArray, UInt8Array, UInt16Array};
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
     use arrow::datatypes::{Field, Schema};
 
     fn batch_with_utf8(name: &str) -> RecordBatch {
@@ -822,5 +871,51 @@ mod tests {
             Value::Str(String::new())
         );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
+    }
+
+    /// Scenario: a `resource` struct and an `AnyValue` `body` struct whose
+    /// second row is null while their child buffers still hold live values --
+    /// a shape a valid Arrow producer is free to emit.
+    /// Guarantees: the parent struct's validity wins. The masked child reads as
+    /// null instead of a fabricated resource id, and the masked body decodes to
+    /// [`Value::Null`] instead of a fabricated log body.
+    #[test]
+    fn null_parent_struct_masks_its_children() {
+        let nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false]));
+        let id_field = Arc::new(Field::new("id", DataType::UInt16, false));
+        let resource = StructArray::new(
+            vec![id_field].into(),
+            vec![Arc::new(UInt16Array::from(vec![7u16, 9])) as ArrayRef],
+            Some(nulls.clone()),
+        );
+        let body = StructArray::new(
+            vec![
+                Arc::new(Field::new("type", DataType::UInt8, false)),
+                Arc::new(Field::new("str", DataType::Utf8, false)),
+            ]
+            .into(),
+            vec![
+                Arc::new(UInt8Array::from(vec![1u8, 1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["kept", "fabricated"])) as ArrayRef,
+            ],
+            Some(nulls),
+        );
+        let schema = Schema::new(vec![
+            Field::new("resource", resource.data_type().clone(), true),
+            Field::new("body", body.data_type().clone(), true),
+        ]);
+        let cols: Vec<ArrayRef> = vec![Arc::new(resource), Arc::new(body)];
+        let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
+
+        let ids = struct_child(&b, "resource", "id", &DataType::UInt16).expect("child");
+        assert_eq!(opt_u16_at(&ids, 0), Some(7));
+        assert_eq!(opt_u16_at(&ids, 1), None);
+
+        let any = any_value_col(&b, "body").expect("body").expect("present");
+        assert_eq!(
+            any.value_at(0, 32).expect("row 0"),
+            Value::Str("kept".into())
+        );
+        assert_eq!(any.value_at(1, 32).expect("row 1"), Value::Null);
     }
 }

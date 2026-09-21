@@ -131,7 +131,7 @@ fn golden_vectors_match() {
         let d = descriptor_from_json(&v["descriptor"]);
         let bytes = canonical_bytes(&d);
         assert_eq!(
-            hex_bytes(&bytes),
+            hex::encode(&bytes),
             v["canonical_hex"].as_str().expect("hex"),
             "bytes of {name}"
         );
@@ -190,8 +190,4 @@ fn producer_attribute_changes_identity() {
             .clone()
     };
     assert_ne!(find("producer_a"), find("producer_b"));
-}
-
-fn hex_bytes(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
