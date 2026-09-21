@@ -286,17 +286,28 @@ impl<T> Block<T> {
         if self.emitted_at_us.is_some() {
             return Err(Error::invalid("block already sealed"));
         }
-        let signal = extracted.signal;
+        let Extracted {
+            signal,
+            descriptors,
+            values,
+            ..
+        } = extracted;
         if !reservation.new_series.is_empty() {
             let ds = Dataset::series_of(signal);
             let slot = self.pending_descriptors.entry(ds).or_default();
-            for i in reservation.new_series {
-                let row = extracted.descriptors[i].clone();
-                let _ = self.pending_series.insert(row.series_id);
-                slot.push(row);
+            // `new_series` holds ascending indices into `descriptors`, which this
+            // call owns: move the chosen rows out instead of cloning them, and
+            // drop the rest with the vector.
+            let mut wanted = reservation.new_series.iter().copied().peekable();
+            for (i, row) in descriptors.into_iter().enumerate() {
+                if wanted.peek() == Some(&i) {
+                    let _ = wanted.next();
+                    let _ = self.pending_series.insert(row.series_id);
+                    slot.push(row);
+                }
             }
         }
-        for (ds, batches) in extracted.values {
+        for (ds, batches) in values {
             let run_target = self.cfg.sorting.run_target_bytes;
             let spec = self.spec_for(ds);
             let table = self
@@ -318,17 +329,39 @@ impl<T> Block<T> {
     /// Idempotent: a flush retry re-seals the same block and reuses the first
     /// stamp, so the file bytes are identical across attempts (spec 5.3).
     ///
+    /// The block becomes sealed only once every fallible step has succeeded.
+    /// `emitted_at` is stamped last, so a failed seal leaves `is_sealed()`
+    /// false and the sink refuses to write the block rather than silently
+    /// dropping the descriptor rows it could not materialize.
+    ///
+    /// Descriptor rows are moved into their `series` batch, never copied, and
+    /// the whole pending set is released as soon as every batch has been built
+    /// -- before the table appends that may concatenate and sort a run. Peak
+    /// transient memory during a series seal is nonetheless proportional to the
+    /// block's whole descriptor volume: one dataset's descriptor rows and the
+    /// Arrow batch built from them are resident at the same time. Materializing
+    /// descriptors into bounded incremental runs instead is a deferred v1
+    /// limitation (see `docs/FORMAT.md`).
+    ///
     /// # Errors
     /// Propagates a failure from building the `series` batch or sealing a run.
     pub fn seal(&mut self, emitted_at_us: i64) -> Result<()> {
-        let stamp = *self.emitted_at_us.get_or_insert(emitted_at_us);
-        let pending = std::mem::take(&mut self.pending_descriptors);
-        for (ds, rows) in pending {
+        // Reuse the first stamp, but do not commit it to the block until the
+        // end: an `emitted_at` set by a seal that then failed would make
+        // `is_sealed()` report a block that never finished sealing.
+        let stamp = self.emitted_at_us.unwrap_or(emitted_at_us);
+        let mut series: Vec<(Dataset, RecordBatch)> = Vec::new();
+        for (ds, rows) in &self.pending_descriptors {
             if rows.is_empty() {
                 continue;
             }
             let refs: Vec<&DescriptorRow> = rows.iter().collect();
-            let batch = series_batch(&refs, stamp, ds, &self.cfg)?;
+            series.push((*ds, series_batch(&refs, stamp, *ds, &self.cfg)?));
+        }
+        // Every batch now holds the descriptors' data, so the rows themselves
+        // are redundant: drop them before the appends below.
+        self.pending_descriptors.clear();
+        for (ds, batch) in series {
             let run_target = self.cfg.sorting.run_target_bytes;
             let spec = self.spec_for(ds);
             let table = self
@@ -341,6 +374,7 @@ impl<T> Block<T> {
             t.seal()?;
         }
         self.bytes = self.recount();
+        self.emitted_at_us = Some(stamp);
         Ok(())
     }
 
@@ -350,13 +384,14 @@ impl<T> Block<T> {
         self.emitted_at_us
     }
 
-    /// Whether `seal` has already run on this block.
+    /// Whether `seal` has already run to completion on this block.
     ///
     /// The seal stamp is set and no descriptor row is still waiting to be
     /// materialized into a series batch, which is the same condition
     /// `into_parts` asserts on. A consumer that walks `tables()` of an unsealed
-    /// block would silently miss every descriptor row, so the sink asserts this
-    /// before it writes.
+    /// block would silently miss every descriptor row, so the sink checks this
+    /// before it writes. `seal` stamps `emitted_at` only after it has succeeded,
+    /// so a block whose seal failed reports false here.
     #[must_use]
     pub fn is_sealed(&self) -> bool {
         self.emitted_at_us.is_some() && self.pending_descriptors.values().all(Vec::is_empty)
@@ -515,6 +550,61 @@ mod tests {
                 .new_series,
             vec![0]
         );
+    }
+
+    /// Scenario: a block holding a metrics descriptor row with no metric block.
+    /// `series_batch` refuses such a row, so materializing it at seal time fails.
+    /// Guarantees: the block does not report itself sealed after a failed seal.
+    /// `emitted_at` is unset and the descriptor rows are still pending, so the
+    /// sink refuses to write the block instead of dropping its series rows.
+    #[test]
+    fn a_failed_seal_leaves_the_block_unsealed() {
+        use crate::canonical::{Descriptor, Signal, canonical_bytes, series_id};
+        use crate::extract::{DescriptorRow, ExtractStats};
+
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        // A logs descriptor, admitted as a metrics request: `admit` routes it to
+        // the `metrics_series` dataset, whose row needs a `metric` block that
+        // this descriptor does not carry. That is the injected fault.
+        let descriptor = Descriptor {
+            signal: Signal::Logs,
+            resource_attrs: vec![],
+            resource_schema_url: String::new(),
+            scope_name: String::new(),
+            scope_version: String::new(),
+            scope_schema_url: String::new(),
+            scope_attrs: vec![],
+            metric: None,
+            attrs: vec![],
+        };
+        let identity_bytes = canonical_bytes(&descriptor);
+        let e = Extracted {
+            signal: Signal::Metrics,
+            descriptors: vec![DescriptorRow {
+                series_id: series_id(&identity_bytes),
+                identity_bytes: identity_bytes.clone(),
+                descriptor,
+                denorm: vec![],
+                approx_bytes: 64,
+            }],
+            values: vec![],
+            pinned_bytes: 0,
+            stats: ExtractStats::default(),
+        };
+        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+        assert_eq!(r.new_series, vec![0]);
+        block.admit(e, r, 1).expect("admit");
+        assert!(!block.is_sealed());
+
+        let err = block.seal(SEAL_AT_US).expect_err("seal fails");
+        assert!(
+            err.to_string()
+                .contains("metrics descriptor without metric")
+        );
+        assert!(!block.is_sealed());
+        assert_eq!(block.emitted_at_us(), None);
     }
 
     /// Scenario: `emitted_at` on a block sealed once and then sealed again, as a flush retry does.

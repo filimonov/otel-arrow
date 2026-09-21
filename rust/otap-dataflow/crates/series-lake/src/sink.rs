@@ -321,11 +321,11 @@ impl Sink {
     ) -> Result<FlushReport> {
         // Descriptor rows only become Arrow rows in the series table when
         // `seal` stamps them, so writing an unsealed block would silently drop
-        // every series row. Same condition `Block::into_parts` asserts on.
-        debug_assert!(
-            block.is_sealed(),
-            "write_block on an unsealed block would drop its descriptor rows"
-        );
+        // every series row. This is a runtime check, not a debug assertion: the
+        // rows would be lost just as silently in a release build.
+        if !block.is_sealed() {
+            return Err(Error::invalid("unsealed block"));
+        }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled { abort_error: None });
         }
@@ -1022,19 +1022,22 @@ mod tests {
         assert_eq!(walkdir_count(dir.path()), 0);
     }
 
-    /// Scenario: a block that was never sealed, under debug assertions.
+    /// Scenario: a block that was never sealed.
     /// Guarantees: the sink refuses to write a block whose descriptor rows have not
     /// been materialized, which would otherwise silently drop every series row.
-    #[cfg(debug_assertions)]
+    /// The refusal is an error in every build profile, not a debug assertion.
     #[tokio::test]
-    #[should_panic(expected = "unsealed block")]
     async fn write_block_rejects_an_unsealed_block() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
         let b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
         assert!(!b.is_sealed());
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
-        let _ = sink.write_block(&b, &CancellationToken::new()).await;
+        let err = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect_err("an unsealed block is refused");
+        assert!(err.to_string().contains("unsealed block"));
     }
 
     /// Scenario: `writer_limit_bytes` and `merge_chunk_bytes` set so low that every
