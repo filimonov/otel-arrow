@@ -749,6 +749,9 @@ saturated inbox and asserts it stays below a documented bound.
 
 ## 7. Dataflow integration
 
+In v1, the shutdown deadline is supplied by the admin shutdown API timeout; a
+pipeline configuration field is future work.
+
 ### 7.1 Node loop
 
 ```text

@@ -10,7 +10,7 @@
 
 **Tech Stack:** Workspace Rust 2024/MSRV 1.88, Arrow/Parquet 58.3, object_store 0.13.2, Tokio LocalSet, engine simulated clock, serde, Python unittest/grpcio/opentelemetry-proto/DuckDB/xxhash/boto3, ClickHouse, Grafana Alloy (River), Docker CLI.
 
-**Spec:** `docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md`, revision 4; section 11 step 2 plus metrics, sections 3.2, 6.2-6.7, 7, 8, 9.2, 9.4 and the v1 test in 9.5. Section 3.2 is the node boundary. Plan 1 supplies the core; plan 3 owns benchmarks and gates.
+**Spec:** `docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md`, revision 4; section 11 step 2 plus metrics, sections 3.2, 6.2-6.7, 7, 8, 9.2, 9.4 and the v1 test in 9.5. Section 3.2 is the node boundary. Plan 1 supplies the core; Task 0 replaces deferred descriptor sealing, this plan supplies the section 9.4 CI lane, and plan 3 owns section 9.5 soak, empirical memory-bound validation and benchmarks.
 
 ## Global Constraints
 
@@ -27,15 +27,15 @@
 - Rust, YAML and Python source and changelog entries are ASCII-only. Every test has immediately preceding `Scenario:` and `Guarantees:` comments.
 - All future cargo commands run from `rust/otap-dataflow`. Run affected-crate `cargo check` after Rust edits, focused tests for each task, and `cargo xtask check` before finalizing. Workspace lints include `missing_docs`, `unused_results`, `unwrap_used` and stdout/stderr restrictions; use `otel_*` events in production.
 - New source files start with the repository copyright/SPDX header. New public items have documentation. Existing crates retain their README and `[lints] workspace = true`; no new crate is necessary.
-- Plan 1 is finished and merged into this branch at `7fd7c3eab`; additive series-lake edits are authorized. Engine/otap changes are restricted to the necessary additive support in task 2 and task 7 step 6, each with its own tests and File Structure justification. No shutdown-policy or engine-timeout change is included. This planning session changes only this Markdown file and runs no cargo build or Git mutation. Commands in tasks are instructions for the future implementer.
+- Plan 1 is finished and merged into this branch at `7fd7c3eab`; additive series-lake edits are authorized. Engine/otap changes are restricted to the necessary additive support in tasks 2 and 9, each with its own tests and File Structure justification. No shutdown-policy or engine-timeout change is included. This planning session changes only this Markdown file and one A07 sentence in the design spec and runs no cargo build or Git mutation. Commands in tasks are instructions for the future implementer.
 - Reviews for this plan run via codex, as required by plan 1.
-- Block-sized synchronous series sealing is an accepted v1 allowance (plan 1 F-park; `crates/series-lake/docs/FORMAT.md`, Limitations of version 1). Budget one additional B for sealing and include its CPU cost in responsiveness statements; do not claim a fixed-workspace bound. Plan 3 validates memory allowances; plan 2 reports the RSS residual.
+- Task 0 materializes descriptors incrementally during admission, then swaps only timestamp buffers at seal. Retained ownership is ACTIVE + FLUSHING + one pending request + notification tokens, with bounded cache/workspace terms and no third B. Stamp overlap is reserved inside the block. The design remains authoritative; the previous A11 deviation is removed. Plan 3 validates empirical memory bounds.
 - Every commit below includes both required trailers. Stage explicit task files, never `git add .`, because other work can share this tree.
-- Docker tests skip when the daemon/CLI or selected local image is absent unless `SERIES_REQUIRE_DOCKER=1`, which makes absence fail. MinIO, RustFS and ClickHouse use env-overridable local tags with defaults `minio/minio:RELEASE.2025-04-22T22-12-26Z`, `rustfs/rustfs:1.0.0-rc.3`, and `clickhouse/clickhouse-server:26.7.4`. Only the Alloy image may be pulled. Startup, protocol, assertion and recovery failures after preflight fail. CI provisioning and digest pinning belong to plan 3.
+- Docker tests skip when the daemon/CLI or selected local image is absent unless `SERIES_REQUIRE_DOCKER=1`, which makes absence fail. MinIO, RustFS and ClickHouse use env-overridable local tags with defaults `minio/minio:RELEASE.2025-04-22T22-12-26Z`, `rustfs/rustfs:1.0.0-rc.3`, and `clickhouse/clickhouse-server:26.7.4`. Only the Alloy image may be pulled by the test runner. The mandatory task 14 workflow provisions the other images before running SERIES_REQUIRE_DOCKER=1. Startup, protocol, assertion and recovery failures after preflight fail. Digest pinning and section 9.5 soak/benchmarks remain plan 3.
 
 ## Ground truth and integration decisions
 
-Paths in this section are repository-relative. All series-lake anchors were re-read against current HEAD `7fd7c3eab` for ruling C3, including unchanged anchors; task-text anchors use that same source snapshot. Re-read before future implementation if the branch advances.
+Paths in this section are repository-relative. All series-lake anchors were re-read against current HEAD `7fd7c3eab` for the second amendment pass, including unchanged anchors; task-text anchors use that same source snapshot. Re-read before future implementation if the branch advances.
 
 | Evidence | Consequence |
 | --- | --- |
@@ -43,12 +43,15 @@ Paths in this section are repository-relative. All series-lake anchors were re-r
 | `rust/otap-dataflow/crates/series-lake/src/config.rs:209`, `:324`, `:384` | `LakeConfig` has flat `window_interval`, integer byte fields and no storage/cache/notify settings. Adapt the user YAML; call `validate()`. It checks a positive whole-second interval, writer ID, row/run ratio, block/extracted ratio, request count, upload minimum 5MiB/concurrency, denormalization collisions/paths, and every values dataset's sort columns. Add positive/whole-second interval checks at the adapter boundary. |
 | `rust/otap-dataflow/crates/series-lake/src/extract/mod.rs:68`, `:83`, `:108` | `extract(&mut OtapArrowRecords, &LakeConfig) -> Result<Extracted>` decodes transport IDs itself. `Extracted` owns descriptors, `(Dataset, Vec<RecordBatch>)`, pinned bytes and statistics. Current statistics aggregate unsupported kinds and mismatched columns: task 7 adds bounded detail. |
 | `rust/otap-dataflow/crates/series-lake/src/buffer.rs:231`, `:280`, `:350`, `:459` | `reserve(&Extracted, &mut SeriesCache, usize, &LakeConfig) -> Result<Reservation>`, `admit(Extracted, Reservation, T)`, `seal(i64)`. `admit` consumes its token even on error and can partially mutate; keep tokens in an adapter-owned `OwnedBlock` beside `Block<()>`, charge their full size through `reserve`, and fail that whole ACTIVE block on an admission error. Do not call `into_parts` on an unsealed failure. |
+| `rust/otap-dataflow/crates/series-lake/src/buffer.rs:164`, `:280`, `:350`, `:376`; `sort.rs:37`, `:140`; `extract/mod.rs:716`; `schema.rs:75` | Current admission holds pending descriptors and seal materializes them. Task 0 removes that map/materialize, uses current `series_batch` with zero stamps and fixed `series_id` sorting during admission, then transactionally swaps Int64 timestamp storage while preserving Timestamp(Microsecond, UTC). Peak retained seal growth is at most eight bytes per series row plus small buffer slack. |
+| `rust/otap-dataflow/crates/series-lake/src/extract/metrics.rs:330`; `attrs.rs:149`; `value.rs:18` | Core extraction owns supported attribute validation and takes `DecodeLimits::new(max_nesting_depth, max_row_bytes)`. Task 6 calls extract once; metadata and exemplar attribute tables remain unread/unvalidated under R17. |
+| `rust/otap-dataflow/crates/core-nodes/src/exporters/file_exporter/metrics.rs:145` | Task 8 follows exact descriptor name, metric name/unit and measurement-label snapshot assertions, and counts emitted descriptors only after a successful durable flush. |
 | `rust/otap-dataflow/crates/series-lake/src/sink.rs:44`, `:95`, `:134`, `:330` | `FileNaming::new(&str)` creates a boot UUID; `FlushReport.files` is `Vec<(Dataset, Path, usize)>`; `Sink::new(Arc<dyn ObjectStore>, LakeConfig, FileNaming)` and `write_block<T>(&Block<T>, &CancellationToken)`. The runtime guard at `sink.rs:339` returns Invalid for an unsealed block. The adapter always seals explicitly. |
 | `rust/otap-dataflow/crates/series-lake/src/cache.rs:44`, `:62` | `is_committed` changes LRU/stats; `mark_committed(id, partition)` may reinsert an evicted ID. Use the returned FLUSHING block's partition, never ACTIVE's. |
 | `rust/otap-dataflow/crates/series-lake/src/clock.rs:62`, `:122`, `:137`, `:157`, `:189` | `WallClock`, `WindowClock`, `WakeOutcome::{RotationRequested { effective_boundary }, TooEarly { sleep_until }}` exist. Re-arm immediately, even when rotation is blocked. |
 | `rust/otap-dataflow/crates/series-lake/src/error.rs:8`, `:23` | Reasons are `RequestTooLarge`, `BlockFull`, `TooManyRequests`, `Invalid(String)`, `Unsupported(String)`. Errors also include Arrow, Parquet, ObjectStore, Pdata, `Cancelled { abort_error }`, and `AbortFailed { source, abort_error }`. BlockFull/TooManyRequests park work; they are not content nacks. |
 | `rust/otap-dataflow/crates/engine/src/local/exporter.rs:54`, `:91`; `rust/otap-dataflow/crates/engine/src/runtime_pipeline.rs:484` | Implement `Exporter<OtapPdata>` using `#[async_trait(?Send)]`, returning `TerminalState`; `spawn_local` is valid. |
-| `rust/otap-dataflow/crates/engine/src/message.rs:283`, `:428`, `:810`, `:874` | `ExporterInbox::recv_when(false)` still force-drains pdata after Shutdown. There is no force marker. Task 2 exposes the already-latched shutdown deadline, needed when completion delivery is full. |
+| `rust/otap-dataflow/crates/engine/src/message.rs:283`, `:428`, `:810`, `:874` | `ExporterInbox::recv_when(false)` still force-drains pdata after Shutdown. There is no force marker. Task 2 exposes the already-latched shutdown deadline. The node always polls forced drain despite notifier saturation and immediately attempts one NodeShutdown NACK per PData; task 11 checks all 32 decisions/failures. |
 | `rust/otap-dataflow/crates/engine/src/control.rs:183`, `:225`, `:235`, `:338`, `:349`; `rust/otap-dataflow/crates/engine/src/effect_handler.rs:367` | Permanent content rejection needs `new_permanent_with_cause(reason, data, NackCause::Refused)`, not merely the cause. Storage uses retryable Unspecified; shutdown uses retryable NodeShutdown. Completion sends await bounded channels. |
 | `rust/otap-dataflow/crates/otap/src/pdata.rs:143`, `:512`, `:523`, `:578`, `:831`, `:1068`; `rust/otap-dataflow/crates/pdata/src/payload.rs:299`, `:328` | Context stack/claims are private; `frames()` is test-only. Task 2 adds claims removal and retained frame accounting. `OtapPdata::into_parts` and `OtapPayload::empty(SignalType)` support small notifications; import `ConsumerEffectHandlerExtension` for notify methods. `num_bytes` needs mutable payload and can return None. |
 | `rust/otap-dataflow/crates/engine/src/control.rs:77`, `:138`; `rust/otap-dataflow/crates/telemetry/src/reporter.rs:222`, `:259` | CallData is a SmallVec that may spill: include spilled capacity in token accounting. Use report for plain sets and report_measurement for measurement sets; the latter preserves pending data on a full reporter channel. |
@@ -57,7 +60,7 @@ Paths in this section are repository-relative. All series-lake anchors were re-r
 | `rust/otap-dataflow/crates/otap/src/object_store.rs:30`, `:165`, `:303`, `:311` | Reuse StorageType and RetryOptions, including S3 endpoint/auth/prefix behavior and bearer-token capability for Azure. Local directories must already exist. |
 | `rust/otap-dataflow/crates/otap/src/otap_grpc/server_settings.rs:47`, `:171`; `rust/otap-dataflow/crates/otap/src/otap_grpc/otlp/server_new.rs:202`, `:521` | `protocols.grpc.wait_for_result: true`, `timeout: 180s`; channel send precedes ack wait. Receiver concurrency is clamped to channel capacity. |
 | `rust/otap-dataflow/crates/validation/Cargo.toml:25`, `:40`, `:64`; `rust/otap-dataflow/crates/validation/src/container.rs:342` | Existing integration tests use a feature and Docker tests may be ignored. Add a real-process Python unittest runner under validation, with explicit Docker preflight and CI invocation; the existing in-process validator alone is not section 9.4 E2E. |
-| `rust/otap-dataflow/crates/engine/src/memory_limiter.rs:955`; `rust/otap-dataflow/crates/engine/src/engine_metrics.rs:85` | RSS comes from `memory_stats::memory_stats().physical_mem`. Reuse the once-per-process engine monitor for residual reporting, not one RSS sample per exporter. |
+| `rust/otap-dataflow/crates/engine/src/memory_limiter.rs:955`; `rust/otap-dataflow/crates/engine/src/engine_metrics.rs:127` | RSS comes from `memory_stats::memory_stats().physical_mem`. Task 9 explicitly registers workers, emits residual only while workers exist, and reuses the engine monitor's single RSS sample for both metrics. |
 | `rust/otap-dataflow/crates/controller/src/lib.rs:2148`; `rust/otap-dataflow/crates/admin/src/pipeline_group.rs:165` | Signal shutdown is hard-coded to 60s. Use existing `/api/v1/groups/shutdown?wait=true&timeout_secs=180` in examples/tests; do not invent a pipeline YAML deadline field. |
 | `rust/otap-dataflow/AGENTS.md:1`; `rust/otap-dataflow/.chloggen/TEMPLATE.yaml:1`; `rust/otap-dataflow/.chloggen/config.yaml:28`; `Makefile:84` | Follow CONTRIBUTING, ASCII/test comments/lints/README/xtask rules. Copy the changelog template, use component pipeline, and validate at repository root with `make chlog-validate`. |
 
@@ -86,19 +89,448 @@ rust/otap-dataflow/
     README.md                           runnable config and public contracts
   crates/otap/src/pdata.rs               task 2: release claims and account retained routing frames
   crates/engine/src/message.rs           task 2: expose existing deadline during forced pdata drain
-  crates/engine/src/engine_metrics.rs    task 7 step 6: aggregate worker bytes and report process RSS residual
-  crates/series-lake/src/buffer.rs       optional same-window descriptor re-emission
+  crates/engine/src/engine_metrics.rs    task 9: active-worker registration and one-sample process residual
+  crates/series-lake/src/buffer.rs       task 0 incremental series runs; task 7 rotation re-emission
   crates/series-lake/src/cache.rs        non-mutating committed-partition lookup
-  crates/series-lake/src/extract/mod.rs  bounded per-column extraction counters
+  crates/series-lake/src/extract/mod.rs  series-row estimates and bounded extraction counters
+  crates/series-lake/README.md          remove deferred block-sized sealing limitation
+  crates/series-lake/docs/FORMAT.md     admission runs and timestamp-only seal
   crates/series-lake/src/extract/metrics.rs bounded unsupported-kind counters
   crates/validation/tests/series_parquet/
     requirements.txt                    real producer/reader dependencies
     test_e2e.py                         local, Docker, shutdown, outage cases
+.github/workflows/series-parquet-e2e.yml required MinIO/RustFS and DuckDB/ClickHouse/Alloy lane
 ```
 
 No new runtime endpoint is introduced. The existing admin telemetry and shutdown endpoints are used only as test/operational clients. Each task repeats the consumed/produced signatures and gives all new code; apply replacement functions literally and preserve other functions in that module.
 
 ---
+
+### Task 0: Incremental series materialization in series-lake
+
+**Files:**
+- Modify: `rust/otap-dataflow/crates/series-lake/src/buffer.rs`
+- Modify: `rust/otap-dataflow/crates/series-lake/src/extract/mod.rs`
+- Modify: `rust/otap-dataflow/crates/series-lake/{README.md,docs/FORMAT.md}`
+- Read: `rust/otap-dataflow/crates/series-lake/src/{sort.rs,schema.rs,sink.rs}`
+
+**Interfaces:**
+- Consumes CURRENT `series_batch(&[&DescriptorRow], i64, Dataset, &LakeConfig)`, `SortSpec::series()`, `sort_batch(&RecordBatch, &SortSpec)`, `SortedTableBuffer::{append,seal,iter_snapshots}`, and `record_batch_pinned_bytes` with one `CountedAllocations` set per retained snapshot.
+- Produces `DescriptorRow::series_row_bytes() -> usize`, admission-time bounded series runs with zero `emitted_at`, and transactional `Block::seal(i64)` column swaps. Keep `reserve`, `admit`, `is_sealed`, `emitted_at_us`, and `into_parts` signatures. Remove `pending_descriptors` and `materialize` completely. No engine dependency is introduced.
+- CURRENT `sort.rs:140` sorts by taking every column, so sorting belongs in admission, never in the stamp transaction. CURRENT `schema.rs:75` requires Timestamp(Microsecond, UTC): construct constant Int64 storage and wrap its shared values in that timestamp type without a cast/copy. `series_batch` already accepts a request-sized slice of descriptor references; no extraction/schema rewrite is needed.
+
+- [ ] **Step 1: Add failing buffer regressions before changing production code**
+
+Inside `buffer.rs`'s existing tests module, reuse `extracted`, `SEAL_AT_US`, and the existing imports. Add:
+
+```rust
+fn snapshot_bytes<'a>(batches: impl Iterator<Item = &'a RecordBatch>) -> usize {
+    let mut seen = CountedAllocations::default();
+    batches.map(|batch| record_batch_pinned_bytes(batch, &mut seen)).sum()
+}
+
+/// Scenario: many distinct requests fill a block before its final timestamp is known.
+/// Guarantees: descriptors are already bounded sorted series runs and carry zero timestamps.
+#[test]
+fn admission_materializes_bounded_series_runs() {
+    let mut cfg = LakeConfig::default();
+    cfg.sorting.run_target_bytes = 64 * 1024;
+    cfg.ingress.max_row_bytes = 16 * 1024;
+    let mut cache = SeriesCache::new(100);
+    let mut block: Block<()> = Block::new(0, 1, &cfg);
+    for i in 0..64 {
+        let e = extracted(&cfg, &format!("host-{i:03}"), 1);
+        let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+        block.admit(e, r, ()).expect("admit");
+    }
+    let table = block.tables().find(|t| t.dataset().is_series()).expect("series");
+    assert_eq!(table.rows(), 64);
+    assert!(!block.is_sealed());
+    for batch in table.iter_snapshots() {
+        assert!(snapshot_bytes(std::iter::once(batch)) <= cfg.sorting.run_target_bytes);
+        assert!(crate::sort::is_sorted(batch, &SortSpec::series()).expect("sorted"));
+        let stamps = batch.column_by_name("emitted_at").expect("stamp")
+            .as_primitive::<TimestampMicrosecondType>();
+        assert!((0..stamps.len()).all(|i| stamps.value(i) == 0));
+    }
+}
+
+/// Scenario: retained series include both completed runs and a final building batch.
+/// Guarantees: seal adds at most eight bytes per series row plus 64 bytes of buffer slack.
+#[test]
+fn seal_peak_retained_bytes_only_adds_timestamp_values() {
+    let cfg = LakeConfig::default();
+    let mut cache = SeriesCache::new(100);
+    let mut block: Block<()> = Block::new(0, 1, &cfg);
+    for i in 0..32 {
+        let e = extracted(&cfg, &format!("{}-{i}", "x".repeat(4096)), 1);
+        let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+        block.admit(e, r, ()).expect("admit");
+    }
+    let table = block.tables.get_mut(&Dataset::LogsSeries).expect("series");
+    let last = table.runs.pop().expect("last run");
+    table.building.push(last);
+    let before: Vec<_> = block.tables().flat_map(|t| t.runs().iter().chain(t.building())).cloned().collect();
+    let rows = block.tables().filter(|t| t.dataset().is_series()).map(SortedTableBuffer::rows).sum::<usize>();
+    let retained = snapshot_bytes(before.iter());
+    block.seal(SEAL_AT_US).expect("seal");
+    // Holding every old batch keeps the complete old/new overlap resident;
+    // this bounds the transaction's peak, not just its net memory change.
+    let peak = snapshot_bytes(before.iter().chain(block.tables().flat_map(SortedTableBuffer::iter_snapshots)));
+    assert!(peak <= retained + rows * 8 + 64, "peak={peak}, before={retained}, rows={rows}");
+    let after: Vec<_> = block.tables().flat_map(SortedTableBuffer::iter_snapshots).collect();
+    for (old, new) in before.iter().zip(after) {
+        for (index, field) in old.schema().fields().iter().enumerate() {
+            if field.name() != "emitted_at" {
+                assert!(std::sync::Arc::ptr_eq(old.column(index), new.column(index)));
+            }
+        }
+    }
+    assert!(block.is_sealed());
+    let (_, ids, tables) = block.into_parts();
+    assert_eq!(ids.len(), rows);
+    assert_eq!(tables[&Dataset::LogsSeries].rows(), rows);
+}
+```
+
+Replace the existing `a_failed_seal_keeps_the_block_intact_and_a_retry_succeeds` test in full; its old invalid-denormalization fixture now fails during `admit`, as intended. The new failure injects a bad stamp column into the second batch, after the first replacement has been prepared:
+
+```rust
+/// Scenario: the second retained series batch has an invalid emitted_at type, then is repaired.
+/// Guarantees: failed sealing changes no batch or stamp; retry commits all rows with one frozen stamp.
+#[test]
+fn a_failed_seal_keeps_the_block_intact_and_a_retry_succeeds() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let cfg = LakeConfig::default();
+    let mut cache = SeriesCache::new(100);
+    let mut block: Block<()> = Block::new(0, 1, &cfg);
+    for host in ["first", "second"] {
+        let e = extracted(&cfg, host, 1);
+        let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+        block.admit(e, r, ()).expect("admit");
+    }
+    let table = block.tables.get_mut(&Dataset::LogsSeries).expect("table");
+    let good = table.runs[1].clone();
+    let index = good.schema().index_of("emitted_at").expect("field");
+    let mut fields = good.schema().fields().to_vec();
+    fields[index] = Arc::new(Field::new("emitted_at", DataType::Int64, false));
+    let mut columns = good.columns().to_vec();
+    columns[index] = Arc::new(Int64Array::from(vec![0; good.num_rows()]));
+    table.runs[1] = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("bad batch");
+    let before: Vec<_> = block.tables().flat_map(SortedTableBuffer::iter_snapshots).cloned().collect();
+    let bytes = block.bytes;
+    assert!(block.seal(SEAL_AT_US).is_err());
+    assert!(!block.is_sealed());
+    assert_eq!(block.emitted_at_us(), None);
+    assert_eq!(block.bytes, bytes);
+    for (old, new) in before.iter().zip(block.tables().flat_map(SortedTableBuffer::iter_snapshots)) {
+        assert_eq!(old, new);
+    }
+    block.tables.get_mut(&Dataset::LogsSeries).expect("table").runs[1] = good;
+    block.seal(SEAL_AT_US + 1).expect("retry");
+    block.seal(SEAL_AT_US + 2).expect("idempotent retry");
+    assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US + 1));
+    assert_eq!(block.tables[&Dataset::LogsSeries].rows(), 2);
+}
+```
+
+Keep the existing reservation, shared-buffer recount, sealed-admission rejection, unsorted-buffer, dedup-address-lifetime and frozen-timestamp tests. Do not weaken their assertions. Add this admission-failure counterpart:
+
+```rust
+/// Scenario: an extracted descriptor lacks a configured denormalized cell.
+/// Guarantees: admission refuses malformed series content before retaining any descriptor or token.
+#[test]
+fn malformed_descriptor_fails_during_admission() {
+    let mut cfg = LakeConfig::default();
+    cfg.logs.denormalize.push(crate::config::Denormalize {
+        path: "resource.host.id".into(), column: "host_col".into(),
+        ty: crate::config::DenormType::String,
+    });
+    let mut e = extracted(&cfg, "host", 1);
+    e.descriptors[0].denorm.clear();
+    let mut cache = SeriesCache::new(10);
+    let mut block: Block<()> = Block::new(0, 1, &cfg);
+    let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+    assert!(block.admit(e, r, ()).is_err());
+    assert!(block.is_empty());
+    assert!(!block.is_sealed());
+    assert_eq!(block.request_count(), 0);
+}
+```
+
+- [ ] **Step 2: Run the red tests**
+
+```bash
+cd rust/otap-dataflow
+cargo test -p otel-arrow-dfe-series-lake buffer::tests
+```
+
+Expected: current admission retains descriptors instead of series batches; the new tests fail before the production replacement.
+
+- [ ] **Step 3: Materialize request descriptors into bounded sorted runs**
+
+In `extract/mod.rs`, add this implementation after `DescriptorRow`. Keep `approx_bytes` as the extraction-slot estimate (decoded tree plus rendered row); reserve charges only the series representation after admission, including room for the old/new timestamp overlap. Replace the `rendered_kv_bytes` comment's seal-time wording with "a descriptor is rendered when its request is admitted". Replace `descriptor_row`'s comment about retaining decoded trees until block seal with "Extraction temporarily retains both the decoded tree and its future rendered series row; admission drops the tree."
+
+```rust
+impl DescriptorRow {
+    /// Conservative Arrow series-row estimate, including stamp-swap headroom.
+    #[must_use]
+    pub fn series_row_bytes(&self) -> usize {
+        let decoded = kv_bytes(&self.descriptor.resource_attrs)
+            + kv_bytes(&self.descriptor.scope_attrs) + kv_bytes(&self.descriptor.attrs);
+        let columns = 10 + usize::from(self.descriptor.metric.is_some()) * 6 + self.denorm.len();
+        // Builder growth, offsets and validity are charged here; decoded
+        // attribute trees die at admission and are not charged to the block.
+        2 * (self.approx_bytes.saturating_sub(decoded) + columns * 64) + 8
+    }
+}
+```
+
+Replace `series_batch` with this CURRENT-source implementation plus final per-column compaction. The existing builders start with capacity for 1024 rows; releasing that slack during request admission is necessary for small descriptor batches to obey their row estimate and run target. This does not copy columns during final seal.
+
+```rust
+/// Build a `series` batch from descriptor rows.
+///
+/// # Errors
+/// Refuses a metrics descriptor without a metric block, or a schema mismatch.
+pub fn series_batch(
+    rows: &[&DescriptorRow],
+    emitted_at_us: i64,
+    ds: Dataset,
+    cfg: &LakeConfig,
+) -> Result<RecordBatch> {
+    let schema = dataset_schema(ds, cfg);
+    let mut builders = schema
+        .fields()
+        .iter()
+        .map(|f| builder_for(f.data_type()))
+        .collect::<Result<Vec<_>>>()?;
+    for r in rows {
+        let d = &r.descriptor;
+        let mut cols: Vec<Col> = vec![
+            Col::Fixed(Some(r.series_id.to_vec())),
+            Col::Bytes(r.identity_bytes.clone()),
+            Col::TsUs(Some(emitted_at_us)),
+            Col::Str(Some(d.resource_schema_url.clone())),
+            map_cell(&d.resource_attrs).0,
+            Col::Str(Some(d.scope_name.clone())),
+            Col::Str(Some(d.scope_version.clone())),
+            Col::Str(Some(d.scope_schema_url.clone())),
+            map_cell(&d.scope_attrs).0,
+            map_cell(&d.attrs).0,
+        ];
+        if ds == Dataset::MetricsSeries {
+            let m = d
+                .metric
+                .as_ref()
+                .ok_or_else(|| Error::invalid("metrics descriptor without metric"))?;
+            cols.extend([
+                Col::Str(Some(m.name.clone())),
+                Col::Str(Some(m.unit.clone())),
+                Col::Str(Some(m.kind.as_str().to_string())),
+                Col::Str(Some(m.temporality.as_str().to_string())),
+                Col::Bool(Some(m.is_monotonic)),
+                Col::Str(Some(m.description.clone())),
+            ]);
+        }
+        cols.extend(r.denorm.iter().cloned().map(Col::from));
+        for (b, c) in builders.iter_mut().zip(&cols) {
+            append(b, c)?;
+        }
+    }
+    let arrays: Vec<ArrayRef> = builders.iter_mut().map(|builder| {
+        let mut array = finish(builder);
+        array.shrink_to_fit();
+        array
+    }).collect();
+    Ok(RecordBatch::try_new(schema, arrays)?)
+}
+```
+
+In `buffer.rs`, add `use std::sync::Arc;`, `use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};`, and `use arrow::datatypes::{DataType, TimeUnit};`. Remove the `pending_descriptors` field and its constructor initializer. In `reserve`, replace `d.approx_bytes` with `d.series_row_bytes()`; preserve the three refusal cases and cache-touch ordering.
+
+Add these private methods to `SortedTableBuffer`. A request may create several runs; every series run is measured and sorted independently. Rebuilding an oversized candidate keeps at most one candidate plus bounded sort scratch live. A single row that cannot fit is refused. No block-sized batch is constructed.
+
+```rust
+/// Append request-local descriptors as independently bounded sorted series runs.
+fn append_series(&mut self, rows: &[&DescriptorRow], cfg: &LakeConfig) -> Result<()> {
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start;
+        let mut estimated = 0usize;
+        while end < rows.len() {
+            let next = rows[end].series_row_bytes();
+            if end > start && estimated.saturating_add(next) > self.run_target { break; }
+            estimated = estimated.saturating_add(next);
+            end += 1;
+            if estimated >= self.run_target { break; }
+        }
+        let sorted = loop {
+            let batch = series_batch(&rows[start..end], 0, self.dataset, cfg)?;
+            let sorted = sort_batch(&batch, &self.spec)?;
+            drop(batch);
+            let bytes = record_batch_pinned_bytes(&sorted, &mut CountedAllocations::default());
+            if bytes <= self.run_target { break sorted; }
+            drop(sorted);
+            if end == start + 1 { return Err(Error::Refused(RefuseReason::RequestTooLarge)); }
+            end = start + (end - start) / 2;
+        };
+        self.rows += sorted.num_rows();
+        self.runs.push(sorted);
+        start = end;
+    }
+    Ok(())
+}
+
+/// Prepare every stamp replacement without mutating the retained batches.
+fn stamped(&self, stamp: i64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    let replace = |batch: &RecordBatch| -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let index = schema.index_of("emitted_at")?;
+        let expected = DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")));
+        if schema.field(index).data_type() != &expected {
+            return Err(Error::invalid("series emitted_at must be a UTC microsecond timestamp"));
+        }
+        let ints = Int64Array::from(vec![stamp; batch.num_rows()]);
+        let values = TimestampMicrosecondArray::new(ints.values().clone(), None).with_timezone("UTC");
+        let mut columns = batch.columns().to_vec();
+        columns[index] = Arc::new(values) as ArrayRef;
+        Ok(RecordBatch::try_new(schema, columns)?)
+    };
+    let runs = self.runs.iter().map(replace).collect::<Result<Vec<_>>>()?;
+    let building = self.building.iter().map(replace).collect::<Result<Vec<_>>>()?;
+    Ok((runs, building))
+}
+```
+
+Replace `Block::admit` in full. Finalize each values run during admission as well, so final block sealing never sorts/copies non-stamp columns. This preserves existing per-table sorting behavior and bounds run work to the admitted request. Admission errors retain the existing caller contract: discard the entire ACTIVE block; the exporter owns its tokens separately.
+
+```rust
+/// Admit a reserved request, materializing series rows with a zero stamp.
+///
+/// # Errors
+/// Refuses sealed blocks and propagates series construction or run sorting errors.
+pub fn admit(&mut self, extracted: Extracted, reservation: Reservation, token: T) -> Result<()> {
+    if self.is_sealed() { return Err(Error::invalid("block already sealed")); }
+    let Extracted { signal, descriptors, values, .. } = extracted;
+    if !reservation.new_series.is_empty() {
+        let ds = Dataset::series_of(signal);
+        let rows: Vec<_> = reservation.new_series.iter().map(|&i| &descriptors[i]).collect();
+        let mut table = self.tables.remove(&ds).unwrap_or_else(||
+            SortedTableBuffer::new(ds, SortSpec::series(), self.cfg.sorting.run_target_bytes));
+        let result = table.append_series(&rows, &self.cfg);
+        let _ = self.tables.insert(ds, table);
+        result?;
+        for row in rows { let _ = self.pending_series.insert(row.series_id); }
+    }
+    drop(descriptors);
+    for (ds, batches) in values {
+        let run_target = self.cfg.sorting.run_target_bytes;
+        let spec = self.spec_for(ds);
+        let table = self.tables.entry(ds)
+            .or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
+        for batch in batches {
+            let _ = table.append(batch)?;
+            table.seal()?;
+        }
+    }
+    self.bytes += reservation.bytes;
+    self.token_bytes += reservation.token_bytes;
+    self.requests.push(token);
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Replace final materialization with an all-or-nothing stamp transaction**
+
+Delete `materialize` entirely. Replace `seal`, `is_sealed`, `is_empty`, and the assertion in `into_parts` as follows; retain the other method bodies/signatures and the existing `recount` arithmetic. Update their comments to describe already-materialized series rows and the sink's seal precondition. A failed stamp attempt keeps the block unsealed; the first successful stamp is frozen across all write retries.
+
+```rust
+/// Replace only emitted_at buffers, committing the sealed state after all swaps succeed.
+///
+/// # Errors
+/// A bad series schema leaves all retained batches, accounting and seal state unchanged.
+pub fn seal(&mut self, emitted_at_us: i64) -> Result<()> {
+    if self.is_sealed() { return Ok(()); }
+    let mut replacements = Vec::new();
+    for (ds, table) in &self.tables {
+        if ds.is_series() {
+            replacements.push((*ds, table.stamped(emitted_at_us)?));
+        }
+    }
+    // All fallible Arrow work has finished. The transaction holds only shared
+    // non-stamp columns and one new eight-byte timestamp per series row.
+    for (ds, (runs, building)) in replacements {
+        let table = self.tables.get_mut(&ds).expect("prepared table exists");
+        table.runs = runs;
+        table.building = building;
+    }
+    for table in self.tables.values_mut() {
+        // Admission sorted each batch already; moving it cannot copy a column.
+        table.runs.append(&mut table.building);
+        table.building_bytes = 0;
+        table.seen = CountedAllocations::default();
+    }
+    self.bytes = self.recount();
+    self.emitted_at_us = Some(emitted_at_us);
+    Ok(())
+}
+
+/// Whether all timestamp swaps have committed successfully.
+#[must_use]
+pub fn is_sealed(&self) -> bool { self.emitted_at_us.is_some() }
+
+/// Whether the block holds no materialized rows.
+#[must_use]
+pub fn is_empty(&self) -> bool { self.tables.values().all(SortedTableBuffer::is_empty) }
+```
+
+Replace `into_parts` with its complete implementation:
+
+```rust
+/// Take apart a successfully sealed block after its flush result.
+#[must_use]
+pub fn into_parts(self) -> (Vec<T>, HashSet<SeriesId>, BTreeMap<Dataset, SortedTableBuffer>) {
+    debug_assert!(self.is_sealed(), "into_parts requires a successfully sealed block");
+    (self.requests, self.pending_series, self.tables)
+}
+```
+
+Remove every stale comment about pending descriptors. The peak test counts retained Arrow allocations across the entire old/new overlap; record-batch/column-vector metadata is small per run and is included in the documented container allowance, never a payload-sized allowance. Stamp storage is charged inside the block reservation, not as another B.
+
+- [ ] **Step 5: Update core limitations and validate**
+
+Remove exactly the series-sealing limitation bullet from both `README.md` and `docs/FORMAT.md`; retain their other limitations. Add this paragraph immediately before each limitations list:
+
+```text
+Descriptors become bounded series runs during request admission. Final sealing
+replaces only emitted_at with the block timestamp, sharing every other column;
+old/new timestamp storage is at most eight additional bytes per series row.
+The first successful seal timestamp remains fixed across flush retries.
+```
+
+```bash
+cd rust/otap-dataflow
+cargo check -p otel-arrow-dfe-series-lake
+cargo test -p otel-arrow-dfe-series-lake
+cd ../..
+python3 tools/sanitycheck.py
+npx --yes markdownlint-cli2 rust/otap-dataflow/crates/series-lake/README.md rust/otap-dataflow/crates/series-lake/docs/FORMAT.md
+```
+
+Expected: all existing core tests and the new bounded-run, peak-overlap, failed-swap, admission-failure and frozen-stamp regressions pass. This is an internal materialization change; the exporter release note later covers user-facing behavior.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add rust/otap-dataflow/crates/series-lake/src/buffer.rs rust/otap-dataflow/crates/series-lake/src/extract/mod.rs rust/otap-dataflow/crates/series-lake/README.md rust/otap-dataflow/crates/series-lake/docs/FORMAT.md
+git commit -m "chore(series-lake): materialize bounded series runs during admission
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
+```
 
 ### Task 1: Runnable logs -> LocalFileSystem slice
 
@@ -153,12 +585,10 @@ from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc as logs_
 
 WORKSPACE = Path(__file__).resolve().parents[4]
 
-
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
-
 
 def log_request(request_id):
     req = logs_pb.ExportLogsServiceRequest()
@@ -170,7 +600,6 @@ def log_request(request_id):
     record = scope.log_records.add(time_unix_nano=1789960500000000000)
     record.body.string_value = request_id
     return req
-
 
 class Engine:
     def __init__(self, directory, storage=None, overrides=None):
@@ -237,7 +666,6 @@ class Engine:
     def __exit__(self, *exc):
         self.close()
 
-
 class LocalSlice(unittest.TestCase):
     # Scenario: a real gRPC logs request reaches a local series exporter.
     # Guarantees: a successful OTLP response has both descriptor and values files.
@@ -253,7 +681,6 @@ class LocalSlice(unittest.TestCase):
                                   [[str(path) for path in values]]).fetchall()
             self.assertEqual(rows, [("request-0",)])
             engine.shutdown()
-
 
 if __name__ == "__main__":
     unittest.main()
@@ -699,7 +1126,7 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 **Interfaces:**
 - Consumes: `OtapPdata::into_parts() -> (Context, OtapPayload)`, `Context::take_transport_headers`, `EffectHandler::notify_ack/notify_nack` through `ConsumerEffectHandlerExtension`, `NackCause::{Refused,NodeShutdown,Unspecified}`.
 - Produces: `Context::take_authorized_identity_entries() -> Option<AuthorizedIdentityEntries>`, `Context::retained_frame_bytes() -> usize`; `ExporterInbox::shutdown_deadline() -> Option<Instant>`; `AckToken::split(OtapPdata) -> (AckToken, OtapPayload)`, `AckToken::bytes() -> usize`; `Outcome`; `Notifier::{new,push,len,bytes,oldest,next}`. A notification send future remains stored across select iterations; dropping a select branch must never drop its token.
-- Notification capacity is `2*N`, where `N=max_requests_per_block`. Normal total live tokens across blocks/pending/notifier are capped at `2*N-1`, leaving one credit to observe a force-drained shutdown message. Once shutdown is latched, stop reading if the notification capacity is full and drive its known deadline. This deliberately stricter admission cap resolves the otherwise unbounded forced-drain/completion-channel combination.
+- Notification capacity is `2*N`, where `N=max_requests_per_block`. Normal total live tokens across blocks/pending/notifier are capped at `2*N-1`, leaving one credit to observe a force-drained shutdown message. After Shutdown is latched, consume forced PData one at a time regardless of notifier saturation, strip/drop its payload, and poll its retryable NodeShutdown NACK once immediately. A pending/failed delivery increments `notify.failures` and releases that token; it never enters the queue. Normal notification allocation remains bounded and inbox polling never stops because notifications are full.
 
 - [ ] **Step 1: Add failing tests for sensitive metadata and completion backpressure**
 
@@ -764,7 +1191,7 @@ use otel_arrow_dfe_pdata::payload::OtapPayload;
 use otel_arrow_dfe_config::SignalType;
 use std::time::Duration;
 
-fn effects(capacity: usize) -> (EffectHandler<OtapPdata>,
+pub(super) fn effects(capacity: usize) -> (EffectHandler<OtapPdata>,
     otel_arrow_dfe_engine::control::PipelineCompletionMsgReceiver<OtapPdata>) {
     let (_rx, reporter) = otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(16);
     let mut effects = EffectHandler::new(test_node("series"), reporter, test_pipeline_runtime_services());
@@ -772,7 +1199,7 @@ fn effects(capacity: usize) -> (EffectHandler<OtapPdata>,
     effects.set_pipeline_completion_msg_sender(tx);
     (effects, rx)
 }
-fn empty_pdata() -> OtapPdata {
+pub(super) fn empty_pdata() -> OtapPdata {
     let mut context = Context::default();
     context.set_source_node(7);
     OtapPdata::new(context, OtapPayload::empty(SignalType::Logs))
@@ -879,11 +1306,13 @@ impl AckToken {
         (Self { context, signal, received: clock::now() }, payload)
     }
     pub fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.context.retained_frame_bytes()
+        std::mem::size_of::<Self>() + self.external_bytes()
     }
+    pub fn external_bytes(&self) -> usize { self.context.retained_frame_bytes() }
     fn pdata(self) -> OtapPdata { OtapPdata::new(self.context, OtapPayload::empty(self.signal)) }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
 pub(super) enum Outcome { Ack, TooLarge, Invalid, Unsupported, Storage, Shutdown }
 impl Outcome {
     pub fn reason(self) -> &'static str {
@@ -899,14 +1328,18 @@ pub(super) struct Notifier {
     queue: VecDeque<(AckToken, Outcome)>,
     sending: Option<Sending>,
     capacity: usize,
+    pub outcomes: [u64; 6],
+    pub failures: u64,
+    pub token_high_water: usize,
 }
 impl Notifier {
     pub fn new(effects: EffectHandler<OtapPdata>, capacity: usize) -> Self {
-        Self { effects, queue: VecDeque::new(), sending: None, capacity }
+        Self { effects, queue: VecDeque::with_capacity(capacity), sending: None, capacity,
+            outcomes: [0; 6], failures: 0, token_high_water: 0 }
     }
     pub fn len(&self) -> usize { self.queue.len() + usize::from(self.sending.is_some()) }
     pub fn bytes(&self) -> usize {
-        self.queue.iter().map(|(t, _)| t.bytes()).sum::<usize>()
+        self.queue.iter().map(|(t, _)| t.external_bytes()).sum::<usize>()
             + self.sending.as_ref().map_or(0, |s| s.bytes)
             + self.queue.capacity() * std::mem::size_of::<(AckToken, Outcome)>()
     }
@@ -916,15 +1349,17 @@ impl Notifier {
     }
     pub fn push(&mut self, token: AckToken, outcome: Outcome) {
         assert!(self.len() < self.capacity, "worker must reserve completion credit");
+        self.token_high_water = self.token_high_water.max(token.bytes());
+        self.outcomes[outcome as usize] += 1;
         self.queue.push_back((token, outcome));
     }
     pub async fn next(&mut self) -> Result<(), Error> {
         if self.sending.is_none() {
             let Some((token, outcome)) = self.queue.pop_front() else { return pending().await; };
-            let bytes = token.bytes();
+            let external = token.external_bytes();
             let received = token.received;
             let effects = self.effects.clone();
-            self.sending = Some(Sending { bytes, received, future: Box::pin(async move {
+            let future = async move {
                 let data = token.pdata();
                 match outcome {
                     Outcome::Ack => effects.notify_ack(AckMsg::new(data)).await,
@@ -934,14 +1369,61 @@ impl Notifier {
                         "shutdown", data, NackCause::NodeShutdown)).await,
                     _ => effects.notify_nack(NackMsg::new("storage", data)).await,
                 }
-            }) });
+            };
+            let bytes = external + std::mem::size_of_val(&future);
+            self.sending = Some(Sending { bytes, received, future: Box::pin(future) });
         }
         let result = self.sending.as_mut().expect("send was installed").future.as_mut().await;
         self.sending = None;
+        if result.is_err() { self.failures += 1; }
         result
+    }
+    pub fn force_shutdown(&mut self, data: OtapPdata) {
+        use futures::FutureExt;
+        let (token, payload) = AckToken::split(data);
+        drop(payload);
+        self.token_high_water = self.token_high_water.max(token.bytes());
+        self.outcomes[Outcome::Shutdown as usize] += 1;
+        let result = self.effects.notify_nack(NackMsg::new_with_cause(
+            "shutdown", token.pdata(), NackCause::NodeShutdown)).now_or_never();
+        if !matches!(result, Some(Ok(()))) {
+            self.failures += 1;
+        }
     }
 }
 ```
+
+Append this test module to `token.rs`; introduce it in Step 1 together with the other failing notifier tests:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Scenario: a token moves from a reserved queue cell into a blocked send future.
+    /// Guarantees: queue storage, external routing buffers and future storage are each charged once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn notifier_bytes_do_not_double_count_inline_tokens() {
+        let (effects, _rx) = super::super::tests::effects(1);
+        let mut notify = Notifier::new(effects, 2);
+        let (first, payload) = AckToken::split(super::super::tests::empty_pdata());
+        drop(payload);
+        notify.push(first, Outcome::Ack);
+        notify.next().await.expect("fill completion channel");
+        let (token, payload) = AckToken::split(super::super::tests::empty_pdata());
+        drop(payload);
+        let external = token.external_bytes();
+        notify.push(token, Outcome::Ack);
+        let queue = notify.queue.capacity() * std::mem::size_of::<(AckToken, Outcome)>();
+        assert_eq!(notify.bytes(), queue + external);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(1), notify.next()).await.is_err());
+        let send = notify.sending.as_ref().expect("blocked send");
+        let future = std::mem::size_of_val(send.future.as_ref().get_ref());
+        assert_eq!(notify.bytes(), queue + external + future);
+    }
+}
+```
+
+Make the existing test helpers `effects` and `empty_pdata` `pub(super)` so this sibling test module can call them; no production API is added.
 
 Add `mod token;` to `mod.rs`. In the temporary one-request loop replace the split line by `let (token, mut payload) = token::AckToken::split(data);`; retain the existing signal local. Use the notifier to deliver the outcome: construct one `Notifier::new(effects.clone(), 2 * self.config.window.max_requests_per_block)` before the loop, replace `let data = OtapPdata::new(context, OtapPayload::empty(signal));` and the following delivery match with the following code, and remove now-unused direct notify imports:
 
@@ -1272,7 +1754,6 @@ async fn run(cfg: config::Config, store: Arc<dyn object_store::ObjectStore>,
             return Ok(TerminalState::new(worker.deadline.expect("shutdown"), []));
         }
         let accept = worker.accept();
-        let can_read = worker.live_tokens() < 2 * worker.cfg.window.max_requests_per_block;
         let deadline = worker.deadline;
         tokio::select! {
             biased;
@@ -1295,15 +1776,13 @@ async fn run(cfg: config::Config, store: Arc<dyn object_store::ObjectStore>,
             () = std::future::ready(()), if worker.rotation_requested && worker.flushing.is_none() => {
                 worker.rotate(); notify_turns = 0;
             }
-            message = inbox.recv_when(accept), if can_read => {
+            message = inbox.recv_when(accept) => {
                 notify_turns = 0;
                 match message? {
                     Message::PData(data) => {
                         if let Some(d) = inbox.shutdown_deadline() {
                             worker.shutdown(d);
-                            let (token, payload) = token::AckToken::split(data);
-                            drop(payload);
-                            worker.notify.push(token, token::Outcome::Shutdown);
+                            worker.notify.force_shutdown(data);
                         } else if accept {
                             worker.admit(data);
                         } else {
@@ -1320,7 +1799,7 @@ async fn run(cfg: config::Config, store: Arc<dyn object_store::ObjectStore>,
 }
 ```
 
-Task 9 replaces the deadline branch with final nacks and bounded cleanup. This task already cancels on owner drop and never blocks inside a notification send. `DrainIngress` is deliberately not a trigger: the engine sends it to receivers only.
+Task 11 replaces the deadline branch with final nacks and bounded cleanup. This task already cancels on owner drop and never blocks inside a notification send. `DrainIngress` is deliberately not a trigger: the engine sends it to receivers only.
 
 - [ ] **Step 4: Verify ownership, durable ordering and the slice**
 
@@ -1571,7 +2050,7 @@ A resume uses the current block's partition and current committed cache contents
 
 - [ ] **Step 4: Verify budget and notification bounds**
 
-Run the two focused tests and `cargo check -p otel-arrow-dfe-core-nodes --features series_parquet` from `rust/otap-dataflow`. Expected: PASS. Inspect that `Pending` contains no `OtapPdata`, `OtapPayload` or `OtapArrowRecords`, and `prepare` has no payload clone. Block bytes include token capacity through `AckToken::bytes`; spare token-vector capacity is explicitly included in retained accounting in task 7.
+Run the two focused tests and `cargo check -p otel-arrow-dfe-core-nodes --features series_parquet` from `rust/otap-dataflow`. Expected: PASS. Inspect that `Pending` contains no `OtapPdata`, `OtapPayload` or `OtapArrowRecords`, and `prepare` has no payload clone. Block bytes include token capacity through `AckToken::bytes`; spare token-vector capacity is explicitly included in retained accounting in task 8.
 
 - [ ] **Step 5: Commit**
 
@@ -1769,7 +2248,7 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 **Interfaces:**
 - Consumes: `Worker::prepare(OtapPdata) -> Result<Pending,(AckToken,Outcome)>`, core extraction of `MetricsNumber`/`MetricsHistogram`, `UnsupportedPolicy::{Reject,Drop}`, OTLP timestamps as converted `i64`.
-- Produces: logs and metrics admission through the same state machine; traces always Refused; validation of every supplied attribute table, including dropped-point/exemplar attributes. This adapter preflight closes the current core's omission at `rust/otap-dataflow/crates/series-lake/src/extract/metrics.rs:368` without changing canonical identity or schemas.
+- Produces: logs and metrics admission through the same state machine; traces always Refused; one call to `lake::extract::extract` per request, with content errors propagated from core extraction. Metadata and exemplar attribute tables are neither read nor validated (plan-1 ruling R17); document that limitation.
 
 - [ ] **Step 1: Add failing network tests for numbers, histograms, mixed drops and traces**
 
@@ -1780,7 +2259,6 @@ from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2 as metr
 from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2_grpc as metrics_rpc
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2 as trace_pb
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2_grpc as trace_rpc
-
 
 def metric_request(request_id, unsupported=False):
     req = metrics_pb.ExportMetricsServiceRequest()
@@ -1801,7 +2279,6 @@ def metric_request(request_id, unsupported=False):
     if unsupported:
         scope.metrics.add(name="summary").summary.data_points.add(count=1, sum=2.0)
     return req
-
 
 class MetricsSlice(unittest.TestCase):
     # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request.
@@ -1920,7 +2397,7 @@ cargo build -p otel-arrow-dfe --bin df_engine --features series_parquet
 
 Expected: supported metric requests currently receive INVALID_ARGUMENT.
 
-- [ ] **Step 3: Admit metrics and validate all attribute content before extraction**
+- [ ] **Step 3: Admit metrics through the existing extraction call**
 
 In `prepare`, replace the logs-only check with:
 
@@ -1930,24 +2407,7 @@ if payload.signal_type() == otel_arrow_dfe_config::SignalType::Traces {
 }
 ```
 
-Add this function to `worker.rs` and call it on `&mut records` immediately before `lake::extract::extract`. It releases each validation table before constructing the next, bounding this temporary work by the converted request and depth limits.
-
-```rust
-fn validate_attributes(records: &mut OtapArrowRecords, cfg: &lake::config::LakeConfig) -> lake::Result<()> {
-    use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType as P;
-    records.decode_transport_optimized_ids().map_err(|e| lake::Error::Pdata(e.to_string()))?;
-    for kind in [P::ResourceAttrs, P::ScopeAttrs, P::MetricAttrs, P::LogAttrs,
-        P::NumberDpAttrs, P::HistogramDpAttrs, P::ExpHistogramDpAttrs, P::SummaryDpAttrs,
-        P::NumberDpExemplarAttrs, P::HistogramDpExemplarAttrs, P::ExpHistogramDpExemplarAttrs] {
-        if let Some(batch) = records.get(kind) {
-            let _ = lake::attrs::AttrTable::from_batch(batch, cfg.ingress.max_nesting_depth)?;
-        }
-    }
-    Ok(())
-}
-```
-
-Retain `extract`'s own decode call; it is idempotent (`rust/otap-dataflow/crates/series-lake/src/extract/mod.rs:100`). The validation table reads duplicate keys and nested CBOR even for non-identity or dropped fields. Malformed parent IDs and schema/conversion failures become Invalid/Refused. Zero-output drops use the existing immediate Ack path; a mixed request retains its token until all supported values files commit.
+Keep exactly one `lake::extract::extract(&mut records, &self.cfg.lake)` call. It owns transport-ID decoding and all supported content validation, including duplicate attributes, nesting limits, temporality and histogram shape/count checks. Propagate its errors through the existing Invalid/Refused mapping; do not add an attribute-validation adapter. Metadata and exemplar attribute tables are neither read nor validated (plan-1 R17), including under drop policy. Any direct core decoder test uses `lake::value::DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)`, never a bare `usize`. Zero-output drops use the existing immediate Ack path; mixed requests retain their token until supported files commit.
 
 - [ ] **Step 4: Verify logs, metrics and content rejection together**
 
@@ -1971,70 +2431,18 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-### Task 7: Worker telemetry, labeled extraction outcomes and process memory residual
+### Task 7: Core block/cache statistics and descriptor re-emission
 
 **Files:**
-- Create: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/metrics.rs`
-- Modify: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/{mod.rs,worker.rs,flush.rs,token.rs,tests.rs}`
 - Modify: `rust/otap-dataflow/crates/series-lake/src/{buffer.rs,cache.rs,extract/mod.rs,extract/metrics.rs}`
-- Modify: `rust/otap-dataflow/crates/engine/src/engine_metrics.rs`
 
 **Interfaces:**
-- Consumes: `FlushReport.files: Vec<(Dataset,Path,usize)>`, `ExtractStats`, `CacheStats`, engine `PipelineContext`, `MetricSet`/`MeasurementMetricSet`, generated registration and `MetricsReporter::report`.
-- Produces: `Metrics::{register,report,snapshots}`, `Worker::sample_metrics`, `Worker.metrics: Option<Metrics>`, `Worker.accounting: SeriesMemoryAccounting`; bounded extraction maps; `SeriesCache::last_committed`; `Block::reserve_with_reemit`; `FlushDone.attempts: u64`.
-- Metrics never use raw error messages, paths, request IDs, series IDs or producer IDs as labels. `column` is registration-time and bounded by the configured denormalized columns. `dataset` is a five-value signal-qualified enum, avoiding ambiguity between logs/series and metrics/series.
-- `series_emitted{reason=new}` means absent/uncommitted in the bounded cache, `partition` means a cached different partition, and `rotation` means an explicit same-window byte/request rotation. Eviction can turn a historical series into `new`; the label is not a global cardinality oracle.
+- Consumes Task 0's series-row reservation estimate and the existing extraction/cache interfaces.
+- Produces bounded per-kind/per-column `ExtractStats`, `SeriesCache::last_committed`, and `Block::reserve_with_reemit`. Existing `reserve` delegates without changing behavior; no engine/exporter dependency is added.
 
-- [ ] **Step 1: Add red tests for required metric names and two-worker accounting**
+- [ ] **Step 1: Add the failing core regression**
 
-In `engine_metrics.rs` tests:
-
-```rust
-/// Scenario: two exporter workers account memory and one exits.
-/// Guarantees: the process total removes the exited worker and never subtracts another worker twice.
-#[test]
-fn series_accounting_releases_each_worker_once() {
-    let baseline = SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-    let mut a = SeriesMemoryAccounting::default();
-    let mut b = SeriesMemoryAccounting::default();
-    a.set(128);
-    b.set(256);
-    a.set(192);
-    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline + 448);
-    drop(a);
-    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline + 256);
-    b.set(0);
-    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline);
-    drop(b);
-    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline);
-}
-```
-
-In `series_parquet/tests.rs`:
-
-```rust
-/// Scenario: telemetry is collected after admitting a request and while a notification waits.
-/// Guarantees: gauges include live requests and all required worker instruments have stable names.
-#[tokio::test(flavor = "current_thread")]
-async fn worker_metrics_cover_live_memory_and_requests() {
-    use otel_arrow_dfe_telemetry::metrics::MetricSetHandler;
-    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-    let (effects, _rx) = effects(4);
-    let wall = Arc::new(lake::clock::TestWallClock::new(0));
-    let mut w = Worker::new(config(), Arc::new(InMemory::new()), wall, effects);
-    w.metrics = Some(super::metrics::Metrics::register(&context, &w.cfg.lake));
-    w.admit(logs_pdata());
-    w.sample_metrics();
-    let m = w.metrics.as_ref().expect("registered");
-    assert_eq!(m.worker.requests_pending.get(), 1);
-    assert!(m.worker.memory_accounted_bytes.get() >= w.active.data.bytes as u64);
-    assert!(m.worker.memory_budget_bytes.get() >= m.worker.memory_accounted_bytes.get());
-    let snapshots = m.worker.snapshot_values();
-    assert!(!snapshots.is_empty());
-}
-```
-
-Also add this core regression test inside `buffer.rs`'s existing tests module, using its local `extracted` fixture:
+In `buffer.rs`'s existing tests module, using its `extracted` fixture:
 
 ```rust
 /// Scenario: a byte rotation begins another block in a partition with a committed descriptor.
@@ -2055,18 +2463,16 @@ fn byte_rotation_can_force_descriptor_reemission() {
 }
 ```
 
-- [ ] **Step 2: Run red telemetry tests**
+- [ ] **Step 2: Run the red test**
 
 ```bash
 cd rust/otap-dataflow
-cargo test -p otel-arrow-dfe-engine series_accounting_releases_each_worker_once -- --test-threads=1
 cargo test -p otel-arrow-dfe-series-lake byte_rotation_can_force_descriptor_reemission
-cargo test -p otel-arrow-dfe-core-nodes --features series_parquet worker_metrics_cover_live_memory_and_requests
 ```
 
-Expected: missing support methods and instruments. Use the exact `Gauge::get`/`MetricSetHandler::snapshot_values` interfaces from the telemetry crate; this test checks recorded values, not just a text list.
+Expected: the additive reservation method is missing.
 
-- [ ] **Step 3: Add bounded details and rotation-aware reservation to the core**
+- [ ] **Step 3: Add bounded core details and reservation support**
 
 Add these fields to `ExtractStats`, preserving existing aggregate fields/tests:
 
@@ -2127,7 +2533,7 @@ pub fn reserve_with_reemit(&self, extracted: &Extracted, cache: &mut SeriesCache
         let committed_here = cache.is_committed(&d.series_id, self.partition);
         if (reemit || !committed_here) && !self.pending_series.contains(&d.series_id) {
             new_series.push(i);
-            bytes += d.approx_bytes + limits.pending_series_entry_bytes;
+            bytes += d.series_row_bytes() + limits.pending_series_entry_bytes;
         }
     }
     if bytes > limits.max_block_bytes { return Err(Error::Refused(RefuseReason::RequestTooLarge)); }
@@ -2142,7 +2548,194 @@ pub fn reserve_with_reemit(&self, extracted: &Extracted, cache: &mut SeriesCache
 
 This small additive core API is necessary to implement the spec 7.4 byte-rotation statement literally; normal `reserve` suppresses committed same-partition descriptors. Coordinate with plan 1's owner rather than forking or duplicating its reservation arithmetic.
 
-- [ ] **Step 4: Declare every worker instrument and its closed labels**
+- [ ] **Step 4: Preserve the extraction boundary**
+
+Keep metadata/exemplar attribute tables unread and unvalidated under R17. Per-column keys come only from configured columns; unsupported-kind counters have the closed exponential-histogram, summary and exemplar domains. Reservation continues using `series_row_bytes()` from Task 0.
+
+- [ ] **Step 5: Verify the independent core change**
+
+```bash
+cd rust/otap-dataflow
+cargo check -p otel-arrow-dfe-series-lake
+cargo test -p otel-arrow-dfe-series-lake
+cd ../..
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add rust/otap-dataflow/crates/series-lake/src/buffer.rs rust/otap-dataflow/crates/series-lake/src/cache.rs rust/otap-dataflow/crates/series-lake/src/extract/mod.rs rust/otap-dataflow/crates/series-lake/src/extract/metrics.rs
+git commit -m "feat(series-lake): expose bounded extraction and rotation statistics
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
+```
+
+### Task 8: Exporter metrics and durable lifecycle accounting
+
+**Files:**
+- Create: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/metrics.rs`
+- Modify: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/{mod.rs,worker.rs,flush.rs,token.rs,tests.rs}`
+
+**Interfaces:**
+- Consumes Task 7's core statistics and `FlushReport.files`; produces `Metrics::{register,report,snapshots}`, `Worker::sample_metrics`, and `FlushDone.attempts: u64`.
+- `OwnedBlock.emitted` and `FlushJob.emitted` retain three descriptor counts until durable commit; the exporter compiles independently of process residual support added next.
+- Labels use closed reason/kind/dataset enums and configured column names. Never label with errors, paths, request IDs, series IDs or producer IDs. `new` means absent/uncommitted in the bounded cache, `partition` means a different cached partition, and `rotation` means explicit same-window re-emission; eviction can produce `new` again.
+
+- [ ] **Step 1: Add failing metric value and schema tests**
+
+In `series_parquet/tests.rs`:
+
+```rust
+/// Scenario: telemetry is collected after admitting a request and while a notification waits.
+/// Guarantees: gauges include live requests and all required worker instruments have stable names.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_metrics_cover_live_memory_and_requests() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (effects, _rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut w = Worker::new(config(), Arc::new(InMemory::new()), wall, effects);
+    w.metrics = Some(super::metrics::Metrics::register(&context, &w.cfg.lake));
+    w.admit(logs_pdata());
+    w.sample_metrics();
+    let m = w.metrics.as_ref().expect("registered");
+    assert_eq!(m.worker.requests_pending.get(), 1);
+    assert!(m.worker.memory_accounted_bytes.get() >= w.active.data.bytes as u64);
+    assert!(m.worker.memory_budget_bytes.get() >= m.worker.memory_accounted_bytes.get());
+    assert_eq!(m.worker.snapshot().descriptor().name, "exporter.series_parquet");
+}
+```
+
+Follow `file_exporter/metrics.rs:145`: assert exact descriptor names, ordered metric names/units, and decoded measurement labels. Add to `metrics.rs`'s test module after its definitions:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn assert_schema(snapshot: &MetricSetSnapshot, fields: &[(&str, &str)], labels: &[(&str, &str)]) {
+        assert_eq!(snapshot.descriptor().name, "exporter.series_parquet");
+        let actual: Vec<_> = snapshot.descriptor().metrics.iter().map(|m| (m.name, m.unit)).collect();
+        assert_eq!(actual, fields);
+        let actual: Vec<_> = snapshot.measurement_attributes().collect();
+        assert_eq!(actual, labels);
+    }
+    /// Scenario: every exporter metric set is registered and each closed label bucket is touched.
+    /// Guarantees: exact descriptor/measurement names, units and label values remain stable.
+    #[test]
+    fn series_metric_schema_is_exact() {
+        let (ctx, registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+        let mut cfg = LakeConfig::default();
+        cfg.logs.denormalize.push(otel_arrow_dfe_series_lake::config::Denormalize {
+            path: "resource.host.id".into(), column: "host_col".into(),
+            ty: otel_arrow_dfe_series_lake::config::DenormType::String,
+        });
+        let mut m = Metrics::register(&ctx, &cfg);
+        assert_schema(&m.worker.snapshot(), &[
+            ("series_cache.entries", "{entry}"), ("series_cache.hits", "{lookup}"),
+            ("series_cache.misses", "{lookup}"), ("series_cache.evictions", "{entry}"),
+            ("block.active_bytes", "By"), ("block.flushing_bytes", "By"),
+            ("block.requests_pending", "{request}"), ("block.pending_slot_occupied", "{slot}"),
+            ("flush.duration", "s"), ("flush.failures", "{flush}"),
+            ("flush.retries", "{attempt}"), ("flush.cancelled", "{flush}"),
+            ("acks", "{request}"), ("notify.queued", "{request}"),
+            ("notify.failures", "{request}"), ("oldest_unacked_seconds", "s"),
+            ("timestamp.out_of_range", "{timestamp}"), ("memory.budget_bytes", "By"),
+            ("memory.accounted_bytes", "By"),
+        ], &[]);
+        for (reason, label) in [(FlushReason::Time, "time"), (FlushReason::Bytes, "bytes"),
+            (FlushReason::Requests, "requests"), (FlushReason::Shutdown, "shutdown")] {
+            m.flush.with(FlushAttrs { reason }).count.add(1);
+            let snapshots = m.flush.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(&snapshots[0], &[("flush.count", "{flush}")], &[("reason", label)]);
+        }
+        for (reason, label) in [(NackReason::Storage, "storage"), (NackReason::TooLarge, "too_large"),
+            (NackReason::Invalid, "invalid"), (NackReason::Unsupported, "unsupported"),
+            (NackReason::Shutdown, "shutdown")] {
+            m.nacks.with(NackAttrs { reason }).nacks.observe(1);
+            let snapshots = m.nacks.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(&snapshots[0], &[("nacks", "{request}")], &[("reason", label)]);
+        }
+        for (dataset, label) in [(DatasetLabel::LogsSeries, "logs_series"), (DatasetLabel::LogsValues, "logs_values"),
+            (DatasetLabel::MetricsSeries, "metrics_series"), (DatasetLabel::MetricsNumber, "metrics_number"),
+            (DatasetLabel::MetricsHistogram, "metrics_histogram")] {
+            m.written.with(DatasetAttrs { dataset }).rows_written.add(1);
+            let snapshots = m.written.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(&snapshots[0], &[("rows_written", "{row}"), ("files_written", "{file}")], &[("dataset", label)]);
+        }
+        for (reason, label) in [(EmitReason::New, "new"), (EmitReason::Partition, "partition"), (EmitReason::Rotation, "rotation")] {
+            m.emitted.with(EmitAttrs { reason }).series_emitted.add(1);
+            let snapshots = m.emitted.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(&snapshots[0], &[("series_emitted", "{row}")], &[("reason", label)]);
+        }
+        for (kind, label) in [(DroppedKind::ExpHistogram, "exp_histogram"), (DroppedKind::Summary, "summary"),
+            (DroppedKind::Exemplar, "exemplar")] {
+            m.dropped.with(DroppedAttrs { kind }).dropped_unsupported.add(1);
+            let snapshots = m.dropped.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(&snapshots[0], &[("dropped_unsupported", "{row}")], &[("kind", label)]);
+        }
+        assert_eq!(m.columns.keys().map(String::as_str).collect::<Vec<_>>(), ["host_col"]);
+        assert_schema(&m.columns["host_col"].snapshot(), &[("denormalize.type_mismatch", "{value}")], &[]);
+        m.columns.get_mut("host_col").expect("column").mismatch.add(1);
+        let snapshot = m.columns["host_col"].snapshot();
+        registry.accumulate_metric_set_snapshot(snapshot.key(), snapshot.bucket(), snapshot.get_metrics());
+        let batch = registry.drain_metric_export_batch();
+        let column = batch.metric_sets.iter().find(|set|
+            set.descriptor.metrics.iter().any(|metric| metric.name == "denormalize.type_mismatch"))
+            .expect("column export");
+        assert_eq!(column.item_attributes, vec![("column".into(), "host_col".into())]);
+        assert!(m.emitted.terminal_snapshots().is_empty());
+    }
+}
+```
+
+Also add this lifecycle regression to `series_parquet/tests.rs` before changing the metric call sites:
+
+```rust
+/// Scenario: one block is abandoned after admission and a later block commits successfully.
+/// Guarantees: series_emitted excludes admitted/abandoned rows and increments only on durable completion.
+#[tokio::test(flavor = "current_thread")]
+async fn series_emitted_requires_durable_completion() {
+    tokio::task::LocalSet::new().run_until(async {
+        let (ctx, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+        let (effects, _rx) = effects(8);
+        let wall = Arc::new(lake::clock::TestWallClock::new(0));
+        let mut w = Worker::new(config(), Arc::new(InMemory::new()), wall, effects);
+        w.metrics = Some(super::metrics::Metrics::register(&ctx, &w.cfg.lake));
+        w.admit(logs_pdata());
+        assert!(w.metrics.as_mut().expect("metrics").emitted.terminal_snapshots().is_empty());
+        w.fail_active(Outcome::Storage);
+        assert!(w.metrics.as_mut().expect("metrics").emitted.terminal_snapshots().is_empty());
+        w.admit(logs_pdata());
+        let expected = w.active.data.pending_series.len() as u64;
+        w.rotate();
+        let done = w.flushing.as_mut().expect("flush").finish().await;
+        assert!(done.as_ref().expect("join").result.is_ok());
+        assert!(w.metrics.as_mut().expect("metrics").emitted.terminal_snapshots().is_empty());
+        w.complete(done);
+        let m = w.metrics.as_ref().expect("metrics");
+        assert_eq!(m.emitted.get(super::metrics::EmitAttrs { reason: super::metrics::EmitReason::New })
+            .series_emitted.get(), expected);
+    }).await;
+}
+```
+
+- [ ] **Step 2: Run the red telemetry tests**
+
+```bash
+cd rust/otap-dataflow
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet worker_metrics_cover_live_memory_and_requests
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet series_metric_schema_is_exact
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet series_emitted_requires_durable_completion
+```
+
+Expected: missing metrics module before implementation; schema mutations must fail exact assertions.
+
+- [ ] **Step 3: Declare all worker instruments and labels**
 
 `metrics.rs`:
 
@@ -2216,8 +2809,8 @@ pub(super) struct DatasetAttrs { pub dataset: DatasetLabel }
 #[metric_set(name = "exporter.series_parquet", measurement_attributes = DatasetAttrs)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct WrittenMetrics {
-    #[metric(unit = "{row}")] pub rows_written: Counter<u64>,
-    #[metric(unit = "{file}")] pub files_written: Counter<u64>,
+    #[metric(name = "rows_written", unit = "{row}")] pub rows_written: Counter<u64>,
+    #[metric(name = "files_written", unit = "{file}")] pub files_written: Counter<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
 pub(super) enum EmitReason { New, Partition, Rotation }
@@ -2227,7 +2820,7 @@ pub(super) struct EmitAttrs { pub reason: EmitReason }
 #[metric_set(name = "exporter.series_parquet", measurement_attributes = EmitAttrs)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct EmittedMetrics {
-    #[metric(unit = "{row}")] pub series_emitted: Counter<u64>,
+    #[metric(name = "series_emitted", unit = "{row}")] pub series_emitted: Counter<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
 pub(super) enum DroppedKind { ExpHistogram, Summary, Exemplar }
@@ -2237,7 +2830,7 @@ pub(super) struct DroppedAttrs { pub kind: DroppedKind }
 #[metric_set(name = "exporter.series_parquet", measurement_attributes = DroppedAttrs)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct DroppedMetrics {
-    #[metric(unit = "{row}")] pub dropped_unsupported: Counter<u64>,
+    #[metric(name = "dropped_unsupported", unit = "{row}")] pub dropped_unsupported: Counter<u64>,
 }
 #[attribute_set(item, registration)]
 #[derive(Debug, Clone)]
@@ -2300,11 +2893,11 @@ impl Metrics {
 }
 ```
 
-- [ ] **Step 5: Wire accounting and lifecycle instrumentation**
+- [ ] **Step 4: Wire accounting and lifecycle instrumentation**
 
-Add these fields to Notifier: `pub outcomes: [u64; 6]`, `pub failures: u64`, and `pub token_high_water: usize`, initialized to zero. Give Outcome `#[repr(usize)]` (the existing order is Ack, TooLarge, Invalid, Unsupported, Storage, Shutdown). In `push`, before moving the token, execute `self.token_high_water = self.token_high_water.max(token.bytes());` and `self.outcomes[outcome as usize] += 1;`. In `next`, before returning its result, execute `if result.is_err() { self.failures += 1; }`. Thus acks/nacks count decisions, notification failures count delivery errors, and committed-but-unnotified remains observable.
+Use the Notifier counters already introduced with tokens. Ack/nack counters count decisions; failures include closed sends and immediate forced-drain NACK attempts that cannot complete. Queue allocation is charged once; queued tokens contribute only external frame/CallData buffers, and the pending send contributes its measured future allocation plus external buffers. Inline token size is never charged again inside the queue.
 
-Add `pub metrics: Option<super::metrics::Metrics>`, initialized to None, and `pub accounting: otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting`, initialized with Default, to Worker. Add `pub reason: super::metrics::FlushReason` initialized `super::metrics::FlushReason::Time` and `pub token_high_water: usize` initialized `std::mem::size_of::<AckToken>()`. Add `pub reemit: bool` initialized false to OwnedBlock; `new_active` sets it when the new start equals the previous start and `reason` is Bytes or Requests. In `offer`, replace the reservation call with `self.active.data.reserve_with_reemit(&pending.extracted, &mut self.cache, pending.token.bytes(), &self.cfg.lake, self.active.reemit)`.
+Add `pub metrics: Option<super::metrics::Metrics>`, initialized to None, to Worker. Add `pub reason: super::metrics::FlushReason` initialized `super::metrics::FlushReason::Time` and `pub token_high_water: usize` initialized `std::mem::size_of::<AckToken>()`. Add `pub reemit: bool` initialized false to OwnedBlock; `new_active` sets it when the new start equals the previous start and `reason` is Bytes or Requests. In `offer`, replace the reservation call with `self.active.data.reserve_with_reemit(&pending.extracted, &mut self.cache, pending.token.bytes(), &self.cfg.lake, self.active.reemit)`.
 
 Replace `Worker::admit` with this implementation. It records extraction outcomes once; resuming the pending slot never increments them again.
 
@@ -2329,29 +2922,22 @@ In `new_active`, replace its final OwnedBlock expression with:
 ```rust
 let reemit = start == self.active.data.window_start_secs
     && matches!(self.reason, super::metrics::FlushReason::Bytes | super::metrics::FlushReason::Requests);
-OwnedBlock { data: Block::new(start, seq, &self.cfg.lake), tokens: vec![], reemit }
+OwnedBlock { data: Block::new(start, seq, &self.cfg.lake), tokens: vec![], reemit, emitted: [0; 3] }
 ```
 
-For each successful reservation's `new_series`, determine the bounded reason before `admit` and record it only after successful admission:
+Add `pub emitted: [u64; 3]` to OwnedBlock and FlushJob, initialized to `[0; 3]` for every new OwnedBlock. Add `emitted: [u64; 3]` after `sink: Rc<lake::sink::Sink>` in FlushJob::new, store that argument in its Self initializer, and pass `old.emitted` after the sink argument at the rotation call site. The three positions are New, Partition, Rotation. Determine the per-request counts before consuming the extracted descriptors:
 
 ```rust
-let emission_reasons: Vec<_> = reservation.new_series.iter().map(|&index| {
+let mut emitted = [0_u64; 3];
+for &index in &reservation.new_series {
     let id = pending.extracted.descriptors[index].series_id;
-    if self.active.reemit { super::metrics::EmitReason::Rotation }
-    else if self.cache.last_committed(&id).is_some() { super::metrics::EmitReason::Partition }
-    else { super::metrics::EmitReason::New }
-}).collect();
-```
-
-In the successful `admit` arm after pushing the token:
-
-```rust
-if let Some(metrics) = &mut self.metrics {
-    for reason in emission_reasons {
-        metrics.emitted.with(super::metrics::EmitAttrs { reason }).series_emitted.add(1);
-    }
+    let reason = if self.active.reemit { 2 }
+        else if self.cache.last_committed(&id).is_some() { 1 } else { 0 };
+    emitted[reason] += 1;
 }
 ```
+
+After successful admission, add these counts to `self.active.emitted` with `for (total, count) in self.active.emitted.iter_mut().zip(emitted) { *total += count; }`. Failure discards the counts with the block. They travel with FLUSHING and increment `series_emitted` only in the `Ok(report)` durable-completion branch below.
 
 Replace the combined BlockFull/TooManyRequests reservation arm in `offer` with:
 
@@ -2427,6 +3013,11 @@ pub fn complete(&mut self, done: Result<FlushDone, tokio::task::JoinError>) {
                 Ok(report) => {
                     for id in &done.data.pending_series { self.cache.mark_committed(*id, done.data.partition); }
                     if let Some(m) = &mut self.metrics {
+                        for (reason, count) in [super::metrics::EmitReason::New,
+                            super::metrics::EmitReason::Partition, super::metrics::EmitReason::Rotation]
+                            .into_iter().zip(job.emitted) {
+                            if count != 0 { m.emitted.with(super::metrics::EmitAttrs { reason }).series_emitted.add(count); }
+                        }
                         for (dataset, _, rows) in report.files {
                             let bucket = m.written.with(DatasetAttrs { dataset: dataset.into() });
                             bucket.rows_written.add(rows as u64);
@@ -2453,7 +3044,7 @@ pub fn complete(&mut self, done: Result<FlushDone, tokio::task::JoinError>) {
 }
 ```
 
-Add this sampling function. Workspace allowances are engineering reservations, not byte-exact measurements. Q6 accepts block-sized series sealing for v1 (plan 1 F-park; FORMAT.md limitations): `descriptor_seal = B` is included in `memory.budget_bytes`, and synchronous seal work also grows with descriptor volume. This is not a fixed-workspace bound. Q5 leaves allowance validation to plan 3; plan 2 reports the once-process RSS residual.
+Add this sampling function. Retained data is exactly ACTIVE + FLUSHING + one pending request + notification tokens, plus the bounded cache. Task 0 materializes series during admission and reserves the eight-byte stamp overlap inside the block. There is no additional B allowance. Construction allowances remain engineering reservations; empirical validation is plan 3.
 
 ```rust
 pub fn sample_metrics(&mut self) {
@@ -2471,9 +3062,7 @@ pub fn sample_metrics(&mut self) {
         + cfg.sorting.merge_chunk_bytes as u64;
     let conversion = 4 * cfg.ingress.max_request_bytes as u64;
     let fixed = 64 * 1024 * 1024_u64;
-    // Current core sealing retains all descriptors beside their materialized batches.
-    let descriptor_seal = cfg.ingress.max_block_bytes as u64;
-    let workspace = sort + merge + writer + upload + conversion + fixed + descriptor_seal;
+    let workspace = sort + merge + writer + upload + conversion + fixed;
     let spare_tokens = self.active.tokens.capacity().saturating_sub(self.active.tokens.len())
         + self.flushing.as_ref().map_or(0, |f| f.tokens.capacity().saturating_sub(f.tokens.len()));
     let accounted = self.active.data.bytes as u64 + flushing as u64 + pending as u64
@@ -2482,7 +3071,6 @@ pub fn sample_metrics(&mut self) {
     let budget = 2 * cfg.ingress.max_block_bytes as u64 + cfg.ingress.max_extracted_bytes as u64
         + self.cfg.cache_entries as u64 * 128 + 2 * cfg.ingress.max_requests_per_block as u64 * token
         + workspace;
-    self.accounting.set(accounted);
     let oldest = self.active.tokens.iter().map(|t| t.received)
         .chain(self.flushing.iter().flat_map(|f| f.tokens.iter().map(|t| t.received)))
         .chain(self.pending.iter().map(|p| p.token.received))
@@ -2545,20 +3133,118 @@ Message::Control(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
 
 At each TerminalState return, replace `[]` with `worker.metrics.as_mut().map_or_else(Vec::new, metrics::Metrics::snapshots)` after sampling. Do not return a bare state that loses the last counters.
 
-- [ ] **Step 6: Report process RSS residual once from the existing engine monitor**
+- [ ] **Step 5: Verify exporter metrics independently**
 
-This is the only engine change in task 7: additive worker accounting and reporting through the existing monitor. Keep existing monitor scheduling, routing and shutdown behavior. Its own `series_accounting_releases_each_worker_once` regression is introduced in step 1 and run in steps 2/7; no unrelated engine refactor is authorized.
+```bash
+cd rust/otap-dataflow
+cargo check -p otel-arrow-dfe-core-nodes --features series_parquet
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet series_parquet
+cd ../..
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet
+git commit -m "feat(series_parquet): report durable writes and bounded worker telemetry
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
+```
+
+### Task 9: Engine process residual accounting for active workers
+
+**Files:**
+- Modify: `rust/otap-dataflow/crates/engine/src/engine_metrics.rs`
+- Modify: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/worker.rs`
+
+**Interfaces:**
+- Consumes the existing engine monitor's single RSS sample and the worker's accounted bytes.
+- Produces `SeriesMemoryAccounting::register()` RAII worker registration and `set(u64)`. The process residual exists only while at least one registered series exporter worker exists, with one monitor reporting it.
+
+- [ ] **Step 1: Add failing registration/accounting tests**
+
+In `engine_metrics.rs` tests:
+
+```rust
+/// Scenario: two exporter workers account memory and one exits.
+/// Guarantees: the process total removes the exited worker and never subtracts another worker twice.
+#[test]
+fn series_accounting_releases_each_worker_once() {
+    let baseline = SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let mut a = SeriesMemoryAccounting::register();
+    let mut b = SeriesMemoryAccounting::register();
+    a.set(128);
+    b.set(256);
+    a.set(192);
+    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline + 448);
+    drop(a);
+    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline + 256);
+    b.set(0);
+    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline);
+    drop(b);
+    assert_eq!(SERIES_ACCOUNTED_BYTES.load(std::sync::atomic::Ordering::Relaxed), baseline);
+}
+```
+
+Also add this monitor regression, using the existing ControllerContext test fixture:
+
+```rust
+/// Scenario: a process has no series workers, then two, then no workers again.
+/// Guarantees: only active workers expose residual telemetry and residual reuses the engine RSS sample.
+#[test]
+fn series_accounting_controls_process_metric_presence() {
+    let registry = TelemetryRegistryHandle::new();
+    let controller = ControllerContext::new(registry.clone());
+    let entity = controller.register_engine_entity();
+    let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+    let mut monitor = EngineMetricsMonitor::new(registry, entity, reporter, controller.memory_pressure_state());
+    monitor.update();
+    assert!(monitor.series.is_none());
+    let mut a = SeriesMemoryAccounting::register();
+    let b = SeriesMemoryAccounting::register();
+    a.set(128);
+    monitor.update();
+    assert_eq!(monitor.series.as_ref().expect("registered").residual.get(),
+        monitor.metrics.memory_rss.get().saturating_sub(128));
+    drop(a);
+    monitor.update();
+    assert!(monitor.series.is_some(), "zero-byte worker is still registered");
+    drop(b);
+    monitor.update();
+    assert!(monitor.series.is_none());
+}
+```
+
+Serialize these two process-global tests with a shared `static SERIES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());` in the test module and `let _guard = SERIES_TEST_LOCK.lock().expect("series test lock");` as each test's first statement. The full workspace suite may otherwise run them concurrently.
+
+- [ ] **Step 2: Run the red engine tests**
+
+```bash
+cd rust/otap-dataflow
+cargo test -p otel-arrow-dfe-engine series_accounting -- --test-threads=1
+```
+
+Expected: no accounting registration or residual metric exists yet.
+
+- [ ] **Step 3: Add active-worker accounting and reuse the monitor sample**
 
 Add to `engine_metrics.rs`:
 
 ```rust
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+static SERIES_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static SERIES_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SERIES_REPORTER_OWNED: AtomicBool = AtomicBool::new(false);
 /// One worker's contribution to process-wide series exporter memory accounting.
-#[derive(Default)]
 pub struct SeriesMemoryAccounting { bytes: u64 }
 impl SeriesMemoryAccounting {
+    /// Register one active exporter worker, including workers currently retaining zero bytes.
+    #[must_use]
+    pub fn register() -> Self {
+        let _ = SERIES_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self { bytes: 0 }
+    }
     /// Replace this worker's accounted bytes without disturbing other workers.
     pub fn set(&mut self, bytes: u64) {
         if bytes >= self.bytes { let _ = SERIES_ACCOUNTED_BYTES.fetch_add(bytes - self.bytes, Ordering::Relaxed); }
@@ -2566,7 +3252,12 @@ impl SeriesMemoryAccounting {
         self.bytes = bytes;
     }
 }
-impl Drop for SeriesMemoryAccounting { fn drop(&mut self) { self.set(0); } }
+impl Drop for SeriesMemoryAccounting {
+    fn drop(&mut self) {
+        self.set(0);
+        let _ = SERIES_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 /// Process-scoped exporter residual; the engine monitor is its single reporter.
 #[metric_set(name = "exporter.series_parquet")]
 #[derive(Debug, Default, Clone)]
@@ -2577,15 +3268,30 @@ pub struct SeriesProcessMetrics {
 }
 ```
 
-Add monitor fields `series: Option<MetricSet<SeriesProcessMetrics>>` and `series_entity: EntityKey`, initialized None and the constructor's entity_key. At the start of `update`:
+Add monitor fields `series: Option<MetricSet<SeriesProcessMetrics>>` and `series_entity: EntityKey`, initialized None and the constructor's entity_key. Add this method in `impl EngineMetricsMonitor`:
 
 ```rust
-if self.series.is_none() && SERIES_REPORTER_OWNED.compare_exchange(false, true,
-    Ordering::AcqRel, Ordering::Acquire).is_ok() {
-    self.series = Some(self.registry.register_metric_set_for_entity::<SeriesProcessMetrics>(self.series_entity));
+fn sync_series_registration(&mut self) {
+    if SERIES_WORKERS.load(Ordering::Acquire) == 0 {
+        if let Some(series) = self.series.take() {
+            let _ = self.registry.unregister_metric_set(series.metric_set_key());
+            SERIES_REPORTER_OWNED.store(false, Ordering::Release);
+        }
+    } else if self.series.is_none() && SERIES_REPORTER_OWNED.compare_exchange(false, true,
+        Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        self.series = Some(self.registry.register_metric_set_for_entity::<SeriesProcessMetrics>(self.series_entity));
+    }
 }
+```
+
+Replace `self.metrics.memory_rss.observe(get_rss_bytes());` at the start of `update` with this exact block; there is only one RSS read:
+
+```rust
+let rss = get_rss_bytes();
+self.metrics.memory_rss.observe(rss);
+self.sync_series_registration();
 if let Some(series) = &mut self.series {
-    series.residual.set(get_rss_bytes().saturating_sub(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed)));
+    series.residual.set(rss.saturating_sub(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed)));
 }
 ```
 
@@ -2593,6 +3299,7 @@ The engine monitor uses its existing internal registry registration mechanism; w
 
 ```rust
 // At the beginning of report:
+self.sync_series_registration();
 if let Some(series) = &mut self.series { self.reporter.report(series)?; }
 // Before flush_until in finish_reporting_until:
 if let Some(series) = &mut self.series {
@@ -2605,25 +3312,33 @@ if let Some(series) = self.series.take() {
 }
 ```
 
-This reports on the engine entity, not a worker entity, and reuses the memory-limiter sampling source. A surviving second monitor can acquire the reporter on its next update. No exporter-to-engine dependency cycle is introduced.
+This reports on the engine entity, not a worker entity, and reuses the exact RSS sample already read for engine.memory_rss. No metric is registered/reported at zero workers; report rechecks worker presence before sending. A surviving second monitor can acquire the reporter on its next update. No exporter-to-engine dependency cycle is introduced.
 
-- [ ] **Step 7: Verify all instruments and commit**
+- [ ] **Step 4: Connect worker lifetime and sampled bytes**
+
+Add `pub accounting: otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting` to Worker, initialized by `SeriesMemoryAccounting::register()` in `Worker::new`. In `sample_metrics`, insert `self.accounting.set(accounted);` immediately after computing `accounted`. Dropping Worker unregisters it exactly once even if its last accounted value is zero. Register workers explicitly; creating a monitor never creates an exporter worker.
+
+- [ ] **Step 5: Verify process lifetime and exporter wiring**
 
 ```bash
 cd rust/otap-dataflow
-cargo check -p otel-arrow-dfe-series-lake -p otel-arrow-dfe-engine -p otel-arrow-dfe-core-nodes --features otel-arrow-dfe-core-nodes/series_parquet
-cargo test -p otel-arrow-dfe-series-lake byte_rotation_can_force_descriptor_reemission
-cargo test -p otel-arrow-dfe-engine series_accounting_releases_each_worker_once -- --test-threads=1
-cargo test -p otel-arrow-dfe-core-nodes --features series_parquet worker_metrics_cover_live_memory_and_requests
+cargo check -p otel-arrow-dfe-engine -p otel-arrow-dfe-core-nodes --features otel-arrow-dfe-core-nodes/series_parquet
+cargo test -p otel-arrow-dfe-engine series_accounting -- --test-threads=1
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet series_parquet
 cd ../..
-git add rust/otap-dataflow/crates/series-lake/src/buffer.rs rust/otap-dataflow/crates/series-lake/src/cache.rs rust/otap-dataflow/crates/series-lake/src/extract/mod.rs rust/otap-dataflow/crates/series-lake/src/extract/metrics.rs rust/otap-dataflow/crates/engine/src/engine_metrics.rs rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet
-git commit -m "feat(series_parquet): expose bounded lifecycle and memory telemetry
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add rust/otap-dataflow/crates/engine/src/engine_metrics.rs rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/worker.rs
+git commit -m "feat(engine): report series exporter RSS residual only for active workers
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-### Task 8: Absolute flush retry deadlines and cache correctness across failures
+### Task 10: Absolute flush retry deadlines and cache correctness across failures
 
 **Files:**
 - Modify: `rust/otap-dataflow/crates/core-nodes/Cargo.toml`
@@ -2631,11 +3346,11 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 **Interfaces:**
 - Consumes: sealed `Block<()>`, `Rc<Sink>`, `CancellationToken`, `FlushDone`, `FlushJob`, `Config.window.flush_retry_deadline`; `Error::{ObjectStore,Parquet,AbortFailed,Cancelled}`.
-- Produces: `FlushJob::new(Block<()>, Vec<AckToken>, Rc<Sink>, Duration) -> Self`, `retryable(&lake::Error) -> bool`, `write_until(&Sink, &Block<()>, &CancellationToken, Instant) -> (lake::Result<FlushReport>, u64)`. One absolute deadline starts at job creation and cancels an in-flight attempt. Per-operation retry settings remain inside the shared object-store backend.
+- Produces: `FlushJob::new(Block<()>, Vec<AckToken>, Rc<Sink>, [u64; 3], Duration, Duration) -> Self`, `finish() -> Result<FlushDone, oneshot::error::RecvError>`, and `cleanup() -> Result<(), JoinError>`. The independent supervisor sends the producer-visible Storage failure at the absolute retry deadline, then cleans up for at most abort_timeout. The same FLUSHING slot remains occupied until cleanup finishes; no next flush can overlap it. Per-operation retries remain inside the shared backend.
 
 - [ ] **Step 1: Add a real ObjectStore fault wrapper and red lifecycle tests**
 
-Append this complete wrapper to `tests.rs`. It intercepts small PUTs and multipart initiation; task 9 additionally covers cancellation during an initiated upload via the core sink's existing tests. No exporter test claims this wrapper is network E2E.
+Append this complete wrapper to `tests.rs`. It intercepts small PUTs and multipart initiation; task 11 additionally covers cancellation during an initiated upload via the core sink's existing tests. No exporter test claims this wrapper is network E2E.
 
 ```rust
 use std::sync::{Mutex, atomic::{AtomicU8, Ordering}};
@@ -2818,11 +3533,49 @@ async fn same_window_overlap_keeps_both_descriptors() {
 
 ```
 
+Add this deadline regression before replacing FlushJob:
+
+```rust
+/// Scenario: a storage write is parked when its 20ms retry deadline expires.
+/// Guarantees: the retryable decision arrives before a one-second cleanup allowance and slot reuse waits for cleanup.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
+    tokio::task::LocalSet::new().run_until(async {
+        let store = Arc::new(FaultStore::default());
+        store.mode.store(3, Ordering::SeqCst);
+        let (effects, _rx) = effects(8);
+        let mut cfg = config();
+        cfg.window.flush_retry_deadline = Duration::from_millis(20);
+        cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+        let wall = Arc::new(lake::clock::TestWallClock::new(0));
+        let mut w = Worker::new(cfg, store.clone(), wall, effects);
+        w.admit(logs_pdata());
+        w.rotate();
+        store.entered.notified().await;
+        let done = tokio::time::timeout(Duration::from_millis(200),
+            w.flushing.as_mut().expect("flush").finish()).await.expect("deadline decision");
+        assert!(done.as_ref().expect("result").result.is_err());
+        w.complete(done);
+        assert_eq!(w.notify.outcomes[Outcome::Storage as usize], 1);
+        w.admit(logs_pdata());
+        w.rotate();
+        assert!(w.flushing.is_none());
+        assert!(w.cleaning.is_some());
+        let mut job = w.cleaning.take().expect("occupied slot");
+        job.cleanup().await.expect("bounded cleanup");
+        store.mode.store(0, Ordering::SeqCst);
+        w.rotate();
+        assert!(w.flushing.is_some());
+    }).await;
+}
+```
+
 - [ ] **Step 2: Verify the retry test fails before adding retries**
 
 ```bash
 cd rust/otap-dataflow
 cargo test -p otel-arrow-dfe-core-nodes --features series_parquet values_retry_reuses_paths_and_bytes
+cargo test -p otel-arrow-dfe-core-nodes --features series_parquet retry_deadline_publishes_before_cleanup_and_reserves_slot
 ```
 
 Expected: attempts is 1 and the block is nacked.
@@ -2847,69 +3600,103 @@ pub(super) fn retryable(error: &lake::Error) -> bool {
         _ => false,
     }
 }
-async fn write_until(sink: &lake::sink::Sink, data: &lake::buffer::Block<()>,
-    cancel: &CancellationToken, deadline: Instant) -> (lake::Result<lake::sink::FlushReport>, u64) {
+async fn write_until(sink: Rc<lake::sink::Sink>, data: Rc<lake::buffer::Block<()>>,
+    cancel: CancellationToken, deadline: Instant, abort_timeout: Duration,
+    result_tx: tokio::sync::oneshot::Sender<FlushDone>) {
     let mut attempts = 0_u64;
     let mut delay = Duration::from_millis(200);
     loop {
         if cancel.is_cancelled() || clock::now() >= deadline {
-            return (Err(lake::Error::Cancelled { abort_error: None }), attempts);
+            let _ = result_tx.send(FlushDone { data, attempts,
+                result: Err(lake::Error::Cancelled { abort_error: None }) });
+            return;
         }
         attempts += 1;
         let attempt_cancel = cancel.child_token();
-        let write = sink.write_block(data, &attempt_cancel);
+        let write = sink.write_block(&data, &attempt_cancel);
         tokio::pin!(write);
         let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => {
-                attempt_cancel.cancel();
-                // Keep polling so the core performs its bounded writable-phase abort.
-                let cleanup = write.await;
-                match cleanup { Err(e) => Err(e), Ok(_) => Err(lake::Error::Cancelled { abort_error: None }) }
+            () = cancel.cancelled() => None,
+            () = clock::sleep_until(deadline) => None,
+            result = &mut write => Some(result),
+        };
+        let Some(result) = result else {
+            // Publish the producer decision before awaiting any cleanup. This
+            // task independently owns the block, sink and pinned write future.
+            let _ = result_tx.send(FlushDone { data: data.clone(), attempts,
+                result: Err(lake::Error::Cancelled { abort_error: None }) });
+            attempt_cancel.cancel();
+            let cleanup_deadline = clock::now() + abort_timeout;
+            tokio::select! {
+                biased;
+                _ = &mut write => {}
+                () = clock::sleep_until(cleanup_deadline) => {}
             }
-            () = clock::sleep_until(deadline) => {
-                attempt_cancel.cancel();
-                let cleanup = write.await;
-                match cleanup { Err(e) => Err(e), Ok(_) => Err(lake::Error::Cancelled { abort_error: None }) }
-            }
-            result = &mut write => result,
+            // Dropping the write after the bound releases the last task-owned
+            // resources even if the object-store future never cooperates.
+            return;
         };
         match result {
-            Ok(report) => return (Ok(report), attempts),
+            Ok(report) => {
+                let _ = result_tx.send(FlushDone { data: data.clone(), attempts, result: Ok(report) });
+                return;
+            }
             Err(error) if retryable(&error) && clock::now() < deadline && !cancel.is_cancelled() => {
                 let wake = (clock::now() + delay).min(deadline);
                 tokio::select! {
                     biased;
-                    () = cancel.cancelled() => return (Err(lake::Error::Cancelled { abort_error: None }), attempts),
+                    () = cancel.cancelled() => {}
                     () = clock::sleep_until(wake) => {}
                 }
                 delay = (delay * 2).min(Duration::from_secs(10));
             }
-            Err(error) => return (Err(error), attempts),
+            Err(error) => {
+                let _ = result_tx.send(FlushDone { data: data.clone(), attempts, result: Err(error) });
+                return;
+            }
         }
     }
 }
 ```
 
-Replace `FlushJob::new` with:
+Replace FlushDone's data field by `pub data: Rc<lake::buffer::Block<()>>`; replace FlushJob's handle field by `handle: JoinHandle<()>` and add `result_rx: tokio::sync::oneshot::Receiver<FlushDone>`. Preserve its cancellation token, bytes, tokens, start time and three emission counts. Replace these methods in full:
 
 ```rust
 pub fn new(data: lake::buffer::Block<()>, tokens: Vec<AckToken>, sink: Rc<lake::sink::Sink>,
-    retry_deadline: Duration) -> Self {
+    emitted: [u64; 3], retry_deadline: Duration, abort_timeout: Duration) -> Self {
     let cancel = CancellationToken::new();
-    let task_cancel = cancel.clone();
     let bytes = data.bytes;
     let started = clock::now();
-    let deadline = started + retry_deadline;
-    let handle = tokio::task::spawn_local(async move {
-        let (result, attempts) = write_until(&sink, &data, &task_cancel, deadline).await;
-        FlushDone { data, result, attempts }
-    });
-    Self { handle, cancel, tokens, bytes, started }
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::task::spawn_local(write_until(sink, Rc::new(data), cancel.clone(),
+        started + retry_deadline, abort_timeout, result_tx));
+    Self { handle, result_rx, cancel, tokens, bytes, started, emitted }
+}
+pub async fn finish(&mut self) -> Result<FlushDone, tokio::sync::oneshot::error::RecvError> {
+    (&mut self.result_rx).await
+}
+pub async fn cleanup(&mut self) -> Result<(), JoinError> { (&mut self.handle).await }
+```
+
+Add `pub cleaning: Option<FlushJob>`, initialized None, to Worker. It owns the same FLUSHING slot during cleanup, never an extra block. Change `Worker::complete`'s error type to `tokio::sync::oneshot::error::RecvError`; after moving all tokens to the notifier, set `self.cleaning = Some(job);`. The successful report still commits the cache and descriptor metrics only once. Refuse rotation while either `flushing` or `cleaning` exists, and add `worker.cleaning.is_none()` to the run loop's ready-to-rotate guard. ACTIVE may continue filling, with at most one pending request, while this slot cleans up.
+
+Add this select branch before the rotation branch:
+
+```rust
+cleaned = async { match worker.cleaning.as_mut() {
+    Some(job) => job.cleanup().await,
+    None => std::future::pending().await,
+} } => {
+    if let Err(error) = cleaned { otel_warn!("series_parquet.cleanup_failed", error = %error); }
+    let _ = worker.cleaning.take();
+    notify_turns = 0;
 }
 ```
 
-Pass `self.cfg.window.flush_retry_deadline` at Worker's call site. Do not call `seal` again inside the retry loop. FileNaming and seq stay frozen. A Parquet encoding error without a storage source returns immediately, nacks the entire block as Storage and leaves the worker alive. Log the actual error using the component `otel_error!` in `Worker::complete`'s failure branch:
+For direct Worker tests that finish a block and then rotate again, insert `if let Some(mut job) = w.cleaning.take() { job.cleanup().await.expect("cleanup"); }` before the next rotation. In `sample_metrics`, replace its `flushing` local with `let flushing = self.flushing.iter().chain(self.cleaning.iter()).map(|job| job.bytes).sum::<usize>();`; keep accounting until the supervisor releases the block. In every early-completion predicate, including the run loop before task 11 introduces `finished`, require `cleaning.is_none()`. The pending cleanup task never owns producer tokens. Dropping Worker cancels both slot holders through FlushJob::drop; the detached supervisor remains independently bounded by abort_timeout.
+
+Pass `old.emitted`, `self.cfg.window.flush_retry_deadline`, and `self.cfg.lake.upload.abort_timeout` at Worker's call site, after the existing block/tokens/sink arguments. Do not call `seal` again inside the retry loop. FileNaming and seq stay frozen. A Parquet encoding error without a storage source returns immediately, nacks the entire block as Storage and leaves the worker alive. Log the actual error using the component `otel_error!` in `Worker::complete`'s failure branch:
 
 ```rust
 otel_error!("series_parquet.flush_failed", error = %error,
@@ -2954,7 +3741,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-### Task 9: Shutdown with two blocks, saturated completions and cancellation-safe drop
+### Task 11: Shutdown with two blocks, saturated completions and cancellation-safe drop
 
 **Files:**
 - Modify: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/{mod.rs,worker.rs,flush.rs,tests.rs}`
@@ -2996,10 +3783,8 @@ async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
     assert_eq!(inbox.shutdown_deadline(), Some(deadline));
     let (effects, mut rx) = effects(1);
     let mut notify = Notifier::new(effects, 2);
-    let (token, payload) = AckToken::split(data);
-    drop(payload);
-    notify.push(token, Outcome::Shutdown);
-    notify.next().await.expect("delivery");
+    notify.force_shutdown(data);
+    assert_eq!(notify.failures, 0);
     match rx.recv().await.expect("nack") {
         PipelineCompletionMsg::DeliverNack { nack } => {
             assert!(!nack.permanent);
@@ -3058,12 +3843,14 @@ async fn shutdown_commits_both_blocks_before_deadline() {
         store.release.notify_one();
         let first = w.flushing.as_mut().expect("first block").finish().await;
         w.complete(first);
+        if let Some(mut job) = w.cleaning.take() { job.cleanup().await.expect("first cleanup"); }
         assert!(!w.finished());
         w.rotate();
         let second = w.flushing.as_mut().expect("active drained into second block").finish().await;
         let report = second.as_ref().expect("join").result.as_ref().expect("durable second block");
         for (_, path, _) in &report.files { assert!(store.head(path).await.is_ok()); }
         w.complete(second);
+        if let Some(mut job) = w.cleaning.take() { job.cleanup().await.expect("second cleanup"); }
         for _ in 0..2 {
             w.notify.next().await.expect("delivery");
             assert!(matches!(rx.recv().await.expect("completion"), PipelineCompletionMsg::DeliverAck { .. }));
@@ -3071,27 +3858,37 @@ async fn shutdown_commits_both_blocks_before_deadline() {
         assert!(w.finished());
     }).await;
 }
-/// Scenario: a flush owner is dropped while storage is parked inside a PUT.
-/// Guarantees: its token is cancelled and the detached task releases the block within abort_timeout.
+/// Scenario: the real SeriesParquet::start future is aborted while a storage PUT is parked.
+/// Guarantees: cancellation drops the write future and releases every sink/store reference within abort_timeout.
 #[tokio::test(flavor = "current_thread")]
-async fn dropping_worker_cancels_flush_task() {
+async fn dropping_start_cancels_flush_task() {
+    use otel_arrow_dfe_engine::local::exporter::Exporter;
     tokio::task::LocalSet::new().run_until(async {
         let store = Arc::new(FaultStore::default());
         store.mode.store(3, Ordering::SeqCst);
         let (effects, _rx) = effects(2);
-        let wall = Arc::new(lake::clock::TestWallClock::new(0));
-        let mut w = Worker::new(config(), store.clone(), wall, effects);
-        w.admit(logs_pdata());
-        w.rotate();
+        let (pdata, _control, inbox) = inbox(2);
+        let mut cfg = config();
+        cfg.window.max_requests_per_block = 1;
+        cfg.lake.ingress.max_requests_per_block = 1;
+        cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+        let mut exporter = super::SeriesParquet::new(cfg);
+        exporter.store_override = Some(store.clone());
+        let node = tokio::task::spawn_local(Box::new(exporter).start(inbox, effects));
+        pdata.send(logs_pdata()).await.expect("request");
         store.entered.notified().await;
-        let cancel = w.flushing.as_ref().expect("flush").cancel.clone();
-        drop(w);
-        assert!(cancel.is_cancelled());
-        tokio::time::timeout(Duration::from_secs(6), async {
-            while Arc::strong_count(&store) != 1 { tokio::task::yield_now().await; }
-        }).await.expect("flush releases its sink/store reference");
+        assert_eq!(store.parked.load(Ordering::SeqCst), 1);
+        node.abort();
+        match node.await { Err(error) => assert!(error.is_cancelled()), Ok(_) => panic!("start was not aborted") }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&store) != 1 || store.parked.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("bounded cancellation releases write, block and sink");
+        assert_eq!(store.parked_drops.load(Ordering::SeqCst), 1);
     }).await;
 }
+
 ```
 
 Add to the Python file:
@@ -3121,6 +3918,25 @@ cargo test -p otel-arrow-dfe-core-nodes --features series_parquet deadline_nacks
 
 Expected: missing expire/finish functions. Preserve the pending/force-drain tests even if the earlier helper methods already pass.
 
+For the cancellation regression, add `#[cfg(test)] store_override: Option<Arc<dyn object_store::ObjectStore>>` to SeriesParquet and `#[cfg(test)] store_override: None` to its constructor. Immediately after the shared backend is constructed in the real `start` method, insert `#[cfg(test)] let store = self.store_override.take().unwrap_or(store);`. The test runs the actual trait entry point and node loop; only the object-store dependency is injected.
+
+Add `parked` and `parked_drops` AtomicUsize fields to FaultStore (Default initializes both). Replace its `if mode == 3` line with:
+
+```rust
+if mode == 3 {
+    struct Parked<'a> { live: &'a std::sync::atomic::AtomicUsize, drops: &'a std::sync::atomic::AtomicUsize }
+    impl Drop for Parked<'_> {
+        fn drop(&mut self) {
+            let _ = self.live.fetch_sub(1, Ordering::SeqCst);
+            let _ = self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let _ = self.parked.fetch_add(1, Ordering::SeqCst);
+    let _guard = Parked { live: &self.parked, drops: &self.parked_drops };
+    self.release.notified().await;
+}
+```
+
 - [ ] **Step 3: Complete deadline handling without waiting on a full completion channel**
 
 Add `pub inbox_drained: bool` initialized to false to Worker. Only the returned Shutdown control message sets it true: a latched deadline seen during forced pdata is not proof that ingress is empty. Add to Worker:
@@ -3128,7 +3944,7 @@ Add `pub inbox_drained: bool` initialized to false to Worker. Only the returned 
 ```rust
 pub fn finished(&self) -> bool {
     self.inbox_drained && self.deadline.is_some() && self.pending.is_none()
-        && self.active.data.is_empty() && self.flushing.is_none() && self.notify.len() == 0
+        && self.active.data.is_empty() && self.flushing.is_none() && self.cleaning.is_none() && self.notify.len() == 0
 }
 pub fn expire(&mut self) {
     if let Some(pending) = self.pending.take() { self.notify.push(pending.token, Outcome::Shutdown); }
@@ -3137,6 +3953,7 @@ pub fn expire(&mut self) {
         if let Some(metrics) = &mut self.metrics { metrics.worker.flush_cancelled.add(1); }
         for token in std::mem::take(&mut job.tokens) { self.notify.push(token, Outcome::Shutdown); }
     }
+    if let Some(job) = &self.cleaning { job.cancel.cancel(); }
     self.fail_active(Outcome::Shutdown);
     self.rotation_requested = false;
 }
@@ -3185,15 +4002,15 @@ async fn finish_expired(worker: &mut worker::Worker) {
             message = "Completion delivery was still blocked at shutdown deadline");
     }
     worker.notify.abandon();
-    if let Some(mut job) = worker.flushing.take() {
+    for mut job in worker.flushing.take().into_iter().chain(worker.cleaning.take()) {
         job.cancel.cancel();
         let cleanup_deadline = otel_arrow_dfe_engine::clock::now() + worker.cfg.lake.upload.abort_timeout;
         tokio::select! {
             biased;
-            _ = job.finish() => {}
+            _ = job.cleanup() => {}
             () = otel_arrow_dfe_engine::clock::sleep_until(cleanup_deadline) => {
                 job.abort_task();
-                let _ = job.finish().await;
+                let _ = job.cleanup().await;
                 otel_warn!("series_parquet.abort_timeout", message = "Flush cleanup reached its bound");
             }
         }
@@ -3229,25 +4046,43 @@ At the deadline do not start another store write. Cancellation of the `start` fu
 Add this test, using the same inbox/effects/FaultStore helpers:
 
 ```rust
-/// Scenario: both the pdata inbox and completion channel remain saturated during shutdown.
-/// Guarantees: a 100ms deadline is observed within one bounded request plus abort cleanup, under 2s here.
+fn terminal_counter(state: &otel_arrow_dfe_engine::terminal_state::TerminalState, name: &str) -> u64 {
+    state.metrics().iter().flat_map(|snapshot| {
+        snapshot.descriptor().metrics.iter().zip(snapshot.get_metrics())
+    }).filter(|(descriptor, _)| descriptor.name == name)
+        .map(|(_, value)| value.to_u64_lossy()).sum()
+}
+/// Scenario: 32 forced requests arrive with the completion channel already full.
+/// Guarantees: every request gets one shutdown decision and a recorded delivery failure; drain stays under 2s.
 #[tokio::test(flavor = "current_thread")]
 async fn saturated_inbox_shutdown_stays_bounded() {
     tokio::task::LocalSet::new().run_until(async {
         let (pdata, control, inbox) = inbox(32);
-        let (effects, _completion_rx) = effects(1);
+        let (effects, mut completion_rx) = effects(1);
+        let mut prime = Notifier::new(effects.clone(), 1);
+        let (token, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        prime.push(token, Outcome::Ack);
+        prime.next().await.expect("saturate completion channel");
         let mut cfg = config();
         cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+        let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+        let metrics = super::metrics::Metrics::register(&context, &cfg.lake);
         let store = Arc::new(FaultStore::default());
         store.mode.store(3, Ordering::SeqCst);
         for _ in 0..32 { pdata.send(logs_pdata()).await.expect("fill inbox"); }
+        drop(pdata);
         let started = std::time::Instant::now();
         control.send(NodeControlMsg::Shutdown {
             deadline: otel_arrow_dfe_engine::clock::now() + Duration::from_millis(100), reason: "saturated".into()
         }).await.expect("shutdown");
         let wall = Arc::new(lake::clock::TestWallClock::new(0));
-        tokio::time::timeout(Duration::from_secs(2), super::run(cfg, store, wall, inbox, effects, None))
+        let state = tokio::time::timeout(Duration::from_secs(2),
+            super::run(cfg, store, wall, inbox, effects, Some(metrics)))
             .await.expect("bounded shutdown").expect("node success");
+        assert_eq!(terminal_counter(&state, "nacks"), 32);
+        assert_eq!(terminal_counter(&state, "notify.failures"), 32);
+        assert!(matches!(completion_rx.recv().await.expect("priming message"), PipelineCompletionMsg::DeliverAck { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
     }).await;
 }
@@ -3302,7 +4137,7 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
 
 ```
 
-The 2s assertion is a short-test tolerance for tiny requests and a 100ms abort budget, not a claim that arbitrary 16MiB admissions finish in 2s. The design target is one bounded admission plus notify_batch plus one merge chunk, followed by deadline/abort cleanup. Q6 accepts synchronous whole-block descriptor sealing as a v1 allowance; large-block responsiveness includes that work and does not meet a fixed-workspace/control-latency claim.
+The 2s assertion is a short-fixture tolerance for tiny requests and a 100ms abort budget. Task 0 moves descriptor materialization and sorting into bounded admission runs; final seal replaces timestamp buffers only. Forced drain polls each immediate NACK exactly once and never waits for notification credit. Cleanup runs independently after the producer decision and before the FLUSHING slot can be reused.
 
 ```bash
 cd rust/otap-dataflow
@@ -3324,7 +4159,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-### Task 10: Alloy -> MinIO/RustFS E2E, two readers and restart/disconnect behavior
+### Task 12: Alloy -> MinIO/RustFS E2E, two readers and restart/disconnect behavior
 
 **Files:**
 - Modify: `rust/otap-dataflow/crates/validation/tests/series_parquet/test_e2e.py`
@@ -3345,7 +4180,6 @@ import boto3
 from botocore.config import Config as BotoConfig
 import uuid
 import xxhash
-
 
 def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
     files = sorted(Path(root).rglob("*.parquet"))
@@ -3400,7 +4234,6 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                     before = db.execute("SELECT count(*) FROM read_parquet(?, union_by_name=true)", [selected]).fetchone()[0]
                     after = db.execute("SELECT count(*) FROM read_parquet(?, union_by_name=true) v JOIN canonical s USING(series_id)", [selected]).fetchone()[0]
                     test.assertEqual(before, after, "canonical join must preserve values cardinality")
-
 
 class DockerSlice(unittest.TestCase):
     def exercise(self, kind):
@@ -3457,12 +4290,10 @@ IMAGE_DEFAULTS = {
     "alloy": "grafana/alloy:v1.19.2",
 }
 
-
 def unavailable(reason):
     if os.environ.get("SERIES_REQUIRE_DOCKER") == "1":
         raise AssertionError(reason)
     raise unittest.SkipTest(reason)
-
 
 def require_docker_image(kind):
     if not shutil.which("docker"):
@@ -3488,7 +4319,6 @@ def require_docker_image(kind):
         unavailable(f"Selected local {kind} image is absent: {image}")
     return image
 
-
 def require_clickhouse():
     binary = os.environ.get("SERIES_CLICKHOUSE_LOCAL", "/usr/bin/clickhouse-local")
     if Path(binary).is_file() and os.access(binary, os.X_OK):
@@ -3500,7 +4330,7 @@ def require_clickhouse():
     return None
 ```
 
-Create the complete `configs/series-parquet.alloy` below. Task 11 uses this same file; task 12 reproduces it byte-for-byte in the README. Linux host networking lets Alloy reach the engine's loopback-only gRPC listener without exposing it on all interfaces. Alloy's file positions and sending queue belong to the producer; the exporter still has no persistent state.
+Create the complete `configs/series-parquet.alloy` below. Task 13 uses this same file; task 14 reproduces it byte-for-byte in the README. Linux host networking lets Alloy reach the engine's loopback-only gRPC listener without exposing it on all interfaces. Alloy's file positions and sending queue belong to the producer; the exporter still has no persistent state.
 
 ```river
 // Copyright The OpenTelemetry Authors
@@ -3620,7 +4450,6 @@ class AlloyProducer:
                                check=False, capture_output=True, timeout=20)
                 self.container = None
 
-
 def wait_for_alloy(store, directory, ids, timeout=90):
     target = Path(directory) / "downloaded"
     deadline = time.monotonic() + timeout
@@ -3674,10 +4503,8 @@ def clickhouse_reader(root):
             subprocess.run(["docker", "rm", "--force", "--volumes", container],
                            check=False, capture_output=True, timeout=20)
 
-
 def sql_string(value):
     return "'" + str(value).replace(chr(92), chr(92) * 2).replace("'", "''") + "'"
-
 
 def verify_readers(test, root, log_ids, metric_count, allow_duplicates=False,
                    alloy_ids=(), metric_ids=()):
@@ -3875,12 +4702,10 @@ class RestartSlice(unittest.TestCase):
                 engine.shutdown(seconds=30)
                 verify_files(self, engine.data, ["disconnected"], 0)
 
-
 def engine_metrics(engine):
     url = f"http://127.0.0.1:{engine.admin_port}/api/v1/telemetry/metrics?format=json&keep_all_zeroes=true"
     with urllib.request.urlopen(url, timeout=5) as response:
         return json.load(response)
-
 
 def metric_max(document, name):
     values = [item["value"] for group in document["metric_sets"]
@@ -3972,14 +4797,14 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 Expected: both installed-image tests PASS with 12 Alloy bodies/attributes and six points per metric dataset agreeing in DuckDB and ClickHouse. Docker-absent run reports two clean skips. All stored identities and every values file's partition/worker descriptor coverage are checked; synthetic request/ACK coverage remains in tasks 1/6/11.
 
-### Task 11: V1 storage outage, producer retries and bounded recovery
+### Task 13: V1 storage outage, producer retries and bounded recovery
 
 **Files:**
 - Modify: `rust/otap-dataflow/crates/validation/tests/series_parquet/test_e2e.py`
 
 **Interfaces:**
-- Consumes: `DockerStore::{stop,recover,download}`, Engine, both synthetic OTLP clients, `AlloyProducer`, the complete task 10 River file, `wait_for_alloy`, `engine_metrics`, `metric_max`, `verify_files`, and `verify_readers` (including its full ClickHouse subprocess/docker-exec code).
-- Produces: `OutageSlice.test_storage_outage_recovers_without_losing_acked_data`. A stopped real endpoint lasts 8s, exceeding a 3s whole-block deadline. Docker Alloy tails 12 known log lines during the outage using task 10's exact River config. Eight synthetic producers continue submitting logs and metrics and retain identical requests across retries for explicit ACK/status assertions. The run is bounded to 120s of producer activity; it is the single v1 failure case, not the deferred chaos/soak program.
+- Consumes: `DockerStore::{stop,recover,download}`, Engine, both synthetic OTLP clients, `AlloyProducer`, the complete task 12 River file, `wait_for_alloy`, `engine_metrics`, `metric_max`, `verify_files`, and `verify_readers` (including its full ClickHouse subprocess/docker-exec code).
+- Produces: `OutageSlice.test_storage_outage_recovers_without_losing_acked_data`. A stopped real endpoint lasts 8s, exceeding a 3s whole-block deadline. Docker Alloy tails 12 known log lines during the outage using task 12's exact River config. Eight synthetic producers continue submitting logs and metrics and retain identical requests across retries for explicit ACK/status assertions. The run is bounded to 120s of producer activity; it is the single v1 failure case, not the deferred chaos/soak program.
 
 - [ ] **Step 1: Add the failing outage regression with exact assertions**
 
@@ -3987,7 +4812,6 @@ Add before the unittest guard:
 
 ```python
 import threading
-
 
 def rss_bytes(pid):
     status = Path(f"/proc/{pid}/status")
@@ -3997,7 +4821,6 @@ def rss_bytes(pid):
         if line.startswith("VmRSS:"):
             return int(line.split()[1]) * 1024
     raise AssertionError("process RSS unavailable while engine is running")
-
 
 class OutageSlice(unittest.TestCase):
     # Scenario: Alloy file tailing and synthetic OTLP requests continue during an eight-second real S3 outage.
@@ -4023,9 +4846,19 @@ class OutageSlice(unittest.TestCase):
                         alloy_ids = [f"{kind}-outage-alloy-{i}" for i in range(12)]
                         engine.logs.Export(log_request("warmup"), timeout=10)
                         baseline_rss = rss_bytes(engine.process.pid)
+                        expected_requests = {(signal, f"p{index}-{item}")
+                                             for index in range(8) for item in range(12)
+                                             for signal in ("logs", "metrics")}
+                        expected_metric_ids = {rid for signal, rid in expected_requests if signal == "metrics"}
+                        expected_log_ids = {"warmup", *alloy_ids} | {rid for signal, rid in expected_requests if signal == "logs"}
                         acknowledged = []
                         retry_codes = []
-                        durations = []
+                        cohort = {}
+                        cohort_finished = {}
+                        cohort_start = threading.Barrier(9, timeout=20)
+                        cohort_ready = threading.Barrier(9, timeout=20)
+                        retryable_codes = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
+                                           grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.CANCELLED}
                         samples = []
                         lock = threading.Lock()
                         end = time.monotonic() + 120
@@ -4033,43 +4866,63 @@ class OutageSlice(unittest.TestCase):
                         def producer(index):
                             logs = logs_rpc.LogsServiceStub(engine.channel)
                             metrics = metrics_rpc.MetricsServiceStub(engine.channel)
+                            cohort_start.wait()
+                            first_started = time.monotonic()
+                            first = logs.Export.future(log_request(f"p{index}-0"), timeout=30)
+                            def first_done(call):
+                                with lock:
+                                    cohort_finished[index] = (time.monotonic(), call.code())
+                            first.add_done_callback(first_done)
+                            with lock:
+                                cohort[index] = (first, first_started)
+                            cohort_ready.wait()
                             for item in range(12):
                                 request_id = f"p{index}-{item}"
                                 for signal, request, send in (
                                     ("logs", log_request(request_id), logs.Export),
                                     ("metrics", metric_request(request_id), metrics.Export),
                                 ):
+                                    first_attempt = item == 0 and signal == "logs"
                                     while time.monotonic() < end:
-                                        started = time.monotonic()
                                         try:
-                                            send(request, timeout=6)
+                                            if first_attempt:
+                                                first_attempt = False
+                                                first.result(timeout=35)
+                                            else:
+                                                send(request, timeout=6)
                                             with lock:
                                                 acknowledged.append((signal, request_id))
-                                                durations.append(time.monotonic() - started)
                                             break
                                         except grpc.RpcError as error:
                                             with lock:
                                                 retry_codes.append(error.code())
-                                                durations.append(time.monotonic() - started)
-                                            if error.code() not in (
-                                                grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
-                                                grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.CANCELLED,
-                                            ):
+                                            if error.code() not in retryable_codes:
                                                 raise
                                             time.sleep(0.1)
                                     else:
                                         raise AssertionError("producer could not drain after recovery")
 
                         store.stop()
+                        outage_started = time.monotonic()
                         alloy.write(alloy_ids)
-                        outage_end = time.monotonic() + 8
                         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                             jobs = [pool.submit(producer, index) for index in range(8)]
+                            cohort_start.wait()
+                            cohort_ready.wait()
+                            self.assertEqual(set(cohort), set(range(8)))
+                            outage_end = time.monotonic() + 8
                             while time.monotonic() < outage_end:
                                 document = engine_metrics(engine)
                                 samples.append((document, rss_bytes(engine.process.pid)))
                                 time.sleep(0.2)
-                            self.assertTrue(any(not job.done() for job in jobs), "outage must block producers")
+                            # Every known first RPC began while storage was stopped.
+                            # No successful response is allowed before recovery starts.
+                            for first, started in cohort.values():
+                                self.assertGreaterEqual(started, outage_started)
+                                if first.done():
+                                    self.assertIn(first.code(), retryable_codes)
+                                # Otherwise this exact RPC is still pending at observation.
+                            recovery_started = time.monotonic()
                             store.recover()
                             while not all(job.done() for job in jobs):
                                 self.assertLess(time.monotonic(), end, "recovery deadline")
@@ -4077,11 +4930,16 @@ class OutageSlice(unittest.TestCase):
                                 time.sleep(0.2)
                             for job in jobs:
                                 job.result()
+                            self.assertEqual(set(cohort_finished), set(range(8)))
+                            for completed, code in cohort_finished.values():
+                                self.assertTrue(code in retryable_codes or
+                                                (code == grpc.StatusCode.OK and completed >= recovery_started),
+                                                "cohort RPC succeeded before storage recovery")
                         wait_for_alloy(store, directory, alloy_ids, timeout=max(1, end - time.monotonic()))
                         (Path(directory) / "outage-samples.json").write_text(json.dumps(samples))
                         self.assertTrue(retry_codes, "outage must cause retryable failures/timeouts")
-                        self.assertTrue(any(duration >= 0.5 for duration in durations), "producer requests must actually wait")
-                        self.assertEqual(len(acknowledged), 8 * 12 * 2)
+                        self.assertEqual(set(acknowledged), expected_requests)
+                        self.assertEqual(len(acknowledged), len(expected_requests))
                         for document, rss in samples:
                             self.assertLessEqual(metric_max(document, "block.active_bytes"), 8 << 20)
                             self.assertLessEqual(metric_max(document, "block.flushing_bytes"), 8 << 20)
@@ -4101,27 +4959,33 @@ class OutageSlice(unittest.TestCase):
                         engine.shutdown(seconds=30)
                         downloaded = Path(directory) / "downloaded"
                         store.download(downloaded)
-                        logs = [rid for signal, rid in acknowledged if signal == "logs"]
-                        expected_logs = ["warmup"] + logs + alloy_ids
-                        metric_ids = [rid for signal, rid in acknowledged if signal == "metrics"]
+                        expected_logs = sorted(expected_log_ids)
+                        metric_ids = sorted(expected_metric_ids)
+                        duplicates = {}
                         verify_files(self, downloaded, expected_logs, 96, allow_duplicates=True)
                         verify_readers(self, downloaded, expected_logs, 96, allow_duplicates=True,
                                        alloy_ids=alloy_ids, metric_ids=metric_ids)
                         with duckdb.connect() as db:
+                            log_path = str(downloaded / "v=1/signal=logs/dataset=values/**/*.parquet")
+                            stored_logs = [row[0] for row in db.execute("SELECT body FROM read_parquet(?)", [log_path]).fetchall()]
+                            self.assertEqual(set(stored_logs), expected_log_ids, "all precomputed log IDs must survive")
+                            duplicates["logs"] = len(stored_logs) - len(expected_log_ids)
                             series = str(downloaded / "v=1/signal=metrics/dataset=series/**/*.parquet")
                             db.execute("CREATE TEMP TABLE series AS SELECT * FROM read_parquet(?, union_by_name=true, filename=true) QUALIFY row_number() OVER(PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC)=1", [series])
                             for dataset in ("number", "histogram"):
                                 path = str(downloaded / f"v=1/signal=metrics/dataset={dataset}/**/*.parquet")
-                                actual = {row[0] for row in db.execute("SELECT DISTINCT s.attrs['request.id'] FROM read_parquet(?) v JOIN series s USING(series_id)", [path]).fetchall()}
-                                expected = {rid for signal, rid in acknowledged if signal == "metrics"}
-                                self.assertTrue(expected.issubset(actual), f"missing acknowledged {dataset} points")
+                                stored = [row[0] for row in db.execute("SELECT s.attrs['request.id'] FROM read_parquet(?) v JOIN series s USING(series_id)", [path]).fetchall()]
+                                self.assertEqual(set(stored), expected_metric_ids, f"missing precomputed {dataset} IDs")
+                                duplicates[dataset] = len(stored) - len(expected_metric_ids)
+                        self.assertTrue(all(count >= 0 for count in duplicates.values()))
+                        (Path(directory) / "outage-duplicates.json").write_text(json.dumps(duplicates))
 ```
 
-The RSS assertion includes the measured warm baseline, per-worker formula (including Q6's accepted extra B for block-sized series sealing), and a declared 128MiB envelope for receiver/channel allocations and allocator retention. It is a finite regression bound; Q5 leaves allowance validation to plan 3. The code writes samples before post-recovery assertions. Alloy's producer queue is outside exporter RSS. No fixed-workspace bound is claimed.
+The RSS assertion includes the measured warm baseline, the ACTIVE + FLUSHING + one pending request + notification-token formula, and a declared 128MiB envelope for receiver/channel allocations and allocator retention. There is no extra B for sealing. This is a finite regression envelope; spec 9.5 empirical memory-bound validation, benchmarks and soak are explicitly plan 3. The barrier cohort proves every first RPC started during the outage and stayed blocked through the observation point or returned a retryable status. Precomputed sets, independent of acknowledgements, require no missing stored IDs; duplicate rows are allowed and counted. Alloy's queue is outside exporter RSS.
 
-Task 11 intentionally uses `configs/series-parquet.alloy` unchanged: `loki.source.file` reads the 12 lines written after `store.stop()`, the attributes processor inserts `e2e.source=alloy-file`, and the OTLP exporter retries until storage returns. The complete task 10 `verify_readers` code runs here too: ClickHouse's latest-descriptor join and DuckDB must agree on every body/attribute pair, raw and joined row counts, and metric request ID. Duplicates are permitted after retries. Alloy does not expose per-line OTLP acknowledgements to the Python test; eventual file coverage proves Alloy delivery, while synthetic clients prove the ACK contract separately.
+Task 13 intentionally uses `configs/series-parquet.alloy` unchanged: `loki.source.file` reads the 12 lines written after `store.stop()`, the attributes processor inserts `e2e.source=alloy-file`, and the OTLP exporter retries until storage returns. The complete task 12 `verify_readers` code runs here too: ClickHouse's latest-descriptor join and DuckDB must agree on every body/attribute pair, raw and joined row counts, and metric request ID. Duplicates are permitted after retries. Alloy does not expose per-line OTLP acknowledgements to the Python test; eventual file coverage proves Alloy delivery, while synthetic clients prove the ACK contract separately.
 
-For review, these are the full shared producer and reader inputs used by the outage above. They are identical to task 10; retain one `configs/series-parquet.alloy` and one helper definition in `test_e2e.py`, rather than appending duplicate definitions. The prerequisite helpers/imports are already provided in task 10.
+For review, these are the full shared producer and reader inputs used by the outage above. They are identical to task 12; retain one `configs/series-parquet.alloy` and one helper definition in `test_e2e.py`, rather than appending duplicate definitions. The prerequisite helpers/imports are already provided in task 12.
 
 ```river
 // Copyright The OpenTelemetry Authors
@@ -4205,10 +5069,8 @@ def clickhouse_reader(root):
             subprocess.run(["docker", "rm", "--force", "--volumes", container],
                            check=False, capture_output=True, timeout=20)
 
-
 def sql_string(value):
     return "'" + str(value).replace(chr(92), chr(92) * 2).replace("'", "''") + "'"
-
 
 def verify_readers(test, root, log_ids, metric_count, allow_duplicates=False,
                    alloy_ids=(), metric_ids=()):
@@ -4278,7 +5140,7 @@ cargo build -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
 /tmp/series-parquet-venv/bin/python crates/validation/tests/series_parquet/test_e2e.py OutageSlice -v
 ```
 
-If it passes immediately, prove the test's sensitivity by temporarily making the flush failure arm queue Ack, run the test and observe missing acknowledged data, then restore the arm before continuing. The exact one-line mutation is `Outcome::Storage` to `Outcome::Ack` in Worker::complete's store-failure arm only. Never commit the mutation. Alternatively run the new test before task 8 on a separate execution checkout; do not mutate a shared tree occupied by another implementer.
+If it passes immediately, prove the test's sensitivity by temporarily making the flush failure arm queue Ack, run the test and observe missing acknowledged data, then restore the arm before continuing. The exact one-line mutation is `Outcome::Storage` to `Outcome::Ack` in Worker::complete's store-failure arm only. Never commit the mutation. Alternatively run the new test before task 10 on a separate execution checkout; do not mutate a shared tree occupied by another implementer.
 
 - [ ] **Step 3: Exercise actual backpressure and correct any failures at their owners**
 
@@ -4317,15 +5179,17 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-### Task 12: Configuration contract, user documentation, changelog and final validation
+### Task 14: Configuration contract, user documentation, changelog and final validation
 
 **Files:**
 - Modify: `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/{README.md,tests.rs}`
 - Modify: `rust/otap-dataflow/crates/core-nodes/README.md`
 - Create: `rust/otap-dataflow/.chloggen/series-parquet-exporter.yaml`, copied from TEMPLATE.yaml
 
+- Create: `.github/workflows/series-parquet-e2e.yml` (mandatory spec 9.4 execution)
+
 **Interfaces:**
-- Consumes: `Config: Deserialize`, runnable `configs/series-parquet-{local,s3}.yaml`, `df_engine --validate-and-exit`, unittest E2E suite, all worker/process metrics from task 7.
+- Consumes: `Config: Deserialize`, runnable `configs/series-parquet-{local,s3}.yaml`, `df_engine --validate-and-exit`, unittest E2E suite, worker metrics from task 8 and process residual metrics from task 9.
 - Produces: complete public operating contract, the exact tested Alloy + df_engine + MinIO reference deployment, both reader commands, and a validated release note. Q1 retains `SERIES_TRACKING_ISSUE=4128` as the explicitly identified temporary tracking reference used in plan 1; replace it with the real PR number when the PR is opened.
 
 - [ ] **Step 1: Write failing contract tests before replacing the initial README**
@@ -4501,7 +5365,9 @@ MinIO defaults to `minio/minio:RELEASE.2025-04-22T22-12-26Z`, RustFS to
 tag. Alloy defaults to `grafana/alloy:v1.19.2` (stable); `SERIES_ALLOY_IMAGE`
 can override it, and only this image may be pulled. Missing Docker/images
 skip locally unless `SERIES_REQUIRE_DOCKER=1`; startup or reader failures
-always fail. CI provisioning and digest pins are separate plan 3 work.
+always fail. The mandatory series-parquet-e2e workflow provisions the selected
+images and runs both stores/readers with SERIES_REQUIRE_DOCKER=1; digest
+pinning, soak and benchmarks remain plan 3 work.
 
 From `rust/otap-dataflow`, after the feature-enabled build above:
 
@@ -4550,12 +5416,10 @@ import unittest
 import uuid
 import duckdb
 
-
 def reader_unavailable(reason):
     if os.environ.get("SERIES_REQUIRE_DOCKER") == "1":
         raise AssertionError(reason)
     raise unittest.SkipTest(reason)
-
 
 @contextlib.contextmanager
 def reference_clickhouse(root):
@@ -4598,7 +5462,6 @@ def reference_clickhouse(root):
             subprocess.run(["docker", "rm", "--force", "--volumes", container],
                            capture_output=True, check=False, timeout=20)
 
-
 class ReferenceReaders(unittest.TestCase):
     # Scenario: Docker Alloy delivers 12 known file lines through df_engine into MinIO Parquet.
     # Guarantees: both readers preserve latest-descriptor join counts and return every expected body and attribute.
@@ -4638,7 +5501,6 @@ class ReferenceReaders(unittest.TestCase):
             self.assertEqual(len(duck_rows), duck_count)
             self.assertEqual(ch_rows, duck_rows)
             self.assertEqual(duck_rows, expected)
-
 
 if __name__ == "__main__":
     unittest.main()
@@ -4756,19 +5618,21 @@ N max_requests_per_block, and T the measured retained completion-token size.
 The retained-data bound is 2B + E + 128C + 2NT. Only ACTIVE and FLUSHING
 exist; one extracted request may wait in the pending slot. Normal admission
 also reserves notification credit, capped at 2N-1 total live tokens, with
-one extra credit for observing force-drained shutdown input.
+one immediate token for observing force-drained shutdown input. Each forced
+request gets an immediate retryable NodeShutdown NACK attempt; delivery
+failures are counted and never stop inbox polling.
 
 Construction workspace allowance is 4 * max_request_bytes for conversion,
 2 * run_target_bytes for sorting, 2 * merge_chunk_bytes for merge/encoding,
 3 * writer_limit_bytes for writer plus encoder transient, and
 part_bytes * (concurrency + 1) + merge_chunk_bytes for upload. A 64MiB
 fixed implementation/configuration allowance covers container and allocator
-overhead. The current core also needs a block-sized descriptor-sealing
-allowance: it retains pending descriptors while constructing their Arrow
-batches. Budget one extra B for this accepted v1 allowance (plan 1 F-park;
-FORMAT.md limitations). No fixed-workspace bound is claimed. These
-are finite engineering allowances, not validated allocation multipliers;
-expansion-factor measurement belongs to the separate benchmark plan.
+overhead. Descriptors become bounded sorted series runs during admission;
+seal swaps only emitted_at buffers and shares all other columns. The eight
+additional timestamp bytes per series row are reserved inside B, so there
+is no extra block-sized sealing allowance. These construction factors are
+engineering reservations; empirical memory-bound validation, expansion
+measurements, soak and benchmarks belong to plan 3.
 
 Process planning bound is the sum of worker bounds plus receiver/channel
 memory, the engine baseline and allocator retention. Input bytes before
@@ -4782,7 +5646,9 @@ allocations, with the cache-entry estimate. memory.budget_bytes reports the
 configured retained/workspace allowance. The once-per-process metric
 memory.unaccounted_rss_bytes is max(0, RSS - sum(worker accounted bytes));
 normal conversion/encoding scratch and allocator overhead appear in this
-residual. Watch trends as well as absolute values.
+residual. It is exposed only while at least one registered exporter worker
+exists and reuses the engine monitor's RSS sample. Watch trends as well as
+absolute values.
 
 The exporter reports cache entries/hits/misses/evictions; active/flushing
 bytes, pending requests and pending-slot occupancy; flush reason, duration,
@@ -4793,14 +5659,16 @@ per-column mismatch counters. Datasets have signal-qualified labels such
 as logs_values and metrics_histogram. Nack reasons are storage, too_large,
 invalid, unsupported and shutdown. Metric labels never include request IDs.
 
-The target control responsiveness bound is one admitted request, one
-notify_batch and one merge chunk of CPU work. The current synchronous
-whole-block descriptor seal adds block-sized work under the accepted v1
-allowance; the target bound does not apply independently of block size.
-Deadline cancellation adds at most
-upload.abort_timeout for best-effort multipart cleanup. Configure bucket
-lifecycle removal of incomplete uploads left by a crash or cancellation
-during Parquet finalization.
+Control handling remains interleaved with bounded request admission,
+notification batches and merge chunks. Descriptor construction/sorting occurs
+in admission; seal replaces timestamp buffers without copying other columns.
+At the retry deadline, producer-visible Storage failure is returned immediately;
+independent cleanup continues for at most upload.abort_timeout and must finish
+before the FLUSHING slot is reused. Configure bucket lifecycle removal of
+incomplete uploads left by a crash or cancellation during Parquet finalization.
+
+Metadata and exemplar attribute tables are neither read nor validated in v1.
+Content errors in supported tables are validated by the core extraction path.
 
 ## Reading and schema changes
 
@@ -4890,6 +5758,68 @@ make chlog-validate
 
 Both note and subtext fit the 200/300-character limits and describe end-user behavior. The only authorized temporary reference is Q1's `SERIES_TRACKING_ISSUE=4128`; do not invent another reference or omit the user-facing entry.
 
+- [ ] **Step 4b: Add the mandatory Docker-backed CI lane**
+
+Create `.github/workflows/series-parquet-e2e.yml` with this complete content. The CI provisioning step loads the ruled local image tags; the Python test runner still uses `--pull=never` for MinIO, RustFS and ClickHouse. Only Alloy may be pulled by the runner itself. Digest pinning and broader performance/soak gates remain plan 3, while this workflow executes the spec 9.4 writer/reader matrix now.
+
+```yaml
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+name: Series Parquet E2E
+on:
+  pull_request:
+    paths:
+      - "rust/otap-dataflow/**"
+      - ".github/workflows/series-parquet-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust/otap-dataflow/**"
+      - ".github/workflows/series-parquet-e2e.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  writer-reader-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust/otap-dataflow
+    env:
+      SERIES_REQUIRE_DOCKER: "1"
+      SERIES_MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
+      SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
+      SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
+      SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev clang cmake
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Provision local object-store and reader images
+        run: |
+          docker info
+          docker pull "$SERIES_MINIO_IMAGE"
+          docker pull "$SERIES_RUSTFS_IMAGE"
+          docker pull "$SERIES_CLICKHOUSE_IMAGE"
+      - name: Install producer and DuckDB dependencies
+        run: |
+          python3 -m venv /tmp/series-parquet-venv
+          /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+      - name: Build the real engine
+        run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
+      - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          SERIES_REQUIRE_DOCKER=1 python3 -m unittest crates.validation.tests.series_parquet.test_e2e -v
+```
+
+Before finalizing the implementation PR, require a successful workflow run with both `DockerSlice.test_minio` and `DockerSlice.test_rustfs`, the outage regression, and both readers enabled. Missing Docker, either backend, Alloy, DuckDB or ClickHouse fails this lane; a green all-skipped suite is not acceptable. Local convenience runs may still skip prerequisites.
+
 - [ ] **Step 5: Run final checks and the real-process suite**
 
 ```bash
@@ -4902,6 +5832,8 @@ cargo build -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
 ./target/debug/df_engine --config configs/series-parquet-local.yaml --validate-and-exit
 ./target/debug/df_engine --config configs/series-parquet-s3.yaml --validate-and-exit
 /tmp/series-parquet-venv/bin/python crates/validation/tests/series_parquet/test_e2e.py -v
+export PATH="/tmp/series-parquet-venv/bin:$PATH"
+SERIES_REQUIRE_DOCKER=1 python3 -m unittest crates.validation.tests.series_parquet.test_e2e -v
 cargo xtask check
 cd ../..
 npx markdownlint-cli2 rust/otap-dataflow/crates/core-nodes/README.md rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/README.md docs/superpowers/plans/2026-09-21-series-parquet-exporter-node.md
@@ -4909,12 +5841,12 @@ python3 tools/sanitycheck.py
 make chlog-validate
 ```
 
-Expected: full xtask check (structure, fmt, all-target clippy, workspace tests) passes, both sample configs validate, Local/metrics/shutdown/restart/Docker/outage tests pass. Docker/reader absence is visible as a skip locally and fails when SERIES_REQUIRE_DOCKER=1; plan 3 supplies the CI lane. The feature-disabled build proves the optional series-lake dependency is not linked accidentally. Do not claim these checks were executed during planning.
+Expected: full xtask check (structure, fmt, all-target clippy, workspace tests) passes, both sample configs validate, Local/metrics/shutdown/restart/Docker/outage tests pass. Docker/reader absence may skip only the convenience run; the mandatory SERIES_REQUIRE_DOCKER=1 lane and series-parquet-e2e.yml must pass with both stores and both readers. The feature-disabled build proves the optional series-lake dependency is not linked accidentally. Do not claim these checks were executed during planning.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add rust/otap-dataflow/crates/core-nodes/README.md rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/README.md rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/tests.rs rust/otap-dataflow/.chloggen/series-parquet-exporter.yaml
+git add rust/otap-dataflow/crates/core-nodes/README.md rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/README.md rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet/tests.rs rust/otap-dataflow/.chloggen/series-parquet-exporter.yaml .github/workflows/series-parquet-e2e.yml
 git commit -m "docs(series_parquet): document durable delivery, budgets and operation
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
@@ -4928,9 +5860,11 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - Benchmarks, expansion-factor measurements, performance gates and broad qualification: plan 3.
 - Live buffer/tail/series introspection HTTP endpoints: spec 10.1. Existing engine admin metrics/shutdown clients do not add such an API.
 - Compaction, discovery indexes, manifests, producer replay IDs and trace storage: spec 10.2.
-- Toxiproxy, failpoint/SIGKILL matrices, nightly or multi-day chaos/soak and the canary gate: spec 10.3. The one bounded v1 outage case remains in task 11.
+- Toxiproxy, failpoint/SIGKILL matrices, nightly or multi-day chaos/soak and the canary gate: spec 10.3. The one bounded v1 outage case remains in task 13.
 - Changes to the existing parquet exporter, including its age/row-trigger bug.
-- Engine shutdown-timeout changes (Q3), CI image provisioning/digest pins (Q2), and incremental series sealing (Q6).
+- Engine shutdown-policy/timeout changes (Q3) and a pipeline YAML shutdown-deadline field (A07 future work).
+- Spec 9.5 short PR-tier outage/forced-rotation soak, empirical memory-bound validation, expansion-factor measurement, benchmarks and performance gates: plan 3. The bounded task 13 outage regression and task 14 spec 9.4 Docker CI lane are included here.
+- CI image digest pinning: plan 3; provisioning the selected tags for the required lane is included here.
 
 ## Amendments (2026-09-21)
 
@@ -4938,74 +5872,78 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - A02: Source, not the earlier core-plan prose, controls names: RequestTooLarge/BlockFull/TooManyRequests, structured Cancelled/AbortFailed, microsecond sealing and FlushReport.files.
 - A03: Task 2 adds minimal Context and inbox accessors because the current engine API cannot strip claims, measure frame capacity, or expose a latched shutdown deadline. It does not change routing or force-drain behavior.
 - A04: The adapter retains tokens beside Block<()> so a consuming/partially failing core admission or a cancelled flush cannot silently lose a completion context. Its reservation still charges real token bytes.
-- A05: Normal live-token admission reserves one shutdown observation credit; the final notification bound remains 2 * max_requests_per_block even with a full completion channel and forced pdata drain.
+- A05: Normal live-token admission reserves one immediate forced-drain credit. Forced PData bypasses the full queue, receives one immediate NodeShutdown NACK attempt, and records delivery failure if the send cannot complete; inbox polling continues.
 - A06: The core statistics need bounded per-column/per-kind details, and byte/request rotation needs explicit descriptor re-emission. Task 7 adds these APIs without changing existing reserve callers.
-- A07: Signal shutdown is fixed at 60s in the engine. Examples use the existing admin API's explicit 180s deadline; no unsupported YAML key is invented.
+- A07: Accepted spec amendment: section 7 now states that v1 shutdown deadline comes from the admin shutdown API timeout and a pipeline config field is future work. Signal shutdown stays 60s; examples use the admin API's 180s timeout.
 - A08: Metrics number and histogram support is in this plan, per the task request, even though the design lists metrics as the next implementation-order step.
-- A09: MinIO/RustFS/ClickHouse use the ruled local image tags with --pull=never and environment overrides. Only Alloy may be pulled. SERIES_REQUIRE_DOCKER=1 turns prerequisite skips into failures; CI provisioning/pinning is plan 3.
+- A09: MinIO/RustFS/ClickHouse use the ruled local image tags with --pull=never and environment overrides. Only Alloy may be pulled by the runner. Task 14 provisions CI images and requires SERIES_REQUIRE_DOCKER=1 for both stores/readers; digest pinning is plan 3.
 - A10: RSS accounting separates measured retained allocations from reserved construction workspace. The short outage envelope is documented; plan 3 still owns empirical expansion-factor validation.
-- A11: Q6 accepts whole-descriptor materialization at `rust/otap-dataflow/crates/series-lake/src/buffer.rs:340` as the v1 F-park allowance documented in FORMAT.md. Budget one extra B and include synchronous block-sized sealing in control latency. No fixed-workspace bound is claimed; plan 3 validates the allowances.
 
 ## Self-Review
 
 ### Spec coverage
 
-Accepted v1 allowance: Q6 retains synchronous block-sized descriptor sealing (plan 1 F-park; FORMAT.md limitations). Tasks 7/12 budget an additional B and include its control-latency cost; no fixed-workspace bound is claimed. Q5 assigns allowance measurement to plan 3. All section 7/8/9.2 integration requirements map below.
+C1 supersedes the former sealing allowance. Task 0 uses current core interfaces for admission-time series runs and transactional stamp swaps, so A11 is removed and the design authority is unchanged. Tasks 7, 8 and 9 independently deliver core statistics, exporter metrics and process residual accounting. The sole spec amendment is A07. Spec 9.4 has a required Docker CI lane; section 9.5 soak, empirical memory validation and benchmarks are explicitly plan 3.
 
 | Requirement | Task and check |
 | --- | --- |
 | 7.1 local exporter, factory, inventory, feature and typed configuration | 1; real df_engine slice and validate-and-exit |
 | 7.1 ACTIVE/FLUSHING, task owns sealed data, no third block | 3; complete_files_before_ack, ownership split |
 | 7.1 biased select, independent boundary sleep, re-arm while busy | 5; busy_rotation_rearms_boundary_sleep |
-| 7.1 completion -> commit cache -> notifications -> release block | 3, 8; durable files and failure/hour/eviction tests |
+| 7.1 completion -> commit cache -> notifications -> release block | 3, 10; durable files and failure/hour/eviction tests |
 | 7.1 pending resumes before new input; no pdata while pending/rotation | 4; one_pending_request_resumes_before_new_input |
-| 7.1 PData from recv_when(false) is force-drained and retryably nacked | 2, 9; forced_pdata_exposes_shutdown_and_is_retryably_nacked |
-| 7.1 Shutdown pending nack, two-block drain, deadline cancellation | 9; deadline_nacks_both_blocks_and_pending and saturated-inbox test |
-| 7.1 dropping start cancels task; abort cleanup bounded | 3, 8, 9; dropping_worker_cancels_flush_task |
-| 7.1 CollectTelemetry and terminal snapshots; other controls ignored | 7, 9; explicit collection branch; no exporter DrainIngress assumption |
-| 7.1 receiver-first draining requires sufficient deadline | 1, 9, 12; real outstanding-request shutdown test and admin command |
+| 7.1 PData from recv_when(false) is force-drained and retryably nacked | 2, 11; forced_pdata_exposes_shutdown_and_is_retryably_nacked |
+| 7.1 Shutdown pending nack, two-block drain, deadline cancellation | 11; deadline_nacks_both_blocks_and_pending and saturated-inbox test |
+| 7.1 dropping start cancels task; abort cleanup bounded | 3, 10, 11; dropping_start_cancels_flush_task |
+| 7.1 CollectTelemetry and terminal snapshots; other controls ignored | 8, 11; explicit collection branch; no exporter DrainIngress assumption |
+| 7.1 receiver-first draining requires sufficient deadline | 1, 11, 14; real outstanding-request shutdown test and admin command |
 | 7.2 no ACK before durable block, zero-output immediate ACK | 1, 3, 6; object existence and mixed/drop tests |
-| 7.2 Refused permanent; store/shutdown retryable; timeout duplicates | 2, 6, 8, 11, 12; cause/permanent assertions and outage retry loop |
-| 7.3 bounded channel/receiver backpressure | 4, 11; closed admission, waiting producers, retryable status checks |
-| 7.4 complete YAML/storage/retry/writer/producer/window/ingress/cache/sort/upload/Parquet/notify/signals | 1, 10, 12; both runnable configs, startup negative cases |
-| 7.4 all physical sort schemas, no configurable series sort | 1, 12; delegates LakeConfig::validate and rejects value_int for histogram |
-| 7.4 sort guidance, same-window descriptor volume, explicit cores | 7, 12; reserve_with_reemit regression and README |
-| 7.5 cache/block/pending metrics | 7; real gauge test and outage sampling |
-| 7.5 reason-tagged flush count, duration, failures/retries/cancelled | 7, 8, 9; closed enums and lifecycle call sites |
-| 7.5 rows/files per dataset and series emission reasons | 7; FlushReport-only committed writes and bounded reservation labels |
-| 7.5 acks/nacks, queued/failed notifications, oldest age | 7, 9, 11; notifier decisions and recovery baseline |
-| 7.5 unsupported kinds, mismatch columns, invalid timestamp counters | 6, 7; detailed extraction statistics |
-| 7.5 memory budget/accounted and once-process RSS residual | 7, 11, 12; engine monitor aggregation/RAII and public formula |
+| 7.2 Refused permanent; store/shutdown retryable; timeout duplicates | 2, 6, 10, 13, 14; cause/permanent assertions and outage retry loop |
+| 7.3 bounded channel/receiver backpressure | 4, 13; closed admission, waiting producers, retryable status checks |
+| 7.4 complete YAML/storage/retry/writer/producer/window/ingress/cache/sort/upload/Parquet/notify/signals | 1, 12, 14; both runnable configs, startup negative cases |
+| 7.4 all physical sort schemas, no configurable series sort | 1, 14; delegates LakeConfig::validate and rejects value_int for histogram |
+| 7.4 sort guidance, same-window descriptor volume, explicit cores | 7, 8, 14; reserve_with_reemit regression and README |
+| 7.5 cache/block/pending metrics | 8; real gauge test and outage sampling |
+| 7.5 reason-tagged flush count, duration, failures/retries/cancelled | 8, 10, 11; closed enums and lifecycle call sites |
+| 7.5 rows/files per dataset and series emission reasons | 8; FlushReport-only committed writes and bounded reservation labels |
+| 7.5 acks/nacks, queued/failed notifications, oldest age | 8, 11, 13; notifier decisions and recovery baseline |
+| 7.5 unsupported kinds, mismatch columns, invalid timestamp counters | 6, 7, 8; detailed extraction statistics |
+| 7.5 memory budget/accounted and once-process RSS residual | 8, 9, 13, 14; active-worker monitor registration/RAII and one RSS sample |
 | 8 input/extracted/row/whole-block oversize -> Refused | 1, 4, 6; pre-conversion size and core reservation/extraction tests |
-| 8 conversion/schema/duplicate/depth/temporality/histogram/count errors | 4, 6; attribute preflight and atomic content-error tests |
+| 8 conversion/schema/duplicate/depth/temporality/histogram/count errors | 4, 6; one core extract call and atomic content-error tests; R17 exclusions documented |
 | 8 unsupported reject, traces always reject | 6; real producer status assertions |
-| 8 object failure retries until absolute deadline | 8; retry classifier, frozen names/bytes and descriptor failure tests |
-| 8 encoding bugs do not retry; block nack and error event; keep running | 3, 8; no retry classifier and complete error branch |
-| 8 shutdown nacks, force drain, cancellation | 9; engine inbox and both-block deadline tests |
-| 8 notification delivery failure logs/counts, never re-exports | 2, 7, 9; persistent send, failure counter and abandonment |
-| 9.2 ACK only after all files | 1, 3, 10; real backend readback plus engine completion harness |
-| 9.2 failed descriptors re-emitted next block | 8; failed_descriptor_does_not_poison_cache |
-| 9.2 hour crossing, same-series overlap, eviction before commit | 8; overlapping_series_and_eviction_preserve_partition_coverage and same_window_overlap_keeps_both_descriptors |
-| 9.2 busy-boundary re-arm, controls, one rotation and pending precedence | 4, 5, 9; clock, pending and saturated-inbox tests |
+| 8 object failure retries until absolute deadline | 10; retry classifier, frozen names/bytes and descriptor failure tests |
+| 8 encoding bugs do not retry; block nack and error event; keep running | 3, 10; no retry classifier and complete error branch |
+| 8 shutdown nacks, force drain, cancellation | 11; engine inbox and both-block deadline tests |
+| 8 notification delivery failure logs/counts, never re-exports | 2, 8, 11; persistent send, failure counter and abandonment |
+| 9.2 ACK only after all files | 1, 3, 12; real backend readback plus engine completion harness |
+| 9.2 failed descriptors re-emitted next block | 10; failed_descriptor_does_not_poison_cache |
+| 9.2 hour crossing, same-series overlap, eviction before commit | 10; overlapping_series_and_eviction_preserve_partition_coverage and same_window_overlap_keeps_both_descriptors |
+| 9.2 busy-boundary re-arm, controls, one rotation and pending precedence | 4, 5, 11; clock, pending and saturated-inbox tests |
 | 9.2 admission immediately before/after boundary | 5; admission_time_assigns_exactly_one_window |
-| 9.2 series succeeds/values fails, stable retry names/bytes | 8; values_retry_reuses_paths_and_bytes |
-| 9.2 restart same window distinct names | 10; real process restart under one known long window |
-| 9.2 producer disconnect cannot retract admitted data | 10; telemetry-confirmed admission before cancellation |
+| 9.2 series succeeds/values fails, stable retry names/bytes | 10; values_retry_reuses_paths_and_bytes |
+| 9.2 restart same window distinct names | 12; real process restart under one known long window |
+| 9.2 producer disconnect cannot retract admitted data | 12; telemetry-confirmed admission before cancellation |
 | 9.2 release original payload/conversion workspace, strip metadata | 2, 4; Context token tests and payload ownership regression |
-| 9.2 full completion channel cannot stall boundary/shutdown | 2, 5, 9; blocked_completion_keeps_boundary_and_control_live and saturated deadline |
-| 9.2 shutdown with both blocks, pending, deadline and drop safety | 9; shutdown_commits_both_blocks_before_deadline, deadline_nacks_both_blocks_and_pending, drop and real receiver-drain tests |
+| 9.2 full completion channel cannot stall boundary/shutdown | 2, 5, 11; blocked_completion_keeps_boundary_and_control_live and saturated deadline |
+| 9.2 shutdown with both blocks, pending, deadline and drop safety | 11; shutdown_commits_both_blocks_before_deadline, deadline_nacks_both_blocks_and_pending, drop and real receiver-drain tests |
 | 9.2 supported/dropped mixed requests, zero output, reject and traces | 6; MetricsSlice cases |
 | 9.2 INT64_MAX and wrapped timestamps | 6; number_and_histogram DuckDB assertions |
-| 9.2 saturated-inbox latency bound | 9; 2s short-fixture bound and general documented formula |
-| 9.4 real producer/process/local then S3, logs and metrics | 1, 6, 10; Docker Alloy tails known lines; synthetic clients cover metrics/ACK details |
-| E2E-1/2 Alloy realism and independent readers | 10, 11; full River config, native ClickHouse/docker exec code, latest-descriptor joins, counts/body/attribute agreement with DuckDB |
-| E2E-3 reference deployment | 12; Alloy + df_engine + MinIO topology, exact shared River config and full two-reader verification test |
-| 9.4 counts/partition coverage/sorting/identity/canonical join/additive schema | 10; verify_files and restart schema test |
-| 9.5 outage longer than deadline, memory allowance, wait/retry/recovery/no missing ACKed IDs | 11; Alloy plus synthetic clients on both real Docker backends, two readers and the Q6 sealing allowance |
+| 9.2 saturated-inbox latency bound | 11; 2s short-fixture bound and general documented formula |
+| 9.4 real producer/process/local then S3, logs and metrics | 1, 6, 12; Docker Alloy tails known lines; synthetic clients cover metrics/ACK details |
+| E2E-1/2 Alloy realism and independent readers | 12, 13; full River config, native ClickHouse/docker exec code, latest-descriptor joins, counts/body/attribute agreement with DuckDB |
+| E2E-3 reference deployment | 14; Alloy + df_engine + MinIO topology, exact shared River config and full two-reader verification test |
+| 9.4 counts/partition coverage/sorting/identity/canonical join/additive schema | 12; verify_files and restart schema test |
+| 9.5 outage longer than deadline, memory allowance, wait/retry/recovery/no missing precomputed IDs | 13; Alloy plus synthetic clients on both real Docker backends, barrier-started outage cohort, both readers, exact precomputed ID sets and duplicate counts |
+| 6.6 incremental descriptors and no extra sealing B | 0; bounded series runs, failed-swap rollback, frozen stamps and peak retained-buffer regression |
+| 7.5 exact metric schema and durable series_emitted | 8; exact names/units/labels and successful FlushReport-only descriptor increments |
+| 8 immediate retry-deadline failure with independent bounded cleanup | 10; result channel precedes cleanup and the occupied slot blocks the next flush |
+| 9.4 explicit MinIO + RustFS, DuckDB + ClickHouse and Alloy CI matrix | 14; series-parquet-e2e.yml and mandatory SERIES_REQUIRE_DOCKER=1 unittest lane |
+| 9.5 soak, empirical memory-bound validation and benchmarks | Plan 3; explicitly out of scope, not claimed complete by the outage regression |
 
 ### Completeness and planning validation
 
-Planning checks: 12 tasks retain Files, Interfaces, checkbox TDD steps, full code and commit commands with both required trailers. Current series-lake anchors were checked against the sources. The amended plan is ASCII; all Python fences and shell snippets are syntax-checked in memory. The required repository sanitycheck and Markdown lint pass after editing. These are planning checks, not compilation or E2E execution; no cargo builds, implementation tests, image pulls or Git mutations are performed in this session.
+Planning checks: 15 tasks numbered 0 through 14 retain Files, Interfaces, checkbox TDD steps, full code and commit commands with both required trailers. Current series-lake anchors were checked against the sources. The amended plan is ASCII; all Python fences and shell snippets are syntax-checked in memory. The required repository sanitycheck and Markdown lint pass after editing. These are planning checks, not compilation or E2E execution; no cargo builds, implementation tests, image pulls or Git mutations are performed in this session.
 
 No unfinished implementation markers, omitted function bodies or undefined conceptual helpers are permitted. Every source addition, replacement body, fixture, command and commit trailer is written explicitly. Q1 explicitly retains the temporary tracking reference 4128, to be replaced by the real PR number when opened. No other unfinished implementation markers or omitted helpers remain. Tests/builds described here are future execution checks, not claimed planning results.
 
@@ -5014,27 +5952,33 @@ No unfinished implementation markers, omitted function bodies or undefined conce
 - One `Config` maps the nested user YAML to one `LakeConfig`; `Window` scheduling config and `window::Window` runtime state have distinct module-qualified types.
 - `AckToken` owns stripped Context + SignalType + monotonic received time; no token owns payload data. `OwnedBlock` owns `Block<()>` plus tokens, and FLUSHING splits those ownership responsibilities without adding a data block.
 - `Pending` owns Extracted + AckToken + admission seconds. Re-reservation occurs against the eventual ACTIVE block. The same types appear in prepare, offer, resume, shutdown and accounting.
-- `FlushDone` carries Block<()> + lake::Result<FlushReport> + attempts; FlushJob retains tokens, cancel handle, bytes and monotonic start. The task 8 constructor adds exactly one Duration argument, updated at its sole worker call site.
+- `FlushDone` carries Rc<Block<()>> + lake::Result<FlushReport> + attempts. Task 8 carries three emission counts with FlushJob; task 10 adds deadline/abort durations, a oneshot decision and an independently owned cleanup handle. The same FLUSHING slot remains reserved through cleanup and its bytes remain accounted.
 - `WindowClock` inputs/outputs are seconds; seal uses microseconds; wall source uses nanoseconds; `engine::clock` governs sleep/retry/shutdown tests.
 - `Outcome` order is stable for the six notifier counters. Permanent Refused is distinct from retryable NodeShutdown/Unspecified. Storage-origin Parquet wrappers are inspected recursively through AbortFailed.
 - `Metrics` uses plain, measurement and registration sets through their respective APIs; process accounting is in the engine, avoiding a dependency on core-nodes from the engine.
 - Python helpers use one Engine, one DockerStore, one AlloyProducer and one shared River file. Synthetic request constructors remain for metrics/ACK cases; both readers see the same final downloaded snapshot with a latest-descriptor join and filename tie breaker. All unittest classes precede the final unittest.main guard.
-- Local image defaults and environment overrides are consistent in tests/docs. Only Alloy may be pulled. Missing ClickHouse falls back to the local Docker image; absence follows SERIES_REQUIRE_DOCKER policy.
-- The README contract test checks that its River block contains the exact config file used by task 10 and task 11. Q1 is the sole intentional temporary tracking reference.
-- Q4 limits engine/otap edits to task 2 accessors and task 7 process accounting; each has a focused regression. Q3 leaves engine shutdown policy unchanged. Q5/Q6 explicitly separate reported allowances from plan 3 validation.
+- Local image defaults and environment overrides are consistent in tests/docs. Only Alloy may be pulled by the test runner; CI preloads the other selected images. Missing ClickHouse falls back to the local Docker image; absence follows SERIES_REQUIRE_DOCKER policy.
+- The README contract test checks that its River block contains the exact config file used by task 12 and task 13. Q1 is the sole intentional temporary tracking reference.
+- Q4 limits engine/otap edits to task 2 accessors and task 9 process accounting; each has a focused regression. Q3 leaves engine shutdown policy unchanged. C1 supersedes Q6 and removes A11; empirical memory validation remains plan 3.
 
 ## Rulings applied
 
-- Q1: Keep `SERIES_TRACKING_ISSUE=4128` with a temporary-reference comment; replace it with the real PR number when opened.
-- Q2: Use env-overridable local MinIO/RustFS/ClickHouse tags with the ruled defaults; skip missing Docker/images unless `SERIES_REQUIRE_DOCKER=1`; defer CI digest pinning to plan 3.
-- Q3: Use the existing admin shutdown endpoint with an explicit timeout; no engine shutdown-policy change or engine PR.
-- Q4: Plan 1 is merged at `7fd7c3eab`; authorize additive series-lake edits and only necessary, separately tested Context/inbox/process-accounting additions with File Structure justifications.
-- Q5: Report the RSS residual in plan 2; plan 3 validates memory allowances.
-- Q6: Accept block-sized series sealing as v1 F-park, budget an extra B, and state its memory/control-latency cost without claiming fixed workspace.
-- E2E-1: Docker Alloy tails N known log lines in task 10 and during the task 11 outage; verify bodies and attributes, retaining synthetic clients for metrics and acknowledgement assertions.
-- E2E-2: DuckDB and ClickHouse read the same Parquet files, choose the latest descriptor per series, preserve join cardinality and agree with producer expectations; skip unavailable ClickHouse prerequisites cleanly.
-- E2E-3: Task 12 documents Alloy + df_engine + MinIO as the reference deployment using the exact test River configuration and complete reader code.
-- C1: The Spec header cites section 3.2 as the node boundary.
-- C2: Task 1 gives the exact package/feature build, YAML path, df_engine invocation, send-log one-liner and DuckDB one-liner.
-- C3: Re-read current series-lake sources and verify/correct every Ground truth and task-text file:line anchor.
-- C4: Global Constraints require codex reviews; every planned commit retains both trailer lines.
+- C1: Task 0 materializes bounded sorted series rows during admission, stamps only Int64 timestamp storage transactionally, removes pending_descriptors/materialize, adapts tests and core limitations, and eliminates the extra B and A11.
+- C2: Task 6 calls core extract once; no attribute-validation adapter is added, metadata/exemplar tables remain unread/unvalidated under R17, and direct decoder calls use DecodeLimits::new.
+- C3: Tasks 2/3/11 consume forced PData one at a time, immediately attempt retryable NodeShutdown NACKs, count failures and keep polling; the saturation test accounts for all 32 requests.
+- C4: Task 13 starts a known RPC cohort behind barriers during the outage, requires blocked or retryable outcomes, and checks precomputed stored-ID sets with duplicates counted.
+- I1: Task 10 publishes Storage failure at the absolute retry deadline before independent bounded cleanup; the same block slot cannot flush again until cleanup finishes.
+- I2: Task 9 registers active workers explicitly, exposes process residual only while workers exist, and reuses the monitor's single RSS sample.
+- I3: Task 2 charges queue allocation once, queued token external buffers, and the measured pending-send future plus external buffers; inline tokens are not double-counted.
+- I4: Task 8 carries emission counts with FLUSHING and increments series_emitted only after Sink::write_block returns Ok.
+- I5: Task 8 asserts exact descriptor/measurement names, units and labels following file_exporter/metrics.rs:145.
+- I6: Task 11 aborts the real SeriesParquet::start future during a parked flush and asserts cancellation and resource release.
+- I7: Task 14 adds a mandatory SERIES_REQUIRE_DOCKER=1 unittest lane and series-parquet-e2e.yml for MinIO/RustFS, DuckDB/ClickHouse and Alloy.
+- M1: Keep 4128 and its existing temporary-reference comment; replace it when the PR opens, per controller authorization.
+- M2: Original Task 7 is split into independently compiling core statistics (7), exporter metrics (8), and process residual accounting (9); later tasks are renumbered.
+- Spec gap 9.5: Soak, empirical memory-bound validation and benchmarks are explicitly assigned to plan 3.
+- A07: One sentence added to spec section 7 makes the admin shutdown API timeout the v1 deadline source; a pipeline config field is future work.
+- Retained Q1-Q5: Authorized tracking reference, ruled local image tags, existing admin shutdown API, narrowly scoped core/engine support, and plan-3 empirical memory validation remain in effect; I7 adds CI provisioning here.
+- Superseded Q6: C1 replaces the former block-sized sealing allowance; no A11 deviation remains.
+- Retained E2E-1/2/3: Alloy file tailing, independent DuckDB/ClickHouse readers, and the exact reference deployment remain in tasks 12-14.
+- Prior amendment C1-C4: Keep section 3.2 authority, runnable local slice commands, current source anchors, codex reviews and both commit trailers; the second-pass C1-C4 entries above govern this review.
