@@ -8,7 +8,7 @@
 
 **Architecture:** One library crate under `rust/otap-dataflow/crates/series-lake` that depends on `otel-arrow-dfe-pdata`, `arrow`, `parquet` and `object_store` but never on the Dataflow engine. Input is `OtapArrowRecords`; output is Parquet files in the Hive layout of the spec. The exporter node (plan 2) wraps this crate.
 
-**Tech Stack:** Rust 2024 edition (MSRV 1.88), arrow 58.3, parquet 58.3, object_store 0.13.2, xxhash-rust (xxh3), ciborium 0.2, lru 0.12 (new workspace dependency), proptest 1 (new dev dependency), tokio, tokio-util (CancellationToken), serde, serde_json, uuid.
+**Tech Stack:** Rust 2024 edition (MSRV 1.88), arrow 58.3, parquet 58.3, object_store 0.13.2, xxhash-rust (xxh3), ciborium 0.2, lru 0.16 (new workspace dependency), proptest 1 (new dev dependency), tokio, tokio-util (CancellationToken), serde, serde_json, uuid.
 
 **Spec:** `docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md` (revision 4). This plan implements section 11 step 1. Plan 2 (exporter node) and plan 3 (benchmarks, gates) follow.
 
@@ -29,7 +29,7 @@
 rust/otap-dataflow/crates/series-lake/
   Cargo.toml                 package otel-arrow-dfe-series-lake
   README.md                  overview, links to FORMAT.md
-  docs/FORMAT.md             implementation-independent format spec (task 13)
+  docs/FORMAT.md             implementation-independent format spec (task 14)
   src/lib.rs                 module list, re-exports
   src/error.rs               Error / RefuseReason
   src/value.rs               owned Value tree, CBOR decode, render_v1, map/body strings
@@ -47,7 +47,10 @@ rust/otap-dataflow/crates/series-lake/
   src/sink.rs                paths, file names, Parquet writing, cancellation
   tests/golden/*.json        canonical vectors (task 3)
   tests/golden.rs            golden vector test
-  tests/oracle.rs            reference-oracle property test (task 12)
+  tests/oracle.rs            reference-oracle property test (task 13)
+  tests/fuzz_canonical.rs    canonical/CBOR proptests (task 13)
+  tests/fuzz_extract.rs      extraction proptests (task 13)
+  tests/golden_roundtrip.rs  golden vectors through OTLP -> OTAP -> extract (task 13)
   tools/gen_golden.py        independent Python generator for vectors
 ```
 
@@ -66,6 +69,8 @@ Each module has one responsibility; `extract` is the only module that reads OTAP
 
 **Interfaces:**
 - Produces: `series_lake::error::{Error, RefuseReason, Result}` used by every later task.
+
+> **Task 1 is already implemented and committed (`6f6be202a`); its text below is historical.** Later tasks amend what it created: Task 8 changes the workspace `lru` pin from `"0.12"` to `"0.16"`, Task 12 Step 2 adds `features = ["zstd"]` to `parquet` and `features = ["fs"]` to `object_store` in the crate `Cargo.toml` and widens `Error::Cancelled` to `Cancelled { abort_error: Option<String> }` plus `RefuseReason::{BlockFull, TooManyRequests, RequestTooLarge}` (Task 10 adds those), and Task 14 removes the unused `futures` dependency. See "Amendments (2026-09-21)" at the end of this plan.
 
 - [ ] **Step 1: Add workspace dependencies**
 
@@ -239,6 +244,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Produces:
   - `pub enum Value { Null, Str(String), Bytes(Vec<u8>), Int(i64), Double(f64), Bool(bool), Array(Vec<Value>), KvList(Vec<(String, Value)>) }`
   - `pub fn decode_cbor(bytes: &[u8], max_depth: usize) -> Result<Value>` (kvlist keys sorted by bytes, duplicate key -> `Error::invalid`)
+  - `pub fn sort_kvlist(list: &mut Vec<(String, Value)>) -> Result<()>` (sort by raw key bytes, duplicate key -> `Error::invalid`)
+  - `pub fn hex_lower(b: &[u8]) -> String` (lowercase hex, no `format!`)
   - `pub fn render_v1(v: &Value) -> serde_json::Value`
   - `pub fn map_string(v: &Value) -> Option<String>` (attribute map entry point; `None` for `Null`)
   - `pub fn body_string(v: &Value) -> Option<String>` (log body entry point)
@@ -250,6 +257,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RefuseReason;
 
     /// Scenario: a CBOR map with unsorted keys and nested array is decoded.
     /// Guarantees: keys come out sorted by raw bytes and nesting is preserved.
@@ -469,9 +477,13 @@ fn render_double(d: f64) -> serde_json::Value {
 
 /// Lowercase hex of a byte slice.
 pub fn hex_lower(b: &[u8]) -> String {
+    const DIGITS: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
     let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        s.push_str(&format!("{byte:02x}"));
+    for &byte in b {
+        s.push(DIGITS[usize::from(byte >> 4)]);
+        s.push(DIGITS[usize::from(byte & 0x0f)]);
     }
     s
 }
@@ -633,6 +645,32 @@ mod tests {
         let id = series_id(b"");
         assert_eq!(hex(&id), "99aa06d3014798d86001c324468d497f");
     }
+
+    /// Scenario: a logs descriptor and a metrics descriptor built the way extraction builds them.
+    /// Guarantees: `metric.is_some()` holds exactly for the metrics signal, so the Rust gate
+    /// (`metric.is_some()`) and the Python generator gate (`signal == "metrics"`) agree.
+    #[test]
+    fn metric_block_is_gated_on_the_metrics_signal() {
+        let logs = logs_desc();
+        assert_eq!(logs.signal, Signal::Logs);
+        assert!(logs.metric.is_none());
+        let _ = canonical_bytes(&logs);
+
+        let metrics = Descriptor {
+            signal: Signal::Metrics,
+            metric: Some(MetricDescriptor {
+                name: "cpu.usage".into(),
+                unit: "s".into(),
+                kind: MetricKind::Gauge,
+                temporality: Temporality::Unspecified,
+                is_monotonic: false,
+                description: String::new(),
+            }),
+            ..logs_desc()
+        };
+        assert_eq!(metrics.metric.is_some(), metrics.signal == Signal::Metrics);
+        let _ = canonical_bytes(&metrics);
+    }
 }
 ```
 
@@ -746,6 +784,11 @@ pub struct MetricDescriptor {
 ///
 /// Attribute lists must be sorted by raw key bytes with unique keys
 /// (see [`crate::value::sort_kvlist`]).
+///
+/// Invariant: `metric.is_some()` exactly when `signal == Signal::Metrics`.
+/// The canonical encoder gates the metric block on `metric.is_some()`, while
+/// the independent Python generator gates it on `signal == "metrics"`; the
+/// invariant makes the two gates the same condition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Descriptor {
     /// Signal.
@@ -823,6 +866,11 @@ fn encode_kvlist(out: &mut Vec<u8>, entries: &[(String, Value)]) {
 
 /// Build the canonical identity bytes of a descriptor.
 pub fn canonical_bytes(d: &Descriptor) -> Vec<u8> {
+    debug_assert_eq!(
+        d.metric.is_some(),
+        d.signal == Signal::Metrics,
+        "metric fields are present exactly for the metrics signal",
+    );
     let mut out = Vec::with_capacity(256);
     put_str(&mut out, "OTEL-SERIES/1");
     put_str(&mut out, d.signal.as_str());
@@ -859,7 +907,7 @@ Add `pub mod canonical;` to `src/lib.rs`.
 - [ ] **Step 4: Run unit tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake canonical::tests`
-Expected: 4 passed. If `series_id_is_xxh3_128_big_endian` fails, check the digest against `python3 -c "import xxhash; print(xxhash.xxh3_128_hexdigest(b''))"` (package `xxhash`); the Python value is the source of truth for the vector, fix the test constant, not the code.
+Expected: 5 passed. If `series_id_is_xxh3_128_big_endian` fails, check the digest against `python3 -c "import xxhash; print(xxhash.xxh3_128_hexdigest(b''))"` (package `xxhash`); the Python value is the source of truth for the vector, fix the test constant, not the code.
 
 - [ ] **Step 5: Write the independent Python generator `tools/gen_golden.py`**
 
@@ -869,7 +917,7 @@ Expected: 4 passed. If `series_id_is_xxh3_128_big_endian` fails, check the diges
 
 Generates tests/golden/canonical_v1.json. Requires: pip install xxhash
 """
-import json, math, struct, sys
+import json, struct, sys
 import xxhash
 
 TAG = dict(str=1, bytes=2, int=3, double=4, bool=5, null=6, array=7, kvlist=8)
@@ -941,6 +989,8 @@ def kv(key, value):
 
 S = lambda s: {"type": "str", "value": s}
 I = lambda i: {"type": "int", "value": i}
+# D takes a finite Python float; non-finite doubles must use DB(bits) so that
+# json.dump(allow_nan=False) never emits bare Infinity/NaN, which serde_json rejects.
 D = lambda f: {"type": "double", "value": f}
 DB = lambda bits: {"type": "double", "bits": bits}
 B = lambda hexs: {"type": "bytes", "value": hexs}
@@ -966,8 +1016,8 @@ cases = [
     ("nan_quiet", {**base_logs, "attrs": [kv("k", DB(0x7FF8000000000000))]}),
     ("nan_payload", {**base_logs, "attrs": [kv("k", DB(0x7FF8000000000001))]}),
     ("nan_negative", {**base_logs, "attrs": [kv("k", DB(0xFFF8000000000000))]}),
-    ("pos_inf", {**base_logs, "attrs": [kv("k", D(math.inf))]}),
-    ("neg_inf", {**base_logs, "attrs": [kv("k", D(-math.inf))]}),
+    ("pos_inf", {**base_logs, "attrs": [kv("k", DB(0x7FF0000000000000))]}),
+    ("neg_inf", {**base_logs, "attrs": [kv("k", DB(0xFFF0000000000000))]}),
     ("unicode_bmp", {**base_logs, "attrs": [kv("k", S("\u00e9\u4e2d"))]}),
     ("unicode_supplementary", {**base_logs, "attrs": [kv("k", S("\U0001F600"))]}),
     ("embedded_nul", {**base_logs, "attrs": [kv("k", S("a\u0000b"))]}),
@@ -992,7 +1042,9 @@ for name, d in cases:
     b = canonical(d)
     vectors.append({"name": name, "descriptor": d, "canonical_hex": b.hex(),
                     "series_id_hex": xxhash.xxh3_128_hexdigest(b)})
-json.dump({"format": "canonical_v1", "vectors": vectors}, open(sys.argv[1], "w"), indent=1, ensure_ascii=False)
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump({"format": "canonical_v1", "vectors": vectors}, fh,
+              indent=1, ensure_ascii=False, allow_nan=False)
 print(f"wrote {len(vectors)} vectors")
 ```
 
@@ -1149,6 +1201,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
   - `pub struct AttrTable { ... }` built by `AttrTable::from_batch(batch: &RecordBatch, max_depth: usize) -> Result<AttrTable>`; works for `attributes_16` (u16 parent ids) and `attributes_32` (u32 parent ids) schemas.
   - `pub fn AttrTable::get(&self, parent_id: u32) -> &[(String, Value)]` (sorted, unique; empty slice when absent)
   - `pub fn AttrTable::approx_bytes(&self, parent_id: u32) -> usize`
+  - `pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Option<ArrayRef>>` -- the single column-cast helper, reused by `extract/mod.rs`
+
+**Precondition:** `parent_id` is read verbatim. OTAP attribute batches carry quasi-delta encoded parent ids, so the caller must have run `OtapArrowRecords::decode_transport_optimized_ids()` first. Task 6's `extract` does exactly that before building any `AttrTable`.
 
 OTAP attribute batches (pdata `schema/payloads.rs`, `attributes_16` / `attributes_32`) have columns `parent_id` (UInt16, or Dictionary<UInt8, UInt32>), `key` (Dictionary<UInt8, Utf8>), `type` (UInt8, values of `AttributeValueType`: 0 Empty, 1 Str, 2 Int, 3 Double, 4 Bool, 5 Map, 6 Slice, 7 Bytes), `str` (Dictionary<UInt16, Utf8>), `int` (Dictionary<UInt16, Int64>), `double` (Float64), `bool` (Boolean), `bytes` (Dictionary<UInt16, Binary>), `ser` (Dictionary<UInt16, Binary>). Optional value columns may be absent. Dictionary columns are removed with `arrow::compute::cast` to their plain value type before reading.
 
@@ -1158,6 +1213,7 @@ OTAP attribute batches (pdata `schema/payloads.rs`, `attributes_16` / `attribute
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RefuseReason;
     use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array, StringArray, UInt8Array, UInt16Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -1229,6 +1285,26 @@ mod tests {
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
         assert!(matches!(AttrTable::from_batch(&b, 32), Err(Error::Refused(RefuseReason::Invalid(_)))));
     }
+
+    /// Scenario: an attribute row carries a null `parent_id`.
+    /// Guarantees: the batch is refused instead of silently attributing the row to parent 0.
+    #[test]
+    fn null_parent_id_is_refused() {
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, true),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new("str", DataType::Utf8, true),
+        ]);
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(vec![Some(0u16), None])),
+            Arc::new(StringArray::from(vec!["k", "j"])),
+            Arc::new(UInt8Array::from(vec![1u8, 1])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ];
+        let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
+        assert!(matches!(AttrTable::from_batch(&b, 32), Err(Error::Refused(RefuseReason::Invalid(_)))));
+    }
 }
 ```
 
@@ -1270,7 +1346,11 @@ pub struct AttrTable {
     groups: HashMap<u32, Vec<(String, Value)>>,
 }
 
-fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Option<ArrayRef>> {
+/// Fetch `name` from `batch` cast to `to`, or `None` when the column is absent.
+///
+/// This is the single "cast this column to a plain type" helper of the crate;
+/// `extract` reuses it instead of defining its own.
+pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Option<ArrayRef>> {
     let Some(col) = batch.column_by_name(name) else {
         return Ok(None);
     };
@@ -1291,21 +1371,24 @@ impl AttrTable {
             let col = batch
                 .column_by_name("parent_id")
                 .ok_or_else(|| Error::invalid("attribute batch lacks parent_id"))?;
-            let plain_col = match col.data_type() {
+            let ids = match col.data_type() {
                 DataType::Dictionary(_, _) => cast(col, &DataType::UInt32)?,
                 _ => col.clone(),
             };
-            match plain_col.data_type() {
-                DataType::UInt16 => plain_col
+            // A null parent_id is malformed input, not parent 0: refuse it rather
+            // than silently attributing the row to the first parent (spec 9.3).
+            let null_parent = || Error::invalid("attribute batch has a null parent_id");
+            match ids.data_type() {
+                DataType::UInt16 => ids
                     .as_primitive::<UInt16Type>()
                     .iter()
-                    .map(|v| u32::from(v.unwrap_or(0)))
-                    .collect(),
-                DataType::UInt32 => plain_col
+                    .map(|v| v.map(u32::from).ok_or_else(null_parent))
+                    .collect::<Result<Vec<u32>>>()?,
+                DataType::UInt32 => ids
                     .as_primitive::<UInt32Type>()
                     .iter()
-                    .map(|v| v.unwrap_or(0))
-                    .collect(),
+                    .map(|v| v.ok_or_else(null_parent))
+                    .collect::<Result<Vec<u32>>>()?,
                 other => return Err(Error::invalid(format!("parent_id type {other}"))),
             }
         };
@@ -1379,7 +1462,7 @@ Add `pub mod attrs;` to `src/lib.rs`.
 - [ ] **Step 4: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake attrs::tests`
-Expected: 2 passed.
+Expected: 3 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1405,12 +1488,12 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
   - `pub struct Denormalize { pub path: String, pub column: String, pub ty: DenormType }` with `serde` accepting either a bare string (`"resource.service.name"`) or the object form; `pub fn source(&self) -> (DenormSource, &str)` where `pub enum DenormSource { Resource, Scope, Attrs }`
   - `pub enum SortOrder { Asc, Desc }`, `pub enum Nulls { First, Last }`, `pub struct SortKey { pub column: String, pub order: SortOrder, pub nulls: Nulls }` (serde: bare string means asc, nulls last)
   - `pub struct SignalConfig { pub series_attributes: Vec<String>, pub denormalize: Vec<Denormalize>, pub values_sort: Vec<SortKey> }`
-  - `pub struct IngressLimits { pub max_request_bytes: usize, pub max_extracted_bytes: usize, pub max_row_bytes: usize, pub max_nesting_depth: usize }`
+  - `pub struct IngressLimits { pub max_request_bytes: usize, pub max_extracted_bytes: usize, pub max_row_bytes: usize, pub max_nesting_depth: usize, pub max_block_bytes: usize, pub max_requests_per_block: usize, pub pending_series_entry_bytes: usize }` (defaults `16MiB`, `32MiB`, `1MiB`, `32`, `500MiB`, `4096`, `64`; spec 6.1)
   - `pub struct SortingConfig { pub enabled: bool, pub run_target_bytes: usize, pub merge_chunk_bytes: usize }`
-  - `pub struct UploadConfig { pub part_bytes: usize, pub concurrency: usize }`
+  - `pub struct UploadConfig { pub part_bytes: usize, pub concurrency: usize, pub abort_timeout: Duration }` (`abort_timeout` default 5s, spec 6.5; bounds the best-effort multipart abort of Task 12)
   - `pub struct ParquetConfig { pub row_group_bytes: usize, pub writer_limit_bytes: usize }` (compression fixed to ZSTD in v1)
   - `pub enum UnsupportedPolicy { Reject, Drop }`
-  - `pub struct LakeConfig { pub writer_id: String, pub producer_id_attribute: String, pub window_interval: Duration, pub ingress: IngressLimits, pub sorting: SortingConfig, pub upload: UploadConfig, pub parquet: ParquetConfig, pub unsupported: UnsupportedPolicy, pub logs: SignalConfig, pub metrics: SignalConfig }` with `Default` matching the spec example and `pub fn validate(&self) -> Result<()>` (column collisions, sort keys exist in the dataset schema, `max_row_bytes <= run_target_bytes / 4`).
+  - `pub struct LakeConfig { pub writer_id: String, pub producer_id_attribute: String, pub window_interval: Duration, pub ingress: IngressLimits, pub sorting: SortingConfig, pub upload: UploadConfig, pub parquet: ParquetConfig, pub unsupported: UnsupportedPolicy, pub logs: SignalConfig, pub metrics: SignalConfig }` with `Default` matching the spec example and `pub fn validate(&self) -> Result<()>` (column collisions, sort keys exist in the dataset schema, `max_row_bytes <= run_target_bytes / 4`, `max_requests_per_block >= 1`, `max_block_bytes >= max_extracted_bytes`).
 - Produces (schema):
   - `pub enum Dataset { LogsSeries, LogsValues, MetricsSeries, MetricsNumber, MetricsHistogram }` with `fn signal(self) -> Signal`, `fn name(self) -> &'static str` (`series`, `values`, `number`, `histogram`), `fn is_series(self) -> bool`, `pub const ALL: [Dataset; 5]`
   - `pub fn dataset_schema(ds: Dataset, cfg: &LakeConfig) -> SchemaRef` (intrinsic columns of spec 5.1 plus `d_*`/aliased denormalized columns; for series datasets only identity-path denormalized columns)
@@ -1689,11 +1772,25 @@ pub struct IngressLimits {
     pub max_row_bytes: usize,
     /// Nested value depth limit.
     pub max_nesting_depth: usize,
+    /// Retained-bytes limit of one block (spec section 6.1).
+    pub max_block_bytes: usize,
+    /// Ack tokens (requests) one block may hold (spec section 6.1).
+    pub max_requests_per_block: usize,
+    /// Fixed bytes charged per `pending_series` entry (spec section 6.1).
+    pub pending_series_entry_bytes: usize,
 }
 
 impl Default for IngressLimits {
     fn default() -> Self {
-        Self { max_request_bytes: 16 << 20, max_extracted_bytes: 32 << 20, max_row_bytes: 1 << 20, max_nesting_depth: 32 }
+        Self {
+            max_request_bytes: 16 << 20,
+            max_extracted_bytes: 32 << 20,
+            max_row_bytes: 1 << 20,
+            max_nesting_depth: 32,
+            max_block_bytes: 500 << 20,
+            max_requests_per_block: 4096,
+            pending_series_entry_bytes: 64,
+        }
     }
 }
 
@@ -1723,11 +1820,14 @@ pub struct UploadConfig {
     pub part_bytes: usize,
     /// In-flight parts.
     pub concurrency: usize,
+    /// Upper bound on a best-effort multipart abort (spec section 6.5).
+    #[serde(with = "humantime_serde")]
+    pub abort_timeout: Duration,
 }
 
 impl Default for UploadConfig {
     fn default() -> Self {
-        Self { part_bytes: 8 << 20, concurrency: 2 }
+        Self { part_bytes: 8 << 20, concurrency: 2, abort_timeout: Duration::from_secs(5) }
     }
 }
 
@@ -1810,6 +1910,12 @@ impl LakeConfig {
         }
         if self.upload.concurrency == 0 || self.upload.part_bytes < 5 << 20 {
             return Err(Error::invalid("upload.part_bytes must be >= 5MiB and concurrency >= 1"));
+        }
+        if self.ingress.max_requests_per_block == 0 {
+            return Err(Error::invalid("max_requests_per_block must be >= 1"));
+        }
+        if self.ingress.max_block_bytes < self.ingress.max_extracted_bytes {
+            return Err(Error::invalid("max_block_bytes must be at least max_extracted_bytes"));
         }
         for ds in crate::schema::Dataset::ALL {
             let schema = crate::schema::dataset_schema(ds, self);
@@ -2071,22 +2177,46 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Create: `rust/otap-dataflow/crates/series-lake/src/extract/mod.rs`
 - Create: `rust/otap-dataflow/crates/series-lake/src/extract/logs.rs`
 - Modify: `rust/otap-dataflow/crates/series-lake/src/attrs.rs` (expose `AnyValueColumns`)
+- Modify: `rust/otap-dataflow/crates/series-lake/src/error.rs` (rename `RefuseReason::TooLarge` to `RequestTooLarge`)
 - Modify: `src/lib.rs` (add `pub mod extract;`)
 
 **Interfaces:**
-- Consumes: `attrs::AttrTable`, `canonical::*`, `schema::{Dataset, dataset_schema, denorm_columns}`, `config::LakeConfig`, `value::*`.
+- Consumes: `attrs::{AttrTable, plain}`, `canonical::*`, `schema::{Dataset, dataset_schema, denorm_columns}`, `config::LakeConfig`, `value::*`.
 - Produces:
   - `pub enum DenormValue { Str(String), Int(i64), Double(f64), Bool(bool) }`
   - `pub struct DescriptorRow { pub series_id: SeriesId, pub identity_bytes: Vec<u8>, pub descriptor: Descriptor, pub denorm: Vec<Option<DenormValue>>, pub approx_bytes: usize }` (`denorm` follows `denorm_columns(series dataset)` order)
-  - `pub struct ExtractStats { pub rows: usize, pub dropped_unsupported: u64, pub timestamp_out_of_range: u64, pub denorm_type_mismatch: u64 }`
+  - `pub struct ExtractStats { pub rows: usize, pub dropped_unsupported: u64, pub dropped_exemplars: u64, pub timestamp_out_of_range: u64, pub denorm_type_mismatch: u64 }`
   - `pub struct Extracted { pub signal: Signal, pub descriptors: Vec<DescriptorRow>, pub values: Vec<(Dataset, Vec<RecordBatch>)>, pub pinned_bytes: usize, pub stats: ExtractStats }`
-  - `pub fn extract(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted>` (traces -> `Refused(Unsupported)`)
+  - `pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted>` -- takes `&mut` because it calls `records.decode_transport_optimized_ids()?` before reading any `parent_id` (spec 6.2 step 3); traces -> `Refused(Unsupported)`
   - `pub fn series_batch(rows: &[&DescriptorRow], emitted_at_us: i64, ds: Dataset, cfg: &LakeConfig) -> Result<RecordBatch>`
-  - `pub(crate) struct AnyValueColumns` in `attrs.rs` with `pub(crate) fn from_struct_or_batch(cols: &dyn ColumnSource) ...`; concretely: `pub(crate) fn any_value_columns(get: impl Fn(&str) -> Option<ArrayRef>) -> Result<AnyValueColumns>` and `pub(crate) fn AnyValueColumns::value_at(&self, row: usize, max_depth: usize) -> Result<Value>`
+  - `pub(crate) struct AnyValueColumns` in `attrs.rs` with `pub(crate) fn new(get: &dyn Fn(&str) -> Option<ArrayRef>) -> Result<Self>` and `pub(crate) fn value_at(&self, row: usize, max_depth: usize) -> Result<Value>`
+  - `pub(crate) struct Budget` in `extract/mod.rs`: the single per-request accountant. `fn new(cfg: &LakeConfig) -> Self`, `fn charge_row(&mut self, bytes: usize) -> Result<()>` (refuses a row over `max_row_bytes`, then charges), `fn charge(&mut self, bytes: usize) -> Result<()>`. Exceeding `max_extracted_bytes` returns `Refused(RequestTooLarge)`.
   - `pub(crate) fn timestamp_pair(ns: i64, stats: &mut ExtractStats) -> (Option<i64>, Option<i64>)` (raw nanos, micros; spec 5.1 rule)
   - `pub(crate) fn denorm_lookup(d: &Denormalize, resource: &[(String, Value)], scope: &[(String, Value)], attrs: &[(String, Value)], stats: &mut ExtractStats) -> Option<DenormValue>`
-  - `pub(crate) struct RowSink` (in `extract/mod.rs`): accumulates Arrow builders for one dataset, seals slices at `run_target_bytes`, enforces `max_row_bytes` / `max_extracted_bytes`; `fn new(ds, cfg)`, `fn push(&mut self, row: &ValuesRow) -> Result<()>`, `fn finish(self) -> Result<(Vec<RecordBatch>, usize)>`
-  - `pub(crate) enum Col { Str(Option<String>), Int(Option<i64>), Double(Option<f64>), Bool(Option<bool>), TsUs(Option<i64>), Fixed(Option<Vec<u8>>), Map(Vec<(String, Option<String>)>), ListI64(Vec<i64>), ListF64(Vec<f64>), Bytes(Vec<u8>) }` and `pub(crate) struct ValuesRow { pub cols: Vec<Col>, pub approx_bytes: usize }` whose `cols` follow the dataset schema order.
+  - `pub(crate) fn descriptor_row(descriptor: Descriptor, ds_series: Dataset, cfg: &LakeConfig, stats: &mut ExtractStats, budget: &mut Budget) -> Result<DescriptorRow>`
+  - Shared OTAP column helpers, all in `extract/mod.rs` (single helper set): `pub(crate) use crate::attrs::plain;` (the column-cast helper, formerly duplicated as `plain_col`), `pub(crate) fn struct_child(...)`, `pub(crate) fn attr_table(...)`, `pub(crate) fn map_col(...)`, `pub(crate) fn opt_u16_at(...) -> Option<u32>`, `pub(crate) fn attrs_of(table: &AttrTable, id: Option<u32>) -> &[(String, Value)]` (empty list for `None`), `pub(crate) fn str_at`, `pub(crate) fn i64_at`, `pub(crate) fn fixed_at`, `pub(crate) fn kv_bytes`, `pub(crate) fn denorm_bytes`.
+  - `pub(crate) struct RowSink` (in `extract/mod.rs`): accumulates Arrow builders for one dataset and seals a slice *before* appending a row that would take it past `run_target_bytes`; `fn new(ds, cfg)`, `fn push(&mut self, row: &ValuesRow, budget: &mut Budget) -> Result<()>`, `fn finish(self, budget: &mut Budget) -> Result<(Vec<RecordBatch>, usize)>`
+  - `pub(crate) enum Col { Str(Option<String>), Int(Option<i64>), Int32(Option<i32>), Double(Option<f64>), Bool(Option<bool>), TsUs(Option<i64>), Fixed(Option<Vec<u8>>), Map(Vec<(String, Option<String>)>), ListI64(Vec<i64>), ListF64(Vec<f64>), Bytes(Vec<u8>) }` and `pub(crate) struct ValuesRow { pub cols: Vec<Col>, pub approx_bytes: usize }` whose `cols` follow the dataset schema order.
+
+- [ ] **Step 0: Rename `RefuseReason::TooLarge` to `RequestTooLarge`**
+
+Task 1 committed `RefuseReason::TooLarge`. The block-admission reasons of Task 10 need one reason per condition, so rename the existing variant now, before the first user exists. In `src/error.rs` replace the variant:
+
+```rust
+/// Why a request is permanently refused (spec section 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefuseReason {
+    /// The request itself, its extracted output or one of its rows exceeds a budget.
+    RequestTooLarge,
+    /// Malformed content: duplicate keys, nesting too deep, bad histogram, ...
+    Invalid(String),
+    /// Unsupported signal or point kind under the reject policy.
+    Unsupported(String),
+}
+```
+
+Run: `cd rust/otap-dataflow && cargo check -p otel-arrow-dfe-series-lake`
+Expected: success (nothing constructed `TooLarge` yet).
 
 - [ ] **Step 1: Refactor `attrs.rs` to expose `AnyValueColumns`**
 
@@ -2164,7 +2294,9 @@ impl AnyValueColumns {
 }
 ```
 
-In `from_batch`, construct `let any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;` and use `any.value_at(row, max_depth)?` in the loop. Re-run `cargo test -p otel-arrow-dfe-series-lake attrs::tests` (still 2 passed).
+In `from_batch`, construct `let any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;` and use `any.value_at(row, max_depth)?` in the loop. Re-run `cargo test -p otel-arrow-dfe-series-lake attrs::tests` (still 3 passed).
+
+`AnyValueColumns::new` keeps its own `cast_opt` closure because it takes a column *lookup*, not a `RecordBatch`; `attrs::plain` stays the single batch-column helper and `extract` reuses it rather than defining a second copy.
 
 - [ ] **Step 2: Write failing tests for logs extraction** (`src/extract/logs.rs`, `#[cfg(test)] mod tests`)
 
@@ -2173,8 +2305,12 @@ In `from_batch`, construct `let any = AnyValueColumns::new(&|n| batch.column_by_
 mod tests {
     use super::*;
     use crate::config::{Denormalize, DenormType, LakeConfig};
+    use crate::error::{Error, RefuseReason};
+    use crate::extract::{extract, series_batch};
     use crate::schema::Dataset;
     use arrow::array::{Array, AsArray};
+    use otel_arrow_dfe_pdata::otap::transform::transport_optimize::apply_transport_optimized_encodings;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
@@ -2225,8 +2361,8 @@ mod tests {
     /// excluded from the residual map, zero timestamp stored as null, denormalized columns filled.
     #[test]
     fn extracts_logs_descriptors_and_values() {
-        let records = encode_logs(&logs_data());
-        let out = extract(&records, &cfg()).expect("extract");
+        let mut records = encode_logs(&logs_data());
+        let out = extract(&mut records, &cfg()).expect("extract");
         assert_eq!(out.signal, Signal::Logs);
         assert_eq!(out.descriptors.len(), 2);
         let (ds, batches) = &out.values[0];
@@ -2259,8 +2395,8 @@ mod tests {
     /// Guarantees: identity_bytes hashes to series_id and maps carry the attributes.
     #[test]
     fn series_batch_round_trip() {
-        let records = encode_logs(&logs_data());
-        let out = extract(&records, &cfg()).expect("extract");
+        let mut records = encode_logs(&logs_data());
+        let out = extract(&mut records, &cfg()).expect("extract");
         let rows: Vec<&DescriptorRow> = out.descriptors.iter().collect();
         let batch = series_batch(&rows, 1_700_000_000_000_000, Dataset::LogsSeries, &cfg()).expect("batch");
         assert_eq!(batch.num_rows(), 2);
@@ -2272,13 +2408,113 @@ mod tests {
     }
 
     /// Scenario: max_extracted_bytes far below the request size.
-    /// Guarantees: extraction stops with TooLarge instead of allocating everything.
+    /// Guarantees: extraction stops with RequestTooLarge instead of allocating everything.
     #[test]
     fn extracted_budget_is_enforced() {
         let mut cfg = cfg();
         cfg.ingress.max_extracted_bytes = 1;
-        let records = encode_logs(&logs_data());
-        assert!(matches!(extract(&records, &cfg), Err(Error::Refused(RefuseReason::TooLarge))));
+        let mut records = encode_logs(&logs_data());
+        assert!(matches!(extract(&mut records, &cfg), Err(Error::Refused(RefuseReason::RequestTooLarge))));
+    }
+
+    /// Scenario: max_row_bytes below the size of a single descriptor row.
+    /// Guarantees: the descriptor row is subject to the row limit, not only values rows.
+    #[test]
+    fn descriptor_rows_are_subject_to_the_row_limit() {
+        let mut cfg = cfg();
+        cfg.ingress.max_row_bytes = 8;
+        let mut records = encode_logs(&logs_data());
+        assert!(matches!(extract(&mut records, &cfg), Err(Error::Refused(RefuseReason::RequestTooLarge))));
+    }
+
+    /// Scenario: the same logs request, once with plain parent ids and once with
+    /// pdata's quasi-delta transport-optimized parent ids on every attribute payload.
+    /// Guarantees: `extract` decodes transport-optimized ids first, so both inputs
+    /// produce the same series ids, the same descriptor count and the same row count.
+    #[test]
+    fn transport_optimized_ids_give_the_same_result() {
+        let mut plain_records = encode_logs(&logs_data());
+        let plain = extract(&mut plain_records, &cfg()).expect("extract plain");
+
+        let mut optimized = encode_logs(&logs_data());
+        for pt in [
+            ArrowPayloadType::ResourceAttrs,
+            ArrowPayloadType::ScopeAttrs,
+            ArrowPayloadType::LogAttrs,
+        ] {
+            let Some(batch) = optimized.get(pt).cloned() else { continue };
+            let (encoded, _remap) =
+                apply_transport_optimized_encodings(&pt, &batch).expect("encode");
+            optimized.set(pt, encoded).expect("set");
+        }
+        let got = extract(&mut optimized, &cfg()).expect("extract optimized");
+
+        let ids = |e: &Extracted| {
+            let mut v: Vec<String> =
+                e.descriptors.iter().map(|d| crate::canonical::hex(&d.series_id)).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&got), ids(&plain));
+        assert_eq!(got.stats.rows, plain.stats.rows);
+        let rows = |e: &Extracted| -> usize {
+            e.values.iter().flat_map(|(_, b)| b.iter()).map(|b| b.num_rows()).sum()
+        };
+        assert_eq!(rows(&got), rows(&plain));
+    }
+
+    /// Scenario: one log record carries attributes and one carries none, so pdata
+    /// writes a null `id` for the second record.
+    /// Guarantees: the record without attributes gets an empty identity attribute
+    /// list instead of inheriting the attributes of log id 0, so the two records
+    /// land in different series.
+    #[test]
+    fn records_without_attributes_do_not_inherit_log_zero() {
+        let data = LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", "h1")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![
+                        LogRecord {
+                            time_unix_nano: 1_000,
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("a".into())),
+                            }),
+                            attributes: vec![kv("logger.name", "L1")],
+                            ..Default::default()
+                        },
+                        LogRecord {
+                            time_unix_nano: 2_000,
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("b".into())),
+                            }),
+                            attributes: vec![],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut records = encode_logs(&data);
+        let out = extract(&mut records, &cfg()).expect("extract");
+        assert_eq!(out.descriptors.len(), 2);
+        let with_attrs = out
+            .descriptors
+            .iter()
+            .find(|d| !d.descriptor.attrs.is_empty())
+            .expect("attributed descriptor");
+        let without = out
+            .descriptors
+            .iter()
+            .find(|d| d.descriptor.attrs.is_empty())
+            .expect("unattributed descriptor");
+        assert_eq!(with_attrs.descriptor.attrs.len(), 1);
+        assert_ne!(with_attrs.series_id, without.series_id);
     }
 }
 ```
@@ -2302,19 +2538,27 @@ pub mod metrics;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int32Builder,
-    Int64Builder, ListBuilder, MapBuilder, StringBuilder, TimestampMicrosecondBuilder,
+    Array, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder,
+    Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder, TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimestampNanosecondType, UInt16Type};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
+use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::canonical::{Descriptor, Signal, SeriesId, hex};
+use crate::attrs::AttrTable;
+use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
-use crate::value::{Value, map_string};
+use crate::value::{Value, map_string, value_bytes};
+
+/// The single "cast this batch column to a plain type" helper of the crate.
+///
+/// Re-exported from `attrs` so that `extract::logs` and `extract::metrics` share
+/// one copy instead of each defining its own `plain_col`.
+pub(crate) use crate::attrs::plain;
 
 /// A typed denormalized value.
 #[derive(Debug, Clone, PartialEq)]
@@ -2351,6 +2595,8 @@ pub struct ExtractStats {
     pub rows: usize,
     /// Points dropped under the drop policy.
     pub dropped_unsupported: u64,
+    /// Exemplar rows dropped (spec 5.1 `dropped_unsupported{kind=exemplar}`).
+    pub dropped_exemplars: u64,
     /// Timestamps outside `1..=i64::MAX`.
     pub timestamp_out_of_range: u64,
     /// Denormalized values stored as null because of a type mismatch.
@@ -2373,13 +2619,85 @@ pub struct Extracted {
 }
 
 /// Extract descriptors and values from one OTAP request.
-pub fn extract(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted> {
+///
+/// Takes `&mut` because OTAP attribute batches carry quasi-delta encoded
+/// `parent_id` columns: spec section 6.2 step 3 requires
+/// `decode_transport_optimized_ids` before any `parent_id` is read. Decoding is
+/// idempotent, so a request whose ids are already plain is unaffected.
+pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted> {
+    if matches!(records, OtapArrowRecords::Traces(_)) {
+        return Err(Error::Refused(RefuseReason::Unsupported("traces".into())));
+    }
+    records
+        .decode_transport_optimized_ids()
+        .map_err(|e| Error::Pdata(e.to_string()))?;
+    let mut budget = Budget::new(cfg);
     match records {
-        OtapArrowRecords::Logs(_) => logs::extract_logs(records, cfg),
-        OtapArrowRecords::Metrics(_) => metrics::extract_metrics(records, cfg),
+        OtapArrowRecords::Logs(_) => logs::extract_logs(records, cfg, &mut budget),
+        OtapArrowRecords::Metrics(_) => metrics::extract_metrics(records, cfg, &mut budget),
         OtapArrowRecords::Traces(_) => {
             Err(Error::Refused(RefuseReason::Unsupported("traces".into())))
         }
+    }
+}
+
+/// The single byte accountant of one request (spec section 6.2 step 4).
+///
+/// One `Budget` is created in [`extract`] and threaded through every descriptor
+/// row, every values row and every sealed values batch, so that a request with
+/// many small datasets cannot spend the whole limit once per dataset. It is a
+/// deliberate upper bound: a row is charged both when it is built (its
+/// approximate size) and again through the pinned bytes of the batch it is
+/// sealed into. Ledger: the over-count is bounded by one Arrow copy of the
+/// request and is revisited in plan 3 with the memory benchmarks.
+pub(crate) struct Budget {
+    limit: usize,
+    max_row: usize,
+    used: usize,
+}
+
+impl Budget {
+    /// New accountant for one request.
+    pub(crate) fn new(cfg: &LakeConfig) -> Self {
+        Self {
+            limit: cfg.ingress.max_extracted_bytes,
+            max_row: cfg.ingress.max_row_bytes,
+            used: 0,
+        }
+    }
+
+    /// Charge one row -- a values row or a descriptor row.
+    ///
+    /// A single row larger than `max_row_bytes` refuses the request, as does a
+    /// running total past `max_extracted_bytes`.
+    pub(crate) fn charge_row(&mut self, bytes: usize) -> Result<()> {
+        if bytes > self.max_row {
+            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        }
+        self.charge(bytes)
+    }
+
+    /// Charge bytes that are not one row, such as a sealed batch.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.limit {
+            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        }
+        Ok(())
+    }
+}
+
+/// Approximate retained bytes of a sorted attribute list.
+pub(crate) fn kv_bytes(list: &[(String, Value)]) -> usize {
+    list.iter().map(|(k, v)| k.len() + 24 + value_bytes(v)).sum()
+}
+
+/// Approximate retained bytes of one denormalized cell.
+pub(crate) fn denorm_bytes(v: &Option<DenormValue>) -> usize {
+    match v {
+        None => 8,
+        Some(DenormValue::Str(s)) => s.len() + 24,
+        Some(_) => 16,
     }
 }
 
@@ -2568,8 +2886,12 @@ fn finish(b: &mut AnyBuilder) -> ArrayRef {
     }
 }
 
-/// Accumulates rows of one dataset into slices of at most `run_target_bytes`,
-/// enforcing `max_row_bytes` and `max_extracted_bytes`.
+/// Accumulates rows of one dataset into slices of at most `run_target_bytes`.
+///
+/// The slice is sealed *before* appending a row that would take it past
+/// `run_target_bytes`, so a sealed slice never exceeds the target (spec 6.2
+/// step 4). Row and request limits are enforced by the shared [`Budget`], which
+/// every dataset of the request shares.
 pub(crate) struct RowSink {
     schema: SchemaRef,
     builders: Vec<AnyBuilder>,
@@ -2579,8 +2901,6 @@ pub(crate) struct RowSink {
     pinned: usize,
     seen: CountedAllocations,
     run_target: usize,
-    max_row: usize,
-    max_extracted: usize,
 }
 
 impl RowSink {
@@ -2596,53 +2916,115 @@ impl RowSink {
             pinned: 0,
             seen: CountedAllocations::default(),
             run_target: cfg.sorting.run_target_bytes,
-            max_row: cfg.ingress.max_row_bytes,
-            max_extracted: cfg.ingress.max_extracted_bytes,
         })
     }
 
-    pub(crate) fn push(&mut self, row: &ValuesRow) -> Result<()> {
-        if row.approx_bytes > self.max_row {
-            return Err(Error::Refused(RefuseReason::TooLarge));
-        }
+    pub(crate) fn push(&mut self, row: &ValuesRow, budget: &mut Budget) -> Result<()> {
+        budget.charge_row(row.approx_bytes)?;
         if row.cols.len() != self.builders.len() {
             return Err(Error::invalid("row width does not match dataset schema"));
+        }
+        // Seal first: a slice must not grow past run_target_bytes.
+        if self.rows_in_slice > 0 && self.slice_bytes + row.approx_bytes > self.run_target {
+            self.seal(budget)?;
         }
         for (b, c) in self.builders.iter_mut().zip(&row.cols) {
             append(b, c)?;
         }
         self.slice_bytes += row.approx_bytes;
         self.rows_in_slice += 1;
-        if self.slice_bytes >= self.run_target {
-            self.seal()?;
-        }
         Ok(())
     }
 
-    fn seal(&mut self) -> Result<()> {
+    fn seal(&mut self, budget: &mut Budget) -> Result<()> {
         if self.rows_in_slice == 0 {
             return Ok(());
         }
         let cols: Vec<ArrayRef> = self.builders.iter_mut().map(finish).collect();
         let batch = RecordBatch::try_new(self.schema.clone(), cols)?;
-        self.pinned += record_batch_pinned_bytes(&batch, &mut self.seen);
-        if self.pinned > self.max_extracted {
-            return Err(Error::Refused(RefuseReason::TooLarge));
-        }
+        let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
+        self.pinned += pinned;
+        budget.charge(pinned)?;
         self.batches.push(batch);
         self.slice_bytes = 0;
         self.rows_in_slice = 0;
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<(Vec<RecordBatch>, usize)> {
-        self.seal()?;
+    pub(crate) fn finish(mut self, budget: &mut Budget) -> Result<(Vec<RecordBatch>, usize)> {
+        self.seal(budget)?;
         Ok((self.batches, self.pinned))
     }
 }
 
-fn map_col(list: &[(String, Value)]) -> Col {
+/// A `Map<Utf8, Utf8>` cell built from a sorted attribute list.
+pub(crate) fn map_col(list: &[(String, Value)]) -> Col {
     Col::Map(list.iter().map(|(k, v)| (k.clone(), map_string(v))).collect())
+}
+
+/// Child of a struct column, cast to a plain type, or `None` when absent.
+pub(crate) fn struct_child(
+    batch: &RecordBatch,
+    parent: &str,
+    child: &str,
+    to: &DataType,
+) -> Result<Option<ArrayRef>> {
+    let Some(col) = batch.column_by_name(parent) else { return Ok(None) };
+    let s = col.as_struct();
+    match s.column_by_name(child) {
+        None => Ok(None),
+        Some(c) if c.data_type() == to => Ok(Some(c.clone())),
+        Some(c) => Ok(Some(arrow::compute::cast(c, to)?)),
+    }
+}
+
+/// Attribute table for a payload type, empty when the payload is absent.
+pub(crate) fn attr_table(
+    records: &OtapArrowRecords,
+    pt: ArrowPayloadType,
+    max_depth: usize,
+) -> Result<AttrTable> {
+    match records.get(pt) {
+        Some(b) => AttrTable::from_batch(b, max_depth),
+        None => Ok(AttrTable::default()),
+    }
+}
+
+/// A `UInt16` id column read as `Option<u32>`.
+///
+/// `None` means "no parent": pdata writes a null id for a record or point that
+/// carries no attributes. A `None` must never be turned into id 0, which would
+/// make such a record inherit the attributes of parent 0.
+pub(crate) fn opt_u16_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
+    a.as_ref()
+        .and_then(|a| a.is_valid(row).then(|| u32::from(a.as_primitive::<UInt16Type>().value(row))))
+}
+
+/// Attributes of an optional parent id: the empty list when the id is `None`.
+pub(crate) fn attrs_of<'a>(table: &'a AttrTable, id: Option<u32>) -> &'a [(String, Value)] {
+    match id {
+        Some(id) => table.get(id),
+        None => &[],
+    }
+}
+
+/// A Utf8 column read as an owned `String`, empty when null or absent.
+pub(crate) fn str_at(a: &Option<ArrayRef>, row: usize) -> String {
+    a.as_ref()
+        .and_then(|a| a.is_valid(row).then(|| a.as_string::<i32>().value(row).to_string()))
+        .unwrap_or_default()
+}
+
+/// A `Timestamp(ns)` column read as `i64`, `0` when null or absent.
+pub(crate) fn i64_at(a: &Option<ArrayRef>, row: usize) -> i64 {
+    a.as_ref()
+        .and_then(|a| a.is_valid(row).then(|| a.as_primitive::<TimestampNanosecondType>().value(row)))
+        .unwrap_or(0)
+}
+
+/// A `FixedSizeBinary` column read as owned bytes, `None` when null or absent.
+pub(crate) fn fixed_at(a: &Option<ArrayRef>, row: usize) -> Option<Vec<u8>> {
+    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_fixed_size_binary().value(row).to_vec()))
 }
 
 /// Build a `series` batch from descriptor rows.
@@ -2684,16 +3066,42 @@ pub fn series_batch(rows: &[&DescriptorRow], emitted_at_us: i64, ds: Dataset, cf
 }
 
 /// Descriptor row constructor shared by logs and metrics.
-pub(crate) fn descriptor_row(descriptor: Descriptor, ds_series: Dataset, cfg: &LakeConfig, stats: &mut ExtractStats) -> DescriptorRow {
+///
+/// The row is charged to `budget` like any other row, so an oversized
+/// descriptor refuses the request through `max_row_bytes` and a request with
+/// very many series refuses through `max_extracted_bytes`.
+pub(crate) fn descriptor_row(
+    descriptor: Descriptor,
+    ds_series: Dataset,
+    cfg: &LakeConfig,
+    stats: &mut ExtractStats,
+    budget: &mut Budget,
+) -> Result<DescriptorRow> {
     let identity_bytes = crate::canonical::canonical_bytes(&descriptor);
     let series_id = crate::canonical::series_id(&identity_bytes);
-    let denorm = denorm_columns(ds_series, cfg)
+    let denorm: Vec<Option<DenormValue>> = denorm_columns(ds_series, cfg)
         .into_iter()
         .map(|d| denorm_lookup(d, &descriptor.resource_attrs, &descriptor.scope_attrs, &descriptor.attrs, stats))
         .collect();
-    let approx_bytes = identity_bytes.len() * 2 + 256;
-    let _ = hex(&series_id);
-    DescriptorRow { series_id, identity_bytes, descriptor, denorm, approx_bytes }
+    // series row: series_id + identity_bytes + emitted_at + the four schema/scope
+    // strings + three attribute maps + the metric block + denormalized columns.
+    let approx_bytes = 16
+        + identity_bytes.len()
+        + 8
+        + descriptor.resource_schema_url.len()
+        + descriptor.scope_name.len()
+        + descriptor.scope_version.len()
+        + descriptor.scope_schema_url.len()
+        + kv_bytes(&descriptor.resource_attrs)
+        + kv_bytes(&descriptor.scope_attrs)
+        + kv_bytes(&descriptor.attrs)
+        + descriptor
+            .metric
+            .as_ref()
+            .map_or(0, |m| m.name.len() + m.unit.len() + m.description.len() + 32)
+        + denorm.iter().map(denorm_bytes).sum::<usize>();
+    budget.charge_row(approx_bytes)?;
+    Ok(DescriptorRow { series_id, identity_bytes, descriptor, denorm, approx_bytes })
 }
 ```
 
@@ -2707,68 +3115,47 @@ The OTAP `Logs` batch (pdata `schema/payloads.rs`, `mod logs`) has columns `time
 
 //! Logs extraction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, Int32Type, TimestampNanosecondType, UInt16Type, UInt32Type};
-use arrow::record_batch::RecordBatch;
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::{DataType, Int32Type, UInt32Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use super::{Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, denorm_lookup, descriptor_row, producer_id, timestamp_pair};
-use crate::attrs::{AnyValueColumns, AttrTable};
+use super::{
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
+    denorm_bytes, denorm_lookup, descriptor_row, fixed_at, i64_at, map_col, opt_u16_at, plain,
+    producer_id, str_at, struct_child, timestamp_pair,
+};
+use crate::attrs::AnyValueColumns;
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
 use crate::value::{Value, body_string, value_bytes};
 
-/// Plain (dictionary-free) column of a batch, or `None` if absent.
-pub(crate) fn plain_col(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Option<ArrayRef>> {
-    match batch.column_by_name(name) {
-        None => Ok(None),
-        Some(c) if c.data_type() == to => Ok(Some(c.clone())),
-        Some(c) => Ok(Some(cast(c, to)?)),
-    }
+/// Memo key for a logs series.
+///
+/// `(resource_id, scope_id)` alone is not enough: the row-level scope and schema
+/// strings are part of the identity, and two rows can share a resource and scope
+/// id while carrying different scope names or schema URLs. `None` ids are part
+/// of the key too, so a record without attributes never collapses into parent 0.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemoKey {
+    resource_id: Option<u32>,
+    scope_id: Option<u32>,
+    resource_schema_url: String,
+    scope_name: String,
+    scope_version: String,
+    scope_schema_url: String,
+    identity_attrs: Vec<u8>,
 }
 
-/// Child of a struct column, cast to a plain type, or `None`.
-pub(crate) fn struct_child(batch: &RecordBatch, parent: &str, child: &str, to: &DataType) -> Result<Option<ArrayRef>> {
-    let Some(col) = batch.column_by_name(parent) else { return Ok(None) };
-    let s = col.as_struct();
-    match s.column_by_name(child) {
-        None => Ok(None),
-        Some(c) if c.data_type() == to => Ok(Some(c.clone())),
-        Some(c) => Ok(Some(cast(c, to)?)),
-    }
-}
-
-fn u16_at(a: &Option<ArrayRef>, row: usize) -> u32 {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| u32::from(a.as_primitive::<UInt16Type>().value(row)))).unwrap_or(0)
-}
-
-fn str_at(a: &Option<ArrayRef>, row: usize) -> String {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_string::<i32>().value(row).to_string())).unwrap_or_default()
-}
-
-fn i64_at(a: &Option<ArrayRef>, row: usize) -> i64 {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<TimestampNanosecondType>().value(row))).unwrap_or(0)
-}
-
-fn fixed_at(a: &Option<ArrayRef>, row: usize) -> Option<Vec<u8>> {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_fixed_size_binary().value(row).to_vec()))
-}
-
-/// Attribute table for a payload type, empty when the payload is absent.
-pub(crate) fn attr_table(records: &OtapArrowRecords, pt: ArrowPayloadType, max_depth: usize) -> Result<AttrTable> {
-    match records.get(pt) {
-        Some(b) => AttrTable::from_batch(b, max_depth),
-        None => Ok(AttrTable::default()),
-    }
-}
-
-pub(crate) fn extract_logs(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted> {
+pub(crate) fn extract_logs(
+    records: &OtapArrowRecords,
+    cfg: &LakeConfig,
+    budget: &mut Budget,
+) -> Result<Extracted> {
     let depth = cfg.ingress.max_nesting_depth;
     let mut stats = ExtractStats::default();
     let Some(logs) = records.get(ArrowPayloadType::Logs) else {
@@ -2779,21 +3166,21 @@ pub(crate) fn extract_logs(records: &OtapArrowRecords, cfg: &LakeConfig) -> Resu
     let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, depth)?;
 
     let ts_ns = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
-    let time = plain_col(logs, "time_unix_nano", &ts_ns)?;
-    let observed = plain_col(logs, "observed_time_unix_nano", &ts_ns)?;
-    let id = plain_col(logs, "id", &DataType::UInt16)?;
-    let severity_number = plain_col(logs, "severity_number", &DataType::Int32)?;
-    let severity_text = plain_col(logs, "severity_text", &DataType::Utf8)?;
-    let event_name = plain_col(logs, "event_name", &DataType::Utf8)?;
-    let flags = plain_col(logs, "flags", &DataType::UInt32)?;
-    let trace_id = plain_col(logs, "trace_id", &DataType::FixedSizeBinary(16))?;
-    let span_id = plain_col(logs, "span_id", &DataType::FixedSizeBinary(8))?;
+    let time = plain(logs, "time_unix_nano", &ts_ns)?;
+    let observed = plain(logs, "observed_time_unix_nano", &ts_ns)?;
+    let id = plain(logs, "id", &DataType::UInt16)?;
+    let severity_number = plain(logs, "severity_number", &DataType::Int32)?;
+    let severity_text = plain(logs, "severity_text", &DataType::Utf8)?;
+    let event_name = plain(logs, "event_name", &DataType::Utf8)?;
+    let flags = plain(logs, "flags", &DataType::UInt32)?;
+    let trace_id = plain(logs, "trace_id", &DataType::FixedSizeBinary(16))?;
+    let span_id = plain(logs, "span_id", &DataType::FixedSizeBinary(8))?;
     let res_id = struct_child(logs, "resource", "id", &DataType::UInt16)?;
     let res_schema = struct_child(logs, "resource", "schema_url", &DataType::Utf8)?;
     let scope_id = struct_child(logs, "scope", "id", &DataType::UInt16)?;
     let scope_name = struct_child(logs, "scope", "name", &DataType::Utf8)?;
     let scope_version = struct_child(logs, "scope", "version", &DataType::Utf8)?;
-    let scope_schema = plain_col(logs, "schema_url", &DataType::Utf8)?;
+    let scope_schema = plain(logs, "schema_url", &DataType::Utf8)?;
     let body = match logs.column_by_name("body") {
         Some(c) => {
             let s = c.as_struct().clone();
@@ -2806,16 +3193,16 @@ pub(crate) fn extract_logs(records: &OtapArrowRecords, cfg: &LakeConfig) -> Resu
     let values_denorm = denorm_columns(Dataset::LogsValues, cfg);
     let mut sink = RowSink::new(Dataset::LogsValues, cfg)?;
     let mut descriptors: Vec<DescriptorRow> = Vec::new();
-    let mut seen: HashMap<SeriesId, usize> = HashMap::new();
-    let mut memo: HashMap<(u32, u32, Vec<u8>), SeriesId> = HashMap::new();
+    let mut seen: HashSet<SeriesId> = HashSet::new();
+    let mut memo: HashMap<MemoKey, SeriesId> = HashMap::new();
 
     for row in 0..logs.num_rows() {
-        let rid = u16_at(&res_id, row);
-        let sid = u16_at(&scope_id, row);
-        let lid = u16_at(&id, row);
-        let resource = resource_attrs.get(rid);
-        let scope = scope_attrs.get(sid);
-        let all_attrs = log_attrs.get(lid);
+        let rid = opt_u16_at(&res_id, row);
+        let sid = opt_u16_at(&scope_id, row);
+        let lid = opt_u16_at(&id, row);
+        let resource = attrs_of(&resource_attrs, rid);
+        let scope = attrs_of(&scope_attrs, sid);
+        let all_attrs = attrs_of(&log_attrs, lid);
         let (identity_attrs, residual): (Vec<(String, Value)>, Vec<(String, Value)>) =
             all_attrs.iter().cloned().partition(|(k, _)| allow.iter().any(|a| a == k));
         let identity_key = crate::canonical::canonical_bytes(&Descriptor {
@@ -2829,27 +3216,35 @@ pub(crate) fn extract_logs(records: &OtapArrowRecords, cfg: &LakeConfig) -> Resu
             metric: None,
             attrs: identity_attrs.clone(),
         });
-        let series_id = match memo.get(&(rid, sid, identity_key.clone())) {
+        let key = MemoKey {
+            resource_id: rid,
+            scope_id: sid,
+            resource_schema_url: str_at(&res_schema, row),
+            scope_name: str_at(&scope_name, row),
+            scope_version: str_at(&scope_version, row),
+            scope_schema_url: str_at(&scope_schema, row),
+            identity_attrs: identity_key,
+        };
+        let series_id = match memo.get(&key) {
             Some(id) => *id,
             None => {
                 let descriptor = Descriptor {
                     signal: Signal::Logs,
                     resource_attrs: resource.to_vec(),
-                    resource_schema_url: str_at(&res_schema, row),
-                    scope_name: str_at(&scope_name, row),
-                    scope_version: str_at(&scope_version, row),
-                    scope_schema_url: str_at(&scope_schema, row),
+                    resource_schema_url: key.resource_schema_url.clone(),
+                    scope_name: key.scope_name.clone(),
+                    scope_version: key.scope_version.clone(),
+                    scope_schema_url: key.scope_schema_url.clone(),
                     scope_attrs: scope.to_vec(),
                     metric: None,
                     attrs: identity_attrs.clone(),
                 };
-                let dr = descriptor_row(descriptor, Dataset::LogsSeries, cfg, &mut stats);
+                let dr = descriptor_row(descriptor, Dataset::LogsSeries, cfg, &mut stats, budget)?;
                 let id = dr.series_id;
-                if !seen.contains_key(&id) {
-                    let _ = seen.insert(id, descriptors.len());
+                if seen.insert(id) {
                     descriptors.push(dr);
                 }
-                let _ = memo.insert((rid, sid, identity_key), id);
+                let _ = memo.insert(key, id);
                 id
             }
         };
@@ -2861,31 +3256,41 @@ pub(crate) fn extract_logs(records: &OtapArrowRecords, cfg: &LakeConfig) -> Resu
             None => Value::Null,
         };
         let body_str = body_string(&body_value);
-        let mut approx = 64 + body_str.as_ref().map_or(0, String::len);
-        approx += residual.iter().map(|(k, v)| k.len() + value_bytes(v)).sum::<usize>();
+        let severity_text_str = str_at(&severity_text, row);
+        let event_name_str = str_at(&event_name, row);
+        let producer = producer_id(resource, &cfg.producer_id_attribute);
+        // Charge everything the row actually retains: fixed cells, the body, the
+        // residual attribute map, the denormalized strings and the projected
+        // producer id.
+        let mut approx = 16 + 8 * 6 + 24 + 8;
+        approx += body_str.as_ref().map_or(0, String::len);
+        approx += severity_text_str.len() + event_name_str.len() + producer.len();
+        approx += residual.iter().map(|(k, v)| k.len() + 24 + value_bytes(v)).sum::<usize>();
         let mut cols = vec![
             Col::Fixed(Some(series_id.to_vec())),
-            Col::Str(Some(producer_id(resource, &cfg.producer_id_attribute))),
+            Col::Str(Some(producer)),
             Col::TsUs(t_us),
             Col::Int(t_ns),
             Col::TsUs(o_us),
             Col::Int(o_ns),
             Col::Int32(Some(severity_number.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<Int32Type>().value(row))).unwrap_or(0))),
-            Col::Str(Some(str_at(&severity_text, row))),
+            Col::Str(Some(severity_text_str)),
             Col::Str(body_str),
-            Col::Str(Some(str_at(&event_name, row))),
+            Col::Str(Some(event_name_str)),
             Col::Fixed(fixed_at(&trace_id, row)),
             Col::Fixed(fixed_at(&span_id, row)),
             Col::Int32(Some(flags.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<UInt32Type>().value(row))).unwrap_or(0) as i32)),
-            Col::Map(residual.iter().map(|(k, v)| (k.clone(), crate::value::map_string(v))).collect()),
+            map_col(&residual),
         ];
         for d in &values_denorm {
-            cols.push(Col::from(denorm_lookup(d, resource, scope, all_attrs, &mut stats)));
+            let v = denorm_lookup(d, resource, scope, all_attrs, &mut stats);
+            approx += denorm_bytes(&v);
+            cols.push(Col::from(v));
         }
-        sink.push(&ValuesRow { cols, approx_bytes: approx })?;
+        sink.push(&ValuesRow { cols, approx_bytes: approx }, budget)?;
         stats.rows += 1;
     }
-    let (batches, pinned_bytes) = sink.finish()?;
+    let (batches, pinned_bytes) = sink.finish(budget)?;
     let values = if batches.is_empty() { vec![] } else { vec![(Dataset::LogsValues, batches)] };
     if descriptors.is_empty() && !values.is_empty() {
         return Err(Error::invalid("values without descriptors"));
@@ -2906,11 +3311,15 @@ Create `src/extract/metrics.rs` with a stub for now so the crate compiles:
 
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 
-use super::Extracted;
+use super::{Budget, Extracted};
 use crate::config::LakeConfig;
 use crate::error::{Error, RefuseReason, Result};
 
-pub(crate) fn extract_metrics(_records: &OtapArrowRecords, _cfg: &LakeConfig) -> Result<Extracted> {
+pub(crate) fn extract_metrics(
+    _records: &OtapArrowRecords,
+    _cfg: &LakeConfig,
+    _budget: &mut Budget,
+) -> Result<Extracted> {
     Err(Error::Refused(RefuseReason::Unsupported("metrics: not implemented".into())))
 }
 ```
@@ -2920,7 +3329,7 @@ Add `pub mod extract;` to `src/lib.rs`.
 - [ ] **Step 6: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake extract::logs::tests`
-Expected: 3 passed. If `encode_logs` places `logger.name` rows out of `parent_id` order, `AttrTable` handles it (hash map grouping). If the `body` struct's children are dictionary-encoded, `AnyValueColumns::new` casts them.
+Expected: 6 passed. If `encode_logs` places `logger.name` rows out of `parent_id` order, `AttrTable` handles it (hash map grouping). If the `body` struct's children are dictionary-encoded, `AnyValueColumns::new` casts them.
 
 - [ ] **Step 7: Commit**
 
@@ -2939,10 +3348,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `rust/otap-dataflow/crates/series-lake/src/extract/metrics.rs` (replace the stub)
 
 **Interfaces:**
-- Consumes: everything from task 6 (`RowSink`, `Col`, `ValuesRow`, `descriptor_row`, `timestamp_pair`, `denorm_lookup`, `producer_id`, `attr_table`, `plain_col`, `struct_child`), `canonical::{MetricDescriptor, MetricKind, Temporality}`.
-- Produces: `pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted>` returning `values` with `Dataset::MetricsNumber` and/or `Dataset::MetricsHistogram`.
+- Consumes: everything from task 6 (`Budget`, `RowSink`, `Col`, `ValuesRow`, `descriptor_row`, `timestamp_pair`, `denorm_lookup`, `denorm_bytes`, `producer_id`, `attr_table`, `attrs_of`, `opt_u16_at`, `str_at`, `i64_at`, `plain`, `struct_child`), `canonical::{MetricDescriptor, MetricKind, Temporality}`.
+- Produces: `pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig, budget: &mut Budget) -> Result<Extracted>` returning `values` with `Dataset::MetricsNumber` and/or `Dataset::MetricsHistogram`.
 
-OTAP layout (pdata `schema/payloads.rs`): `UnivariateMetrics` columns `id` UInt16, `metric_type` UInt8 (1 gauge, 2 sum, 3 histogram, 4 exp histogram, 5 summary), `name`, `aggregation_temporality` (Dictionary<UInt8, Int32>: 0 unspecified, 1 delta, 2 cumulative), `description`, `is_monotonic` Boolean, `unit`, `schema_url`, `resource` struct, `scope` struct. `NumberDataPoints`: `parent_id` UInt16 (metric id), `start_time_unix_nano`, `time_unix_nano`, `int_value` Int64, `double_value` Float64, `id` UInt32, `flags` UInt32; attributes in `NumberDpAttrs` keyed by the point `id`. `HistogramDataPoints`: `parent_id`, `id`, `count` UInt64, `sum`, `min`, `max`, `bucket_counts` List<UInt64>, `explicit_bounds` List<Float64>, `start_time_unix_nano`, `time_unix_nano`, `flags`; attributes in `HistogramDpAttrs`. `ExpHistogramDataPoints` and `SummaryDataPoints` are unsupported in v1. Exemplar payloads are simply not read.
+OTAP layout (pdata `schema/payloads.rs`): `UnivariateMetrics` columns `id` UInt16, `metric_type` UInt8 (1 gauge, 2 sum, 3 histogram, 4 exp histogram, 5 summary), `name`, `aggregation_temporality` (Dictionary<UInt8, Int32>: 0 unspecified, 1 delta, 2 cumulative), `description`, `is_monotonic` Boolean, `unit`, `schema_url`, `resource` struct, `scope` struct. `NumberDataPoints`: `parent_id` UInt16 (metric id), `start_time_unix_nano`, `time_unix_nano`, `int_value` Int64, `double_value` Float64, `id` UInt32, `flags` UInt32; attributes in `NumberDpAttrs` keyed by the point `id`. `HistogramDataPoints`: `parent_id`, `id`, `count` UInt64, `sum`, `min`, `max`, `bucket_counts` List<UInt64>, `explicit_bounds` List<Float64>, `start_time_unix_nano`, `time_unix_nano`, `flags`; attributes in `HistogramDpAttrs`. `ExpHistogramDataPoints` and `SummaryDataPoints` are unsupported in v1. Exemplar payloads (`NumberDpExemplars`, `HistogramDpExemplars`, `ExpHistogramDpExemplars`) are not stored; their row counts go into `stats.dropped_exemplars` (spec 5.1 `dropped_unsupported{kind=exemplar}`) and their attribute payloads are neither read nor validated -- a documented v1 limitation recorded in `FORMAT.md` (task 14).
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `metrics.rs`)
 
@@ -2958,8 +3367,8 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
         AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
-        HistogramDataPoint, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric,
-        number_data_point,
+        HistogramDataPoint, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        Summary, SummaryDataPoint, metric, number_data_point,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::testing::round_trip::encode_metrics;
@@ -3019,7 +3428,9 @@ mod tests {
     /// INT64_MAX intact, histogram lists are stored as signed integers.
     #[test]
     fn extracts_number_and_histogram() {
-        let out = extract_metrics(&encode_metrics(&gauge_and_hist()), &LakeConfig::default()).expect("extract");
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&encode_metrics(&gauge_and_hist()), &cfg, &mut budget).expect("extract");
         assert_eq!(out.descriptors.len(), 3);
         let number = out.values.iter().find(|(d, _)| *d == Dataset::MetricsNumber).expect("number").1[0].clone();
         assert_eq!(number.num_rows(), 3);
@@ -3055,7 +3466,9 @@ mod tests {
             })),
             ..Default::default()
         }]);
-        assert!(matches!(extract_metrics(&encode_metrics(&md), &LakeConfig::default()), Err(Error::Refused(RefuseReason::Invalid(_)))));
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        assert!(matches!(extract_metrics(&encode_metrics(&md), &cfg, &mut budget), Err(Error::Refused(RefuseReason::Invalid(_)))));
     }
 
     /// Scenario: an exponential histogram under reject and under drop.
@@ -3071,13 +3484,51 @@ mod tests {
             ..Default::default()
         }]);
         let records = encode_metrics(&md);
-        assert!(matches!(extract_metrics(&records, &LakeConfig::default()), Err(Error::Refused(RefuseReason::Unsupported(_)))));
+        let reject = LakeConfig::default();
+        let mut budget = Budget::new(&reject);
+        assert!(matches!(extract_metrics(&records, &reject, &mut budget), Err(Error::Refused(RefuseReason::Unsupported(_)))));
         let mut cfg = LakeConfig::default();
         cfg.unsupported = UnsupportedPolicy::Drop;
-        let out = extract_metrics(&records, &cfg).expect("drop");
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("drop");
         assert_eq!(out.stats.rows, 0);
         assert_eq!(out.stats.dropped_unsupported, 1);
         assert!(out.values.is_empty());
+    }
+
+    /// Scenario: a gauge and a summary in the same request under the drop policy.
+    /// Guarantees: the summary never reaches temporality validation (pdata supplies
+    /// no temporality for summaries), the request succeeds, the gauge rows survive
+    /// and the summary points are counted as dropped.
+    #[test]
+    fn summary_is_dropped_without_failing_temporality_validation() {
+        let md = data(vec![
+            Metric {
+                name: "cpu".into(),
+                unit: "1".into(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![dp(10, number_data_point::Value::AsDouble(0.5), vec![kv("cpu", "0")])],
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "q".into(),
+                data: Some(metric::Data::Summary(Summary {
+                    data_points: vec![SummaryDataPoint { time_unix_nano: 20, count: 2, sum: 4.0, ..Default::default() }],
+                })),
+                ..Default::default()
+            },
+        ]);
+        let records = encode_metrics(&md);
+        let mut cfg = LakeConfig::default();
+        cfg.unsupported = UnsupportedPolicy::Drop;
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("drop");
+        assert_eq!(out.stats.rows, 1);
+        assert_eq!(out.stats.dropped_unsupported, 1);
+        assert_eq!(out.descriptors.len(), 1);
+        let number = out.values.iter().find(|(d, _)| *d == Dataset::MetricsNumber).expect("number");
+        assert_eq!(number.1[0].num_rows(), 1);
     }
 
     /// Scenario: a histogram whose bucket_counts length is not bounds + 1.
@@ -3092,7 +3543,9 @@ mod tests {
             })),
             ..Default::default()
         }]);
-        assert!(matches!(extract_metrics(&encode_metrics(&md), &LakeConfig::default()), Err(Error::Refused(RefuseReason::Invalid(_)))));
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        assert!(matches!(extract_metrics(&encode_metrics(&md), &cfg, &mut budget), Err(Error::Refused(RefuseReason::Invalid(_)))));
     }
 }
 ```
@@ -3100,7 +3553,7 @@ mod tests {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake extract::metrics::tests`
-Expected: 4 failed (stub returns Unsupported).
+Expected: 5 failed (stub returns Unsupported).
 
 - [ ] **Step 3: Implement `extract_metrics`**
 
@@ -3110,16 +3563,18 @@ Expected: 4 failed (stub returns Unsupported).
 
 //! Metrics extraction: number and histogram points (spec section 5.1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, Float64Type, Int32Type, Int64Type, TimeUnit, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::{DataType, Float64Type, Int32Type, Int64Type, TimeUnit, UInt8Type, UInt32Type, UInt64Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use super::logs::{attr_table, plain_col, struct_child};
-use super::{Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, denorm_lookup, descriptor_row, producer_id, timestamp_pair};
+use super::{
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
+    denorm_bytes, denorm_lookup, descriptor_row, i64_at, opt_u16_at, plain, producer_id, str_at,
+    struct_child, timestamp_pair,
+};
 use crate::attrs::AttrTable;
 use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
 use crate::config::{LakeConfig, UnsupportedPolicy};
@@ -3128,40 +3583,43 @@ use crate::schema::{Dataset, denorm_columns};
 use crate::value::Value;
 
 /// Per-metric fields read once from the `UnivariateMetrics` batch.
+///
+/// Only the finished `descriptor_base` is kept: the resource and scope ids were
+/// already resolved into attribute lists here, so nothing downstream reads them.
 struct MetricRow {
-    resource_id: u32,
-    scope_id: u32,
     descriptor_base: Descriptor,
 }
 
-fn opt_str(a: &Option<ArrayRef>, row: usize) -> String {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_string::<i32>().value(row).to_string())).unwrap_or_default()
-}
-
-fn opt_u16(a: &Option<ArrayRef>, row: usize) -> u32 {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| u32::from(a.as_primitive::<UInt16Type>().value(row)))).unwrap_or(0)
-}
-
-fn ts(a: &Option<ArrayRef>, row: usize) -> i64 {
-    a.as_ref()
-        .and_then(|a| a.is_valid(row).then(|| a.as_primitive::<arrow::datatypes::TimestampNanosecondType>().value(row)))
-        .unwrap_or(0)
+/// Memo key for a metrics series: the metric and the point's attribute parent.
+///
+/// Both ids are optional, because pdata writes a null id for a point that has
+/// no attributes; `None` must stay distinct from attribute parent 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MemoKey {
+    metric_id: u32,
+    attrs_id: Option<u32>,
 }
 
 fn flags(a: &Option<ArrayRef>, row: usize) -> i32 {
+    // stored as received; readers treat it as a bit set
     a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<UInt32Type>().value(row))).unwrap_or(0) as i32
 }
 
-fn metric_rows(records: &OtapArrowRecords, resource_attrs: &AttrTable, scope_attrs: &AttrTable) -> Result<HashMap<u32, MetricRow>> {
+fn metric_rows(
+    records: &OtapArrowRecords,
+    resource_attrs: &AttrTable,
+    scope_attrs: &AttrTable,
+    cfg: &LakeConfig,
+) -> Result<HashMap<u32, MetricRow>> {
     let Some(m) = records.get(ArrowPayloadType::UnivariateMetrics) else { return Ok(HashMap::new()) };
-    let id = plain_col(m, "id", &DataType::UInt16)?;
-    let kind = plain_col(m, "metric_type", &DataType::UInt8)?;
-    let name = plain_col(m, "name", &DataType::Utf8)?;
-    let temporality = plain_col(m, "aggregation_temporality", &DataType::Int32)?;
-    let description = plain_col(m, "description", &DataType::Utf8)?;
-    let is_monotonic = plain_col(m, "is_monotonic", &DataType::Boolean)?;
-    let unit = plain_col(m, "unit", &DataType::Utf8)?;
-    let scope_schema = plain_col(m, "schema_url", &DataType::Utf8)?;
+    let id = plain(m, "id", &DataType::UInt16)?;
+    let kind = plain(m, "metric_type", &DataType::UInt8)?;
+    let name = plain(m, "name", &DataType::Utf8)?;
+    let temporality = plain(m, "aggregation_temporality", &DataType::Int32)?;
+    let description = plain(m, "description", &DataType::Utf8)?;
+    let is_monotonic = plain(m, "is_monotonic", &DataType::Boolean)?;
+    let unit = plain(m, "unit", &DataType::Utf8)?;
+    let scope_schema = plain(m, "schema_url", &DataType::Utf8)?;
     let res_id = struct_child(m, "resource", "id", &DataType::UInt16)?;
     let res_schema = struct_child(m, "resource", "schema_url", &DataType::Utf8)?;
     let scope_id = struct_child(m, "scope", "id", &DataType::UInt16)?;
@@ -3183,30 +3641,48 @@ fn metric_rows(records: &OtapArrowRecords, resource_attrs: &AttrTable, scope_att
             Some(2) => Temporality::Cumulative,
             _ => Temporality::Unspecified,
         };
-        if kind != MetricKind::Gauge && temporality == Temporality::Unspecified {
-            return Err(Error::invalid("sum or histogram with unspecified temporality"));
+        // Order matters: an unsupported kind is settled by the policy first, and
+        // its temporality is never validated. pdata only supplies temporality for
+        // sums and histograms, so a summary would otherwise be refused as invalid
+        // even under the drop policy.
+        match kind {
+            MetricKind::ExpHistogram | MetricKind::Summary => {
+                if cfg.unsupported == UnsupportedPolicy::Reject {
+                    return Err(Error::Refused(RefuseReason::Unsupported(kind.as_str().to_string())));
+                }
+                // Dropped: the point rows are counted from the unsupported
+                // payloads, and no values row can reference this metric.
+                continue;
+            }
+            MetricKind::Sum | MetricKind::Histogram => {
+                if temporality == Temporality::Unspecified {
+                    return Err(Error::invalid("sum or histogram with unspecified temporality"));
+                }
+            }
+            MetricKind::Gauge => {}
         }
-        let rid = opt_u16(&res_id, row);
-        let sid = opt_u16(&scope_id, row);
+        let rid = opt_u16_at(&res_id, row);
+        let sid = opt_u16_at(&scope_id, row);
         let descriptor_base = Descriptor {
             signal: Signal::Metrics,
-            resource_attrs: resource_attrs.get(rid).to_vec(),
-            resource_schema_url: opt_str(&res_schema, row),
-            scope_name: opt_str(&scope_name, row),
-            scope_version: opt_str(&scope_version, row),
-            scope_schema_url: opt_str(&scope_schema, row),
-            scope_attrs: scope_attrs.get(sid).to_vec(),
+            resource_attrs: attrs_of(resource_attrs, rid).to_vec(),
+            resource_schema_url: str_at(&res_schema, row),
+            scope_name: str_at(&scope_name, row),
+            scope_version: str_at(&scope_version, row),
+            scope_schema_url: str_at(&scope_schema, row),
+            scope_attrs: attrs_of(scope_attrs, sid).to_vec(),
             metric: Some(MetricDescriptor {
-                name: opt_str(&name, row),
-                unit: opt_str(&unit, row),
+                name: str_at(&name, row),
+                unit: str_at(&unit, row),
                 kind,
                 temporality: if kind == MetricKind::Gauge { Temporality::Unspecified } else { temporality },
                 is_monotonic: kind == MetricKind::Sum && is_monotonic.as_ref().is_some_and(|a| a.is_valid(row) && a.as_boolean().value(row)),
-                description: opt_str(&description, row),
+                description: str_at(&description, row),
             }),
             attrs: vec![],
         };
-        let _ = out.insert(opt_u16(&id, row), MetricRow { resource_id: rid, scope_id: sid, descriptor_base });
+        let metric_id = opt_u16_at(&id, row).ok_or_else(|| Error::invalid("metric row without id"))?;
+        let _ = out.insert(metric_id, MetricRow { descriptor_base });
     }
     Ok(out)
 }
@@ -3215,28 +3691,47 @@ struct Common<'a> {
     cfg: &'a LakeConfig,
     metrics: &'a HashMap<u32, MetricRow>,
     descriptors: Vec<DescriptorRow>,
-    seen: HashMap<SeriesId, usize>,
+    seen: HashSet<SeriesId>,
+    memo: HashMap<MemoKey, SeriesId>,
     stats: ExtractStats,
 }
 
+/// The metric a data point belongs to.
+///
+/// A free function rather than a method on `Common`, so that holding the
+/// borrowed `MetricRow` does not block `&mut c.stats` while building the row.
+fn metric_of(metrics: &HashMap<u32, MetricRow>, metric_id: u32) -> Result<&MetricRow> {
+    metrics
+        .get(&metric_id)
+        .ok_or_else(|| Error::invalid("data point references unknown metric"))
+}
+
 impl Common<'_> {
-    /// Descriptor for (metric, point attrs); returns the series id and the resolved descriptor index.
-    fn series_for(&mut self, metric_id: u32, attrs: &[(String, Value)]) -> Result<(SeriesId, usize)> {
-        let m = self.metrics.get(&metric_id).ok_or_else(|| Error::invalid("data point references unknown metric"))?;
-        let mut d = m.descriptor_base.clone();
+    /// Series id for (metric, point attrs), memoized before any hashing.
+    ///
+    /// Without the memo, `canonical_bytes` plus XXH3 plus the denormalized
+    /// lookups would run once per data point instead of once per series, and
+    /// `stats.denorm_type_mismatch` would count points rather than series.
+    fn series_for(
+        &mut self,
+        metric_id: u32,
+        attrs_id: Option<u32>,
+        attrs: &[(String, Value)],
+        budget: &mut Budget,
+    ) -> Result<SeriesId> {
+        let key = MemoKey { metric_id, attrs_id };
+        if let Some(id) = self.memo.get(&key) {
+            return Ok(*id);
+        }
+        let mut d = metric_of(self.metrics, metric_id)?.descriptor_base.clone();
         d.attrs = attrs.to_vec();
-        let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats);
+        let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats, budget)?;
         let id = dr.series_id;
-        let idx = match self.seen.get(&id) {
-            Some(i) => *i,
-            None => {
-                let i = self.descriptors.len();
-                let _ = self.seen.insert(id, i);
-                self.descriptors.push(dr);
-                i
-            }
-        };
-        Ok((id, idx))
+        if self.seen.insert(id) {
+            self.descriptors.push(dr);
+        }
+        let _ = self.memo.insert(key, id);
+        Ok(id)
     }
 }
 
@@ -3248,39 +3743,76 @@ fn opt_f64(a: &Option<ArrayRef>, row: usize) -> Option<f64> {
     a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<Float64Type>().value(row)))
 }
 
-fn opt_u32(a: &Option<ArrayRef>, row: usize) -> u32 {
-    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<UInt32Type>().value(row))).unwrap_or(0)
+fn opt_u32_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
+    a.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<UInt32Type>().value(row)))
 }
 
-fn common_cols(id: SeriesId, m: &MetricRow, cfg: &LakeConfig, t_ns: i64, s_ns: i64, fl: i32, stats: &mut ExtractStats) -> Vec<Col> {
+/// The eight leading columns shared by both values datasets, plus their bytes.
+fn common_cols(
+    id: SeriesId,
+    m: &MetricRow,
+    cfg: &LakeConfig,
+    t_ns: i64,
+    s_ns: i64,
+    fl: i32,
+    stats: &mut ExtractStats,
+) -> (Vec<Col>, usize) {
     let (t_ns, t_us) = timestamp_pair(t_ns, stats);
     let (s_ns, s_us) = timestamp_pair(s_ns, stats);
-    vec![
+    let producer = producer_id(&m.descriptor_base.resource_attrs, &cfg.producer_id_attribute);
+    let name = m.descriptor_base.metric.as_ref().map(|x| x.name.clone()).unwrap_or_default();
+    let bytes = 16 + producer.len() + name.len() + 8 * 5 + 48;
+    let cols = vec![
         Col::Fixed(Some(id.to_vec())),
-        Col::Str(Some(producer_id(&m.descriptor_base.resource_attrs, &cfg.producer_id_attribute))),
-        Col::Str(Some(m.descriptor_base.metric.as_ref().map(|x| x.name.clone()).unwrap_or_default())),
+        Col::Str(Some(producer)),
+        Col::Str(Some(name)),
         Col::TsUs(t_us),
         Col::Int(t_ns),
         Col::TsUs(s_us),
         Col::Int(s_ns),
         Col::Int32(Some(fl)),
-    ]
+    ];
+    (cols, bytes)
 }
 
-fn push_denorm(cols: &mut Vec<Col>, ds: Dataset, m: &MetricRow, attrs: &[(String, Value)], cfg: &LakeConfig, stats: &mut ExtractStats) {
+/// Append the denormalized cells of `ds` and return the bytes they add.
+fn push_denorm(
+    cols: &mut Vec<Col>,
+    ds: Dataset,
+    m: &MetricRow,
+    attrs: &[(String, Value)],
+    cfg: &LakeConfig,
+    stats: &mut ExtractStats,
+) -> usize {
+    let mut bytes = 0;
     for d in denorm_columns(ds, cfg) {
-        cols.push(Col::from(denorm_lookup(d, &m.descriptor_base.resource_attrs, &m.descriptor_base.scope_attrs, attrs, stats)));
+        let v = denorm_lookup(d, &m.descriptor_base.resource_attrs, &m.descriptor_base.scope_attrs, attrs, stats);
+        bytes += denorm_bytes(&v);
+        cols.push(Col::from(v));
     }
+    bytes
 }
 
-pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<Extracted> {
+pub(crate) fn extract_metrics(
+    records: &OtapArrowRecords,
+    cfg: &LakeConfig,
+    budget: &mut Budget,
+) -> Result<Extracted> {
     let depth = cfg.ingress.max_nesting_depth;
     let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, depth)?;
     let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, depth)?;
-    let metrics = metric_rows(records, &resource_attrs, &scope_attrs)?;
-    let mut c = Common { cfg, metrics: &metrics, descriptors: Vec::new(), seen: HashMap::new(), stats: ExtractStats::default() };
+    let metrics = metric_rows(records, &resource_attrs, &scope_attrs, cfg)?;
+    let mut c = Common {
+        cfg,
+        metrics: &metrics,
+        descriptors: Vec::new(),
+        seen: HashSet::new(),
+        memo: HashMap::new(),
+        stats: ExtractStats::default(),
+    };
 
-    // Unsupported point kinds.
+    // Unsupported point kinds. `metric_rows` has already refused the request
+    // under the reject policy, so reaching a non-empty payload here means drop.
     for pt in [ArrowPayloadType::ExpHistogramDataPoints, ArrowPayloadType::SummaryDataPoints] {
         if let Some(b) = records.get(pt) {
             if b.num_rows() > 0 {
@@ -3294,6 +3826,14 @@ pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> R
         }
     }
 
+    // Exemplars are not part of the v1 format (spec 5.1). Count the rows we
+    // drop; their own attribute payloads are ignored and not validated.
+    for pt in [ArrowPayloadType::NumberDpExemplars, ArrowPayloadType::HistogramDpExemplars, ArrowPayloadType::ExpHistogramDpExemplars] {
+        if let Some(b) = records.get(pt) {
+            c.stats.dropped_exemplars += b.num_rows() as u64;
+        }
+    }
+
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let mut values = Vec::new();
     let mut pinned_bytes = 0;
@@ -3301,27 +3841,34 @@ pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> R
     // Number points.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, depth)?;
-        let parent = plain_col(b, "parent_id", &DataType::UInt16)?;
-        let pid = plain_col(b, "id", &DataType::UInt32)?;
-        let start = plain_col(b, "start_time_unix_nano", &ts_ns)?;
-        let time = plain_col(b, "time_unix_nano", &ts_ns)?;
-        let iv = plain_col(b, "int_value", &DataType::Int64)?;
-        let dv = plain_col(b, "double_value", &DataType::Float64)?;
-        let fl = plain_col(b, "flags", &DataType::UInt32)?;
+        let parent = plain(b, "parent_id", &DataType::UInt16)?;
+        let pid = plain(b, "id", &DataType::UInt32)?;
+        let start = plain(b, "start_time_unix_nano", &ts_ns)?;
+        let time = plain(b, "time_unix_nano", &ts_ns)?;
+        let iv = plain(b, "int_value", &DataType::Int64)?;
+        let dv = plain(b, "double_value", &DataType::Float64)?;
+        let fl = plain(b, "flags", &DataType::UInt32)?;
         let mut sink = RowSink::new(Dataset::MetricsNumber, cfg)?;
         for row in 0..b.num_rows() {
-            let metric_id = opt_u16(&parent, row);
-            let point_attrs = attrs.get(opt_u32(&pid, row));
-            let (id, _) = c.series_for(metric_id, point_attrs)?;
-            let m = &metrics[&metric_id];
-            let mut cols = common_cols(id, m, cfg, ts(&time, row), ts(&start, row), flags(&fl, row), &mut c.stats);
+            let metric_id = opt_u16_at(&parent, row)
+                .ok_or_else(|| Error::invalid("number point without parent metric id"))?;
+            let attrs_id = opt_u32_at(&pid, row);
+            let point_attrs = match attrs_id {
+                Some(id) => attrs.get(id),
+                None => &[],
+            };
+            let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
+            let m = metric_of(&metrics, metric_id)?;
+            let (mut cols, mut approx) =
+                common_cols(id, m, cfg, i64_at(&time, row), i64_at(&start, row), flags(&fl, row), &mut c.stats);
             cols.push(Col::Int(opt_i64(&iv, row)));
             cols.push(Col::Double(opt_f64(&dv, row)));
-            push_denorm(&mut cols, Dataset::MetricsNumber, m, point_attrs, cfg, &mut c.stats);
-            sink.push(&ValuesRow { cols, approx_bytes: 96 })?;
+            approx += 16;
+            approx += push_denorm(&mut cols, Dataset::MetricsNumber, m, point_attrs, cfg, &mut c.stats);
+            sink.push(&ValuesRow { cols, approx_bytes: approx }, budget)?;
             c.stats.rows += 1;
         }
-        let (batches, pinned) = sink.finish()?;
+        let (batches, pinned) = sink.finish(budget)?;
         pinned_bytes += pinned;
         if !batches.is_empty() {
             values.push((Dataset::MetricsNumber, batches));
@@ -3331,23 +3878,28 @@ pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> R
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, depth)?;
-        let parent = plain_col(b, "parent_id", &DataType::UInt16)?;
-        let pid = plain_col(b, "id", &DataType::UInt32)?;
-        let start = plain_col(b, "start_time_unix_nano", &ts_ns)?;
-        let time = plain_col(b, "time_unix_nano", &ts_ns)?;
-        let count = plain_col(b, "count", &DataType::UInt64)?;
-        let sum = plain_col(b, "sum", &DataType::Float64)?;
-        let min = plain_col(b, "min", &DataType::Float64)?;
-        let max = plain_col(b, "max", &DataType::Float64)?;
-        let fl = plain_col(b, "flags", &DataType::UInt32)?;
+        let parent = plain(b, "parent_id", &DataType::UInt16)?;
+        let pid = plain(b, "id", &DataType::UInt32)?;
+        let start = plain(b, "start_time_unix_nano", &ts_ns)?;
+        let time = plain(b, "time_unix_nano", &ts_ns)?;
+        let count = plain(b, "count", &DataType::UInt64)?;
+        let sum = plain(b, "sum", &DataType::Float64)?;
+        let min = plain(b, "min", &DataType::Float64)?;
+        let max = plain(b, "max", &DataType::Float64)?;
+        let fl = plain(b, "flags", &DataType::UInt32)?;
         let bc = b.column_by_name("bucket_counts");
         let eb = b.column_by_name("explicit_bounds");
         let mut sink = RowSink::new(Dataset::MetricsHistogram, cfg)?;
         for row in 0..b.num_rows() {
-            let metric_id = opt_u16(&parent, row);
-            let point_attrs = attrs.get(opt_u32(&pid, row));
-            let (id, _) = c.series_for(metric_id, point_attrs)?;
-            let m = &metrics[&metric_id];
+            let metric_id = opt_u16_at(&parent, row)
+                .ok_or_else(|| Error::invalid("histogram point without parent metric id"))?;
+            let attrs_id = opt_u32_at(&pid, row);
+            let point_attrs = match attrs_id {
+                Some(id) => attrs.get(id),
+                None => &[],
+            };
+            let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
+            let m = metric_of(&metrics, metric_id)?;
             let counts: Vec<i64> = match bc {
                 Some(a) if a.is_valid(row) => {
                     let list = a.as_list::<i32>().value(row);
@@ -3375,19 +3927,20 @@ pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> R
             }
             let cnt = count.as_ref().and_then(|a| a.is_valid(row).then(|| a.as_primitive::<UInt64Type>().value(row))).unwrap_or(0);
             let cnt = i64::try_from(cnt).map_err(|_| Error::invalid("histogram count above i64::MAX"))?;
-            let mut cols = common_cols(id, m, cfg, ts(&time, row), ts(&start, row), flags(&fl, row), &mut c.stats);
+            let (mut cols, mut approx) =
+                common_cols(id, m, cfg, i64_at(&time, row), i64_at(&start, row), flags(&fl, row), &mut c.stats);
             cols.push(Col::Int(Some(cnt)));
             cols.push(Col::Double(opt_f64(&sum, row)));
             cols.push(Col::Double(opt_f64(&min, row)));
             cols.push(Col::Double(opt_f64(&max, row)));
-            let approx = 128 + counts.len() * 8 + bounds.len() * 8;
+            approx += 32 + counts.len() * 8 + bounds.len() * 8 + 48;
             cols.push(Col::ListI64(counts));
             cols.push(Col::ListF64(bounds));
-            push_denorm(&mut cols, Dataset::MetricsHistogram, m, point_attrs, cfg, &mut c.stats);
-            sink.push(&ValuesRow { cols, approx_bytes: approx })?;
+            approx += push_denorm(&mut cols, Dataset::MetricsHistogram, m, point_attrs, cfg, &mut c.stats);
+            sink.push(&ValuesRow { cols, approx_bytes: approx }, budget)?;
             c.stats.rows += 1;
         }
-        let (batches, pinned) = sink.finish()?;
+        let (batches, pinned) = sink.finish(budget)?;
         pinned_bytes += pinned;
         if !batches.is_empty() {
             values.push((Dataset::MetricsHistogram, batches));
@@ -3400,12 +3953,12 @@ pub(crate) fn extract_metrics(records: &OtapArrowRecords, cfg: &LakeConfig) -> R
 }
 ```
 
-Note on `metrics[&metric_id]`: indexing a `HashMap` panics on a missing key, which `series_for` has already excluded; keep the `series_for` call first, or use `.get(...).ok_or_else(...)` to satisfy reviewers. Note on `flags(...) as i32`: same reinterpretation comment as in logs.
+Note on `flags(...) as i32`: a `u32` bit set reinterpreted into the signed storage column, same as in logs; add `#[allow(clippy::cast_possible_wrap)]` on `flags` if clippy complains. Note on metric lookup: `metric_of` returns a `Result`, so a data point that references a metric id the `UnivariateMetrics` batch does not carry refuses the request instead of panicking.
 
 - [ ] **Step 4: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake extract::`
-Expected: 7 passed (3 logs, 4 metrics).
+Expected: 11 passed (6 logs, 5 metrics).
 
 - [ ] **Step 5: Commit**
 
@@ -3423,12 +3976,26 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `rust/otap-dataflow/crates/series-lake/src/cache.rs`
 - Create: `rust/otap-dataflow/crates/series-lake/src/clock.rs` (only the `PartitionId` type now; the rest in task 11)
+- Modify: `rust/otap-dataflow/Cargo.toml` (change the `lru` pin committed by task 1)
 - Modify: `src/lib.rs` (add `pub mod cache; pub mod clock;`)
 
 **Interfaces:**
 - Produces:
   - `pub struct PartitionId { pub date: u32 /* days since epoch */, pub hour: u8 }` in `clock.rs` with `Copy, Eq, Hash, Ord`, `fn from_unix_secs(secs: i64) -> PartitionId`, `fn date_string(&self) -> String` (`YYYY-MM-DD`), `fn hour_string(&self) -> String` (`HH`)
   - `pub struct SeriesCache` with `fn new(max_entries: usize) -> Self`, `fn is_committed(&mut self, id: &SeriesId, partition: PartitionId) -> bool` (touches the entry), `fn touch(&mut self, id: SeriesId)` (insert if absent without a partition, evicts LRU), `fn mark_committed(&mut self, id: SeriesId, partition: PartitionId)`, `fn len(&self) -> usize`, `fn is_empty(&self) -> bool`, `fn stats(&self) -> CacheStats { hits, misses, evictions }` (counters since creation)
+
+- [ ] **Step 0: Align the workspace `lru` pin with the versions already in the lock**
+
+Task 1 committed `lru = "0.12"` in `rust/otap-dataflow/Cargo.toml`. `Cargo.lock` already carries `lru` 0.16.4 and 0.18.4 through transitive dependencies, so 0.12 adds a third copy of the crate for no benefit. Change the workspace line to:
+
+```toml
+lru = "0.16"
+```
+
+The API this crate uses is unchanged between 0.12 and 0.16, verified against the vendored `lru-0.16.4` source: `LruCache::new(NonZeroUsize) -> LruCache<K, V>`, `put(&mut self, K, V) -> Option<V>`, `get(&mut self, &Q) -> Option<&V>`, `contains(&self, &Q) -> bool`, `cap(&self) -> NonZeroUsize`, `len(&self) -> usize`, `is_empty(&self) -> bool`, `pop_lru(&mut self) -> Option<(K, V)>`. `lru` 0.16 needs Rust 1.70, below the workspace MSRV of 1.88.
+
+Run: `cd rust/otap-dataflow && cargo check -p otel-arrow-dfe-series-lake`
+Expected: success, and `Cargo.lock` no longer gains an `lru 0.12.x` entry.
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `cache.rs`)
 
@@ -3455,8 +4022,10 @@ mod tests {
         c.mark_committed(id(1), p);
         assert!(c.is_committed(&id(1), p));
         assert!(!c.is_committed(&id(1), q));
-        assert_eq!(c.stats().misses, 1);
-        assert_eq!(c.stats().hits, 3);
+        // Four lookups: absent -> miss, present with no partition -> miss,
+        // present with p -> hit, asked for q -> miss.
+        assert_eq!(c.stats().hits, 1);
+        assert_eq!(c.stats().misses, 3);
     }
 
     /// Scenario: capacity 2, three distinct ids touched in order.
@@ -3630,7 +4199,7 @@ Expected: 2 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add rust/otap-dataflow/crates/series-lake
+git add rust/otap-dataflow/Cargo.toml rust/otap-dataflow/Cargo.lock rust/otap-dataflow/crates/series-lake
 git commit -m "feat(series_lake): bounded series cache keyed by committed partition
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -3648,11 +4217,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `config::{SortKey, SortOrder, Nulls}`.
 - Produces:
   - `pub struct SortSpec { keys: Vec<SortKey> }` with `fn new(keys: Vec<SortKey>) -> SortSpec`, `fn series() -> SortSpec` (`series_id` asc), `fn is_empty(&self) -> bool`, `fn metadata_string(&self) -> String` (`column:asc|desc:nulls_first|nulls_last,...` or `none`)
-  - `pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch>` (permutation plus `take`; doubles normalized so that `-0.0 == +0.0` and every NaN sorts last ascending)
-  - `pub fn merge_runs(runs: &[RecordBatch], spec: &SortSpec, chunk_bytes: usize) -> Result<Vec<RecordBatch>>` (globally sorted output in chunks of at most about `chunk_bytes`, using `arrow::compute::interleave`; with an empty spec it concatenates in order)
-  - `pub fn is_sorted(batch: &RecordBatch, spec: &SortSpec) -> Result<bool>` (test helper, public for the oracle test)
+  - `pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch>` (permutation plus `take`; doubles normalized so that `-0.0 == +0.0` and every NaN sorts last ascending; not stable)
+  - `pub struct MergeIter` implementing `Iterator<Item = Result<RecordBatch>>`, built by `pub fn merge_runs(runs: Vec<RecordBatch>, spec: &SortSpec, chunk_bytes: usize) -> Result<MergeIter>`: one globally sorted output chunk is materialized per `next()`, using `arrow::compute::interleave`; with an empty spec the runs are yielded unchanged in arrival order, with no concatenation
+  - `pub fn is_sorted(batch: &RecordBatch, spec: &SortSpec) -> Result<bool>` (test helper, public for the oracle test; compares adjacent `arrow::row` keys, never a `lexsort_to_indices` permutation)
 
-Implementation approach: build the sort columns with `arrow::compute::SortColumn { values, options: Some(SortOptions { descending, nulls_first }) }`; for `Float64` columns replace the values by a normalized copy (`NaN -> f64::NAN` positive, `-0.0 -> 0.0`) via `arrow::compute::unary`; `lexsort_to_indices` then orders positive NaN last under ascending (arrow uses `total_cmp`). For the merge, convert the normalized sort columns of every run with `arrow::row::RowConverter` (`SortField::new_with_options`) and run a binary heap over `(Row, run_index, row_index)`; emit `(run_index, row_index)` pairs and materialize each chunk with `interleave` per column.
+Implementation approach: build the sort columns with `arrow::compute::SortColumn { values, options: Some(SortOptions { descending, nulls_first }) }`; for `Float64` columns replace the values by a normalized copy (`NaN -> f64::NAN` positive, `-0.0 -> 0.0`) via `arrow::compute::unary`; `lexsort_to_indices` then orders positive NaN last under ascending (arrow uses `total_cmp`). For the merge, convert the normalized sort columns of every run with `arrow::row::RowConverter` (`SortField::new_with_options`) and run a binary heap over `(Row, run_index, row_index)`; each `next()` drains the heap until the chunk row count is reached and materializes that chunk with `interleave` per column, so only one output chunk exists at a time. The chunk row count is `chunk_bytes / avg_row_bytes`, where `avg_row_bytes` is the deduplicated pinned bytes of **all** runs divided by their total row count -- not the first run's average, which would undersize chunks whenever later runs carry wider rows.
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `sort.rs`)
 
@@ -3689,7 +4258,8 @@ mod tests {
     }
 
     /// Scenario: keys with a null, both NaN signs and both zero signs.
-    /// Guarantees: null last, NaNs after all numbers, -0.0 and +0.0 keep input order (stable).
+    /// Guarantees: null last, NaNs after all numbers, and -0.0 compares equal to +0.0
+    /// so the pair stays adjacent; their relative order is unspecified and unasserted.
     #[test]
     fn sort_batch_normalizes_doubles() {
         let b = batch(
@@ -3713,7 +4283,8 @@ mod tests {
         let r1 = sort_batch(&batch(vec![Some(5), Some(1), Some(9)], vec![0.0; 3], "a"), &spec()).expect("s");
         let r2 = sort_batch(&batch(vec![Some(2), Some(8)], vec![0.0; 2], "b"), &spec()).expect("s");
         let r3 = sort_batch(&batch(vec![Some(3), None, Some(4)], vec![0.0; 3], "c"), &spec()).expect("s");
-        let out = merge_runs(&[r1, r2, r3], &spec(), 1).expect("merge");
+        let out: Vec<RecordBatch> =
+            merge_runs(vec![r1, r2, r3], &spec(), 1).expect("merge").collect::<Result<_>>().expect("chunks");
         assert!(out.len() >= 4, "tiny chunk budget must yield several chunks");
         let all = arrow::compute::concat_batches(&out[0].schema(), &out).expect("concat");
         assert_eq!(all.num_rows(), 8);
@@ -3728,11 +4299,30 @@ mod tests {
     fn empty_spec_concatenates() {
         let r1 = batch(vec![Some(5)], vec![0.0], "a");
         let r2 = batch(vec![Some(1)], vec![0.0], "b");
-        let out = merge_runs(&[r1, r2], &SortSpec::new(vec![]), 1 << 20).expect("merge");
+        let out: Vec<RecordBatch> = merge_runs(vec![r1, r2], &SortSpec::new(vec![]), 1 << 20)
+            .expect("merge")
+            .collect::<Result<_>>()
+            .expect("chunks");
+        assert_eq!(out.len(), 2, "unsorted mode yields the runs as they are, without concatenating");
         let all = arrow::compute::concat_batches(&out[0].schema(), &out).expect("concat");
         assert_eq!(all.column(0).as_primitive::<Int64Type>().values(), &[5, 1]);
         assert_eq!(SortSpec::new(vec![]).metadata_string(), "none");
         assert_eq!(spec().metadata_string(), "k:asc:nulls_last,f:asc:nulls_last");
+    }
+
+    /// Scenario: a correctly ordered batch in which every sort key is tied, and a
+    /// batch that is genuinely out of order.
+    /// Guarantees: `is_sorted` accepts the tied batch and rejects the unordered one.
+    /// A permutation-based check would reject the tied batch, because arrow's
+    /// lexicographic sort is unstable and need not return the identity there.
+    #[test]
+    fn is_sorted_accepts_tied_keys() {
+        let tied = batch(vec![Some(7); 6], vec![1.0; 6], "x");
+        assert!(is_sorted(&tied, &spec()).expect("tied"));
+        let descending = batch(vec![Some(3), Some(2), Some(1)], vec![0.0; 3], "x");
+        assert!(!is_sorted(&descending, &spec()).expect("descending"));
+        let ordered = sort_batch(&descending, &spec()).expect("sort");
+        assert!(is_sorted(&ordered, &spec()).expect("ordered"));
     }
 }
 ```
@@ -3755,10 +4345,11 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
-use arrow::compute::{SortColumn, SortOptions, concat_batches, interleave, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Float64Type};
+use arrow::compute::{SortColumn, SortOptions, interleave, lexsort_to_indices, take};
+use arrow::datatypes::{DataType, Float64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 
 use crate::config::{Nulls, SortKey, SortOrder};
 use crate::error::{Error, Result};
@@ -3845,7 +4436,11 @@ fn sort_columns(batch: &RecordBatch, spec: &SortSpec) -> Result<Vec<SortColumn>>
         .collect()
 }
 
-/// Sort one batch by the spec (stable). Returns the input unchanged for an empty spec.
+/// Sort one batch by the spec. Returns the input unchanged for an empty spec.
+///
+/// Not stable: arrow's `lexsort_to_indices` is an unstable sort, so the relative
+/// order of rows whose sort keys are equal is unspecified. Nothing in the format
+/// depends on it.
 pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch> {
     if spec.is_empty() || batch.num_rows() < 2 {
         return Ok(batch.clone());
@@ -3874,30 +4469,15 @@ impl PartialOrd for HeapItem {
     }
 }
 impl Ord for HeapItem {
-    // Reversed so BinaryHeap pops the smallest row; ties broken by run index for stability.
+    // Reversed so BinaryHeap pops the smallest row; ties broken by run index so
+    // that equal rows leave the merge in run order.
     fn cmp(&self, o: &Self) -> Ordering {
         o.row.as_ref().cmp(&self.row.as_ref()).then(o.run.cmp(&self.run))
     }
 }
 
-fn approx_row_bytes(batch: &RecordBatch) -> usize {
-    if batch.num_rows() == 0 {
-        return 1;
-    }
-    (batch.get_array_memory_size() / batch.num_rows()).max(1)
-}
-
-/// Merge sorted runs into globally sorted chunks of about `chunk_bytes`.
-pub fn merge_runs(runs: &[RecordBatch], spec: &SortSpec, chunk_bytes: usize) -> Result<Vec<RecordBatch>> {
-    let runs: Vec<&RecordBatch> = runs.iter().filter(|r| r.num_rows() > 0).collect();
-    let Some(first) = runs.first() else { return Ok(vec![]) };
-    let schema = first.schema();
-    if spec.is_empty() {
-        // Arrival order; re-chunk by size only.
-        let all = concat_batches(&schema, runs.iter().copied())?;
-        let rows_per_chunk = (chunk_bytes / approx_row_bytes(&all)).max(1);
-        return Ok((0..all.num_rows()).step_by(rows_per_chunk).map(|s| all.slice(s, rows_per_chunk.min(all.num_rows() - s))).collect());
-    }
+/// Row converter for the sort keys of a schema.
+fn key_converter(schema: &Schema, spec: &SortSpec) -> Result<RowConverter> {
     let fields: Vec<SortField> = spec
         .keys
         .iter()
@@ -3906,66 +4486,165 @@ pub fn merge_runs(runs: &[RecordBatch], spec: &SortSpec, chunk_bytes: usize) -> 
             Ok(SortField::new_with_options(dt, SortSpec::options(k)))
         })
         .collect::<std::result::Result<_, arrow::error::ArrowError>>()?;
-    let converter = RowConverter::new(fields)?;
-    let mut rows_per_run = Vec::with_capacity(runs.len());
-    for r in &runs {
-        let cols: Vec<ArrayRef> = sort_columns(r, spec)?.into_iter().map(|c| c.values).collect();
-        rows_per_run.push(converter.convert_columns(&cols)?);
-    }
-    let mut heap = BinaryHeap::new();
-    for (run, rows) in rows_per_run.iter().enumerate() {
-        heap.push(HeapItem { row: rows.row(0).owned(), run, idx: 0 });
-    }
-    let row_bytes = approx_row_bytes(first);
-    let rows_per_chunk = (chunk_bytes / row_bytes).max(1);
-    let arrays_per_col: Vec<Vec<&dyn Array>> = (0..schema.fields().len())
-        .map(|c| runs.iter().map(|r| r.column(c).as_ref()).collect())
-        .collect();
-    let mut out = Vec::new();
-    let mut pending: Vec<(usize, usize)> = Vec::with_capacity(rows_per_chunk);
-    let flush = |pending: &mut Vec<(usize, usize)>, out: &mut Vec<RecordBatch>| -> Result<()> {
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let cols: Vec<ArrayRef> = arrays_per_col
-            .iter()
-            .map(|arrs| interleave(arrs, pending))
-            .collect::<std::result::Result<_, _>>()?;
-        out.push(RecordBatch::try_new(schema.clone(), cols)?);
-        pending.clear();
-        Ok(())
-    };
-    while let Some(item) = heap.pop() {
-        pending.push((item.run, item.idx));
-        let next = item.idx + 1;
-        if next < rows_per_run[item.run].num_rows() {
-            heap.push(HeapItem { row: rows_per_run[item.run].row(next).owned(), run: item.run, idx: next });
-        }
-        if pending.len() >= rows_per_chunk {
-            flush(&mut pending, &mut out)?;
-        }
-    }
-    flush(&mut pending, &mut out)?;
-    Ok(out)
+    Ok(RowConverter::new(fields)?)
 }
 
-/// Whether a batch is sorted by the spec (test helper).
+/// Encode a batch's normalized sort-key columns into comparable rows.
+fn key_rows(batch: &RecordBatch, spec: &SortSpec, converter: &RowConverter) -> Result<Rows> {
+    let cols: Vec<ArrayRef> = sort_columns(batch, spec)?.into_iter().map(|c| c.values).collect();
+    Ok(converter.convert_columns(&cols)?)
+}
+
+/// Average pinned bytes per row over every run, deduplicating shared buffers.
+fn avg_row_bytes(runs: &[RecordBatch]) -> usize {
+    let mut seen = CountedAllocations::default();
+    let mut bytes = 0usize;
+    let mut rows = 0usize;
+    for r in runs {
+        bytes += record_batch_pinned_bytes(r, &mut seen);
+        rows += r.num_rows();
+    }
+    if rows == 0 {
+        return 1;
+    }
+    (bytes / rows).max(1)
+}
+
+/// Lazy k-way merge: one output chunk is materialized per `next()`.
+///
+/// Memory: the iterator holds the input runs, the encoded sort keys of every row
+/// of every run, and one output chunk. The encoded keys cover the key columns
+/// only, not the whole dataset, so they are a small fraction of the runs
+/// themselves; they must stay resident because the heap compares rows from any
+/// run at any point of the merge.
+///
+/// Ledger (approximation): the chunk row count is fixed up front from the
+/// average pinned bytes per row over all runs, so a chunk whose rows happen to
+/// be wider than average exceeds `chunk_bytes`. The overshoot is bounded by
+/// `max_row_bytes` per row, and `max_row_bytes <= run_target_bytes / 4` is
+/// validated at startup. Exact byte-driven chunking is a plan 3 follow-up.
+pub struct MergeIter {
+    runs: Vec<RecordBatch>,
+    schema: SchemaRef,
+    /// Sorted mode: encoded keys per run, plus the merge heap.
+    keys: Vec<Rows>,
+    heap: BinaryHeap<HeapItem>,
+    rows_per_chunk: usize,
+    /// Unsorted mode: index of the next run to hand out unchanged.
+    next_run: usize,
+    sorted: bool,
+}
+
+impl MergeIter {
+    fn interleave(&self, pending: &[(usize, usize)]) -> Result<RecordBatch> {
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
+        for c in 0..self.schema.fields().len() {
+            let arrays: Vec<&dyn Array> = self.runs.iter().map(|r| r.column(c).as_ref()).collect();
+            cols.push(interleave(&arrays, pending)?);
+        }
+        Ok(RecordBatch::try_new(self.schema.clone(), cols)?)
+    }
+}
+
+impl Iterator for MergeIter {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.sorted {
+            // Unsorted mode: hand out the runs in arrival order, unchanged. No
+            // concatenation, so no second copy of the dataset is ever built.
+            let run = self.runs.get(self.next_run)?;
+            self.next_run += 1;
+            return Some(Ok(run.clone()));
+        }
+        let mut pending: Vec<(usize, usize)> = Vec::with_capacity(self.rows_per_chunk);
+        while let Some(item) = self.heap.pop() {
+            pending.push((item.run, item.idx));
+            let next = item.idx + 1;
+            if next < self.keys[item.run].num_rows() {
+                self.heap.push(HeapItem {
+                    row: self.keys[item.run].row(next).owned(),
+                    run: item.run,
+                    idx: next,
+                });
+            }
+            if pending.len() >= self.rows_per_chunk {
+                break;
+            }
+        }
+        if pending.is_empty() {
+            return None;
+        }
+        Some(self.interleave(&pending))
+    }
+}
+
+/// Merge sorted runs into globally sorted chunks of about `chunk_bytes`.
+///
+/// The result is an iterator: only one output chunk exists at a time, so the
+/// caller (the sink) can hand each chunk to the Parquet writer and drop it. With
+/// an empty spec the runs are yielded unchanged, in arrival order.
+pub fn merge_runs(runs: Vec<RecordBatch>, spec: &SortSpec, chunk_bytes: usize) -> Result<MergeIter> {
+    let runs: Vec<RecordBatch> = runs.into_iter().filter(|r| r.num_rows() > 0).collect();
+    let Some(first) = runs.first() else {
+        return Ok(MergeIter {
+            runs: Vec::new(),
+            schema: Arc::new(Schema::empty()),
+            keys: Vec::new(),
+            heap: BinaryHeap::new(),
+            rows_per_chunk: 1,
+            next_run: 0,
+            sorted: false,
+        });
+    };
+    let schema = first.schema();
+    if spec.is_empty() {
+        return Ok(MergeIter {
+            runs,
+            schema,
+            keys: Vec::new(),
+            heap: BinaryHeap::new(),
+            rows_per_chunk: 1,
+            next_run: 0,
+            sorted: false,
+        });
+    }
+    let converter = key_converter(&schema, spec)?;
+    let mut keys = Vec::with_capacity(runs.len());
+    for r in &runs {
+        keys.push(key_rows(r, spec, &converter)?);
+    }
+    let mut heap = BinaryHeap::new();
+    for (run, rows) in keys.iter().enumerate() {
+        heap.push(HeapItem { row: rows.row(0).owned(), run, idx: 0 });
+    }
+    let rows_per_chunk = (chunk_bytes / avg_row_bytes(&runs)).max(1);
+    Ok(MergeIter { runs, schema, keys, heap, rows_per_chunk, next_run: 0, sorted: true })
+}
+
+/// Whether a batch is sorted by the spec (test helper, also used by the oracle).
+///
+/// Adjacent rows are compared through their encoded `arrow::row` keys, which
+/// carry the spec's ascending/descending and null placement. Comparing the
+/// permutation produced by `lexsort_to_indices` would be wrong: that sort is
+/// unstable, so tied keys can yield a non-identity permutation for a batch that
+/// is correctly ordered.
 pub fn is_sorted(batch: &RecordBatch, spec: &SortSpec) -> Result<bool> {
     if spec.is_empty() || batch.num_rows() < 2 {
         return Ok(true);
     }
-    let cols = sort_columns(batch, spec)?;
-    let idx = lexsort_to_indices(&cols, None)?;
-    Ok(idx.values().iter().enumerate().all(|(i, v)| *v as usize == i))
+    let converter = key_converter(&batch.schema(), spec)?;
+    let rows = key_rows(batch, spec, &converter)?;
+    Ok((1..rows.num_rows()).all(|i| rows.row(i - 1) <= rows.row(i)))
 }
 ```
 
-`OwnedRow` per heap item allocates; acceptable for v1 (rows are short). Add `pub mod sort;` to `src/lib.rs`.
+`OwnedRow` per heap item allocates; acceptable for v1 (rows are short, one per run at a time). Add `pub mod sort;` to `src/lib.rs`.
 
 - [ ] **Step 4: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake sort::tests`
-Expected: 3 passed.
+Expected: 4 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -3982,16 +4661,44 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `rust/otap-dataflow/crates/series-lake/src/buffer.rs`
+- Modify: `rust/otap-dataflow/crates/series-lake/src/error.rs` (two new `RefuseReason` variants)
 - Modify: `src/lib.rs` (add `pub mod buffer;`)
 
 **Interfaces:**
 - Consumes: `sort::{SortSpec, sort_batch}`, `extract::{Extracted, DescriptorRow, series_batch}`, `schema::Dataset`, `clock::PartitionId`, `cache::SeriesCache`, `config::LakeConfig`.
 - Produces:
   - `pub struct SortedTableBuffer` with `fn new(dataset: Dataset, spec: SortSpec, run_target_bytes: usize)`, `fn append(&mut self, batch: RecordBatch) -> Result<usize>` (returns pinned bytes newly retained; seals a run when the building size reaches the target), `fn seal(&mut self) -> Result<()>`, `fn runs(&self) -> &[RecordBatch]`, `fn building(&self) -> &[RecordBatch]`, `fn rows(&self) -> usize`, `fn is_empty(&self) -> bool`, `fn dataset(&self) -> Dataset`, `fn spec(&self) -> &SortSpec`, `fn iter_snapshots(&self) -> impl Iterator<Item = &RecordBatch>` (building then runs; spec 10.1 consequence)
-  - `pub struct Reservation { pub bytes: usize, pub new_series: Vec<usize> }` (indices into `Extracted::descriptors` that must be emitted)
+  - `pub struct Reservation { pub bytes: usize, pub token_bytes: usize, pub new_series: Vec<usize> }` (`new_series` are indices into `Extracted::descriptors` that must be emitted)
   - `pub struct Block<T> { pub window_start_secs: i64, pub partition: PartitionId, pub seq: u64, tables: BTreeMap<Dataset, SortedTableBuffer>, pub pending_series: HashSet<SeriesId>, pub bytes: usize, pub requests: Vec<T> }`
-  - `impl<T> Block<T>`: `fn new(window_start_secs: i64, seq: u64, cfg: &LakeConfig) -> Block<T>`, `fn reserve(&self, extracted: &Extracted, cache: &mut SeriesCache, token_bytes: usize, cfg: &LakeConfig) -> Reservation`, `fn admit(&mut self, extracted: Extracted, reservation: Reservation, token: T, emitted_at_us: i64, cfg: &LakeConfig) -> Result<()>`, `fn seal(&mut self) -> Result<()>`, `fn tables(&self) -> impl Iterator<Item = &SortedTableBuffer>` (series datasets first), `fn is_empty(&self) -> bool`, `fn request_count(&self) -> usize`, `fn into_parts(self) -> (Vec<T>, HashSet<SeriesId>, BTreeMap<Dataset, SortedTableBuffer>)`
-  - `pub const PENDING_SERIES_ENTRY_BYTES: usize = 64;`
+  - `impl<T> Block<T>`: `fn new(window_start_secs: i64, seq: u64, cfg: &LakeConfig) -> Block<T>`, `fn reserve(&self, extracted: &Extracted, cache: &mut SeriesCache, token_bytes: usize, cfg: &LakeConfig) -> Result<Reservation>`, `fn admit(&mut self, extracted: Extracted, reservation: Reservation, token: T) -> Result<()>`, `fn seal(&mut self, emitted_at_us: i64) -> Result<()>`, `fn emitted_at_us(&self) -> Option<i64>`, `fn tables(&self) -> impl Iterator<Item = &SortedTableBuffer>` (series datasets first), `fn is_empty(&self) -> bool`, `fn request_count(&self) -> usize`, `fn into_parts(self) -> (Vec<T>, HashSet<SeriesId>, BTreeMap<Dataset, SortedTableBuffer>)`
+  - `RefuseReason::{BlockFull, TooManyRequests}` added to `src/error.rs`.
+
+Three behaviours differ from the naive version and matter downstream:
+
+1. **`reserve` can refuse** (spec 6.2 step 5). A request whose own reservation exceeds `max_block_bytes` is refused permanently with `RequestTooLarge`, even into an empty block. A request that does not fit the *current* block gets `BlockFull`, and a block already holding `max_requests_per_block` tokens gets `TooManyRequests`. The last two are rotation signals, not nacks: plan 2's node loop parks the request in `pending`, sets `rotation_requested` and resumes it after the rotation.
+2. **`admit` takes no timestamp.** `emitted_at` is the block *seal* time (spec section 5.1), so descriptor rows are held as `DescriptorRow` values until `seal(now_us)` stamps them all at once. The stamp is recorded, so a re-seal during a flush retry reuses it and the file content stays byte-identical across retries.
+3. **Byte accounting is recomputed once, at seal.** `append` returns the pinned bytes it newly retained, which the reservation uses as an upper bound while the block is being filled. `seal` then recomputes `block.bytes` with a single `CountedAllocations` set covering every retained batch of every table plus the pending-series entries and the token bytes, so buffers shared between a sealed run and a later batch are counted once. Ledger: that recount is linear in the block's batches and runs once per block; doing it per append would be quadratic. Plan 3's memory benchmarks revisit it.
+
+- [ ] **Step 0: Add the two block refusal reasons**
+
+In `src/error.rs`, extend the enum Task 6 renamed:
+
+```rust
+/// Why a request is permanently refused (spec section 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefuseReason {
+    /// The request itself, its extracted output or one of its rows exceeds a budget.
+    RequestTooLarge,
+    /// The active block cannot take this request; the caller rotates and retries.
+    BlockFull,
+    /// The active block already holds `max_requests_per_block` tokens.
+    TooManyRequests,
+    /// Malformed content: duplicate keys, nesting too deep, bad histogram, ...
+    Invalid(String),
+    /// Unsupported signal or point kind under the reject policy.
+    Unsupported(String),
+}
+```
 
 - [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `buffer.rs`)
 
@@ -4001,11 +4708,16 @@ mod tests {
     use super::*;
     use crate::cache::SeriesCache;
     use crate::config::LakeConfig;
+    use crate::error::RefuseReason;
     use crate::extract::extract;
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::TimestampMicrosecondType;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
+
+    const SEAL_AT_US: i64 = 1_700_000_000_000_000;
 
     fn logs(host: &str, n: usize) -> LogsData {
         let kv = |k: &str, v: &str| KeyValue { key: k.into(), value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.into())) }) };
@@ -4021,6 +4733,11 @@ mod tests {
         }
     }
 
+    fn extracted(cfg: &LakeConfig, host: &str, n: usize) -> Extracted {
+        let mut records = encode_logs(&logs(host, n));
+        extract(&mut records, cfg).expect("extract")
+    }
+
     /// Scenario: two requests for the same series in one block, then the same series after commit.
     /// Guarantees: the descriptor is reserved once per block and not at all once committed in the partition.
     #[test]
@@ -4028,30 +4745,134 @@ mod tests {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
         let mut block: Block<u32> = Block::new(0, 1, &cfg);
-        let e1 = extract(&encode_logs(&logs("h", 2)), &cfg).expect("e1");
-        let r1 = block.reserve(&e1, &mut cache, 16, &cfg);
+        let e1 = extracted(&cfg, "h", 2);
+        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("reserve 1");
         assert_eq!(r1.new_series, vec![0]);
         assert!(r1.bytes > 16);
-        block.admit(e1, r1, 1, 0, &cfg).expect("admit");
-        let e2 = extract(&encode_logs(&logs("h", 1)), &cfg).expect("e2");
-        let r2 = block.reserve(&e2, &mut cache, 16, &cfg);
+        block.admit(e1, r1, 1).expect("admit");
+        let e2 = extracted(&cfg, "h", 1);
+        let r2 = block.reserve(&e2, &mut cache, 16, &cfg).expect("reserve 2");
         assert!(r2.new_series.is_empty());
-        block.admit(e2, r2, 2, 0, &cfg).expect("admit");
+        block.admit(e2, r2, 2).expect("admit");
         assert_eq!(block.request_count(), 2);
         assert_eq!(block.pending_series.len(), 1);
+        block.seal(SEAL_AT_US).expect("seal");
         let series = block.tables().find(|t| t.dataset().is_series()).expect("series table");
         assert_eq!(series.rows(), 1);
         // commit in the block's partition
         for id in &block.pending_series {
             cache.mark_committed(*id, block.partition);
         }
-        let mut next: Block<u32> = Block::new(0, 2, &cfg);
-        let e3 = extract(&encode_logs(&logs("h", 1)), &cfg).expect("e3");
-        assert!(next.reserve(&e3, &mut cache, 16, &cfg).new_series.is_empty());
-        let mut other: Block<u32> = Block::new(3600, 3, &cfg); // next hour
-        assert_eq!(other.reserve(&e3, &mut cache, 16, &cfg).new_series, vec![0]);
-        let _ = &mut other;
-        let _ = &mut next;
+        let next: Block<u32> = Block::new(0, 2, &cfg);
+        let e3 = extracted(&cfg, "h", 1);
+        assert!(next.reserve(&e3, &mut cache, 16, &cfg).expect("reserve 3").new_series.is_empty());
+        let other: Block<u32> = Block::new(3600, 3, &cfg); // next hour
+        assert_eq!(other.reserve(&e3, &mut cache, 16, &cfg).expect("reserve 4").new_series, vec![0]);
+    }
+
+    /// Scenario: `emitted_at` on a block sealed once and then sealed again, as a flush retry does.
+    /// Guarantees: every descriptor row carries the first seal's timestamp and the second seal does not restamp.
+    #[test]
+    fn emitted_at_is_stamped_at_seal_and_frozen() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let e = extracted(&cfg, "h", 2);
+        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+        block.admit(e, r, 1).expect("admit");
+        block.seal(SEAL_AT_US).expect("seal");
+        block.seal(SEAL_AT_US + 5_000_000).expect("re-seal");
+        assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
+        let series = block.tables().find(|t| t.dataset().is_series()).expect("series table");
+        let batch = series.runs().first().expect("run");
+        let stamps = batch.column_by_name("emitted_at").expect("emitted_at");
+        let stamps = stamps.as_primitive::<TimestampMicrosecondType>();
+        assert!((0..stamps.len()).all(|i| stamps.value(i) == SEAL_AT_US));
+    }
+
+    /// Scenario: a request whose reservation alone exceeds `max_block_bytes`, offered to an empty block.
+    /// Guarantees: refused permanently as `RequestTooLarge`, and the empty block is left untouched.
+    #[test]
+    fn oversize_request_is_refused_by_an_empty_block() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_block_bytes = 1;
+        let mut cache = SeriesCache::new(100);
+        let block: Block<u32> = Block::new(0, 1, &cfg);
+        let e = extracted(&LakeConfig::default(), "h", 4);
+        assert!(matches!(
+            block.reserve(&e, &mut cache, 16, &cfg),
+            Err(Error::Refused(RefuseReason::RequestTooLarge))
+        ));
+        assert_eq!(block.bytes, 0);
+        assert_eq!(block.request_count(), 0);
+        assert!(block.pending_series.is_empty());
+        assert_eq!(block.tables().count(), 0);
+    }
+
+    /// Scenario: a block already holding `max_requests_per_block` tokens.
+    /// Guarantees: the next reservation is refused with `TooManyRequests` and the block is unchanged.
+    #[test]
+    fn request_count_limit_refuses_before_mutating() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_requests_per_block = 2;
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        for token in 0..2u32 {
+            let e = extracted(&cfg, "h", 1);
+            let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+            block.admit(e, r, token).expect("admit");
+        }
+        let before_bytes = block.bytes;
+        let before_series = block.pending_series.len();
+        let e = extracted(&cfg, "h", 1);
+        assert!(matches!(
+            block.reserve(&e, &mut cache, 16, &cfg),
+            Err(Error::Refused(RefuseReason::TooManyRequests))
+        ));
+        assert_eq!(block.bytes, before_bytes);
+        assert_eq!(block.pending_series.len(), before_series);
+        assert_eq!(block.request_count(), 2);
+    }
+
+    /// Scenario: a non-empty block that cannot take one more request within `max_block_bytes`.
+    /// Guarantees: `BlockFull` is returned, which the node loop turns into a rotation, and the block is unchanged.
+    #[test]
+    fn full_block_refuses_with_block_full() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let first = extracted(&cfg, "h", 4);
+        let r = block.reserve(&first, &mut cache, 16, &cfg).expect("reserve");
+        block.admit(first, r, 1).expect("admit");
+        let before_bytes = block.bytes;
+
+        let mut tight = cfg.clone();
+        tight.ingress.max_block_bytes = before_bytes + 1;
+        let e = extracted(&cfg, "h2", 4);
+        assert!(matches!(
+            block.reserve(&e, &mut cache, 16, &tight),
+            Err(Error::Refused(RefuseReason::BlockFull))
+        ));
+        assert_eq!(block.bytes, before_bytes);
+        assert_eq!(block.request_count(), 1);
+    }
+
+    /// Scenario: two requests that share the same Arrow buffers are admitted into one block.
+    /// Guarantees: the seal-time recount deduplicates shared allocations, so the block's
+    /// byte count is at most the sum of the per-request reservations and at least one copy.
+    #[test]
+    fn seal_recounts_shared_buffers_once() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let e1 = extracted(&cfg, "h", 8);
+        let one_request_pinned = e1.pinned_bytes;
+        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("r1");
+        block.admit(e1, r1, 1).expect("admit");
+        let reserved = block.bytes;
+        block.seal(SEAL_AT_US).expect("seal");
+        assert!(block.bytes <= reserved, "the recount is never above the reservation upper bound");
+        assert!(block.bytes >= one_request_pinned / 2, "one copy of the data is still counted");
     }
 
     /// Scenario: a buffer with a tiny run target receives several batches.
@@ -4059,7 +4880,7 @@ mod tests {
     #[test]
     fn buffer_seals_sorted_runs() {
         let cfg = LakeConfig::default();
-        let e = extract(&encode_logs(&logs("h", 50)), &cfg).expect("e");
+        let e = extracted(&cfg, "h", 50);
         let (_, batches) = e.values.into_iter().next().expect("values");
         let mut buf = SortedTableBuffer::new(Dataset::LogsValues, SortSpec::new(cfg.logs.values_sort.clone()), 1);
         let mut total = 0;
@@ -4101,13 +4922,10 @@ use crate::cache::SeriesCache;
 use crate::canonical::SeriesId;
 use crate::clock::PartitionId;
 use crate::config::LakeConfig;
-use crate::error::Result;
-use crate::extract::{Extracted, series_batch};
+use crate::error::{Error, RefuseReason, Result};
+use crate::extract::{DescriptorRow, Extracted, series_batch};
 use crate::schema::Dataset;
 use crate::sort::{SortSpec, sort_batch};
-
-/// Charged bytes per `pending_series` entry (spec section 6.1).
-pub const PENDING_SERIES_ENTRY_BYTES: usize = 64;
 
 /// Building batches plus sealed sorted runs for one dataset.
 pub struct SortedTableBuffer {
@@ -4137,6 +4955,10 @@ impl SortedTableBuffer {
     }
 
     /// Append a batch; returns the pinned bytes newly retained by this buffer.
+    ///
+    /// The returned value is an upper bound used while the block fills: it never
+    /// sees the bytes that `seal` releases when the building batches are replaced
+    /// by one concatenated run. `Block::seal` recomputes the truth.
     pub fn append(&mut self, batch: RecordBatch) -> Result<usize> {
         let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
         self.rows += batch.num_rows();
@@ -4149,6 +4971,10 @@ impl SortedTableBuffer {
     }
 
     /// Sort and seal the building batches into one run.
+    ///
+    /// No re-accounting happens here: recomputing the pinned bytes of every run
+    /// on every seal would be quadratic in the number of runs. `Block::seal`
+    /// performs one deduplicated recount over the whole block instead.
     pub fn seal(&mut self) -> Result<()> {
         if self.building.is_empty() {
             return Ok(());
@@ -4156,12 +4982,6 @@ impl SortedTableBuffer {
         let schema = self.building[0].schema();
         let merged = concat_batches(&schema, &self.building)?;
         let sorted = sort_batch(&merged, &self.spec)?;
-        // Re-account: the concatenated run replaces the building batches.
-        self.seen = CountedAllocations::default();
-        for r in &self.runs {
-            let _ = record_batch_pinned_bytes(r, &mut self.seen);
-        }
-        let _ = record_batch_pinned_bytes(&sorted, &mut self.seen);
         self.runs.push(sorted);
         self.building.clear();
         self.building_bytes = 0;
@@ -4209,6 +5029,8 @@ impl SortedTableBuffer {
 pub struct Reservation {
     /// Bytes the request will add to the block.
     pub bytes: usize,
+    /// The part of `bytes` that is the ack token.
+    pub token_bytes: usize,
     /// Indices into `Extracted::descriptors` whose descriptor must be written by this block.
     pub new_series: Vec<usize>,
 }
@@ -4224,14 +5046,15 @@ pub struct Block<T> {
     tables: BTreeMap<Dataset, SortedTableBuffer>,
     /// Series whose descriptor this block carries.
     pub pending_series: HashSet<SeriesId>,
-    /// Accounted bytes.
+    /// Accounted bytes: an upper bound while filling, exact after `seal`.
     pub bytes: usize,
     /// Request tokens.
     pub requests: Vec<T>,
-    cfg_run_target: usize,
-    sort_enabled: bool,
-    logs_sort: SortSpec,
-    metrics_sort: SortSpec,
+    /// Descriptor rows waiting for the seal timestamp, keyed by series dataset.
+    pending_descriptors: BTreeMap<Dataset, Vec<DescriptorRow>>,
+    token_bytes: usize,
+    emitted_at_us: Option<i64>,
+    cfg: LakeConfig,
 }
 
 impl<T> Block<T> {
@@ -4245,56 +5068,86 @@ impl<T> Block<T> {
             pending_series: HashSet::new(),
             bytes: 0,
             requests: Vec::new(),
-            cfg_run_target: cfg.sorting.run_target_bytes,
-            sort_enabled: cfg.sorting.enabled,
-            logs_sort: SortSpec::new(cfg.logs.values_sort.clone()),
-            metrics_sort: SortSpec::new(cfg.metrics.values_sort.clone()),
+            pending_descriptors: BTreeMap::new(),
+            token_bytes: 0,
+            emitted_at_us: None,
+            cfg: cfg.clone(),
         }
     }
 
     fn spec_for(&self, ds: Dataset) -> SortSpec {
         if ds.is_series() {
             SortSpec::series()
-        } else if !self.sort_enabled {
+        } else if !self.cfg.sorting.enabled {
             SortSpec::new(vec![])
         } else if ds.signal() == crate::canonical::Signal::Logs {
-            self.logs_sort.clone()
+            SortSpec::new(self.cfg.logs.values_sort.clone())
         } else {
-            self.metrics_sort.clone()
+            SortSpec::new(self.cfg.metrics.values_sort.clone())
         }
     }
 
-    /// Compute what admitting `extracted` would add (spec section 6.2 step 5). Touches the cache.
-    pub fn reserve(&self, extracted: &Extracted, cache: &mut SeriesCache, token_bytes: usize, _cfg: &LakeConfig) -> Reservation {
+    /// Compute what admitting `extracted` would add (spec section 6.2 step 5).
+    ///
+    /// Refuses before touching anything:
+    /// * `RequestTooLarge` when the reservation alone exceeds `max_block_bytes`,
+    ///   even for an empty block -- a permanent nack;
+    /// * `TooManyRequests` when the block already holds `max_requests_per_block`;
+    /// * `BlockFull` when the request does not fit the remaining budget.
+    ///
+    /// The last two tell the caller to rotate and offer the request to the next
+    /// block. The block is never mutated, and the cache is only written (through
+    /// `touch`) once the reservation is accepted; the `is_committed` lookups
+    /// above move LRU recency, which is not correctness state (invariant 3).
+    pub fn reserve(
+        &self,
+        extracted: &Extracted,
+        cache: &mut SeriesCache,
+        token_bytes: usize,
+        cfg: &LakeConfig,
+    ) -> Result<Reservation> {
+        let limits = &cfg.ingress;
         let mut bytes = extracted.pinned_bytes + token_bytes;
         let mut new_series = Vec::new();
         for (i, d) in extracted.descriptors.iter().enumerate() {
             let committed_here = cache.is_committed(&d.series_id, self.partition);
-            cache.touch(d.series_id);
             if !committed_here && !self.pending_series.contains(&d.series_id) {
                 new_series.push(i);
-                bytes += d.approx_bytes + PENDING_SERIES_ENTRY_BYTES;
+                bytes += d.approx_bytes + limits.pending_series_entry_bytes;
             }
         }
-        Reservation { bytes, new_series }
+        if bytes > limits.max_block_bytes {
+            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        }
+        if self.requests.len() >= limits.max_requests_per_block {
+            return Err(Error::Refused(RefuseReason::TooManyRequests));
+        }
+        if self.bytes + bytes > limits.max_block_bytes {
+            return Err(Error::Refused(RefuseReason::BlockFull));
+        }
+        for d in &extracted.descriptors {
+            cache.touch(d.series_id);
+        }
+        Ok(Reservation { bytes, token_bytes, new_series })
     }
 
     /// Admit a reserved request (spec section 6.2 step 6).
-    pub fn admit(&mut self, extracted: Extracted, reservation: Reservation, token: T, emitted_at_us: i64, cfg: &LakeConfig) -> Result<()> {
+    ///
+    /// Descriptor rows are held, not written: `seal` stamps them with the block's
+    /// `emitted_at` and builds the `series` batch then.
+    pub fn admit(&mut self, extracted: Extracted, reservation: Reservation, token: T) -> Result<()> {
         let signal = extracted.signal;
         if !reservation.new_series.is_empty() {
-            let rows: Vec<&crate::extract::DescriptorRow> = reservation.new_series.iter().map(|i| &extracted.descriptors[*i]).collect();
             let ds = Dataset::series_of(signal);
-            let batch = series_batch(&rows, emitted_at_us, ds, cfg)?;
-            for r in &rows {
-                let _ = self.pending_series.insert(r.series_id);
+            let slot = self.pending_descriptors.entry(ds).or_default();
+            for i in reservation.new_series {
+                let row = extracted.descriptors[i].clone();
+                let _ = self.pending_series.insert(row.series_id);
+                slot.push(row);
             }
-            let run_target = self.cfg_run_target;
-            let spec = self.spec_for(ds);
-            let _ = self.tables.entry(ds).or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target)).append(batch)?;
         }
         for (ds, batches) in extracted.values {
-            let run_target = self.cfg_run_target;
+            let run_target = self.cfg.sorting.run_target_bytes;
             let spec = self.spec_for(ds);
             let table = self.tables.entry(ds).or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
             for b in batches {
@@ -4302,16 +5155,55 @@ impl<T> Block<T> {
             }
         }
         self.bytes += reservation.bytes;
+        self.token_bytes += reservation.token_bytes;
         self.requests.push(token);
         Ok(())
     }
 
-    /// Seal every table's building batches.
-    pub fn seal(&mut self) -> Result<()> {
+    /// Stamp `emitted_at`, write the descriptor rows and seal every table.
+    ///
+    /// Idempotent: a flush retry re-seals the same block and reuses the first
+    /// stamp, so the file bytes are identical across attempts (spec 5.3).
+    pub fn seal(&mut self, emitted_at_us: i64) -> Result<()> {
+        let stamp = *self.emitted_at_us.get_or_insert(emitted_at_us);
+        let pending = std::mem::take(&mut self.pending_descriptors);
+        for (ds, rows) in pending {
+            if rows.is_empty() {
+                continue;
+            }
+            let refs: Vec<&DescriptorRow> = rows.iter().collect();
+            let batch = series_batch(&refs, stamp, ds, &self.cfg)?;
+            let run_target = self.cfg.sorting.run_target_bytes;
+            let spec = self.spec_for(ds);
+            let table = self.tables.entry(ds).or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
+            let _ = table.append(batch)?;
+        }
         for t in self.tables.values_mut() {
             t.seal()?;
         }
+        self.bytes = self.recount();
         Ok(())
+    }
+
+    /// The seal timestamp, once the block has been sealed.
+    pub fn emitted_at_us(&self) -> Option<i64> {
+        self.emitted_at_us
+    }
+
+    /// One deduplicated pass over everything the block retains.
+    fn recount(&self) -> usize {
+        let mut seen = CountedAllocations::default();
+        let mut bytes = 0usize;
+        for t in self.tables.values() {
+            for b in t.iter_snapshots() {
+                bytes += record_batch_pinned_bytes(b, &mut seen);
+            }
+        }
+        for rows in self.pending_descriptors.values() {
+            bytes += rows.iter().map(|r| r.approx_bytes).sum::<usize>();
+        }
+        bytes += self.pending_series.len() * self.cfg.ingress.pending_series_entry_bytes;
+        bytes + self.token_bytes
     }
 
     /// Tables in write order: series datasets first (Dataset's Ord puts LogsSeries and MetricsSeries before their values).
@@ -4321,7 +5213,8 @@ impl<T> Block<T> {
 
     /// Whether the block holds no rows.
     pub fn is_empty(&self) -> bool {
-        self.tables.values().all(SortedTableBuffer::is_empty)
+        self.pending_descriptors.values().all(Vec::is_empty)
+            && self.tables.values().all(SortedTableBuffer::is_empty)
     }
 
     /// Number of admitted requests.
@@ -4341,7 +5234,7 @@ impl<T> Block<T> {
 - [ ] **Step 4: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake buffer::tests`
-Expected: 2 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -4586,19 +5479,71 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `rust/otap-dataflow/crates/series-lake/src/sink.rs`
+- Modify: `rust/otap-dataflow/crates/series-lake/Cargo.toml` (parquet `zstd`, object_store `fs`, `futures` moves to dev-dependencies)
+- Modify: `rust/otap-dataflow/crates/series-lake/src/error.rs` (`Cancelled { abort_error }`, `AbortFailed`)
 - Modify: `src/lib.rs` (add `pub mod sink;`)
 
 **Interfaces:**
-- Consumes: `buffer::{Block, SortedTableBuffer}`, `sort::merge_runs`, `schema::{Dataset, schema_fingerprint}`, `clock::PartitionId`, `config::LakeConfig`.
+- Consumes: `buffer::{Block, SortedTableBuffer}`, `sort::{MergeIter, merge_runs}`, `schema::{Dataset, schema_fingerprint}`, `clock::PartitionId`, `config::LakeConfig`.
 - Produces:
   - `pub struct FileNaming { pub writer_id: String, pub boot_id: String }` with `fn new(writer_id: &str) -> FileNaming` (generates a UUIDv4 `boot_id`)
   - `pub fn object_path(ds: Dataset, partition: PartitionId, window_start_secs: i64, naming: &FileNaming, seq: u64) -> object_store::path::Path` producing `v=1/signal=<s>/dataset=<d>/date=YYYY-MM-DD/hour=HH/part-<YYYYMMDD>T<HHMMSS>Z-<writer_id>-<boot_id>-<seq:08>.parquet`
   - `pub struct FlushReport { pub files: Vec<(Dataset, object_store::path::Path, usize /* rows */)> }`
   - `pub struct Sink { store: Arc<dyn ObjectStore>, cfg: LakeConfig, naming: FileNaming }` with `fn new(store: Arc<dyn ObjectStore>, cfg: LakeConfig, naming: FileNaming) -> Sink`
-  - `pub async fn Sink::write_block<T>(&self, block: &Block<T>, cancel: &CancellationToken) -> Result<FlushReport>` (series datasets first, then values; frozen names; `Error::Cancelled` on cancellation; writer memory limit enforced; metadata of spec 5.4)
-  - `pub fn file_metadata(...) -> Vec<KeyValue>` (parquet `KeyValue` entries): `format_version`, `series_hash`, `schema_fingerprint`, `sort_key`, `writer_id`, `boot_id`, `seq`, `window_start`, `window_end`, `row_count`, `min_time_unix_nano`, `max_time_unix_nano` (the last two only for values datasets, computed with `arrow::compute::min/max` over `time_unix_nano`)
+  - `pub async fn Sink::write_block<T>(&self, block: &Block<T>, cancel: &CancellationToken) -> Result<FlushReport>` (series datasets first, then values; frozen names; `Error::Cancelled { .. }` on cancellation; writer memory limit enforced; metadata of spec 5.4)
+  - `pub fn file_metadata(&self, table: &SortedTableBuffer, rows: usize, time_range: (Option<i64>, Option<i64>), seq: u64, window_start_secs: i64) -> Vec<KeyValue>` (parquet `KeyValue` entries): `format_version`, `series_hash`, `schema_fingerprint`, `sort_key`, `writer_id`, `boot_id`, `seq`, `window_start`, `window_end`, `row_count`, `min_time_unix_nano`, `max_time_unix_nano` (the last two only for values datasets, computed with `arrow::compute::min/max` over `time_unix_nano` of the runs, before the merge, since the merged chunks are produced lazily)
 
-- [ ] **Step 1: Write failing tests** (`#[cfg(test)] mod tests` in `sink.rs`)
+Cancellation and cleanup follow one rule (spec 6.5 step 2): the writer is *writable* until finalization starts, and *finalizing* afterwards.
+
+- While writable, every `await` is raced against the token, and every failure -- a merge error, a write error, a flush error or a cancellation -- aborts the multipart upload best effort, bounded by `upload.abort_timeout` through `tokio::time::timeout`.
+- Once `AsyncArrowWriter::finish` has started, nothing is aborted: `object_store` 0.13's `BufWriter::abort` panics when the writer has already begun shutting down (`buffered.rs:365`, `BufWriterState::Flush(_) => panic!("Already shut down")`). A cancellation that lands there returns `Cancelled` and leaves the partial upload to the bucket's multipart lifecycle rule (spec 5.3); reclaiming it belongs to compaction, not to this crate.
+- `finish(&mut self)` is used rather than `close(self)`: `close` consumes the writer, so the cancellation arm of a `select!` could not also own it. `finish` returns the `ParquetMetaData` (parquet 58.4 `arrow/async_writer/mod.rs:250`); the value is not needed, only the footer it writes.
+
+- [ ] **Step 1: Enable the Parquet and object_store features this task needs**
+
+Task 1 declared `parquet.workspace = true` and `object_store.workspace = true`. The workspace entries are `parquet = { version = "58.3", default-features = false, features = ["arrow", "async", "object_store"] }` and `object_store = { version = "0.13.2", default-features = false }`, so ZSTD compression and `object_store::local::LocalFileSystem` are both compiled out. Without the `zstd` feature the first row-group flush fails at runtime with `ParquetError::General("Disabled feature at compile time: zstd")`; without `fs` the tests of this task and task 13 do not compile. In `crates/series-lake/Cargo.toml`:
+
+```toml
+[dependencies]
+parquet = { workspace = true, features = ["zstd"] }
+object_store = { workspace = true, features = ["fs"] }
+```
+
+(replacing the two `.workspace = true` lines; `crates/core-nodes/Cargo.toml` enables `fs` the same way). At the same time move the unused production dependency to where it is actually used -- the cancellation test below needs `futures::stream::BoxStream` to implement `ObjectStore`:
+
+```toml
+# remove from [dependencies]:
+#   futures.workspace = true
+[dev-dependencies]
+futures.workspace = true
+```
+
+Run: `cd rust/otap-dataflow && cargo check -p otel-arrow-dfe-series-lake --all-targets`
+Expected: success.
+
+- [ ] **Step 2: Widen `Error::Cancelled` and add `AbortFailed`**
+
+In `src/error.rs` replace the `Cancelled` variant and add one more, so that a failed cleanup is never silently discarded:
+
+```rust
+    /// Flush cancelled. `abort_error` is set when the best-effort multipart
+    /// abort also failed or timed out.
+    #[error("cancelled{}", match abort_error { Some(e) => format!(" (multipart abort failed: {e})"), None => String::new() })]
+    Cancelled {
+        /// Why the cleanup abort did not succeed, if it did not.
+        abort_error: Option<String>,
+    },
+    /// A write failed and the best-effort multipart abort failed as well.
+    #[error("{source}; multipart abort failed: {abort_error}")]
+    AbortFailed {
+        /// The original failure.
+        source: Box<Error>,
+        /// Why the cleanup abort did not succeed.
+        abort_error: String,
+    },
+```
+
+- [ ] **Step 3: Write failing tests** (`#[cfg(test)] mod tests` in `sink.rs`)
 
 ```rust
 #[cfg(test)]
@@ -4608,21 +5553,37 @@ mod tests {
     use crate::cache::SeriesCache;
     use crate::config::LakeConfig;
     use crate::extract::extract;
+    use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
-    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutOptions,
+        PutPayload, PutResult,
+    };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue as OtlpKeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
+    const WINDOW_START: i64 = 1_789_960_500;
+    const SEAL_AT_US: i64 = 1_789_960_500_000_000;
+
     fn logs(n: usize) -> LogsData {
-        let kv = |k: &str, v: &str| KeyValue { key: k.into(), value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.into())) }) };
+        let kv = |k: &str, v: &str| OtlpKeyValue { key: k.into(), value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.into())) }) };
         LogsData {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource { attributes: vec![kv("host.id", "h")], ..Default::default() }),
                 scope_logs: vec![ScopeLogs {
-                    log_records: (0..n).map(|i| LogRecord { time_unix_nano: 5_000 - i as u64, ..Default::default() }).collect(),
+                    log_records: (0..n)
+                        .map(|i| LogRecord {
+                            time_unix_nano: 5_000 - i as u64,
+                            body: Some(AnyValue { value: Some(any_value::Value::StringValue(format!("body-{i}"))) }),
+                            ..Default::default()
+                        })
+                        .collect(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4630,13 +5591,83 @@ mod tests {
         }
     }
 
-    fn block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+    fn sealed_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
         let mut cache = SeriesCache::new(10);
-        let mut b: Block<u8> = Block::new(1_789_960_500, 7, cfg);
-        let e = extract(&encode_logs(&logs(n)), cfg).expect("extract");
-        let r = b.reserve(&e, &mut cache, 8, cfg);
-        b.admit(e, r, 0, 1_789_960_500_000_000, cfg).expect("admit");
+        let mut b: Block<u8> = Block::new(WINDOW_START, 7, cfg);
+        let mut records = encode_logs(&logs(n));
+        let e = extract(&mut records, cfg).expect("extract");
+        let r = b.reserve(&e, &mut cache, 8, cfg).expect("reserve");
+        b.admit(e, r, 0).expect("admit");
+        b.seal(SEAL_AT_US).expect("seal");
         b
+    }
+
+    fn local(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("fs"))
+    }
+
+    /// An `ObjectStore` that parks every multipart upload until it is released,
+    /// and announces that a multipart upload has started.
+    #[derive(Debug)]
+    struct ParkedMultipart {
+        inner: Arc<dyn ObjectStore>,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl std::fmt::Display for ParkedMultipart {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ParkedMultipart({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ParkedMultipart {
+        async fn put_opts(&self, location: &Path, payload: PutPayload, options: PutOptions) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(&self, location: &Path, options: PutOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.entered.notify_waiters();
+            self.release.notified().await;
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream<'a>(&'a self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn walkdir_count(root: &std::path::Path) -> usize {
+        fn walk(p: &std::path::Path, n: &mut usize) {
+            for e in std::fs::read_dir(p).expect("dir") {
+                let e = e.expect("entry");
+                if e.path().is_dir() {
+                    walk(&e.path(), n);
+                } else if e.path().extension().is_some_and(|x| x == "parquet") {
+                    *n += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        walk(root, &mut n);
+        n
     }
 
     /// Scenario: path components for a known window and sequence.
@@ -4644,7 +5675,7 @@ mod tests {
     #[test]
     fn object_path_layout() {
         let naming = FileNaming { writer_id: "w1".into(), boot_id: "b".into() };
-        let p = object_path(Dataset::LogsValues, PartitionId::from_unix_secs(1_789_960_500), 1_789_960_500, &naming, 42);
+        let p = object_path(Dataset::LogsValues, PartitionId::from_unix_secs(WINDOW_START), WINDOW_START, &naming, 42);
         assert_eq!(
             p.as_ref(),
             "v=1/signal=logs/dataset=values/date=2026-09-21/hour=03/part-20260921T031500Z-w1-b-00000042.parquet"
@@ -4657,11 +5688,9 @@ mod tests {
     #[tokio::test]
     async fn writes_series_before_values_and_reads_back() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("fs"));
         let cfg = LakeConfig::default();
-        let mut b = block(&cfg, 30);
-        b.seal().expect("seal");
-        let sink = Sink::new(store.clone(), cfg.clone(), FileNaming { writer_id: "w".into(), boot_id: "boot".into() });
+        let b = sealed_block(&cfg, 30);
+        let sink = Sink::new(local(&dir), cfg.clone(), FileNaming { writer_id: "w".into(), boot_id: "boot".into() });
         let report = sink.write_block(&b, &CancellationToken::new()).await.expect("write");
         assert_eq!(report.files.len(), 2);
         assert_eq!(report.files[0].0, Dataset::LogsSeries);
@@ -4684,50 +5713,123 @@ mod tests {
         // rewrite: same names, still two files on disk
         let report2 = sink.write_block(&b, &CancellationToken::new()).await.expect("rewrite");
         assert_eq!(report.files[1].1, report2.files[1].1);
-        let count = walkdir_count(dir.path());
-        assert_eq!(count, 2);
+        assert_eq!(walkdir_count(dir.path()), 2);
+    }
+
+    /// Scenario: a sealed block into which nothing was ever admitted.
+    /// Guarantees: no dataset file is created for a zero-row dataset (spec 5.3).
+    #[tokio::test]
+    async fn empty_block_writes_no_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg = LakeConfig::default();
+        let mut b: Block<u8> = Block::new(WINDOW_START, 7, &cfg);
+        b.seal(SEAL_AT_US).expect("seal");
+        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+        let report = sink.write_block(&b, &CancellationToken::new()).await.expect("write");
+        assert!(report.files.is_empty());
+        assert_eq!(walkdir_count(dir.path()), 0);
+    }
+
+    /// Scenario: `writer_limit_bytes` and `merge_chunk_bytes` set so low that every
+    /// merged chunk closes the current row group.
+    /// Guarantees: the file has more than one row group and still holds every row.
+    #[tokio::test]
+    async fn writer_limit_closes_row_groups() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut cfg = LakeConfig::default();
+        cfg.parquet.writer_limit_bytes = 1;
+        cfg.sorting.merge_chunk_bytes = 1;
+        let b = sealed_block(&cfg, 40);
+        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+        let report = sink.write_block(&b, &CancellationToken::new()).await.expect("write");
+        let values = report.files.iter().find(|(d, _, _)| *d == Dataset::LogsValues).expect("values file");
+        let file = std::fs::File::open(dir.path().join(values.1.as_ref())).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
+        assert!(reader.metadata().num_row_groups() > 1, "the writer memory limit must close row groups");
+        let rows: usize = reader.build().expect("build").map(|b| b.expect("batch").num_rows()).sum();
+        assert_eq!(rows, 40);
     }
 
     /// Scenario: the token is cancelled before writing.
     /// Guarantees: write_block returns Cancelled and leaves no completed object.
     #[tokio::test]
-    async fn cancellation_aborts() {
+    async fn cancellation_before_writing_aborts() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("fs"));
         let cfg = LakeConfig::default();
-        let mut b = block(&cfg, 5);
-        b.seal().expect("seal");
-        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let b = sealed_block(&cfg, 5);
+        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let token = CancellationToken::new();
         token.cancel();
-        assert!(matches!(sink.write_block(&b, &token).await, Err(Error::Cancelled)));
+        assert!(matches!(sink.write_block(&b, &token).await, Err(Error::Cancelled { .. })));
         assert_eq!(walkdir_count(dir.path()), 0);
     }
 
-    fn walkdir_count(root: &std::path::Path) -> usize {
-        fn walk(p: &std::path::Path, n: &mut usize) {
-            for e in std::fs::read_dir(p).expect("dir") {
-                let e = e.expect("entry");
-                if e.path().is_dir() {
-                    walk(&e.path(), n);
-                } else if e.path().extension().is_some_and(|x| x == "parquet") {
-                    *n += 1;
-                }
-            }
-        }
-        let mut n = 0;
-        walk(root, &mut n);
-        n
+    /// Scenario: cancellation arrives while the chunk loop is running, with a tiny
+    /// merge chunk size so that many chunk boundaries are crossed.
+    /// Guarantees: the write stops with Cancelled and no complete Parquet file is left.
+    #[tokio::test]
+    async fn cancellation_at_a_chunk_boundary() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut cfg = LakeConfig::default();
+        cfg.sorting.merge_chunk_bytes = 1;
+        let b = sealed_block(&cfg, 4_000);
+        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            canceller.cancel();
+        });
+        let got = sink.write_block(&b, &token).await;
+        handle.await.expect("canceller");
+        assert!(matches!(got, Err(Error::Cancelled { .. })));
+        assert_eq!(walkdir_count(dir.path()), 0);
+    }
+
+    /// Scenario: cancellation arrives while a multipart upload is in flight, with an
+    /// object store that parks `put_multipart` until the test releases it.
+    /// Guarantees: the parked upload is cancelled rather than awaited to completion,
+    /// `write_block` returns Cancelled and no complete Parquet file is left.
+    #[tokio::test]
+    async fn cancellation_inside_an_upload() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(ParkedMultipart {
+            inner: local(&dir),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let mut cfg = LakeConfig::default();
+        // Small parts so the BufWriter switches to a multipart upload quickly.
+        cfg.upload.part_bytes = 4 << 10;
+        cfg.sorting.merge_chunk_bytes = 4 << 10;
+        let b = sealed_block(&cfg, 4_000);
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let token = CancellationToken::new();
+        let waiter = entered.notified();
+        let canceller = token.clone();
+        let handle = tokio::spawn(async move {
+            waiter.await;
+            canceller.cancel();
+        });
+        let got = sink.write_block(&b, &token).await;
+        handle.await.expect("canceller");
+        release.notify_waiters();
+        assert!(matches!(got, Err(Error::Cancelled { .. })));
+        assert_eq!(walkdir_count(dir.path()), 0);
     }
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+`async_trait` is already a workspace dependency used across the repo; add `async-trait.workspace = true` to `[dev-dependencies]` if it is not there yet (`grep -n '^async-trait' rust/otap-dataflow/Cargo.toml`).
+
+- [ ] **Step 4: Run tests to verify they fail**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake sink::tests`
 Expected: compile error.
 
-- [ ] **Step 3: Implement `src/sink.rs`**
+- [ ] **Step 5: Implement `src/sink.rs`**
 
 ```rust
 // Copyright The OpenTelemetry Authors
@@ -4746,7 +5848,7 @@ use object_store::path::Path;
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::ParquetObjectWriter;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::format::KeyValue;
 use tokio_util::sync::CancellationToken;
 
@@ -4808,10 +5910,10 @@ pub struct Sink {
     naming: FileNaming,
 }
 
-fn time_range(chunks: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
+fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
     let mut lo = None;
     let mut hi = None;
-    for c in chunks {
+    for c in batches {
         if let Some(col) = c.column_by_name("time_unix_nano") {
             let a = col.as_primitive::<Int64Type>();
             if let Some(mn) = arrow::compute::min(a) {
@@ -4832,7 +5934,18 @@ impl Sink {
     }
 
     /// File metadata of spec section 5.4.
-    pub fn file_metadata(&self, table: &SortedTableBuffer, chunks: &[RecordBatch], seq: u64, window_start_secs: i64) -> Vec<KeyValue> {
+    ///
+    /// `rows` and `time_range` are computed from the sealed runs before the merge,
+    /// because the merged chunks are produced lazily and are not all available at
+    /// the time the writer properties are built.
+    pub fn file_metadata(
+        &self,
+        table: &SortedTableBuffer,
+        rows: usize,
+        time_range: (Option<i64>, Option<i64>),
+        seq: u64,
+        window_start_secs: i64,
+    ) -> Vec<KeyValue> {
         let schema = dataset_schema(table.dataset(), &self.cfg);
         let mut kv = vec![
             KeyValue::new("format_version".into(), "1".to_string()),
@@ -4844,11 +5957,10 @@ impl Sink {
             KeyValue::new("seq".into(), seq.to_string()),
             KeyValue::new("window_start".into(), window_start_secs.to_string()),
             KeyValue::new("window_end".into(), (window_start_secs + i64::try_from(self.cfg.window_interval.as_secs()).unwrap_or(15)).to_string()),
-            KeyValue::new("row_count".into(), chunks.iter().map(RecordBatch::num_rows).sum::<usize>().to_string()),
+            KeyValue::new("row_count".into(), rows.to_string()),
         ];
         if !table.dataset().is_series() {
-            let (lo, hi) = time_range(chunks);
-            if let (Some(lo), Some(hi)) = (lo, hi) {
+            if let (Some(lo), Some(hi)) = time_range {
                 kv.push(KeyValue::new("min_time_unix_nano".into(), lo.to_string()));
                 kv.push(KeyValue::new("max_time_unix_nano".into(), hi.to_string()));
             }
@@ -4856,54 +5968,120 @@ impl Sink {
         kv
     }
 
-    async fn write_table(&self, table: &SortedTableBuffer, path: &Path, seq: u64, window_start_secs: i64, cancel: &CancellationToken) -> Result<usize> {
+    /// Best-effort abort of a still-writable upload.
+    ///
+    /// Bounded by `upload.abort_timeout`, so a wedged store cannot block the flush
+    /// task. Returns why the abort did not succeed, or `None` when it did.
+    async fn abort_upload(&self, writer: AsyncArrowWriter<ParquetObjectWriter>) -> Option<String> {
+        let mut buf: BufWriter = writer.into_inner().into_inner();
+        match tokio::time::timeout(self.cfg.upload.abort_timeout, buf.abort()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_elapsed) => Some(format!("abort timed out after {:?}", self.cfg.upload.abort_timeout)),
+        }
+    }
+
+    /// Attach the outcome of the cleanup abort to the failure that triggered it.
+    fn with_abort(cause: Error, abort_error: Option<String>) -> Error {
+        match (cause, abort_error) {
+            (Error::Cancelled { .. }, abort_error) => Error::Cancelled { abort_error },
+            (cause, None) => cause,
+            (cause, Some(abort_error)) => Error::AbortFailed { source: Box::new(cause), abort_error },
+        }
+    }
+
+    async fn write_table(
+        &self,
+        table: &SortedTableBuffer,
+        path: &Path,
+        seq: u64,
+        window_start_secs: i64,
+        cancel: &CancellationToken,
+    ) -> Result<usize> {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
-        let chunks = merge_runs(&runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        let total_rows: usize = runs.iter().map(RecordBatch::num_rows).sum();
+        let range = time_range(&runs);
         let schema = dataset_schema(table.dataset(), &self.cfg);
+        // Spec 5.4 asks for ZSTD, statistics and dictionary encoding explicitly
+        // rather than by relying on arrow-rs defaults. max_row_group_size disables
+        // the row-count-based split so that the byte-driven flush below owns row
+        // group boundaries.
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(true)
             .set_max_row_group_size(usize::MAX)
-            .set_key_value_metadata(Some(self.file_metadata(table, &chunks, seq, window_start_secs)))
+            .set_key_value_metadata(Some(self.file_metadata(table, total_rows, range, seq, window_start_secs)))
             .build();
         let buf = BufWriter::with_capacity(self.store.clone(), path.clone(), self.cfg.upload.part_bytes)
             .with_max_concurrency(self.cfg.upload.concurrency);
         let object_writer = ParquetObjectWriter::from_buf_writer(buf);
         let mut writer = AsyncArrowWriter::try_new(object_writer, schema, Some(props))?;
-        let mut rows = 0;
-        for chunk in &chunks {
-            if cancel.is_cancelled() {
-                let _ = writer.into_inner().into_inner().abort().await;
-                return Err(Error::Cancelled);
-            }
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    let _ = writer.into_inner().into_inner().abort().await;
-                    return Err(Error::Cancelled);
+
+        // Phase 1: the writer is writable. Every await races the token, and every
+        // failure aborts the multipart upload.
+        let mut rows = 0usize;
+        let mut failure: Option<Error> = None;
+        let merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        for chunk in merged {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
                 }
-                res = writer.write(chunk) => { res?; }
+            };
+            let step = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
+                r = writer.write(&chunk) => r.map_err(Error::from),
+            };
+            if let Err(e) = step {
+                failure = Some(e);
+                break;
             }
             rows += chunk.num_rows();
             if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
                 || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
             {
-                writer.flush().await?;
+                let step = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
+                    r = writer.flush() => r.map_err(Error::from),
+                };
+                if let Err(e) = step {
+                    failure = Some(e);
+                    break;
+                }
             }
         }
-        tokio::select! {
+        if let Some(cause) = failure {
+            let abort_error = self.abort_upload(writer).await;
+            return Err(Self::with_abort(cause, abort_error));
+        }
+        if cancel.is_cancelled() {
+            let abort_error = self.abort_upload(writer).await;
+            return Err(Error::Cancelled { abort_error });
+        }
+
+        // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
+        // down; `BufWriter::abort` panics once shutdown has started, so nothing is
+        // aborted from here on. A partial multipart upload left by a cancellation
+        // in this phase is reclaimed by the bucket's multipart lifecycle rule
+        // (spec 5.3), not by this crate.
+        let finish = tokio::select! {
             biased;
-            () = cancel.cancelled() => {
-                let _ = writer.into_inner().into_inner().abort().await;
-                Err(Error::Cancelled)
-            }
-            res = writer.close() => { let _ = res?; Ok(rows) }
-        }
+            () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
+            r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
+        };
+        finish?;
+        Ok(rows)
     }
 
     /// Write every non-empty table of a sealed block, series datasets first.
     pub async fn write_block<T>(&self, block: &Block<T>, cancel: &CancellationToken) -> Result<FlushReport> {
         if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
+            return Err(Error::Cancelled { abort_error: None });
         }
         let mut report = FlushReport::default();
         for table in block.tables() {
@@ -4920,18 +6098,19 @@ impl Sink {
 ```
 
 Notes for the implementer:
-- `AsyncArrowWriter::into_inner` consumes the writer and returns the `ParquetObjectWriter`; `ParquetObjectWriter::into_inner` returns the `object_store::buffered::BufWriter`, whose `abort()` aborts an in-flight multipart upload (verified against parquet 58.3 and object_store 0.13.2 docs). If the abort itself fails, the leftover is covered by the bucket lifecycle rule of spec 5.3.
+- `AsyncArrowWriter::into_inner` consumes the writer and returns the `ParquetObjectWriter`; `ParquetObjectWriter::into_inner` returns the `object_store::buffered::BufWriter`, whose `abort()` aborts an in-flight multipart upload (verified against the vendored parquet 58.4.0 `arrow/async_writer/mod.rs:273`, `async_writer/store.rs`, and object_store 0.13.2 `buffered.rs:366`). It is only reachable from the writable phase, where `abort` is documented not to panic.
+- `AsyncArrowWriter::finish(&mut self) -> Result<ParquetMetaData>` exists in parquet 58.4 (`arrow/async_writer/mod.rs:250`) and leaves the writer owned by this function, which is what makes the cancellation `select!` compile; `close(self)` would move it into one arm.
 - `set_max_row_group_size(usize::MAX)` disables the row-count-based row group split so the byte-based `flush()` in the loop controls row groups; `in_progress_size()` is the encoded size estimate.
 - Tables are iterated through `Block::tables()`, whose `BTreeMap` order writes each signal's series dataset before its values datasets.
 
 Add `pub mod sink;` to `src/lib.rs`.
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 6: Run tests**
 
 Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake sink::tests`
-Expected: 3 passed.
+Expected: 7 passed.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add rust/otap-dataflow/crates/series-lake
@@ -4947,11 +6126,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `rust/otap-dataflow/crates/series-lake/tests/oracle.rs`
 - Create: `rust/otap-dataflow/crates/series-lake/tests/fuzz_canonical.rs`
+- Create: `rust/otap-dataflow/crates/series-lake/tests/fuzz_extract.rs`
+- Create: `rust/otap-dataflow/crates/series-lake/tests/golden_roundtrip.rs`
 
 **Interfaces:**
 - Consumes the public API of every module. No new production code.
 
-The oracle: generate random log records (random `host.id` from a small set, random `logger.name` from a small set, random timestamps including 0, random bodies and residual attributes), split them into random requests (1..=5 records each), extract and admit into a `Block`, seal, write with `Sink` to a `LocalFileSystem`, read back every Parquet file, and compare against a naive model: `Vec<Row>` sorted with `sort_by` on `(series_id, time_unix_nano nulls last)`; the descriptor set must equal the set of distinct `(host.id, logger.name)` pairs. Runs with sorting enabled (exact order equality) and disabled (multiset equality).
+The oracle computes the expected output **independently of `extract`**: it builds a `canonical::Descriptor` straight from the generated OTLP input and hashes it with `canonical_bytes` plus `series_id`. Nothing in the reference path calls extraction, so the two implementations can disagree. Each case generates records, splits them into requests of random size, admits them into one `Block`, seals it, writes it with `Sink` to a `LocalFileSystem`, reads every Parquet file back and compares:
+
+- the multiset of `(series_id, time, payload)` value rows against the model, where `payload` is the body for logs, the int/double value for metric number points and the count for histogram points;
+- the set of `series_id`s in the `series` file against the model's set, and, per series, the descriptor content read back from the file (`resource_attrs`, `attrs`, and for metrics `metric_name`, `metric_type`, `temporality`);
+- under `sorting.enabled`, that the values file is globally ordered by the sort spec.
+
+Three datasets are covered -- logs values, metric number points and metric histogram points -- each with `sorting` both on and off.
 
 - [ ] **Step 1: Write `tests/oracle.rs`**
 
@@ -4961,55 +6148,206 @@ The oracle: generate random log records (random `host.id` from a small set, rand
 
 //! Reference-oracle property test (spec section 9.1).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
-use arrow::datatypes::Int64Type;
+use arrow::datatypes::{Float64Type, Int64Type};
+use arrow::record_batch::RecordBatch;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
-use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
-use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
+use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
+use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
+    AnyValue, InstrumentationScope, KeyValue, any_value,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+    LogRecord, LogsData, ResourceLogs, ScopeLogs,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
+    AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, MetricsData,
+    NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+};
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
-use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
+use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
 use otel_arrow_dfe_series_lake::buffer::Block;
 use otel_arrow_dfe_series_lake::cache::SeriesCache;
+use otel_arrow_dfe_series_lake::canonical::{
+    Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_bytes,
+    series_id,
+};
 use otel_arrow_dfe_series_lake::config::LakeConfig;
 use otel_arrow_dfe_series_lake::extract::extract;
 use otel_arrow_dfe_series_lake::schema::Dataset;
 use otel_arrow_dfe_series_lake::sink::{FileNaming, Sink};
+use otel_arrow_dfe_series_lake::sort::{SortSpec, is_sorted};
+use otel_arrow_dfe_series_lake::value::Value;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use proptest::prelude::*;
 use tokio_util::sync::CancellationToken;
 
+const WINDOW_START: i64 = 1_789_960_500;
+const SEAL_AT_US: i64 = 1_789_960_500_000_000;
+
+fn kv(k: &str, v: &str) -> KeyValue {
+    KeyValue { key: k.into(), value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.into())) }) }
+}
+
+fn attr(k: &str, v: &str) -> (String, Value) {
+    (k.to_string(), Value::Str(v.to_string()))
+}
+
+fn base_cfg(sorting: bool) -> LakeConfig {
+    let mut cfg = LakeConfig::default();
+    cfg.logs.series_attributes = vec!["logger.name".into()];
+    cfg.sorting.enabled = sorting;
+    // Seal a run per request: maximal merge pressure. `validate()` is not called
+    // here, so the run_target/max_row relation does not apply.
+    cfg.sorting.run_target_bytes = 1;
+    cfg.sorting.merge_chunk_bytes = 1;
+    cfg.ingress.max_row_bytes = 1 << 20;
+    cfg
+}
+
+/// The reference identity of a logs series, built without touching `extract`.
+fn logs_series_id(host: u8, logger: u8) -> SeriesId {
+    series_id(&canonical_bytes(&Descriptor {
+        signal: Signal::Logs,
+        resource_attrs: vec![attr("host.id", &format!("h{host}"))],
+        resource_schema_url: String::new(),
+        scope_name: String::new(),
+        scope_version: String::new(),
+        scope_schema_url: String::new(),
+        scope_attrs: vec![],
+        metric: None,
+        attrs: vec![attr("logger.name", &format!("L{logger}"))],
+    }))
+}
+
+/// The reference identity of a metrics series, built without touching `extract`.
+fn metrics_series_id(host: u8, name: &str, kind: MetricKind, temporality: Temporality, dp: u8) -> SeriesId {
+    series_id(&canonical_bytes(&Descriptor {
+        signal: Signal::Metrics,
+        resource_attrs: vec![attr("host.id", &format!("h{host}"))],
+        resource_schema_url: String::new(),
+        scope_name: String::new(),
+        scope_version: String::new(),
+        scope_schema_url: String::new(),
+        scope_attrs: vec![],
+        metric: Some(MetricDescriptor {
+            name: name.to_string(),
+            unit: String::new(),
+            kind,
+            temporality,
+            is_monotonic: false,
+            description: String::new(),
+        }),
+        attrs: vec![attr("dp", &format!("d{dp}"))],
+    }))
+}
+
+/// Admit every request into one block, seal it, write it and read the files back.
+async fn round_trip(
+    cfg: &LakeConfig,
+    requests: Vec<OtapArrowRecords>,
+) -> Result<(BTreeMap<Dataset, Vec<RecordBatch>>, tempfile::TempDir), TestCaseError> {
+    let dir = tempfile::tempdir().map_err(|e| TestCaseError::fail(e.to_string()))?;
+    let store: Arc<dyn ObjectStore> = Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).map_err(|e| TestCaseError::fail(e.to_string()))?,
+    );
+    let mut cache = SeriesCache::new(10_000);
+    let mut block: Block<usize> = Block::new(WINDOW_START, 1, cfg);
+    for (i, mut records) in requests.into_iter().enumerate() {
+        let e = extract(&mut records, cfg).map_err(|e| TestCaseError::fail(format!("{e}")))?;
+        let r = block.reserve(&e, &mut cache, 8, cfg).map_err(|e| TestCaseError::fail(format!("{e}")))?;
+        block.admit(e, r, i).map_err(|e| TestCaseError::fail(format!("{e}")))?;
+    }
+    block.seal(SEAL_AT_US).map_err(|e| TestCaseError::fail(format!("{e}")))?;
+    let sink = Sink::new(store, cfg.clone(), FileNaming::new("oracle"));
+    let report = sink
+        .write_block(&block, &CancellationToken::new())
+        .await
+        .map_err(|e| TestCaseError::fail(format!("{e}")))?;
+
+    let mut out: BTreeMap<Dataset, Vec<RecordBatch>> = BTreeMap::new();
+    for (ds, path, _) in &report.files {
+        let file = std::fs::File::open(dir.path().join(path.as_ref()))
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?
+            .build()
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        for b in reader {
+            out.entry(*ds).or_default().push(b.map_err(|e| TestCaseError::fail(e.to_string()))?);
+        }
+    }
+    Ok((out, dir))
+}
+
+fn series_id_at(b: &RecordBatch, row: usize) -> Vec<u8> {
+    b.column_by_name("series_id").expect("series_id").as_fixed_size_binary().value(row).to_vec()
+}
+
+fn time_at(b: &RecordBatch, row: usize) -> Option<i64> {
+    let t = b.column_by_name("time_unix_nano").expect("time_unix_nano").as_primitive::<Int64Type>();
+    t.is_valid(row).then(|| t.value(row))
+}
+
+/// Map column read back as a sorted key/value vector.
+fn map_at(b: &RecordBatch, name: &str, row: usize) -> Vec<(String, String)> {
+    let m = b.column_by_name(name).expect(name).as_map();
+    let entries = m.value(row);
+    let keys = entries.column(0).as_string::<i32>();
+    let values = entries.column(1).as_string::<i32>();
+    let mut out: Vec<(String, String)> = (0..entries.num_rows())
+        .map(|i| (keys.value(i).to_string(), values.value(i).to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
+fn string_at(b: &RecordBatch, name: &str, row: usize) -> String {
+    b.column_by_name(name).expect(name).as_string::<i32>().value(row).to_string()
+}
+
+/// Assert the values file is globally ordered when sorting is on.
+fn check_order(cfg: &LakeConfig, batches: &[RecordBatch], signal: Signal) -> Result<(), TestCaseError> {
+    if !cfg.sorting.enabled {
+        return Ok(());
+    }
+    let keys = if signal == Signal::Logs { &cfg.logs.values_sort } else { &cfg.metrics.values_sort };
+    let spec = SortSpec::new(keys.clone());
+    let schema = batches[0].schema();
+    let all = arrow::compute::concat_batches(&schema, batches).map_err(|e| TestCaseError::fail(e.to_string()))?;
+    prop_assert!(is_sorted(&all, &spec).map_err(|e| TestCaseError::fail(format!("{e}")))?);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- logs
+
 #[derive(Debug, Clone)]
-struct Rec {
+struct LogRec {
     host: u8,
     logger: u8,
     time: u64,
     body: String,
 }
 
-fn rec_strategy() -> impl Strategy<Value = Rec> {
+fn log_rec() -> impl Strategy<Value = LogRec> {
     (0u8..3, 0u8..3, prop_oneof![Just(0u64), 1u64..1_000_000], "[a-z]{0,8}")
-        .prop_map(|(host, logger, time, body)| Rec { host, logger, time, body })
+        .prop_map(|(host, logger, time, body)| LogRec { host, logger, time, body })
 }
 
-fn kv(k: &str, v: &str) -> KeyValue {
-    KeyValue { key: k.into(), value: Some(AnyValue { value: Some(any_value::Value::StringValue(v.into())) }) }
-}
-
-fn to_logs_data(recs: &[Rec]) -> LogsData {
-    // One ResourceLogs per host so resources differ; records grouped by host.
+fn logs_request(recs: &[LogRec]) -> OtapArrowRecords {
     let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
     hosts.sort_unstable();
     hosts.dedup();
-    LogsData {
+    encode_logs(&LogsData {
         resource_logs: hosts
             .iter()
             .map(|h| ResourceLogs {
                 resource: Some(Resource { attributes: vec![kv("host.id", &format!("h{h}"))], ..Default::default() }),
                 scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope::default()),
                     log_records: recs
                         .iter()
                         .filter(|r| r.host == *h)
@@ -5025,132 +6363,356 @@ fn to_logs_data(recs: &[Rec]) -> LogsData {
                 ..Default::default()
             })
             .collect(),
-    }
+    })
 }
 
-/// Model row: what the values file must contain, in oracle order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ModelRow {
-    series: (u8, u8),
-    time: Option<i64>,
-    body: String,
-}
-
-async fn run_case(recs: Vec<Rec>, splits: Vec<u8>, sorting: bool) -> Result<(), TestCaseError> {
-    let mut cfg = LakeConfig::default();
-    cfg.logs.series_attributes = vec!["logger.name".into()];
-    cfg.sorting.enabled = sorting;
-    cfg.sorting.run_target_bytes = 1; // seal a run per request: maximal merge pressure
-    cfg.sorting.merge_chunk_bytes = 1;
-    cfg.ingress.max_row_bytes = 0; // disabled check for tiny targets: validate() is not called here
-    let dir = tempfile::tempdir().map_err(|e| TestCaseError::fail(e.to_string()))?;
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).map_err(|e| TestCaseError::fail(e.to_string()))?);
-    let mut cache = SeriesCache::new(1000);
-    let mut block: Block<usize> = Block::new(1_789_960_500, 1, &cfg);
-
-    // Split into requests.
+fn split<T: Clone>(items: &[T], sizes: &[u8]) -> Vec<Vec<T>> {
+    let mut out = Vec::new();
     let mut idx = 0;
-    let mut req = 0;
-    while idx < recs.len() {
-        let n = usize::from(splits[req % splits.len()].max(1)).min(recs.len() - idx);
-        let chunk = &recs[idx..idx + n];
+    let mut which = 0;
+    while idx < items.len() {
+        let n = usize::from(sizes[which % sizes.len()].max(1)).min(items.len() - idx);
+        out.push(items[idx..idx + n].to_vec());
         idx += n;
-        req += 1;
-        let records = encode_logs(&to_logs_data(chunk));
-        let e = extract(&records, &cfg).map_err(|e| TestCaseError::fail(format!("{e}")))?;
-        let r = block.reserve(&e, &mut cache, 8, &cfg);
-        block.admit(e, r, req, 0, &cfg).map_err(|e| TestCaseError::fail(format!("{e}")))?;
+        which += 1;
     }
-    block.seal().map_err(|e| TestCaseError::fail(format!("{e}")))?;
-    let sink = Sink::new(store, cfg.clone(), FileNaming::new("oracle"));
-    let report = sink.write_block(&block, &CancellationToken::new()).await.map_err(|e| TestCaseError::fail(format!("{e}")))?;
+    out
+}
 
-    // Oracle.
-    let mut model: Vec<ModelRow> = recs
+async fn logs_case(recs: Vec<LogRec>, sizes: Vec<u8>, sorting: bool) -> Result<(), TestCaseError> {
+    let cfg = base_cfg(sorting);
+    let requests: Vec<OtapArrowRecords> = split(&recs, &sizes).iter().map(|c| logs_request(c)).collect();
+    let (files, _dir) = round_trip(&cfg, requests).await?;
+
+    // Model, computed without extraction.
+    let mut model: Vec<(Vec<u8>, Option<i64>, String)> = recs
         .iter()
-        .map(|r| ModelRow { series: (r.host, r.logger), time: (r.time > 0).then_some(r.time as i64), body: r.body.clone() })
+        .map(|r| {
+            (
+                logs_series_id(r.host, r.logger).to_vec(),
+                (r.time > 0).then_some(r.time as i64),
+                r.body.clone(),
+            )
+        })
         .collect();
-    let expected_series: BTreeSet<(u8, u8)> = recs.iter().map(|r| (r.host, r.logger)).collect();
+    let model_series: BTreeSet<Vec<u8>> =
+        recs.iter().map(|r| logs_series_id(r.host, r.logger).to_vec()).collect();
 
-    // Actual.
+    let values = files.get(&Dataset::LogsValues).expect("values file");
     let mut actual: Vec<(Vec<u8>, Option<i64>, String)> = Vec::new();
-    let mut series_ids: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (ds, path, _) in &report.files {
-        let file = std::fs::File::open(dir.path().join(path.as_ref())).map_err(|e| TestCaseError::fail(e.to_string()))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| TestCaseError::fail(e.to_string()))?.build().map_err(|e| TestCaseError::fail(e.to_string()))?;
-        for b in reader {
-            let b = b.map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let ids = b.column_by_name("series_id").expect("id").as_fixed_size_binary();
-            match ds {
-                Dataset::LogsSeries => {
-                    for i in 0..b.num_rows() {
-                        let _ = series_ids.insert(ids.value(i).to_vec());
-                    }
-                }
-                Dataset::LogsValues => {
-                    let t = b.column_by_name("time_unix_nano").expect("t").as_primitive::<Int64Type>();
-                    let body = b.column_by_name("body").expect("body").as_string::<i32>();
-                    for i in 0..b.num_rows() {
-                        actual.push((ids.value(i).to_vec(), t.is_valid(i).then(|| t.value(i)), body.value(i).to_string()));
-                    }
-                }
-                _ => return Err(TestCaseError::fail("unexpected dataset")),
-            }
+    for b in values {
+        for row in 0..b.num_rows() {
+            actual.push((series_id_at(b, row), time_at(b, row), string_at(b, "body", row)));
         }
     }
-    prop_assert_eq!(series_ids.len(), expected_series.len(), "distinct descriptors");
-    prop_assert_eq!(actual.len(), model.len(), "row count");
-
-    // Map model series to actual ids through the (host, logger) -> id association observed in the data.
-    // Since ids are opaque, compare orderings: group actual by id, model by series, and check
-    // that both orders are consistent with the sort spec.
-    if sorting {
-        // Sorted by (series_id, time nulls last): within the output, ids must be non-decreasing and
-        // times non-decreasing within one id with nulls at the end.
-        for w in actual.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            prop_assert!(a.0 <= b.0, "series ids non-decreasing");
-            if a.0 == b.0 {
-                match (a.1, b.1) {
-                    (Some(x), Some(y)) => prop_assert!(x <= y, "time non-decreasing"),
-                    (None, Some(_)) => return Err(TestCaseError::fail("null before value")),
-                    _ => {}
-                }
-            }
-        }
-    }
-    // Multiset equality of (time, body) per series, independent of ids.
     model.sort();
-    let mut actual_tb: Vec<(Option<i64>, String)> = actual.iter().map(|(_, t, b)| (*t, b.clone())).collect();
-    let mut model_tb: Vec<(Option<i64>, String)> = model.iter().map(|m| (m.time, m.body.clone())).collect();
-    actual_tb.sort();
-    model_tb.sort();
-    prop_assert_eq!(actual_tb, model_tb, "rows as multiset");
+    actual.sort();
+    prop_assert_eq!(actual, model, "logs value rows as a multiset of (series_id, time, body)");
+    check_order(&cfg, values, Signal::Logs)?;
+
+    // Descriptor content, per series.
+    let series = files.get(&Dataset::LogsSeries).expect("series file");
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for b in series {
+        for row in 0..b.num_rows() {
+            let id = series_id_at(b, row);
+            prop_assert!(seen.insert(id.clone()), "a series is described at most once");
+            let host_attr = map_at(b, "resource_attrs", row);
+            let ident = map_at(b, "attrs", row);
+            prop_assert_eq!(host_attr.len(), 1);
+            prop_assert_eq!(ident.len(), 1);
+            let expected = logs_series_id(
+                host_attr[0].1.trim_start_matches('h').parse::<u8>().expect("host"),
+                ident[0].1.trim_start_matches('L').parse::<u8>().expect("logger"),
+            );
+            prop_assert_eq!(id, expected.to_vec(), "descriptor content hashes to its series_id");
+        }
+    }
+    prop_assert_eq!(seen, model_series, "descriptor set");
     Ok(())
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, .. ProptestConfig::default() })]
+// ------------------------------------------------------- metric numbers
 
-    /// Scenario: random records, random request splits, sorting enabled.
-    /// Guarantees: output equals the naive model as a multiset and is globally sorted by the spec.
+#[derive(Debug, Clone)]
+struct NumRec {
+    host: u8,
+    metric: u8,
+    dp: u8,
+    time: u64,
+    int_value: Option<i64>,
+    double_value: Option<f64>,
+}
+
+fn num_rec() -> impl Strategy<Value = NumRec> {
+    (0u8..2, 0u8..2, 0u8..3, prop_oneof![Just(0u64), 1u64..1_000_000], any::<bool>(), -1000i64..1000)
+        .prop_map(|(host, metric, dp, time, is_int, v)| NumRec {
+            host,
+            metric,
+            dp,
+            time,
+            int_value: is_int.then_some(v),
+            double_value: (!is_int).then_some(v as f64),
+        })
+}
+
+fn metrics_request(build: impl Fn(u8) -> Vec<Metric>, hosts: &[u8]) -> OtapArrowRecords {
+    encode_metrics(&MetricsData {
+        resource_metrics: hosts
+            .iter()
+            .map(|h| ResourceMetrics {
+                resource: Some(Resource { attributes: vec![kv("host.id", &format!("h{h}"))], ..Default::default() }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope::default()),
+                    metrics: build(*h),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect(),
+    })
+}
+
+fn number_request(recs: &[NumRec]) -> OtapArrowRecords {
+    let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    metrics_request(
+        |h| {
+            let mut names: Vec<u8> = recs.iter().filter(|r| r.host == h).map(|r| r.metric).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+                .iter()
+                .map(|m| Metric {
+                    name: format!("m{m}"),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: recs
+                            .iter()
+                            .filter(|r| r.host == h && r.metric == *m)
+                            .map(|r| NumberDataPoint {
+                                time_unix_nano: r.time,
+                                attributes: vec![kv("dp", &format!("d{}", r.dp))],
+                                value: Some(match (r.int_value, r.double_value) {
+                                    (Some(i), _) => number_data_point::Value::AsInt(i),
+                                    (_, Some(d)) => number_data_point::Value::AsDouble(d),
+                                    _ => number_data_point::Value::AsInt(0),
+                                }),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &hosts,
+    )
+}
+
+async fn number_case(recs: Vec<NumRec>, sizes: Vec<u8>, sorting: bool) -> Result<(), TestCaseError> {
+    let cfg = base_cfg(sorting);
+    let requests: Vec<OtapArrowRecords> = split(&recs, &sizes).iter().map(|c| number_request(c)).collect();
+    let (files, _dir) = round_trip(&cfg, requests).await?;
+
+    let mut model: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = recs
+        .iter()
+        .map(|r| {
+            (
+                metrics_series_id(r.host, &format!("m{}", r.metric), MetricKind::Gauge, Temporality::Unspecified, r.dp).to_vec(),
+                (r.time > 0).then_some(r.time as i64),
+                r.int_value,
+                r.double_value.map(|d| d.to_string()),
+            )
+        })
+        .collect();
+    let model_series: BTreeSet<Vec<u8>> = model.iter().map(|m| m.0.clone()).collect();
+
+    let values = files.get(&Dataset::MetricsNumber).expect("number file");
+    let mut actual: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = Vec::new();
+    for b in values {
+        let vi = b.column_by_name("value_int").expect("value_int").as_primitive::<Int64Type>();
+        let vd = b.column_by_name("value_double").expect("value_double").as_primitive::<Float64Type>();
+        for row in 0..b.num_rows() {
+            actual.push((
+                series_id_at(b, row),
+                time_at(b, row),
+                vi.is_valid(row).then(|| vi.value(row)),
+                vd.is_valid(row).then(|| vd.value(row).to_string()),
+            ));
+        }
+    }
+    model.sort();
+    actual.sort();
+    prop_assert_eq!(actual, model, "number rows as a multiset of (series_id, time, int, double)");
+    check_order(&cfg, values, Signal::Metrics)?;
+
+    let series = files.get(&Dataset::MetricsSeries).expect("series file");
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for b in series {
+        for row in 0..b.num_rows() {
+            let id = series_id_at(b, row);
+            prop_assert!(seen.insert(id.clone()), "a series is described at most once");
+            prop_assert_eq!(string_at(b, "metric_type", row), "gauge".to_string());
+            prop_assert_eq!(string_at(b, "temporality", row), String::new());
+            let host_attr = map_at(b, "resource_attrs", row);
+            let ident = map_at(b, "attrs", row);
+            let expected = metrics_series_id(
+                host_attr[0].1.trim_start_matches('h').parse::<u8>().expect("host"),
+                &string_at(b, "metric_name", row),
+                MetricKind::Gauge,
+                Temporality::Unspecified,
+                ident[0].1.trim_start_matches('d').parse::<u8>().expect("dp"),
+            );
+            prop_assert_eq!(id, expected.to_vec(), "descriptor content hashes to its series_id");
+        }
+    }
+    prop_assert_eq!(seen, model_series, "descriptor set");
+    Ok(())
+}
+
+// ---------------------------------------------------- metric histograms
+
+#[derive(Debug, Clone)]
+struct HistRec {
+    host: u8,
+    metric: u8,
+    dp: u8,
+    time: u64,
+    count: u32,
+}
+
+fn hist_rec() -> impl Strategy<Value = HistRec> {
+    (0u8..2, 0u8..2, 0u8..3, prop_oneof![Just(0u64), 1u64..1_000_000], 0u32..100)
+        .prop_map(|(host, metric, dp, time, count)| HistRec { host, metric, dp, time, count })
+}
+
+fn histogram_request(recs: &[HistRec]) -> OtapArrowRecords {
+    let mut hosts: Vec<u8> = recs.iter().map(|r| r.host).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    metrics_request(
+        |h| {
+            let mut names: Vec<u8> = recs.iter().filter(|r| r.host == h).map(|r| r.metric).collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+                .iter()
+                .map(|m| Metric {
+                    name: format!("m{m}"),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        aggregation_temporality: AggregationTemporality::Delta as i32,
+                        data_points: recs
+                            .iter()
+                            .filter(|r| r.host == h && r.metric == *m)
+                            .map(|r| HistogramDataPoint {
+                                time_unix_nano: r.time,
+                                attributes: vec![kv("dp", &format!("d{}", r.dp))],
+                                count: u64::from(r.count),
+                                sum: Some(f64::from(r.count)),
+                                bucket_counts: vec![u64::from(r.count), 0],
+                                explicit_bounds: vec![1.0],
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                })
+                .collect()
+        },
+        &hosts,
+    )
+}
+
+async fn histogram_case(recs: Vec<HistRec>, sizes: Vec<u8>, sorting: bool) -> Result<(), TestCaseError> {
+    let cfg = base_cfg(sorting);
+    let requests: Vec<OtapArrowRecords> = split(&recs, &sizes).iter().map(|c| histogram_request(c)).collect();
+    let (files, _dir) = round_trip(&cfg, requests).await?;
+
+    let mut model: Vec<(Vec<u8>, Option<i64>, i64)> = recs
+        .iter()
+        .map(|r| {
+            (
+                metrics_series_id(r.host, &format!("m{}", r.metric), MetricKind::Histogram, Temporality::Delta, r.dp).to_vec(),
+                (r.time > 0).then_some(r.time as i64),
+                i64::from(r.count),
+            )
+        })
+        .collect();
+    let model_series: BTreeSet<Vec<u8>> = model.iter().map(|m| m.0.clone()).collect();
+
+    let values = files.get(&Dataset::MetricsHistogram).expect("histogram file");
+    let mut actual: Vec<(Vec<u8>, Option<i64>, i64)> = Vec::new();
+    for b in values {
+        let count = b.column_by_name("count").expect("count").as_primitive::<Int64Type>();
+        for row in 0..b.num_rows() {
+            actual.push((series_id_at(b, row), time_at(b, row), count.value(row)));
+        }
+    }
+    model.sort();
+    actual.sort();
+    prop_assert_eq!(actual, model, "histogram rows as a multiset of (series_id, time, count)");
+    check_order(&cfg, values, Signal::Metrics)?;
+
+    let series = files.get(&Dataset::MetricsSeries).expect("series file");
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for b in series {
+        for row in 0..b.num_rows() {
+            let id = series_id_at(b, row);
+            prop_assert!(seen.insert(id.clone()), "a series is described at most once");
+            prop_assert_eq!(string_at(b, "metric_type", row), "histogram".to_string());
+            prop_assert_eq!(string_at(b, "temporality", row), "delta".to_string());
+        }
+    }
+    prop_assert_eq!(seen, model_series, "descriptor set");
+    Ok(())
+}
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
+
+    /// Scenario: random log records split into random requests, sorting on and off.
+    /// Guarantees: the values file equals the independently computed model as a multiset of
+    /// (series_id, time, body), the descriptor set matches and each descriptor's content
+    /// hashes back to its own series_id; with sorting on the file is globally ordered.
     #[test]
-    fn oracle_sorted(recs in prop::collection::vec(rec_strategy(), 1..60), splits in prop::collection::vec(1u8..6, 1..8)) {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
-        rt.block_on(run_case(recs, splits, true))?;
+    fn oracle_logs(
+        recs in prop::collection::vec(log_rec(), 1..40),
+        sizes in prop::collection::vec(1u8..6, 1..8),
+        sorting in any::<bool>(),
+    ) {
+        rt().block_on(logs_case(recs, sizes, sorting))?;
     }
 
-    /// Scenario: the same with sorting disabled.
-    /// Guarantees: output is still the same multiset; invariants do not depend on sorting.
+    /// Scenario: random gauge data points split into random requests, sorting on and off.
+    /// Guarantees: the number file equals the independently computed model as a multiset of
+    /// (series_id, time, value_int, value_double) and the descriptors match.
     #[test]
-    fn oracle_unsorted(recs in prop::collection::vec(rec_strategy(), 1..60), splits in prop::collection::vec(1u8..6, 1..8)) {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
-        rt.block_on(run_case(recs, splits, false))?;
+    fn oracle_metric_numbers(
+        recs in prop::collection::vec(num_rec(), 1..30),
+        sizes in prop::collection::vec(1u8..6, 1..8),
+        sorting in any::<bool>(),
+    ) {
+        rt().block_on(number_case(recs, sizes, sorting))?;
+    }
+
+    /// Scenario: random delta histogram points split into random requests, sorting on and off.
+    /// Guarantees: the histogram file equals the independently computed model as a multiset of
+    /// (series_id, time, count) and the descriptors carry kind and temporality.
+    #[test]
+    fn oracle_metric_histograms(
+        recs in prop::collection::vec(hist_rec(), 1..30),
+        sizes in prop::collection::vec(1u8..6, 1..8),
+        sorting in any::<bool>(),
+    ) {
+        rt().block_on(histogram_case(recs, sizes, sorting))?;
     }
 }
 ```
-
-`max_row_bytes = 0` would refuse every row through `RowSink::push`; set it to `1 << 20` instead and keep `run_target_bytes = 1` (the `validate()` relation is not enforced by `RowSink`). Correct the line to `cfg.ingress.max_row_bytes = 1 << 20;` when writing the file.
 
 - [ ] **Step 2: Write `tests/fuzz_canonical.rs`**
 
@@ -5207,6 +6769,20 @@ fn canon_nan(v: &Value) -> Value {
     }
 }
 
+fn desc(attrs: Vec<(String, Value)>) -> Descriptor {
+    Descriptor {
+        signal: Signal::Logs,
+        resource_attrs: vec![],
+        resource_schema_url: String::new(),
+        scope_name: String::new(),
+        scope_version: String::new(),
+        scope_schema_url: String::new(),
+        scope_attrs: vec![],
+        metric: None,
+        attrs,
+    }
+}
+
 proptest! {
     /// Scenario: arbitrary value trees round-trip through CBOR.
     /// Guarantees: decode never panics and reproduces the tree (NaN payloads excepted, which CBOR
@@ -5221,47 +6797,419 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    /// Scenario: arbitrary attribute lists in arbitrary order.
-    /// Guarantees: encoding is order independent after sort_kvlist and the hash is 16 bytes.
+    /// Scenario: the same attribute list handed to the encoder in two different orders,
+    /// one already sorted and one shuffled and then normalized by `sort_kvlist`.
+    /// Guarantees: the two encodings are byte-identical, so key order in the input never
+    /// reaches the identity, and the shuffled input really is a different order before
+    /// normalization whenever the list has at least two keys.
     #[test]
-    fn encoding_is_order_independent(mut kvs in prop::collection::vec((any::<String>(), value_strategy()), 0..6)) {
-        kvs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        kvs.dedup_by(|a, b| a.0 == b.0);
-        let mut shuffled = kvs.clone();
-        shuffled.reverse();
+    fn encoding_is_order_independent(
+        kvs in prop::collection::vec((any::<String>(), value_strategy()), 0..6),
+        rotate in 0usize..6,
+    ) {
+        let mut sorted = kvs;
+        sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        sorted.dedup_by(|a, b| a.0 == b.0);
+
+        let mut shuffled = sorted.clone();
+        if shuffled.len() > 1 {
+            shuffled.rotate_left(rotate % shuffled.len());
+            shuffled.reverse();
+            let sorted_keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
+            let shuffled_keys: Vec<&str> = shuffled.iter().map(|(k, _)| k.as_str()).collect();
+            prop_assert_ne!(sorted_keys, shuffled_keys, "the shuffled input must differ before sorting");
+        }
+
+        // Encode the shuffled list as the extractor would: normalize, then encode.
         sort_kvlist(&mut shuffled).expect("unique keys");
-        let a = canonical_bytes(&desc(kvs));
+        let a = canonical_bytes(&desc(sorted));
         let b = canonical_bytes(&desc(shuffled));
         prop_assert_eq!(&a, &b);
-        prop_assert_eq!(series_id(&a).len(), 16);
-    }
-}
-
-fn desc(attrs: Vec<(String, Value)>) -> Descriptor {
-    Descriptor {
-        signal: Signal::Logs,
-        resource_attrs: vec![],
-        resource_schema_url: String::new(),
-        scope_name: String::new(),
-        scope_version: String::new(),
-        scope_schema_url: String::new(),
-        scope_attrs: vec![],
-        metric: None,
-        attrs,
+        prop_assert_eq!(series_id(&a), series_id(&b));
     }
 }
 ```
 
-- [ ] **Step 3: Run both test files**
+- [ ] **Step 3: Write `tests/fuzz_extract.rs`**
 
-Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake --test oracle --test fuzz_canonical`
-Expected: 4 passed. If `oracle_sorted` fails on "series ids non-decreasing", the merge or run sort is wrong; if it fails on "rows as multiset", extraction or interleave dropped or duplicated rows. Shrunken cases from proptest are the debugging input.
+```rust
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-- [ ] **Step 4: Commit**
+//! Fuzz-style property tests for extraction (spec section 9.3).
+
+use std::collections::BTreeSet;
+
+use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
+use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, LogsData, ResourceLogs, ScopeLogs};
+use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
+    Gauge, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+    number_data_point,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
+use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
+use otel_arrow_dfe_series_lake::canonical::hex;
+use otel_arrow_dfe_series_lake::config::LakeConfig;
+use otel_arrow_dfe_series_lake::extract::extract;
+use proptest::prelude::*;
+
+#[derive(Debug, Clone)]
+struct Attr {
+    key: String,
+    value: String,
+}
+
+fn attr() -> impl Strategy<Value = Attr> {
+    ("[a-z.]{1,6}", "[a-zA-Z0-9]{0,6}").prop_map(|(key, value)| Attr { key, value })
+}
+
+fn kv(a: &Attr) -> KeyValue {
+    KeyValue {
+        key: a.key.clone(),
+        value: Some(AnyValue { value: Some(any_value::Value::StringValue(a.value.clone())) }),
+    }
+}
+
+/// Deduplicate by key: OTLP with duplicate keys is invalid input, tested elsewhere.
+fn unique(attrs: &[Attr]) -> Vec<Attr> {
+    let mut out: Vec<Attr> = Vec::new();
+    for a in attrs {
+        if !out.iter().any(|x| x.key == a.key) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+fn logs_of(records: &[Vec<Attr>], resource: &[Attr]) -> LogsData {
+    LogsData {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource { attributes: resource.iter().map(kv).collect(), ..Default::default() }),
+            scope_logs: vec![ScopeLogs {
+                log_records: records
+                    .iter()
+                    .enumerate()
+                    .map(|(i, attrs)| LogRecord {
+                        time_unix_nano: 1_000 + i as u64,
+                        attributes: attrs.iter().map(kv).collect(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn metrics_of(points: &[Vec<Attr>], resource: &[Attr]) -> MetricsData {
+    MetricsData {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource { attributes: resource.iter().map(kv).collect(), ..Default::default() }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "m".into(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: points
+                            .iter()
+                            .enumerate()
+                            .map(|(i, attrs)| NumberDataPoint {
+                                time_unix_nano: 1_000 + i as u64,
+                                attributes: attrs.iter().map(kv).collect(),
+                                value: Some(number_data_point::Value::AsInt(i as i64)),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+fn cfg_with(series_attributes: Vec<String>) -> LakeConfig {
+    let mut cfg = LakeConfig::default();
+    cfg.logs.series_attributes = series_attributes;
+    cfg
+}
+
+fn logs_series_ids(data: &LogsData, cfg: &LakeConfig) -> BTreeSet<String> {
+    let mut records = encode_logs(data);
+    let out = extract(&mut records, cfg).expect("extract logs");
+    out.descriptors.iter().map(|d| hex(&d.series_id)).collect()
+}
+
+fn metric_series_ids(data: &MetricsData, cfg: &LakeConfig) -> BTreeSet<String> {
+    let mut records = encode_metrics(data);
+    let out = extract(&mut records, cfg).expect("extract metrics");
+    out.descriptors.iter().map(|d| hex(&d.series_id)).collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 48, .. ProptestConfig::default() })]
+
+    /// Scenario: random OTLP logs and metrics with random attribute sets.
+    /// Guarantees: extraction never panics, produces one descriptor per distinct identity
+    /// and never more descriptors than rows.
+    #[test]
+    fn extract_never_panics(
+        resource in prop::collection::vec(attr(), 0..4),
+        records in prop::collection::vec(prop::collection::vec(attr(), 0..4), 1..8),
+    ) {
+        let resource = unique(&resource);
+        let records: Vec<Vec<Attr>> = records.iter().map(|r| unique(r)).collect();
+        let keys: Vec<String> = records.iter().flatten().map(|a| a.key.clone()).collect();
+        let cfg = cfg_with(keys);
+        let logs = logs_series_ids(&logs_of(&records, &resource), &cfg);
+        prop_assert!(logs.len() <= records.len());
+        let metrics = metric_series_ids(&metrics_of(&records, &resource), &cfg);
+        prop_assert!(metrics.len() <= records.len());
+    }
+
+    /// Scenario: the same records with their attribute lists permuted, and the same
+    /// records delivered as one request or as several.
+    /// Guarantees: the set of series ids is identical in all three cases, so neither
+    /// attribute order nor request framing reaches the identity.
+    #[test]
+    fn identity_is_independent_of_attribute_order_and_framing(
+        resource in prop::collection::vec(attr(), 1..4),
+        records in prop::collection::vec(prop::collection::vec(attr(), 1..4), 2..8),
+    ) {
+        let resource = unique(&resource);
+        let records: Vec<Vec<Attr>> = records.iter().map(|r| unique(r)).collect();
+        let keys: Vec<String> = records.iter().flatten().map(|a| a.key.clone()).collect();
+        let cfg = cfg_with(keys);
+
+        let whole = logs_series_ids(&logs_of(&records, &resource), &cfg);
+
+        let mut reversed_resource = resource.clone();
+        reversed_resource.reverse();
+        let reversed: Vec<Vec<Attr>> = records
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.reverse();
+                r
+            })
+            .collect();
+        prop_assert_eq!(logs_series_ids(&logs_of(&reversed, &reversed_resource), &cfg), whole.clone());
+
+        let mut split_ids: BTreeSet<String> = BTreeSet::new();
+        for chunk in records.chunks(2) {
+            split_ids.extend(logs_series_ids(&logs_of(chunk, &resource), &cfg));
+        }
+        prop_assert_eq!(split_ids, whole);
+    }
+}
+```
+
+- [ ] **Step 4: Write `tests/golden_roundtrip.rs`**
+
+Spec section 4 requires every golden vector to be re-checked through the real OTLP-to-OTAP conversion, not only through a directly constructed `Descriptor`. This test rebuilds each vector as OTLP, converts it with pdata's encoders, runs `extract` and compares the resulting `series_id` with the hash the Python generator recorded.
+
+```rust
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Every canonical golden vector, checked through OTLP -> OTAP -> extract.
+
+use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
+    AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+    LogRecord, LogsData, ResourceLogs, ScopeLogs,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
+    AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, MetricsData,
+    NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+};
+use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
+use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
+use otel_arrow_dfe_series_lake::canonical::hex;
+use otel_arrow_dfe_series_lake::config::LakeConfig;
+use otel_arrow_dfe_series_lake::extract::extract;
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+}
+
+fn any_value_from_json(j: &serde_json::Value) -> AnyValue {
+    let v = match j["type"].as_str().expect("type") {
+        "null" => None,
+        "str" => Some(any_value::Value::StringValue(j["value"].as_str().expect("str").to_string())),
+        "bytes" => Some(any_value::Value::BytesValue(hex_decode(j["value"].as_str().expect("hex")))),
+        "int" => Some(any_value::Value::IntValue(j["value"].as_i64().expect("int"))),
+        "double" => Some(any_value::Value::DoubleValue(match j.get("bits") {
+            Some(bits) => f64::from_bits(bits.as_u64().expect("bits")),
+            None => j["value"].as_f64().expect("double"),
+        })),
+        "bool" => Some(any_value::Value::BoolValue(j["value"].as_bool().expect("bool"))),
+        "array" => Some(any_value::Value::ArrayValue(ArrayValue {
+            values: j["items"].as_array().expect("items").iter().map(any_value_from_json).collect(),
+        })),
+        "kvlist" => Some(any_value::Value::KvlistValue(KeyValueList {
+            values: kvs_from_json(&j["entries"]),
+        })),
+        other => panic!("unknown type {other}"),
+    };
+    AnyValue { value: v }
+}
+
+fn kvs_from_json(j: &serde_json::Value) -> Vec<KeyValue> {
+    j.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| KeyValue {
+                    key: e["key"].as_str().expect("key").to_string(),
+                    value: Some(any_value_from_json(&e["value"])),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn str_field(j: &serde_json::Value, k: &str) -> String {
+    j.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn keys_of(j: &serde_json::Value, field: &str) -> Vec<String> {
+    j.get(field)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|e| e["key"].as_str().expect("key").to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn logs_for(d: &serde_json::Value) -> LogsData {
+    LogsData {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: kvs_from_json(&d["resource_attrs"]),
+                ..Default::default()
+            }),
+            schema_url: str_field(d, "resource_schema_url"),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: str_field(d, "scope_name"),
+                    version: str_field(d, "scope_version"),
+                    attributes: kvs_from_json(&d["scope_attrs"]),
+                    ..Default::default()
+                }),
+                schema_url: str_field(d, "scope_schema_url"),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_000,
+                    attributes: kvs_from_json(&d["attrs"]),
+                    ..Default::default()
+                }],
+            }],
+        }],
+    }
+}
+
+fn metrics_for(d: &serde_json::Value) -> MetricsData {
+    let m = &d["metric"];
+    let name = str_field(m, "name");
+    let unit = str_field(m, "unit");
+    let point = NumberDataPoint {
+        time_unix_nano: 1_000,
+        attributes: kvs_from_json(&d["attrs"]),
+        value: Some(number_data_point::Value::AsInt(1)),
+        ..Default::default()
+    };
+    let temporality = match str_field(m, "temporality").as_str() {
+        "delta" => AggregationTemporality::Delta as i32,
+        "cumulative" => AggregationTemporality::Cumulative as i32,
+        _ => AggregationTemporality::Unspecified as i32,
+    };
+    let data = match m["kind"].as_str().expect("kind") {
+        "gauge" => metric::Data::Gauge(Gauge { data_points: vec![point] }),
+        "sum" => metric::Data::Sum(Sum {
+            aggregation_temporality: temporality,
+            is_monotonic: m.get("is_monotonic").and_then(|v| v.as_bool()).unwrap_or(false),
+            data_points: vec![point],
+        }),
+        "histogram" => metric::Data::Histogram(Histogram {
+            aggregation_temporality: temporality,
+            data_points: vec![HistogramDataPoint {
+                time_unix_nano: 1_000,
+                attributes: kvs_from_json(&d["attrs"]),
+                count: 1,
+                sum: Some(1.0),
+                bucket_counts: vec![1],
+                explicit_bounds: vec![],
+                ..Default::default()
+            }],
+        }),
+        other => panic!("golden vector uses unsupported metric kind {other}"),
+    };
+    MetricsData {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: kvs_from_json(&d["resource_attrs"]),
+                ..Default::default()
+            }),
+            schema_url: str_field(d, "resource_schema_url"),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: str_field(d, "scope_name"),
+                    version: str_field(d, "scope_version"),
+                    attributes: kvs_from_json(&d["scope_attrs"]),
+                    ..Default::default()
+                }),
+                schema_url: str_field(d, "scope_schema_url"),
+                metrics: vec![Metric { name, unit, data: Some(data), ..Default::default() }],
+            }],
+        }],
+    }
+}
+
+/// Scenario: every golden vector rebuilt as OTLP, converted to OTAP by pdata and
+/// run through the real extraction path.
+/// Guarantees: the converted representation produces exactly the `series_id` the
+/// independent Python generator recorded, so conversion is identity preserving
+/// (spec section 4 and 9.1).
+#[test]
+fn golden_vectors_survive_otlp_to_otap_conversion() {
+    let raw = include_str!("golden/canonical_v1.json");
+    let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
+    let vectors = doc["vectors"].as_array().expect("vectors");
+    assert!(vectors.len() >= 30);
+    for v in vectors {
+        let name = v["name"].as_str().expect("name");
+        let d = &v["descriptor"];
+        let expected = v["series_id_hex"].as_str().expect("id");
+        let mut cfg = LakeConfig::default();
+        // Every identity attribute of the vector must stay in the identity.
+        cfg.logs.series_attributes = keys_of(d, "attrs");
+        // The vectors never project a producer id.
+        cfg.producer_id_attribute = "__absent__".into();
+        let got = if d["signal"] == "logs" {
+            let mut records = encode_logs(&logs_for(d));
+            extract(&mut records, &cfg).expect("extract logs")
+        } else {
+            let mut records = encode_metrics(&metrics_for(d));
+            extract(&mut records, &cfg).expect("extract metrics")
+        };
+        assert_eq!(got.descriptors.len(), 1, "one series for {name}");
+        assert_eq!(hex(&got.descriptors[0].series_id), expected, "series id of {name}");
+    }
+}
+```
+
+If a vector cannot survive the round trip, the spec text decides which side is wrong; do not weaken the assertion. The two most likely culprits are a golden vector whose scope or schema URL is not carried by pdata's encoder for that signal, and a double whose bit pattern is normalized during OTLP encoding. Record any deviation in `docs/FORMAT.md` limitations (task 14) instead of skipping the vector silently.
+
+- [ ] **Step 5: Run all four test files**
+
+Run: `cd rust/otap-dataflow && cargo test -p otel-arrow-dfe-series-lake --test oracle --test fuzz_canonical --test fuzz_extract --test golden_roundtrip`
+Expected: 8 passed (3 oracle, 2 canonical, 2 extract, 1 golden round trip). If an oracle case fails on "rows as a multiset", extraction or the merge dropped or duplicated rows; if it fails on "descriptor content hashes to its series_id", the descriptor written to the `series` file disagrees with the identity used for the values rows. Shrunken cases from proptest are the debugging input.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add rust/otap-dataflow/crates/series-lake/tests
-git commit -m "test(series_lake): reference-oracle property test and canonical fuzzing
+git commit -m "test(series_lake): reference oracle, extraction fuzzing and golden round trip
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -5273,11 +7221,14 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Files:**
 - Create: `rust/otap-dataflow/crates/series-lake/docs/FORMAT.md`
 - Modify: `rust/otap-dataflow/crates/series-lake/README.md`
+- Modify: `rust/otap-dataflow/crates/series-lake/Cargo.toml` (dependency cleanup)
 - Create: `rust/otap-dataflow/.chloggen/series-lake-core.yaml`
 
 - [ ] **Step 1: Write `docs/FORMAT.md`**
 
-An implementation-independent description, no Rust, no Dataflow, no buffer internals. Copy the following sections from the design spec (revision 4) verbatim, adjusting only cross-references: section 4 (canonical encoding v1, without the paragraph about `crates/series-lake/docs/FORMAT.md`), section 5.1 (datasets, columns, timestamp rule, `render_v1`, unsupported inputs), section 5.2 (denormalization and the schema contract), section 5.3 (layout, naming, visibility guarantees), section 5.4 (Parquet options, metadata, compaction scope), section 5.5 (reading, canonical view, coverage guarantee). Add a short preamble:
+`FORMAT.md` is **normative for this crate**: it is what a reader or writer in another language implements against, so it restates the relevant spec sections rather than linking to them. That duplication is accepted on purpose; the header below records which document wins if they ever disagree.
+
+Copy the following sections from the design spec (revision 4), adjusting only cross-references: section 4 (canonical encoding v1, without the paragraph about `crates/series-lake/docs/FORMAT.md`), section 5.1 (datasets, columns, timestamp rule, `render_v1`, unsupported inputs), section 5.2 (denormalization and the schema contract), section 5.3 (layout, naming, visibility guarantees), section 5.4 (Parquet options, metadata, compaction scope), section 5.5 (reading, canonical view, coverage guarantee). Add this preamble:
 
 ```markdown
 # Series Lake Format, version 1
@@ -5287,13 +7238,36 @@ exporter: series identity, datasets, layout, file semantics, delivery
 semantics and compatibility rules. It is independent of the writer
 implementation; any reader or writer in any language may rely on it.
 
+This file is normative for the format. It deliberately restates parts of
+`docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md`, which
+is the design rationale rather than the contract; where the two disagree,
+this file describes what the writer actually produces and the spec explains
+why.
+
 Golden vectors for the identity encoding live next to this file in
 `../tests/golden/canonical_v1.json`, generated by `../tools/gen_golden.py`.
 ```
 
-and a closing section:
+and these two closing sections:
 
 ```markdown
+## Limitations of version 1
+
+- Exponential histograms and summaries are not stored. Depending on the
+  `unsupported` policy the whole request is rejected, or the points are
+  dropped and counted.
+- Exemplars are not stored. Their rows are counted as dropped, and their own
+  attribute payloads are neither read nor validated.
+- Metric metadata attributes are not read. Duplicate keys inside a payload
+  that version 1 ignores are therefore not detected, while duplicate keys in
+  any identity attribute list (resource, scope, log record, data point) make
+  the request invalid.
+- Attribute maps are lossy for readers: values are rendered to strings by
+  `render_v1`, so a string `"42"` and an integer `42` are indistinguishable in
+  the `attrs` map. The identity encoding is not lossy; `series_id`
+  distinguishes them.
+- Traces are refused.
+
 ## Compatibility rules
 
 - `format_version` is part of every file's metadata and of the `v=1` path
@@ -5303,6 +7277,11 @@ and a closing section:
   columns). Readers must read with union-by-name semantics.
 - `series_id` values are comparable across writers, versions of this writer,
   and languages, as long as `format_version` matches.
+- A reader that joins `series` and values files from different writers must
+  compare the `schema_fingerprint` metadata key. Two files of the same dataset
+  with different fingerprints have different column sets; read them with
+  union-by-name and treat missing columns as null rather than assuming a
+  single schema.
 ```
 
 Run `npx markdownlint-cli2 rust/otap-dataflow/crates/series-lake/docs/FORMAT.md` and `python3 tools/sanitycheck.py` from the repository root; fix any findings.
@@ -5322,6 +7301,72 @@ Append after the existing text:
 - `sink`: Parquet files on an `object_store`, Hive layout, frozen names.
 - `clock`: wall clock trait and aligned window boundaries.
 
+## Producer id contract
+
+Every writer that shares a lake must set `producer_id_attribute` to the same
+resource attribute, and that attribute must be present and stable on every
+request. It stays part of the series identity and is additionally projected
+into the `producer_id` column of every values row, so that a reader can tell
+which producer a row came from without joining the `series` dataset. A
+request whose resource lacks the attribute gets an empty `producer_id`, which
+is a distinct producer as far as readers are concerned.
+
+`writer_id` is a different thing: it identifies the writer process in file
+names and file metadata and is never part of the identity.
+
+## Limitations in version 1
+
+- Exponential histograms and summaries are not stored (`unsupported` decides
+  between rejecting the request and dropping the points).
+- Exemplars are not stored; their rows are counted as dropped.
+- Metric metadata attributes are not read, so duplicate keys inside them are
+  not detected.
+- `attrs` maps are lossy: values are rendered to strings, so a string `"42"`
+  and an integer `42` look the same in the map. They are still different
+  series.
+- Traces are refused.
+
+## Reading the data
+
+DuckDB:
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+CREATE VIEW logs_values AS
+  SELECT * FROM read_parquet('s3://bucket/v=1/signal=logs/dataset=values/**/*.parquet',
+                             hive_partitioning = true, union_by_name = true);
+CREATE VIEW logs_series AS
+  SELECT * FROM read_parquet('s3://bucket/v=1/signal=logs/dataset=series/**/*.parquet',
+                             hive_partitioning = true, union_by_name = true);
+-- one descriptor per series: the newest wins
+CREATE VIEW logs_series_latest AS
+  SELECT * EXCLUDE (rn) FROM (
+    SELECT *, row_number() OVER (PARTITION BY series_id ORDER BY emitted_at DESC) AS rn
+    FROM logs_series) WHERE rn = 1;
+SELECT v.time, s.resource_attrs, v.body
+FROM logs_values v JOIN logs_series_latest s USING (series_id)
+WHERE v.date = '2026-09-21';
+```
+
+Spark:
+
+```python
+values = (spark.read.option("mergeSchema", "true")
+          .parquet("s3a://bucket/v=1/signal=logs/dataset=values/"))
+series = (spark.read.option("mergeSchema", "true")
+          .parquet("s3a://bucket/v=1/signal=logs/dataset=series/"))
+latest = (series.withColumn("rn", row_number().over(
+              Window.partitionBy("series_id").orderBy(col("emitted_at").desc())))
+          .filter("rn = 1").drop("rn"))
+values.join(latest, "series_id").select("time", "resource_attrs", "body")
+```
+
+Both recipes need `union_by_name` / `mergeSchema` because denormalized columns
+may be added over time. To detect an incompatible mix, compare the
+`schema_fingerprint` key in each file's Parquet metadata: files of one dataset
+with different fingerprints have different column sets, and a reader that
+ignores this silently drops columns.
+
 ## Testing
 
 ```bash
@@ -5330,39 +7375,67 @@ cargo test -p otel-arrow-dfe-series-lake
 ```
 
 The reference-oracle property test in `tests/oracle.rs` is the main
-correctness test; `tests/golden.rs` checks the identity encoding against
-vectors produced by an independent Python implementation.
+correctness test; `tests/golden.rs` and `tests/golden_roundtrip.rs` check the
+identity encoding against vectors produced by an independent Python
+implementation, both directly and through the real OTLP-to-OTAP conversion.
 ```
 
-- [ ] **Step 3: Add the changelog entry `.chloggen/series-lake-core.yaml`**
+- [ ] **Step 3: Dependency cleanup**
 
-```yaml
-change_type: new_component
-component: pipeline
-note: "Add the series-lake crate: canonical series identity, series/values extraction from OTAP records, bounded series cache, sorted block buffers and a Parquet sink over object_store."
-issues: [0]
-subtext: |
-  This is the engine-independent core of the upcoming exporter:series_parquet node.
-  The storage format is documented in crates/series-lake/docs/FORMAT.md.
-```
-
-Replace `[0]` with the tracking issue or PR number once it exists. Run `make chlog-validate` from the repository root (or `cd rust/otap-dataflow && make chlog-validate` if the target lives there; check the Makefile).
-
-- [ ] **Step 4: Run the full workspace checks**
-
-Run:
+Confirm the crate declares nothing it does not use. Task 12 already moved `futures` out of `[dependencies]` and into `[dev-dependencies]`, where the cancellation test's `ObjectStore` wrapper needs `futures::stream::BoxStream`. Verify:
 
 ```bash
 cd rust/otap-dataflow
-cargo xtask structure-check
-cargo xtask quick-check
-cargo test -p otel-arrow-dfe-series-lake
-cd ../.. && python3 tools/sanitycheck.py
+grep -n 'futures' crates/series-lake/Cargo.toml
+grep -rn 'futures::' crates/series-lake/src | wc -l   # expect 0
 ```
 
-Expected: all pass with no warnings from the `series-lake` crate. Fix clippy findings (`unwrap_used`, `unused_results`, `missing_docs`) in place.
+Expected: `futures` appears only under `[dev-dependencies]`, and no `src` file names it. If `cargo-udeps` or `cargo-machete` is available, run it on the crate and remove anything else it flags.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Add the changelog entry `.chloggen/series-lake-core.yaml`**
+
+Copy `rust/otap-dataflow/.chloggen/TEMPLATE.yaml` verbatim to `rust/otap-dataflow/.chloggen/series-lake-core.yaml` and fill in the fields, keeping every comment line from the template:
+
+```bash
+cd rust/otap-dataflow
+cp .chloggen/TEMPLATE.yaml .chloggen/series-lake-core.yaml
+```
+
+Filled values (the comments from the template stay above each field):
+
+```yaml
+change_type: new_component
+
+component: pipeline
+
+note: "Add the series-lake crate that normalizes OTAP logs and metrics into series and values Parquet datasets on object storage."
+
+issues: [<PR number>]
+
+subtext: |
+  Series identity is stable across writers and languages; the on-disk format is
+  documented in crates/series-lake/docs/FORMAT.md. No pipeline node uses it yet.
+```
+
+`issues` is mandatory and must carry a number: `rust/otap-dataflow/AGENTS.md` says "One or more tracking issues related to the change. You can use the PR number here if no issue exists." Put the pull request number there; `[0]` and `[]` are not acceptable. `note` must stay at or below 200 characters and `subtext` at or below 300, ASCII only, and both are written as release notes for end users.
+
+Validate: `cd rust/otap-dataflow && make chlog-validate` (check the Makefile for the exact target name if it fails).
+
+- [ ] **Step 5: Run the full check suite**
+
+`rust/otap-dataflow/AGENTS.md` names `cargo xtask check` as the required full validation path: structure checks, `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. Run it, plus the markdown and ASCII checks for the two documents this task touches:
+
+```bash
+cd rust/otap-dataflow
+cargo xtask check
+cd ../..
+npx markdownlint-cli2 rust/otap-dataflow/crates/series-lake/README.md rust/otap-dataflow/crates/series-lake/docs/FORMAT.md
+python3 tools/sanitycheck.py
+```
+
+Expected: all pass with no warnings from the `series-lake` crate. Fix clippy findings (`unwrap_used`, `unused_results`, `missing_docs`, `format_push_string`) in place rather than allowing them.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add rust/otap-dataflow/crates/series-lake rust/otap-dataflow/.chloggen/series-lake-core.yaml
@@ -5380,4 +7453,69 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - End-to-end tests with a real OTLP producer and MinIO, the v1 outage test:
   plan 2.
 - Benchmarks and expansion-factor measurements: plan 3.
+- `cargo-fuzz` targets for the canonical encoder, the CBOR decoder and
+  extraction. Spec section 9.3's fuzzing requirement is met in this plan by
+  the proptest files `tests/fuzz_canonical.rs` and `tests/fuzz_extract.rs`,
+  which run in CI on every change. Standalone `cargo-fuzz` targets need a
+  nightly toolchain and a separate CI job, and are deferred to plan 3.
+- Compaction, and reclaiming multipart uploads orphaned by a cancellation that
+  landed during Parquet finalization: both belong to the lifecycle/compaction
+  scope of spec section 5.4, not to this crate.
 - The deferred items of spec section 10.
+
+## Deferred, recorded here on purpose
+
+Two approximations are accepted for v1 and re-examined by plan 3's benchmarks:
+
+- **Seal-time block recount.** `Block::seal` recomputes the block's retained
+  bytes with one deduplicated pass over every retained batch. That is linear
+  per seal but touches every batch, so a block with very many small runs pays
+  for it once at seal. Per-append exact accounting would be quadratic and is
+  not worth it before the benchmarks say so.
+- **Approximate merge chunk sizing.** `MergeIter` fixes its chunk row count
+  from the average pinned bytes per row over all runs, so a chunk of
+  wider-than-average rows exceeds `merge_chunk_bytes`. The overshoot is
+  bounded by `max_row_bytes` per row. Exact byte-driven chunking needs a size
+  estimate per output row and is deferred.
+
+---
+
+## Amendments (2026-09-21)
+
+Applied from `.superpowers/sdd/2026-09-21-series-lake-core/plan-amendment-rulings.md`, which
+resolves the scratchpad codex review and `preflight-scan.md`. Task 1 is already implemented and
+committed (`6f6be202a`), so rulings that would have changed it are carried by a later task.
+
+- R01 -- `extract` takes `&mut OtapArrowRecords` and decodes transport-optimized ids first; transport-optimized equivalence test added. Tasks 4 (precondition note), 6, 7, 10, 12, 13.
+- R02 -- id helpers return `Option<u32>`, `None` means an empty attribute list, null `parent_id` is invalid, memo key carries the scope and schema strings, mixed attributed/unattributed test added. Tasks 4, 6, 7.
+- R03 -- `write_table` restructured so it compiles: `select!` never moves the writer, `finish(&mut self)` replaces `close(self)`, `into_inner` is reached only from the abort path. Task 12.
+- R04 -- state-aware cleanup: abort on every writable-phase failure, never after finalization starts, bounded by the new `upload.abort_timeout`; `Error::Cancelled { abort_error }` and `Error::AbortFailed`. Tasks 5, 12.
+- R05 -- crate `Cargo.toml` enables `parquet` feature `zstd` and `object_store` feature `fs`. Task 12 step 1 (Task 1 is committed), referenced from Task 14.
+- R06 -- cache partition-tracking assertions corrected to `hits == 1`, `misses == 3`. Task 8.
+- R07 -- `gen_golden.py` encodes the infinities as bit patterns and dumps with `allow_nan=False`. Task 3.
+- R08 -- `is_sorted` compares adjacent `arrow::row` keys instead of a `lexsort_to_indices` permutation; `sort_batch` no longer claims stability; tied-key test added. Task 9.
+- R09 -- metrics extraction: dead fields and imports dropped, descriptor memoized per (metric, point attrs) before hashing, `metric_of` replaces panicking `HashMap` indexing, `series_for` returns only the id, `seen` is a `HashSet`. Tasks 6, 7.
+- R10 -- unsupported kind and policy are evaluated before temporality validation, which applies only to sums and histograms; gauge-plus-summary drop test added. Task 7.
+- R11 -- the oracle code block sets `max_row_bytes = 1 << 20` directly; the prose correction is gone. Task 13.
+- R12 -- `IngressLimits` gains `max_block_bytes` (500 MiB) and `max_requests_per_block` (4096); `Block::reserve` refuses with `RequestTooLarge` / `BlockFull` / `TooManyRequests`; three refusal tests added. Tasks 5, 10.
+- R13 -- one `Budget` per request, created in `extract` and charged by descriptor rows, every values row and every sealed batch; `max_row_bytes` covers descriptor rows; a run is sealed before the row that would overflow it. Tasks 6, 7.
+- R14 -- reservation uses descriptor bytes plus measured pinned bytes; `Block::seal` recomputes retained bytes once with a single `CountedAllocations` set; the quadratic per-seal recount is gone. Task 10.
+- R15 -- `merge_runs` returns a lazy `MergeIter`; unsorted mode yields runs as they are, with no concatenation; chunk sizing uses the average over all runs. Tasks 9, 12.
+- R16 -- `emitted_at` is stamped once in `Block::seal(now)` and frozen across retries; `admit` takes no timestamp. Tasks 10, 12, 13.
+- R17 -- `ExtractStats::dropped_exemplars` counts exemplar payload rows; duplicate-key validation is documented as covering identity attribute lists only. Tasks 6, 7, 14.
+- R18 -- the oracle derives expected identities from an independent `Descriptor` construction and compares full multisets plus per-series descriptor content, over logs, metric number and histogram datasets, sorted and unsorted, with arbitrary request splits. Task 13.
+- R19 -- new tests: empty table writes no file, `writer_limit_bytes` forces several row groups, cancellation at a chunk boundary and inside a parked multipart upload, plus `tests/fuzz_extract.rs`; `cargo-fuzz` targets moved to "Out of scope". Tasks 12, 13, 14.
+- R20 -- the workspace `lru` pin becomes `"0.16"`, with the API verified against the vendored source. Task 8 step 0 (amends Task 1).
+- R21 -- the final gate is `cargo xtask check` plus `markdownlint` on README and FORMAT.md plus `tools/sanitycheck.py`. Task 14.
+- R22 -- README gains the producer-id contract, the v1 limitations, DuckDB and Spark recipes and `schema_fingerprint` mismatch detection; the changelog is copied from the template; FORMAT.md is declared normative for the crate. Task 14.
+- R23 -- no-op statements removed, `encoding_is_order_independent` rewritten to encode two genuinely different orders, `plain_col`/`struct_child`/`attr_table`/`map_col` live in `extract/mod.rs` with `attrs::plain` reused, `hex_lower` uses a lookup table, `futures` moves to dev-dependencies, Interfaces lists updated. Tasks 2, 4, 6, 7, 10, 12, 13, 14.
+- R24 -- `PENDING_SERIES_ENTRY_BYTES` becomes `IngressLimits::pending_series_entry_bytes` (default 64). Tasks 5, 10.
+- R25 -- `WriterProperties` sets statistics, dictionary encoding and row group size explicitly; abort errors surface per R04. Task 12.
+- R26 -- Task 3 keeps its vectors and gains the `metric.is_some()` invariant plus its assertion; the OTLP-to-OTAP golden round trip lives in Task 13 as `tests/golden_roundtrip.rs`. Tasks 3, 13.
+
+Two ruling details were adjusted against the binding spec and are called out here:
+
+- `upload.abort_timeout` defaults to **5s**, the value in spec section 6.5 and in the spec's
+  configuration example, rather than the 10s named in R04.
+- `RefuseReason::TooLarge` was renamed to `RequestTooLarge` (Task 6 step 0) instead of adding a
+  second, overlapping "too large" reason beside the block reasons R12 introduces.
