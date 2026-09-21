@@ -524,6 +524,19 @@ impl Context {
         self.authorized_identity.as_ref()
     }
 
+    /// Takes and returns the authorization-derived context entries, if any.
+    ///
+    /// The counterpart of [`Context::take_transport_headers`], for a node that
+    /// must drop verified claims from a context it retains. A node that parks
+    /// a request across slow I/O and later returns the context in an ack or
+    /// nack should keep only the routing frames, so neither the inbound
+    /// credentials nor the claims derived from them stay resident for the
+    /// duration of that I/O.
+    #[must_use]
+    pub fn take_authorized_identity(&mut self) -> Option<AuthorizedIdentityEntries> {
+        self.authorized_identity.take()
+    }
+
     fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
@@ -2768,6 +2781,57 @@ mod test {
             &["reader".to_string(), "writer".to_string()]
         );
         assert!(entries.get("missing_entry").is_none());
+    }
+
+    /// Scenario: a node that parks a request across slow I/O strips the
+    /// request metadata from the context it retains, using
+    /// `take_transport_headers` and `take_authorized_identity`, and then still
+    /// routes an ack on that context.
+    /// Guarantees: both takes return what was captured and leave the context
+    /// empty of headers and claims, while the ack/nack routing frames survive,
+    /// so a retained context carries no inbound credentials.
+    #[test]
+    fn taking_headers_and_claims_clears_them_but_keeps_routing_frames() {
+        let mut headers = TransportHeaders::new();
+        let name = ContextEntryName::try_from("tenant").expect("valid test context entry name");
+        headers.push(TransportHeader::captured(
+            name,
+            "x-tenant",
+            true,
+            ValueKind::Text,
+            "acme".as_bytes(),
+        ));
+        let policy: AuthorizedIdentityPolicy = serde_json::from_value(
+            serde_json::json!([{"claim": "sub", "store_as": "customer_id"}]),
+        )
+        .expect("valid authorized identity policy");
+        let identity = AuthorizedIdentity::new().with_subject("customer-42");
+
+        let (test_data, pdata) = create_test();
+        let mut pdata = pdata
+            .test_subscribe_to(Interests::ACKS | Interests::NACKS, test_data.into(), 101)
+            .with_transport_headers(headers.clone());
+        pdata.capture_authorized_identity(&policy, &identity);
+
+        let (mut context, _payload) = pdata.into_parts();
+        assert!(context.has_ack_or_nack_subscribers());
+
+        assert_eq!(context.take_transport_headers(), Some(headers));
+        assert!(
+            context
+                .take_authorized_identity()
+                .expect("claims were captured")
+                .get("customer_id")
+                .is_some()
+        );
+
+        // Both are now gone, and taking again is a no-op rather than a panic.
+        assert!(context.transport_headers().is_none());
+        assert!(context.authorized_identity_entries().is_none());
+        assert!(context.take_transport_headers().is_none());
+        assert!(context.take_authorized_identity().is_none());
+        // The stripped context still routes the completion it was retained for.
+        assert!(context.has_ack_or_nack_subscribers());
     }
 
     /// Scenario: pdata carries authorized identity entries captured from

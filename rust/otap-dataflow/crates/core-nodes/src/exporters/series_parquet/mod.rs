@@ -111,6 +111,35 @@ impl SeriesParquet {
     }
 }
 
+/// How a failed request must be reported back to its sender.
+///
+/// The distinction is the phase the failure came from, not the error type.
+/// Validation -- the request budget, the signal check, `extract` and
+/// `reserve` -- judges the request's own content, so the identical bytes will
+/// be refused again and the client must change the request. Everything after
+/// that point (`admit`, `seal`, and the Arrow, Parquet and object store work
+/// inside `write_block`) is infrastructure: the same request may well succeed
+/// on a retry, so it must not be reported as a client error.
+#[derive(Debug)]
+enum Failure {
+    /// The request's content or size is refused; retrying is futile.
+    Permanent(lake::Error),
+    /// Writing the request failed; the sender may retry.
+    Retryable(lake::Error),
+}
+
+impl Failure {
+    /// Build the nack this failure must be reported as.
+    fn into_nack(self, data: OtapPdata) -> NackMsg<OtapPdata> {
+        match self {
+            Failure::Permanent(e) => {
+                NackMsg::new_permanent_with_cause(e.to_string(), data, NackCause::Refused)
+            }
+            Failure::Retryable(e) => NackMsg::new(e.to_string(), data),
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl Exporter<OtapPdata> for SeriesParquet {
     async fn start(
@@ -147,69 +176,23 @@ impl Exporter<OtapPdata> for SeriesParquet {
         loop {
             match inbox.recv().await? {
                 Message::PData(data) => {
-                    let (context, mut payload) = data.into_parts();
+                    let (mut context, payload) = data.into_parts();
+                    // The context is retained across extraction and a storage
+                    // round trip before it is handed back on the ack or nack.
+                    // Only the routing frames are needed for that, so the
+                    // inbound credentials and the claims derived from them are
+                    // dropped here rather than staying resident for the
+                    // duration of the write (spec section 7).
+                    let _ = context.take_transport_headers();
+                    let _ = context.take_authorized_identity();
                     let signal = payload.signal_type();
-                    // `num_bytes` is an estimate of the wire representation, so
-                    // the budget is also enforced on the measured extracted
-                    // output inside `extract`.
-                    let input_ok = payload
-                        .num_bytes()
-                        .is_some_and(|n| n <= self.config.lake.ingress.max_request_bytes);
-                    let result: lake::Result<()> = async {
-                        if !input_ok {
-                            return Err(lake::Error::Refused(lake::RefuseReason::RequestTooLarge));
-                        }
-                        if signal != otel_arrow_dfe_config::SignalType::Logs {
-                            return Err(lake::Error::Refused(lake::RefuseReason::Unsupported(
-                                "signal".into(),
-                            )));
-                        }
-                        let mut records: OtapArrowRecords = payload
-                            .try_into_with_default()
-                            .map_err(|e| lake::Error::Pdata(format!("{e}")))?;
-                        let extracted = lake::extract::extract(&mut records, &self.config.lake)?;
-                        drop(records);
-                        if extracted.stats.rows == 0 {
-                            return Ok(());
-                        }
-                        let secs = lake::clock::nanos_to_secs(wall.now_unix_nanos());
-                        let clock =
-                            lake::clock::WindowClock::new(self.config.window.interval, secs);
-                        let mut block =
-                            lake::buffer::Block::new(clock.last_boundary(), seq, &self.config.lake);
-                        seq = seq
-                            .checked_add(1)
-                            .ok_or_else(|| lake::Error::invalid("sequence exhausted"))?;
-                        let reservation =
-                            block.reserve(&extracted, &mut cache, 0, &self.config.lake)?;
-                        block.admit(extracted, reservation, ())?;
-                        block.seal(lake::clock::nanos_to_micros(wall.now_unix_nanos()))?;
-                        let _ = sink.write_block(&block, &CancellationToken::new()).await?;
-                        // Only a flush that resolved marks the descriptors
-                        // committed, so a failed flush re-emits them.
-                        for id in &block.pending_series {
-                            cache.mark_committed(*id, block.partition);
-                        }
-                        Ok(())
-                    }
-                    .await;
+                    let result =
+                        write_request(payload, &self.config, &sink, &mut cache, &mut seq, &wall)
+                            .await;
                     let data = OtapPdata::new(context, OtapPayload::empty(signal));
                     let delivered = match result {
                         Ok(()) => effects.notify_ack(AckMsg::new(data)).await,
-                        Err(
-                            e @ (lake::Error::Refused(_)
-                            | lake::Error::Pdata(_)
-                            | lake::Error::Arrow(_)),
-                        ) => {
-                            effects
-                                .notify_nack(NackMsg::new_permanent_with_cause(
-                                    e.to_string(),
-                                    data,
-                                    NackCause::Refused,
-                                ))
-                                .await
-                        }
-                        Err(e) => effects.notify_nack(NackMsg::new(e.to_string(), data)).await,
+                        Err(failure) => effects.notify_nack(failure.into_nack(data)).await,
                     };
                     if let Err(e) = delivered {
                         otel_warn!("series_parquet.notify_failed", error = %e);
@@ -227,4 +210,76 @@ impl Exporter<OtapPdata> for SeriesParquet {
             }
         }
     }
+}
+
+/// Extract one request, write it and report which phase any failure came from.
+///
+/// Validation runs first and its refusals are [`Failure::Permanent`]: the
+/// request budget, the signal check, `extract` and `reserve` all judge the
+/// request's own content. A payload that cannot be decoded into OTAP records
+/// is counted as validation too, because the same bytes will not decode on a
+/// retry either. From `admit` onwards every failure is [`Failure::Retryable`],
+/// including the Arrow, Parquet and object store errors raised inside
+/// `write_block`, so a full disk or an unreachable bucket is never reported to
+/// the client as a request it must change.
+async fn write_request(
+    mut payload: OtapPayload,
+    config: &config::Config,
+    sink: &lake::sink::Sink,
+    cache: &mut lake::cache::SeriesCache,
+    seq: &mut u64,
+    wall: &impl WallClock,
+) -> Result<(), Failure> {
+    let signal = payload.signal_type();
+    // `num_bytes` is an estimate of the wire representation, so the budget is
+    // also enforced on the measured extracted output inside `extract`.
+    if !payload
+        .num_bytes()
+        .is_some_and(|n| n <= config.lake.ingress.max_request_bytes)
+    {
+        return Err(Failure::Permanent(lake::Error::Refused(
+            lake::RefuseReason::RequestTooLarge,
+        )));
+    }
+    if signal != otel_arrow_dfe_config::SignalType::Logs {
+        return Err(Failure::Permanent(lake::Error::Refused(
+            lake::RefuseReason::Unsupported("signal".into()),
+        )));
+    }
+    let mut records: OtapArrowRecords = payload
+        .try_into_with_default()
+        .map_err(|e| Failure::Permanent(lake::Error::invalid(format!("undecodable pdata: {e}"))))?;
+    let extracted =
+        lake::extract::extract(&mut records, &config.lake).map_err(Failure::Permanent)?;
+    drop(records);
+    if extracted.stats.rows == 0 {
+        return Ok(());
+    }
+    let secs = lake::clock::nanos_to_secs(wall.now_unix_nanos());
+    let clock = lake::clock::WindowClock::new(config.window.interval, secs);
+    let mut block = lake::buffer::Block::new(clock.last_boundary(), *seq, &config.lake);
+    // Reserving is still validation: it refuses a request too large for any
+    // block. The sequence only advances once a block exists to consume it.
+    let reservation = block
+        .reserve(&extracted, cache, 0, &config.lake)
+        .map_err(Failure::Permanent)?;
+    *seq = seq
+        .checked_add(1)
+        .ok_or_else(|| Failure::Retryable(lake::Error::invalid("sequence exhausted")))?;
+    block
+        .admit(extracted, reservation, ())
+        .map_err(Failure::Retryable)?;
+    block
+        .seal(lake::clock::nanos_to_micros(wall.now_unix_nanos()))
+        .map_err(Failure::Retryable)?;
+    let _ = sink
+        .write_block(&block, &CancellationToken::new())
+        .await
+        .map_err(Failure::Retryable)?;
+    // Only a flush that resolved marks the descriptors committed, so a failed
+    // flush re-emits them.
+    for id in &block.pending_series {
+        cache.mark_committed(*id, block.partition);
+    }
+    Ok(())
 }

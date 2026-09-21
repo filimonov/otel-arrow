@@ -85,6 +85,10 @@ class Engine:
         try:
             grpc.channel_ready_future(self.channel).result(timeout=30)
         except Exception:
+            # The caller usually runs inside a TemporaryDirectory that is about
+            # to be removed, taking the engine log with it. Print it before
+            # closing, or a startup failure leaves nothing to diagnose.
+            print(f"engine failed to start, log follows:\n{self.engine_log()}")
             self.close()
             raise
         self.logs = logs_rpc.LogsServiceStub(self.channel)
