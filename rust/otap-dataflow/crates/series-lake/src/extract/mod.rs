@@ -10,10 +10,13 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder,
-    Float64Builder, Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder,
+    Float64Builder, Int32Builder, Int64Builder, ListArray, ListBuilder, MapBuilder, StringBuilder,
     StructArray, TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type};
+use arrow::datatypes::{
+    DataType, Float64Type, Int64Type, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type,
+    UInt32Type,
+};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
@@ -569,6 +572,64 @@ pub(crate) fn i64_at(a: &Option<ArrayRef>, row: usize) -> i64 {
         .unwrap_or(0)
 }
 
+/// An `Int64` column read as `Option<i64>`, `None` when null or absent.
+pub(crate) fn opt_i64(a: &Option<ArrayRef>, row: usize) -> Option<i64> {
+    a.as_ref().and_then(|a| {
+        a.is_valid(row)
+            .then(|| a.as_primitive::<Int64Type>().value(row))
+    })
+}
+
+/// A `Float64` column read as `Option<f64>`, `None` when null or absent.
+pub(crate) fn opt_f64(a: &Option<ArrayRef>, row: usize) -> Option<f64> {
+    a.as_ref().and_then(|a| {
+        a.is_valid(row)
+            .then(|| a.as_primitive::<Float64Type>().value(row))
+    })
+}
+
+/// A `UInt32` id column read as `Option<u32>`.
+///
+/// Like [`opt_u16_at`], `None` means "no parent" and must never become id 0.
+pub(crate) fn opt_u32_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
+    a.as_ref().and_then(|a| {
+        a.is_valid(row)
+            .then(|| a.as_primitive::<UInt32Type>().value(row))
+    })
+}
+
+/// A `UInt32` OTLP flags column reinterpreted into the signed storage column.
+///
+/// The flags are a bit set, stored as received; readers interpret the bits. The
+/// storage column is `Int32` for Parquet portability, so the top bit wraps into
+/// the sign bit rather than being lost.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn flags_at(a: &Option<ArrayRef>, row: usize) -> i32 {
+    a.as_ref()
+        .and_then(|a| {
+            a.is_valid(row)
+                .then(|| a.as_primitive::<UInt32Type>().value(row))
+        })
+        .unwrap_or(0) as i32
+}
+
+/// A `List` column of a batch, or `None` when it is absent.
+///
+/// The downcast is checked: a column that is present but is not a list refuses
+/// the request instead of panicking, exactly as [`struct_child`] and
+/// [`any_value_col`] do for their own shapes.
+pub(crate) fn list_col(batch: &RecordBatch, name: &str) -> Result<Option<ListArray>> {
+    let Some(col) = batch.column_by_name(name) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        col.as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| Error::invalid(format!("column {name} is not a list")))?
+            .clone(),
+    ))
+}
+
 /// A `FixedSizeBinary` column read as owned bytes, `None` when null or absent.
 pub(crate) fn fixed_at(a: &Option<ArrayRef>, row: usize) -> Option<Vec<u8>> {
     a.as_ref().and_then(|a| {
@@ -710,6 +771,24 @@ mod tests {
         assert!(
             struct_child(&b, "scope", "id", &DataType::UInt16)
                 .expect("absent parent")
+                .is_none()
+        );
+    }
+
+    /// Scenario: `list_col` is given a batch whose `bucket_counts` column is a
+    /// string column rather than a list.
+    /// Guarantees: the request is refused as invalid content, not panicked on by
+    /// an unchecked downcast; an absent column is simply absent.
+    #[test]
+    fn list_col_refuses_a_non_list_column() {
+        let b = batch_with_utf8("bucket_counts");
+        assert!(matches!(
+            list_col(&b, "bucket_counts"),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        assert!(
+            list_col(&b, "explicit_bounds")
+                .expect("absent column")
                 .is_none()
         );
     }

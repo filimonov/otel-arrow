@@ -6,14 +6,14 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow::array::{Array, AsArray};
-use arrow::datatypes::{DataType, Int32Type, TimeUnit, UInt32Type};
+use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, any_value_col,
-    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at, i64_at, map_col,
-    opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
+    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at, flags_at, i64_at,
+    map_col, opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
@@ -65,7 +65,7 @@ pub(crate) fn extract_logs(
     let severity_number = plain(logs, "severity_number", &DataType::Int32)?;
     let severity_text = plain(logs, "severity_text", &DataType::Utf8)?;
     let event_name = plain(logs, "event_name", &DataType::Utf8)?;
-    let flags = plain(logs, "flags", &DataType::UInt32)?;
+    let flags_col = plain(logs, "flags", &DataType::UInt32)?;
     let trace_id = plain(logs, "trace_id", &DataType::FixedSizeBinary(16))?;
     let span_id = plain(logs, "span_id", &DataType::FixedSizeBinary(8))?;
     let res_id = struct_child(logs, "resource", "id", &DataType::UInt16)?;
@@ -169,16 +169,6 @@ pub(crate) fn extract_logs(
                     .then(|| a.as_primitive::<Int32Type>().value(row))
             })
             .unwrap_or(0);
-        // `flags as i32` below is a bit reinterpretation of the OTLP `u32` flags
-        // into the signed storage column: stored as received; readers treat it
-        // as a bit set.
-        let flags_bits = flags
-            .as_ref()
-            .and_then(|a| {
-                a.is_valid(row)
-                    .then(|| a.as_primitive::<UInt32Type>().value(row))
-            })
-            .unwrap_or(0);
         let mut cols = vec![
             Col::Fixed(Some(series_id.to_vec())),
             Col::Str(Some(producer)),
@@ -192,11 +182,7 @@ pub(crate) fn extract_logs(
             Col::Str(Some(event_name_str)),
             Col::Fixed(fixed_at(&trace_id, row)),
             Col::Fixed(fixed_at(&span_id, row)),
-            Col::Int32(Some({
-                #[allow(clippy::cast_possible_wrap)]
-                let flags_i32 = flags_bits as i32;
-                flags_i32
-            })),
+            Col::Int32(Some(flags_at(&flags_col, row))),
             map_col(&residual),
         ];
         for d in &values_denorm {

@@ -5,17 +5,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{
-    DataType, Float64Type, Int32Type, Int64Type, TimeUnit, UInt8Type, UInt32Type, UInt64Type,
-};
+use arrow::array::{Array, AsArray, ListArray};
+use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UInt64Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
-    denorm_bytes, denorm_lookup, descriptor_row, i64_at, opt_u16_at, plain, producer_id, str_at,
-    struct_child, timestamp_pair,
+    denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, list_col, opt_f64, opt_i64,
+    opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
 use crate::attrs::AttrTable;
 use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
@@ -34,25 +32,19 @@ struct MetricRow {
 
 /// Memo key for a metrics series: the metric and the point's attribute parent.
 ///
+/// `attrs_id` is the point's own OTAP `id`, which is the parent key of its
+/// attribute batch. The key needs no discriminator for which attribute table
+/// the id came from: a metric has exactly one kind, so all of a metric's points
+/// live in a single point payload and therefore resolve against a single
+/// attribute table (`NumberDpAttrs` or `HistogramDpAttrs`). Two metrics never
+/// share a `metric_id`, so ids from the two tables cannot collide in this map.
+///
 /// Both ids are optional, because pdata writes a null id for a point that has
 /// no attributes; `None` must stay distinct from attribute parent 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MemoKey {
     metric_id: u32,
     attrs_id: Option<u32>,
-}
-
-/// The OTLP `u32` flags bit set reinterpreted into the signed storage column.
-///
-/// Stored as received; readers treat it as a bit set, exactly as in logs.
-#[allow(clippy::cast_possible_wrap)]
-fn flags(a: &Option<ArrayRef>, row: usize) -> i32 {
-    a.as_ref()
-        .and_then(|a| {
-            a.is_valid(row)
-                .then(|| a.as_primitive::<UInt32Type>().value(row))
-        })
-        .unwrap_or(0) as i32
 }
 
 fn metric_rows(
@@ -211,25 +203,37 @@ impl Common<'_> {
     }
 }
 
-fn opt_i64(a: &Option<ArrayRef>, row: usize) -> Option<i64> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<Int64Type>().value(row))
-    })
+/// One row of `bucket_counts`, cast to the signed storage type.
+///
+/// A null element would silently become a bucket of 0, which is a different
+/// histogram, so it refuses the request instead. An absent or null list row is
+/// an empty list, which is the "no buckets" case.
+fn bucket_counts_at(a: &Option<ListArray>, row: usize) -> Result<Vec<i64>> {
+    let Some(list) = a.as_ref().filter(|a| a.is_valid(row)).map(|a| a.value(row)) else {
+        return Ok(vec![]);
+    };
+    let vals = arrow::compute::cast(&list, &DataType::UInt64)?;
+    let mut out = Vec::with_capacity(vals.len());
+    for v in vals.as_primitive::<UInt64Type>().iter() {
+        let v = v.ok_or_else(|| Error::invalid("null bucket count"))?;
+        out.push(i64::try_from(v).map_err(|_| Error::invalid("bucket count above i64::MAX"))?);
+    }
+    Ok(out)
 }
 
-fn opt_f64(a: &Option<ArrayRef>, row: usize) -> Option<f64> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<Float64Type>().value(row))
-    })
-}
-
-fn opt_u32_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<UInt32Type>().value(row))
-    })
+/// One row of `explicit_bounds`.
+///
+/// A null element would silently become a bound of 0.0, which is a different
+/// histogram, so it refuses the request instead.
+fn explicit_bounds_at(a: &Option<ListArray>, row: usize) -> Result<Vec<f64>> {
+    let Some(list) = a.as_ref().filter(|a| a.is_valid(row)).map(|a| a.value(row)) else {
+        return Ok(vec![]);
+    };
+    let vals = arrow::compute::cast(&list, &DataType::Float64)?;
+    vals.as_primitive::<Float64Type>()
+        .iter()
+        .map(|v| v.ok_or_else(|| Error::invalid("null explicit bound")))
+        .collect()
 }
 
 /// The eight leading columns shared by both values datasets, plus their bytes.
@@ -371,7 +375,7 @@ pub(crate) fn extract_metrics(
                 cfg,
                 i64_at(&time, row),
                 i64_at(&start, row),
-                flags(&fl, row),
+                flags_at(&fl, row),
                 &mut c.stats,
             );
             cols.push(Col::Int(opt_i64(&iv, row)));
@@ -413,8 +417,8 @@ pub(crate) fn extract_metrics(
         let min = plain(b, "min", &DataType::Float64)?;
         let max = plain(b, "max", &DataType::Float64)?;
         let fl = plain(b, "flags", &DataType::UInt32)?;
-        let bc = b.column_by_name("bucket_counts");
-        let eb = b.column_by_name("explicit_bounds");
+        let bc = list_col(b, "bucket_counts")?;
+        let eb = list_col(b, "explicit_bounds")?;
         let mut sink = RowSink::new(Dataset::MetricsHistogram, cfg)?;
         for row in 0..b.num_rows() {
             let metric_id = opt_u16_at(&parent, row)
@@ -426,33 +430,8 @@ pub(crate) fn extract_metrics(
             };
             let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
             let m = metric_of(&metrics, metric_id)?;
-            let counts: Vec<i64> = match bc {
-                Some(a) if a.is_valid(row) => {
-                    let list = a.as_list::<i32>().value(row);
-                    let vals = arrow::compute::cast(&list, &DataType::UInt64)?;
-                    let mut out = Vec::with_capacity(vals.len());
-                    for v in vals.as_primitive::<UInt64Type>().iter() {
-                        let v = v.unwrap_or(0);
-                        out.push(
-                            i64::try_from(v)
-                                .map_err(|_| Error::invalid("bucket count above i64::MAX"))?,
-                        );
-                    }
-                    out
-                }
-                _ => vec![],
-            };
-            let bounds: Vec<f64> = match eb {
-                Some(a) if a.is_valid(row) => {
-                    let list = a.as_list::<i32>().value(row);
-                    let vals = arrow::compute::cast(&list, &DataType::Float64)?;
-                    vals.as_primitive::<Float64Type>()
-                        .iter()
-                        .map(|v| v.unwrap_or(0.0))
-                        .collect()
-                }
-                _ => vec![],
-            };
+            let counts = bucket_counts_at(&bc, row)?;
+            let bounds = explicit_bounds_at(&eb, row)?;
             let ok = (counts.is_empty() && bounds.is_empty()) || counts.len() == bounds.len() + 1;
             if !ok {
                 return Err(Error::invalid(
@@ -474,7 +453,7 @@ pub(crate) fn extract_metrics(
                 cfg,
                 i64_at(&time, row),
                 i64_at(&start, row),
-                flags(&fl, row),
+                flags_at(&fl, row),
                 &mut c.stats,
             );
             cols.push(Col::Int(Some(cnt)));
@@ -525,13 +504,14 @@ mod tests {
     use crate::config::{LakeConfig, UnsupportedPolicy};
     use crate::error::{Error, RefuseReason};
     use crate::schema::Dataset;
-    use arrow::array::{Array, AsArray};
+    use arrow::array::{Array, AsArray, Float64Builder, ListBuilder, UInt64Builder};
     use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
-        AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge,
-        Histogram, HistogramDataPoint, Metric, MetricsData, NumberDataPoint, ResourceMetrics,
-        ScopeMetrics, Sum, Summary, SummaryDataPoint, metric, number_data_point,
+        AggregationTemporality, Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint,
+        Gauge, Histogram, HistogramDataPoint, Metric, MetricsData, NumberDataPoint,
+        ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint, exemplar, metric,
+        number_data_point,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
     use otel_arrow_dfe_pdata::testing::round_trip::encode_metrics;
@@ -551,6 +531,19 @@ mod tests {
             value: Some(v),
             attributes: attrs,
             ..Default::default()
+        }
+    }
+
+    /// One exemplar carrying filtered attributes of its own, so that the
+    /// encoder emits both an exemplar payload and an exemplar attribute
+    /// payload. Neither is stored by the v1 format.
+    fn ex(t: u64) -> Exemplar {
+        Exemplar {
+            time_unix_nano: t,
+            value: Some(exemplar::Value::AsInt(7)),
+            filtered_attributes: vec![kv("exemplar.only", "x")],
+            span_id: vec![0xBB; 8],
+            trace_id: vec![0xAA; 16],
         }
     }
 
@@ -577,11 +570,14 @@ mod tests {
                 unit: "1".into(),
                 data: Some(metric::Data::Gauge(Gauge {
                     data_points: vec![
-                        dp(
-                            10,
-                            number_data_point::Value::AsInt(i64::MAX),
-                            vec![kv("cpu", "0")],
-                        ),
+                        NumberDataPoint {
+                            exemplars: vec![ex(9)],
+                            ..dp(
+                                10,
+                                number_data_point::Value::AsInt(i64::MAX),
+                                vec![kv("cpu", "0")],
+                            )
+                        },
                         dp(
                             20,
                             number_data_point::Value::AsDouble(0.5),
@@ -606,6 +602,7 @@ mod tests {
                         sum: Some(6.0),
                         bucket_counts: vec![1, 2],
                         explicit_bounds: vec![5.0],
+                        exemplars: vec![ex(39)],
                         ..Default::default()
                     }],
                 })),
@@ -621,9 +618,35 @@ mod tests {
     fn extracts_number_and_histogram() {
         let cfg = LakeConfig::default();
         let mut budget = Budget::new(&cfg);
-        let out = extract_metrics(&encode_metrics(&gauge_and_hist()), &cfg, &mut budget)
-            .expect("extract");
+        let records = encode_metrics(&gauge_and_hist());
+        // The assertion on dropped_exemplars below is only meaningful if the
+        // encoder really produced the exemplar payloads.
+        for pt in [
+            ArrowPayloadType::NumberDpExemplars,
+            ArrowPayloadType::HistogramDpExemplars,
+            ArrowPayloadType::NumberDpExemplarAttrs,
+            ArrowPayloadType::HistogramDpExemplarAttrs,
+        ] {
+            assert_eq!(
+                records
+                    .get(pt)
+                    .map(arrow::record_batch::RecordBatch::num_rows),
+                Some(1),
+                "{pt:?}"
+            );
+        }
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("extract");
         assert_eq!(out.descriptors.len(), 3);
+        // One number exemplar and one histogram exemplar, both dropped. Their
+        // filtered attributes are never read, so they cannot reach a series.
+        assert_eq!(out.stats.dropped_exemplars, 2);
+        assert_eq!(out.stats.dropped_unsupported, 0);
+        for d in &out.descriptors {
+            assert!(
+                d.descriptor.attrs.iter().all(|(k, _)| k != "exemplar.only"),
+                "exemplar attributes leaked into a series"
+            );
+        }
         let number = out
             .values
             .iter()
@@ -939,5 +962,123 @@ mod tests {
             extract_metrics(&encode_metrics(&md), &cfg, &mut budget),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
+    }
+
+    /// Scenario: two gauge points of the same metric, the first carrying an
+    /// attribute and so becoming attribute parent 0, the second carrying none.
+    /// pdata still numbers the second point, but writes no attribute row for it.
+    /// Guarantees: the point without attributes resolves to an empty attribute
+    /// list rather than inheriting attribute parent 0, so the two points land in
+    /// two distinct series and the memo does not collapse them.
+    #[test]
+    fn points_without_attributes_do_not_inherit_parent_zero() {
+        let md = data(vec![Metric {
+            name: "cpu".into(),
+            data: Some(metric::Data::Gauge(Gauge {
+                data_points: vec![
+                    dp(10, number_data_point::Value::AsInt(1), vec![kv("cpu", "0")]),
+                    dp(20, number_data_point::Value::AsInt(2), vec![]),
+                ],
+            })),
+            ..Default::default()
+        }]);
+        let records = encode_metrics(&md);
+        // The premise: pdata really does leave the second point's id null.
+        let points = records
+            .get(ArrowPayloadType::NumberDataPoints)
+            .expect("number points");
+        let ids = plain(points, "id", &DataType::UInt32)
+            .expect("id column")
+            .expect("id present");
+        let point_ids: Vec<Option<u32>> = (0..points.num_rows())
+            .map(|r| opt_u32_at(&Some(ids.clone()), r))
+            .collect();
+        assert_eq!(point_ids, vec![Some(0), Some(1)]);
+        // Point 1 has its own id but no rows in the attribute batch, so the
+        // table must answer with the empty list, not with parent 0's attributes.
+        let cfg = LakeConfig::default();
+        let table = attr_table(
+            &records,
+            ArrowPayloadType::NumberDpAttrs,
+            cfg.ingress.max_nesting_depth,
+        )
+        .expect("attrs");
+        assert_eq!(table.get(0).len(), 1);
+        assert!(table.get(1).is_empty());
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("extract");
+        assert_eq!(out.descriptors.len(), 2);
+        let with_attrs = out
+            .descriptors
+            .iter()
+            .find(|d| !d.descriptor.attrs.is_empty())
+            .expect("attributed descriptor");
+        let without = out
+            .descriptors
+            .iter()
+            .find(|d| d.descriptor.attrs.is_empty())
+            .expect("unattributed descriptor");
+        assert_eq!(with_attrs.descriptor.attrs.len(), 1);
+        assert_ne!(with_attrs.series_id, without.series_id);
+        let number = out
+            .values
+            .iter()
+            .find(|(d, _)| *d == Dataset::MetricsNumber)
+            .expect("number")
+            .1[0]
+            .clone();
+        let row_ids = number
+            .column_by_name("series_id")
+            .expect("id")
+            .as_fixed_size_binary();
+        assert_ne!(row_ids.value(0), row_ids.value(1));
+    }
+
+    /// Scenario: `bucket_counts` and `explicit_bounds` rows that hold a null
+    /// element, and rows that are absent or null altogether.
+    /// Guarantees: a null element refuses the request as invalid rather than
+    /// being stored as a 0 bucket or a 0.0 bound; an absent or null list row is
+    /// read as the empty list.
+    #[test]
+    fn null_list_elements_are_refused() {
+        let mut counts = ListBuilder::new(UInt64Builder::new());
+        counts.values().append_value(1);
+        counts.values().append_null();
+        counts.append(true);
+        counts.append(false);
+        let counts = counts.finish();
+
+        let mut bounds = ListBuilder::new(Float64Builder::new());
+        bounds.values().append_value(1.0);
+        bounds.values().append_null();
+        bounds.append(true);
+        bounds.append(false);
+        let bounds = bounds.finish();
+
+        assert!(matches!(
+            bucket_counts_at(&Some(counts.clone()), 0),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        assert!(matches!(
+            explicit_bounds_at(&Some(bounds.clone()), 0),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        // A null list row, and an absent column, are both the empty list.
+        assert_eq!(
+            bucket_counts_at(&Some(counts), 1).expect("null row"),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            explicit_bounds_at(&Some(bounds), 1).expect("null row"),
+            Vec::<f64>::new()
+        );
+        assert_eq!(
+            bucket_counts_at(&None, 0).expect("absent"),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            explicit_bounds_at(&None, 0).expect("absent"),
+            Vec::<f64>::new()
+        );
     }
 }
