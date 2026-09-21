@@ -3,6 +3,8 @@
 
 //! Wall clock abstraction, partition ids and window boundary arithmetic.
 
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
+
 /// A `date/hour` storage partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PartitionId {
@@ -14,31 +16,35 @@ pub struct PartitionId {
 
 impl PartitionId {
     /// Partition of a Unix timestamp in seconds.
+    ///
+    /// `secs` below zero (before 1970) is clamped to zero: negative Unix
+    /// timestamps are not a supported wall-clock input for this crate, so
+    /// both `date` and `hour` collapse to the epoch rather than reporting a
+    /// partially-clamped, pre-epoch instant.
     #[must_use]
     pub fn from_unix_secs(secs: i64) -> Self {
-        let days = secs.div_euclid(86_400);
-        let hour = secs.rem_euclid(86_400) / 3_600;
+        let clamped = secs.max(0);
+        let Some(dt) = DateTime::<Utc>::from_timestamp(clamped, 0) else {
+            return Self { date: 0, hour: 0 };
+        };
+        let Some(epoch) = NaiveDate::from_ymd_opt(1970, 1, 1) else {
+            return Self { date: 0, hour: 0 };
+        };
+        let days = dt.date_naive().signed_duration_since(epoch).num_days();
         Self {
             date: u32::try_from(days).unwrap_or(0),
-            hour: hour as u8,
+            hour: dt.hour() as u8,
         }
     }
 
     /// `YYYY-MM-DD` of the partition (proleptic Gregorian, UTC).
     #[must_use]
     pub fn date_string(&self) -> String {
-        // Civil-from-days algorithm (Howard Hinnant), valid for all u32 day counts.
-        let z = i64::from(self.date) + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
-        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = doy - (153 * mp + 2) / 5 + 1;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 };
-        let y = if m <= 2 { y + 1 } else { y };
-        format!("{y:04}-{m:02}-{d:02}")
+        let secs = i64::from(self.date) * 86_400;
+        DateTime::<Utc>::from_timestamp(secs, 0).map_or_else(
+            || "1970-01-01".to_string(),
+            |dt| dt.format("%Y-%m-%d").to_string(),
+        )
     }
 
     /// `HH` of the partition.
@@ -293,5 +299,32 @@ mod tests {
         t.advance(1);
         assert_eq!(t.now_unix_nanos(), 5_000_000_001);
         assert_eq!(nanos_to_secs(5_000_000_001), 5);
+    }
+
+    /// Scenario: a leap day far from the epoch (2000-02-29, a century year
+    /// divisible by 400 and therefore leap in the proleptic Gregorian
+    /// calendar) alongside the near-epoch 2026-09-21 case.
+    /// Guarantees: `date_string` matches `chrono`'s own formatting of the
+    /// same instant, confirming the `chrono`-backed implementation agrees
+    /// with an independently computed reference for a date that exercises
+    /// leap-year handling, not just the happy-path date used elsewhere.
+    #[test]
+    fn date_string_matches_chrono_for_dates_far_from_epoch() {
+        // 2000-02-29T12:00:00Z = 951825600
+        let leap_day = PartitionId::from_unix_secs(951_825_600);
+        assert_eq!(leap_day.date_string(), "2000-02-29");
+        let expected = DateTime::<Utc>::from_timestamp(951_825_600, 0)
+            .expect("in-range timestamp")
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(leap_day.date_string(), expected);
+
+        // 2026-09-21T03:15:00Z = 1789960500
+        let recent = PartitionId::from_unix_secs(1_789_960_500);
+        let expected = DateTime::<Utc>::from_timestamp(1_789_960_500, 0)
+            .expect("in-range timestamp")
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(recent.date_string(), expected);
     }
 }
