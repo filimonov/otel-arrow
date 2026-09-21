@@ -8,6 +8,7 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
@@ -48,15 +49,15 @@ impl FileNaming {
     }
 }
 
+/// `YYYYMMDDTHHMMSSZ` of a Unix timestamp in seconds.
+///
+/// Negative input is clamped to the epoch, matching
+/// [`PartitionId::from_unix_secs`], so a file name and the Hive partition it
+/// sits in never disagree about the instant.
 fn utc_stamp(unix_secs: i64) -> String {
-    let p = PartitionId::from_unix_secs(unix_secs);
-    let date = p.date_string().replace('-', "");
-    let secs_of_day = unix_secs.rem_euclid(86_400);
-    format!(
-        "{date}T{:02}{:02}{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
+    DateTime::<Utc>::from_timestamp(unix_secs.max(0), 0).map_or_else(
+        || "19700101T000000Z".to_string(),
+        |dt| dt.format("%Y%m%dT%H%M%SZ").to_string(),
     )
 }
 
@@ -96,12 +97,18 @@ pub struct Sink {
     naming: FileNaming,
 }
 
+/// Smallest and largest `time_unix_nano` across the sealed runs of a table.
+///
+/// A column of an unexpected type is skipped rather than panicked on: the
+/// metadata it feeds is advisory, and no data-derived input may panic here.
 fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
     let mut lo = None;
     let mut hi = None;
     for c in batches {
-        if let Some(col) = c.column_by_name("time_unix_nano") {
-            let a = col.as_primitive::<Int64Type>();
+        if let Some(a) = c
+            .column_by_name("time_unix_nano")
+            .and_then(|col| col.as_primitive_opt::<Int64Type>())
+        {
             if let Some(mn) = arrow::compute::min(a) {
                 lo = Some(lo.map_or(mn, |x: i64| x.min(mn)));
             }
@@ -202,7 +209,13 @@ impl Sink {
     ) -> Result<usize> {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
         let total_rows: usize = runs.iter().map(RecordBatch::num_rows).sum();
-        let range = time_range(&runs);
+        // A series table has no `time_unix_nano` column, so the scan would be
+        // pure overhead and the metadata keys it feeds are values-only anyway.
+        let range = if table.dataset().is_series() {
+            (None, None)
+        } else {
+            time_range(&runs)
+        };
         let schema = dataset_schema(table.dataset(), &self.cfg);
         // Spec 5.4 asks for ZSTD, statistics and dictionary encoding explicitly
         // rather than by relying on arrow-rs defaults. An unlimited row count
@@ -298,6 +311,13 @@ impl Sink {
         block: &Block<T>,
         cancel: &CancellationToken,
     ) -> Result<FlushReport> {
+        // Descriptor rows only become Arrow rows in the series table when
+        // `seal` stamps them, so writing an unsealed block would silently drop
+        // every series row. Same condition `Block::into_parts` asserts on.
+        debug_assert!(
+            block.is_sealed(),
+            "write_block on an unsealed block would drop its descriptor rows"
+        );
         if cancel.is_cancelled() {
             return Err(Error::Cancelled { abort_error: None });
         }
@@ -333,7 +353,7 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
     };
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
         AnyValue, KeyValue as OtlpKeyValue, any_value,
@@ -341,23 +361,36 @@ mod tests {
     use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
         LogRecord, LogsData, ResourceLogs, ScopeLogs,
     };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
+        AggregationTemporality, Gauge, Histogram, HistogramDataPoint, Metric, MetricsData,
+        NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    };
     use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
-    use otel_arrow_dfe_pdata::testing::round_trip::encode_logs;
+    use otel_arrow_dfe_pdata::testing::round_trip::{encode_logs, encode_metrics};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     const WINDOW_START: i64 = 1_789_960_500;
     const SEAL_AT_US: i64 = 1_789_960_500_000_000;
+    const SEQ: u64 = 7;
+    /// First `time_unix_nano` of the generated log records; they count down.
+    const FIRST_LOG_TIME: u64 = 9_000_000;
 
-    fn logs(n: usize) -> LogsData {
-        let kv = |k: &str, v: &str| OtlpKeyValue {
+    fn kv(k: &str, v: &str) -> OtlpKeyValue {
+        OtlpKeyValue {
             key: k.into(),
             value: Some(AnyValue {
                 value: Some(any_value::Value::StringValue(v.into())),
             }),
-        };
+        }
+    }
+
+    /// `n` log records whose bodies are `body_len` hex characters wide.
+    fn logs(n: usize, body_len: usize) -> LogsData {
         LogsData {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
@@ -367,9 +400,9 @@ mod tests {
                 scope_logs: vec![ScopeLogs {
                     log_records: (0..n)
                         .map(|i| LogRecord {
-                            time_unix_nano: 5_000 - i as u64,
+                            time_unix_nano: FIRST_LOG_TIME - i as u64,
                             body: Some(AnyValue {
-                                value: Some(any_value::Value::StringValue(format!("body-{i}"))),
+                                value: Some(any_value::Value::StringValue(body(i, body_len))),
                             }),
                             ..Default::default()
                         })
@@ -381,10 +414,27 @@ mod tests {
         }
     }
 
-    fn sealed_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+    /// A body of `len` hex characters that differs for every `i`.
+    ///
+    /// The bytes come from a splitmix-style mix so that ZSTD cannot fold the
+    /// payload away: the upload tests need the written object to actually pass
+    /// the 5 MiB multipart threshold.
+    fn body(i: usize, len: usize) -> String {
+        let mut s = String::with_capacity(len);
+        let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        while s.len() < len {
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            s.push_str(&format!("{x:016x}"));
+        }
+        s.truncate(len);
+        s
+    }
+
+    fn seal_logs(cfg: &LakeConfig, n: usize, body_len: usize) -> Block<u8> {
         let mut cache = SeriesCache::new(10);
-        let mut b: Block<u8> = Block::new(WINDOW_START, 7, cfg);
-        let mut records = encode_logs(&logs(n));
+        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, cfg);
+        let mut records = encode_logs(&logs(n, body_len));
         let e = extract(&mut records, cfg).expect("extract");
         let r = b.reserve(&e, &mut cache, 8, cfg).expect("reserve");
         b.admit(e, r, 0).expect("admit");
@@ -392,27 +442,139 @@ mod tests {
         b
     }
 
+    /// A sealed block of 30 small log rows.
+    fn sealed_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+        seal_logs(cfg, n, 8)
+    }
+
+    /// A sealed block whose values object is comfortably larger than one 5 MiB
+    /// multipart part, so that the upload tests reach an in-flight `put_part`
+    /// while the writer is still in its writable phase.
+    fn sealed_upload_block(cfg: &LakeConfig) -> Block<u8> {
+        seal_logs(cfg, 24_000, 1_024)
+    }
+
+    /// Config whose writer hands the object store several parts during the
+    /// chunk loop: real 5 MiB parts, one in-flight part at a time, and row
+    /// groups small enough that the loop flushes repeatedly.
+    fn upload_config() -> LakeConfig {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_request_bytes = 64 << 20;
+        cfg.ingress.max_extracted_bytes = 64 << 20;
+        cfg.upload.part_bytes = 5 << 20;
+        cfg.upload.concurrency = 1;
+        cfg.parquet.row_group_bytes = 256 << 10;
+        cfg.sorting.merge_chunk_bytes = 512 << 10;
+        cfg.validate().expect("valid config");
+        cfg
+    }
+
     fn local(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("fs"))
     }
 
-    /// An `ObjectStore` that parks every multipart upload until it is released,
-    /// and announces that a multipart upload has started.
-    #[derive(Debug)]
-    struct ParkedMultipart {
-        inner: Arc<dyn ObjectStore>,
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
+    fn naming(writer_id: &str, boot_id: &str) -> FileNaming {
+        FileNaming {
+            writer_id: writer_id.into(),
+            boot_id: boot_id.into(),
+        }
     }
 
-    impl std::fmt::Display for ParkedMultipart {
+    fn injected() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "test",
+            source: "injected failure".into(),
+        }
+    }
+
+    /// What the wrapping multipart upload does with each part.
+    #[derive(Debug, Clone, Copy)]
+    enum PartBehavior {
+        /// Never resolve, leaving the part in flight.
+        Park,
+        /// Fail immediately.
+        Fail,
+    }
+
+    /// What the wrapping multipart upload does when it is aborted.
+    #[derive(Debug, Clone, Copy)]
+    enum AbortBehavior {
+        /// Delegate to the real upload.
+        Delegate,
+        /// Fail the abort.
+        Fail,
+        /// Never resolve, so only the abort timeout ends it.
+        Hang,
+    }
+
+    /// An `ObjectStore` that starts real multipart uploads and then controls how
+    /// their parts and aborts behave.
+    ///
+    /// `put_multipart_opts` delegates immediately, unlike a wrapper that parks
+    /// before delegating: the `BufWriter` must actually reach its `Write` state,
+    /// because that is the only state in which `BufWriter::abort` does anything.
+    #[derive(Debug)]
+    struct ControlledMultipart {
+        inner: Arc<dyn ObjectStore>,
+        /// Notified when a part upload has started.
+        entered: Arc<Notify>,
+        /// Set once the upload has been aborted.
+        aborted: Arc<AtomicBool>,
+        /// Number of parts the writer handed to the upload.
+        parts: Arc<AtomicUsize>,
+        part: PartBehavior,
+        abort: AbortBehavior,
+    }
+
+    /// The upload handed back by [`ControlledMultipart`].
+    #[derive(Debug)]
+    struct ControlledUpload {
+        inner: Box<dyn MultipartUpload>,
+        entered: Arc<Notify>,
+        aborted: Arc<AtomicBool>,
+        parts: Arc<AtomicUsize>,
+        part: PartBehavior,
+        abort: AbortBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for ControlledUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            let _ = self.parts.fetch_add(1, Ordering::SeqCst);
+            // A permit, not a broadcast: the canceller must observe the part
+            // even if it subscribes afterwards.
+            self.entered.notify_one();
+            match self.part {
+                PartBehavior::Park => Box::pin(std::future::pending()),
+                PartBehavior::Fail => Box::pin(std::future::ready(Err(injected()))),
+            }
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborted.store(true, Ordering::SeqCst);
+            match self.abort {
+                AbortBehavior::Delegate => self.inner.abort().await,
+                AbortBehavior::Fail => {
+                    let _ = self.inner.abort().await;
+                    Err(injected())
+                }
+                AbortBehavior::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    impl std::fmt::Display for ControlledMultipart {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "ParkedMultipart({})", self.inner)
+            write!(f, "ControlledMultipart({})", self.inner)
         }
     }
 
     #[async_trait::async_trait]
-    impl ObjectStore for ParkedMultipart {
+    impl ObjectStore for ControlledMultipart {
         async fn put_opts(
             &self,
             location: &Path,
@@ -427,10 +589,105 @@ mod tests {
             location: &Path,
             options: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            // `notify_one` stores a permit, so the canceller observes the parked
-            // upload even if it subscribes after this point.
-            self.entered.notify_one();
-            self.release.notified().await;
+            let inner = self.inner.put_multipart_opts(location, options).await?;
+            Ok(Box::new(ControlledUpload {
+                inner,
+                entered: self.entered.clone(),
+                aborted: self.aborted.clone(),
+                parts: self.parts.clone(),
+                part: self.part,
+                abort: self.abort,
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// An `ObjectStore` that cancels a token the first time the values dataset
+    /// object is opened, so a test can land a cancellation inside the chunk loop
+    /// without depending on the scheduler.
+    #[derive(Debug)]
+    struct CancelOnValues {
+        inner: Arc<dyn ObjectStore>,
+        token: CancellationToken,
+        /// Set when the trip happened on a multipart upload, which only starts
+        /// while the writer is still writable.
+        tripped_multipart: Arc<AtomicBool>,
+    }
+
+    impl CancelOnValues {
+        fn trip(&self, location: &Path, multipart: bool) -> bool {
+            if !location.as_ref().contains("dataset=values") {
+                return false;
+            }
+            if multipart {
+                self.tripped_multipart.store(true, Ordering::SeqCst);
+            }
+            self.token.cancel();
+            true
+        }
+    }
+
+    impl std::fmt::Display for CancelOnValues {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CancelOnValues({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CancelOnValues {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            let _ = self.trip(location, false);
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            let _ = self.trip(location, true);
             self.inner.put_multipart_opts(location, options).await
         }
 
@@ -473,52 +730,61 @@ mod tests {
         }
     }
 
-    fn walkdir_count(root: &std::path::Path) -> usize {
-        fn walk(p: &std::path::Path, n: &mut usize) {
+    /// Parquet files under `root` whose path contains `needle`.
+    fn parquet_count(root: &std::path::Path, needle: &str) -> usize {
+        fn walk(p: &std::path::Path, needle: &str, n: &mut usize) {
             for e in std::fs::read_dir(p).expect("dir") {
                 let e = e.expect("entry");
-                if e.path().is_dir() {
-                    walk(&e.path(), n);
-                } else if e.path().extension().is_some_and(|x| x == "parquet") {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, needle, n);
+                } else if path.extension().is_some_and(|x| x == "parquet")
+                    && path.to_string_lossy().contains(needle)
+                {
                     *n += 1;
                 }
             }
         }
         let mut n = 0;
-        walk(root, &mut n);
+        walk(root, needle, &mut n);
         n
     }
 
-    /// Parquet files of the `dataset=values` Hive partition.
-    fn values_count(root: &std::path::Path) -> usize {
-        fn walk(p: &std::path::Path, n: &mut usize) {
-            for e in std::fs::read_dir(p).expect("dir") {
-                let e = e.expect("entry");
-                if e.path().is_dir() {
-                    walk(&e.path(), n);
-                } else if e.path().to_string_lossy().contains("dataset=values") {
-                    *n += 1;
-                }
-            }
-        }
-        let mut n = 0;
-        walk(root, &mut n);
-        n
+    /// Every Parquet file under `root`.
+    fn walkdir_count(root: &std::path::Path) -> usize {
+        parquet_count(root, "")
+    }
+
+    /// Key-value metadata of a written file, as a lookup closure.
+    fn file_kv(root: &std::path::Path, path: &Path) -> Vec<(String, String)> {
+        let file = std::fs::File::open(root.join(path.as_ref())).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
+        reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .expect("kv")
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    fn get<'a>(kv: &'a [(String, String)], key: &str) -> &'a str {
+        kv.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("missing metadata key {key}"))
     }
 
     /// Scenario: path components for a known window and sequence.
     /// Guarantees: the Hive layout and file name of spec section 5.3 are produced exactly.
     #[test]
     fn object_path_layout() {
-        let naming = FileNaming {
-            writer_id: "w1".into(),
-            boot_id: "b".into(),
-        };
         let p = object_path(
             Dataset::LogsValues,
             PartitionId::from_unix_secs(WINDOW_START),
             WINDOW_START,
-            &naming,
+            &naming("w1", "b"),
             42,
         );
         assert_eq!(
@@ -529,20 +795,14 @@ mod tests {
 
     /// Scenario: a block with 30 log rows written to a local directory, then read back.
     /// Guarantees: series file exists next to the values file, values are sorted by the spec,
-    /// metadata carries the window and fingerprint, the same block rewrites the same names.
+    /// every metadata key of spec 5.4 carries the expected value, the row count agrees with the
+    /// flush report, and the same block rewrites the same names.
     #[tokio::test]
     async fn writes_series_before_values_and_reads_back() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
         let b = sealed_block(&cfg, 30);
-        let sink = Sink::new(
-            local(&dir),
-            cfg.clone(),
-            FileNaming {
-                writer_id: "w".into(),
-                boot_id: "boot".into(),
-            },
-        );
+        let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"));
         let report = sink
             .write_block(&b, &CancellationToken::new())
             .await
@@ -550,29 +810,52 @@ mod tests {
         assert_eq!(report.files.len(), 2);
         assert_eq!(report.files[0].0, Dataset::LogsSeries);
         assert_eq!(report.files[1].0, Dataset::LogsValues);
-        let values_path = dir.path().join(report.files[1].1.as_ref());
-        let file = std::fs::File::open(&values_path).expect("open");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
-        let kv = reader
-            .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .expect("kv")
-            .clone();
-        let get = |k: &str| {
-            kv.iter()
-                .find(|e| e.key == k)
-                .and_then(|e| e.value.clone())
-                .expect(k)
-        };
-        assert_eq!(get("format_version"), "1");
-        assert_eq!(get("window_start"), "1789960500");
-        assert_eq!(get("window_end"), "1789960515");
-        assert_eq!(get("row_count"), "30");
+
+        let (_, values_path, values_rows) = &report.files[1];
+        let kv = file_kv(dir.path(), values_path);
+        assert_eq!(get(&kv, "format_version"), "1");
+        assert_eq!(get(&kv, "series_hash"), "xxh3_128/canonical_v1");
         assert_eq!(
-            get("sort_key"),
+            get(&kv, "schema_fingerprint"),
+            format!(
+                "{:016x}",
+                schema_fingerprint(&dataset_schema(Dataset::LogsValues, &cfg))
+            )
+        );
+        assert_eq!(
+            get(&kv, "sort_key"),
             "series_id:asc:nulls_last,time_unix_nano:asc:nulls_last"
         );
+        assert_eq!(get(&kv, "writer_id"), "w");
+        assert_eq!(get(&kv, "boot_id"), "boot");
+        assert_eq!(get(&kv, "seq"), SEQ.to_string());
+        assert_eq!(get(&kv, "window_start"), "1789960500");
+        assert_eq!(get(&kv, "window_end"), "1789960515");
+        // The metadata row count is the count the sink actually wrote.
+        assert_eq!(get(&kv, "row_count"), "30");
+        assert_eq!(get(&kv, "row_count"), values_rows.to_string());
+        // Record i carries FIRST_LOG_TIME - i, for i in 0..30.
+        assert_eq!(
+            get(&kv, "min_time_unix_nano"),
+            (FIRST_LOG_TIME - 29).to_string()
+        );
+        assert_eq!(get(&kv, "max_time_unix_nano"), FIRST_LOG_TIME.to_string());
+
+        // A series dataset has no time column, so it carries no time bounds.
+        let series_kv = file_kv(dir.path(), &report.files[0].1);
+        assert_eq!(get(&series_kv, "row_count"), report.files[0].2.to_string());
+        assert!(!series_kv.iter().any(|(k, _)| k == "min_time_unix_nano"));
+        assert!(!series_kv.iter().any(|(k, _)| k == "max_time_unix_nano"));
+        assert_eq!(
+            get(&series_kv, "schema_fingerprint"),
+            format!(
+                "{:016x}",
+                schema_fingerprint(&dataset_schema(Dataset::LogsSeries, &cfg))
+            )
+        );
+
+        let file = std::fs::File::open(dir.path().join(values_path.as_ref())).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
         let batches: Vec<_> = reader
             .build()
             .expect("build")
@@ -582,6 +865,7 @@ mod tests {
         assert_eq!(all.num_rows(), 30);
         let spec = crate::sort::SortSpec::new(cfg.logs.values_sort.clone());
         assert!(crate::sort::is_sorted(&all, &spec).expect("sorted"));
+
         // rewrite: same names, still two files on disk
         let report2 = sink
             .write_block(&b, &CancellationToken::new())
@@ -591,13 +875,108 @@ mod tests {
         assert_eq!(walkdir_count(dir.path()), 2);
     }
 
+    /// Scenario: a metrics block carrying both a gauge and a histogram.
+    /// Guarantees: the series dataset is written before both value datasets, each value
+    /// dataset gets its own file under its own Hive prefix, and each file's row count
+    /// matches the flush report.
+    #[tokio::test]
+    async fn metrics_block_writes_series_before_both_value_datasets() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(10);
+        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
+        let mut records = encode_metrics(&gauge_and_histogram());
+        let e = extract(&mut records, &cfg).expect("extract");
+        let r = b.reserve(&e, &mut cache, 8, &cfg).expect("reserve");
+        b.admit(e, r, 0).expect("admit");
+        b.seal(SEAL_AT_US).expect("seal");
+
+        let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"));
+        let report = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        let order: Vec<Dataset> = report.files.iter().map(|(d, _, _)| *d).collect();
+        assert_eq!(
+            order,
+            vec![
+                Dataset::MetricsSeries,
+                Dataset::MetricsNumber,
+                Dataset::MetricsHistogram
+            ]
+        );
+        assert_eq!(parquet_count(dir.path(), "dataset=series"), 1);
+        assert_eq!(parquet_count(dir.path(), "dataset=number"), 1);
+        assert_eq!(parquet_count(dir.path(), "dataset=histogram"), 1);
+        assert_eq!(walkdir_count(dir.path()), 3);
+        for (ds, path, rows) in &report.files {
+            assert!(*rows > 0, "{ds:?} wrote no rows");
+            let kv = file_kv(dir.path(), path);
+            assert_eq!(get(&kv, "row_count"), rows.to_string());
+            assert_eq!(
+                get(&kv, "schema_fingerprint"),
+                format!("{:016x}", schema_fingerprint(&dataset_schema(*ds, &cfg)))
+            );
+            assert_eq!(
+                kv.iter().any(|(k, _)| k == "min_time_unix_nano"),
+                !ds.is_series()
+            );
+        }
+    }
+
+    fn gauge_and_histogram() -> MetricsData {
+        let dp = |t: u64, v: f64| NumberDataPoint {
+            time_unix_nano: t,
+            value: Some(number_data_point::Value::AsDouble(v)),
+            attributes: vec![kv("cpu", "0")],
+            ..Default::default()
+        };
+        MetricsData {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", "h1")],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "cpu".into(),
+                            unit: "1".into(),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![dp(10, 0.5), dp(20, 0.7)],
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "lat".into(),
+                            data: Some(metric::Data::Histogram(Histogram {
+                                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                                data_points: vec![HistogramDataPoint {
+                                    time_unix_nano: 40,
+                                    count: 3,
+                                    sum: Some(6.0),
+                                    bucket_counts: vec![1, 2],
+                                    explicit_bounds: vec![5.0],
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
     /// Scenario: a sealed block into which nothing was ever admitted.
     /// Guarantees: no dataset file is created for a zero-row dataset (spec 5.3).
     #[tokio::test]
     async fn empty_block_writes_no_file() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
-        let mut b: Block<u8> = Block::new(WINDOW_START, 7, &cfg);
+        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
         b.seal(SEAL_AT_US).expect("seal");
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let report = sink
@@ -606,6 +985,21 @@ mod tests {
             .expect("write");
         assert!(report.files.is_empty());
         assert_eq!(walkdir_count(dir.path()), 0);
+    }
+
+    /// Scenario: a block that was never sealed, under debug assertions.
+    /// Guarantees: the sink refuses to write a block whose descriptor rows have not
+    /// been materialized, which would otherwise silently drop every series row.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "unsealed block")]
+    async fn write_block_rejects_an_unsealed_block() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg = LakeConfig::default();
+        let b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
+        assert!(!b.is_sealed());
+        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+        let _ = sink.write_block(&b, &CancellationToken::new()).await;
     }
 
     /// Scenario: `writer_limit_bytes` and `merge_chunk_bytes` set so low that every
@@ -617,6 +1011,7 @@ mod tests {
         let mut cfg = LakeConfig::default();
         cfg.parquet.writer_limit_bytes = 1;
         cfg.sorting.merge_chunk_bytes = 1;
+        cfg.validate().expect("valid config");
         let b = sealed_block(&cfg, 40);
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let report = sink
@@ -659,52 +1054,56 @@ mod tests {
         assert_eq!(walkdir_count(dir.path()), 0);
     }
 
-    /// Scenario: cancellation arrives while the chunk loop is running, with a tiny
-    /// merge chunk size so that many chunk boundaries are crossed.
-    /// Guarantees: the write stops with Cancelled and no complete Parquet file is left.
+    /// Scenario: the store cancels the token the moment the values object is opened,
+    /// which happens part way through the chunk loop of a multi-part values file.
+    /// Guarantees: every run stops with Cancelled after the series file has been
+    /// finalized and before any values object is completed.
     #[tokio::test]
     async fn cancellation_at_a_chunk_boundary() {
         let dir = tempfile::tempdir().expect("tmp");
-        let mut cfg = LakeConfig::default();
-        cfg.sorting.merge_chunk_bytes = 1;
-        let b = sealed_block(&cfg, 4_000);
-        let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+        let cfg = upload_config();
+        let b = sealed_upload_block(&cfg);
         let token = CancellationToken::new();
-        let canceller = token.clone();
-        let handle = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            canceller.cancel();
+        let tripped_multipart = Arc::new(AtomicBool::new(false));
+        let store: Arc<dyn ObjectStore> = Arc::new(CancelOnValues {
+            inner: local(&dir),
+            token: token.clone(),
+            tripped_multipart: tripped_multipart.clone(),
         });
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
         let got = sink.write_block(&b, &token).await;
-        handle.await.expect("canceller");
-        assert!(matches!(got, Err(Error::Cancelled { .. })));
-        // The values table is the one with thousands of chunk boundaries, so it is
-        // the table the cancellation lands in; its object is never completed. The
-        // series table is a single small chunk that may already have been
-        // finalized when the token fires, and a finalized file is never unwritten.
-        assert_eq!(values_count(dir.path()), 0);
-        assert!(walkdir_count(dir.path()) <= 1);
+        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(
+            tripped_multipart.load(Ordering::SeqCst),
+            "the token must fire inside the chunk loop, not at finalization"
+        );
+        // The series file was finalized before the token fired; a finalized file
+        // is never unwritten (spec 6.5 step 2).
+        assert_eq!(parquet_count(dir.path(), "dataset=series"), 1);
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
     }
 
-    /// Scenario: cancellation arrives while a multipart upload is in flight, with an
-    /// object store that parks `put_multipart` until the test releases it.
-    /// Guarantees: the parked upload is cancelled rather than awaited to completion,
-    /// `write_block` returns Cancelled and no complete Parquet file is left.
+    /// Scenario: cancellation arrives while a real multipart part is in flight, with a
+    /// store whose `put_part` never resolves.
+    /// Guarantees: the writer is in its `Write` state so the abort takes the real path,
+    /// the upload is aborted rather than awaited to completion, `write_block` returns
+    /// Cancelled and no values object is completed.
     #[tokio::test]
     async fn cancellation_inside_an_upload() {
         let dir = tempfile::tempdir().expect("tmp");
         let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let store: Arc<dyn ObjectStore> = Arc::new(ParkedMultipart {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let parts = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
             inner: local(&dir),
             entered: entered.clone(),
-            release: release.clone(),
+            aborted: aborted.clone(),
+            parts: parts.clone(),
+            part: PartBehavior::Park,
+            abort: AbortBehavior::Delegate,
         });
-        let mut cfg = LakeConfig::default();
-        // Small parts so the BufWriter switches to a multipart upload quickly.
-        cfg.upload.part_bytes = 4 << 10;
-        cfg.sorting.merge_chunk_bytes = 4 << 10;
-        let b = sealed_block(&cfg, 4_000);
+        let cfg = upload_config();
+        let b = sealed_upload_block(&cfg);
         let sink = Sink::new(store, cfg, FileNaming::new("w"));
         let token = CancellationToken::new();
         let canceller = token.clone();
@@ -715,8 +1114,88 @@ mod tests {
         });
         let got = sink.write_block(&b, &token).await;
         handle.await.expect("canceller");
-        release.notify_waiters();
-        assert!(matches!(got, Err(Error::Cancelled { .. })));
-        assert_eq!(walkdir_count(dir.path()), 0);
+        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(
+            parts.load(Ordering::SeqCst) > 0,
+            "the writer must have handed a real part to the upload"
+        );
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the in-flight multipart upload must be aborted"
+        );
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+    }
+
+    /// Scenario: a part upload fails while the writer is still writable and the
+    /// best-effort abort that follows fails as well.
+    /// Guarantees: `AbortFailed` carries both the original write failure and the reason
+    /// the cleanup did not succeed, and no values object is completed.
+    #[tokio::test]
+    async fn write_failure_with_a_failing_abort_reports_both() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let aborted = Arc::new(AtomicBool::new(false));
+        let parts = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
+            inner: local(&dir),
+            entered: Arc::new(Notify::new()),
+            aborted: aborted.clone(),
+            parts: parts.clone(),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Fail,
+        });
+        let cfg = upload_config();
+        let b = sealed_upload_block(&cfg);
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let got = sink.write_block(&b, &CancellationToken::new()).await;
+        let Err(Error::AbortFailed {
+            source,
+            abort_error,
+        }) = got
+        else {
+            panic!("expected AbortFailed, got {got:?}");
+        };
+        // The failure that triggered the cleanup is preserved, not replaced.
+        assert!(
+            source.to_string().contains("injected failure"),
+            "original failure lost: {source}"
+        );
+        assert!(
+            abort_error.contains("injected failure"),
+            "abort failure lost: {abort_error}"
+        );
+        assert!(parts.load(Ordering::SeqCst) > 0);
+        assert!(aborted.load(Ordering::SeqCst));
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+    }
+
+    /// Scenario: a part upload fails and the best-effort abort then hangs, with a
+    /// one-millisecond `upload.abort_timeout`.
+    /// Guarantees: the timeout branch ends the cleanup, and the reported abort error
+    /// names the timeout instead of blocking the flush task forever.
+    #[tokio::test]
+    async fn abort_timeout_is_reported() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
+            inner: local(&dir),
+            entered: Arc::new(Notify::new()),
+            aborted: Arc::new(AtomicBool::new(false)),
+            parts: Arc::new(AtomicUsize::new(0)),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Hang,
+        });
+        let mut cfg = upload_config();
+        cfg.upload.abort_timeout = Duration::from_millis(1);
+        cfg.validate().expect("valid config");
+        let b = sealed_upload_block(&cfg);
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let got = sink.write_block(&b, &CancellationToken::new()).await;
+        let Err(Error::AbortFailed { abort_error, .. }) = got else {
+            panic!("expected AbortFailed, got {got:?}");
+        };
+        assert!(
+            abort_error.contains("timed out"),
+            "expected a timeout reason, got {abort_error}"
+        );
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
     }
 }

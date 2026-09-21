@@ -350,6 +350,18 @@ impl<T> Block<T> {
         self.emitted_at_us
     }
 
+    /// Whether `seal` has already run on this block.
+    ///
+    /// The seal stamp is set and no descriptor row is still waiting to be
+    /// materialized into a series batch, which is the same condition
+    /// `into_parts` asserts on. A consumer that walks `tables()` of an unsealed
+    /// block would silently miss every descriptor row, so the sink asserts this
+    /// before it writes.
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.emitted_at_us.is_some() && self.pending_descriptors.values().all(Vec::is_empty)
+    }
+
     /// One deduplicated pass over everything the block retains.
     ///
     /// Called only from `seal`, after the pending descriptor rows have been
