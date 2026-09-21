@@ -301,30 +301,26 @@ mod tests {
         assert_eq!(nanos_to_secs(5_000_000_001), 5);
     }
 
-    /// Scenario: a leap day far from the epoch (2000-02-29, a century year
-    /// divisible by 400 and therefore leap in the proleptic Gregorian
-    /// calendar) alongside the near-epoch 2026-09-21 case.
-    /// Guarantees: `date_string` matches `chrono`'s own formatting of the
-    /// same instant, confirming the `chrono`-backed implementation agrees
-    /// with an independently computed reference for a date that exercises
-    /// leap-year handling, not just the happy-path date used elsewhere.
+    /// Scenario: three known dates far from the epoch round-trip through
+    /// `from_unix_secs` then `date_string`: 2026-09-21 (the near-epoch case
+    /// used elsewhere), 2000-02-29 (a century year divisible by 400, so it
+    /// is a leap year in the proleptic Gregorian calendar), and 2100-03-01
+    /// (the day after a century year, 2100, that is *not* leap despite
+    /// being divisible by 100).
+    /// Guarantees: `date_string` produces the exact calendar date for each,
+    /// against independently known literal strings rather than only
+    /// against `chrono`'s own formatting, so the test is a real regression
+    /// net for the `chrono`-backed implementation.
     #[test]
-    fn date_string_matches_chrono_for_dates_far_from_epoch() {
-        // 2000-02-29T12:00:00Z = 951825600
-        let leap_day = PartitionId::from_unix_secs(951_825_600);
-        assert_eq!(leap_day.date_string(), "2000-02-29");
-        let expected = DateTime::<Utc>::from_timestamp(951_825_600, 0)
-            .expect("in-range timestamp")
-            .format("%Y-%m-%d")
-            .to_string();
-        assert_eq!(leap_day.date_string(), expected);
-
-        // 2026-09-21T03:15:00Z = 1789960500
-        let recent = PartitionId::from_unix_secs(1_789_960_500);
-        let expected = DateTime::<Utc>::from_timestamp(1_789_960_500, 0)
-            .expect("in-range timestamp")
-            .format("%Y-%m-%d")
-            .to_string();
-        assert_eq!(recent.date_string(), expected);
+    fn date_string_round_trips_for_dates_far_from_epoch() {
+        let cases: [(i64, &str); 3] = [
+            (1_789_960_500, "2026-09-21"), // 2026-09-21T03:15:00Z
+            (951_825_600, "2000-02-29"),   // 2000-02-29T12:00:00Z (leap day)
+            (4_107_565_800, "2100-03-01"), // 2100-03-01T06:30:00Z (non-leap century)
+        ];
+        for (secs, expected) in cases {
+            let p = PartitionId::from_unix_secs(secs);
+            assert_eq!(p.date_string(), expected, "secs={secs}");
+        }
     }
 }
