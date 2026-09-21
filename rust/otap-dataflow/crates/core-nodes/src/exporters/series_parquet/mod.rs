@@ -14,6 +14,11 @@
 //! waiting for the flush slot. A slow destination therefore becomes
 //! backpressure rather than unbounded memory.
 //!
+//! A request the ACTIVE block cannot take is not refused for it. Its rows are
+//! already extracted, so the extraction is parked, admission closes, and it is
+//! offered to the next block before any newer request. At most one request is
+//! parked, which is what keeps the worker to two blocks and one request.
+//!
 //! Rotation timing is not yet the window timer: a block is sealed as soon as
 //! it holds a request, so this still writes one file set per request. A later
 //! task replaces the trigger with the aligned window clock without changing
@@ -222,6 +227,14 @@ async fn run(
                 }
             } => {
                 worker.complete(done);
+                // The flush slot is free, so the rotation the parked request
+                // is waiting for can be served before the loop takes anything
+                // else; the resume has to happen in the same turn, or a newer
+                // request could reach the new block first.
+                if worker.rotation_requested {
+                    worker.rotate();
+                }
+                worker.resume_pending();
                 notify_turns = 0;
             }
 
@@ -241,6 +254,7 @@ async fn run(
             () = std::future::ready(()),
                 if worker.rotation_requested && worker.flushing.is_none() => {
                 worker.rotate();
+                worker.resume_pending();
                 notify_turns = 0;
             }
 

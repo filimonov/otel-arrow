@@ -17,6 +17,13 @@
 //! There is no third block: while a flush is outstanding the node closes pdata
 //! admission instead of opening another ACTIVE block, so the memory a worker
 //! can hold is bounded by the two blocks and the completions in flight.
+//!
+//! A block-scoped refusal -- a full block, or one already holding its request
+//! limit -- is not the request's fault, so the request is not nacked for it.
+//! Its extraction is parked in `pending`, admission closes until a block
+//! opens, and the parked request is reserved against that block before any
+//! newer one. Exactly one request is ever parked, so the bound above becomes
+//! two blocks, one request and the completions in flight.
 
 use super::config::Config;
 use super::flush::{FlushDone, FlushJob};
@@ -95,6 +102,34 @@ pub(super) struct OwnedBlock {
     pub(super) tokens: Vec<AckToken>,
 }
 
+/// One extracted request waiting for a block that can take it.
+///
+/// This is what the worker holds instead of the request: the payload and the
+/// record batches the conversion produced are already gone, so parking costs
+/// the extracted rows and the completion and nothing else.
+pub(super) struct Pending {
+    /// The rows the request contributed.
+    pub(super) extracted: Extracted,
+    /// The completion the request is still owed.
+    pub(super) token: AckToken,
+    /// Wall-clock second the request was prepared at, for window alignment.
+    pub(super) admission_secs: i64,
+}
+
+/// What preparing one request produced.
+///
+/// Preparation always decides the request: either its rows are ready to be
+/// offered to a block, or it has failed validation and owes its sender a
+/// refusal. This is an enum rather than a `Result` because neither arm is
+/// propagated -- both are handled at the single call site -- and because a
+/// refusal is a normal outcome of admission, not an error the worker reports.
+pub(super) enum Prepared {
+    /// The request's rows, ready to be offered to a block.
+    Ready(Pending),
+    /// The request failed validation and its completion is still owed.
+    Failed(AckToken, Failure),
+}
+
 /// The ACTIVE and FLUSHING pair of one exporter instance.
 pub(super) struct Worker {
     /// Validated user configuration.
@@ -103,6 +138,8 @@ pub(super) struct Worker {
     pub(super) active: OwnedBlock,
     /// The one block being written, if any.
     pub(super) flushing: Option<FlushJob>,
+    /// The one extracted request no block could take yet.
+    pub(super) pending: Option<Pending>,
     /// Descriptors already written for a partition.
     pub(super) cache: SeriesCache,
     /// Delivery of decided completions.
@@ -147,6 +184,7 @@ impl Worker {
             cfg,
             active,
             flushing: None,
+            pending: None,
             cache,
             notify,
             rotation_requested: false,
@@ -166,6 +204,7 @@ impl Worker {
         self.active.tokens.len()
             + self.flushing.as_ref().map_or(0, |job| job.tokens.len())
             + self.notify.len()
+            + usize::from(self.pending.is_some())
     }
 
     /// Whether one more request may be admitted.
@@ -178,6 +217,7 @@ impl Worker {
     pub(super) fn accept(&self) -> bool {
         self.deadline.is_none()
             && !self.rotation_requested
+            && self.pending.is_none()
             && self.notify.has_credit(self.live_tokens())
     }
 
@@ -195,55 +235,169 @@ impl Worker {
         }
     }
 
-    /// Validate one request and extract its rows.
+    /// Validate one request, extract its rows and release its payload.
     ///
-    /// Returns `Ok(None)` for a request that carries no rows at all: there is
-    /// nothing to make durable, so it is acknowledged without touching a
-    /// block.
-    fn prepare(&self, mut payload: OtapPayload) -> Result<Option<Extracted>, Failure> {
+    /// The returned value is what the worker may have to hold until the next
+    /// block opens, so nothing of the request's own representation survives
+    /// the call: the pdata is consumed, the transport frames and claims are
+    /// dropped inside [`AckToken::split`], and the conversion records are
+    /// dropped here. Only the extracted rows and the completion remain.
+    ///
+    /// Nothing in here touches a block, so a request that fails validation
+    /// leaves the ACTIVE block exactly as it was.
+    pub(super) fn prepare(&self, data: OtapPdata) -> Prepared {
+        // The completion is retained across a storage round trip before it is
+        // handed back, so the token keeps only the routing frames: the payload
+        // is taken out here and the inbound credentials and the claims derived
+        // from them are dropped inside `split`, rather than staying resident
+        // for the duration of the write (spec section 7).
+        let (token, mut payload) = AckToken::split(data);
         // `num_bytes` is an estimate of the wire representation, so the budget
         // is also enforced on the measured extracted output inside `extract`.
         if !payload
             .num_bytes()
             .is_some_and(|n| n <= self.cfg.lake.ingress.max_request_bytes)
         {
-            return Err(Failure::Permanent(lake::Error::Refused(
-                lake::RefuseReason::RequestTooLarge,
-            )));
+            return Prepared::Failed(
+                token,
+                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)),
+            );
         }
         if payload.signal_type() != otel_arrow_dfe_config::SignalType::Logs {
-            return Err(Failure::Permanent(lake::Error::Refused(
-                lake::RefuseReason::Unsupported("signal".into()),
-            )));
+            return Prepared::Failed(
+                token,
+                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
+                    "signal".into(),
+                ))),
+            );
         }
+        let extracted = match self.extract(payload) {
+            Ok(extracted) => extracted,
+            Err(failure) => return Prepared::Failed(token, failure),
+        };
+        Prepared::Ready(Pending {
+            extracted,
+            token,
+            admission_secs: nanos_to_secs(self.wall.now_unix_nanos()),
+        })
+    }
+
+    /// Convert one payload and extract its rows, dropping the conversion.
+    ///
+    /// Split out so the record batches the conversion produced go out of scope
+    /// with the call rather than living as long as the extraction does.
+    fn extract(&self, payload: OtapPayload) -> Result<Extracted, Failure> {
         let mut records: OtapArrowRecords = payload.try_into_with_default().map_err(|e| {
             Failure::Permanent(lake::Error::invalid(format!("undecodable pdata: {e}")))
         })?;
-        let extracted =
-            lake::extract::extract(&mut records, &self.cfg.lake).map_err(Failure::Permanent)?;
-        drop(records);
-        if extracted.stats.rows == 0 {
-            return Ok(None);
-        }
-        Ok(Some(extracted))
+        lake::extract::extract(&mut records, &self.cfg.lake).map_err(Failure::Permanent)
     }
 
     /// Take ownership of one request's completion and try to admit its rows.
     ///
-    /// Every path ends with the request decided or its completion held by the
-    /// ACTIVE block; none leaves it without an owner.
+    /// Every path ends with the request decided, its completion held by the
+    /// ACTIVE block, or the whole extraction parked; none leaves it without an
+    /// owner.
     pub(super) fn admit(&mut self, data: OtapPdata) {
-        // The completion is retained across a storage round trip before it is
-        // handed back, so the token keeps only the routing frames: the payload
-        // is returned here and the inbound credentials and the claims derived
-        // from them are dropped inside `split`, rather than staying resident
-        // for the duration of the write (spec section 7).
-        let (token, payload) = AckToken::split(data);
-        let token_bytes = token.bytes();
-        match self.prepare(payload) {
-            Ok(Some(extracted)) => self.admit_extracted(token, extracted, token_bytes),
-            Ok(None) => self.notify.push(token, Outcome::Ack),
-            Err(failure) => self.refuse(token, &failure),
+        match self.prepare(data) {
+            Prepared::Ready(pending) => self.offer(pending),
+            Prepared::Failed(token, failure) => self.refuse(token, &failure),
+        }
+    }
+
+    /// Offer one prepared request to the ACTIVE block.
+    ///
+    /// A request that carries no rows is acknowledged without touching a
+    /// block. Otherwise the reservation runs first, so the block is mutated
+    /// only once it has accepted the request. A block-scoped refusal parks the
+    /// extraction and asks for a rotation instead of refusing the sender: the
+    /// same rows will fit the next block. Only one request is ever parked,
+    /// because admission closes while one is waiting.
+    pub(super) fn offer(&mut self, pending: Pending) {
+        if pending.extracted.stats.rows == 0 {
+            self.notify.push(pending.token, Outcome::Ack);
+            return;
+        }
+        // A request that arrived after the ACTIVE block's window ended belongs
+        // to the next block, not to the one still in hand.
+        let windows = lake::clock::WindowClock::new(
+            self.cfg.window.interval,
+            self.active.data.window_start_secs,
+        );
+        if windows.effective_boundary(pending.admission_secs) > self.active.data.window_start_secs {
+            self.park(pending);
+            return;
+        }
+        let token_bytes = pending.token.bytes();
+        let reservation = match self.active.data.reserve(
+            &pending.extracted,
+            &mut self.cache,
+            token_bytes,
+            &self.cfg.lake,
+        ) {
+            Ok(reservation) => reservation,
+            // The block-scoped refusals judge whichever block happened to
+            // be active, so the request waits for the next one. An empty
+            // block cannot refuse this way -- a request it does not fit is
+            // `RequestTooLarge` -- so parking here can never become an
+            // endless rotation; the guard makes that a checked fact rather
+            // than an inference about `reserve`.
+            Err(lake::Error::Refused(
+                lake::RefuseReason::BlockFull | lake::RefuseReason::TooManyRequests,
+            )) if !self.active.data.is_empty() => {
+                self.park(pending);
+                return;
+            }
+            Err(error) => {
+                // The reservation refused before the block was touched, so
+                // only this request is affected.
+                self.refuse(pending.token, &Self::reservation_failure(error));
+                return;
+            }
+        };
+        match self.active.data.admit(pending.extracted, reservation, ()) {
+            Ok(()) => {
+                self.active.tokens.push(pending.token);
+                // Rotation timing is not this task's: until the window timer
+                // lands, a block is sealed as soon as it holds a request, so
+                // an acknowledged request is durable without waiting for a
+                // later one to arrive.
+                self.rotation_requested = true;
+            }
+            Err(error) => {
+                // A failed admission leaves the block partially updated by
+                // contract, so the whole ACTIVE block is failed rather than
+                // written.
+                self.refuse(pending.token, &Failure::Retryable(error));
+                self.fail_active(Outcome::Storage);
+            }
+        }
+    }
+
+    /// Park the one request the ACTIVE block could not take.
+    fn park(&mut self, pending: Pending) {
+        assert!(
+            self.pending.is_none(),
+            "admission closes while a request is parked"
+        );
+        self.pending = Some(pending);
+        self.rotation_requested = true;
+    }
+
+    /// Offer the parked request to the block that has just opened.
+    ///
+    /// A no-op while a rotation is still owed, so the request is never offered
+    /// to a block that is about to be sealed, and once shutdown has been
+    /// latched, because [`Worker::shutdown`] has already decided it. The
+    /// reservation is recomputed here against the new block's partition and
+    /// the cache as it now stands, so a descriptor the failed block carried is
+    /// written again by this one.
+    pub(super) fn resume_pending(&mut self) {
+        if self.rotation_requested || self.deadline.is_some() {
+            return;
+        }
+        if let Some(pending) = self.pending.take() {
+            self.offer(pending);
         }
     }
 
@@ -259,41 +413,6 @@ impl Worker {
             error = %failure.error()
         );
         self.notify.push(token, outcome);
-    }
-
-    /// Reserve, then admit, an already validated request.
-    fn admit_extracted(&mut self, token: AckToken, extracted: Extracted, token_bytes: usize) {
-        let reservation =
-            match self
-                .active
-                .data
-                .reserve(&extracted, &mut self.cache, token_bytes, &self.cfg.lake)
-            {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    // The reservation refused before the block was touched, so
-                    // only this request is affected.
-                    self.refuse(token, &Self::reservation_failure(error));
-                    return;
-                }
-            };
-        match self.active.data.admit(extracted, reservation, ()) {
-            Ok(()) => {
-                self.active.tokens.push(token);
-                // Rotation timing is not this task's: until the window timer
-                // lands, a block is sealed as soon as it holds a request, so
-                // an acknowledged request is durable without waiting for a
-                // later one to arrive.
-                self.rotation_requested = true;
-            }
-            Err(error) => {
-                // A failed admission leaves the block partially updated by
-                // contract, so the whole ACTIVE block is failed rather than
-                // written.
-                self.refuse(token, &Failure::Retryable(error));
-                self.fail_active(Outcome::Storage);
-            }
-        }
     }
 
     /// An empty block for the current window, after the one in hand.
@@ -336,6 +455,10 @@ impl Worker {
         }
         self.rotation_requested = false;
         if self.active.data.is_empty() {
+            // A parked request may be waiting for a later window than the one
+            // this empty block was opened for, so the block is replaced rather
+            // than kept; otherwise the resume would park it again.
+            self.active = self.new_active();
             return;
         }
         if let Err(error) = self
@@ -408,13 +531,19 @@ impl Worker {
     /// The earliest deadline wins, so a second, tighter shutdown cannot extend
     /// the first.
     pub(super) fn shutdown(&mut self, deadline: Instant) {
+        // Nothing will open another block, so the parked request is decided
+        // now rather than waiting for a rotation that will not serve it.
+        if let Some(pending) = self.pending.take() {
+            self.notify.push(pending.token, Outcome::Shutdown);
+        }
         self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
         self.rotation_requested = true;
     }
 
     /// Whether the worker owes nothing further.
     pub(super) fn is_idle(&self) -> bool {
-        self.active.tokens.is_empty()
+        self.pending.is_none()
+            && self.active.tokens.is_empty()
             && self.active.data.is_empty()
             && self.flushing.is_none()
             && self.notify.is_empty()
@@ -428,6 +557,9 @@ impl Worker {
     /// immediately is counted as a delivery failure and released, so the node
     /// returns within its deadline and no request is left undecided.
     pub(super) fn abandon(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.notify.push(pending.token, Outcome::Shutdown);
+        }
         if let Some(mut job) = self.flushing.take() {
             job.cancel.cancel();
             for token in std::mem::take(&mut job.tokens) {

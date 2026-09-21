@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::token::{AckToken, Notifier, Outcome};
-use super::worker::{Failure, Worker};
+use super::worker::{Failure, Prepared, Worker};
 use object_store::ObjectStoreExt;
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::SignalType;
@@ -578,6 +578,183 @@ async fn complete_files_before_ack() {
             assert!(worker.notify.next().await.is_ok());
             assert!(matches!(
                 rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
+        })
+        .await;
+}
+
+/// A worker configuration whose blocks hold at most `requests` requests, so a
+/// third request has to wait for the next block.
+fn worker_config_with_requests(requests: usize) -> Config {
+    let mut cfg = worker_config();
+    cfg.window.max_requests_per_block = requests;
+    cfg.lake.ingress.max_requests_per_block = requests;
+    cfg
+}
+
+/// Scenario: two requests fill a two-request block and a third request needs
+/// the next one.
+/// Guarantees: exactly one extracted request is parked, admission closes while
+/// it waits, and it enters the next block before anything newer, so a request
+/// that could not be reserved is neither dropped nor reordered behind later
+/// input and the worker still holds no more than two blocks and one request.
+#[tokio::test(flavor = "current_thread")]
+async fn one_pending_request_resumes_before_new_input() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config_with_requests(2), store, wall, handler);
+
+            worker.admit(logs_pdata());
+            worker.admit(logs_pdata());
+            worker.admit(logs_pdata());
+
+            assert_eq!(worker.active.tokens.len(), 2);
+            assert!(worker.pending.is_some());
+            assert!(!worker.accept());
+
+            worker.rotate();
+            worker.resume_pending();
+            assert!(worker.pending.is_none());
+            assert_eq!(worker.active.tokens.len(), 1);
+            assert_eq!(worker.live_tokens(), 3);
+            assert!(worker.active.data.bytes <= worker.cfg.window.max_block_bytes);
+        })
+        .await;
+}
+
+/// Scenario: a request whose logical size exceeds the input budget is offered
+/// to an empty ACTIVE block.
+/// Guarantees: nothing is admitted, no request is parked and the sender gets a
+/// permanent refusal, because a request that cannot fit an empty block would
+/// be refused by every following block as well.
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_input_is_refused_atomically() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(2);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            cfg.lake.ingress.max_request_bytes = 1;
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            worker.admit(logs_pdata());
+            assert_eq!(worker.active.data.bytes, 0);
+            assert!(worker.pending.is_none());
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Scenario: preparation consumes Arrow input whose original array is still
+/// weakly observed from outside the worker.
+/// Guarantees: the parked extraction retains no original input array and no
+/// conversion record batch, so parking one request cannot keep a whole
+/// request's Arrow buffers resident beside the two blocks.
+#[tokio::test(flavor = "current_thread")]
+async fn prepare_releases_original_arrow_payload() {
+    use otel_arrow_dfe_pdata::TryIntoWithOptions;
+    use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+
+    let (context, payload) = logs_pdata().into_parts();
+    let records: OtapArrowRecords = payload.try_into_with_default().expect("records");
+    let weak = Arc::downgrade(
+        records
+            .get(ArrowPayloadType::Logs)
+            .expect("logs batch")
+            .column(0),
+    );
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (handler, _rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(worker_config(), store, wall, handler);
+
+    let prepared = worker.prepare(OtapPdata::new(context, records.into()));
+    assert!(matches!(prepared, Prepared::Ready(_)));
+    assert!(
+        weak.upgrade().is_none(),
+        "the prepared output cannot pin the input arrays"
+    );
+}
+
+/// Scenario: a well-formed request is converted and then fails the extraction
+/// budget, which is measured only after the conversion has run.
+/// Guarantees: the failure is a permanent refusal, nothing is parked and the
+/// ACTIVE block is left untouched, because every validation phase completes
+/// before the block is reserved against.
+#[tokio::test(flavor = "current_thread")]
+async fn extraction_failure_is_refused_atomically() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(2);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            // Large enough to pass the wire-size check, so the refusal can
+            // only come from the measured extracted output.
+            cfg.lake.ingress.max_extracted_bytes = 1;
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            worker.admit(logs_pdata());
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(worker.pending.is_none());
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                }
+                other => panic!("expected an extraction refusal, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Scenario: an OTLP protobuf body that is not decodable reaches preparation
+/// after its byte-size check.
+/// Guarantees: it is decided without touching a block and without panicking.
+/// The OTLP byte views are deliberately non-validating, so such a body decodes
+/// to a request carrying no rows rather than to a conversion error; the worker
+/// therefore acknowledges it, and this records that as the behaviour a sender
+/// sees rather than leaving it to be discovered as a crash.
+#[tokio::test(flavor = "current_thread")]
+async fn an_undecodable_body_is_decided_without_touching_a_block() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (context, _) = logs_pdata().into_parts();
+            // Field 1 (`resource_logs`), length-delimited, declaring 127 bytes
+            // that the buffer does not contain.
+            let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(
+                bytes::Bytes::from_static(&[0x0A, 0x7F]),
+            );
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(2);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+
+            worker.admit(OtapPdata::new(context, payload.into()));
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(worker.pending.is_none());
+
+            assert!(worker.notify.next().await.is_ok());
+            assert!(matches!(
+                rx.recv().await.expect("a completion"),
                 PipelineCompletionMsg::DeliverAck { .. }
             ));
         })

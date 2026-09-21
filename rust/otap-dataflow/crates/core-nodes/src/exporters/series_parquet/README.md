@@ -15,7 +15,14 @@ admitted to the ACTIVE block and acknowledged only once the whole block has
 been written and its descriptors marked committed; a failed write nacks every
 request of the block as retryable. Admission closes once the ACTIVE block is
 waiting to be rotated, so no third block is ever needed and a slow destination
-becomes backpressure. Rotation timing is still a placeholder: a block is sealed as
+becomes backpressure. A request the ACTIVE block cannot reserve room for is
+not refused: its extracted rows are parked, input closes until the next block
+opens, and the parked request enters that block before anything newer. Only
+one request is ever parked, so the memory a worker holds is the two blocks
+plus one request. Preparation runs entirely before the block is reserved
+against, so a refused request leaves the block unchanged, and the request's
+payload and conversion batches are released as soon as its rows are
+extracted. Rotation timing is still a placeholder: a block is sealed as
 soon as it holds a request, so this writes one file set per request until the
 window timer lands. Later tasks add that timer, telemetry and a drain-aware
 shutdown. Only logs are accepted; metrics and traces are permanently refused.
