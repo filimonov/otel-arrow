@@ -6,6 +6,7 @@
 //! See `docs/FORMAT.md` for the storage format and the design spec at the
 //! repository root for the architecture.
 
+pub mod canonical;
 pub mod error;
 pub mod value;
 
