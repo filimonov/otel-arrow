@@ -139,6 +139,11 @@ impl WindowClock {
     /// `start_unix_secs` below zero is clamped to zero: negative Unix
     /// timestamps (before 1970) are not a supported wall-clock input for
     /// this crate, mirroring `PartitionId::from_unix_secs`'s day-0 clamp.
+    ///
+    /// `interval` is truncated to whole seconds and raised to at least 1 s:
+    /// a zero or sub-second interval (e.g. `Duration::from_millis(500)` or
+    /// `Duration::ZERO`) becomes a 1 s window rather than causing a
+    /// division by zero.
     #[must_use]
     pub fn new(interval: Duration, start_unix_secs: i64) -> Self {
         let interval_secs = i64::try_from(interval.as_secs()).unwrap_or(15).max(1);
@@ -242,6 +247,38 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(c.next_boundary(65), 75);
+    }
+
+    /// Scenario: negative wall-clock seconds (before the Unix epoch) are fed
+    /// into `new`, `boundary` and `on_wake`.
+    /// Guarantees: negative input is clamped to zero rather than panicking
+    /// or underflowing; `on_wake` with a negative `now` reports `TooEarly`
+    /// and does not move `last_boundary`.
+    #[test]
+    fn negative_seconds_are_clamped_without_panicking() {
+        let mut c = WindowClock::new(Duration::from_secs(15), -100);
+        assert_eq!(c.last_boundary(), 0);
+        assert_eq!(c.boundary(-5), 0);
+        match c.on_wake(-5) {
+            WakeOutcome::TooEarly { sleep_until } => assert_eq!(sleep_until, 15),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(c.last_boundary(), 0);
+    }
+
+    /// Scenario: `WindowClock::new` is given a zero or sub-second interval.
+    /// Guarantees: the interval is truncated to whole seconds and raised to
+    /// at least 1 s, so boundary arithmetic never divides by zero.
+    #[test]
+    fn sub_second_interval_is_raised_to_one_second() {
+        let c = WindowClock::new(Duration::from_millis(500), 10);
+        assert_eq!(c.last_boundary(), 10);
+        assert_eq!(c.boundary(11), 11);
+        assert_eq!(c.next_boundary(10), 11);
+
+        let c_zero = WindowClock::new(Duration::ZERO, 10);
+        assert_eq!(c_zero.last_boundary(), 10);
+        assert_eq!(c_zero.boundary(11), 11);
     }
 
     /// Scenario: partition of Unix seconds and the civil date rendering.
