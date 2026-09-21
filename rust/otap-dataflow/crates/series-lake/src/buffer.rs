@@ -329,19 +329,21 @@ impl<T> Block<T> {
     /// Idempotent: a flush retry re-seals the same block and reuses the first
     /// stamp, so the file bytes are identical across attempts (spec 5.3).
     ///
-    /// The block becomes sealed only once every fallible step has succeeded.
-    /// `emitted_at` is stamped last, so a failed seal leaves `is_sealed()`
-    /// false and the sink refuses to write the block rather than silently
-    /// dropping the descriptor rows it could not materialize.
+    /// All or nothing. Every step is fallible, so the descriptor rows are taken
+    /// into a local for the duration and put straight back if any step fails:
+    /// a block whose seal failed still holds every row it was given, still
+    /// reports `is_sealed() == false`, and can be sealed again once whatever
+    /// caused the failure is gone. `emitted_at` is stamped only after the last
+    /// fallible step, so the sink refuses to write a block that never finished
+    /// sealing rather than silently dropping its series rows.
     ///
-    /// Descriptor rows are moved into their `series` batch, never copied, and
-    /// the whole pending set is released as soon as every batch has been built
-    /// -- before the table appends that may concatenate and sort a run. Peak
-    /// transient memory during a series seal is nonetheless proportional to the
-    /// block's whole descriptor volume: one dataset's descriptor rows and the
-    /// Arrow batch built from them are resident at the same time. Materializing
-    /// descriptors into bounded incremental runs instead is a deferred v1
-    /// limitation (see `docs/FORMAT.md`).
+    /// Descriptor rows are moved into their `series` batch, never copied, but
+    /// they stay alive until the seal has succeeded. Peak transient memory
+    /// during a series seal is therefore proportional to the block's whole
+    /// descriptor volume: the pending rows and the Arrow batches built from
+    /// them are resident at the same time. Materializing descriptors into
+    /// bounded incremental runs instead is a deferred v1 limitation (see
+    /// `docs/FORMAT.md`).
     ///
     /// # Errors
     /// Propagates a failure from building the `series` batch or sealing a run.
@@ -350,31 +352,44 @@ impl<T> Block<T> {
         // end: an `emitted_at` set by a seal that then failed would make
         // `is_sealed()` report a block that never finished sealing.
         let stamp = self.emitted_at_us.unwrap_or(emitted_at_us);
-        let mut series: Vec<(Dataset, RecordBatch)> = Vec::new();
-        for (ds, rows) in &self.pending_descriptors {
+        let pending = std::mem::take(&mut self.pending_descriptors);
+        if let Err(e) = self.materialize(&pending, stamp) {
+            self.pending_descriptors = pending;
+            return Err(e);
+        }
+        self.bytes = self.recount();
+        self.emitted_at_us = Some(stamp);
+        Ok(())
+    }
+
+    /// Build every pending descriptor set into its `series` batch, append the
+    /// batches and seal every table.
+    ///
+    /// Split out of [`Block::seal`] so that the descriptor rows can be held in
+    /// a local across all of it: each step here can fail, and the caller puts
+    /// the rows back and leaves the block unsealed when one does.
+    fn materialize(
+        &mut self,
+        pending: &BTreeMap<Dataset, Vec<DescriptorRow>>,
+        stamp: i64,
+    ) -> Result<()> {
+        for (ds, rows) in pending {
             if rows.is_empty() {
                 continue;
             }
             let refs: Vec<&DescriptorRow> = rows.iter().collect();
-            series.push((*ds, series_batch(&refs, stamp, *ds, &self.cfg)?));
-        }
-        // Every batch now holds the descriptors' data, so the rows themselves
-        // are redundant: drop them before the appends below.
-        self.pending_descriptors.clear();
-        for (ds, batch) in series {
+            let batch = series_batch(&refs, stamp, *ds, &self.cfg)?;
             let run_target = self.cfg.sorting.run_target_bytes;
-            let spec = self.spec_for(ds);
+            let spec = self.spec_for(*ds);
             let table = self
                 .tables
-                .entry(ds)
-                .or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
+                .entry(*ds)
+                .or_insert_with(|| SortedTableBuffer::new(*ds, spec, run_target));
             let _ = table.append(batch)?;
         }
         for t in self.tables.values_mut() {
             t.seal()?;
         }
-        self.bytes = self.recount();
-        self.emitted_at_us = Some(stamp);
         Ok(())
     }
 
@@ -552,22 +567,29 @@ mod tests {
         );
     }
 
-    /// Scenario: a block holding a metrics descriptor row with no metric block.
-    /// `series_batch` refuses such a row, so materializing it at seal time fails.
-    /// Guarantees: the block does not report itself sealed after a failed seal.
-    /// `emitted_at` is unset and the descriptor rows are still pending, so the
-    /// sink refuses to write the block instead of dropping its series rows.
+    /// Scenario: a block whose configuration declares one denormalized column
+    /// while the admitted descriptor row carries no denormalized cell, so the
+    /// `series` batch cannot be built. The fault is then removed and the seal
+    /// retried.
+    /// Guarantees: the failed seal leaves the block exactly as it was. No stamp
+    /// is set, `is_sealed()` is false, the descriptor row is still pending and
+    /// no table was created from a half-written batch. Once the fault is gone
+    /// the retry seals the same block and the descriptor row reaches the series
+    /// table, so nothing was discarded by the failure.
     #[test]
-    fn a_failed_seal_leaves_the_block_unsealed() {
+    fn a_failed_seal_keeps_the_block_intact_and_a_retry_succeeds() {
         use crate::canonical::{Descriptor, Signal, canonical_bytes, series_id};
+        use crate::config::{DenormType, Denormalize};
         use crate::extract::{DescriptorRow, ExtractStats};
 
-        let cfg = LakeConfig::default();
+        let mut cfg = LakeConfig::default();
+        cfg.logs.denormalize = vec![Denormalize {
+            path: "resource.host.id".into(),
+            column: "host_col".into(),
+            ty: DenormType::String,
+        }];
         let mut cache = SeriesCache::new(100);
         let mut block: Block<u32> = Block::new(0, 1, &cfg);
-        // A logs descriptor, admitted as a metrics request: `admit` routes it to
-        // the `metrics_series` dataset, whose row needs a `metric` block that
-        // this descriptor does not carry. That is the injected fault.
         let descriptor = Descriptor {
             signal: Signal::Logs,
             resource_attrs: vec![],
@@ -580,11 +602,13 @@ mod tests {
             attrs: vec![],
         };
         let identity_bytes = canonical_bytes(&descriptor);
+        // The injected fault: the schema has a denormalized column, the row has
+        // no cell for it, so the built arrays have different lengths.
         let e = Extracted {
-            signal: Signal::Metrics,
+            signal: Signal::Logs,
             descriptors: vec![DescriptorRow {
                 series_id: series_id(&identity_bytes),
-                identity_bytes: identity_bytes.clone(),
+                identity_bytes,
                 descriptor,
                 denorm: vec![],
                 approx_bytes: 64,
@@ -596,15 +620,27 @@ mod tests {
         let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
         assert_eq!(r.new_series, vec![0]);
         block.admit(e, r, 1).expect("admit");
-        assert!(!block.is_sealed());
 
-        let err = block.seal(SEAL_AT_US).expect_err("seal fails");
-        assert!(
-            err.to_string()
-                .contains("metrics descriptor without metric")
-        );
+        let err = block
+            .seal(SEAL_AT_US)
+            .expect_err("the series batch cannot be built");
+        assert!(!err.to_string().is_empty());
         assert!(!block.is_sealed());
         assert_eq!(block.emitted_at_us(), None);
+        // The descriptor row survived the failure and no table was created.
+        assert!(!block.is_empty(), "the descriptor row is still pending");
+        assert_eq!(block.tables().count(), 0);
+
+        // Remove the fault and seal again: the same block completes.
+        block.cfg.logs.denormalize.clear();
+        block.seal(SEAL_AT_US).expect("the retry seals");
+        assert!(block.is_sealed());
+        assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
+        let series = block
+            .tables()
+            .find(|t| t.dataset().is_series())
+            .expect("series table");
+        assert_eq!(series.rows(), 1);
     }
 
     /// Scenario: `emitted_at` on a block sealed once and then sealed again, as a flush retry does.
