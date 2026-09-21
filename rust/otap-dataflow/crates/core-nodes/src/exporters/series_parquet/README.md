@@ -13,9 +13,9 @@ endpoint with `timeout_secs=180`; signal shutdown currently grants only 60s.
 The node owns one ACTIVE block and at most one FLUSHING block. Requests are
 admitted to the ACTIVE block and acknowledged only once the whole block has
 been written and its descriptors marked committed; a failed write nacks every
-request of the block as retryable. While a flush is outstanding the node stops
-taking pdata instead of opening a third block, so a slow destination becomes
-backpressure. Rotation timing is still a placeholder: a block is sealed as
+request of the block as retryable. Admission closes once the ACTIVE block is
+waiting to be rotated, so no third block is ever needed and a slow destination
+becomes backpressure. Rotation timing is still a placeholder: a block is sealed as
 soon as it holds a request, so this writes one file set per request until the
 window timer lands. Later tasks add that timer, telemetry and a drain-aware
 shutdown. Only logs are accepted; metrics and traces are permanently refused.

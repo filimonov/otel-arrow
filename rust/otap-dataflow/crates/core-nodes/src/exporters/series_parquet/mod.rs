@@ -7,9 +7,12 @@
 //! request is admitted to the ACTIVE block, and the completion it is owed is
 //! held beside the block until the whole block has been written: an ack means
 //! the request's rows are in object storage, and a failed write nacks every
-//! request of the block as retryable. While a flush is outstanding the node
-//! closes pdata admission rather than opening a third block, so a slow
-//! destination becomes backpressure instead of unbounded memory.
+//! request of the block as retryable. Admission closes once the ACTIVE block
+//! is waiting to be rotated, which is what stops a third block from being
+//! needed: a request may still join an empty ACTIVE block while the previous
+//! one is being written, but nothing is admitted once that block is itself
+//! waiting for the flush slot. A slow destination therefore becomes
+//! backpressure rather than unbounded memory.
 //!
 //! Rotation timing is not yet the window timer: a block is sealed as soon as
 //! it holds a request, so this still writes one file set per request. A later
@@ -35,6 +38,7 @@ use otel_arrow_dfe_otap::{OTAP_EXPORTER_FACTORIES, object_store::StorageType};
 use otel_arrow_dfe_series_lake as lake;
 use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Registered component identifier.
 pub const SERIES_PARQUET_URN: &str = "urn:otel:exporter:series_parquet";
@@ -153,9 +157,9 @@ impl Exporter<OtapPdata> for SeriesParquet {
 ///
 /// The branches are ordered: the shutdown deadline outranks everything, then a
 /// resolved flush, then completion delivery, then rotation, and only then a new
-/// message. `accept` is false while a rotation is pending or a flush is
-/// outstanding, which is what turns a slow destination into backpressure on the
-/// channel rather than a third block. Once shutdown has been latched the node
+/// message. `accept` is false once the ACTIVE block is waiting to be rotated,
+/// which is what turns a slow destination into backpressure on the channel
+/// rather than a third block. Once shutdown has been latched the node
 /// keeps taking force-drained pdata and refuses each one immediately with a
 /// retryable `NodeShutdown` nack, spending the completion credit that was
 /// reserved for exactly that.
@@ -167,14 +171,19 @@ async fn run(
     effects: EffectHandler<OtapPdata>,
 ) -> Result<TerminalState, Error> {
     let mut worker = worker::Worker::new(cfg, store, wall, effects);
-    // The engine hands the Shutdown control message over only once it has
-    // force-drained the pdata backlog, and it closes the inbox in the same
-    // step. Receiving again after that yields a closed error rather than
-    // blocking, so the node stops receiving and finishes the work it holds.
-    let mut closed = false;
+    // The Shutdown control message is the end of the inbox, not the start of
+    // the drain: the engine latches it, force-drains the pdata backlog past a
+    // closed admission gate, and releases it only once the upstream channel is
+    // empty and closed, closing the inbox in the same step. So this holds the
+    // deadline it carried, and it is what says both that no further request
+    // can arrive and that receiving again would fail rather than block.
+    // Terminating on an idle worker alone would return while an upstream
+    // sender is still alive, dropping whatever it sends next without a
+    // decision.
+    let mut closed: Option<Instant> = None;
     let mut notify_turns = 0_usize;
     loop {
-        if let Some(deadline) = worker.deadline
+        if let Some(deadline) = closed
             && worker.is_idle()
         {
             return Ok(TerminalState::new(
@@ -235,10 +244,10 @@ async fn run(
                 notify_turns = 0;
             }
 
-            message = inbox.recv_when(accept), if !closed => {
+            message = inbox.recv_when(accept), if closed.is_none() => {
                 notify_turns = 0;
-                match message? {
-                    Message::PData(data) => {
+                match message {
+                    Ok(Message::PData(data)) => {
                         if let Some(d) = inbox.shutdown_deadline() {
                             // Force-drained: the node is past admission, so the
                             // request is refused immediately rather than parked.
@@ -248,12 +257,22 @@ async fn run(
                             worker.admit(data);
                         }
                     }
-                    Message::Control(NodeControlMsg::Shutdown { deadline, reason }) => {
+                    Ok(Message::Control(NodeControlMsg::Shutdown { deadline, reason })) => {
                         otel_info!("series_parquet.shutdown", reason = reason);
-                        closed = true;
+                        closed = Some(deadline);
                         worker.shutdown(deadline);
                     }
-                    Message::Control(_) => {}
+                    Ok(Message::Control(_)) => {}
+                    Err(e) => {
+                        // The inbox closes only when it releases the Shutdown
+                        // it latched, so this is the channel failing rather
+                        // than the node shutting down. Nothing more can be
+                        // received and no deadline was granted, so everything
+                        // still held is decided before the error is reported.
+                        otel_warn!("series_parquet.inbox_failed", error = %e);
+                        worker.abandon();
+                        return Err(e.into());
+                    }
                 }
             }
 

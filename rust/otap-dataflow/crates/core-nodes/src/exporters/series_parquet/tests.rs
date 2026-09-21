@@ -7,13 +7,18 @@ use super::config::Config;
 use super::token::{AckToken, Notifier, Outcome};
 use super::worker::{Failure, Worker};
 use object_store::ObjectStoreExt;
+use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_engine::Interests;
 use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::control::NackCause;
+use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::control::{
     PipelineCompletionMsg, PipelineCompletionMsgReceiver, pipeline_completion_msg_channel,
 };
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
+use otel_arrow_dfe_engine::local::message::LocalReceiver;
+use otel_arrow_dfe_engine::message::{ExporterInbox, Receiver};
 use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_pdata::OtapPayload;
@@ -301,6 +306,97 @@ async fn a_storage_failure_after_validation_is_retryable() {
             }
         })
         .await;
+}
+
+/// Scenario: two requests are buffered and a third is sent after the node has
+/// already latched shutdown and refused the first two, with the upstream
+/// sender still alive throughout.
+/// Guarantees: every one of them is decided with a retryable `NodeShutdown`
+/// nack and the node returns its terminal state only after the upstream
+/// channel closes, so a node that has latched shutdown never returns while
+/// requests it could still be handed are outstanding.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_decides_every_force_drained_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(8);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(8);
+            let inbox = ExporterInbox::new(
+                Receiver::Local(LocalReceiver::mpsc(control_rx)),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+                0,
+                Interests::empty(),
+            );
+            let (handler, mut rx) = effects(8);
+
+            // The engine latches this and releases it only once the upstream
+            // pdata channel is both empty and closed, so the two requests
+            // below are force-drained before the node ever sees it.
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            for _ in 0..2 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a buffered request enqueues");
+            }
+
+            let node = tokio::task::spawn_local(super::run(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+            ));
+
+            for _ in 0..2 {
+                expect_shutdown_nack(&mut rx).await;
+            }
+
+            // The node has refused everything it was handed and is idle, but
+            // the sender is still alive, so this request must still be
+            // decided rather than dropped with the inbox.
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("a late request enqueues");
+            expect_shutdown_nack(&mut rx).await;
+
+            // Closing the upstream pdata channel is what releases the latched
+            // shutdown; the control sender stays alive, as it does in the
+            // engine.
+            drop(pdata_tx);
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns once the upstream channel closes")
+                .expect("the node task joins");
+            if let Err(error) = terminal {
+                panic!("unexpected node failure: {error}");
+            }
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Take one completion and assert it is a retryable shutdown refusal.
+async fn expect_shutdown_nack(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>) {
+    match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a completion arrives")
+        .expect("a completion arrives")
+    {
+        PipelineCompletionMsg::DeliverNack { nack } => {
+            assert!(!nack.permanent);
+            assert_eq!(nack.cause, NackCause::NodeShutdown);
+            assert_eq!(nack.reason, "shutdown");
+        }
+        other => panic!("expected a nack, got {other:?}"),
+    }
 }
 
 /// Scenario: the shutdown deadline elapses while a flush is still outstanding.
