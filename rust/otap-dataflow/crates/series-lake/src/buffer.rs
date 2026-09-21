@@ -153,13 +153,12 @@ impl SortedTableBuffer {
     /// at a time. A candidate whose measured size overshoots `run_target` is
     /// halved and rebuilt. No block-sized series batch is ever constructed.
     ///
-    /// A single row that is itself larger than `run_target` becomes its own
-    /// oversized run rather than a refusal, exactly as `append` does for a
-    /// values batch: `run_target_bytes` is a packing target, not an admission
-    /// limit, and the row was already checked against `max_row_bytes` during
-    /// extraction and against `max_block_bytes` during reservation. A validated
-    /// configuration cannot reach this case at all, because `validate` requires
-    /// `max_row_bytes <= run_target_bytes / 4`.
+    /// A single row may exceed `run_target` by its Arrow overhead and becomes
+    /// its own oversized run rather than a refusal: `run_target_bytes` is a
+    /// packing target, and the admission limits are `max_row_bytes`, enforced
+    /// during extraction, and `max_block_bytes`, enforced by `reserve`. A
+    /// validated configuration barely reaches this case at all, because
+    /// `validate` requires `max_row_bytes <= run_target_bytes / 4`.
     ///
     /// # Errors
     /// Propagates a series-batch or sort failure.
@@ -195,6 +194,30 @@ impl SortedTableBuffer {
             start = end;
         }
         Ok(())
+    }
+
+    /// Prepare the run that `seal` would make of the building batches, without
+    /// mutating anything.
+    ///
+    /// The non-mutating half of [`SortedTableBuffer::seal`], used by
+    /// `Block::seal` so that finalizing a values table is part of the same
+    /// all-or-nothing transaction as stamping the series tables. An empty
+    /// building set produces no run. With sorting disabled the building batches
+    /// become runs as they are, sharing every buffer, because concatenating
+    /// them would copy every row to no purpose.
+    ///
+    /// # Errors
+    /// Propagates an Arrow failure from the concatenate or the sort.
+    fn finalized(&self) -> Result<Vec<RecordBatch>> {
+        let Some(first) = self.building.first() else {
+            return Ok(Vec::new());
+        };
+        if self.spec.is_empty() {
+            return Ok(self.building.clone());
+        }
+        let schema = first.schema();
+        let merged = concat_batches(&schema, &self.building)?;
+        Ok(vec![sort_batch(&merged, &self.spec)?])
     }
 
     /// Prepare every stamp replacement without mutating the retained batches.
@@ -356,9 +379,10 @@ impl<T> Block<T> {
     /// (spec section 6.2 step 6).
     ///
     /// Descriptor rows become Arrow series rows here, in bounded sorted runs,
-    /// with `emitted_at` left at zero until the block seals. Values batches are
-    /// sorted into runs here as well, so that sealing never has to sort or copy
-    /// a non-stamp column.
+    /// with `emitted_at` left at zero until the block seals. Values batches
+    /// accumulate into the building run of their table and are sealed into a
+    /// sorted run once they cross `run_target_bytes`, so a run packs batches
+    /// from as many requests as fit it.
     ///
     /// A sealed block takes nothing more. Its `emitted_at` is already fixed, so
     /// a late descriptor would be stamped with a time before it arrived, and its
@@ -389,11 +413,17 @@ impl<T> Block<T> {
         } = extracted;
         if !reservation.new_series.is_empty() {
             let ds = Dataset::series_of(signal);
+            // The reservation is public, so its indices are caller-supplied
+            // data: resolve them all before anything is mutated.
             let rows: Vec<&DescriptorRow> = reservation
                 .new_series
                 .iter()
-                .map(|&i| &descriptors[i])
-                .collect();
+                .map(|&i| {
+                    descriptors.get(i).ok_or_else(|| {
+                        Error::invalid("reservation names a descriptor the request does not carry")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             // Take the table out for the call so that `append_series` can borrow
             // it mutably while `self.cfg` is read, then put it straight back --
             // including on the error path, so the block stays well formed.
@@ -416,11 +446,11 @@ impl<T> Block<T> {
                 .entry(ds)
                 .or_insert_with(|| SortedTableBuffer::new(ds, spec, run_target));
             for batch in batches {
+                // `append` seals a run once the building batches cross
+                // `run_target`, so batches from several requests pack into one
+                // run. Whatever is still building when the block seals is
+                // finalized there, inside the same transaction as the stamps.
                 let _ = table.append(batch)?;
-                // Seal here rather than at block seal: sealing a run sorts and
-                // copies every column, which the block's stamp transaction must
-                // never do.
-                table.seal()?;
             }
         }
         self.bytes += reservation.bytes;
@@ -442,32 +472,44 @@ impl<T> Block<T> {
     /// the sink refuses to write a block that never finished sealing rather than
     /// writing unstamped series rows.
     ///
-    /// Peak transient memory is the block's retained bytes plus one new eight
-    /// byte timestamp per series row: every other column is shared between the
-    /// old batch and its replacement.
+    /// Sealing the series tables costs one new eight-byte timestamp per series
+    /// row and nothing else: every other column is shared between the old batch
+    /// and its replacement. A values table pays for finalizing whatever was
+    /// still building, which is one run bounded by `run_target_bytes`.
     ///
     /// # Errors
-    /// A bad series schema leaves all retained batches, accounting and seal
-    /// state unchanged.
+    /// A bad series schema, or an Arrow failure finalizing a values run, leaves
+    /// all retained batches, accounting and seal state unchanged.
     pub fn seal(&mut self, emitted_at_us: i64) -> Result<()> {
         if self.is_sealed() {
             return Ok(());
         }
-        let mut replacements = Vec::new();
+        let mut stamped = Vec::new();
+        let mut finalized = Vec::new();
         for (ds, table) in &self.tables {
             if ds.is_series() {
-                replacements.push((*ds, table.stamped(emitted_at_us)?));
+                stamped.push((*ds, table.stamped(emitted_at_us)?));
+            } else {
+                finalized.push((*ds, table.finalized()?));
             }
         }
-        // All fallible Arrow work has finished. The transaction holds only shared
-        // non-stamp columns and one new eight-byte timestamp per series row.
-        for (ds, (runs, building)) in replacements {
+        // All fallible Arrow work has finished. The transaction holds the
+        // series tables' shared non-stamp columns plus one new eight-byte
+        // timestamp per series row, and one finalized run per values table.
+        for (ds, (runs, building)) in stamped {
             let table = self.tables.get_mut(&ds).expect("prepared table exists");
             table.runs = runs;
             table.building = building;
         }
+        for (ds, runs) in finalized {
+            let table = self.tables.get_mut(&ds).expect("prepared table exists");
+            table.building.clear();
+            table.runs.extend(runs);
+        }
         for table in self.tables.values_mut() {
-            // Admission sorted each batch already; moving it cannot copy a column.
+            // Every batch is already sorted: the series replacements by
+            // admission, the values runs by `finalized`. Moving them cannot
+            // copy a column.
             table.runs.append(&mut table.building);
             table.building_bytes = 0;
             table.seen = CountedAllocations::default();
@@ -641,7 +683,11 @@ mod tests {
     }
 
     /// Scenario: retained series include both completed runs and a final building batch.
-    /// Guarantees: seal adds at most eight bytes per series row plus 64 bytes of buffer slack.
+    /// Guarantees: the stamp transaction over the series tables adds at most
+    /// eight bytes per series row plus 64 bytes of buffer slack, and shares
+    /// every non-stamp column with the batch it replaces. The values tables are
+    /// measured separately: finalizing their building run is an ordinary
+    /// concatenate-and-sort and is not part of this bound.
     #[test]
     fn seal_peak_retained_bytes_only_adds_timestamp_values() {
         let cfg = LakeConfig::default();
@@ -657,6 +703,7 @@ mod tests {
         table.building.push(last);
         let before: Vec<_> = block
             .tables()
+            .filter(|t| t.dataset().is_series())
             .flat_map(|t| t.runs().iter().chain(t.building()))
             .cloned()
             .collect();
@@ -670,9 +717,12 @@ mod tests {
         // Holding every old batch keeps the complete old/new overlap resident;
         // this bounds the transaction's peak, not just its net memory change.
         let peak = snapshot_bytes(
-            before
-                .iter()
-                .chain(block.tables().flat_map(SortedTableBuffer::iter_snapshots)),
+            before.iter().chain(
+                block
+                    .tables()
+                    .filter(|t| t.dataset().is_series())
+                    .flat_map(SortedTableBuffer::iter_snapshots),
+            ),
         );
         assert!(
             peak <= retained + rows * 8 + 64,
@@ -680,6 +730,7 @@ mod tests {
         );
         let after: Vec<_> = block
             .tables()
+            .filter(|t| t.dataset().is_series())
             .flat_map(SortedTableBuffer::iter_snapshots)
             .collect();
         for (old, new) in before.iter().zip(after) {
@@ -693,6 +744,69 @@ mod tests {
         let (_, ids, tables) = block.into_parts();
         assert_eq!(ids.len(), rows);
         assert_eq!(tables[&Dataset::LogsSeries].rows(), rows);
+    }
+
+    /// Scenario: two requests whose values batches each stay under the run
+    /// target, and then the same two requests under a run target every one of
+    /// them crosses.
+    /// Guarantees: values batches pack across requests -- sub-target requests
+    /// share one building run and become exactly one sorted run at seal, while
+    /// a request that crosses the target seals its own run during admission.
+    /// Sealing never leaves a values batch unsorted or unaccounted.
+    #[test]
+    fn values_batches_pack_across_requests_until_the_run_target() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        for host in ["a", "b"] {
+            let e = extracted(&cfg, host, 4);
+            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
+            block.admit(e, r, ()).expect("admit");
+        }
+        let values = &block.tables[&Dataset::LogsValues];
+        assert!(
+            values.runs().is_empty(),
+            "a sub-target batch is not sealed into a run during admission"
+        );
+        assert_eq!(
+            values.building().len(),
+            2,
+            "both requests share one building run"
+        );
+        block.seal(SEAL_AT_US).expect("seal");
+        let values = &block.tables[&Dataset::LogsValues];
+        assert_eq!(
+            values.runs().len(),
+            1,
+            "the seal transaction finalizes both requests into one run"
+        );
+        assert!(values.building().is_empty());
+        assert_eq!(values.rows(), 8);
+        assert!(
+            crate::sort::is_sorted(&values.runs()[0], values.spec()).expect("is_sorted"),
+            "the finalized run is sorted by the table's spec"
+        );
+
+        let mut tight = LakeConfig::default();
+        tight.sorting.run_target_bytes = 1;
+        let mut cache = SeriesCache::new(100);
+        let mut block: Block<()> = Block::new(0, 1, &tight);
+        for host in ["a", "b"] {
+            let e = extracted(&tight, host, 1);
+            let r = block.reserve(&e, &mut cache, 0, &tight).expect("reserve");
+            block.admit(e, r, ()).expect("admit");
+        }
+        let values = &block.tables[&Dataset::LogsValues];
+        assert_eq!(
+            values.runs().len(),
+            2,
+            "each request crossed the run target on its own"
+        );
+        assert!(values.building().is_empty());
+        block.seal(SEAL_AT_US).expect("seal");
+        let values = &block.tables[&Dataset::LogsValues];
+        assert_eq!(values.runs().len(), 2, "the seal adds no further run");
+        assert_eq!(values.rows(), 2);
     }
 
     /// Scenario: an extracted descriptor lacks a configured denormalized cell.

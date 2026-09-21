@@ -396,9 +396,11 @@ what it read.
 ## Limitations of version 1
 
 Descriptors become bounded series runs during request admission. Final sealing
-replaces only emitted_at with the block timestamp, sharing every other column;
-old/new timestamp storage is at most eight additional bytes per series row.
-The first successful seal timestamp remains fixed across flush retries.
+replaces only the emitted_at column of those runs with the block timestamp,
+sharing every other column; old/new timestamp storage is at most eight
+additional bytes per series row. A values dataset additionally finalizes
+whatever is still buffered into one run bounded by run_target_bytes. The
+first successful seal timestamp remains fixed across flush retries.
 
 - Exponential histograms and summaries are not stored. Depending on the
   `unsupported` policy the whole request is rejected, or the points are
