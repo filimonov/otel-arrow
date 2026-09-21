@@ -7,5 +7,6 @@
 //! repository root for the architecture.
 
 pub mod error;
+pub mod value;
 
 pub use error::{Error, RefuseReason, Result};
