@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
-use arrow::datatypes::{Float64Type, Int64Type};
+use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
 use arrow::record_batch::RecordBatch;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
@@ -312,6 +312,140 @@ fn opt_string_at(b: &RecordBatch, name: &str, row: usize) -> Option<String> {
         .expect("utf8 column")
         .as_string::<i32>();
     a.is_valid(row).then(|| a.value(row).to_string())
+}
+
+/// A `Timestamp(Microsecond)` cell.
+fn opt_ts_us_at(b: &RecordBatch, name: &str, row: usize) -> Option<i64> {
+    let a = b
+        .column_by_name(name)
+        .expect("timestamp column")
+        .as_primitive::<TimestampMicrosecondType>();
+    a.is_valid(row).then(|| a.value(row))
+}
+
+/// A nullable `Int64` cell.
+fn opt_i64_at(b: &RecordBatch, name: &str, row: usize) -> Option<i64> {
+    let a = b
+        .column_by_name(name)
+        .expect("int64 column")
+        .as_primitive::<Int64Type>();
+    a.is_valid(row).then(|| a.value(row))
+}
+
+/// A non-null `Int32` cell.
+fn i32_at(b: &RecordBatch, name: &str, row: usize) -> i32 {
+    b.column_by_name(name)
+        .expect("int32 column")
+        .as_primitive::<Int32Type>()
+        .value(row)
+}
+
+/// A double's bit pattern, so that the sign of a zero and every NaN payload
+/// are compared exactly rather than by `f64` equality.
+fn bits(d: f64) -> String {
+    format!("{:016x}", d.to_bits())
+}
+
+/// A nullable `Float64` cell as its bit pattern.
+fn opt_f64_bits_at(b: &RecordBatch, name: &str, row: usize) -> Option<String> {
+    let a = b
+        .column_by_name(name)
+        .expect("float64 column")
+        .as_primitive::<Float64Type>();
+    a.is_valid(row).then(|| bits(a.value(row)))
+}
+
+/// A `List<Int64>` cell.
+fn list_i64_at(b: &RecordBatch, name: &str, row: usize) -> Vec<i64> {
+    let l = b
+        .column_by_name(name)
+        .expect("list column")
+        .as_list::<i32>();
+    let items = l.value(row);
+    let items = items.as_primitive::<Int64Type>();
+    (0..items.len()).map(|i| items.value(i)).collect()
+}
+
+/// A `List<Float64>` cell as bit patterns.
+fn list_f64_bits_at(b: &RecordBatch, name: &str, row: usize) -> Vec<String> {
+    let l = b
+        .column_by_name(name)
+        .expect("list column")
+        .as_list::<i32>();
+    let items = l.value(row);
+    let items = items.as_primitive::<Float64Type>();
+    (0..items.len()).map(|i| bits(items.value(i))).collect()
+}
+
+/// The denormalized cells of a values row, in schema order.
+fn denorm_at(b: &RecordBatch, columns: &[&str], row: usize) -> Vec<Option<String>> {
+    columns.iter().map(|c| opt_string_at(b, c, row)).collect()
+}
+
+/// The eight columns every metrics values row starts with.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetricsHead {
+    series_id: Vec<u8>,
+    producer_id: String,
+    metric_name: String,
+    time_us: Option<i64>,
+    time_ns: Option<i64>,
+    start_us: Option<i64>,
+    start_ns: Option<i64>,
+    flags: i32,
+}
+
+impl MetricsHead {
+    fn read(b: &RecordBatch, row: usize) -> Self {
+        Self {
+            series_id: series_id_at(b, row),
+            producer_id: string_at(b, "producer_id", row),
+            metric_name: string_at(b, "metric_name", row),
+            time_us: opt_ts_us_at(b, "time", row),
+            time_ns: opt_i64_at(b, "time_unix_nano", row),
+            start_us: opt_ts_us_at(b, "start_time", row),
+            start_ns: opt_i64_at(b, "start_time_unix_nano", row),
+            flags: i32_at(b, "flags", row),
+        }
+    }
+
+    /// The model head: the generators emit no start time and no flags, and the
+    /// microsecond column is the nanosecond one divided down.
+    fn model(series_id: Vec<u8>, host: u8, metric: u8, time: u64) -> Self {
+        let ns = (time > 0).then_some(time as i64);
+        Self {
+            series_id,
+            producer_id: host_name(host),
+            metric_name: metric_name(metric),
+            time_us: ns.map(|t| t / 1000),
+            time_ns: ns,
+            start_us: None,
+            start_ns: None,
+            flags: 0,
+        }
+    }
+}
+
+/// Every column of one `metrics_number` row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NumberRow {
+    head: MetricsHead,
+    value_int: Option<i64>,
+    value_double_bits: Option<String>,
+    denorm: Vec<Option<String>>,
+}
+
+/// Every column of one `metrics_histogram` row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HistogramRow {
+    head: MetricsHead,
+    count: i64,
+    sum_bits: Option<String>,
+    min_bits: Option<String>,
+    max_bits: Option<String>,
+    bucket_counts: Vec<i64>,
+    explicit_bounds_bits: Vec<String>,
+    denorm: Vec<Option<String>>,
 }
 
 /// Assert the values file is globally ordered when sorting is on.
@@ -809,38 +943,27 @@ async fn number_case(
         )
     };
 
-    let mut model: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = recs
+    let mut model: Vec<NumberRow> = recs
         .iter()
-        .map(|r| {
-            (
-                identity(r).0,
-                (r.time > 0).then_some(r.time as i64),
-                r.int_value,
-                r.double_value.map(|d| format!("{:016x}", d.to_bits())),
-            )
+        .map(|r| NumberRow {
+            head: MetricsHead::model(identity(r).0, r.host, r.metric, r.time),
+            value_int: r.int_value,
+            value_double_bits: r.double_value.map(bits),
+            denorm: vec![Some(host_name(r.host)), Some(dp_name(r.dp))],
         })
         .collect();
     let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
 
     let values = files.get(&Dataset::MetricsNumber).expect("number file");
-    let mut actual: Vec<(Vec<u8>, Option<i64>, Option<i64>, Option<String>)> = Vec::new();
+    let mut actual: Vec<NumberRow> = Vec::new();
     for b in values {
-        let vi = b
-            .column_by_name("value_int")
-            .expect("value_int")
-            .as_primitive::<Int64Type>();
-        let vd = b
-            .column_by_name("value_double")
-            .expect("value_double")
-            .as_primitive::<Float64Type>();
         for row in 0..b.num_rows() {
-            actual.push((
-                series_id_at(b, row),
-                time_at(b, row),
-                vi.is_valid(row).then(|| vi.value(row)),
-                vd.is_valid(row)
-                    .then(|| format!("{:016x}", vd.value(row).to_bits())),
-            ));
+            actual.push(NumberRow {
+                head: MetricsHead::read(b, row),
+                value_int: opt_i64_at(b, "value_int", row),
+                value_double_bits: opt_f64_bits_at(b, "value_double", row),
+                denorm: denorm_at(b, &METRICS_DENORM, row),
+            });
         }
     }
     model.sort();
@@ -848,7 +971,7 @@ async fn number_case(
     prop_assert_eq!(
         actual,
         model,
-        "number rows as a multiset of (series_id, time, int, double bits)"
+        "number rows as a multiset of complete rows, every column compared"
     );
     check_order(&cfg, values, Signal::Metrics)?;
 
@@ -940,10 +1063,8 @@ async fn histogram_case(
     sorting: bool,
 ) -> Result<(), TestCaseError> {
     let cfg = base_cfg(sorting);
-    let requests: Vec<OtapArrowRecords> = split(&recs, &sizes)
-        .iter()
-        .map(|c| histogram_request(c))
-        .collect();
+    let chunks = split(&recs, &sizes);
+    let requests: Vec<OtapArrowRecords> = chunks.iter().map(|c| histogram_request(c)).collect();
     let (files, _dir) = round_trip(&cfg, requests).await?;
 
     let identity = |r: &HistRec| {
@@ -963,14 +1084,26 @@ async fn histogram_case(
         )
     };
 
-    let mut model: Vec<(Vec<u8>, Option<i64>, i64)> = recs
+    // The generator sets `sum` to the count and leaves min and max unset. The
+    // model is built per request, because a `sum` of zero comes back null only
+    // when every point of that request has a zero sum: pdata omits an optional
+    // column whose every entry is the type default, and writes the value
+    // otherwise. That is a property of the transport encoding, not of this
+    // writer, which stores whatever the decoded batch holds.
+    let mut model: Vec<HistogramRow> = chunks
         .iter()
-        .map(|r| {
-            (
-                identity(r).0,
-                (r.time > 0).then_some(r.time as i64),
-                r.count as i64,
-            )
+        .flat_map(|chunk| {
+            let any_sum = chunk.iter().any(|r| r.count != 0);
+            chunk.iter().map(move |r| HistogramRow {
+                head: MetricsHead::model(identity(r).0, r.host, r.metric, r.time),
+                count: r.count as i64,
+                sum_bits: any_sum.then(|| bits(r.count as f64)),
+                min_bits: None,
+                max_bits: None,
+                bucket_counts: vec![r.count as i64, 0],
+                explicit_bounds_bits: vec![bits(1.0)],
+                denorm: vec![Some(host_name(r.host)), Some(dp_name(r.dp))],
+            })
         })
         .collect();
     let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
@@ -978,14 +1111,23 @@ async fn histogram_case(
     let values = files
         .get(&Dataset::MetricsHistogram)
         .expect("histogram file");
-    let mut actual: Vec<(Vec<u8>, Option<i64>, i64)> = Vec::new();
+    let mut actual: Vec<HistogramRow> = Vec::new();
     for b in values {
-        let count = b
-            .column_by_name("count")
-            .expect("count")
-            .as_primitive::<Int64Type>();
         for row in 0..b.num_rows() {
-            actual.push((series_id_at(b, row), time_at(b, row), count.value(row)));
+            actual.push(HistogramRow {
+                head: MetricsHead::read(b, row),
+                count: b
+                    .column_by_name("count")
+                    .expect("count")
+                    .as_primitive::<Int64Type>()
+                    .value(row),
+                sum_bits: opt_f64_bits_at(b, "sum", row),
+                min_bits: opt_f64_bits_at(b, "min", row),
+                max_bits: opt_f64_bits_at(b, "max", row),
+                bucket_counts: list_i64_at(b, "bucket_counts", row),
+                explicit_bounds_bits: list_f64_bits_at(b, "explicit_bounds", row),
+                denorm: denorm_at(b, &METRICS_DENORM, row),
+            });
         }
     }
     model.sort();
@@ -993,7 +1135,7 @@ async fn histogram_case(
     prop_assert_eq!(
         actual,
         model,
-        "histogram rows as a multiset of (series_id, time, count)"
+        "histogram rows as a multiset of complete rows, every column compared"
     );
     check_order(&cfg, values, Signal::Metrics)?;
 
@@ -1042,10 +1184,11 @@ proptest! {
     /// monotonicities, over several resources and scopes, split into random requests,
     /// run with sorting off and then on.
     /// Guarantees: the number file equals the independently computed model as a multiset of
-    /// (series_id, time, value_int, value_double bits), doubles compared by bit pattern so
-    /// the sign of a zero is not lost, and the whole descriptor map equals the model field
-    /// by field, including metric name, unit, type, temporality, monotonicity and
-    /// description.
+    /// complete rows -- series id, producer id, metric name, both time columns, both start
+    /// time columns, flags, both value columns and both denormalized columns -- with doubles
+    /// compared by bit pattern so the sign of a zero is not lost, and the whole descriptor
+    /// map equals the model field by field, including metric name, unit, type, temporality,
+    /// monotonicity and description.
     #[test]
     fn oracle_metric_numbers(
         recs in prop::collection::vec(num_rec(), 1..30),
@@ -1059,8 +1202,10 @@ proptest! {
     /// Scenario: random histogram points of both temporalities over several resources and
     /// scopes, split into random requests, run with sorting off and then on.
     /// Guarantees: the histogram file equals the independently computed model as a multiset
-    /// of (series_id, time, count), and the whole descriptor map equals the model field by
-    /// field.
+    /// of complete rows -- series id, producer id, metric name, both time columns, both start
+    /// time columns, flags, count, sum, min, max, the bucket count and explicit bound lists
+    /// and both denormalized columns -- with doubles compared by bit pattern, and the whole
+    /// descriptor map equals the model field by field.
     #[test]
     fn oracle_metric_histograms(
         recs in prop::collection::vec(hist_rec(), 1..30),
