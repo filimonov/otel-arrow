@@ -404,8 +404,9 @@ what it read.
 - Attribute maps are lossy for readers: values are rendered to strings by
   `render_v1`, so a string `"42"` and an integer `42` are indistinguishable in
   the `attrs` map. The identity encoding is not lossy; `series_id`
-  distinguishes them. Bytes values render as a lowercase-hex string (quoted
-  JSON when not the sole top-level value, as in an attribute map cell); a
+  distinguishes them. A bytes value, whether it is an attribute map cell, a
+  log body, or nested inside an array or kvlist, always renders as a
+  quoted JSON string of lowercase hex (e.g. `"ab12"`), never bare hex; a
   dedicated `body_bytes BINARY` column for the log body is deferred to a
   later format version.
 - A cancellation (for example, exporter shutdown) that lands after a file's
