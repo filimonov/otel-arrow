@@ -863,6 +863,20 @@ impl<PData> ExporterInbox<PData> {
     }
 }
 
+impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
+    /// Deadline latched by the inbox while it force-drains buffered pdata.
+    ///
+    /// `None` until a Shutdown has been latched. Stateful exporters can keep
+    /// shutdown bounded when a completion send is full before the final
+    /// Shutdown control message is released: the exporter learns the deadline
+    /// from the first force-drained pdata rather than from the control message
+    /// it has not been handed yet. Read-only, so drain order is unaffected.
+    #[must_use]
+    pub fn shutdown_deadline(&self) -> Option<Instant> {
+        self.core.shutting_down_deadline
+    }
+}
+
 impl<PData: ReceivedAtNode> ExporterInbox<PData> {
     /// Receives the next message with pdata admission enabled.
     pub async fn recv(&mut self) -> Result<Message<PData>, RecvError> {
@@ -1320,5 +1334,52 @@ mod tests {
             shutdown,
             Message::Control(NodeControlMsg::Shutdown { .. })
         ));
+    }
+
+    /// Scenario: Shutdown is latched while an exporter with admission closed
+    /// still has buffered pdata, and the drain then ends on a closed pdata
+    /// channel.
+    /// Guarantees: the read-only accessor exposes the latched deadline while
+    /// the forced drain runs, and drain order is unchanged. The control
+    /// message that ends the drain is the inbox's own synthesized Shutdown,
+    /// which carries a different deadline, so an exporter that must bound the
+    /// completion work it still owes has to read the deadline from the
+    /// accessor during the drain rather than wait for the control message.
+    #[tokio::test]
+    async fn exporter_deadline_is_visible_during_forced_drain() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(2);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(2);
+        let mut inbox = ExporterInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        assert_eq!(inbox.shutdown_deadline(), None);
+
+        let deadline = clock::now() + Duration::from_secs(1);
+        pdata_tx
+            .send_async(TestMsg::new("buffered"))
+            .await
+            .expect("pdata");
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "test".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+
+        let message = inbox.recv_when(false).await.expect("forced data");
+        assert!(matches!(message, Message::PData(TestMsg(ref body)) if body == "buffered"));
+        assert_eq!(inbox.shutdown_deadline(), Some(deadline));
+
+        drop(pdata_tx);
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("shutdown control"),
+            Message::Control(NodeControlMsg::Shutdown { ref reason, .. })
+                if reason == "pdata channel closed"
+        ));
+        assert_eq!(inbox.shutdown_deadline(), None);
     }
 }

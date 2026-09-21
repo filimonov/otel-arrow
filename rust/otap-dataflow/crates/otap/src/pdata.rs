@@ -537,6 +537,28 @@ impl Context {
         self.authorized_identity.take()
     }
 
+    /// Returns the bytes this context keeps resident in its routing frames,
+    /// including unused vector capacity.
+    ///
+    /// A node that parks a stripped context as a completion token holds the
+    /// frame vector and any spilled calldata for as long as the request is
+    /// undecided, so both are charged against that node's memory budget. The
+    /// inline calldata of an unspilled frame is already part of the frame, and
+    /// is not counted twice.
+    #[must_use]
+    pub fn retained_frame_bytes(&self) -> usize {
+        let spilled = self
+            .stack
+            .iter()
+            .filter(|frame| frame.route.calldata.spilled())
+            .map(|frame| {
+                frame.route.calldata.capacity()
+                    * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
+            })
+            .sum::<usize>();
+        self.stack.capacity() * size_of::<Frame>() + spilled
+    }
+
     fn capture_authorized_identity(
         &mut self,
         policy: &AuthorizedIdentityPolicy,
@@ -3609,5 +3631,34 @@ mod test {
 
         let (_, payload) = create_test_pdata().into_parts();
         assert!(!payload.test_has_cached_item_count());
+    }
+
+    /// Scenario: a retained completion context has excess frame capacity and
+    /// captured metadata.
+    /// Guarantees: claims and headers can be released without losing routing,
+    /// and the retained frame allocation is charged, including the unused
+    /// vector capacity a parked completion token keeps resident.
+    #[test]
+    fn completion_context_can_release_metadata_and_measure_frames() {
+        let mut context = Context::with_capacity(17);
+        context.set_source_node(42);
+        context.authorized_identity = Some(AuthorizedIdentityEntries::default());
+        context.set_transport_headers(TransportHeaders::with_capacity(256));
+
+        assert!(context.take_authorized_identity().is_some());
+        assert!(context.take_transport_headers().is_some());
+        assert!(context.transport_headers().is_none());
+        assert!(context.authorized_identity_entries().is_none());
+        assert_eq!(context.source_node(), Some(42));
+
+        let frame = context.stack.first_mut().expect("source frame");
+        for n in 0_u64..32 {
+            frame.route.calldata.push(n.into());
+        }
+        assert!(
+            context.retained_frame_bytes()
+                >= 17 * size_of::<Frame>()
+                    + 32 * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
+        );
     }
 }

@@ -4,9 +4,15 @@
 //! Configuration adapter tests for the series Parquet exporter.
 
 use super::config::Config;
+use super::token::{AckToken, Notifier, Outcome};
 use super::{Failure, write_request};
-use otel_arrow_dfe_engine::control::NackCause;
-use otel_arrow_dfe_otap::pdata::OtapPdata;
+use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_engine::control::{
+    PipelineCompletionMsg, PipelineCompletionMsgReceiver, pipeline_completion_msg_channel,
+};
+use otel_arrow_dfe_engine::local::exporter::EffectHandler;
+use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
+use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_pdata::OtapPayload;
 use otel_arrow_dfe_pdata::encode::{encode_logs_otap_batch, encode_metrics_otap_batch};
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
@@ -20,6 +26,35 @@ use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_series_lake as lake;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Build an exporter effect handler wired to a completion channel of exactly
+/// `capacity` slots, so a test can saturate it deterministically.
+pub(super) fn effects(
+    capacity: usize,
+) -> (
+    EffectHandler<OtapPdata>,
+    PipelineCompletionMsgReceiver<OtapPdata>,
+) {
+    let (_rx, reporter) =
+        otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(16);
+    let mut effects = EffectHandler::new(
+        test_node("series"),
+        reporter,
+        test_pipeline_runtime_services(),
+    );
+    let (tx, rx) = pipeline_completion_msg_channel(capacity);
+    effects.set_pipeline_completion_msg_sender(tx);
+    (effects, rx)
+}
+
+/// A payload-free request that still carries a routing frame, so the
+/// completion it owes is actually routed rather than skipped.
+pub(super) fn empty_pdata() -> OtapPdata {
+    let mut context = Context::default();
+    context.set_source_node(7);
+    OtapPdata::new(context, OtapPayload::empty(SignalType::Logs))
+}
 
 /// Scenario: the full adapter maps byte strings and rejects an impossible lake
 /// budget.
@@ -245,21 +280,66 @@ async fn a_storage_failure_after_validation_is_retryable() {
     );
 }
 
-/// Scenario: both failure classes are turned into the nack the engine routes.
-/// Guarantees: a permanent failure carries `NackCause::Refused` and is marked
-/// permanent, while a retryable one is neither, so a retry processor redelivers
-/// exactly the requests that can still succeed.
+/// Scenario: both failure classes are turned into the outcome the notifier
+/// delivers.
+/// Guarantees: a size refusal and an unsupported signal keep their own
+/// outcome, any other validation refusal is reported as invalid, and every
+/// retryable failure becomes a storage outcome, so the phase a failure came
+/// from still decides what the sender is told.
 #[test]
-fn each_failure_class_maps_to_its_nack() {
-    let data =
-        || OtapPdata::new_default(OtapPayload::empty(otel_arrow_dfe_config::SignalType::Logs));
+fn each_failure_class_maps_to_its_outcome() {
+    assert_eq!(
+        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)).outcome(),
+        Outcome::TooLarge
+    );
+    assert_eq!(
+        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
+            "signal".into()
+        )))
+        .outcome(),
+        Outcome::Unsupported
+    );
+    assert_eq!(
+        Failure::Permanent(lake::Error::invalid("undecodable pdata")).outcome(),
+        Outcome::Invalid
+    );
+    assert_eq!(
+        Failure::Retryable(lake::Error::invalid("flush failed")).outcome(),
+        Outcome::Storage
+    );
+}
 
-    let permanent = Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge))
-        .into_nack(data());
-    assert!(permanent.permanent);
-    assert_eq!(permanent.cause, NackCause::Refused);
+/// Scenario: the bounded engine completion channel fills while a second
+/// notification waits.
+/// Guarantees: cancelling a poll preserves the second context and sends it
+/// exactly once later, so a request never loses its decision because the
+/// exporter had to attend to something else.
+#[tokio::test(flavor = "current_thread")]
+async fn notification_survives_cancelled_poll() {
+    let (handler, mut rx) = effects(1);
+    let mut notify = Notifier::new(handler, 2);
+    for _ in 0..2 {
+        let (token, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(token, Outcome::Ack);
+    }
 
-    let retryable = Failure::Retryable(lake::Error::invalid("flush failed")).into_nack(data());
-    assert!(!retryable.permanent);
-    assert_eq!(retryable.cause, NackCause::Unspecified);
+    assert!(notify.next().await.is_ok());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), notify.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(notify.len(), 1);
+
+    assert!(matches!(
+        rx.recv().await.expect("first completion"),
+        PipelineCompletionMsg::DeliverAck { .. }
+    ));
+    assert!(notify.next().await.is_ok());
+    assert!(matches!(
+        rx.recv().await.expect("second completion"),
+        PipelineCompletionMsg::DeliverAck { .. }
+    ));
+    assert_eq!(notify.len(), 0);
 }

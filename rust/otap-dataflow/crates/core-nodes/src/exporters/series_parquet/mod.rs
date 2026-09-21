@@ -14,21 +14,22 @@
 pub mod config;
 #[cfg(test)]
 mod tests;
+mod token;
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
+use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
-use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
+use otel_arrow_dfe_engine::control::NodeControlMsg;
 use otel_arrow_dfe_engine::error::{Error, ExporterErrorKind, format_error_sources};
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
-use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, ExporterFactory};
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_otap::{OTAP_EXPORTER_FACTORIES, object_store::StorageType};
 use otel_arrow_dfe_pdata::OtapPayload;
@@ -129,13 +130,31 @@ enum Failure {
 }
 
 impl Failure {
-    /// Build the nack this failure must be reported as.
-    fn into_nack(self, data: OtapPdata) -> NackMsg<OtapPdata> {
+    /// The underlying lake error, whichever phase it came from.
+    ///
+    /// The error value is dropped together with the payload once the request
+    /// is decided, so the call site logs it while the detail still exists.
+    fn error(&self) -> &lake::Error {
         match self {
-            Failure::Permanent(e) => {
-                NackMsg::new_permanent_with_cause(e.to_string(), data, NackCause::Refused)
+            Failure::Permanent(e) | Failure::Retryable(e) => e,
+        }
+    }
+
+    /// The completion outcome this failure must be reported as.
+    ///
+    /// A permanent failure keeps the validation rule that rejected the
+    /// request, because the sender can act on it; every retryable failure is
+    /// reported as a storage outcome, which is not a client error.
+    fn outcome(&self) -> token::Outcome {
+        match self {
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)) => {
+                token::Outcome::TooLarge
             }
-            Failure::Retryable(e) => NackMsg::new(e.to_string(), data),
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(_))) => {
+                token::Outcome::Unsupported
+            }
+            Failure::Permanent(_) => token::Outcome::Invalid,
+            Failure::Retryable(_) => token::Outcome::Storage,
         }
     }
 }
@@ -173,28 +192,51 @@ impl Exporter<OtapPdata> for SeriesParquet {
         let mut cache = lake::cache::SeriesCache::new(self.config.cache_entries);
         let wall = lake::clock::SystemWallClock;
         let mut seq = 0_u64;
+        // One credit per in-flight request in each of the two blocks a window
+        // pair can hold. The loop below still admits one request at a time, so
+        // it never reserves more than one credit; the bound is what later
+        // batching will spend against.
+        let mut notify = token::Notifier::new(
+            effects.clone(),
+            2 * self.config.window.max_requests_per_block,
+        );
         loop {
             match inbox.recv().await? {
                 Message::PData(data) => {
-                    let (mut context, payload) = data.into_parts();
-                    // The context is retained across extraction and a storage
-                    // round trip before it is handed back on the ack or nack.
-                    // Only the routing frames are needed for that, so the
-                    // inbound credentials and the claims derived from them are
-                    // dropped here rather than staying resident for the
-                    // duration of the write (spec section 7).
-                    let _ = context.take_transport_headers();
-                    let _ = context.take_authorized_identity();
-                    let signal = payload.signal_type();
-                    let result =
-                        write_request(payload, &self.config, &sink, &mut cache, &mut seq, &wall)
-                            .await;
-                    let data = OtapPdata::new(context, OtapPayload::empty(signal));
-                    let delivered = match result {
-                        Ok(()) => effects.notify_ack(AckMsg::new(data)).await,
-                        Err(failure) => effects.notify_nack(failure.into_nack(data)).await,
+                    // The completion is retained across extraction and a
+                    // storage round trip before it is handed back. The token
+                    // keeps only the routing frames: the payload is returned
+                    // here and the inbound credentials and the claims derived
+                    // from them are dropped inside `split`, rather than
+                    // staying resident for the duration of the write (spec
+                    // section 7).
+                    let (token, payload) = token::AckToken::split(data);
+                    let outcome = match write_request(
+                        payload,
+                        &self.config,
+                        &sink,
+                        &mut cache,
+                        &mut seq,
+                        &wall,
+                    )
+                    .await
+                    {
+                        Ok(()) => token::Outcome::Ack,
+                        Err(failure) => {
+                            let outcome = failure.outcome();
+                            // The error value is dropped with the payload, so
+                            // it is reported here while the detail still
+                            // exists; the completion carries only the outcome.
+                            otel_warn!(
+                                "series_parquet.request_failed",
+                                outcome = outcome.reason(),
+                                error = %failure.error()
+                            );
+                            outcome
+                        }
                     };
-                    if let Err(e) = delivered {
+                    notify.push(token, outcome);
+                    if let Err(e) = notify.next().await {
                         otel_warn!("series_parquet.notify_failed", error = %e);
                     }
                 }
