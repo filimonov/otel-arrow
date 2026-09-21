@@ -17,13 +17,13 @@ use otel_arrow_dfe_pdata::schema::consts::{
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, any_value_col,
     attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at, flags_at, i64_at,
-    map_col, opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
+    map_cell, opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
-use crate::value::{Value, body_string, value_bytes};
+use crate::value::{Value, body_string};
 
 /// Memo key for a logs series.
 ///
@@ -156,16 +156,17 @@ pub(crate) fn extract_logs(
         let severity_text_str = str_at(&severity_text, row);
         let event_name_str = str_at(&event_name, row);
         let producer = producer_id(resource, &cfg.producer_id_attribute);
-        // Charge everything the row actually retains: fixed cells, the body, the
-        // residual attribute map, the denormalized strings and the projected
-        // producer id.
+        // Charge everything the row actually retains, in the form it is stored
+        // in: fixed cells, the rendered body, the rendered residual attribute
+        // map, the denormalized strings and the projected producer id. The map
+        // and the body are charged their rendered `String::len()`, because hex
+        // encoding and JSON escaping can make the stored cell several times the
+        // size of the decoded value tree.
+        let (residual_cell, residual_bytes) = map_cell(&residual);
         let mut approx = 16 + 8 * 6 + 24 + 8;
         approx += body_str.as_ref().map_or(0, String::len);
         approx += severity_text_str.len() + event_name_str.len() + producer.len();
-        approx += residual
-            .iter()
-            .map(|(k, v)| k.len() + 24 + value_bytes(v))
-            .sum::<usize>();
+        approx += residual_bytes;
         let severity = severity_number
             .as_ref()
             .and_then(|a| {
@@ -187,7 +188,7 @@ pub(crate) fn extract_logs(
             Col::Fixed(fixed_at(&trace_id, row)),
             Col::Fixed(fixed_at(&span_id, row)),
             Col::Int32(Some(flags_at(&flags_col, row))),
-            map_col(&residual),
+            residual_cell,
         ];
         for d in &values_denorm {
             let v = denorm_lookup(d, resource, scope, all_attrs, &mut stats);
@@ -416,6 +417,46 @@ mod tests {
         let mut cfg = cfg();
         cfg.ingress.max_extracted_bytes = 1;
         let mut records = encode_logs(&logs_data());
+        assert!(matches!(
+            extract(&mut records, &cfg),
+            Err(Error::Refused(RefuseReason::RequestTooLarge))
+        ));
+    }
+
+    /// Scenario: one log record carries a 600 KiB bytes attribute. The decoded
+    /// value tree is well under the default 1 MiB row limit, but `render_v1`
+    /// hex-encodes bytes, so the stored map cell is over 1.2 MiB.
+    /// Guarantees: the row limit is applied to the rendered cell, so the request
+    /// is refused instead of being admitted on a tree-sized estimate that the
+    /// stored row then exceeds.
+    #[test]
+    fn a_bytes_attribute_is_charged_its_rendered_hex_size() {
+        const RAW: usize = 600 << 10;
+        let cfg = LakeConfig::default();
+        // The premise of the test: the tree fits the limit, the rendering does not.
+        let attr = vec![("blob".to_string(), Value::Bytes(vec![0xABu8; RAW]))];
+        assert!(crate::extract::kv_bytes(&attr) < cfg.ingress.max_row_bytes);
+        assert!(crate::extract::rendered_kv_bytes(&attr) > cfg.ingress.max_row_bytes);
+
+        let data = LogsData {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000,
+                        attributes: vec![KeyValue {
+                            key: "blob".into(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::BytesValue(vec![0xAB; RAW])),
+                            }),
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut records = encode_logs(&data);
         assert!(matches!(
             extract(&mut records, &cfg),
             Err(Error::Refused(RefuseReason::RequestTooLarge))

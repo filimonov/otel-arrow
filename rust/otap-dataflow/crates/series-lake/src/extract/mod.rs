@@ -470,13 +470,36 @@ impl RowSink {
     }
 }
 
-/// A `Map<Utf8, Utf8>` cell built from a sorted attribute list.
-pub(crate) fn map_col(list: &[(String, Value)]) -> Col {
-    Col::Map(
-        list.iter()
-            .map(|(k, v)| (k.clone(), map_string(v)))
-            .collect(),
-    )
+/// A `Map<Utf8, Utf8>` cell built from a sorted attribute list, with the bytes
+/// the rendered cell retains.
+///
+/// Rendering, not the decoded value tree, decides how large the stored cell is:
+/// `render_v1` hex-encodes a bytes value (doubling its length) and JSON-escapes
+/// strings (which can expand them several-fold). Charging the tree's size would
+/// therefore admit a row whose stored form is far past `max_row_bytes`, which no
+/// later recount can undo. The caller charges the returned size.
+pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
+    let entries: Vec<(String, Option<String>)> = list
+        .iter()
+        .map(|(k, v)| (k.clone(), map_string(v)))
+        .collect();
+    let bytes = entries
+        .iter()
+        .map(|(k, v)| k.len() + 24 + v.as_ref().map_or(0, String::len))
+        .sum();
+    (Col::Map(entries), bytes)
+}
+
+/// Bytes a sorted attribute list occupies once rendered into a map cell.
+///
+/// Measured by rendering, because the expansion is serde_json's escaping and
+/// `render_v1`'s hex encoding and cannot be predicted from the value tree. Used
+/// where the cell itself is built later (a descriptor row becomes a `series`
+/// row only at seal time) and only its size is needed now.
+pub(crate) fn rendered_kv_bytes(list: &[(String, Value)]) -> usize {
+    list.iter()
+        .map(|(k, v)| k.len() + 24 + map_string(v).map_or(0, |s| s.len()))
+        .sum()
 }
 
 /// The children of a struct column with the parent's validity applied.
@@ -709,12 +732,12 @@ pub fn series_batch(
             Col::Bytes(r.identity_bytes.clone()),
             Col::TsUs(Some(emitted_at_us)),
             Col::Str(Some(d.resource_schema_url.clone())),
-            map_col(&d.resource_attrs),
+            map_cell(&d.resource_attrs).0,
             Col::Str(Some(d.scope_name.clone())),
             Col::Str(Some(d.scope_version.clone())),
             Col::Str(Some(d.scope_schema_url.clone())),
-            map_col(&d.scope_attrs),
-            map_col(&d.attrs),
+            map_cell(&d.scope_attrs).0,
+            map_cell(&d.attrs).0,
         ];
         if ds == Dataset::MetricsSeries {
             let m = d
@@ -767,6 +790,11 @@ pub(crate) fn descriptor_row(
         .collect();
     // series row: series_id + identity_bytes + emitted_at + the four schema/scope
     // strings + three attribute maps + the metric block + denormalized columns.
+    //
+    // Each attribute list is counted twice on purpose: the `DescriptorRow` keeps
+    // the decoded value tree until the block seals (`kv_bytes`), and the `series`
+    // row it becomes holds the rendered map cell (`rendered_kv_bytes`), which
+    // hex encoding and JSON escaping can make much larger than the tree.
     let approx_bytes = 16
         + identity_bytes.len()
         + 8
@@ -777,6 +805,9 @@ pub(crate) fn descriptor_row(
         + kv_bytes(&descriptor.resource_attrs)
         + kv_bytes(&descriptor.scope_attrs)
         + kv_bytes(&descriptor.attrs)
+        + rendered_kv_bytes(&descriptor.resource_attrs)
+        + rendered_kv_bytes(&descriptor.scope_attrs)
+        + rendered_kv_bytes(&descriptor.attrs)
         + descriptor.metric.as_ref().map_or(0, |m| {
             m.name.len() + m.unit.len() + m.description.len() + 32
         })
@@ -871,6 +902,41 @@ mod tests {
             Value::Str(String::new())
         );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
+    }
+
+    /// Scenario: an attribute list holding a bytes value, which `render_v1`
+    /// hex-encodes, and a nested value whose strings are full of characters
+    /// JSON must escape.
+    /// Guarantees: the rendered size counts both expansions, exceeds the
+    /// decoded tree size `kv_bytes` reports, and agrees exactly with the cell
+    /// [`map_cell`] builds -- so the two ways a row is charged cannot drift.
+    #[test]
+    fn rendered_bytes_count_hex_encoding_and_json_escaping() {
+        let list = vec![
+            ("b".to_string(), Value::Bytes(vec![0xFF; 100])),
+            (
+                "n".to_string(),
+                Value::KvList(vec![(
+                    "inner".to_string(),
+                    Value::Array(vec![Value::Str("\"\\\n\t".repeat(50))]),
+                )]),
+            ),
+        ];
+        let (cell, bytes) = map_cell(&list);
+        assert_eq!(bytes, rendered_kv_bytes(&list));
+        assert!(rendered_kv_bytes(&list) > kv_bytes(&list));
+        match cell {
+            Col::Map(entries) => {
+                assert_eq!(entries.len(), 2);
+                // 100 bytes become 200 hex digits inside a pair of JSON quotes.
+                let hex = entries[0].1.as_deref().expect("rendered bytes cell");
+                assert_eq!(hex.len(), 202);
+                // Every one of the 200 escaped characters becomes two.
+                let nested = entries[1].1.as_deref().expect("rendered nested cell");
+                assert!(nested.len() > 400);
+            }
+            other => unreachable!("expected a map cell, got {other:?}"),
+        }
     }
 
     /// Scenario: a `resource` struct and an `AnyValue` `body` struct whose
