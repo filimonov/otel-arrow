@@ -97,7 +97,6 @@ pub(super) enum Outcome {
     /// Writing the request failed; the sender may retry.
     Storage,
     /// The node shut down before the request could be decided.
-    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -175,18 +174,15 @@ impl Notifier {
         self.queue.len() + usize::from(self.sending.is_some())
     }
 
-    // The exporter's receive loop still blocks on one request at a time, so
-    // the inbox force-drains on its own and the shutdown and reporting surface
-    // below has no production caller yet. The nonblocking select that calls it
-    // arrives with the window pair; it is built and tested here because the
-    // ownership rules it depends on -- one charge per token, a send future
-    // that survives a cancelled poll -- belong to this module.
     /// Whether no completion is outstanding.
-    #[allow(dead_code)]
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    // The counters and size reporting below are read by the node's metrics,
+    // which a later task adds; they are built and tested here because the
+    // accounting rules they depend on -- one charge per token, a send future
+    // that survives a cancelled poll -- belong to this module.
     /// Bytes the notifier keeps resident.
     ///
     /// Each token is charged once: a queued token by the queue cell it sits in
@@ -230,14 +226,16 @@ impl Notifier {
         self.token_high_water
     }
 
-    /// Whether one more normal completion may be queued.
+    /// Whether one more normal completion may be queued, given the number of
+    /// completions the caller already owes.
     ///
-    /// False once the only slot left is the reserved one, so the worker stops
-    /// admitting rather than spending the credit that lets the node observe a
-    /// forced drain.
-    #[allow(dead_code)]
-    pub(super) fn has_credit(&self) -> bool {
-        self.len() + 1 < self.capacity
+    /// `live` counts every token that will eventually reach this queue, not
+    /// only the ones already in it: a token held by a block is a completion
+    /// the notifier has yet to be handed. False once the only slot left is the
+    /// reserved one, so the worker stops admitting rather than spending the
+    /// credit that lets the node decide one force-drained request.
+    pub(super) fn has_credit(&self, live: usize) -> bool {
+        live + 1 < self.capacity
     }
 
     /// Queue one decided request.
@@ -259,6 +257,45 @@ impl Notifier {
         self.queue.push_back((token, outcome));
     }
 
+    /// The engine call one decided completion is delivered by.
+    ///
+    /// Every delivery path goes through this, so a queued completion, a
+    /// completion abandoned at the shutdown deadline and a force-drained
+    /// refusal are reported identically.
+    async fn delivery(
+        effects: EffectHandler<OtapPdata>,
+        token: AckToken,
+        outcome: Outcome,
+    ) -> Result<(), Error> {
+        let data = token.pdata();
+        match outcome {
+            Outcome::Ack => effects.notify_ack(AckMsg::new(data)).await,
+            Outcome::Shutdown => {
+                effects
+                    .notify_nack(NackMsg::new_with_cause(
+                        outcome.reason(),
+                        data,
+                        NackCause::NodeShutdown,
+                    ))
+                    .await
+            }
+            refused if refused.refused() => {
+                effects
+                    .notify_nack(NackMsg::new_permanent_with_cause(
+                        refused.reason(),
+                        data,
+                        NackCause::Refused,
+                    ))
+                    .await
+            }
+            other => {
+                effects
+                    .notify_nack(NackMsg::new(other.reason(), data))
+                    .await
+            }
+        }
+    }
+
     /// Drive the single completion send to completion.
     ///
     /// Cancellation safe: the send future is installed before it is polled and
@@ -272,36 +309,7 @@ impl Notifier {
             };
             let external = token.external_bytes();
             let received = token.received;
-            let effects = self.effects.clone();
-            let future = async move {
-                let data = token.pdata();
-                match outcome {
-                    Outcome::Ack => effects.notify_ack(AckMsg::new(data)).await,
-                    Outcome::Shutdown => {
-                        effects
-                            .notify_nack(NackMsg::new_with_cause(
-                                outcome.reason(),
-                                data,
-                                NackCause::NodeShutdown,
-                            ))
-                            .await
-                    }
-                    refused if refused.refused() => {
-                        effects
-                            .notify_nack(NackMsg::new_permanent_with_cause(
-                                refused.reason(),
-                                data,
-                                NackCause::Refused,
-                            ))
-                            .await
-                    }
-                    other => {
-                        effects
-                            .notify_nack(NackMsg::new(other.reason(), data))
-                            .await
-                    }
-                }
-            };
+            let future = Self::delivery(self.effects.clone(), token, outcome);
             let bytes = external + size_of_val(&future);
             self.sending = Some(Sending {
                 bytes,
@@ -330,24 +338,45 @@ impl Notifier {
     /// immediately; a send that would block is counted as a failure and the
     /// token is released rather than parked, so force-drain never stalls on a
     /// full completion channel.
-    #[allow(dead_code)]
     pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
-        use futures::FutureExt;
-
         let (token, payload) = AckToken::split(data);
         drop(payload);
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[Outcome::Shutdown as usize] += 1;
-        let delivered = self
-            .effects
-            .notify_nack(NackMsg::new_with_cause(
-                Outcome::Shutdown.reason(),
-                token.pdata(),
-                NackCause::NodeShutdown,
-            ))
-            .now_or_never();
+        self.deliver_now(token, Outcome::Shutdown);
+    }
+
+    /// Attempt one completion immediately, counting a send that would block.
+    ///
+    /// Used only on the paths that must not park a token: a force-drained
+    /// request and the completions abandoned once the shutdown deadline has
+    /// elapsed. The token is released either way, so the request ends decided
+    /// or counted as a delivery failure, never silently dropped.
+    fn deliver_now(&mut self, token: AckToken, outcome: Outcome) {
+        use futures::FutureExt;
+
+        let delivered = Self::delivery(self.effects.clone(), token, outcome).now_or_never();
         if !matches!(delivered, Some(Ok(()))) {
             self.failures += 1;
+        }
+    }
+
+    /// Attempt every outstanding completion once, without blocking.
+    ///
+    /// Called when the shutdown deadline has elapsed and the node is about to
+    /// return. Whatever the engine cannot take immediately is counted as a
+    /// delivery failure and released, so the node leaves nothing undecided and
+    /// still returns within its deadline.
+    pub(super) fn drain_now(&mut self) {
+        use futures::FutureExt;
+
+        if let Some(mut sending) = self.sending.take()
+            && !matches!(sending.future.as_mut().now_or_never(), Some(Ok(())))
+        {
+            self.failures += 1;
+        }
+        while let Some((token, outcome)) = self.queue.pop_front() {
+            self.deliver_now(token, outcome);
         }
     }
 }
@@ -524,13 +553,13 @@ mod tests {
         let mut notify = Notifier::new(handler, 4);
 
         for _ in 0..3 {
-            assert!(notify.has_credit());
+            assert!(notify.has_credit(notify.len()));
             let (token, payload) = AckToken::split(empty_pdata());
             drop(payload);
             notify.push(token, Outcome::Ack);
         }
         assert_eq!(notify.len(), 3);
-        assert!(!notify.has_credit());
+        assert!(!notify.has_credit(notify.len()));
 
         let (token, payload) = AckToken::split(empty_pdata());
         drop(payload);

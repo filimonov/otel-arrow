@@ -5,8 +5,11 @@
 
 use super::config::Config;
 use super::token::{AckToken, Notifier, Outcome};
-use super::{Failure, write_request};
+use super::worker::{Failure, Worker};
+use object_store::ObjectStoreExt;
 use otel_arrow_dfe_config::SignalType;
+use otel_arrow_dfe_engine::clock;
+use otel_arrow_dfe_engine::control::NackCause;
 use otel_arrow_dfe_engine::control::{
     PipelineCompletionMsg, PipelineCompletionMsgReceiver, pipeline_completion_msg_channel,
 };
@@ -24,7 +27,6 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_series_lake as lake;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,89 +197,144 @@ fn metrics_payload() -> OtapPayload {
     OtapPayload::from(encode_metrics_otap_batch(&view).expect("encodes to OTAP"))
 }
 
-fn config_for(base: &Path) -> Config {
-    serde_json::from_value(serde_json::json!({
-        "storage": {"file": {"base_uri": base.to_string_lossy()}},
-        "window": {"interval": "15s"}
-    }))
-    .expect("valid config")
-}
-
-fn sink_for(cfg: &Config, root: &Path) -> lake::sink::Sink {
-    let store = Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(root).expect("local object store"),
-    );
-    lake::sink::Sink::new(
-        store,
-        cfg.lake.clone(),
-        lake::sink::FileNaming::new(&cfg.lake.writer_id),
-    )
-}
-
 /// Scenario: a metrics request reaches an exporter that only supports logs,
 /// and a logs request larger than `ingress.max_request_bytes` arrives.
-/// Guarantees: both are classified `Permanent`, because validation judges the
-/// request's own content and the identical bytes would be refused again.
-#[tokio::test]
+/// Guarantees: both are refused as permanent client errors with the rule that
+/// rejected them, and neither leaves anything in the ACTIVE block, because
+/// validation judges the request's own content and the identical bytes would
+/// be refused again.
+#[tokio::test(flavor = "current_thread")]
 async fn validation_refusals_are_permanent() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cfg = config_for(dir.path());
-    let sink = sink_for(&cfg, dir.path());
-    let mut cache = lake::cache::SeriesCache::new(cfg.cache_entries);
-    let mut seq = 0_u64;
-    let wall = lake::clock::SystemWallClock;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
 
-    let failure = write_request(metrics_payload(), &cfg, &sink, &mut cache, &mut seq, &wall)
-        .await
-        .expect_err("metrics are not supported");
-    assert!(
-        matches!(failure, Failure::Permanent(_)),
-        "unsupported signal must be permanent, got {failure:?}"
-    );
+            let mut context = Context::default();
+            context.set_source_node(7);
+            worker.admit(OtapPdata::new(context, metrics_payload()));
+            // The same logs request that is admitted elsewhere, now larger
+            // than the budget it is measured against.
+            worker.cfg.lake.ingress.max_request_bytes = 1;
+            worker.admit(logs_pdata());
 
-    let mut tiny = config_for(dir.path());
-    tiny.lake.ingress.max_request_bytes = 1;
-    let failure = write_request(logs_payload(), &tiny, &sink, &mut cache, &mut seq, &wall)
-        .await
-        .expect_err("request exceeds its budget");
-    assert!(
-        matches!(failure, Failure::Permanent(_)),
-        "an over-budget request must be permanent, got {failure:?}"
-    );
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(!worker.rotation_requested);
+            for reason in ["unsupported", "too_large"] {
+                assert!(worker.notify.next().await.is_ok());
+                match rx.recv().await.expect("a refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(nack.permanent);
+                        assert_eq!(nack.cause, NackCause::Refused);
+                        assert_eq!(nack.reason, reason);
+                    }
+                    other => panic!("expected a nack, got {other:?}"),
+                }
+            }
+        })
+        .await;
 }
 
-/// Scenario: a well-formed logs request passes validation, but the object
-/// store cannot be written, because the directory the sink was rooted at has
-/// been replaced by a regular file.
-/// Guarantees: the storage failure is classified `Retryable`, never as a
-/// client refusal, so an unreachable or full destination does not tell the
-/// sender to change a request that is perfectly valid. Replacing the root with
-/// a file is used rather than dropping its write permission because no user,
-/// including root, can create a path below a regular file, so the failure is
+/// Scenario: a well-formed logs request is admitted and rotated, but the
+/// object store cannot be written, because the directory the store was rooted
+/// at has been replaced by a regular file.
+/// Guarantees: every request of the block is nacked as retryable rather than
+/// refused, and the descriptor is left uncommitted so the next block writes it
+/// again. An unreachable or full destination must not tell the sender to
+/// change a request that is perfectly valid. Replacing the root with a file is
+/// used rather than dropping its write permission because no user, including
+/// root, can create a path below a regular file, so the failure is
 /// deterministic everywhere the tests run.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn a_storage_failure_after_validation_is_retryable() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path().join("lake");
-    std::fs::create_dir(&root).expect("create the lake root");
-    let cfg = config_for(&root);
-    let sink = sink_for(&cfg, &root);
-    let mut cache = lake::cache::SeriesCache::new(cfg.cache_entries);
-    let mut seq = 0_u64;
-    let wall = lake::clock::SystemWallClock;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("lake");
+            std::fs::create_dir(&root).expect("create the lake root");
+            let store = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&root)
+                    .expect("local object store"),
+            );
+            // The store has already resolved its root, so swapping the
+            // directory for a file breaks every write underneath it.
+            std::fs::remove_dir_all(&root).expect("remove the lake root");
+            std::fs::write(&root, b"not a directory").expect("put a file in its place");
 
-    // The sink has already resolved its root, so swapping the directory for a
-    // file breaks every write underneath it.
-    std::fs::remove_dir_all(&root).expect("remove the lake root");
-    std::fs::write(&root, b"not a directory").expect("put a file in its place");
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
 
-    let failure = write_request(logs_payload(), &cfg, &sink, &mut cache, &mut seq, &wall)
-        .await
-        .expect_err("the destination is not writable");
-    assert!(
-        matches!(failure, Failure::Retryable(_)),
-        "a storage failure must be retryable, got {failure:?}"
-    );
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            let partition = worker.active.data.partition;
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(
+                done.as_ref().expect("the flush task joins").result.is_err(),
+                "the destination is not writable"
+            );
+
+            worker.complete(done);
+            assert!(!worker.cache.is_committed(&id, partition));
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a storage failure") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.reason, "storage");
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Scenario: the shutdown deadline elapses while a flush is still outstanding.
+/// Guarantees: the write is cancelled and every completion the worker still
+/// owns is delivered as a retryable `NodeShutdown` nack, so a request is never
+/// dropped undecided along with the worker.
+#[tokio::test(flavor = "current_thread")]
+async fn the_deadline_decides_every_outstanding_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let elapsed = clock::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("an instant one second in the past");
+            worker.shutdown(elapsed);
+            worker.abandon();
+
+            assert!(worker.is_idle());
+            match rx.recv().await.expect("a shutdown refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                    assert_eq!(nack.reason, "shutdown");
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+        })
+        .await;
 }
 
 /// Scenario: both failure classes are turned into the outcome the notifier
@@ -348,4 +405,85 @@ async fn notification_survives_cancelled_poll() {
         PipelineCompletionMsg::DeliverAck { .. }
     ));
     assert_eq!(notify.len(), 0);
+}
+
+/// A worker configuration with a one-second window and a small request bound,
+/// so the completion credit arithmetic is exercised at a size a test can
+/// reason about. The base URI is never used: these tests hand the worker an
+/// in-memory object store directly.
+fn worker_config() -> Config {
+    serde_json::from_value(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-unused"}},
+        "window": {"interval": "1s", "max_requests_per_block": 4}
+    }))
+    .expect("valid config")
+}
+
+/// One well-formed logs request that still carries a routing frame.
+fn logs_pdata() -> OtapPdata {
+    let mut context = Context::default();
+    context.set_source_node(7);
+    OtapPdata::new(context, logs_payload())
+}
+
+/// Scenario: a request is admitted, rotated into a real in-memory object store
+/// flush, and completed.
+/// Guarantees: no completion is emitted before the flush resolved, both files
+/// exist in the store by the time the ack is queued, and only a completed
+/// flush marks the descriptor committed in the cache under the flushed
+/// block's partition.
+#[tokio::test(flavor = "current_thread")]
+async fn complete_files_before_ack() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            let partition = worker.active.data.partition;
+            assert!(!worker.cache.is_committed(&id, partition));
+
+            worker.rotate();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), rx.recv())
+                    .await
+                    .is_err(),
+                "a started flush is not a durable one"
+            );
+
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let report = done
+                .as_ref()
+                .expect("the flush task joins")
+                .result
+                .as_ref()
+                .expect("the write succeeds");
+            assert_eq!(report.files.len(), 2);
+            for (_, path, _) in &report.files {
+                assert!(store.head(path).await.is_ok());
+            }
+
+            worker.complete(done);
+            assert!(worker.cache.is_committed(&id, partition));
+            assert!(worker.notify.next().await.is_ok());
+            assert!(matches!(
+                rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
+        })
+        .await;
 }

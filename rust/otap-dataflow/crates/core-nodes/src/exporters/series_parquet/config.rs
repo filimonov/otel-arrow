@@ -147,8 +147,8 @@ pub struct Config {
     pub(super) lake: LakeConfig,
     pub(super) window: Window,
     pub(super) cache_entries: usize,
-    /// Validated here, consumed once completion batching lands.
-    #[allow(dead_code)]
+    /// Completion sends the node loop takes before it yields to its other
+    /// branches.
     pub(super) notify_batch: usize,
 }
 
@@ -229,7 +229,7 @@ impl TryFrom<RawConfig> for Config {
         {
             return Err("all byte, depth and abort budgets must be positive".into());
         }
-        // Later tasks size a notification buffer from this count; refuse a
+        // The node sizes its notification buffer from this count; refuse a
         // value that cannot be doubled rather than overflowing there.
         let _ = lake
             .ingress

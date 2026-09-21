@@ -3,18 +3,18 @@
 
 //! Series/values Parquet exporter with durable acknowledgements.
 //!
-//! This is the first runnable slice of the node: one request at a time is
-//! extracted, admitted to a fresh block, sealed and flushed, and only then
-//! acknowledged. That keeps the durability contract exact -- an OK response
-//! means the request's rows are in object storage -- at the cost of one file
-//! set per request. Later tasks replace this loop with bounded per-window
-//! batching, an ACTIVE/FLUSHING pair and backpressure, without changing what
-//! an ack means.
-
-pub mod config;
-#[cfg(test)]
-mod tests;
-mod token;
+//! The node owns exactly one ACTIVE block and at most one FLUSHING block. A
+//! request is admitted to the ACTIVE block, and the completion it is owed is
+//! held beside the block until the whole block has been written: an ack means
+//! the request's rows are in object storage, and a failed write nacks every
+//! request of the block as retryable. While a flush is outstanding the node
+//! closes pdata admission rather than opening a third block, so a slow
+//! destination becomes backpressure instead of unbounded memory.
+//!
+//! Rotation timing is not yet the window timer: a block is sealed as soon as
+//! it holds a request, so this still writes one file set per request. A later
+//! task replaces the trigger with the aligned window clock without changing
+//! what an ack means.
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -32,15 +32,9 @@ use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_otap::{OTAP_EXPORTER_FACTORIES, object_store::StorageType};
-use otel_arrow_dfe_pdata::OtapPayload;
-use otel_arrow_dfe_pdata::TryIntoWithOptions;
-use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_series_lake as lake;
 use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-
-use lake::clock::WallClock;
 
 /// Registered component identifier.
 pub const SERIES_PARQUET_URN: &str = "urn:otel:exporter:series_parquet";
@@ -49,6 +43,13 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = SERIES_PARQUET_URN,
     target = "otel.exporter.series_parquet",
 );
+
+pub mod config;
+mod flush;
+#[cfg(test)]
+mod tests;
+mod token;
+mod worker;
 
 /// Declares the series Parquet exporter as a local exporter factory.
 ///
@@ -112,58 +113,11 @@ impl SeriesParquet {
     }
 }
 
-/// How a failed request must be reported back to its sender.
-///
-/// The distinction is the phase the failure came from, not the error type.
-/// Validation -- the request budget, the signal check, `extract` and
-/// `reserve` -- judges the request's own content, so the identical bytes will
-/// be refused again and the client must change the request. Everything after
-/// that point (`admit`, `seal`, and the Arrow, Parquet and object store work
-/// inside `write_block`) is infrastructure: the same request may well succeed
-/// on a retry, so it must not be reported as a client error.
-#[derive(Debug)]
-enum Failure {
-    /// The request's content or size is refused; retrying is futile.
-    Permanent(lake::Error),
-    /// Writing the request failed; the sender may retry.
-    Retryable(lake::Error),
-}
-
-impl Failure {
-    /// The underlying lake error, whichever phase it came from.
-    ///
-    /// The error value is dropped together with the payload once the request
-    /// is decided, so the call site logs it while the detail still exists.
-    fn error(&self) -> &lake::Error {
-        match self {
-            Failure::Permanent(e) | Failure::Retryable(e) => e,
-        }
-    }
-
-    /// The completion outcome this failure must be reported as.
-    ///
-    /// A permanent failure keeps the validation rule that rejected the
-    /// request, because the sender can act on it; every retryable failure is
-    /// reported as a storage outcome, which is not a client error.
-    fn outcome(&self) -> token::Outcome {
-        match self {
-            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)) => {
-                token::Outcome::TooLarge
-            }
-            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(_))) => {
-                token::Outcome::Unsupported
-            }
-            Failure::Permanent(_) => token::Outcome::Invalid,
-            Failure::Retryable(_) => token::Outcome::Storage,
-        }
-    }
-}
-
 #[async_trait(?Send)]
 impl Exporter<OtapPdata> for SeriesParquet {
     async fn start(
         mut self: Box<Self>,
-        mut inbox: ExporterInbox<OtapPdata>,
+        inbox: ExporterInbox<OtapPdata>,
         effects: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         if self.config.retry.is_some() && matches!(&self.config.storage, StorageType::File { .. }) {
@@ -184,144 +138,130 @@ impl Exporter<OtapPdata> for SeriesParquet {
                 error: format!("error initializing object store {e}"),
                 source_detail: format_error_sources(&e),
             })?;
-        let sink = lake::sink::Sink::new(
+        run(
+            self.config.clone(),
             store,
-            self.config.lake.clone(),
-            lake::sink::FileNaming::new(&self.config.lake.writer_id),
-        );
-        let mut cache = lake::cache::SeriesCache::new(self.config.cache_entries);
-        let wall = lake::clock::SystemWallClock;
-        let mut seq = 0_u64;
-        // One credit per in-flight request in each of the two blocks a window
-        // pair can hold. The loop below still admits one request at a time, so
-        // it never reserves more than one credit; the bound is what later
-        // batching will spend against.
-        let mut notify = token::Notifier::new(
-            effects.clone(),
-            2 * self.config.window.max_requests_per_block,
-        );
-        loop {
-            match inbox.recv().await? {
-                Message::PData(data) => {
-                    // The completion is retained across extraction and a
-                    // storage round trip before it is handed back. The token
-                    // keeps only the routing frames: the payload is returned
-                    // here and the inbound credentials and the claims derived
-                    // from them are dropped inside `split`, rather than
-                    // staying resident for the duration of the write (spec
-                    // section 7).
-                    let (token, payload) = token::AckToken::split(data);
-                    let outcome = match write_request(
-                        payload,
-                        &self.config,
-                        &sink,
-                        &mut cache,
-                        &mut seq,
-                        &wall,
-                    )
-                    .await
-                    {
-                        Ok(()) => token::Outcome::Ack,
-                        Err(failure) => {
-                            let outcome = failure.outcome();
-                            // The error value is dropped with the payload, so
-                            // it is reported here while the detail still
-                            // exists; the completion carries only the outcome.
-                            otel_warn!(
-                                "series_parquet.request_failed",
-                                outcome = outcome.reason(),
-                                error = %failure.error()
-                            );
-                            outcome
-                        }
-                    };
-                    notify.push(token, outcome);
-                    if let Err(e) = notify.next().await {
-                        otel_warn!("series_parquet.notify_failed", error = %e);
-                    }
-                }
-                Message::Control(NodeControlMsg::Shutdown { deadline, .. }) => {
-                    // Every request that was acknowledged is already durable,
-                    // so there is nothing buffered to flush on the way out.
-                    return Ok(TerminalState::new(
-                        deadline,
-                        std::iter::empty::<MetricSetSnapshot>(),
-                    ));
-                }
-                Message::Control(_) => {}
-            }
-        }
+            Arc::new(lake::clock::SystemWallClock),
+            inbox,
+            effects,
+        )
+        .await
     }
 }
 
-/// Extract one request, write it and report which phase any failure came from.
+/// Drive one worker until shutdown completes or its deadline elapses.
 ///
-/// Validation runs first and its refusals are [`Failure::Permanent`]: the
-/// request budget, the signal check, `extract` and `reserve` all judge the
-/// request's own content. A payload that cannot be decoded into OTAP records
-/// is counted as validation too, because the same bytes will not decode on a
-/// retry either. From `admit` onwards every failure is [`Failure::Retryable`],
-/// including the Arrow, Parquet and object store errors raised inside
-/// `write_block`, so a full disk or an unreachable bucket is never reported to
-/// the client as a request it must change.
-async fn write_request(
-    mut payload: OtapPayload,
-    config: &config::Config,
-    sink: &lake::sink::Sink,
-    cache: &mut lake::cache::SeriesCache,
-    seq: &mut u64,
-    wall: &impl WallClock,
-) -> Result<(), Failure> {
-    let signal = payload.signal_type();
-    // `num_bytes` is an estimate of the wire representation, so the budget is
-    // also enforced on the measured extracted output inside `extract`.
-    if !payload
-        .num_bytes()
-        .is_some_and(|n| n <= config.lake.ingress.max_request_bytes)
-    {
-        return Err(Failure::Permanent(lake::Error::Refused(
-            lake::RefuseReason::RequestTooLarge,
-        )));
+/// The branches are ordered: the shutdown deadline outranks everything, then a
+/// resolved flush, then completion delivery, then rotation, and only then a new
+/// message. `accept` is false while a rotation is pending or a flush is
+/// outstanding, which is what turns a slow destination into backpressure on the
+/// channel rather than a third block. Once shutdown has been latched the node
+/// keeps taking force-drained pdata and refuses each one immediately with a
+/// retryable `NodeShutdown` nack, spending the completion credit that was
+/// reserved for exactly that.
+async fn run(
+    cfg: config::Config,
+    store: Arc<dyn object_store::ObjectStore>,
+    wall: Arc<dyn lake::clock::WallClock>,
+    mut inbox: ExporterInbox<OtapPdata>,
+    effects: EffectHandler<OtapPdata>,
+) -> Result<TerminalState, Error> {
+    let mut worker = worker::Worker::new(cfg, store, wall, effects);
+    // The engine hands the Shutdown control message over only once it has
+    // force-drained the pdata backlog, and it closes the inbox in the same
+    // step. Receiving again after that yields a closed error rather than
+    // blocking, so the node stops receiving and finishes the work it holds.
+    let mut closed = false;
+    let mut notify_turns = 0_usize;
+    loop {
+        if let Some(deadline) = worker.deadline
+            && worker.is_idle()
+        {
+            return Ok(TerminalState::new(
+                deadline,
+                std::iter::empty::<MetricSetSnapshot>(),
+            ));
+        }
+        let accept = worker.accept();
+        let deadline = worker.deadline;
+        tokio::select! {
+            biased;
+
+            // The deadline outranks every other branch: whatever is still
+            // outstanding is cancelled and decided rather than waited for.
+            () = async {
+                match deadline {
+                    Some(d) => otel_arrow_dfe_engine::clock::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                otel_warn!("series_parquet.shutdown_deadline_elapsed");
+                worker.abandon();
+                return Ok(TerminalState::new(
+                    deadline.expect("the deadline branch only fires with a deadline"),
+                    std::iter::empty::<MetricSetSnapshot>(),
+                ));
+            }
+
+            // A resolved flush is what turns a block's requests into
+            // completions, so it is served before anything that could add to
+            // the next block.
+            done = async {
+                match worker.flushing.as_mut() {
+                    Some(job) => job.finish().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                worker.complete(done);
+                notify_turns = 0;
+            }
+
+            // Bounded so a long completion backlog cannot starve the flush and
+            // receive branches; `notify_batch` sends are taken before the loop
+            // yields and reopens them.
+            result = worker.notify.next(),
+                if !worker.notify.is_empty() && notify_turns < worker.cfg.notify_batch => {
+                if let Err(e) = result {
+                    otel_warn!("series_parquet.notify_failed", error = %e);
+                }
+                notify_turns += 1;
+            }
+
+            // Always ready when it is enabled, so a requested rotation happens
+            // before the next message is taken.
+            () = std::future::ready(()),
+                if worker.rotation_requested && worker.flushing.is_none() => {
+                worker.rotate();
+                notify_turns = 0;
+            }
+
+            message = inbox.recv_when(accept), if !closed => {
+                notify_turns = 0;
+                match message? {
+                    Message::PData(data) => {
+                        if let Some(d) = inbox.shutdown_deadline() {
+                            // Force-drained: the node is past admission, so the
+                            // request is refused immediately rather than parked.
+                            worker.shutdown(d);
+                            worker.notify.force_shutdown(data);
+                        } else {
+                            worker.admit(data);
+                        }
+                    }
+                    Message::Control(NodeControlMsg::Shutdown { deadline, reason }) => {
+                        otel_info!("series_parquet.shutdown", reason = reason);
+                        closed = true;
+                        worker.shutdown(deadline);
+                    }
+                    Message::Control(_) => {}
+                }
+            }
+
+            // Reopens the notification branch after its batch, once every other
+            // branch has had a turn.
+            () = tokio::task::yield_now(), if notify_turns >= worker.cfg.notify_batch => {
+                notify_turns = 0;
+            }
+        }
     }
-    if signal != otel_arrow_dfe_config::SignalType::Logs {
-        return Err(Failure::Permanent(lake::Error::Refused(
-            lake::RefuseReason::Unsupported("signal".into()),
-        )));
-    }
-    let mut records: OtapArrowRecords = payload
-        .try_into_with_default()
-        .map_err(|e| Failure::Permanent(lake::Error::invalid(format!("undecodable pdata: {e}"))))?;
-    let extracted =
-        lake::extract::extract(&mut records, &config.lake).map_err(Failure::Permanent)?;
-    drop(records);
-    if extracted.stats.rows == 0 {
-        return Ok(());
-    }
-    let secs = lake::clock::nanos_to_secs(wall.now_unix_nanos());
-    let clock = lake::clock::WindowClock::new(config.window.interval, secs);
-    let mut block = lake::buffer::Block::new(clock.last_boundary(), *seq, &config.lake);
-    // Reserving is still validation: it refuses a request too large for any
-    // block. The sequence only advances once a block exists to consume it.
-    let reservation = block
-        .reserve(&extracted, cache, 0, &config.lake)
-        .map_err(Failure::Permanent)?;
-    *seq = seq
-        .checked_add(1)
-        .ok_or_else(|| Failure::Retryable(lake::Error::invalid("sequence exhausted")))?;
-    block
-        .admit(extracted, reservation, ())
-        .map_err(Failure::Retryable)?;
-    block
-        .seal(lake::clock::nanos_to_micros(wall.now_unix_nanos()))
-        .map_err(Failure::Retryable)?;
-    let _ = sink
-        .write_block(&block, &CancellationToken::new())
-        .await
-        .map_err(Failure::Retryable)?;
-    // Only a flush that resolved marks the descriptors committed, so a failed
-    // flush re-emits them.
-    for id in &block.pending_series {
-        cache.mark_committed(*id, block.partition);
-    }
-    Ok(())
 }
