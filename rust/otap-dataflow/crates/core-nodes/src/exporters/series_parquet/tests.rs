@@ -318,13 +318,19 @@ fn each_failure_class_maps_to_its_outcome() {
 async fn notification_survives_cancelled_poll() {
     let (handler, mut rx) = effects(1);
     let mut notify = Notifier::new(handler, 2);
-    for _ in 0..2 {
-        let (token, payload) = AckToken::split(empty_pdata());
-        drop(payload);
-        notify.push(token, Outcome::Ack);
-    }
 
+    // The first completion is handed over before the second is queued, so the
+    // notifier never holds more normal completions than its cap allows.
+    let (first, payload) = AckToken::split(empty_pdata());
+    drop(payload);
+    notify.push(first, Outcome::Ack);
     assert!(notify.next().await.is_ok());
+
+    // The completion channel holds one message and nothing has read it, so
+    // this second send cannot make progress.
+    let (second, payload) = AckToken::split(empty_pdata());
+    drop(payload);
+    notify.push(second, Outcome::Ack);
     assert!(
         tokio::time::timeout(Duration::from_millis(5), notify.next())
             .await

@@ -3651,14 +3651,23 @@ mod test {
         assert!(context.authorized_identity_entries().is_none());
         assert_eq!(context.source_node(), Some(42));
 
+        // An unspilled frame keeps its calldata inline, so the frame vector is
+        // the whole charge.
+        assert!(!context.stack[0].route.calldata.spilled());
+        assert_eq!(context.stack.capacity(), 17);
+        assert_eq!(context.retained_frame_bytes(), 17 * size_of::<Frame>());
+
         let frame = context.stack.first_mut().expect("source frame");
         for n in 0_u64..32 {
             frame.route.calldata.push(n.into());
         }
-        assert!(
-            context.retained_frame_bytes()
-                >= 17 * size_of::<Frame>()
-                    + 32 * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
+        assert!(context.stack[0].route.calldata.spilled());
+        let spilled = context.stack[0].route.calldata.capacity();
+        assert!(spilled >= 32);
+        assert_eq!(
+            context.retained_frame_bytes(),
+            17 * size_of::<Frame>()
+                + spilled * size_of::<otel_arrow_dfe_engine::control::Context8u8>()
         );
     }
 }

@@ -230,14 +230,28 @@ impl Notifier {
         self.token_high_water
     }
 
+    /// Whether one more normal completion may be queued.
+    ///
+    /// False once the only slot left is the reserved one, so the worker stops
+    /// admitting rather than spending the credit that lets the node observe a
+    /// forced drain.
+    #[allow(dead_code)]
+    pub(super) fn has_credit(&self) -> bool {
+        self.len() + 1 < self.capacity
+    }
+
     /// Queue one decided request.
     ///
     /// The caller reserves the credit before it admits the request, so a push
-    /// that would exceed the capacity is a worker bug rather than a runtime
-    /// condition.
+    /// that would exceed the bound is a worker bug rather than a runtime
+    /// condition. The bound is checked after the insertion, not before it: a
+    /// normal outcome may take the notifier up to `capacity - 1` live
+    /// completions, and the last slot is kept for a shutdown outcome, so the
+    /// node can always still decide one force-drained request.
     pub(super) fn push(&mut self, token: AckToken, outcome: Outcome) {
+        let reserved = usize::from(outcome != Outcome::Shutdown);
         assert!(
-            self.len() < self.capacity,
+            self.len() + 1 + reserved <= self.capacity,
             "worker must reserve completion credit"
         );
         self.token_high_water = self.token_high_water.max(token.bytes());
@@ -452,38 +466,95 @@ mod tests {
         }
     }
 
-    /// Scenario: two completions are queued and the oldest is asked for while
-    /// one of them is parked in a blocked send.
-    /// Guarantees: the age of the oldest outstanding completion is reported
-    /// whether it sits in the queue or in the send slot, so a shutdown
-    /// deadline can be measured against work the notifier still owes.
+    /// Scenario: one completion is parked in a blocked send and a second,
+    /// strictly later one waits behind it in the queue.
+    /// Guarantees: the oldest outstanding completion is the blocked send, not
+    /// the queued one and not a completion that has already been delivered, so
+    /// a shutdown deadline is measured against the work the notifier still
+    /// owes.
     #[tokio::test(flavor = "current_thread")]
-    async fn oldest_spans_the_queue_and_the_blocked_send() {
+    async fn oldest_is_the_blocked_send_not_the_queued_completion() {
         let (handler, _rx) = effects(1);
-        let mut notify = Notifier::new(handler, 3);
+        let mut notify = Notifier::new(handler, 4);
         assert_eq!(notify.oldest(), None);
 
         let (first, payload) = AckToken::split(empty_pdata());
         drop(payload);
-        let first_received = first.received;
+        let delivered_received = first.received;
         notify.push(first, Outcome::Ack);
         notify.next().await.expect("fill completion channel");
+        assert_eq!(notify.oldest(), None);
 
-        let (second, payload) = AckToken::split(empty_pdata());
+        let (blocked, payload) = AckToken::split(empty_pdata());
         drop(payload);
-        notify.push(second, Outcome::Ack);
-        let (third, payload) = AckToken::split(empty_pdata());
+        let blocked_received = blocked.received;
+        notify.push(blocked, Outcome::Ack);
+
+        // The two remaining tokens must carry distinct timestamps for the
+        // choice between them to mean anything, and the system clock is what
+        // `AckToken::split` reads.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let (queued, payload) = AckToken::split(empty_pdata());
         drop(payload);
-        notify.push(third, Outcome::Ack);
+        let queued_received = queued.received;
+        notify.push(queued, Outcome::Ack);
+        assert!(blocked_received < queued_received);
+        assert!(delivered_received < blocked_received);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(1), notify.next())
                 .await
                 .is_err()
         );
-        assert_eq!(notify.len(), 2);
-        let oldest = notify.oldest().expect("two completions are outstanding");
-        assert!(oldest >= first_received);
         assert!(notify.sending.is_some());
+        assert_eq!(notify.len(), 2);
+        assert_eq!(notify.oldest(), Some(blocked_received));
+    }
+
+    /// Scenario: normal completions are queued until the notifier is one slot
+    /// from its capacity, and a force-drained request is then decided.
+    /// Guarantees: normal outcomes stop at `capacity - 1` live completions and
+    /// the last slot stays usable by a shutdown outcome, so the node always
+    /// keeps the credit it needs to decide one force-drained request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_last_completion_slot_is_reserved_for_shutdown() {
+        // Capacity 4 stands for 2N with N = 2; the cap on normal live
+        // completions is therefore 3.
+        let (handler, _rx) = effects(1);
+        let mut notify = Notifier::new(handler, 4);
+
+        for _ in 0..3 {
+            assert!(notify.has_credit());
+            let (token, payload) = AckToken::split(empty_pdata());
+            drop(payload);
+            notify.push(token, Outcome::Ack);
+        }
+        assert_eq!(notify.len(), 3);
+        assert!(!notify.has_credit());
+
+        let (token, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(token, Outcome::Shutdown);
+        assert_eq!(notify.len(), 4);
+        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 1);
+    }
+
+    /// Scenario: a normal completion is pushed while the only free slot is the
+    /// one reserved for a forced drain.
+    /// Guarantees: the push panics rather than silently spending the reserved
+    /// credit, so the bound is a checked worker contract.
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "worker must reserve completion credit")]
+    async fn a_normal_completion_cannot_take_the_reserved_slot() {
+        let (handler, _rx) = effects(1);
+        let mut notify = Notifier::new(handler, 2);
+
+        let (first, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(first, Outcome::Ack);
+
+        let (second, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(second, Outcome::Ack);
     }
 }
