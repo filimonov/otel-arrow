@@ -907,6 +907,18 @@ def parse_core_list(text: str):
     return sorted(cores)
 
 
+def available_physical_cores(sibling_groups, available) -> int:
+    """How many physical cores a run may use, from its allowed logical cores.
+
+    A physical core is one kernel thread-sibling group; it counts once if the
+    run may use any of its logical cores. Two SMT siblings of one core are
+    therefore one physical core, and a core outside the effective affinity or
+    cgroup cpuset does not count at all, however many the machine has.
+    """
+    allowed = set(available)
+    return sum(1 for group in sibling_groups if allowed & set(group))
+
+
 def ram_bytes() -> int:
     """Total physical memory in bytes."""
     for line in Path("/proc/meminfo").read_text().splitlines():
@@ -1072,6 +1084,9 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
     list.
     """
     topology = core_topology()
+    # The effective affinity of this process already reflects its cgroup
+    # cpuset, so it is the set of cores a run started from here may use.
+    available = sorted(os.sched_getaffinity(0))
     with open("/proc/loadavg", encoding="ascii") as handle:
         load = [float(value) for value in handle.read().split()[:3]]
     threads = []
@@ -1092,7 +1107,10 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
         "logical_core_count": topology["logical_core_count"],
         "physical_core_count": topology["physical_core_count"],
         "sibling_groups": topology["sibling_groups"],
-        "available_cores": sorted(os.sched_getaffinity(0)),
+        "available_cores": available,
+        "available_physical_core_count": available_physical_cores(
+            topology["sibling_groups"], available
+        ),
         "ram_bytes": ram_bytes(),
         "kernel": platform.platform(),
         "load_average_1_5_15": load,
@@ -1351,8 +1369,17 @@ class HostLease:
                 f"the lease file {self.path} was replaced while this run held it"
             )
 
+    @property
+    def held(self) -> bool:
+        """Whether this object currently owns an acquired lock descriptor."""
+        return self._fd is not None
+
     def release(self):
-        """Give the lease back by unlocking and closing the descriptor."""
+        """Give the lease back by unlocking and closing the descriptor.
+
+        Idempotent: releasing a lease that is not held does nothing, so every
+        cleanup path may call it without knowing how far acquisition got.
+        """
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -2514,11 +2541,20 @@ class RunControls:
         self.closed = False
 
     def open(self):
-        """Take the lease and start watching for builds, in that order."""
+        """Take the lease and start watching for builds, in that order.
+
+        If the monitor cannot start, the lease just taken is released before
+        the error propagates: a run that never began measuring must not keep
+        the machine locked.
+        """
         self.lease.acquire(
             deadline_ns=time.monotonic_ns() + int(self.lease_wait_s * 10**9)
         )
-        _ = self.monitor.start()
+        try:
+            _ = self.monitor.start()
+        except BaseException:
+            self.lease.release()
+            raise
         self.opened = True
         environment = self.result["environment"]
         environment["machine_identity_sha256"] = machine_identity_sha256()
@@ -2561,24 +2597,58 @@ class RunControls:
         return snapshot
 
     def close(self):
-        """Stop the controls and record each of their outcomes, once."""
+        """Stop the controls and record each of their outcomes, once.
+
+        The lease is released in `finally` whenever it is actually held,
+        whatever else raised, and the release itself is idempotent. A build
+        monitor that fails to stop leaves build activity unobservable, so it
+        is recorded as a failed hard check rather than allowed to skip the
+        remaining checks or the release.
+        """
         if self.closed:
             return
         self.closed = True
+        try:
+            self._record_outcomes()
+        finally:
+            if self.lease.held:
+                self.lease.release()
+                self.result["environment"]["lease"] = self.lease.as_json()
+            record_event(self.result, "host_controls_closed")
+
+    def _record_outcomes(self):
+        """Record every lifecycle check from what the controls observed."""
         environment = self.result["environment"]
         checks = self.result["checks"]
         if self.opened:
-            report = self.monitor.stop()
-            environment["build_monitor"] = report
-            checks.append(
-                check(
-                    "no_concurrent_build",
-                    CHECK_HARD,
-                    STATUS_FAILED if report["detected"] else STATUS_PASSED,
-                    f"{report['observation_count']} build processes seen in "
-                    f"{report['scans']} scans",
+            try:
+                report = self.monitor.stop()
+            except Exception as error:
+                report = None
+                environment["build_monitor"] = {
+                    "detected": None,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                checks.append(
+                    check(
+                        "no_concurrent_build",
+                        CHECK_HARD,
+                        STATUS_FAILED,
+                        f"the build monitor failed to stop, so build activity "
+                        f"is unobservable: {error}",
+                    )
                 )
-            )
+            if report is not None:
+                environment["build_monitor"] = report
+                checks.append(
+                    check(
+                        "no_concurrent_build",
+                        CHECK_HARD,
+                        STATUS_FAILED if report["detected"] else STATUS_PASSED,
+                        f"{report['observation_count']} build processes seen in "
+                        f"{report['scans']} scans",
+                    )
+                )
             try:
                 self.lease.assert_held()
                 lease_status, lease_detail = STATUS_PASSED, str(self.lease.path)
@@ -2644,7 +2714,7 @@ class RunControls:
             )
         checks.append(check("affinity_matched", CHECK_HARD, affinity_status, affinity_detail))
         start = self.taken.get("start") or {}
-        physical = start.get("physical_core_count")
+        physical = start.get("available_physical_core_count")
         checks.append(
             check(
                 "physical_cores_sufficient",
@@ -2652,13 +2722,11 @@ class RunControls:
                 STATUS_PASSED
                 if isinstance(physical, int) and physical >= MINIMUM_PHYSICAL_CORES
                 else STATUS_FAILED,
-                f"{physical} physical cores, {MINIMUM_PHYSICAL_CORES} required",
+                f"{physical} physical cores available to the run, "
+                f"{MINIMUM_PHYSICAL_CORES} required; the machine has "
+                f"{start.get('physical_core_count')}",
             )
         )
-        if self.opened:
-            self.lease.release()
-            environment["lease"] = self.lease.as_json()
-        record_event(self.result, "host_controls_closed")
 
 
 def settle_status(result) -> None:
@@ -2771,6 +2839,8 @@ def fingerprint_material(result) -> dict:
     run_dir = _required(result.get("run_dir"), "run_dir")
     config = _required(result.get("config", {}).get("effective"), "config.effective")
     workload = _required(result.get("workload"), "workload")
+    for field in dataclasses.fields(Workload):
+        _ = _required(workload.get(field.name), f"workload.{field.name}")
     schedule = _required(result.get("workload_schedule"), "workload_schedule")
     for key in ("duration_s", "rate_requests_per_s", "max_in_flight"):
         _ = _required(schedule.get(key), f"workload_schedule.{key}")
@@ -2778,7 +2848,7 @@ def fingerprint_material(result) -> dict:
     build_fields = {}
     for key in ("profile", "features", "allocator", "toolchain"):
         build_fields[key] = _required(build.get(key), f"environment.build.{key}")
-    return {
+    material = {
         "case": _required(result.get("case"), "case"),
         "machine": machine,
         "available_cores": sorted(int(core) for core in available),
@@ -2791,6 +2861,29 @@ def fingerprint_material(result) -> dict:
         },
         "build": build_fields,
     }
+    _reject_nulls(material, "fingerprint")
+    return material
+
+
+def _reject_nulls(value, path):
+    """Fail on a null anywhere in the fingerprint material, naming it.
+
+    A null hashes as JSON `null`, so two runs that each failed to record the
+    same nested input would share a fingerprint while describing different
+    environments. An input that is genuinely absent must be omitted by the
+    code that records it, or recorded as an explicit value, never as null.
+    """
+    if value is None:
+        raise AssertionError(
+            f"fingerprint input {path} is null; a nested input that was not "
+            f"recorded cannot be hashed as if it were known"
+        )
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _reject_nulls(child, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _reject_nulls(child, f"{path}[{index}]")
 
 
 def baseline_fingerprint(result) -> str:

@@ -788,6 +788,21 @@ class AffinityContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "requested"):
             measurement.assert_affinity(snapshot)
 
+    # Scenario: a run may use both SMT siblings of one core, one sibling of
+    # another, and nothing of a third.
+    # Guarantees: siblings of one core count once, and a core outside the
+    # run's affinity does not count at all.
+    def test_available_physical_cores_count_sibling_groups(self):
+        groups = [[0, 16], [1, 17], [2, 18]]
+        self.assertEqual(measurement.available_physical_cores(groups, [0, 16]), 1)
+        self.assertEqual(
+            measurement.available_physical_cores(groups, [0, 16, 17]), 2
+        )
+        self.assertEqual(measurement.available_physical_cores(groups, []), 0)
+        self.assertEqual(
+            measurement.available_physical_cores(groups, range(19)), 3
+        )
+
     # Scenario: a kernel core list names a range and a single core.
     # Guarantees: an observed allowed set is compared as core ids rather than
     # as text.
@@ -1229,8 +1244,42 @@ class BaselineContracts(unittest.TestCase):
             ("schedule rate", lambda r: r["workload_schedule"].pop("rate_requests_per_s")),
             ("run directory", lambda r: r.pop("run_dir")),
             ("effective config", lambda r: r["config"].update(effective={})),
+            ("workload seed", lambda r: r["workload"].pop("seed")),
+            (
+                "every workload member but one",
+                lambda r: r.update(workload={"requests": 100}),
+            ),
         ):
             with self.subTest(missing=label):
+                result = measured_result()
+                mutate(result)
+                with self.assertRaisesRegex(AssertionError, "fingerprint input"):
+                    _ = measurement.baseline_fingerprint(result)
+
+    # Scenario: a fingerprint input is present but null, at the top of a
+    # member or deep inside the effective configuration.
+    # Guarantees: a null at any depth is refused rather than hashed as JSON
+    # null, which would let two runs that each failed to record the same
+    # input share a fingerprint.
+    def test_a_nested_null_fingerprint_input_raises(self):
+        for label, mutate in (
+            ("workload seed", lambda r: r["workload"].update(seed=None)),
+            (
+                "nested configuration value",
+                lambda r: r["config"]["effective"]["window"].update(interval=None),
+            ),
+            (
+                "nested sibling group member",
+                lambda r: r["environment"]["start"]["sibling_groups"].append(
+                    [None]
+                ),
+            ),
+            (
+                "schedule concurrency",
+                lambda r: r["workload_schedule"].update(max_in_flight=None),
+            ),
+        ):
+            with self.subTest(null=label):
                 result = measured_result()
                 mutate(result)
                 with self.assertRaisesRegex(AssertionError, "fingerprint input"):
@@ -1906,6 +1955,126 @@ class CommandContracts(unittest.TestCase):
         )
         self.assertTrue(document["environment"]["build_monitor"]["detected"])
         self.assertEqual(builder.poll(), None, "the monitor must not stop it")
+
+    def restrict_affinity(self, cores):
+        """Confine the test's main thread to `cores` for this test only."""
+        before = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, set(cores))
+        self.addCleanup(os.sched_setaffinity, 0, before)
+
+    # Scenario: the machine has many physical cores, but the run's affinity
+    # allows only one of them and two are required.
+    # Guarantees: the gate counts the physical cores available to the run,
+    # not the machine's, so the restricted run fails and writes no baseline.
+    def test_a_run_restricted_below_the_core_floor_fails(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        self.restrict_affinity([core])
+        report = temporary_directory(self) / "report"
+        with mock.patch.object(measurement, "MINIMUM_PHYSICAL_CORES", 2):
+            with self.assertRaisesRegex(AssertionError, "physical_cores_sufficient"):
+                _ = self.run_measured(
+                    temporary_directory(self), report, self.experiment(core=core), lease
+                )
+        document = self.published(report)
+        self.assertEqual(
+            self.checks_of(document)["physical_cores_sufficient"],
+            measurement.STATUS_FAILED,
+        )
+        self.assertEqual(document["environment"]["start"]["available_physical_core_count"], 1)
+        self.assertGreaterEqual(document["environment"]["start"]["physical_core_count"], 2)
+        self.assertEqual(document["baseline_files"], [])
+
+    # Scenario: the run may use both SMT siblings of one physical core, and
+    # two physical cores are required.
+    # Guarantees: two siblings of one core count as one, so the run fails.
+    def test_two_smt_siblings_count_as_one_physical_core(self):
+        allowed = set(os.sched_getaffinity(0))
+        pair = next(
+            (
+                group
+                for group in measurement.core_topology()["sibling_groups"]
+                if len(group) >= 2 and set(group) <= allowed
+            ),
+            None,
+        )
+        if pair is None:
+            raise unittest.SkipTest("no SMT sibling pair is available to this run")
+        lease = self.isolated()
+        self.restrict_affinity(pair)
+        report = temporary_directory(self) / "report"
+        with mock.patch.object(measurement, "MINIMUM_PHYSICAL_CORES", 2):
+            with self.assertRaisesRegex(AssertionError, "physical_cores_sufficient"):
+                _ = self.run_measured(
+                    temporary_directory(self),
+                    report,
+                    self.experiment(core=pair[0]),
+                    lease,
+                )
+        start = self.published(report)["environment"]["start"]
+        self.assertEqual(start["available_cores"], sorted(pair))
+        self.assertEqual(start["available_physical_core_count"], 1)
+
+    # Scenario: the build monitor fails to start after the lease was taken.
+    # Guarantees: the lease is released before the error propagates, the
+    # failed run is still published, and the next run can take the lease.
+    def test_a_monitor_that_fails_to_start_releases_the_lease(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        report = temporary_directory(self) / "report"
+        with mock.patch.object(
+            measurement.BuildMonitor, "start", side_effect=RuntimeError("no procfs")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no procfs"):
+                _ = self.run_measured(
+                    temporary_directory(self), report, self.experiment(core=core), lease
+                )
+        document = self.published(report)
+        self.assertEqual(document["status"], measurement.STATUS_FAILED)
+        again = measurement.HostLease(lease).acquire(
+            deadline_ns=measurement.time.monotonic_ns()
+        )
+        self.addCleanup(again.release)
+        again.assert_held()
+
+    # Scenario: the build monitor fails to stop at the end of a run.
+    # Guarantees: the lease is still released, the unobservable build
+    # activity is a failed hard check rather than a skipped one, closing
+    # again is a no-op, and the next run can take the lease.
+    def test_a_monitor_that_fails_to_stop_still_releases_the_lease(self):
+        lease = self.isolated()
+        result = measurement.new_result({"run_id": "r", "case": "t"})
+        controls = measurement.RunControls(result, lease_path=lease, lease_wait_s=0)
+        _ = controls.open()
+
+        def stop_monitor():
+            """Stop the real monitor thread the patched stop left running."""
+            controls.monitor._stop.set()
+            if controls.monitor._thread is not None:
+                controls.monitor._thread.join(10)
+
+        self.addCleanup(stop_monitor)
+        with mock.patch.object(
+            controls.monitor, "stop", side_effect=AssertionError("monitor stuck")
+        ):
+            controls.close()
+            controls.close()
+        checks = {entry["name"]: entry for entry in result["checks"]}
+        self.assertEqual(
+            checks["no_concurrent_build"]["status"], measurement.STATUS_FAILED
+        )
+        self.assertIn("monitor stuck", checks["no_concurrent_build"]["detail"])
+        self.assertEqual(
+            [entry["name"] for entry in result["checks"]].count("no_concurrent_build"),
+            1,
+            "closing twice records the outcomes once",
+        )
+        self.assertFalse(controls.lease.held)
+        again = measurement.HostLease(lease).acquire(
+            deadline_ns=measurement.time.monotonic_ns()
+        )
+        self.addCleanup(again.release)
+        again.assert_held()
 
     # Scenario: another measurement already holds the host lease.
     # Guarantees: the run does not start measuring, fails with the lease
