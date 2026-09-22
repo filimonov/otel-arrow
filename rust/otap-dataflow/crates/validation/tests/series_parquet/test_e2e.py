@@ -2148,6 +2148,56 @@ def rss_bytes(pid):
     raise AssertionError("process RSS unavailable while engine is running")
 
 
+def stored_multiplicity(root):
+    """How many rows each log body and each metric request id has.
+
+    Metric rows are counted through the latest-descriptor join the crate
+    README documents, so a series whose descriptor was written again by a
+    later block still contributes exactly one row per values row. This is what
+    a resend has to be measured against: an at-least-once duplicate is one
+    more row under an id that was already there, never a new id and never a
+    row that the join drops or doubles.
+    """
+    root = Path(root)
+
+    def tally(paths, sql):
+        if not paths:
+            return collections.Counter()
+        rows = db.execute(sql, [[str(path) for path in paths]]).fetchall()
+        return collections.Counter(dict(rows))
+
+    counts = {}
+    with duckdb.connect() as db:
+        counts["logs"] = tally(
+            sorted((root / "v=1/signal=logs/dataset=values").rglob("*.parquet")),
+            "SELECT body, count(*) FROM read_parquet(?, union_by_name=true) "
+            "GROUP BY body",
+        )
+        series = sorted(
+            (root / "v=1/signal=metrics/dataset=series").rglob("*.parquet")
+        )
+        if series:
+            db.execute(
+                "CREATE OR REPLACE TEMP TABLE canonical AS SELECT * FROM "
+                "read_parquet(?, union_by_name=true, filename=true) QUALIFY "
+                "row_number() OVER (PARTITION BY series_id ORDER BY emitted_at "
+                "DESC, filename DESC)=1",
+                [[str(path) for path in series]],
+            )
+        for dataset in ("number", "histogram"):
+            counts[dataset] = tally(
+                sorted(
+                    (root / f"v=1/signal=metrics/dataset={dataset}").rglob(
+                        "*.parquet"
+                    )
+                ),
+                "SELECT s.attrs['request.id'], count(*) FROM "
+                "read_parquet(?, union_by_name=true) v JOIN canonical s "
+                "USING(series_id) GROUP BY 1",
+            )
+    return counts
+
+
 # Codes a producer is allowed to see and must retry. A storage failure is a
 # transient NACK, which the OTLP receiver reports as UNAVAILABLE.
 RETRYABLE_CODES = {
@@ -2200,29 +2250,33 @@ class OutageSlice(unittest.TestCase):
         require_clickhouse()
         with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
             summary = self.exercise_outage(
-                "minio", store, directory, call_wait=CALL_WAIT_SHORT
+                "minio", store, directory, call_wait=CALL_WAIT_SHORT, resend=3
             )
         # The point of this variant: the producers really did stop waiting on
-        # admitted calls, which is the only way this suite reaches the
-        # duplicate path at all.
+        # admitted calls, which is what an at-least-once producer does and the
+        # only way the racy duplicate path is reached at all.
         self.assertGreater(
             summary["client_waits"],
             0,
             "no client wait expired, so no request was resent after admission",
         )
-        # Duplicates are permitted, not required: the exporter may still have
-        # decided every resent request before the producer gave up.
-        self.assertTrue(
-            all(count >= 0 for count in summary["duplicates"].values()),
-            summary["duplicates"],
-        )
 
-    def exercise_outage(self, kind, store, directory, call_wait=CALL_WAIT):
+    @staticmethod
+    def downloaded(store, target):
+        """Copy the store's objects into `target` and return the path."""
+        store.download(target)
+        return target
+
+    def exercise_outage(self, kind, store, directory, call_wait=CALL_WAIT, resend=0):
         """One store: stop it under load, recover it, and check the lake.
 
         `call_wait` is how long a producer waits out one ordinary call before
-        giving up on it and resending. Returns what the run observed, so a
-        caller can assert on the behavior its own variant is about.
+        giving up on it and resending. `resend`, when set, replays that many
+        already-acknowledged log ids and that many metric ids once the store
+        is healthy again, which is what an at-least-once producer does when
+        its own wait expired; the duplicates that creates are deterministic
+        rather than raced for. Returns what the run observed, so a caller can
+        assert on the behavior its own variant is about.
         """
         overrides = {
             # The flush deadline is shorter than the outage, so the exporter
@@ -2546,17 +2600,49 @@ class OutageSlice(unittest.TestCase):
                 # The engine recovers in place: no restart, and the backlog
                 # drains back to an empty pending set.
                 self.assertIsNone(engine.process.poll(), "the engine did not survive")
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    document = engine_metrics(engine)
-                    if (
-                        metric_max(document, "oldest_unacked_seconds") <= 1
-                        and metric_max(document, "block.requests_pending") == 0
-                    ):
-                        break
-                    time.sleep(0.2)
-                else:
+
+                def settle(seconds=10):
+                    """Wait until nothing is pending and nothing is stale."""
+                    limit = time.monotonic() + seconds
+                    while time.monotonic() < limit:
+                        document = engine_metrics(engine)
+                        if (
+                            metric_max(document, "oldest_unacked_seconds") <= 1
+                            and metric_max(document, "block.requests_pending") == 0
+                        ):
+                            return
+                        time.sleep(0.2)
                     self.fail("oldest unacked age did not return to baseline")
+
+                settle()
+                if resend:
+                    # Everything acknowledged is durable now, so what the
+                    # store holds is the baseline the replay is measured
+                    # against.
+                    before_counts = stored_multiplicity(
+                        self.downloaded(store, Path(directory) / "baseline")
+                    )
+                    resent = {
+                        "logs": [f"p{index}-0" for index in range(resend)],
+                        "metrics": [
+                            f"p{index}-0" for index in range(resend, 2 * resend)
+                        ],
+                    }
+                    # Byte-identical replays of requests that were already
+                    # acknowledged, which is exactly what an at-least-once
+                    # producer sends after its own wait expired. The store is
+                    # healthy again, so a refusal here is a test failure, not
+                    # a retry: these calls are outside the refusal accounting
+                    # above and carry an ordinary deadline.
+                    for request_id in resent["logs"]:
+                        logs_rpc.LogsServiceStub(engine.channel).Export(
+                            log_request(request_id), timeout=60
+                        )
+                    for request_id in resent["metrics"]:
+                        metrics_rpc.MetricsServiceStub(engine.channel).Export(
+                            metric_request(request_id), timeout=60
+                        )
+                    settle()
                 engine.shutdown(seconds=30)
             except Exception:
                 print(engine.engine_log())
@@ -2616,7 +2702,39 @@ class OutageSlice(unittest.TestCase):
                     f"missing precomputed {dataset} IDs",
                 )
                 duplicates[dataset] = len(stored) - len(expected_metric_ids)
-        self.assertTrue(all(count >= 0 for count in duplicates.values()))
+        forced = {}
+        if resend:
+            after_counts = stored_multiplicity(downloaded)
+            for dataset, counter in after_counts.items():
+                replayed = set(resent["logs" if dataset == "logs" else "metrics"])
+                self.assertEqual(
+                    set(counter),
+                    set(before_counts[dataset]),
+                    f"the replay changed which ids exist in {dataset}",
+                )
+                for request_id, count in counter.items():
+                    if request_id in replayed:
+                        # The replayed id is stored again, on top of the row
+                        # that was already acknowledged: a duplicate, present
+                        # by construction rather than by a race.
+                        self.assertGreaterEqual(
+                            count,
+                            before_counts[dataset][request_id] + 1,
+                            f"replayed {request_id} was not stored again in "
+                            f"{dataset}",
+                        )
+                        self.assertGreaterEqual(count, 2, f"{dataset} {request_id}")
+                    else:
+                        self.assertEqual(
+                            count,
+                            before_counts[dataset][request_id],
+                            f"{request_id} changed multiplicity in {dataset} "
+                            "without being replayed",
+                        )
+                forced[dataset] = sum(
+                    counter[request_id] - before_counts[dataset][request_id]
+                    for request_id in replayed
+                )
         codes = collections.Counter(
             f"{signal}/{code.name}" for signal, code in server_codes
         )
@@ -2628,10 +2746,12 @@ class OutageSlice(unittest.TestCase):
             f"/{counters['flush.retries']:.0f}, "
             f"Alloy {len(alloy_refusals)} refused exports and "
             f"{len(alloy_deadlines)} own deadlines, "
-            f"duplicate rows {duplicates}"
+            f"incidental duplicate rows {duplicates}"
+            + (f", forced by replay {forced}" if resend else "")
         )
         return {
             "duplicates": duplicates,
+            "forced": forced,
             "client_waits": len(local_waits),
             "server_codes": codes,
         }
