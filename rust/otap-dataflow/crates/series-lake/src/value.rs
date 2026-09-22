@@ -300,6 +300,37 @@ mod tests {
         assert!(decode_cbor(&buf, DecodeLimits::new(5, usize::MAX)).is_ok());
     }
 
+    /// Scenario: maps nested one level below, exactly at and one level above
+    /// the depth limit, and an array inside maps at the limit.
+    /// Guarantees: the limit counts every container level alike -- a nested
+    /// map is refused exactly where a nested array would be -- and a payload
+    /// at the limit decodes, so `max_nesting_depth` is the deepest accepted
+    /// nesting, not one less or one more.
+    #[test]
+    fn decode_cbor_depth_is_exact_for_nested_maps() {
+        fn maps(levels: usize, leaf: ciborium::Value) -> Vec<u8> {
+            let mut v = leaf;
+            for _ in 0..levels {
+                v = ciborium::Value::Map(vec![(ciborium::Value::Text("k".into()), v)]);
+            }
+            let mut buf = Vec::new();
+            ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
+            buf
+        }
+        let limit = 8;
+        let limits = DecodeLimits::new(limit, usize::MAX);
+        let int = || ciborium::Value::Integer(1.into());
+        assert!(decode_cbor(&maps(limit - 1, int()), limits).is_ok());
+        assert!(decode_cbor(&maps(limit, int()), limits).is_ok());
+        assert!(matches!(
+            decode_cbor(&maps(limit + 1, int()), limits),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        let array = ciborium::Value::Array(vec![int()]);
+        assert!(decode_cbor(&maps(limit - 1, array.clone()), limits).is_ok());
+        assert!(decode_cbor(&maps(limit, array), limits).is_err());
+    }
+
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.
     /// Guarantees: the JSON mapping of spec section 5.1 is produced exactly.
     #[test]

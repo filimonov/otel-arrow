@@ -730,6 +730,10 @@ async fn complete_files_before_ack() {
 
             worker.rotate();
             assert!(
+                worker.notify.is_empty(),
+                "nothing is decided before the flush resolves"
+            );
+            assert!(
                 tokio::time::timeout(Duration::from_millis(5), rx.recv())
                     .await
                     .is_err(),
@@ -1104,6 +1108,10 @@ async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
             assert!(worker.pending.is_none());
 
             worker.rotate();
+            assert!(
+                worker.notify.is_empty(),
+                "a dropped point decides nothing before the flush resolves"
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(5), rx.recv())
                     .await
@@ -1551,6 +1559,125 @@ async fn admission_time_assigns_exactly_one_window() {
     assert!(worker.pending.is_some());
     assert!(worker.rotation_requested);
     assert!(!worker.accept());
+}
+
+/// Scenario: a request is extracted at exactly 1_000_000_000 ns, the first
+/// nanosecond of the second one-second window, after one extracted in the
+/// last nanosecond of the first.
+/// Guarantees: the boundary nanosecond belongs to the new window, not to the
+/// one it ends, so window assignment has no off-by-one at the boundary.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_at_the_exact_boundary_belongs_to_the_next_window() {
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(999_999_999));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::clone(&wall) as _,
+        handler,
+    );
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.data.window_start_secs, 0);
+    assert_eq!(worker.active.tokens.len(), 1);
+
+    wall.set(1_000_000_000);
+    worker.admit(logs_pdata());
+    assert_eq!(
+        worker.active.tokens.len(),
+        1,
+        "the ended window takes nothing more"
+    );
+    assert_eq!(
+        worker.pending.as_ref().map(|p| p.admission_secs),
+        Some(1),
+        "the boundary request waits for the window it belongs to"
+    );
+}
+
+/// Scenario: the factory builds the exporter for local file storage with no
+/// capability bound to the node.
+/// Guarantees: creation succeeds, because file storage needs no bearer token
+/// provider, so a local pipeline never has to declare one.
+#[test]
+fn the_factory_creates_file_storage_without_a_capability() {
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::config::ExporterConfig;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let metrics_system = otel_arrow_dfe_telemetry::InternalTelemetrySystem::default();
+    let controller = ControllerContext::new(metrics_system.registry());
+    let pipeline = controller
+        .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
+        .with_node_context(
+            "series".into(),
+            super::SERIES_PARQUET_URN.into(),
+            otel_arrow_dfe_config::node::NodeKind::Exporter,
+            std::collections::HashMap::new(),
+        );
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    node_config.config = serde_json::json!({
+        "storage": {"file": {"base_uri": dir.path().to_str().expect("utf-8 path")}}
+    });
+    let created = (super::SERIES_PARQUET.create)(
+        pipeline,
+        test_node("series"),
+        Arc::new(node_config),
+        &ExporterConfig::new("series"),
+        &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+    );
+    assert!(created.is_ok(), "file storage needs no capability");
+}
+
+/// Scenario: the factory builds the exporter for Azure storage, which
+/// authenticates through a bearer token provider, with no capability bound
+/// to the node; the store retry budget is valid, so only the missing
+/// capability can refuse it.
+/// Guarantees: creation fails with an invalid-configuration error naming the
+/// capability, before the node starts, instead of starting an exporter that
+/// cannot authenticate.
+#[test]
+#[cfg(feature = "azure")]
+fn the_factory_refuses_azure_storage_without_a_token_provider() {
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::config::ExporterConfig;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+
+    let metrics_system = otel_arrow_dfe_telemetry::InternalTelemetrySystem::default();
+    let controller = ControllerContext::new(metrics_system.registry());
+    let pipeline = controller
+        .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
+        .with_node_context(
+            "series".into(),
+            super::SERIES_PARQUET_URN.into(),
+            otel_arrow_dfe_config::node::NodeKind::Exporter,
+            std::collections::HashMap::new(),
+        );
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    node_config.config = serde_json::json!({
+        "storage": {"azure": {
+            "base_uri": "https://mystorageaccount.blob.core.windows.net/container"
+        }},
+        "retry": {"retry_timeout": "30s"}
+    });
+    let created = (super::SERIES_PARQUET.create)(
+        pipeline,
+        test_node("series"),
+        Arc::new(node_config),
+        &ExporterConfig::new("series"),
+        &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+    );
+    let Err(err) = created else {
+        panic!("azure storage must require a bound bearer_token_provider");
+    };
+    assert!(
+        matches!(
+            err,
+            otel_arrow_dfe_config::error::Error::InvalidUserConfig { .. }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("bearer_token_provider"), "{err}");
 }
 
 /// An object store whose writes park until a test opens its gate.

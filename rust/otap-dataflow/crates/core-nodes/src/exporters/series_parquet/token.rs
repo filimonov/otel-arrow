@@ -526,6 +526,37 @@ mod tests {
     use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
     use std::time::Duration;
 
+    /// Scenario: a request carrying transport headers is split into its
+    /// completion and its payload.
+    /// Guarantees: the completion keeps the routing frames but neither the
+    /// transport headers nor any authorization claims, so the credentials a
+    /// producer sent are not held for as long as its request waits for its
+    /// block to be written.
+    #[test]
+    fn split_drops_transport_headers_and_claims() {
+        use otel_arrow_dfe_config::context::ContextEntryName;
+        use otel_arrow_dfe_config::transport_headers::{
+            TransportHeader, TransportHeaders, ValueKind,
+        };
+
+        let mut context = Context::default();
+        context.set_source_node(7);
+        let mut headers = TransportHeaders::new();
+        headers.push(TransportHeader::new(
+            ContextEntryName::try_from("authorization").expect("a valid name"),
+            ValueKind::Text,
+            b"Bearer secret".to_vec(),
+        ));
+        context.set_transport_headers(headers);
+        let data = OtapPdata::new(context, OtapPayload::empty(SignalType::Logs));
+        assert!(data.transport_headers().is_some());
+
+        let (token, _payload) = AckToken::split(data);
+        assert!(token.context.transport_headers().is_none());
+        assert!(token.context.authorized_identity_entries().is_none());
+        assert_eq!(token.signal(), SignalType::Logs);
+    }
+
     /// Scenario: a token moves from a reserved queue cell into a blocked send
     /// future.
     /// Guarantees: queue storage, external routing buffers and future storage
