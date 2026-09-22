@@ -13,7 +13,17 @@ endpoint with `timeout_secs=180`; signal shutdown currently grants only 60s.
 The node owns one ACTIVE block and at most one FLUSHING block. Requests are
 admitted to the ACTIVE block and acknowledged only once the whole block has
 been written and its descriptors marked committed; a failed write nacks every
-request of the block as retryable. Admission closes once the ACTIVE block is
+request of the block as retryable. A storage failure is retried against the
+identical sealed block -- same file names, same bytes, so a retry overwrites
+what a failed attempt left rather than duplicating rows -- until an absolute
+deadline taken when the block was sealed (`window.flush_retry_deadline`).
+At that deadline the block's requests are nacked immediately, while the
+abandoned write is cancelled and given at most `upload.abort_timeout` to
+unwind; the flush slot stays occupied until that cleanup has finished, so no
+next block writes the same names while an abandoned attempt might still be in
+flight. Only a fully successful write marks the descriptor cache, against the
+partition of the block that was written, so the cache never claims durability
+for rows that were not stored. Admission closes once the ACTIVE block is
 waiting to be rotated, so no third block is ever needed and a slow destination
 becomes backpressure. A request the ACTIVE block cannot reserve room for is
 not refused: its extracted rows are parked, input closes until the next block

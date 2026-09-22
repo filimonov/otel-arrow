@@ -348,7 +348,14 @@ async fn a_storage_failure_after_validation_is_retryable() {
 
             let (handler, mut rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            // A broken destination is retried until the block's absolute
+            // deadline, so the test gives it one it can reach on a simulated
+            // clock rather than waiting out the configured default.
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(1);
+            let mut worker = Worker::new(cfg, store, wall, handler);
 
             worker.admit(logs_pdata());
             let id = *worker
@@ -360,12 +367,14 @@ async fn a_storage_failure_after_validation_is_retryable() {
                 .expect("the request carries a descriptor");
             let partition = worker.active.data.partition;
             worker.rotate();
+            let ticker = ticking(&sim, Duration::from_millis(50));
             let done = worker
                 .flushing
                 .as_mut()
                 .expect("a rotated block is flushing")
                 .finish()
                 .await;
+            drop(ticker);
             assert!(
                 done.as_ref().expect("the flush task joins").result.is_err(),
                 "the destination is not writable"
@@ -1934,6 +1943,9 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
                     .await;
                 assert!(done.as_ref().expect("the flush task joins").result.is_ok());
                 worker.complete(done);
+                // The decided block keeps the flush slot until its supervising
+                // task has released it, so the next rotation waits for that.
+                drain_cleanup(worker).await;
                 // The notifier holds one credit per block here, so the ack is
                 // delivered before the next block is decided.
                 assert!(worker.notify.next().await.is_ok());
@@ -2240,4 +2252,576 @@ async fn pending_and_notification_bytes_are_reported() {
     );
     assert!(metrics.worker.memory_accounted_bytes.get() >= pending + tokens);
     assert_eq!(metrics.worker.pending_slot.get(), 1);
+}
+
+/// Injection mode: every request passes through to the inner store.
+const FAULT_NONE: u8 = 0;
+/// Injection mode: every write of a `series` dataset file fails.
+const FAULT_SERIES: u8 = 1;
+/// Injection mode: the first write of a `values` dataset file fails, and the
+/// store heals itself in the same step so the retry succeeds.
+const FAULT_VALUES_ONCE: u8 = 2;
+/// Injection mode: every write parks until the test releases it.
+const FAULT_PARK: u8 = 3;
+
+/// An object store that injects failures at the two entry points a Parquet
+/// write actually uses: a small single-shot PUT and the initiation of a
+/// multipart upload.
+///
+/// This is a fault wrapper around an in-memory store, not a network
+/// destination: it proves what the exporter does with a store that refuses,
+/// stalls or heals, and nothing about real object storage behaviour.
+///
+/// Recording each PUT before it is allowed to fail is what lets a test compare
+/// the bytes and the path of a failed attempt with those of the retry that
+/// followed it, which is the observable form of "retries reuse frozen file
+/// names and byte-identical objects".
+#[derive(Debug, Default)]
+struct FaultStore {
+    /// The store that actually holds whatever is allowed through.
+    inner: object_store::memory::InMemory,
+    /// The active injection mode, one of the `FAULT_*` constants.
+    mode: std::sync::atomic::AtomicU8,
+    /// Path and payload of every PUT, including the ones that then failed.
+    writes: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    /// Raised as each write reaches the injection point, so a test can wait
+    /// for a flush to have started rather than guess that it has.
+    entered: tokio::sync::Notify,
+    /// Releases one parked write under `FAULT_PARK`.
+    release: tokio::sync::Notify,
+}
+
+impl std::fmt::Display for FaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("series fault store")
+    }
+}
+
+impl FaultStore {
+    /// Announce a write and apply the active injection mode to it.
+    async fn before(&self, path: &object_store::path::Path) -> object_store::Result<()> {
+        self.entered.notify_one();
+        let mode = self.mode.load(std::sync::atomic::Ordering::SeqCst);
+        if mode == FAULT_PARK {
+            self.release.notified().await;
+        }
+        let path = path.as_ref();
+        let fail = mode == 4
+            || (mode == FAULT_SERIES && path.contains("dataset=series/"))
+            || (mode == FAULT_VALUES_ONCE
+                && path.contains("dataset=values/")
+                && self
+                    .mode
+                    .compare_exchange(
+                        FAULT_VALUES_ONCE,
+                        FAULT_NONE,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok());
+        if fail {
+            return Err(object_store::Error::Generic {
+                store: "series-test",
+                source: Box::new(std::io::Error::other("injected store failure")),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FaultStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let bytes = payload.iter().flat_map(|b| b.iter().copied()).collect();
+        self.writes
+            .lock()
+            .expect("writes lock")
+            .push((path.to_string(), bytes));
+        self.before(path).await?;
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.before(path).await?;
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Advances a simulated clock on every runtime turn, until it is dropped.
+///
+/// The flush retry backoff and the absolute retry deadline are both measured
+/// on the engine clock, so a test that needs a retry to happen has to move
+/// that clock rather than sleep on the real one. Advancing on every turn is
+/// also self-limiting: the absolute deadline is reached in a finite number of
+/// steps, so a condition that never holds fails the flush instead of hanging.
+struct Ticker(tokio::task::JoinHandle<()>);
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Start advancing `sim` by `step` on every turn of the current runtime.
+fn ticking(sim: &clock::SimClock, step: Duration) -> Ticker {
+    let sim = sim.clone();
+    Ticker(tokio::task::spawn_local(async move {
+        loop {
+            tokio::task::yield_now().await;
+            sim.advance(step);
+        }
+    }))
+}
+
+/// Release a finished flush's cleanup slot so the worker can rotate again.
+///
+/// A completed flush leaves its supervising task in the same FLUSHING slot
+/// until that task has finished releasing the block, sink and write future it
+/// owns. The node loop joins it in its own select branch; a test driving a
+/// worker directly has to do the same before the next rotation.
+async fn drain_cleanup(worker: &mut Worker) {
+    if let Some(mut job) = worker.cleaning.take() {
+        job.cleanup().await.expect("the cleanup task joins");
+    }
+}
+
+/// Scenario: the series file is written, the first values file write fails,
+/// and the store heals before the retry.
+/// Guarantees: the retry re-uses the frozen file names and byte-identical
+/// objects, the block is acknowledged exactly once, and the retry is counted
+/// without counting a flush failure.
+#[tokio::test(flavor = "current_thread")]
+async fn values_retry_reuses_paths_and_bytes() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_VALUES_ONCE, std::sync::atomic::Ordering::SeqCst);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let _ticker = ticking(&sim, Duration::from_millis(250));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert_eq!(
+                done.as_ref().expect("the flush resolves").attempts,
+                2,
+                "the failed write is retried once"
+            );
+
+            worker.complete(done);
+            worker.notify.next().await.expect("the ack is sent");
+            assert!(matches!(
+                rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
+
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(
+                metrics.worker.flush_retries.get(),
+                1,
+                "the extra attempt is reported as a retry"
+            );
+            assert_eq!(
+                metrics.worker.flush_failures.get(),
+                0,
+                "a retried flush that succeeded is not a failure"
+            );
+            assert_eq!(metrics.worker.flush_cancelled.get(), 0);
+
+            let writes = store.writes.lock().expect("writes lock");
+            assert_eq!(writes.len(), 4, "two files, one of them written twice");
+            assert_eq!(writes[0], writes[2], "the series file is rewritten as-is");
+            assert_eq!(writes[1], writes[3], "the values file is rewritten as-is");
+        })
+        .await;
+}
+
+/// Scenario: the series file write fails until the absolute retry deadline,
+/// and a request carrying the same descriptor arrives afterwards.
+/// Guarantees: the failed block nacks retryably without marking the cache, and
+/// the next block writes that descriptor again.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_descriptor_does_not_poison_cache() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_SERIES, std::sync::atomic::Ordering::SeqCst);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(30);
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            worker.rotate();
+            let ticker = ticking(&sim, Duration::from_millis(50));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            drop(ticker);
+            worker.complete(done);
+            worker.notify.next().await.expect("the nack is sent");
+            match rx.recv().await.expect("nack") {
+                PipelineCompletionMsg::DeliverNack { nack } => assert!(
+                    !nack.permanent,
+                    "a storage failure is the sender's to retry"
+                ),
+                other => panic!("expected a retryable nack, got {other:?}"),
+            }
+            assert!(
+                !worker
+                    .cache
+                    .is_committed(&id, lake::clock::PartitionId::from_unix_secs(0)),
+                "a block that was never written marks nothing durable"
+            );
+            drain_cleanup(&mut worker).await;
+
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            worker.admit(logs_pdata());
+            assert!(
+                worker.active.data.pending_series.contains(&id),
+                "the descriptor is written again rather than assumed durable"
+            );
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("the second block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            assert_eq!(worker.notify.len(), 1, "the second block is acknowledged");
+        })
+        .await;
+}
+
+/// Scenario: a flush parked across an hour boundary is joined by the same
+/// series in a later partition, and the cache evicts that series before the
+/// flush resolves.
+/// Guarantees: the commit names the flushed block's own partition, and it
+/// cannot retract the descriptor the next partition still owes.
+#[tokio::test(flavor = "current_thread")]
+async fn overlapping_series_and_eviction_preserve_partition_coverage() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(3_599_000_000_000));
+            let mut cfg = worker_config();
+            cfg.cache_entries = 1;
+            let mut worker = Worker::new(cfg, store.clone(), Arc::clone(&wall) as _, handler);
+
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            worker.rotate();
+            store.entered.notified().await;
+
+            wall.set(3_600_000_000_000);
+            worker.admit(logs_pdata());
+            assert!(
+                worker.pending.is_some(),
+                "a request for the next hour waits for its own block"
+            );
+            worker.cache.touch([99; 16]);
+
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.release.notify_one();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            assert_eq!(
+                worker.cache.last_committed(&id),
+                Some(lake::clock::PartitionId::from_unix_secs(3599)),
+                "the commit names the partition that was written"
+            );
+            drain_cleanup(&mut worker).await;
+
+            worker.rotate();
+            worker.resume_pending();
+            assert_eq!(
+                worker.active.data.partition,
+                lake::clock::PartitionId::from_unix_secs(3600)
+            );
+            assert!(
+                worker.active.data.pending_series.contains(&id),
+                "the new partition writes its own copy of the descriptor"
+            );
+        })
+        .await;
+}
+
+/// Scenario: the same series is admitted to the ACTIVE block while the
+/// FLUSHING block carrying it is parked in the same window.
+/// Guarantees: both blocks keep their own descriptor copy, and the flushed
+/// block's commit cannot retract the copy the ACTIVE block still owes.
+#[tokio::test(flavor = "current_thread")]
+async fn same_window_overlap_keeps_both_descriptors() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            worker.rotate();
+            store.entered.notified().await;
+
+            worker.admit(logs_pdata());
+            assert!(
+                worker.active.data.pending_series.contains(&id),
+                "the ACTIVE block carries its own copy"
+            );
+            assert_eq!(
+                worker
+                    .flushing
+                    .as_ref()
+                    .expect("a rotated block is flushing")
+                    .tokens
+                    .len(),
+                1,
+                "the flushing block still owes its own request"
+            );
+            let partition = worker.active.data.partition;
+            assert!(!worker.cache.is_committed(&id, partition));
+
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.release.notify_one();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            assert!(worker.cache.is_committed(&id, partition));
+            assert!(
+                worker.active.data.pending_series.contains(&id),
+                "a late commit does not retract a descriptor already reserved"
+            );
+            drain_cleanup(&mut worker).await;
+
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("the second block is flushing")
+                .finish()
+                .await;
+            let report = done
+                .as_ref()
+                .expect("the flush resolves")
+                .result
+                .as_ref()
+                .expect("the write succeeds");
+            assert_eq!(report.files.len(), 2, "the descriptor is written again");
+            worker.complete(done);
+            assert_eq!(worker.notify.len(), 2);
+        })
+        .await;
+}
+
+/// Scenario: a write is parked in the store when its absolute retry deadline
+/// expires, while cleanup is allowed a whole second.
+/// Guarantees: the retryable decision is published at the deadline rather than
+/// after the cleanup allowance, and the FLUSHING slot stays occupied by the
+/// cleanup until it has finished.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            store.entered.notified().await;
+
+            // Only the retry deadline has elapsed. The write is still parked
+            // in the store, so a decision that arrives now cannot have waited
+            // for either the write or the cleanup allowance.
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(
+                done.as_ref().expect("the flush resolves").result.is_err(),
+                "the deadline fails the block"
+            );
+            worker.complete(done);
+            assert_eq!(
+                worker.notify.outcomes()[Outcome::Storage as usize],
+                1,
+                "the block is nacked as retryable storage"
+            );
+
+            // The slot the cleanup holds is the same FLUSHING slot, so nothing
+            // rotates into it while the abandoned write is still unwinding.
+            worker.admit(logs_pdata());
+            worker.rotate();
+            assert!(worker.flushing.is_none(), "no second write is started");
+            assert!(worker.cleaning.is_some(), "the slot is still occupied");
+
+            let mut job = worker.cleaning.take().expect("the occupied slot");
+            sim.advance(Duration::from_secs(2));
+            job.cleanup().await.expect("the cleanup is bounded");
+
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            worker.rotate();
+            assert!(
+                worker.flushing.is_some(),
+                "the released slot takes the next block"
+            );
+        })
+        .await;
+}
+
+/// Scenario: an encoding bug and a storage I/O error arrive as the same lake
+/// error type.
+/// Guarantees: only a failure with a storage origin earns whole-block retries.
+#[test]
+fn retry_classifier_distinguishes_encoding_from_storage() {
+    assert!(!super::flush::retryable(&lake::Error::Parquet(
+        parquet::errors::ParquetError::General("encoding bug".into())
+    )));
+    assert!(super::flush::retryable(&lake::Error::ObjectStore(
+        object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("offline")),
+        }
+    )));
+    assert!(super::flush::retryable(&lake::Error::Parquet(
+        parquet::errors::ParquetError::External(Box::new(object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("offline")),
+        }))
+    )));
+    assert!(!super::flush::retryable(&lake::Error::Cancelled {
+        abort_error: None
+    }));
 }

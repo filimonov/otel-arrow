@@ -297,10 +297,33 @@ async fn drive(
                 notify_turns += 1;
             }
 
+            // A decided block's supervising task still holds the flush slot
+            // until it has released the write it was cancelling, so joining it
+            // is what frees the slot for the next rotation. It owes no
+            // completion, which is why it ranks below the branches that do.
+            cleaned = async {
+                match worker.cleaning.as_mut() {
+                    Some(job) => job.cleanup().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Err(error) = cleaned {
+                    otel_warn!("series_parquet.cleanup_failed", error = %error);
+                }
+                let _ = worker.cleaning.take();
+                if worker.rotation_requested {
+                    worker.rotate();
+                }
+                worker.resume_pending();
+                notify_turns = 0;
+            }
+
             // Always ready when it is enabled, so a requested rotation happens
             // before the next message is taken.
             () = std::future::ready(()),
-                if worker.rotation_requested && worker.flushing.is_none() => {
+                if worker.rotation_requested
+                    && worker.flushing.is_none()
+                    && worker.cleaning.is_none() => {
                 worker.rotate();
                 worker.resume_pending();
                 notify_turns = 0;

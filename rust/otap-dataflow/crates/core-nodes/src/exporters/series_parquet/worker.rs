@@ -66,7 +66,6 @@ use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::task::JoinError;
 
 /// Bytes charged per bounded descriptor cache entry.
 ///
@@ -186,6 +185,14 @@ pub(super) struct Worker {
     pub(super) active: OwnedBlock,
     /// The one block being written, if any.
     pub(super) flushing: Option<FlushJob>,
+    /// The decided block whose supervising task is still releasing what it
+    /// owns.
+    ///
+    /// This is the same FLUSHING slot, not a third block: it holds no
+    /// completions and no rows the node still owes anything for, only the task
+    /// that has to finish cancelling and aborting an abandoned write before
+    /// another block may be written to the same file names.
+    pub(super) cleaning: Option<FlushJob>,
     /// The one extracted request no block could take yet.
     pub(super) pending: Option<Pending>,
     /// Descriptors already written for a partition.
@@ -258,6 +265,7 @@ impl Worker {
             cfg,
             active,
             flushing: None,
+            cleaning: None,
             pending: None,
             cache,
             notify,
@@ -625,11 +633,12 @@ impl Worker {
 
     /// Seal the ACTIVE block and start writing it.
     ///
-    /// A no-op while a flush is already outstanding: the rotation stays
-    /// requested and is served once the flush slot frees, which is what keeps
-    /// the worker to two blocks.
+    /// A no-op while the flush slot is taken -- by a write, or by the cleanup
+    /// of one that has already been decided: the rotation stays requested and
+    /// is served once the slot frees, which is what keeps the worker to two
+    /// blocks and keeps two writes off the same file names.
     pub(super) fn rotate(&mut self) {
-        if self.flushing.is_some() {
+        if self.flushing.is_some() || self.cleaning.is_some() {
             return;
         }
         self.rotation_requested = false;
@@ -670,6 +679,8 @@ impl Worker {
             old.tokens,
             self.sink.clone(),
             old.emitted,
+            self.cfg.window.flush_retry_deadline,
+            self.cfg.lake.upload.abort_timeout,
         ));
     }
 
@@ -690,7 +701,10 @@ impl Worker {
     /// The cache is marked committed only here, only on success, and only
     /// against the partition of the block that was actually written, so a
     /// descriptor is treated as written exactly when its file exists.
-    pub(super) fn complete(&mut self, done: Result<FlushDone, JoinError>) {
+    pub(super) fn complete(
+        &mut self,
+        done: Result<FlushDone, tokio::sync::oneshot::error::RecvError>,
+    ) {
         let Some(mut job) = self.flushing.take() else {
             return;
         };
@@ -755,7 +769,11 @@ impl Worker {
                                 metrics.worker.flush_cancelled.add(1);
                             }
                         }
-                        otel_warn!("series_parquet.flush_failed", error = %error);
+                        otel_error!(
+                            "series_parquet.flush_failed",
+                            error = %error,
+                            message = "Block failed before durable completion"
+                        );
                         self.failed_outcome()
                     }
                 }
@@ -771,6 +789,11 @@ impl Worker {
         for token in std::mem::take(&mut job.tokens) {
             self.notify.push(token, outcome);
         }
+        // The job keeps the FLUSHING slot until its task has released the
+        // block, the sink handle and the write future it owns. It owes no
+        // completion from here on, so nothing a producer waits for is held by
+        // it; what it holds back is the next write to the same file names.
+        self.cleaning = Some(job);
     }
 
     /// Publish everything the worker can be asked about right now.
@@ -795,7 +818,14 @@ impl Worker {
             return;
         }
         self.samples += 1;
-        let flushing = self.flushing.as_ref().map_or(0, |job| job.bytes);
+        // Both slot holders are the one FLUSHING block: a decided block is
+        // still accounted for until its supervising task has released it.
+        let flushing = self
+            .flushing
+            .iter()
+            .chain(self.cleaning.iter())
+            .map(|job| job.bytes)
+            .sum::<usize>();
         let pending = self.pending.as_ref().map_or(0, |parked| {
             parked.extracted.pinned_bytes
                 + parked
@@ -821,9 +851,12 @@ impl Worker {
             .tokens
             .capacity()
             .saturating_sub(self.active.tokens.len())
-            + self.flushing.as_ref().map_or(0, |job| {
-                job.tokens.capacity().saturating_sub(job.tokens.len())
-            });
+            + self
+                .flushing
+                .iter()
+                .chain(self.cleaning.iter())
+                .map(|job| job.tokens.capacity().saturating_sub(job.tokens.len()))
+                .sum::<usize>();
         let accounted = self.active.data.bytes as u64
             + flushing as u64
             + pending as u64
@@ -928,6 +961,7 @@ impl Worker {
             && self.active.tokens.is_empty()
             && self.active.data.is_empty()
             && self.flushing.is_none()
+            && self.cleaning.is_none()
             && self.notify.is_empty()
     }
 
@@ -962,6 +996,10 @@ impl Worker {
                 self.notify.push(token, Outcome::Shutdown);
             }
         }
+        // A cleanup still in progress owes no completion; the node has run out
+        // of time to wait for it, so its cancellation token is fired by the
+        // drop and the task is left to the runtime.
+        let _ = self.cleaning.take();
         self.fail_active(Outcome::Shutdown);
         self.notify.drain_now();
     }
