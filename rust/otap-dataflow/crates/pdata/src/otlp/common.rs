@@ -275,13 +275,21 @@ impl fmt::Display for AnyValue {
     }
 }
 
-pub(crate) struct AnyValueArrays<'a> {
+/// The seven `AnyValue` columns of an attribute batch, read without casting.
+pub struct AnyValueArrays<'a> {
+    /// The value type tag of each row.
     pub attr_type: &'a UInt8Array,
+    /// String values.
     pub attr_str: Option<StringArrayAccessor<'a>>,
+    /// Integer values.
     pub attr_int: Option<Int64ArrayAccessor<'a>>,
+    /// Double values.
     pub attr_double: Option<&'a Float64Array>,
+    /// Boolean values.
     pub attr_bool: Option<&'a BooleanArray>,
+    /// Bytes values.
     pub attr_bytes: Option<ByteArrayAccessor<'a>>,
+    /// CBOR-serialized map and slice values.
     pub attr_ser: Option<ByteArrayAccessor<'a>>,
 }
 

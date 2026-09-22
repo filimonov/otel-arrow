@@ -14,15 +14,14 @@ use arrow::array::{
     StructArray, TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{
-    DataType, Float64Type, Int64Type, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type,
-    UInt32Type,
+    DataType, Float64Type, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type, UInt32Type,
 };
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::attrs::{AnyValueColumns, AttrTable};
+use crate::attrs::{AnyValueColumns, AttrTable, bytes_cell, int_cell, readable, str_cell};
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
@@ -610,11 +609,7 @@ pub(crate) fn struct_child(
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| Error::invalid(format!("column {parent} is not a struct")))?;
-    match flat_child(s, child) {
-        None => Ok(None),
-        Some(c) if c.data_type() == to => Ok(Some(c)),
-        Some(c) => Ok(Some(arrow::compute::cast(&c, to)?)),
-    }
+    flat_child(s, child).map(|c| readable(c, to)).transpose()
 }
 
 /// The `AnyValue` struct column `name` of a batch, or `None` when it is absent.
@@ -677,12 +672,12 @@ pub(crate) fn attrs_of(table: &AttrTable, id: Option<u32>) -> &[(String, Value)]
 }
 
 /// A Utf8 column read as an owned `String`, empty when null or absent.
+///
+/// Reads through a dictionary (see [`readable`]), so only this one cell is
+/// copied.
 pub(crate) fn str_at(a: &Option<ArrayRef>, row: usize) -> String {
     a.as_ref()
-        .and_then(|a| {
-            a.is_valid(row)
-                .then(|| a.as_string::<i32>().value(row).to_string())
-        })
+        .and_then(|a| str_cell(a, row, str::to_owned))
         .unwrap_or_default()
 }
 
@@ -698,10 +693,7 @@ pub(crate) fn i64_at(a: &Option<ArrayRef>, row: usize) -> i64 {
 
 /// An `Int64` column read as `Option<i64>`, `None` when null or absent.
 pub(crate) fn opt_i64(a: &Option<ArrayRef>, row: usize) -> Option<i64> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<Int64Type>().value(row))
-    })
+    a.as_ref().and_then(|a| int_cell(a, row))
 }
 
 /// A `Float64` column read as `Option<f64>`, `None` when null or absent.
@@ -756,10 +748,7 @@ pub(crate) fn list_col(batch: &RecordBatch, name: &str) -> Result<Option<ListArr
 
 /// A `FixedSizeBinary` column read as owned bytes, `None` when null or absent.
 pub(crate) fn fixed_at(a: &Option<ArrayRef>, row: usize) -> Option<Vec<u8>> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_fixed_size_binary().value(row).to_vec())
-    })
+    a.as_ref().and_then(|a| bytes_cell(a, row, <[u8]>::to_vec))
 }
 
 /// Build a `series` batch from descriptor rows.

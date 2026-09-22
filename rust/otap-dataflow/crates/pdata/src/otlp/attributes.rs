@@ -44,9 +44,13 @@ pub enum AttributeValueType {
 pub(crate) type Attribute16Arrays<'a> = AttributeArrays<'a, UInt16Type>;
 pub(crate) type Attribute32Arrays<'a> = AttributeArrays<'a, UInt32Type>;
 
-pub(crate) struct AttributeArrays<'a, T: ArrowPrimitiveType> {
+/// The columns of an attribute batch, read without casting.
+pub struct AttributeArrays<'a, T: ArrowPrimitiveType> {
+    /// The id of the parent each attribute belongs to.
     pub parent_id: MaybeDictArrayAccessor<'a, PrimitiveArray<T>>,
+    /// Attribute keys.
     pub attr_key: MaybeDictArrayAccessor<'a, StringArray>,
+    /// Attribute values.
     pub anyval_arrays: AnyValueArrays<'a>,
 }
 

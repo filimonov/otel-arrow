@@ -977,6 +977,16 @@ become null; a negative converted timestamp becomes null and increments
   conversion, because the shared byte views decode lazily. Corruption inside
   a nested message is not validated and surfaces as missing fields rather
   than as a refusal.
+- Dictionary-encoded OTAP Arrow columns are read through their dictionary,
+  never expanded first. Every attribute key and value is charged as it is
+  read: one longer than `ingress.max_row_bytes`, or an attribute table whose
+  decoded strings and bytes pass `ingress.max_extracted_bytes`, refuses the
+  request as too large. A value referenced by many rows therefore cannot grow
+  memory before the budgets apply.
+- The OTLP receiver hands this exporter the raw request bytes, and the
+  shared conversion to Arrow encodes nested map and array attribute values
+  with a recursive encoder that has no depth limit of its own. Deep nesting is
+  refused by `ingress.max_nesting_depth` only after that conversion.
 
 ### Format and storage limits in v1
 

@@ -342,7 +342,8 @@ pub(crate) fn extract_metrics(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)
+        .with_table_bytes(cfg.ingress.max_extracted_bytes);
     let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits)?;
     let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits)?;
     let metrics = metric_rows(records, cfg)?;

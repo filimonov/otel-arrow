@@ -595,11 +595,16 @@ impl<'a> MaybeDictArrayAccessor<'a, BinaryArray> {
 }
 
 impl<'a> MaybeDictArrayAccessor<'a, FixedSizeBinaryArray> {
-    pub(crate) fn try_new(arr: &'a ArrayRef, dims: i32) -> Result<Self> {
+    /// Wrap a `FixedSizeBinary(dims)` array, or a dictionary of such values.
+    ///
+    /// Returns an error if the array is neither.
+    pub fn try_new(arr: &'a ArrayRef, dims: i32) -> Result<Self> {
         Self::try_new_with_datatype(DataType::FixedSizeBinary(dims), arr)
     }
 
-    pub(crate) fn slice_at(&self, idx: usize) -> Option<&[u8]> {
+    /// The value at `idx` without copying it, or `None` when that row is null.
+    #[must_use]
+    pub fn slice_at(&self, idx: usize) -> Option<&[u8]> {
         match self {
             Self::Dictionary16(dict) => dict.slice_at(idx),
             Self::Dictionary8(dict) => dict.slice_at(idx),
@@ -615,7 +620,10 @@ impl<'a> MaybeDictArrayAccessor<'a, FixedSizeBinaryArray> {
 }
 
 impl<'a> MaybeDictArrayAccessor<'a, StringArray> {
-    pub(crate) fn try_new(arr: &'a ArrayRef) -> Result<Self> {
+    /// Wrap a `Utf8` array, or a dictionary of `Utf8` values.
+    ///
+    /// Returns an error if the array is neither.
+    pub fn try_new(arr: &'a ArrayRef) -> Result<Self> {
         Self::try_new_with_datatype(StringArray::DATA_TYPE, arr)
     }
 
@@ -627,7 +635,10 @@ impl<'a> MaybeDictArrayAccessor<'a, StringArray> {
         Self::try_new(get_required_array(record_batch, column_name)?)
     }
 
-    pub(crate) fn str_at(&self, idx: usize) -> Option<&str> {
+    /// The string at `idx` without copying it, reading through the
+    /// dictionary when there is one, or `None` when that row is null.
+    #[must_use]
+    pub fn str_at(&self, idx: usize) -> Option<&str> {
         match self {
             Self::Dictionary16(dict) => dict.str_at(idx),
             Self::Dictionary8(dict) => dict.str_at(idx),
@@ -646,8 +657,10 @@ impl<'a> MaybeDictArrayAccessor<'a, StringArray> {
 pub(crate) type UInt32ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, UInt32Array>;
 pub(crate) type Int32ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, Int32Array>;
 pub(crate) type Int64ArrayAccessor<'a> = MaybeDictArrayAccessor<'a, Int64Array>;
-pub(crate) type StringArrayAccessor<'a> = MaybeDictArrayAccessor<'a, StringArray>;
-pub(crate) type FixedSizeBinaryArrayAccessor<'a> = MaybeDictArrayAccessor<'a, FixedSizeBinaryArray>;
+/// A `Utf8` column that may be dictionary encoded.
+pub type StringArrayAccessor<'a> = MaybeDictArrayAccessor<'a, StringArray>;
+/// A `FixedSizeBinary` column that may be dictionary encoded.
+pub type FixedSizeBinaryArrayAccessor<'a> = MaybeDictArrayAccessor<'a, FixedSizeBinaryArray>;
 pub(crate) type DurationNanosArrayAccessor<'a> =
     MaybeDictArrayAccessor<'a, DurationNanosecondArray>;
 

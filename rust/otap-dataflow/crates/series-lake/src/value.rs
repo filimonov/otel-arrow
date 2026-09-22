@@ -11,17 +11,29 @@ use crate::error::{Error, RefuseReason, Result};
 pub struct DecodeLimits {
     /// Maximum nesting depth of the decoded value.
     pub max_depth: usize,
-    /// Maximum encoded byte length of one `ser` cell.
+    /// Maximum byte length of one string, bytes or encoded `ser` cell.
     pub max_cell_bytes: usize,
+    /// Maximum string and byte content one attribute table may decode.
+    pub max_table_bytes: usize,
 }
 
 impl DecodeLimits {
-    /// Limits from a depth and an encoded-cell byte bound.
+    /// Limits from a depth and a cell byte bound, with no table bound.
     #[must_use]
     pub fn new(max_depth: usize, max_cell_bytes: usize) -> Self {
         Self {
             max_depth,
             max_cell_bytes,
+            max_table_bytes: usize::MAX,
+        }
+    }
+
+    /// The same limits with a bound on what one attribute table may decode.
+    #[must_use]
+    pub fn with_table_bytes(self, max_table_bytes: usize) -> Self {
+        Self {
+            max_table_bytes,
+            ..self
         }
     }
 }

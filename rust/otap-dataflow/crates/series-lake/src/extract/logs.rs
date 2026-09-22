@@ -47,7 +47,8 @@ pub(crate) fn extract_logs(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)
+        .with_table_bytes(cfg.ingress.max_extracted_bytes);
     let mut stats = ExtractStats::default();
     let Some(logs) = records.get(ArrowPayloadType::Logs) else {
         return Ok(Extracted {
