@@ -29,10 +29,12 @@ use otel_arrow_dfe_pdata::OtapPayload;
 use otel_arrow_dfe_pdata::encode::{encode_logs_otap_batch, encode_metrics_otap_batch};
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
+use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_series_lake as lake;
@@ -206,7 +208,28 @@ fn metrics_payload() -> OtapPayload {
     OtapPayload::from(encode_metrics_otap_batch(&view).expect("encodes to OTAP"))
 }
 
-/// Scenario: a metrics request reaches an exporter that only supports logs,
+/// One well-formed OTLP traces request, kept in its wire form.
+///
+/// Traces are refused on the signal alone, before any conversion, so the
+/// request never has to be encoded into OTAP records.
+fn traces_payload() -> OtapPayload {
+    let request = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    name: "unsupported".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(bytes::Bytes::from(encoded(&request)))
+        .into()
+}
+
+/// Scenario: a traces request reaches an exporter that has no traces schema,
 /// and a logs request larger than `ingress.max_request_bytes` arrives.
 /// Guarantees: both are refused as permanent client errors with the rule that
 /// rejected them, and neither leaves anything in the ACTIVE block, because
@@ -223,7 +246,7 @@ async fn validation_refusals_are_permanent() {
 
             let mut context = Context::default();
             context.set_source_node(7);
-            worker.admit(OtapPdata::new(context, metrics_payload()));
+            worker.admit(OtapPdata::new(context, traces_payload()));
             // The same logs request that is admitted elsewhere, now larger
             // than the budget it is measured against.
             worker.cfg.lake.ingress.max_request_bytes = 1;
@@ -743,6 +766,71 @@ async fn a_malformed_otlp_body_is_refused_atomically() {
             // Field 1 (`resource_logs`), length-delimited, declaring 127 bytes
             // that the buffer does not contain.
             let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(
+                bytes::Bytes::from_static(&[0x0A, 0x7F]),
+            );
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(2);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+
+            worker.admit(OtapPdata::new(context, payload.into()));
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(worker.pending.is_none());
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert_eq!(nack.reason, "invalid");
+                }
+                other => panic!("expected a framing refusal, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Scenario: a well-formed OTLP metrics request reaches the same worker that
+/// admits logs.
+/// Guarantees: it is admitted through one extraction into the ACTIVE block and
+/// holds its completion there, so metrics travel the single admission state
+/// machine rather than a signal-specific path.
+#[tokio::test(flavor = "current_thread")]
+async fn metrics_are_admitted_like_logs() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, _rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+
+            let mut context = Context::default();
+            context.set_source_node(7);
+            worker.admit(OtapPdata::new(context, metrics_payload()));
+
+            assert!(!worker.active.data.is_empty());
+            assert_eq!(worker.active.tokens.len(), 1);
+            assert!(worker.pending.is_none());
+            assert_eq!(worker.notify.len(), 0);
+        })
+        .await;
+}
+
+/// Scenario: an OTLP metrics body whose top-level framing is truncated reaches
+/// preparation after its byte-size check.
+/// Guarantees: it is refused permanently and the ACTIVE block is untouched.
+/// The framing walk is per signal, so admitting metrics must not let a damaged
+/// metrics body through the check that already covers logs.
+#[tokio::test(flavor = "current_thread")]
+async fn a_malformed_otlp_metrics_body_is_refused_atomically() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut context = Context::default();
+            context.set_source_node(7);
+            // Field 1 (`resource_metrics`), length-delimited, declaring 127
+            // bytes that the buffer does not contain.
+            let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
                 bytes::Bytes::from_static(&[0x0A, 0x7F]),
             );
             let store = Arc::new(object_store::memory::InMemory::new());

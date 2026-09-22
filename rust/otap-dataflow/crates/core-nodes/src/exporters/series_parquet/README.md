@@ -35,7 +35,18 @@ its window ends, which writes more than one file set for that window. The waitin
 engine's monotonic clock, so a wall clock that steps backwards cannot reopen a
 window that was already written and boundaries missed while the node was busy
 coalesce into one rotation. Later tasks add telemetry and a drain-aware
-shutdown. Only logs are accepted; metrics and traces are permanently refused.
+shutdown.
+
+Logs and metrics share one admission path and one extraction call per request.
+Traces have no dataset in the lake and are permanently refused on the signal
+alone, before any conversion. A metrics request may carry points the lake has
+no dataset for, namely exponential histograms and summaries; the `unsupported`
+setting decides them for the whole request atomically. Under `reject` the
+request is refused and nothing is written; under `drop` the unsupported points
+are discarded, counted, and the supported rows are acknowledged once they are
+durable. A request that extracts no rows at all is acknowledged without
+opening a file. Metadata and exemplar attribute tables are neither read nor
+validated, under either policy.
 
 ## Configuration
 
@@ -43,7 +54,9 @@ shutdown. Only logs are accepted; metrics and traces are permanently refused.
 `window` holds the rotation interval and the budgets of one block.
 `ingress` holds the four per-request budgets; the two block-level budgets
 belong under `window`, and naming one of them under `ingress` is refused
-rather than ignored. Byte-valued settings accept human units such as `64MiB`.
+rather than ignored. `unsupported` is `reject` or `drop`, and `logs` and
+`metrics` carry the per-signal series attributes, denormalized columns and
+sort order. Byte-valued settings accept human units such as `64MiB`.
 `parquet.compression` may only be `zstd`, which is what the sink writes.
 
 ## Layout

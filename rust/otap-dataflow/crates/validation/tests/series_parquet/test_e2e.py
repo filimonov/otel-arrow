@@ -16,6 +16,12 @@ import grpc
 import yaml
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2 as logs_pb
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc as logs_rpc
+from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2 as metrics_pb
+from opentelemetry.proto.collector.metrics.v1 import (
+    metrics_service_pb2_grpc as metrics_rpc,
+)
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2 as trace_pb
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2_grpc as trace_rpc
 
 WORKSPACE = Path(__file__).resolve().parents[4]
 
@@ -59,6 +65,33 @@ def log_request(request_id):
     record.body.string_value = request_id
     logger = record.attributes.add(key="logger.name")
     logger.value.string_value = "series.logger"
+    return req
+
+
+def metric_request(request_id, unsupported=False):
+    """Build an OTLP metrics request with one gauge and one histogram point.
+
+    `unsupported` appends a summary metric, which the lake has no dataset for;
+    it is what the `unsupported` policy decides.
+    """
+    req = metrics_pb.ExportMetricsServiceRequest()
+    resource = req.resource_metrics.add()
+    resource.resource.attributes.add(key="host.id").value.string_value = "producer-1"
+    scope = resource.scope_metrics.add()
+    scope.scope.name = "series-e2e"
+    number = scope.metrics.add(name="integer", unit="1")
+    point = number.gauge.data_points.add(time_unix_nano=2**64 - 1, as_int=2**63 - 1)
+    point.attributes.add(key="request.id").value.string_value = request_id
+    hist = scope.metrics.add(name="histogram", unit="s")
+    hist.histogram.aggregation_temporality = 2
+    point = hist.histogram.data_points.add(
+        time_unix_nano=1789960500000000000, count=3, sum=4.0
+    )
+    point.bucket_counts.extend([1, 2])
+    point.explicit_bounds.append(1.0)
+    point.attributes.add(key="request.id").value.string_value = request_id
+    if unsupported:
+        scope.metrics.add(name="summary").summary.data_points.add(count=1, sum=2.0)
     return req
 
 
@@ -255,6 +288,192 @@ class LocalSlice(unittest.TestCase):
                 print(engine.engine_log())
                 raise
 
+
+class MetricsSlice(unittest.TestCase):
+    """Metrics admission, unsupported policy and content refusals."""
+
+    # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request.
+    # Guarantees: integer precision, histogram shape and wrapped timestamp
+    # nullability survive Parquet, and both metric datasets are written.
+    def test_number_and_histogram(self):
+        with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
+            try:
+                metrics_rpc.MetricsServiceStub(engine.channel).Export(
+                    metric_request("metric-0"), timeout=20
+                )
+                with duckdb.connect() as db:
+                    pattern = str(
+                        engine.data / "v=1/signal=metrics/dataset=number/**/*.parquet"
+                    )
+                    rows = db.execute(
+                        "SELECT value_int, time_unix_nano FROM read_parquet(?)",
+                        [pattern],
+                    ).fetchall()
+                    self.assertEqual(rows, [(2**63 - 1, None)])
+                    pattern = str(
+                        engine.data
+                        / "v=1/signal=metrics/dataset=histogram/**/*.parquet"
+                    )
+                    rows = db.execute(
+                        "SELECT count, bucket_counts, explicit_bounds "
+                        "FROM read_parquet(?)",
+                        [pattern],
+                    ).fetchall()
+                    self.assertEqual(rows, [(3, [1, 2], [1.0])])
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+    # Scenario: supported points share a request with an unsupported summary.
+    # Guarantees: reject is atomic and writes nothing, while drop returns OK
+    # only after the supported rows are durable.
+    def test_mixed_policy(self):
+        for policy in ("reject", "drop"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as directory:
+                with Engine(directory, overrides={"unsupported": policy}) as engine:
+                    try:
+                        call = metrics_rpc.MetricsServiceStub(engine.channel)
+                        if policy == "reject":
+                            with self.assertRaises(grpc.RpcError) as caught:
+                                call.Export(metric_request("mixed", True), timeout=20)
+                            self.assertEqual(
+                                caught.exception.code(),
+                                grpc.StatusCode.INVALID_ARGUMENT,
+                            )
+                            self.assertEqual(list(engine.data.rglob("*.parquet")), [])
+                        else:
+                            call.Export(metric_request("mixed", True), timeout=20)
+                            self.assertTrue(
+                                list(
+                                    engine.data.glob(
+                                        "v=1/signal=metrics/dataset=number/"
+                                        "**/*.parquet"
+                                    )
+                                )
+                            )
+                        engine.shutdown()
+                    except Exception:
+                        print(engine.engine_log())
+                        raise
+
+    # Scenario: a traces request arrives even with unsupported: drop.
+    # Guarantees: traces are permanently refused and never produce lake files,
+    # because the drop policy governs unsupported metric points and not a
+    # signal the lake has no schema for.
+    def test_traces_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory, Engine(
+            directory, overrides={"unsupported": "drop"}
+        ) as engine:
+            try:
+                req = trace_pb.ExportTraceServiceRequest()
+                req.resource_spans.add().scope_spans.add().spans.add(
+                    name="unsupported"
+                )
+                with self.assertRaises(grpc.RpcError) as caught:
+                    trace_rpc.TraceServiceStub(engine.channel).Export(req, timeout=20)
+                self.assertEqual(
+                    caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT
+                )
+                self.assertEqual(list(engine.data.rglob("*.parquet")), [])
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+    # Scenario: invalid temporality, histogram shape/count or duplicate
+    # attributes arrive.
+    # Guarantees: each request is refused atomically and a subsequent valid
+    # request still commits, so a content error does not stop the worker.
+    def test_content_failures_do_not_stop_worker(self):
+        cases = []
+        temporal = metric_request("bad-temporality")
+        temporal.resource_metrics[0].scope_metrics[0].metrics[
+            1
+        ].histogram.aggregation_temporality = 0
+        cases.append(temporal)
+        shape = metric_request("bad-shape")
+        shape.resource_metrics[0].scope_metrics[0].metrics[
+            1
+        ].histogram.data_points[0].bucket_counts.append(1)
+        cases.append(shape)
+        count = metric_request("bad-count")
+        count.resource_metrics[0].scope_metrics[0].metrics[1].histogram.data_points[
+            0
+        ].count = 2**63
+        cases.append(count)
+        duplicate = metric_request("bad-attrs")
+        attrs = duplicate.resource_metrics[0].scope_metrics[0].metrics[
+            0
+        ].gauge.data_points[0].attributes
+        attrs.add(key="request.id").value.string_value = "duplicate"
+        cases.append(duplicate)
+        with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
+            try:
+                call = metrics_rpc.MetricsServiceStub(engine.channel)
+                for req in cases:
+                    with self.assertRaises(grpc.RpcError) as caught:
+                        call.Export(req, timeout=20)
+                    self.assertEqual(
+                        caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT
+                    )
+                self.assertEqual(list(engine.data.rglob("*.parquet")), [])
+                call.Export(metric_request("valid-after-errors"), timeout=20)
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+    # Scenario: the drop policy receives only an unsupported summary point.
+    # Guarantees: a request that extracts no rows receives OK without opening
+    # any Parquet file.
+    def test_zero_output_drop_acks_without_files(self):
+        with tempfile.TemporaryDirectory() as directory, Engine(
+            directory, overrides={"unsupported": "drop"}
+        ) as engine:
+            try:
+                request = metric_request("unsupported-only", unsupported=True)
+                metrics = request.resource_metrics[0].scope_metrics[0].metrics
+                del metrics[:2]
+                metrics_rpc.MetricsServiceStub(engine.channel).Export(
+                    request, timeout=20
+                )
+                self.assertEqual(list(engine.data.rglob("*.parquet")), [])
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+    # Scenario: logs exceed a row, extracted-output or input budget, or
+    # contain excessive nesting.
+    # Guarantees: each limit rejects the whole request permanently and writes
+    # no partial data.
+    def test_each_ingress_budget_refuses_atomically(self):
+        cases = []
+        large = log_request("x" * 4096)
+        cases.append(({"max_request_bytes": "1KiB"}, large))
+        cases.append(({"max_row_bytes": "1KiB"}, large))
+        cases.append(({"max_extracted_bytes": "1KiB"}, large))
+        deep = log_request("deep")
+        value = deep.resource_logs[0].resource.attributes.add(key="nested").value
+        for _ in range(40):
+            value = value.array_value.values.add()
+        value.string_value = "leaf"
+        cases.append(({"max_nesting_depth": 8}, deep))
+        for limits, request in cases:
+            with self.subTest(limits=limits), tempfile.TemporaryDirectory() as directory:
+                with Engine(directory, overrides={"ingress": limits}) as engine:
+                    try:
+                        with self.assertRaises(grpc.RpcError) as caught:
+                            engine.logs.Export(request, timeout=20)
+                        self.assertEqual(
+                            caught.exception.code(), grpc.StatusCode.INVALID_ARGUMENT
+                        )
+                        self.assertEqual(list(engine.data.rglob("*.parquet")), [])
+                        engine.shutdown()
+                    except Exception:
+                        print(engine.engine_log())
+                        raise
 
 if __name__ == "__main__":
     unittest.main()

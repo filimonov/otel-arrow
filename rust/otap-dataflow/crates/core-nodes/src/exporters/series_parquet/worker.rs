@@ -23,10 +23,18 @@
 //! for a damaged body: without the check a truncated request would become a
 //! request carrying no rows and be acknowledged as stored. Only the top level
 //! is validated -- field tags and the bounds of each length-delimited field.
-//! Nested `ResourceLogs`, `ScopeLogs` and `LogRecord` content is still read
-//! lazily and is not validated here; corruption inside a submessage surfaces as
-//! missing or empty fields rather than a refusal. Covering that is deferred to
-//! the chaos tests of plan 3.
+//! Nested content is still read lazily and is not validated here; corruption
+//! inside a submessage surfaces as missing or empty fields rather than a
+//! refusal. Covering that is deferred to the chaos tests of plan 3.
+//!
+//! Logs and metrics are admitted through the same state machine and the same
+//! single extraction call; traces have no lake schema and are refused on the
+//! signal alone. A metrics request whose points the lake has no dataset for --
+//! exponential histograms and summaries -- is decided by the configured
+//! `unsupported` policy inside that one extraction call, atomically for the
+//! whole request: `reject` refuses it, `drop` keeps the supported points and
+//! counts the rest. Metadata and exemplar attribute tables are neither read
+//! nor validated, under either policy.
 //!
 //! A block-scoped refusal -- a full block, or one already holding its request
 //! limit -- is not the request's fault, so the request is not nacked for it.
@@ -48,7 +56,8 @@ use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
-use otel_arrow_dfe_pdata::{OtapPayload, PayloadData, TryIntoWithOptions};
+use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
+use otel_arrow_dfe_pdata::{OtapPayload, OtlpProtoBytes, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -277,11 +286,16 @@ impl Worker {
                 Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)),
             );
         }
-        if payload.signal_type() != otel_arrow_dfe_config::SignalType::Logs {
+        // Logs and metrics share one admission path; traces have no lake
+        // schema at all, so they are refused on the signal alone, before any
+        // conversion. The `unsupported` policy governs unsupported metric
+        // points inside a request the lake does have a schema for, so it does
+        // not apply here.
+        if payload.signal_type() == otel_arrow_dfe_config::SignalType::Traces {
             return Prepared::Failed(
                 token,
                 Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
-                    "signal".into(),
+                    "traces".into(),
                 ))),
             );
         }
@@ -315,9 +329,18 @@ impl Worker {
         let PayloadData::OtlpBytes(bytes) = payload.data() else {
             return Ok(());
         };
-        RawLogsData::try_from(bytes).map(|_| ()).map_err(|error| {
+        let (signal, framed) = match bytes {
+            OtlpProtoBytes::ExportLogsRequest(buf) => ("logs", RawLogsData::try_new(buf).map(drop)),
+            OtlpProtoBytes::ExportMetricsRequest(buf) => {
+                ("metrics", RawMetricsData::try_new(buf).map(drop))
+            }
+            // Traces are decided by the signal check before this runs, so
+            // there is no body to walk here.
+            OtlpProtoBytes::ExportTracesRequest(_) => return Ok(()),
+        };
+        framed.map_err(|error| {
             Failure::Permanent(lake::Error::invalid(format!(
-                "malformed OTLP logs body: {error}"
+                "malformed OTLP {signal} body: {error}"
             )))
         })
     }
