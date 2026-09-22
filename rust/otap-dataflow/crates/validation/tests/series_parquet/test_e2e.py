@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -2097,6 +2098,341 @@ def metric_max(document, name):
         if item["name"] == name and isinstance(item["value"], (int, float))
     ]
     return max(values, default=0)
+
+
+def rss_bytes(pid):
+    """Resident set size of one process, in bytes, from /proc.
+
+    The outage test bounds the exporter's memory against the budget it
+    reports, so it needs the real process size rather than an allocator
+    statistic.
+    """
+    status = Path(f"/proc/{pid}/status")
+    if not status.exists():
+        raise unittest.SkipTest("Outage RSS assertion requires Linux /proc")
+    for line in status.read_text().splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024
+    raise AssertionError("process RSS unavailable while engine is running")
+
+
+# Codes a producer is allowed to see and must retry. A storage failure is a
+# transient NACK, which the OTLP receiver reports as UNAVAILABLE; the other
+# three are the client's own deadline or cancellation rather than a refusal
+# the exporter issued.
+RETRYABLE_CODES = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+    grpc.StatusCode.CANCELLED,
+}
+CLIENT_GAVE_UP = {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.CANCELLED}
+
+
+class OutageSlice(unittest.TestCase):
+    """A real object store taken off the network under live producers."""
+
+    # Scenario: Alloy file tailing and synthetic OTLP requests continue during
+    # an eight-second real S3 outage that outlasts the flush deadline.
+    # Guarantees: no request is acknowledged while the store is down, every
+    # refusal is the retryable UNAVAILABLE status, the engine recovers without
+    # a restart, and both readers recover every Alloy body and every
+    # acknowledged synthetic ID within the memory envelope.
+    def test_storage_outage_recovers_without_losing_acked_data(self):
+        require_clickhouse()
+        for kind in ("minio", "rustfs"):
+            with self.subTest(store=kind), DockerStore(kind) as store:
+                with tempfile.TemporaryDirectory() as directory:
+                    self.exercise_outage(kind, store, directory)
+
+    def exercise_outage(self, kind, store, directory):
+        """One store: stop it under load, recover it, and check the lake."""
+        overrides = {
+            # The flush deadline is shorter than the outage, so the exporter
+            # cannot wait the store out: it has to fail blocks and refuse
+            # their requests retryably while the store is gone.
+            "window": {
+                "interval": "1s",
+                "max_block_bytes": "8MiB",
+                "max_requests_per_block": 8,
+                "flush_retry_deadline": "3s",
+            },
+            "ingress": {
+                "max_request_bytes": "1MiB",
+                "max_extracted_bytes": "2MiB",
+                "max_row_bytes": "16KiB",
+                "max_nesting_depth": 32,
+            },
+            "series_cache": {"max_entries": 128},
+            "sorting": {
+                "enabled": True,
+                "run_target_bytes": "64KiB",
+                "merge_chunk_bytes": "128KiB",
+            },
+            "parquet": {
+                "compression": "zstd",
+                "row_group_bytes": "512KiB",
+                "writer_limit_bytes": "1MiB",
+            },
+            "upload": {"part_bytes": "5MiB", "concurrency": 1, "abort_timeout": "1s"},
+            # The object store client gives up at once, so every wait during
+            # the outage is the exporter's own bounded flush retry.
+            "retry": {
+                "max_retries": 0,
+                "init_backoff": "50ms",
+                "max_backoff": "100ms",
+                "backoff_base": 2.0,
+                "retry_timeout": "200ms",
+            },
+        }
+        with Engine(
+            directory, storage=store.storage, overrides=overrides
+        ) as engine, AlloyProducer(directory, engine) as alloy:
+            try:
+                alloy_ids = [f"{kind}-outage-alloy-{i}" for i in range(12)]
+                engine.logs.Export(log_request("warmup"), timeout=10)
+                baseline_rss = rss_bytes(engine.process.pid)
+                expected_requests = {
+                    (signal, f"p{index}-{item}")
+                    for index in range(8)
+                    for item in range(12)
+                    for signal in ("logs", "metrics")
+                }
+                expected_metric_ids = {
+                    rid for signal, rid in expected_requests if signal == "metrics"
+                }
+                expected_log_ids = {"warmup", *alloy_ids} | {
+                    rid for signal, rid in expected_requests if signal == "logs"
+                }
+                acknowledged = []
+                retry_codes = []
+                cohort = {}
+                cohort_finished = {}
+                cohort_start = threading.Barrier(9, timeout=20)
+                cohort_ready = threading.Barrier(9, timeout=20)
+                samples = []
+                lock = threading.Lock()
+                end = time.monotonic() + 120
+
+                def producer(index):
+                    """Send 12 logs and 12 metrics, retrying every refusal.
+
+                    The very first RPC is started before the cohort barrier
+                    releases, so the test knows it began while the store was
+                    stopped; the identical request is resent on every retry,
+                    which is what makes the acknowledged set comparable with
+                    what is stored.
+                    """
+                    logs = logs_rpc.LogsServiceStub(engine.channel)
+                    metrics = metrics_rpc.MetricsServiceStub(engine.channel)
+                    cohort_start.wait()
+                    first_started = time.monotonic()
+                    first = logs.Export.future(log_request(f"p{index}-0"), timeout=30)
+
+                    def first_done(call):
+                        with lock:
+                            cohort_finished[index] = (time.monotonic(), call.code())
+
+                    first.add_done_callback(first_done)
+                    with lock:
+                        cohort[index] = (first, first_started)
+                    cohort_ready.wait()
+                    for item in range(12):
+                        request_id = f"p{index}-{item}"
+                        for signal, request, send in (
+                            ("logs", log_request(request_id), logs.Export),
+                            ("metrics", metric_request(request_id), metrics.Export),
+                        ):
+                            first_attempt = item == 0 and signal == "logs"
+                            while time.monotonic() < end:
+                                try:
+                                    if first_attempt:
+                                        first_attempt = False
+                                        first.result(timeout=35)
+                                    else:
+                                        send(request, timeout=6)
+                                    with lock:
+                                        acknowledged.append(
+                                            (signal, request_id, time.monotonic())
+                                        )
+                                    break
+                                except grpc.RpcError as error:
+                                    with lock:
+                                        retry_codes.append(error.code())
+                                    if error.code() not in RETRYABLE_CODES:
+                                        raise
+                                    time.sleep(0.1)
+                            else:
+                                raise AssertionError(
+                                    "producer could not drain after recovery"
+                                )
+
+                store.stop()
+                outage_started = time.monotonic()
+                alloy.write(alloy_ids)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    jobs = [pool.submit(producer, index) for index in range(8)]
+                    cohort_start.wait()
+                    cohort_ready.wait()
+                    self.assertEqual(set(cohort), set(range(8)))
+                    outage_end = time.monotonic() + 8
+                    while time.monotonic() < outage_end:
+                        document = engine_metrics(engine)
+                        samples.append((document, rss_bytes(engine.process.pid)))
+                        time.sleep(0.2)
+                    # Every known first RPC began while storage was stopped.
+                    # No successful response is allowed before recovery starts.
+                    for first, started in cohort.values():
+                        self.assertGreaterEqual(started, outage_started)
+                        if first.done():
+                            self.assertIn(first.code(), RETRYABLE_CODES)
+                        # Otherwise this exact RPC is still pending at
+                        # observation.
+                    # The engine must have given up on at least one block: an
+                    # outage that produced no failure would prove nothing.
+                    self.assertGreaterEqual(
+                        wait_for_metric(engine, "flush.failures", 1, 30),
+                        1,
+                        "no block failed while the store was stopped",
+                    )
+                    recovery_started = time.monotonic()
+                    store.recover()
+                    while not all(job.done() for job in jobs):
+                        self.assertLess(time.monotonic(), end, "recovery deadline")
+                        samples.append(
+                            (engine_metrics(engine), rss_bytes(engine.process.pid))
+                        )
+                        time.sleep(0.2)
+                    for job in jobs:
+                        job.result()
+                    self.assertEqual(set(cohort_finished), set(range(8)))
+                    for completed, code in cohort_finished.values():
+                        self.assertTrue(
+                            code in RETRYABLE_CODES
+                            or (
+                                code == grpc.StatusCode.OK
+                                and completed >= recovery_started
+                            ),
+                            "cohort RPC succeeded before storage recovery",
+                        )
+                wait_for_alloy(
+                    store, directory, alloy_ids, timeout=max(1, end - time.monotonic())
+                )
+                self.assertTrue(
+                    retry_codes, "outage must cause retryable failures/timeouts"
+                )
+                # No acknowledgement may predate recovery: every one of these
+                # requests was admitted while the store was unreachable, so an
+                # OK before the store came back would be an ack without
+                # durable data.
+                self.assertFalse(
+                    [item for item in acknowledged if item[2] < recovery_started],
+                    "a request was acknowledged while the store was stopped",
+                )
+                # Every refusal the exporter issued is the one retryable code;
+                # the rest of what a producer saw is its own deadline.
+                refusals = set(retry_codes) - CLIENT_GAVE_UP
+                self.assertEqual(
+                    refusals,
+                    {grpc.StatusCode.UNAVAILABLE},
+                    f"non-retryable refusal during the outage: {refusals}",
+                )
+                self.assertEqual(
+                    {(signal, rid) for signal, rid, _ in acknowledged},
+                    expected_requests,
+                )
+                self.assertEqual(len(acknowledged), len(expected_requests))
+                for document, rss in samples:
+                    self.assertLessEqual(
+                        metric_max(document, "block.active_bytes"), 8 << 20
+                    )
+                    self.assertLessEqual(
+                        metric_max(document, "block.flushing_bytes"), 8 << 20
+                    )
+                    self.assertLessEqual(
+                        metric_max(document, "block.pending_slot_occupied"), 1
+                    )
+                    self.assertLessEqual(metric_max(document, "notify.queued"), 16)
+                    budget = metric_max(document, "memory.budget_bytes")
+                    self.assertGreater(
+                        budget, 0, "missing budget telemetry is a failure"
+                    )
+                    self.assertLessEqual(rss, baseline_rss + budget + (128 << 20))
+                # The engine recovers in place: no restart, and the backlog
+                # drains back to an empty pending set.
+                self.assertIsNone(engine.process.poll(), "the engine did not survive")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    document = engine_metrics(engine)
+                    if (
+                        metric_max(document, "oldest_unacked_seconds") <= 1
+                        and metric_max(document, "block.requests_pending") == 0
+                    ):
+                        break
+                    time.sleep(0.2)
+                else:
+                    self.fail("oldest unacked age did not return to baseline")
+                engine.shutdown(seconds=30)
+            except Exception:
+                print(engine.engine_log())
+                raise
+        downloaded = Path(directory) / "downloaded"
+        store.download(downloaded)
+        expected_logs = sorted(expected_log_ids)
+        metric_ids = sorted(expected_metric_ids)
+        duplicates = {}
+        verify_files(self, downloaded, expected_logs, 96, allow_duplicates=True)
+        verify_readers(
+            self,
+            downloaded,
+            expected_logs,
+            96,
+            allow_duplicates=True,
+            alloy_ids=alloy_ids,
+            metric_ids=metric_ids,
+        )
+        with duckdb.connect() as db:
+            log_path = str(downloaded / "v=1/signal=logs/dataset=values/**/*.parquet")
+            stored_logs = [
+                row[0]
+                for row in db.execute(
+                    "SELECT body FROM read_parquet(?)", [log_path]
+                ).fetchall()
+            ]
+            self.assertEqual(
+                set(stored_logs), expected_log_ids, "all precomputed log IDs must survive"
+            )
+            duplicates["logs"] = len(stored_logs) - len(expected_log_ids)
+            series = str(downloaded / "v=1/signal=metrics/dataset=series/**/*.parquet")
+            db.execute(
+                "CREATE OR REPLACE TEMP TABLE series AS SELECT * FROM "
+                "read_parquet(?, union_by_name=true, filename=true) QUALIFY "
+                "row_number() OVER(PARTITION BY series_id ORDER BY emitted_at DESC, "
+                "filename DESC)=1",
+                [series],
+            )
+            for dataset in ("number", "histogram"):
+                path = str(
+                    downloaded / f"v=1/signal=metrics/dataset={dataset}/**/*.parquet"
+                )
+                stored = [
+                    row[0]
+                    for row in db.execute(
+                        "SELECT s.attrs['request.id'] FROM read_parquet(?) v "
+                        "JOIN series s USING(series_id)",
+                        [path],
+                    ).fetchall()
+                ]
+                self.assertEqual(
+                    set(stored), expected_metric_ids, f"missing precomputed {dataset} IDs"
+                )
+                duplicates[dataset] = len(stored) - len(expected_metric_ids)
+        self.assertTrue(all(count >= 0 for count in duplicates.values()))
+        codes = collections.Counter(code.name for code in retry_codes)
+        print(
+            f"{kind} outage: {len(retry_codes)} producer retries {dict(codes)}, "
+            f"duplicate rows {duplicates}"
+        )
 
 
 if __name__ == "__main__":
