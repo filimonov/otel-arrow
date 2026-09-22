@@ -1405,6 +1405,64 @@ async fn wall_clock_drift_is_not_mistaken_for_a_backward_step() {
     assert_eq!(window.clock.last_boundary(), 100_005);
 }
 
+/// Scenario: a window boundary passes while the previous block is still being
+/// written and the ACTIVE block is empty.
+/// Guarantees: the empty block is replaced by one for the new window at once,
+/// without waiting for the flush slot, so admission stays open across the
+/// boundary instead of closing until an unrelated write finishes.
+#[tokio::test(flavor = "current_thread")]
+async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, Arc::clone(&wall) as _, handler);
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            assert!(
+                worker.flushing.is_some(),
+                "the first block is being written"
+            );
+            assert!(worker.active.data.is_empty());
+
+            wall.set(1_000_000_000);
+            let _ = worker.window.clock.on_wake(1);
+            worker.reason = super::metrics::FlushReason::Time;
+            worker.rotation_requested = true;
+            worker.rotate();
+            assert!(
+                !worker.rotation_requested,
+                "an empty block needs no flush slot"
+            );
+            assert_eq!(worker.active.data.window_start_secs, 1);
+            assert!(worker.accept(), "admission stays open across the boundary");
+        })
+        .await;
+}
+
+/// Scenario: refusals arrive in a burst, then after a pause of the log
+/// interval.
+/// Guarantees: one WARN line is written per interval however many requests
+/// are refused within it, and the next line reports how many were left out,
+/// so a producer resending a refused request cannot flood the log while the
+/// count of refusals is still visible.
+#[test]
+fn refusal_warnings_are_rate_limited() {
+    let mut log = super::worker::RefusalLog::default();
+    let start = std::time::Instant::now();
+    assert_eq!(log.admit(start), Some(0));
+    for i in 1..=5 {
+        assert_eq!(log.admit(start + Duration::from_millis(i * 100)), None);
+    }
+    assert_eq!(log.admit(start + Duration::from_secs(1)), Some(5));
+    assert_eq!(log.admit(start + Duration::from_millis(1_500)), None);
+}
+
 /// Take one completion, require it to be an ack, and say which request it
 /// belonged to.
 async fn expect_ack(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>) -> Option<usize> {

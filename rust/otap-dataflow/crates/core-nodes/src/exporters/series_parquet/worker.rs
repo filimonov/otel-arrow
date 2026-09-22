@@ -78,6 +78,39 @@ const CACHE_ENTRY_BYTES: u64 = 128;
 /// buffers it accounts for itself.
 const FIXED_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Shortest interval between two per-request refusal WARN lines.
+const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Rate limit of the per-request refusal WARN.
+///
+/// A producer that keeps sending a request this node refuses would otherwise
+/// write one WARN line per request, at whatever rate it sends. Every refusal
+/// is still counted in the `nacks` metric; the log keeps one line per
+/// interval and says how many it left out.
+#[derive(Debug, Default)]
+pub(super) struct RefusalLog {
+    /// When the last line was written.
+    last: Option<Instant>,
+    /// Refusals left out since then.
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    /// Whether a refusal seen at `now` is logged, and if it is, how many were
+    /// left out since the previous line.
+    pub(super) fn admit(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < REFUSAL_LOG_INTERVAL)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
 /// How a failed request must be reported back to its sender.
 ///
 /// Only a refusal the lake itself classified as one -- [`lake::Error::Refused`]
@@ -324,6 +357,8 @@ pub(super) struct Worker {
     /// a regression test can assert the scan happens only when telemetry is
     /// actually collected.
     pub(super) samples: u64,
+    /// Rate limit of the per-request refusal WARN.
+    refusals: RefusalLog,
     /// Registered instruments, once the node has a pipeline context.
     ///
     /// `None` for a worker driven directly by a test, which keeps every call
@@ -388,6 +423,7 @@ impl Worker {
             reason: FlushReason::Time,
             token_high_water: size_of::<AckToken>(),
             samples: 0,
+            refusals: RefusalLog::default(),
             metrics: None,
             accounting: SeriesMemoryAccounting::register(),
         }
@@ -692,15 +728,23 @@ impl Worker {
     /// Report a decided failure and release its completion.
     ///
     /// The error value is dropped with the payload, so it is logged here while
-    /// the detail still exists; the completion carries only the outcome.
+    /// the detail still exists; the completion carries the outcome and the
+    /// reason sentence. The line names the signal and carries the sentence,
+    /// which states the size against the limit where the stage knows it, and
+    /// it is rate limited (see [`RefusalLog`]).
     fn refuse(&mut self, token: AckToken, failure: &Failure, stage: Stage) {
         let outcome = failure.outcome();
         let sentence = failure.sentence(stage, &self.cfg);
-        otel_warn!(
-            "series_parquet.request_failed",
-            outcome = outcome.reason(),
-            error = %failure.error()
-        );
+        if let Some(suppressed) = self.refusals.admit(clock::now()) {
+            otel_warn!(
+                "series_parquet.request_failed",
+                outcome = outcome.reason(),
+                signal = ?token.signal(),
+                reason = %sentence,
+                error = %failure.error(),
+                suppressed = suppressed
+            );
+        }
         self.notify.push_with(token, outcome, Some(sentence.into()));
     }
 
@@ -754,22 +798,26 @@ impl Worker {
 
     /// Seal the ACTIVE block and start writing it.
     ///
-    /// A no-op while the flush slot is taken -- by a write, or by the cleanup
-    /// of one that has already been decided: the rotation stays requested and
-    /// is served once the slot frees, which is what keeps the worker to two
-    /// blocks and keeps two writes off the same file names.
+    /// An empty ACTIVE block writes nothing, so it is replaced at once,
+    /// whatever holds the flush slot: waiting for an unrelated write to finish
+    /// would only keep admission closed across a window boundary. Otherwise
+    /// this is a no-op while the flush slot is taken -- by a write, or by the
+    /// cleanup of one that has already been decided: the rotation stays
+    /// requested and is served once the slot frees, which is what keeps the
+    /// worker to two blocks and keeps two writes off the same file names.
     pub(super) fn rotate(&mut self) {
-        if self.flushing.is_some() || self.cleaning.is_some() {
-            return;
-        }
-        self.rotation_requested = false;
         if self.active.data.is_empty() {
+            self.rotation_requested = false;
             // A parked request may be waiting for a later window than the one
             // this empty block was opened for, so the block is replaced rather
             // than kept; otherwise the resume would park it again.
             self.active = self.new_active();
             return;
         }
+        if self.flushing.is_some() || self.cleaning.is_some() {
+            return;
+        }
+        self.rotation_requested = false;
         if let Err(error) = self
             .active
             .data
@@ -826,6 +874,12 @@ impl Worker {
         &mut self,
         done: Result<FlushDone, tokio::sync::oneshot::error::RecvError>,
     ) {
+        // One FLUSHING slot: a decided block still unwinding holds it, so no
+        // new write can have started, and no second result can arrive.
+        debug_assert!(
+            self.cleaning.is_none(),
+            "a flush completes only while the slot has no cleanup"
+        );
         let Some(mut job) = self.flushing.take() else {
             return;
         };
@@ -973,14 +1027,28 @@ impl Worker {
         });
         let token = self.token_high_water.max(self.notify.token_high_water()) as u64;
         let cfg = &self.cfg.lake;
-        let cache = self.cache.len() as u64 * CACHE_ENTRY_BYTES;
-        let sort = 2 * cfg.sorting.run_target_bytes as u64;
-        let merge = 2 * cfg.sorting.merge_chunk_bytes as u64;
-        let writer = 3 * cfg.parquet.writer_limit_bytes as u64;
-        let upload = cfg.upload.part_bytes as u64 * (cfg.upload.concurrency as u64 + 1)
-            + cfg.sorting.merge_chunk_bytes as u64;
-        let conversion = 4 * cfg.ingress.max_request_bytes as u64;
-        let workspace = sort + merge + writer + upload + conversion + FIXED_WORKSPACE_BYTES;
+        // Every term is derived from unbounded configuration values, so the
+        // arithmetic saturates rather than overflowing: a budget written to
+        // mean "no practical limit" reports `u64::MAX`, not a panic.
+        let bytes = |n: usize| n as u64;
+        let cache = bytes(self.cache.len()).saturating_mul(CACHE_ENTRY_BYTES);
+        let sort = bytes(cfg.sorting.run_target_bytes).saturating_mul(2);
+        let merge = bytes(cfg.sorting.merge_chunk_bytes).saturating_mul(2);
+        let writer = bytes(cfg.parquet.writer_limit_bytes).saturating_mul(3);
+        let upload = bytes(cfg.upload.part_bytes)
+            .saturating_mul(bytes(cfg.upload.concurrency).saturating_add(1))
+            .saturating_add(bytes(cfg.sorting.merge_chunk_bytes));
+        let conversion = bytes(cfg.ingress.max_request_bytes).saturating_mul(4);
+        let workspace = [
+            sort,
+            merge,
+            writer,
+            upload,
+            conversion,
+            FIXED_WORKSPACE_BYTES,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
         let spare_tokens = self
             .active
             .tokens
@@ -999,11 +1067,17 @@ impl Worker {
             + self.notify.bytes() as u64
             + (spare_tokens * size_of::<AckToken>()) as u64;
         self.accounting.set(accounted);
-        let budget = 2 * cfg.ingress.max_block_bytes as u64
-            + cfg.ingress.max_extracted_bytes as u64
-            + self.cfg.cache_entries as u64 * CACHE_ENTRY_BYTES
-            + 2 * cfg.ingress.max_requests_per_block as u64 * token
-            + workspace;
+        let budget = [
+            bytes(cfg.ingress.max_block_bytes).saturating_mul(2),
+            bytes(cfg.ingress.max_extracted_bytes),
+            bytes(self.cfg.cache_entries).saturating_mul(CACHE_ENTRY_BYTES),
+            bytes(cfg.ingress.max_requests_per_block)
+                .saturating_mul(2)
+                .saturating_mul(token),
+            workspace,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
         let oldest = self
             .active
             .tokens

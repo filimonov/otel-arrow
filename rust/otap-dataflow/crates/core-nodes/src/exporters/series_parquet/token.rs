@@ -70,6 +70,11 @@ impl AckToken {
         self.received
     }
 
+    /// Signal type of the request.
+    pub(super) fn signal(&self) -> SignalType {
+        self.signal
+    }
+
     /// Bytes owned outside the token's own inline storage.
     ///
     /// Charged separately because the inline part is already accounted for by
@@ -226,10 +231,14 @@ pub(super) struct Notifier {
 
 impl Notifier {
     /// Create a notifier that may hold `capacity` live completions.
+    ///
+    /// The queue grows with the completions it actually holds rather than
+    /// being reserved at `capacity`, which is derived from an unbounded
+    /// configuration value.
     pub(super) fn new(effects: EffectHandler<OtapPdata>, capacity: usize) -> Self {
         Self {
             effects,
-            queue: VecDeque::with_capacity(capacity),
+            queue: VecDeque::new(),
             sending: None,
             capacity,
             outcomes: [0; OUTCOMES],
@@ -695,6 +704,27 @@ mod tests {
         }
         assert_eq!(delivered + notify.len(), N);
         assert_eq!(delivered, N);
+    }
+
+    /// Scenario: a notifier is created with a capacity no queue could ever
+    /// hold -- what a very large `window.max_requests_per_block` doubles to --
+    /// and then used.
+    /// Guarantees: creation allocates nothing up front and the queue grows
+    /// only with the completions it actually holds, so a large configured
+    /// bound neither aborts the worker at start nor reserves memory it never
+    /// uses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_huge_capacity_is_not_preallocated() {
+        let (handler, mut rx) = effects(1);
+        let mut notify = Notifier::new(handler, usize::MAX / 2);
+        let (token, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(token, Outcome::Ack);
+        notify.next().await.expect("the completion is accepted");
+        assert!(matches!(
+            rx.recv().await.expect("an ack"),
+            PipelineCompletionMsg::DeliverAck { .. }
+        ));
     }
 
     /// Scenario: one completion is parked in a blocked send and a second,

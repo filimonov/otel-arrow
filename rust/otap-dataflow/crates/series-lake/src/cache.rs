@@ -31,11 +31,17 @@ pub struct SeriesCache {
 
 impl SeriesCache {
     /// Create a cache holding at most `max_entries` ids (at least 1).
+    ///
+    /// Nothing is allocated up front: the bound is a configured ceiling, and
+    /// a value written to mean "no practical limit" must not reserve -- or
+    /// fail to reserve -- a table of that size at startup.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         let cap = NonZeroUsize::new(max_entries.max(1)).expect("max(1) is non-zero");
+        let mut inner = LruCache::unbounded();
+        inner.resize(cap);
         Self {
-            inner: LruCache::new(cap),
+            inner,
             stats: CacheStats::default(),
         }
     }
@@ -107,6 +113,20 @@ mod tests {
 
     fn id(n: u8) -> SeriesId {
         [n; 16]
+    }
+
+    /// Scenario: the cache is created with `usize::MAX` entries, the value an
+    /// operator writes to mean "no practical limit", and then used.
+    /// Guarantees: creation allocates nothing up front -- it neither aborts
+    /// nor panics on capacity overflow -- and the cache still works, so a
+    /// large configured bound costs only the entries actually held.
+    #[test]
+    fn an_unbounded_capacity_is_not_preallocated() {
+        let mut cache = SeriesCache::new(usize::MAX);
+        cache.touch(id(1));
+        cache.mark_committed(id(1), PartitionId { date: 1, hour: 2 });
+        assert!(cache.is_committed(&id(1), PartitionId { date: 1, hour: 2 }));
+        assert_eq!(cache.len(), 1);
     }
 
     /// Scenario: a series is touched, then committed for hour P, then asked about P and Q.

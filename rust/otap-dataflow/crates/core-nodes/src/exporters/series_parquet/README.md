@@ -115,7 +115,9 @@ decided it and what to do, for example `request of 20000000 bytes exceeds
 ingress.max_request_bytes (16777216 bytes); split the batch upstream or raise
 the limit`. Any error detail it quotes is cut to 256 bytes and kept on one
 line. The short machine form of the outcome is the `reason` label of the
-`nacks` metric.
+`nacks` metric. Refusals are also logged at WARN as
+`series_parquet.request_failed` with the signal and the same sentence, at most
+one line per second; the next line reports how many were left out.
 
 A request refused for `window.max_block_bytes` is judged on its worst case,
 as if every series it carries were new to the block, whatever the descriptor

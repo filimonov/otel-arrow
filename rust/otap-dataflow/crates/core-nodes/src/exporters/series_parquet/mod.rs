@@ -288,15 +288,11 @@ async fn drive(
                     None => std::future::pending().await,
                 }
             } => {
+                // The decided block moves into the cleanup half of the same
+                // FLUSHING slot, so no rotation can be served here: the one a
+                // parked request waits for is served, with its resume in the
+                // same turn, once the cleanup branch below frees the slot.
                 worker.complete(done);
-                // The flush slot is free, so the rotation the parked request
-                // is waiting for can be served before the loop takes anything
-                // else; the resume has to happen in the same turn, or a newer
-                // request could reach the new block first.
-                if worker.rotation_requested {
-                    worker.rotate();
-                }
-                worker.resume_pending();
                 notify_turns = 0;
             }
 
@@ -333,11 +329,12 @@ async fn drive(
             }
 
             // Always ready when it is enabled, so a requested rotation happens
-            // before the next message is taken.
+            // before the next message is taken. An empty ACTIVE block needs
+            // no flush slot to be replaced.
             () = std::future::ready(()),
                 if worker.rotation_requested
-                    && worker.flushing.is_none()
-                    && worker.cleaning.is_none() => {
+                    && (worker.active.data.is_empty()
+                        || (worker.flushing.is_none() && worker.cleaning.is_none())) => {
                 worker.rotate();
                 worker.resume_pending();
                 notify_turns = 0;
