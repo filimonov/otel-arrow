@@ -8,6 +8,25 @@ loki.source.file "series" {
 
 otelcol.receiver.loki "series" {
   output {
+    logs = [otelcol.processor.transform.series.input]
+  }
+}
+
+// The lake takes its producer_id column from a resource attribute, which the
+// Loki bridge does not supply: without this the rows would carry an empty
+// producer. `host.id` is the attribute named by `producer_id_attribute` in the
+// series Parquet exporter config, and `service.name` feeds the denormalized
+// service column.
+otelcol.processor.transform "series" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["host.id"], "alloy-producer")`,
+      `set(attributes["service.name"], "series-e2e-service")`,
+    ]
+  }
+  output {
     logs = [otelcol.processor.attributes.series.input]
   }
 }

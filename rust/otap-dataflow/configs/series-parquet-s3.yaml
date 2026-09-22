@@ -16,7 +16,9 @@
 # AWS auth provider configuration instead of static credentials.
 #
 # `series-parquet.alloy` is the matching Grafana Alloy producer: it tails a
-# file and exports OTLP logs to the receiver below.
+# file and exports OTLP logs to the receiver below. It sets the resource
+# attribute named by `producer_id_attribute` (`host.id`), which is what fills
+# the `producer_id` column of every values row it produces.
 #
 # Usage:
 #   df_engine --config configs/series-parquet-s3.yaml \

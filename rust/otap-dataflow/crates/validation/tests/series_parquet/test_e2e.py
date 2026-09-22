@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -995,6 +996,137 @@ def sql_string(value):
     return "'" + str(value).replace(chr(92), chr(92) * 2).replace("'", "''") + "'"
 
 
+def alloy_producer_id():
+    """The `host.id` the reference Alloy config stamps on its resource.
+
+    Read out of the shipped config rather than repeated here, so the test
+    cannot drift away from the deployment it documents.
+    """
+    text = (WORKSPACE / "configs/series-parquet.alloy").read_text()
+    found = re.search(r'set\(attributes\["host\.id"\], "([^"]+)"\)', text)
+    if not found:
+        raise AssertionError("the Alloy config no longer sets a resource host.id")
+    return found.group(1)
+
+
+# Columns every dataset must contribute to the canonical row, checked against
+# the columns the files actually carry so the comparison cannot quietly shrink.
+REQUIRED_COLUMNS = {
+    ("logs", "values"): {
+        "series_id", "producer_id", "time", "time_unix_nano", "observed_time",
+        "observed_time_unix_nano", "severity_number", "severity_text", "body",
+        "event_name", "trace_id", "span_id", "flags", "attrs", "service_name",
+    },
+    ("metrics", "number"): {
+        "series_id", "producer_id", "metric_name", "time", "time_unix_nano",
+        "start_time", "start_time_unix_nano", "flags", "value_int",
+        "value_double", "service_name",
+    },
+    ("metrics", "histogram"): {
+        "series_id", "producer_id", "metric_name", "time", "time_unix_nano",
+        "start_time", "start_time_unix_nano", "flags", "count", "sum", "min",
+        "max", "bucket_counts", "explicit_bounds", "service_name",
+    },
+    ("logs", "series"): {
+        "series_id", "identity_bytes", "emitted_at", "resource_schema_url",
+        "resource_attrs", "scope_name", "scope_version", "scope_schema_url",
+        "scope_attrs", "attrs", "service_name",
+    },
+    ("metrics", "series"): {
+        "series_id", "identity_bytes", "emitted_at", "resource_schema_url",
+        "resource_attrs", "scope_name", "scope_version", "scope_schema_url",
+        "scope_attrs", "attrs", "metric_name", "unit", "metric_type",
+        "temporality", "is_monotonic", "description", "service_name",
+    },
+}
+
+
+def canonical_column(kind, column):
+    """DuckDB and ClickHouse expressions that render one column identically.
+
+    Every rendering is a string and never NULL, so the per-row strings the two
+    readers build can be compared directly. Doubles are rendered as their value
+    scaled to microseconds-of-a-unit and rounded, which is the one place the
+    comparison is not bit exact: the two engines print floating point
+    differently, and no test value needs finer resolution than 1e-6.
+    """
+    if kind == "VARCHAR":
+        return f"coalesce({column}, 'null')", f"ifNull({column}, 'null')"
+    if kind in ("BIGINT", "INTEGER", "SMALLINT", "TINYINT", "HUGEINT", "UBIGINT"):
+        return (
+            f"coalesce(CAST({column} AS VARCHAR), 'null')",
+            f"ifNull(toString({column}), 'null')",
+        )
+    if kind == "BOOLEAN":
+        case = (
+            f"CASE WHEN {column} IS NULL THEN 'null' "
+            f"WHEN {column} THEN 'true' ELSE 'false' END"
+        )
+        return case, case
+    if kind == "DOUBLE" or kind == "FLOAT":
+        return (
+            f"coalesce(CAST(CAST(round({column} * 1000000) AS BIGINT) AS VARCHAR), "
+            "'null')",
+            f"ifNull(toString(toInt64(round({column} * 1000000))), 'null')",
+        )
+    if kind == "BLOB":
+        return f"coalesce(hex({column}), 'null')", f"ifNull(hex({column}), 'null')"
+    if kind.startswith("TIMESTAMP"):
+        return (
+            f"coalesce(CAST(epoch_us({column}) AS VARCHAR), 'null')",
+            f"ifNull(toString(toUnixTimestamp64Micro({column})), 'null')",
+        )
+    if kind == "MAP(VARCHAR, VARCHAR)":
+        return (
+            f"coalesce(array_to_string(list_transform(list_sort(map_keys({column})), "
+            f"k -> k || '=' || coalesce(list_extract(map_extract({column}, k), 1), "
+            "'null')), ','), 'null')",
+            f"ifNull(arrayStringConcat(arrayMap(k -> concat(k, '=', "
+            f"ifNull(toString({column}[k]), 'null')), arraySort(mapKeys({column}))), "
+            "','), 'null')",
+        )
+    if kind in ("BIGINT[]", "INTEGER[]"):
+        return (
+            f"coalesce(array_to_string(list_transform({column}, "
+            "x -> coalesce(CAST(x AS VARCHAR), 'null')), ','), 'null')",
+            f"ifNull(arrayStringConcat(arrayMap(x -> ifNull(toString(x), 'null'), "
+            f"{column}), ','), 'null')",
+        )
+    if kind in ("DOUBLE[]", "FLOAT[]"):
+        return (
+            f"coalesce(array_to_string(list_transform({column}, "
+            "x -> coalesce(CAST(CAST(round(x * 1000000) AS BIGINT) AS VARCHAR), "
+            "'null')), ','), 'null')",
+            f"ifNull(arrayStringConcat(arrayMap(x -> ifNull(toString(toInt64("
+            f"round(x * 1000000))), 'null'), {column}), ','), 'null')",
+        )
+    raise AssertionError(f"no canonical rendering for {kind} column {column}")
+
+
+def canonical_row(db, relation, alias, required, skip=("filename",)):
+    """One expression per reader that renders a whole row as a string.
+
+    The column list comes from the files themselves, so a column the exporter
+    adds is compared from the day it appears; `required` is what must be in
+    that list, so a projection that silently loses columns fails instead.
+    """
+    columns = [
+        (name, kind)
+        for name, kind, *_ in db.execute(f"DESCRIBE SELECT * FROM {relation}").fetchall()
+        if name not in skip
+    ]
+    names = {name for name, _ in columns}
+    missing = set(required) - names
+    if missing:
+        raise AssertionError(f"{relation} is missing columns {sorted(missing)}")
+    duck, clickhouse = [], []
+    for name, kind in sorted(columns):
+        one, other = canonical_column(kind, f"{alias}.{name}")
+        duck.append(f"'{name}=' || {one}")
+        clickhouse.append(f"'{name}=' || {other}")
+    return " || '|' || ".join(duck), " || '|' || ".join(clickhouse)
+
+
 def verify_readers(
     test,
     root,
@@ -1008,11 +1140,16 @@ def verify_readers(
 
     DuckDB reads the files in process and ClickHouse reads the same files
     through `clickhouse-local`, both with the latest-descriptor window join
-    the crate README documents. A disagreement between them is a defect in
-    what was written, not in one reader.
+    the crate README documents. The comparison is over every column of the
+    values row and of the descriptor it joins to, rendered into one string per
+    row by expressions written separately for each engine, so a disagreement
+    anywhere in the row is caught rather than only in the few columns a test
+    happens to name. A disagreement is a defect in what was written, not in
+    one reader.
     """
     root = Path(root).resolve()
     alloy_ids = set(alloy_ids)
+    producer = alloy_producer_id()
     with duckdb.connect() as db, clickhouse_reader(root) as clickhouse:
         for signal, dataset in (
             ("logs", "values"),
@@ -1026,19 +1163,25 @@ def verify_readers(
                 test.assertEqual(expected_count, 0, f"missing {signal}/{dataset}")
                 continue
             series = f"v=1/signal={signal}/dataset=series/**/*.parquet"
+            # Hive partitioning is turned off so that both readers see the
+            # same columns: ClickHouse's file() does not synthesize `date` and
+            # `hour` from the path, and the partition values are checked
+            # against the file names in verify_files instead.
             duck_values = (
-                f"read_parquet({sql_string(root / relative)}, union_by_name=true)"
+                f"read_parquet({sql_string(root / relative)}, union_by_name=true, "
+                "hive_partitioning=false)"
             )
             duck_series = (
                 f"read_parquet({sql_string(root / series)}, union_by_name=true, "
-                "filename=true)"
+                "filename=true, hive_partitioning=false)"
             )
             ch_values = f"file({sql_string(relative)}, 'Parquet')"
             ch_series = f"file({sql_string(series)}, 'Parquet')"
-            projection = (
-                "v.body, coalesce(v.attrs['e2e.source'], '')"
-                if signal == "logs"
-                else "s.attrs['request.id']"
+            duck_value_row, ch_value_row = canonical_row(
+                db, duck_values, "v", REQUIRED_COLUMNS[(signal, dataset)]
+            )
+            duck_series_row, ch_series_row = canonical_row(
+                db, duck_series, "s", REQUIRED_COLUMNS[(signal, "series")]
             )
             duck_sql = f"""
                 WITH canonical AS (
@@ -1047,7 +1190,7 @@ def verify_readers(
                         PARTITION BY series_id
                         ORDER BY emitted_at DESC, filename DESC) = 1
                 )
-                SELECT {projection} FROM {duck_values} v
+                SELECT {{projection}} FROM {duck_values} v
                 INNER JOIN canonical s ON v.series_id = s.series_id
             """
             ch_sql = f"""
@@ -1059,13 +1202,39 @@ def verify_readers(
                         FROM {ch_series}
                     ) WHERE rank = 1
                 )
-                SELECT {projection} FROM {ch_values} AS v
+                SELECT {{projection}} FROM {ch_values} AS v
                 INNER JOIN canonical AS s ON v.series_id = s.series_id
             """
-            duck_rows = sorted(db.execute(duck_sql).fetchall())
-            ch_rows = sorted(clickhouse(ch_sql))
+            whole = f"{duck_value_row} || '|' || {duck_series_row}"
+            ch_whole = f"{ch_value_row} || '|' || {ch_series_row}"
+            duck_all = sorted(
+                row[0]
+                for row in db.execute(duck_sql.format(projection=whole)).fetchall()
+            )
+            ch_all = sorted(
+                row[0] for row in clickhouse(ch_sql.format(projection=ch_whole))
+            )
             test.assertEqual(
-                ch_rows, duck_rows, f"reader disagreement for {signal}/{dataset}"
+                len(ch_all),
+                len(duck_all),
+                f"row count disagreement for {signal}/{dataset}",
+            )
+            for one, other in zip(duck_all, ch_all):
+                test.assertEqual(
+                    other, one, f"reader disagreement for {signal}/{dataset}"
+                )
+            # The expectations the producer itself can state: what was sent,
+            # which producer sent it, and that the descriptor carries the same
+            # resource identity the values row was stamped with.
+            projection = (
+                "v.body, coalesce(v.attrs['e2e.source'], ''), v.producer_id, "
+                "coalesce(list_extract(map_extract(s.resource_attrs, 'host.id'), 1), '')"
+                if signal == "logs"
+                else "s.attrs['request.id'], v.producer_id, "
+                "coalesce(list_extract(map_extract(s.resource_attrs, 'host.id'), 1), '')"
+            )
+            duck_rows = sorted(
+                db.execute(duck_sql.format(projection=projection)).fetchall()
             )
             before = db.execute(f"SELECT count(*) FROM {duck_values}").fetchone()[0]
             ch_before = int(clickhouse(f"SELECT count(*) FROM {ch_values}")[0][0])
@@ -1075,13 +1244,27 @@ def verify_readers(
                 before,
                 "latest-descriptor join must preserve cardinality",
             )
+            test.assertEqual(
+                len(duck_all), before, "the whole-row comparison skipped rows"
+            )
             if allow_duplicates:
                 test.assertGreaterEqual(before, expected_count)
             else:
                 test.assertEqual(before, expected_count)
+            for row in duck_rows:
+                test.assertTrue(row[-2], f"empty producer_id in {signal}/{dataset}")
+                test.assertEqual(
+                    row[-1], row[-2], "descriptor and values disagree on host.id"
+                )
             if signal == "logs":
                 expected = sorted(
-                    (body, "alloy-file" if body in alloy_ids else "") for body in log_ids
+                    (
+                        body,
+                        "alloy-file" if body in alloy_ids else "",
+                        producer if body in alloy_ids else "producer-1",
+                        producer if body in alloy_ids else "producer-1",
+                    )
+                    for body in log_ids
                 )
                 if allow_duplicates:
                     test.assertEqual(set(duck_rows), set(expected))
@@ -1229,6 +1412,41 @@ class DockerStore:
             self.container = None
 
 
+# The frozen object layout of spec section 5.3. The writer id is matched
+# loosely because it is user configured and may itself contain a dash; the
+# boot id and sequence have fixed shapes, so the split stays unambiguous.
+PART_NAME = re.compile(
+    r"^v=1/signal=(?P<signal>logs|metrics)"
+    r"/dataset=(?P<dataset>series|values|number|histogram)"
+    r"/date=(?P<date>\d{4}-\d{2}-\d{2})/hour=(?P<hour>\d{2})"
+    r"/part-(?P<stamp>\d{8}T\d{6}Z)-(?P<writer>.+)"
+    r"-(?P<boot>[0-9a-f]{32})-(?P<seq>\d{8})\.parquet$"
+)
+
+
+def verify_layout(test, root, path, metadata):
+    """Check one object's path against the layout and its own metadata.
+
+    The name is not merely well shaped: every component of it has to agree
+    with the file metadata, and the Hive partition has to agree with the
+    window the name records, so a reader can locate a file from the metadata
+    alone and a writer cannot drift from the documented layout.
+    """
+    relative = Path(path).relative_to(root).as_posix()
+    match = PART_NAME.fullmatch(relative)
+    test.assertTrue(match, f"object is not in the frozen layout: {relative}")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(int(metadata["window_start"])))
+    test.assertEqual(match["stamp"], stamp, f"window stamp of {relative}")
+    test.assertEqual(match["writer"], metadata["writer_id"], f"writer of {relative}")
+    test.assertEqual(match["boot"], metadata["boot_id"], f"boot id of {relative}")
+    test.assertEqual(int(match["seq"]), int(metadata["seq"]), f"sequence of {relative}")
+    test.assertEqual(
+        match["date"], f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}", f"date of {relative}"
+    )
+    test.assertEqual(match["hour"], stamp[9:11], f"hour of {relative}")
+    return match
+
+
 def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
     """Read every downloaded part file and check the lake's own invariants.
 
@@ -1256,6 +1474,7 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                     [str(path)],
                 ).fetchall()
             )
+            verify_layout(test, root, path, metadata)
             signal = partitions["signal"]
             dataset = partitions["dataset"]
             worker = (metadata["writer_id"], metadata["boot_id"])
@@ -1350,6 +1569,24 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                     test.assertEqual(
                         before, after, "canonical join must preserve values cardinality"
                     )
+
+
+def wait_for_metric(engine, name, target, timeout):
+    """Wait for an exporter metric to reach `target`, returning the best seen.
+
+    The largest value seen across polls is kept rather than the last one: a
+    counter that the engine drains into its reporting interval is only visible
+    in the snapshot that carries it, and this has to observe the event, not
+    catch it still standing there.
+    """
+    best = 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        best = max(best, metric_max(engine_metrics(engine), name))
+        if best >= target:
+            return best
+        time.sleep(0.05)
+    return best
 
 
 def export_with_retry(engine, body, attempts=5, timeout=120):
@@ -1471,7 +1708,18 @@ class DockerSlice(unittest.TestCase):
                             pool.submit(export_with_retry, engine, body)
                             for body in during
                         ]
-                        time.sleep(8)
+                        # The outage lasts until the engine itself reports a
+                        # block it could not write, not until a fixed sleep
+                        # expires: that is the state this test is about.
+                        failures = wait_for_metric(engine, "flush.failures", 1, 120)
+                        self.assertGreaterEqual(
+                            failures, 1, "no block failed while the store was stopped"
+                        )
+                        self.assertEqual(
+                            [call.done() for call in calls],
+                            [False] * len(calls),
+                            "a producer finished while the store was stopped",
+                        )
                         store.recover()
                         retries = sum(call.result(timeout=180) for call in calls)
                     engine.shutdown()
@@ -1578,6 +1826,110 @@ class DockerSlice(unittest.TestCase):
             )
             verify_files(self, target, ids, 0, allow_duplicates=True)
             verify_readers(self, target, ids, 0, allow_duplicates=True)
+
+    # Scenario: the store is stopped while a sealed block is being written, so
+    # the flush has to retry, and it is started again well inside the flush
+    # deadline.
+    # Guarantees: the retried block lands under the object names it was given
+    # the first time -- same window stamp, writer id, boot id and sequence --
+    # and leaves no extra part file behind, so a retry rewrites an object
+    # rather than adding one.
+    def test_retry_keeps_frozen_object_names(self):
+        require_clickhouse()
+        with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
+            overrides = {
+                # The deadline outlasts the outage, so the flush is retried
+                # rather than failed; the object store client itself gives up
+                # at once, so every attempt is the exporter's own.
+                "window": {"interval": "1s", "flush_retry_deadline": "120s"},
+                "retry": {
+                    "max_retries": 0,
+                    "init_backoff": "200ms",
+                    "max_backoff": "1s",
+                    "backoff_base": 2.0,
+                    "retry_timeout": "1s",
+                },
+            }
+            with Engine(
+                directory,
+                storage=store.storage,
+                overrides=overrides,
+                telemetry_interval="50ms",
+            ) as engine:
+                try:
+                    store.stop()
+                    call = engine.logs.Export.future(
+                        log_request("frozen-0"), timeout=180
+                    )
+                    flushing = 0
+                    deadline = time.monotonic() + 60
+                    while time.monotonic() < deadline:
+                        flushing = max(
+                            flushing,
+                            engine.exporter_gauges("block_flushing_bytes")[
+                                "block_flushing_bytes"
+                            ],
+                        )
+                        if flushing > 0:
+                            break
+                        time.sleep(0.05)
+                    self.assertGreater(
+                        flushing, 0, "the block was never handed to a flush"
+                    )
+                    self.assertFalse(
+                        call.done(), "the request was decided while the store was down"
+                    )
+                    store.recover()
+                    call.result(timeout=180)
+                    retries = wait_for_metric(engine, "flush.retries", 1, 30)
+                    self.assertGreaterEqual(
+                        retries, 1, "the flush reached the store on its first attempt"
+                    )
+                    engine.shutdown()
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+            target, bodies = stored_bodies(store, directory, "downloaded")
+            self.assertEqual(bodies, ["frozen-0"])
+            files = sorted(Path(target).rglob("*.parquet"))
+            # One values file and one descriptor file, in two dataset
+            # directories: a retry rewrote the same two objects. The two share
+            # a file name, which is why the directories are counted too.
+            self.assertEqual(
+                len(files), 2, f"a retry left extra part files behind: {files}"
+            )
+            self.assertEqual(len({path.parent for path in files}), 2, files)
+            verify_files(self, target, ["frozen-0"], 0)
+            verify_readers(self, target, ["frozen-0"], 0)
+            # Both files belong to one logical block, and each one's name
+            # still carries the sequence, boot id and window its metadata
+            # records: the retry rewrote the objects the first attempt named.
+            blocks = set()
+            for path in files:
+                with duckdb.connect() as db:
+                    metadata = dict(
+                        db.execute(
+                            "SELECT decode(key), decode(value) FROM "
+                            "parquet_kv_metadata(?)",
+                            [str(path)],
+                        ).fetchall()
+                    )
+                blocks.add(
+                    (metadata["seq"], metadata["boot_id"], metadata["window_start"])
+                )
+                self.assertTrue(
+                    path.name.endswith(f"-{int(metadata['seq']):08d}.parquet"),
+                    path.name,
+                )
+            self.assertEqual(len(blocks), 1, f"two blocks were written: {blocks}")
+            # Nothing else reached the bucket either, so no attempt left a
+            # stray object behind under a name of its own.
+            keys = []
+            for page in store.client.get_paginator("list_objects_v2").paginate(
+                Bucket=store.bucket, Prefix="otel/"
+            ):
+                keys += [item["Key"] for item in page.get("Contents", [])]
+            self.assertEqual(len(keys), 2, f"the bucket holds extra objects: {keys}")
 
 
 class RestartSlice(unittest.TestCase):
