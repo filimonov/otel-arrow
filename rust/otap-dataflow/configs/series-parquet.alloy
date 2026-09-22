@@ -1,0 +1,46 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+loki.source.file "series" {
+  targets = [{ __path__ = "/input/events.log", job = "series-e2e" }]
+  forward_to = [otelcol.receiver.loki.series.receiver]
+  tail_from_end = false
+}
+
+otelcol.receiver.loki "series" {
+  output {
+    logs = [otelcol.processor.attributes.series.input]
+  }
+}
+
+otelcol.processor.attributes "series" {
+  action {
+    key = "e2e.source"
+    value = "alloy-file"
+    action = "insert"
+  }
+  output {
+    logs = [otelcol.exporter.otlp.series.input]
+  }
+}
+
+otelcol.exporter.otlp "series" {
+  timeout = "6s"
+  client {
+    endpoint = sys.env("OTLP_ENDPOINT")
+    compression = "none"
+    tls {
+      insecure = true
+    }
+  }
+  sending_queue {
+    enabled = true
+    num_consumers = 1
+    queue_size = 128
+  }
+  retry_on_failure {
+    enabled = true
+    initial_interval = "200ms"
+    max_interval = "1s"
+    max_elapsed_time = "0s"
+  }
+}

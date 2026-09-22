@@ -2,19 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real OTLP producer, df_engine process and Parquet reader."""
 import collections
+import concurrent.futures
+import contextlib
+import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 
+import boto3
 import duckdb
 import grpc
+import xxhash
 import yaml
+from botocore.config import Config as BotoConfig
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2 as logs_pb
 from opentelemetry.proto.collector.logs.v1 import logs_service_pb2_grpc as logs_rpc
 from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2 as metrics_pb
@@ -721,6 +730,971 @@ class ShutdownSlice(unittest.TestCase):
             except Exception:
                 print(engine.engine_log())
                 raise
+
+
+IMAGE_DEFAULTS = {
+    "minio": "minio/minio:RELEASE.2025-04-22T22-12-26Z",
+    "rustfs": "rustfs/rustfs:1.0.0-rc.3",
+    "clickhouse": "clickhouse/clickhouse-server:26.7.4",
+    "alloy": "grafana/alloy:v1.19.2",
+}
+
+
+def unavailable(reason):
+    """Skip, unless the runner demands that the containers be present.
+
+    A developer without Docker still gets a green suite; a lane that sets
+    `SERIES_REQUIRE_DOCKER=1` gets a failure instead, so the container tests
+    cannot silently stop running where they are supposed to run.
+    """
+    if os.environ.get("SERIES_REQUIRE_DOCKER") == "1":
+        raise AssertionError(reason)
+    raise unittest.SkipTest(reason)
+
+
+def require_docker_image(kind):
+    """The image tag to run, once Docker and the image are known to be there."""
+    if not shutil.which("docker"):
+        unavailable("Docker CLI absent")
+    try:
+        probe = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        unavailable("Docker daemon did not respond within 10 seconds")
+    if probe.returncode:
+        unavailable("Docker daemon unavailable")
+    image = os.environ.get("SERIES_" + kind.upper() + "_IMAGE", IMAGE_DEFAULTS[kind])
+    present = (
+        subprocess.run(
+            ["docker", "image", "inspect", image], capture_output=True, timeout=10
+        ).returncode
+        == 0
+    )
+    if not present and kind == "alloy":
+        # Alloy is the only image this plan authorizes the test runner to pull.
+        try:
+            pull = subprocess.run(
+                ["docker", "pull", image], capture_output=True, text=True, timeout=180
+            )
+            present = pull.returncode == 0
+        except subprocess.TimeoutExpired:
+            present = False
+    if not present:
+        unavailable(f"Selected local {kind} image is absent: {image}")
+    return image
+
+
+def require_clickhouse():
+    """A `clickhouse-local` binary, or None when the reader runs in Docker."""
+    binary = os.environ.get("SERIES_CLICKHOUSE_LOCAL", "/usr/bin/clickhouse-local")
+    if Path(binary).is_file() and os.access(binary, os.X_OK):
+        return binary
+    binary = (
+        shutil.which("clickhouse-local")
+        if "SERIES_CLICKHOUSE_LOCAL" not in os.environ
+        else None
+    )
+    if binary:
+        return binary
+    require_docker_image("clickhouse")
+    return None
+
+
+class AlloyProducer:
+    """Grafana Alloy tailing a file into the engine's OTLP gRPC receiver.
+
+    The container runs on the host network so that it can reach a receiver
+    bound to loopback, and the reference River config the repository ships is
+    the one it runs: the test exercises the documented deployment rather than
+    a fixture of its own.
+    """
+
+    def __init__(self, directory, engine):
+        self.root = Path(directory) / "alloy"
+        self.engine = engine
+        self.name = "series-alloy-" + uuid.uuid4().hex
+        self.container = None
+
+    def __enter__(self):
+        if not sys.platform.startswith("linux"):
+            unavailable("Alloy host-network fixture requires Linux")
+        image = require_docker_image("alloy")
+        self.root.mkdir(mode=0o755)
+        self.lines = self.root / "events.log"
+        self.lines.write_text("")
+        config = self.root / "config.alloy"
+        config.write_text((WORKSPACE / "configs/series-parquet.alloy").read_text())
+        port = free_port()
+        args = [
+            "docker", "run", "--pull=never", "--detach", "--name", self.name,
+            "--network", "host", "--user", f"{os.getuid()}:{os.getgid()}",
+            "--mount", f"type=bind,src={self.root.resolve()},dst=/input,readonly",
+            "-e", f"OTLP_ENDPOINT=127.0.0.1:{self.engine.grpc_port}",
+            image, "run", "--storage.path=/tmp/alloy-state",
+            f"--server.http.listen-addr=127.0.0.1:{port}", "/input/config.alloy",
+        ]
+        try:
+            self.container = subprocess.check_output(args, text=True, timeout=30).strip()
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                state = subprocess.check_output(
+                    [
+                        "docker", "inspect", "--format", "{{.State.Running}}",
+                        self.container,
+                    ],
+                    text=True,
+                    timeout=10,
+                ).strip()
+                if state != "true":
+                    raise AssertionError(
+                        "Alloy exited before becoming ready:\n" + self.logs()
+                    )
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/-/ready", timeout=1
+                    ) as response:
+                        if response.status == 200:
+                            return self
+                except (OSError, urllib.error.URLError):
+                    pass
+                time.sleep(0.1)
+            raise AssertionError("Alloy readiness deadline exceeded")
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def logs(self):
+        """Everything the Alloy container has written, for a failure message."""
+        if not self.container:
+            return ""
+        done = subprocess.run(
+            ["docker", "logs", self.container],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return done.stdout + done.stderr
+
+    def write(self, ids):
+        """Append one line per id and make the bytes visible to the tail."""
+        with self.lines.open("a") as stream:
+            for item in ids:
+                if "\n" in item:
+                    raise ValueError("each expected body must be one log line")
+                stream.write(item + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def __exit__(self, *exc):
+        if self.container:
+            try:
+                subprocess.run(
+                    ["docker", "stop", "--time", "10", self.container],
+                    check=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+                (self.root / "alloy.log").write_text(self.logs())
+            finally:
+                subprocess.run(
+                    ["docker", "rm", "--force", "--volumes", self.container],
+                    check=False,
+                    capture_output=True,
+                    timeout=20,
+                )
+                self.container = None
+
+
+def wait_for_alloy(store, directory, ids, timeout=90):
+    """Wait until every line Alloy was given is readable from the store.
+
+    Alloy owns its own file positions and sending queue, so delivery is
+    eventual from the test's point of view; the engine's own acknowledgement
+    only covers the requests the test itself sent.
+    """
+    target = Path(directory) / "downloaded"
+    deadline = time.monotonic() + timeout
+    actual = set()
+    while time.monotonic() < deadline:
+        store.download(target)
+        paths = sorted((target / "v=1/signal=logs/dataset=values").rglob("*.parquet"))
+        if paths:
+            with duckdb.connect() as db:
+                actual = {
+                    row[0]
+                    for row in db.execute(
+                        "SELECT body FROM read_parquet(?, union_by_name=true)",
+                        [[str(path) for path in paths]],
+                    ).fetchall()
+                }
+            if set(ids).issubset(actual):
+                return
+        time.sleep(0.2)
+    missing = sorted(set(ids) - actual)
+    raise AssertionError(f"Alloy rows did not become durable: {missing}")
+
+
+@contextlib.contextmanager
+def clickhouse_reader(root):
+    """A `query(sql)` callable backed by clickhouse-local over `root`."""
+    root = Path(root).resolve()
+    binary = require_clickhouse()
+    container = None
+    try:
+        if binary:
+            prefix = [binary]
+        else:
+            image = require_docker_image("clickhouse")
+            name = "series-reader-" + uuid.uuid4().hex
+            container = subprocess.check_output(
+                [
+                    "docker", "run", "--pull=never", "--detach", "--name", name,
+                    "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+                    "--mount", f"type=bind,src={root},dst=/data,readonly",
+                    "--entrypoint", "/bin/sleep", image, "infinity",
+                ],
+                text=True,
+                timeout=30,
+            ).strip()
+            prefix = [
+                "docker", "exec", "--workdir", "/data", container, "clickhouse", "local",
+            ]
+
+        def query(sql):
+            result = subprocess.run(
+                prefix
+                + [
+                    "--query",
+                    sql + " FORMAT JSONCompactEachRow",
+                    "--output_format_json_quote_64bit_integers=0",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            return [
+                tuple(json.loads(line))
+                for line in result.stdout.splitlines()
+                if line.strip()
+            ]
+
+        yield query
+    finally:
+        if container:
+            subprocess.run(
+                ["docker", "rm", "--force", "--volumes", container],
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+
+
+def sql_string(value):
+    """Quote a path as a SQL string literal for both readers."""
+    return "'" + str(value).replace(chr(92), chr(92) * 2).replace("'", "''") + "'"
+
+
+def verify_readers(
+    test,
+    root,
+    log_ids,
+    metric_count,
+    allow_duplicates=False,
+    alloy_ids=(),
+    metric_ids=(),
+):
+    """Two independent readers must agree with each other and the producer.
+
+    DuckDB reads the files in process and ClickHouse reads the same files
+    through `clickhouse-local`, both with the latest-descriptor window join
+    the crate README documents. A disagreement between them is a defect in
+    what was written, not in one reader.
+    """
+    root = Path(root).resolve()
+    alloy_ids = set(alloy_ids)
+    with duckdb.connect() as db, clickhouse_reader(root) as clickhouse:
+        for signal, dataset in (
+            ("logs", "values"),
+            ("metrics", "number"),
+            ("metrics", "histogram"),
+        ):
+            relative = f"v=1/signal={signal}/dataset={dataset}/**/*.parquet"
+            paths = sorted(root.glob(relative))
+            expected_count = len(log_ids) if signal == "logs" else metric_count
+            if not paths:
+                test.assertEqual(expected_count, 0, f"missing {signal}/{dataset}")
+                continue
+            series = f"v=1/signal={signal}/dataset=series/**/*.parquet"
+            duck_values = (
+                f"read_parquet({sql_string(root / relative)}, union_by_name=true)"
+            )
+            duck_series = (
+                f"read_parquet({sql_string(root / series)}, union_by_name=true, "
+                "filename=true)"
+            )
+            ch_values = f"file({sql_string(relative)}, 'Parquet')"
+            ch_series = f"file({sql_string(series)}, 'Parquet')"
+            projection = (
+                "v.body, coalesce(v.attrs['e2e.source'], '')"
+                if signal == "logs"
+                else "s.attrs['request.id']"
+            )
+            duck_sql = f"""
+                WITH canonical AS (
+                    SELECT * FROM {duck_series}
+                    QUALIFY row_number() OVER (
+                        PARTITION BY series_id
+                        ORDER BY emitted_at DESC, filename DESC) = 1
+                )
+                SELECT {projection} FROM {duck_values} v
+                INNER JOIN canonical s ON v.series_id = s.series_id
+            """
+            ch_sql = f"""
+                WITH canonical AS (
+                    SELECT * FROM (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY series_id
+                            ORDER BY emitted_at DESC, _path DESC) AS rank
+                        FROM {ch_series}
+                    ) WHERE rank = 1
+                )
+                SELECT {projection} FROM {ch_values} AS v
+                INNER JOIN canonical AS s ON v.series_id = s.series_id
+            """
+            duck_rows = sorted(db.execute(duck_sql).fetchall())
+            ch_rows = sorted(clickhouse(ch_sql))
+            test.assertEqual(
+                ch_rows, duck_rows, f"reader disagreement for {signal}/{dataset}"
+            )
+            before = db.execute(f"SELECT count(*) FROM {duck_values}").fetchone()[0]
+            ch_before = int(clickhouse(f"SELECT count(*) FROM {ch_values}")[0][0])
+            test.assertEqual(ch_before, before)
+            test.assertEqual(
+                len(duck_rows),
+                before,
+                "latest-descriptor join must preserve cardinality",
+            )
+            if allow_duplicates:
+                test.assertGreaterEqual(before, expected_count)
+            else:
+                test.assertEqual(before, expected_count)
+            if signal == "logs":
+                expected = sorted(
+                    (body, "alloy-file" if body in alloy_ids else "") for body in log_ids
+                )
+                if allow_duplicates:
+                    test.assertEqual(set(duck_rows), set(expected))
+                else:
+                    test.assertEqual(duck_rows, expected)
+            elif metric_ids:
+                test.assertEqual({row[0] for row in duck_rows}, set(metric_ids))
+
+
+class DockerStore:
+    """A MinIO or RustFS container serving S3 on a loopback port.
+
+    The store keeps its data in its own container across a stop and start,
+    which is what makes an outage recoverable; the exporter itself still holds
+    nothing across a restart.
+    """
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.name = "series-e2e-" + uuid.uuid4().hex
+        self.container = None
+        self.bucket = "series-test"
+        self.key = "series-test-access"
+        self.secret = "series-test-secret-12345"
+
+    def __enter__(self):
+        image = require_docker_image(self.kind)
+        # The host port is chosen here rather than by Docker: a container that
+        # is stopped and started again keeps an explicit mapping, so the
+        # engine's configured endpoint stays valid across an outage.
+        self.port = free_port()
+        args = [
+            "docker", "run", "--pull=never", "--detach", "--name", self.name,
+            "--publish", f"127.0.0.1:{self.port}:9000",
+        ]
+        if self.kind == "minio":
+            args += [
+                "-e", f"MINIO_ROOT_USER={self.key}",
+                "-e", f"MINIO_ROOT_PASSWORD={self.secret}",
+                image, "server", "/data", "--address", ":9000",
+            ]
+        else:
+            args += [
+                "-e", f"RUSTFS_ACCESS_KEY={self.key}",
+                "-e", f"RUSTFS_SECRET_KEY={self.secret}",
+                "-e", "RUSTFS_ADDRESS=0.0.0.0:9000",
+                "-e", "RUSTFS_VOLUMES=/data",
+                image,
+            ]
+        try:
+            self.container = subprocess.check_output(args, text=True).strip()
+            mapping = subprocess.check_output(
+                ["docker", "port", self.container, "9000/tcp"], text=True
+            ).strip()
+            if f":{self.port}" not in mapping:
+                raise AssertionError(
+                    f"{self.kind} did not publish {self.port}: {mapping}"
+                )
+            self.endpoint = f"http://127.0.0.1:{self.port}"
+            self.client = boto3.client(
+                "s3",
+                endpoint_url=self.endpoint,
+                region_name="us-east-1",
+                aws_access_key_id=self.key,
+                aws_secret_access_key=self.secret,
+                config=BotoConfig(
+                    connect_timeout=5,
+                    read_timeout=10,
+                    retries={"max_attempts": 0},
+                    s3={"addressing_style": "path"},
+                ),
+            )
+            self.ready()
+            self.client.create_bucket(Bucket=self.bucket)
+            self.storage = {
+                "s3": {
+                    "base_uri": f"s3://{self.bucket}/otel",
+                    "region": "us-east-1",
+                    "endpoint": self.endpoint,
+                    "allow_http": True,
+                    "virtual_hosted_style_request": False,
+                    "auth": {
+                        "type": "static_credentials",
+                        "access_key_id": self.key,
+                        "secret_access_key": self.secret,
+                    },
+                }
+            }
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def ready(self):
+        """Block until the store answers an S3 request, or fail with its log."""
+        deadline = time.monotonic() + 60
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                self.client.list_buckets()
+                return
+            except Exception as error:
+                last_error = error
+                time.sleep(0.2)
+        logs = subprocess.check_output(
+            ["docker", "logs", self.container], stderr=subprocess.STDOUT, text=True
+        )
+        raise AssertionError(f"{self.kind} never became S3-ready: {last_error}\n{logs}")
+
+    def download(self, directory):
+        """Copy every completed Parquet object into a local directory."""
+        directory = Path(directory)
+        for page in self.client.get_paginator("list_objects_v2").paginate(
+            Bucket=self.bucket, Prefix="otel/"
+        ):
+            for item in page.get("Contents", []):
+                key = item["Key"]
+                if key.endswith(".parquet"):
+                    destination = directory / key.removeprefix("otel/")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    self.client.download_file(self.bucket, key, str(destination))
+
+    def stop(self):
+        """Take the store off the network without losing what it holds."""
+        subprocess.run(
+            ["docker", "stop", "--time", "0", self.container],
+            check=True,
+            capture_output=True,
+        )
+
+    def recover(self):
+        """Start the same container again and wait for it to serve S3."""
+        subprocess.run(
+            ["docker", "start", self.container], check=True, capture_output=True
+        )
+        self.ready()
+
+    def __exit__(self, *exc):
+        if self.container:
+            subprocess.run(
+                ["docker", "rm", "--force", "--volumes", self.container],
+                check=False,
+                capture_output=True,
+            )
+            self.container = None
+
+
+def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
+    """Read every downloaded part file and check the lake's own invariants.
+
+    Each file is checked against the metadata it carries: the recorded row
+    count, the sort key it claims and, for a descriptor file, that every
+    stored identity really hashes to the series id it is filed under. The
+    values rows of a partition must then be covered by the descriptors of the
+    same signal, partition and writer, which is what makes the lake readable
+    without a catalog.
+    """
+    files = sorted(Path(root).rglob("*.parquet"))
+    test.assertTrue(files)
+    coverage = set()
+    values = []
+    bodies = []
+    counts = {"number": 0, "histogram": 0}
+    with duckdb.connect() as db:
+        for path in files:
+            partitions = dict(
+                part.split("=", 1) for part in path.parts if "=" in part
+            )
+            metadata = dict(
+                db.execute(
+                    "SELECT decode(key), decode(value) FROM parquet_kv_metadata(?)",
+                    [str(path)],
+                ).fetchall()
+            )
+            signal = partitions["signal"]
+            dataset = partitions["dataset"]
+            worker = (metadata["writer_id"], metadata["boot_id"])
+            partition = (partitions["date"], partitions["hour"])
+            # Hashing the whole row forces every column to be decoded, so a
+            # file that cannot be read at all fails here; the count is what
+            # the recorded row count is checked against. The hash is summed in
+            # SQL rather than fetched, which keeps timestamp conversion (and
+            # its optional pytz dependency) out of the reader.
+            rows = db.execute(
+                "SELECT count(*), sum(hash(t)) FROM "
+                "read_parquet(?, hive_partitioning=false) t",
+                [str(path)],
+            ).fetchone()[0]
+            test.assertEqual(int(metadata["row_count"]), rows)
+            if dataset == "series":
+                ids = db.execute(
+                    "SELECT series_id, identity_bytes FROM read_parquet(?)", [str(path)]
+                ).fetchall()
+                test.assertEqual(
+                    [row[0] for row in ids], sorted(row[0] for row in ids)
+                )
+                for series_id, identity in ids:
+                    test.assertEqual(xxhash.xxh3_128_digest(identity), series_id)
+                    coverage.add((signal, partition, worker, series_id))
+            else:
+                keys = db.execute(
+                    "SELECT series_id, time_unix_nano FROM read_parquet(?)", [str(path)]
+                ).fetchall()
+                if metadata["sort_key"] != "none":
+                    test.assertEqual(
+                        keys,
+                        sorted(
+                            keys, key=lambda row: (row[0], row[1] is None, row[1] or 0)
+                        ),
+                    )
+                values.extend((signal, partition, worker, row[0]) for row in keys)
+                if dataset == "values":
+                    bodies.extend(
+                        row[0]
+                        for row in db.execute(
+                            "SELECT body FROM read_parquet(?)", [str(path)]
+                        ).fetchall()
+                    )
+                else:
+                    counts[dataset] += len(keys)
+        test.assertTrue(
+            set(values).issubset(coverage),
+            "descriptor coverage per partition and worker",
+        )
+        test.assertTrue(set(log_ids).issubset(set(bodies)))
+        if not allow_duplicates:
+            test.assertEqual(sorted(bodies), sorted(log_ids))
+            test.assertEqual(counts, {"number": metric_count, "histogram": metric_count})
+        else:
+            test.assertGreaterEqual(counts["number"], metric_count)
+            test.assertGreaterEqual(counts["histogram"], metric_count)
+        for signal, datasets in (
+            ("logs", ("values",)),
+            ("metrics", ("number", "histogram")),
+        ):
+            series = [
+                str(p)
+                for p in files
+                if f"signal={signal}" in p.parts and "dataset=series" in p.parts
+            ]
+            if not series:
+                continue
+            db.execute(
+                "CREATE OR REPLACE TEMP TABLE canonical AS SELECT * FROM "
+                "read_parquet(?, union_by_name=true, filename=true) QUALIFY "
+                "row_number() OVER (PARTITION BY series_id ORDER BY emitted_at "
+                "DESC, filename DESC)=1",
+                [series],
+            )
+            for dataset in datasets:
+                selected = [
+                    str(p)
+                    for p in files
+                    if f"signal={signal}" in p.parts and f"dataset={dataset}" in p.parts
+                ]
+                if selected:
+                    before = db.execute(
+                        "SELECT count(*) FROM read_parquet(?, union_by_name=true)",
+                        [selected],
+                    ).fetchone()[0]
+                    after = db.execute(
+                        "SELECT count(*) FROM read_parquet(?, union_by_name=true) v "
+                        "JOIN canonical s USING(series_id)",
+                        [selected],
+                    ).fetchone()[0]
+                    test.assertEqual(
+                        before, after, "canonical join must preserve values cardinality"
+                    )
+
+
+def export_with_retry(engine, body, attempts=5, timeout=120):
+    """Export one log body, retrying the one refusal a producer must retry.
+
+    Delivery is at least once: a refused request may already be stored, and
+    the producer still has to resend it, so a retry is allowed to create a
+    duplicate but is never allowed to lose the body. The number of extra
+    attempts is returned so a test can report how many duplicates it risked.
+    """
+    for attempt in range(attempts):
+        try:
+            engine.logs.Export(log_request(body), timeout=timeout)
+            return attempt
+        except grpc.RpcError as error:
+            if error.code() not in (
+                grpc.StatusCode.UNAVAILABLE,
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+            ):
+                raise
+    raise AssertionError(f"{body} was refused {attempts} times")
+
+
+def stored_bodies(store, directory, name):
+    """Every logs body currently readable from the store, with duplicates."""
+    target = Path(directory) / name
+    store.download(target)
+    paths = sorted((target / "v=1/signal=logs/dataset=values").rglob("*.parquet"))
+    if not paths:
+        return target, []
+    with duckdb.connect() as db:
+        rows = db.execute(
+            "SELECT body FROM read_parquet(?, union_by_name=true)",
+            [[str(path) for path in paths]],
+        ).fetchall()
+    return target, [row[0] for row in rows]
+
+
+class DockerSlice(unittest.TestCase):
+    """Grafana Alloy and a real S3 object store in containers."""
+
+    def exercise(self, kind):
+        """Run the Alloy file-tail topology against one object store."""
+        require_clickhouse()
+        with DockerStore(kind) as store, tempfile.TemporaryDirectory() as directory:
+            with Engine(directory, storage=store.storage) as engine:
+                ids = [f"{kind}-alloy-{i}" for i in range(12)]
+                metric_ids = [f"{kind}-metric-{i}" for i in range(6)]
+                with AlloyProducer(directory, engine) as alloy:
+                    alloy.write(ids)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                        metric = metrics_rpc.MetricsServiceStub(engine.channel)
+                        results = [
+                            pool.submit(metric.Export, metric_request(item), timeout=30)
+                            for item in metric_ids
+                        ]
+                        for result in results:
+                            result.result(timeout=35)
+                    wait_for_alloy(store, directory, ids)
+                engine.shutdown()
+                downloaded = Path(directory) / "downloaded"
+                store.download(downloaded)
+                verify_files(self, downloaded, ids, 6)
+                verify_readers(
+                    self, downloaded, ids, 6, alloy_ids=ids, metric_ids=metric_ids
+                )
+
+    # Scenario: Docker Alloy tails 12 known lines into a real engine using
+    # MinIO, alongside synthetic metrics.
+    # Guarantees: DuckDB and ClickHouse agree on bodies, attributes, counts and
+    # latest-descriptor joins.
+    def test_minio(self):
+        self.exercise("minio")
+
+    # Scenario: the same Alloy and synthetic-metrics topology writes to the
+    # local RustFS image.
+    # Guarantees: both readers recover all expected rows with identical bodies,
+    # attributes and descriptor coverage.
+    def test_rustfs(self):
+        self.exercise("rustfs")
+
+    # Scenario: the object store is stopped while six producers are exporting
+    # and is started again, with its data intact, a few seconds later.
+    # Guarantees: the outage refuses requests retryably rather than losing
+    # them, every body a producer resent is stored, and the duplicates that
+    # at-least-once delivery permits are counted rather than assumed away.
+    def test_store_outage_is_at_least_once(self):
+        require_clickhouse()
+        with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
+            overrides = {
+                # The flush deadline is shorter than the outage, so the
+                # exporter has to give up on a block and refuse its requests
+                # retryably rather than waiting the store out.
+                "window": {"interval": "1s", "flush_retry_deadline": "5s"},
+                # Short per-operation retries so a request finds out quickly
+                # that the store is gone and the exporter's own flush retry,
+                # not the object store client, is what waits out the outage.
+                "retry": {
+                    "max_retries": 2,
+                    "init_backoff": "200ms",
+                    "max_backoff": "1s",
+                    "backoff_base": 2.0,
+                    "retry_timeout": "5s",
+                },
+            }
+            with Engine(
+                directory, storage=store.storage, overrides=overrides
+            ) as engine:
+                try:
+                    before = [f"outage-before-{i}" for i in range(3)]
+                    during = [f"outage-during-{i}" for i in range(6)]
+                    for body in before:
+                        self.assertEqual(export_with_retry(engine, body), 0)
+                    store.stop()
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(during)
+                    ) as pool:
+                        calls = [
+                            pool.submit(export_with_retry, engine, body)
+                            for body in during
+                        ]
+                        time.sleep(8)
+                        store.recover()
+                        retries = sum(call.result(timeout=180) for call in calls)
+                    engine.shutdown()
+                    ids = before + during
+                    target, bodies = stored_bodies(store, directory, "downloaded")
+                    self.assertEqual(set(bodies), set(ids), "a body was lost")
+                    duplicates = len(bodies) - len(set(bodies))
+                    print(
+                        f"store outage: {retries} producer retries, "
+                        f"{duplicates} duplicate rows"
+                    )
+                    self.assertGreaterEqual(
+                        retries, 1, "the outage refused nothing, so nothing was retried"
+                    )
+                    self.assertLessEqual(duplicates, retries)
+                    verify_files(self, target, ids, 0, allow_duplicates=True)
+                    verify_readers(self, target, ids, 0, allow_duplicates=True)
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+
+    # Scenario: the engine process is killed while a block holding two
+    # admitted requests has not been written, and a second engine is started
+    # against the same bucket.
+    # Guarantees: nothing that was acknowledged before the kill is lost, the
+    # restarted engine writes under a new boot id instead of colliding with
+    # the old names, and the producer's resend leaves no body missing.
+    def test_engine_restart_is_at_least_once(self):
+        require_clickhouse()
+        with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A block of exactly three requests and a window long enough that
+            # only the block's own request count can seal it: the first three
+            # bodies seal their block and become durable, and the two that
+            # follow stay in an open block that nothing can flush.
+            overrides = {
+                "window": {"interval": "600s", "max_requests_per_block": 3},
+            }
+            acked = [f"restart-acked-{i}" for i in range(3)]
+            lost = [f"restart-inflight-{i}" for i in range(2)]
+            first = root / "engine-0"
+            first.mkdir()
+            with Engine(
+                first,
+                storage=store.storage,
+                overrides=overrides,
+                telemetry_interval="50ms",
+            ) as engine:
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                        calls = [
+                            pool.submit(export_with_retry, engine, body)
+                            for body in acked
+                        ]
+                        for call in calls:
+                            self.assertEqual(call.result(timeout=120), 0)
+                    inflight = [
+                        engine.logs.Export.future(log_request(body), timeout=30)
+                        for body in lost
+                    ]
+                    deadline = time.monotonic() + 60
+                    while time.monotonic() < deadline:
+                        pending = metric_max(
+                            engine_metrics(engine), "block.requests_pending"
+                        )
+                        if pending >= 2:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("the second block never held both requests")
+                    engine.process.kill()
+                    for call in inflight:
+                        with self.assertRaises(grpc.RpcError):
+                            call.result(timeout=30)
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+            _, survived = stored_bodies(store, directory, "after-kill")
+            self.assertEqual(
+                set(survived), set(acked), "an acknowledged body did not survive"
+            )
+            second = root / "engine-1"
+            second.mkdir()
+            # The second engine rotates on its window instead: the resent
+            # bodies are fewer than a block, so only the window can seal them.
+            with Engine(
+                second, storage=store.storage, overrides={"window": {"interval": "1s"}}
+            ) as engine:
+                try:
+                    retries = sum(
+                        export_with_retry(engine, body) for body in lost
+                    )
+                    engine.shutdown()
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+            ids = acked + lost
+            target, bodies = stored_bodies(store, directory, "downloaded")
+            self.assertEqual(set(bodies), set(ids), "a body was lost")
+            duplicates = len(bodies) - len(set(bodies))
+            print(
+                f"engine restart: {retries} producer retries, "
+                f"{duplicates} duplicate rows"
+            )
+            verify_files(self, target, ids, 0, allow_duplicates=True)
+            verify_readers(self, target, ids, 0, allow_duplicates=True)
+
+
+class RestartSlice(unittest.TestCase):
+    """A second engine process, and a producer that walks away."""
+
+    # Scenario: two engine processes write into the same aligned window and
+    # base directory.
+    # Guarantees: boot IDs prevent object-name collisions and additive columns
+    # read with union-by-name.
+    def test_restart_names_and_additive_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "destination"
+            target.mkdir()
+            storage = {"file": {"base_uri": str(target)}}
+            names = []
+            for index in range(2):
+                work = root / f"engine-{index}"
+                work.mkdir()
+                overrides = {
+                    "window": {
+                        "interval": "3153600000s",
+                        "max_requests_per_block": 1,
+                        "flush_retry_deadline": "10s",
+                    }
+                }
+                if index:
+                    overrides["logs"] = {
+                        "denormalize": [
+                            {
+                                "path": "attrs.new.field",
+                                "column": "new_field",
+                                "type": "string",
+                            }
+                        ]
+                    }
+                with Engine(work, storage=storage, overrides=overrides) as engine:
+                    try:
+                        request = log_request(f"restart-{index}")
+                        if index:
+                            scope = request.resource_logs[0].scope_logs[0]
+                            record = scope.log_records[0]
+                            record.attributes.add(
+                                key="new.field"
+                            ).value.string_value = "added"
+                        engine.logs.Export(request, timeout=20)
+                        engine.shutdown()
+                    except Exception:
+                        print(engine.engine_log())
+                        raise
+                names.append(set(path.name for path in target.rglob("*.parquet")))
+            self.assertTrue(names[0] < names[1])
+            with duckdb.connect() as db:
+                path = str(target / "v=1/signal=logs/dataset=values/**/*.parquet")
+                rows = db.execute(
+                    "SELECT body, new_field FROM read_parquet(?, union_by_name=true) "
+                    "ORDER BY body",
+                    [path],
+                ).fetchall()
+                self.assertEqual(rows, [("restart-0", None), ("restart-1", "added")])
+                windows = db.execute(
+                    "SELECT DISTINCT decode(value) FROM parquet_kv_metadata(?) "
+                    "WHERE decode(key)='window_start'",
+                    [path],
+                ).fetchall()
+                self.assertEqual(windows, [("0",)])
+            verify_files(self, target, ["restart-0", "restart-1"], 0)
+
+    # Scenario: a producer disconnects after admission but before a long
+    # window commits.
+    # Guarantees: abandoning the client result cannot retract accepted data.
+    def test_disconnect_does_not_remove_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            overrides = {"window": {"interval": "5s", "flush_retry_deadline": "10s"}}
+            with Engine(
+                directory, overrides=overrides, telemetry_interval="50ms"
+            ) as engine:
+                try:
+                    call = engine.logs.Export.future(
+                        log_request("disconnected"), timeout=20
+                    )
+                    deadline = time.monotonic() + 4
+                    while time.monotonic() < deadline:
+                        metrics = engine_metrics(engine)
+                        if metric_max(metrics, "block.requests_pending") >= 1:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("request was not observed as admitted")
+                    call.cancel()
+                    engine.shutdown(seconds=30)
+                    verify_files(self, engine.data, ["disconnected"], 0)
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+
+
+def engine_metrics(engine):
+    """The engine's own metric snapshot, as JSON, including zero values."""
+    url = (
+        f"http://127.0.0.1:{engine.admin_port}"
+        "/api/v1/telemetry/metrics?format=json&keep_all_zeroes=true"
+    )
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return json.load(response)
+
+
+def metric_max(document, name):
+    """The largest reported value of one exporter metric in a snapshot."""
+    values = [
+        item["value"]
+        for group in document["metric_sets"]
+        if group["name"] == "exporter.series_parquet"
+        for item in group["metrics"]
+        if item["name"] == name and isinstance(item["value"], (int, float))
+    ]
+    return max(values, default=0)
 
 
 if __name__ == "__main__":

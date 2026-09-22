@@ -257,6 +257,25 @@ directory before starting. An OK OTLP response means the request's rows are
 already durable, so clients should retry timeouts and transient failures and
 tolerate duplicates. Only logs are accepted; metrics and traces are refused.
 
+### `series-parquet-s3.yaml`
+
+The same pipeline writing to an S3-compatible object store:
+
+- Receives OTLP on `127.0.0.1:4317` with `wait_for_result: true`
+- Writes the series and values datasets under `s3://series-test/otel`
+- Retries object-store operations with an explicit backoff schedule
+
+Requires a binary built with `--features series_parquet,aws` and an existing
+bucket. The static credentials are local test credentials for a MinIO or
+RustFS container; production deployments use the shared AWS auth provider
+configuration.
+
+### `series-parquet.alloy`
+
+The Grafana Alloy producer used with either series Parquet config: it tails
+`/input/events.log`, inserts an `e2e.source` attribute and exports OTLP logs to
+the endpoint named by the `OTLP_ENDPOINT` environment variable.
+
 ### `syslog-perf.yaml`
 
 Syslog/CEF receiver with performance metrics:
