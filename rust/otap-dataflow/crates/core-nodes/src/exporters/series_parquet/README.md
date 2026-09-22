@@ -22,7 +22,10 @@ one request is ever parked, so the memory a worker holds is the two blocks
 plus one request. Preparation runs entirely before the block is reserved
 against, so a refused request leaves the block unchanged, and the request's
 payload and conversion batches are released as soon as its rows are
-extracted. Rotation timing is still a placeholder: a block is sealed as
+extracted. An OTLP body's top-level protobuf framing is validated before it is
+converted, because the shared byte views decode lazily: without that check a
+truncated request would be acknowledged as stored. Corruption inside a nested
+message is not validated and still surfaces as missing fields. Rotation timing is still a placeholder: a block is sealed as
 soon as it holds a request, so this writes one file set per request until the
 window timer lands. Later tasks add that timer, telemetry and a drain-aware
 shutdown. Only logs are accepted; metrics and traces are permanently refused.

@@ -18,6 +18,16 @@
 //! admission instead of opening another ACTIVE block, so the memory a worker
 //! can hold is bounded by the two blocks and the completions in flight.
 //!
+//! An OTLP request is checked for top-level protobuf wire framing before it is
+//! converted, because the shared byte views decode lazily and report no error
+//! for a damaged body: without the check a truncated request would become a
+//! request carrying no rows and be acknowledged as stored. Only the top level
+//! is validated -- field tags and the bounds of each length-delimited field.
+//! Nested `ResourceLogs`, `ScopeLogs` and `LogRecord` content is still read
+//! lazily and is not validated here; corruption inside a submessage surfaces as
+//! missing or empty fields rather than a refusal. Covering that is deferred to
+//! the chaos tests of plan 3.
+//!
 //! A block-scoped refusal -- a full block, or one already holding its request
 //! limit -- is not the request's fault, so the request is not nacked for it.
 //! Its extraction is parked in `pending`, admission closes until a block
@@ -36,7 +46,8 @@ use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
-use otel_arrow_dfe_pdata::{OtapPayload, TryIntoWithOptions};
+use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
+use otel_arrow_dfe_pdata::{OtapPayload, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -271,6 +282,9 @@ impl Worker {
                 ))),
             );
         }
+        if let Err(failure) = Self::check_wire_format(&payload) {
+            return Prepared::Failed(token, failure);
+        }
         let extracted = match self.extract(payload) {
             Ok(extracted) => extracted,
             Err(failure) => return Prepared::Failed(token, failure),
@@ -279,6 +293,29 @@ impl Worker {
             extracted,
             token,
             admission_secs: nanos_to_secs(self.wall.now_unix_nanos()),
+        })
+    }
+
+    /// Refuse an OTLP body whose top-level protobuf framing is broken.
+    ///
+    /// The shared OTLP byte views are deliberately non-validating: the
+    /// conversion this node performs reads them lazily and reports no error for
+    /// a truncated or corrupt body, so without this check a damaged request
+    /// would be converted into a request carrying no rows and acknowledged as
+    /// if it had been stored. The framing walk is a single linear pass over the
+    /// buffer with no allocation, and only the top level is checked -- see the
+    /// module documentation for what that does and does not cover.
+    ///
+    /// A payload that already holds Arrow records has no wire framing to check;
+    /// it is validated by the conversion and the extraction instead.
+    fn check_wire_format(payload: &OtapPayload) -> Result<(), Failure> {
+        let PayloadData::OtlpBytes(bytes) = payload.data() else {
+            return Ok(());
+        };
+        RawLogsData::try_from(bytes).map(|_| ()).map_err(|error| {
+            Failure::Permanent(lake::Error::invalid(format!(
+                "malformed OTLP logs body: {error}"
+            )))
         })
     }
 
@@ -419,12 +456,24 @@ impl Worker {
     ///
     /// The window start never moves backwards, so a wall clock that steps back
     /// cannot make a later block claim an earlier partition.
+    ///
+    /// A parked request also pulls the start forward to its own window. Without
+    /// that, a wall clock that steps back between parking a request and opening
+    /// the next block would produce a block the parked request is once again
+    /// too late for: it would be parked again, rotated again, and the node
+    /// would spin opening empty blocks. The parked request is the reason this
+    /// block is being opened, so the block is opened for its window.
     fn new_active(&mut self) -> OwnedBlock {
         let secs = nanos_to_secs(self.wall.now_unix_nanos());
         let windows = lake::clock::WindowClock::new(self.cfg.window.interval, secs);
+        let parked = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| windows.boundary(pending.admission_secs));
         let start = windows
             .last_boundary()
-            .max(self.active.data.window_start_secs);
+            .max(self.active.data.window_start_secs)
+            .max(parked);
         let seq = self.seq;
         // A worker would have to seal one block per nanosecond for six hundred
         // years to reach this.

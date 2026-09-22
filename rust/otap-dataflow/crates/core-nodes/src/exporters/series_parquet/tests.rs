@@ -725,15 +725,14 @@ async fn extraction_failure_is_refused_atomically() {
         .await;
 }
 
-/// Scenario: an OTLP protobuf body that is not decodable reaches preparation
-/// after its byte-size check.
-/// Guarantees: it is decided without touching a block and without panicking.
-/// The OTLP byte views are deliberately non-validating, so such a body decodes
-/// to a request carrying no rows rather than to a conversion error; the worker
-/// therefore acknowledges it, and this records that as the behaviour a sender
-/// sees rather than leaving it to be discovered as a crash.
+/// Scenario: an OTLP protobuf body whose top-level framing is truncated
+/// reaches preparation after its byte-size check.
+/// Guarantees: it is refused permanently and the ACTIVE block is untouched.
+/// The shared byte views decode lazily and report no error for such a body, so
+/// the exporter checks the framing itself: without that a damaged request
+/// would convert to a request carrying no rows and be acknowledged as stored.
 #[tokio::test(flavor = "current_thread")]
-async fn an_undecodable_body_is_decided_without_touching_a_block() {
+async fn a_malformed_otlp_body_is_refused_atomically() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (context, _) = logs_pdata().into_parts();
@@ -753,10 +752,197 @@ async fn an_undecodable_body_is_decided_without_touching_a_block() {
             assert!(worker.pending.is_none());
 
             assert!(worker.notify.next().await.is_ok());
-            assert!(matches!(
-                rx.recv().await.expect("a completion"),
-                PipelineCompletionMsg::DeliverAck { .. }
-            ));
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert_eq!(nack.reason, "invalid");
+                }
+                other => panic!("expected a framing refusal, got {other:?}"),
+            }
         })
         .await;
+}
+
+/// Scenario: the wall clock steps backwards between parking a request for a
+/// later window and opening the block that request is waiting for.
+/// Guarantees: one rotation admits the parked request, which is not parked
+/// again. The block a parked request is opened for takes its window from that
+/// request, so a clock that steps back cannot make the node spin opening empty
+/// blocks the parked request is forever too late for.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backward_clock_step_does_not_repark_the_pending_request() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, _rx) = effects(8);
+            // One-second windows, so the block opened at 100 s ends well
+            // before the request prepared at 200 s.
+            let wall = Arc::new(lake::clock::TestWallClock::new(100 * 1_000_000_000));
+            let mut worker = Worker::new(worker_config(), store, Arc::clone(&wall) as _, handler);
+            assert_eq!(worker.active.data.window_start_secs, 100);
+
+            wall.set(200 * 1_000_000_000);
+            worker.admit(logs_pdata());
+            assert!(
+                worker.pending.is_some(),
+                "a request past the block's window waits for the next block"
+            );
+            assert!(worker.active.tokens.is_empty());
+
+            // The clock now steps back behind both the parked request and the
+            // block that is about to be replaced.
+            wall.set(50 * 1_000_000_000);
+            worker.rotate();
+            worker.resume_pending();
+
+            assert!(worker.pending.is_none(), "one rotation is enough");
+            assert_eq!(worker.active.tokens.len(), 1);
+            assert_eq!(worker.active.data.window_start_secs, 200);
+        })
+        .await;
+}
+
+/// Scenario: a request whose reservation alone exceeds the block budget is
+/// offered to an empty ACTIVE block.
+/// Guarantees: `Block::reserve` refuses it as `RequestTooLarge`, the worker
+/// reports that permanently rather than parking it, and the block is
+/// untouched. An empty block is the largest one the request will ever be
+/// offered, so parking it would rotate for ever without admitting it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(2);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            // The per-request and extraction budgets stay wide open, so the
+            // refusal can only come from the block budget inside `reserve`.
+            cfg.window.max_block_bytes = 1;
+            cfg.lake.ingress.max_block_bytes = 1;
+            let worker = Worker::new(
+                cfg.clone(),
+                store.clone(),
+                Arc::clone(&wall) as _,
+                effects(1).0,
+            );
+            assert!(
+                matches!(worker.prepare(logs_pdata()), Prepared::Ready(_)),
+                "preparation must succeed, or the refusal would not be the block budget"
+            );
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            worker.admit(logs_pdata());
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(
+                worker.pending.is_none(),
+                "an empty block cannot take it, and no later block will either"
+            );
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert_eq!(nack.reason, "too_large");
+                }
+                other => panic!("expected a block-budget refusal, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// Scenario: a request is parked by the running node, and a newer, distinct
+/// request is sent while it waits.
+/// Guarantees: the parked request reaches storage before the newer one, and
+/// the newer one is not taken off the channel while a request is parked, so
+/// backpressure is real rather than a third block. Each request carries its
+/// own source node, so the completions say which request was decided first.
+#[tokio::test(flavor = "current_thread")]
+async fn the_parked_request_is_stored_before_a_newer_one() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(8);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(8);
+            let inbox = ExporterInbox::new(
+                Receiver::Local(LocalReceiver::mpsc(control_rx)),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+                0,
+                Interests::empty(),
+            );
+            let (handler, mut rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+
+            let node = tokio::task::spawn_local(super::run(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::clone(&wall) as _,
+                inbox,
+                handler,
+            ));
+
+            // The first request opens and seals the first block, leaving an
+            // empty block aligned to the window that starts at zero.
+            pdata_tx
+                .send_async(logs_pdata_from(1))
+                .await
+                .expect("the first request enqueues");
+            assert_eq!(expect_ack(&mut rx).await, Some(1));
+
+            // Both of the next two belong to a later window, so the first of
+            // them cannot join the block in hand and is parked.
+            wall.set(5 * 1_000_000_000);
+            pdata_tx
+                .send_async(logs_pdata_from(2))
+                .await
+                .expect("the parked request enqueues");
+            pdata_tx
+                .send_async(logs_pdata_from(3))
+                .await
+                .expect("the newer request enqueues");
+
+            assert_eq!(expect_ack(&mut rx).await, Some(2));
+            assert_eq!(expect_ack(&mut rx).await, Some(3));
+
+            drop(pdata_tx);
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins");
+            if let Err(error) = terminal {
+                panic!("unexpected node failure: {error}");
+            }
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Take one completion, require it to be an ack, and say which request it
+/// belonged to.
+async fn expect_ack(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>) -> Option<usize> {
+    match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a completion arrives")
+        .expect("a completion arrives")
+    {
+        PipelineCompletionMsg::DeliverAck { ack } => ack.accepted.into_parts().0.source_node(),
+        other => panic!("expected an ack, got {other:?}"),
+    }
+}
+
+/// One well-formed logs request carrying `source` as its routing frame, so a
+/// completion can be traced back to the request that earned it.
+fn logs_pdata_from(source: usize) -> OtapPdata {
+    let mut context = Context::default();
+    context.set_source_node(source);
+    OtapPdata::new(context, logs_payload())
 }
