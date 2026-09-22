@@ -271,8 +271,8 @@ silently writing zstd.
 Cross-field rules enforced at startup: `ingress.max_row_bytes` must be at most
 a quarter of `sorting.run_target_bytes`; `window.max_block_bytes` must be at
 least twice `ingress.max_extracted_bytes`, because a block charges a request's
-series rows at up to twice their extracted estimate; `upload.part_bytes` must be at least 5MiB
-for the S3 multipart minimum; request counts, byte and depth budgets, cache
+series rows at up to twice their extracted estimate; `upload.part_bytes` must
+be at least 5MiB for the S3 multipart minimum; request counts, byte and depth budgets, cache
 capacity, upload concurrency, `notify_batch` and the abort and retry durations
 must all be positive. A logical input size that cannot be measured is refused
 before conversion. `retry` settings apply to individual storage operations;
