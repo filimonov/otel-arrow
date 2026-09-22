@@ -882,6 +882,24 @@ class AlloyProducer:
         )
         return done.stdout + done.stderr
 
+    def export_failures(self):
+        """Alloy's own record of an export it tried and the engine refused.
+
+        The shipped River config retries forever
+        (`max_elapsed_time = "0s"`), so the collector's
+        `otelcol_exporter_send_failed_log_records` counter stays at zero: it
+        only counts a send the exporter gave up on. What Alloy does report on
+        every refused attempt is this line, which carries the gRPC status the
+        engine returned, so it proves both that Alloy reached the receiver and
+        what it was told.
+        """
+        return [
+            line
+            for line in self.logs().splitlines()
+            if "Exporting failed" in line
+            and "component_id=otelcol.exporter.otlp.series" in line
+        ]
+
     def write(self, ids):
         """Append one line per id and make the bytes visible to the tail."""
         with self.lines.open("a") as stream:
@@ -2117,26 +2135,30 @@ def rss_bytes(pid):
 
 
 # Codes a producer is allowed to see and must retry. A storage failure is a
-# transient NACK, which the OTLP receiver reports as UNAVAILABLE; the other
-# three are the client's own deadline or cancellation rather than a refusal
-# the exporter issued.
+# transient NACK, which the OTLP receiver reports as UNAVAILABLE.
 RETRYABLE_CODES = {
     grpc.StatusCode.UNAVAILABLE,
     grpc.StatusCode.DEADLINE_EXCEEDED,
     grpc.StatusCode.RESOURCE_EXHAUSTED,
     grpc.StatusCode.CANCELLED,
 }
-CLIENT_GAVE_UP = {grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.CANCELLED}
+# How close to its own deadline a call must have run for the test to credit a
+# DEADLINE_EXCEEDED to the deadline the test itself set rather than to the
+# server. A call that reports the code earlier than this counts as a status
+# the server returned and has to satisfy the refusal assertion.
+LOCAL_DEADLINE_SLACK = 0.5
 
 
 class OutageSlice(unittest.TestCase):
     """A real object store taken off the network under live producers."""
 
-    # Scenario: Alloy file tailing and synthetic OTLP requests continue during
-    # an eight-second real S3 outage that outlasts the flush deadline.
-    # Guarantees: no request is acknowledged while the store is down, every
-    # refusal is the retryable UNAVAILABLE status, the engine recovers without
-    # a restart, and both readers recover every Alloy body and every
+    # Scenario: Alloy file tailing and independent synthetic logs and metrics
+    # requests continue during an eight-second real S3 outage that outlasts the
+    # flush deadline.
+    # Guarantees: no request of either signal is acknowledged while the store
+    # is down, every status the server returned is the retryable UNAVAILABLE,
+    # Alloy itself recorded a refused export attempt, the engine recovers
+    # without a restart, and both readers recover every Alloy body and every
     # acknowledged synthetic ID within the memory envelope.
     def test_storage_outage_recovers_without_losing_acked_data(self):
         require_clickhouse()
@@ -2192,11 +2214,12 @@ class OutageSlice(unittest.TestCase):
                 alloy_ids = [f"{kind}-outage-alloy-{i}" for i in range(12)]
                 engine.logs.Export(log_request("warmup"), timeout=10)
                 baseline_rss = rss_bytes(engine.process.pid)
+                signals = ("logs", "metrics")
                 expected_requests = {
                     (signal, f"p{index}-{item}")
                     for index in range(8)
                     for item in range(12)
-                    for signal in ("logs", "metrics")
+                    for signal in signals
                 }
                 expected_metric_ids = {
                     rid for signal, rid in expected_requests if signal == "metrics"
@@ -2205,96 +2228,185 @@ class OutageSlice(unittest.TestCase):
                     rid for signal, rid in expected_requests if signal == "logs"
                 }
                 acknowledged = []
-                retry_codes = []
+                # Statuses the server actually returned, kept apart from the
+                # deadlines this test imposed on its own calls: only the
+                # former can be a refusal the exporter is answerable for.
+                server_codes = []
+                local_waits = []
                 cohort = {}
                 cohort_finished = {}
-                cohort_start = threading.Barrier(9, timeout=20)
-                cohort_ready = threading.Barrier(9, timeout=20)
+                # Eight threads per signal plus this one. Logs and metrics run
+                # independently, so neither signal has to wait for the other
+                # to be acknowledged before it reaches the stopped store.
+                workers = 8 * len(signals)
+                cohort_start = threading.Barrier(workers + 1, timeout=30)
+                cohort_ready = threading.Barrier(workers + 1, timeout=30)
                 samples = []
                 lock = threading.Lock()
                 end = time.monotonic() + 120
 
-                def producer(index):
-                    """Send 12 logs and 12 metrics, retrying every refusal.
+                def classify(signal, error, started, timeout):
+                    """Record one failure as the server's or as our deadline.
 
-                    The very first RPC is started before the cohort barrier
-                    releases, so the test knows it began while the store was
-                    stopped; the identical request is resent on every retry,
-                    which is what makes the acknowledged set comparable with
-                    what is stored.
+                    The signal is kept with the status so the test can show
+                    that both logs and metrics were refused by the stopped
+                    store, rather than one signal waiting on the other.
                     """
-                    logs = logs_rpc.LogsServiceStub(engine.channel)
-                    metrics = metrics_rpc.MetricsServiceStub(engine.channel)
+                    elapsed = time.monotonic() - started
+                    with lock:
+                        if (
+                            error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+                            and elapsed >= timeout - LOCAL_DEADLINE_SLACK
+                        ):
+                            local_waits.append((signal, elapsed))
+                        else:
+                            server_codes.append((signal, error.code()))
+
+                def producer(signal, index):
+                    """Send 12 requests of one signal, retrying every refusal.
+
+                    Each thread starts its own first RPC before the cohort
+                    barrier releases, so the test knows an RPC of this signal
+                    began while the store was stopped. The identical request
+                    is resent on every retry, which is what makes the
+                    acknowledged set comparable with what is stored.
+                    """
+                    if signal == "logs":
+                        stub = logs_rpc.LogsServiceStub(engine.channel)
+                        build = log_request
+                    else:
+                        stub = metrics_rpc.MetricsServiceStub(engine.channel)
+                        build = metric_request
                     cohort_start.wait()
                     first_started = time.monotonic()
-                    first = logs.Export.future(log_request(f"p{index}-0"), timeout=30)
+                    first = stub.Export.future(build(f"p{index}-0"), timeout=30)
 
                     def first_done(call):
                         with lock:
-                            cohort_finished[index] = (time.monotonic(), call.code())
+                            cohort_finished[(signal, index)] = (
+                                time.monotonic(),
+                                call.code(),
+                            )
 
                     first.add_done_callback(first_done)
                     with lock:
-                        cohort[index] = (first, first_started)
+                        cohort[(signal, index)] = (first, first_started)
                     cohort_ready.wait()
                     for item in range(12):
                         request_id = f"p{index}-{item}"
-                        for signal, request, send in (
-                            ("logs", log_request(request_id), logs.Export),
-                            ("metrics", metric_request(request_id), metrics.Export),
-                        ):
-                            first_attempt = item == 0 and signal == "logs"
-                            while time.monotonic() < end:
-                                try:
-                                    if first_attempt:
-                                        first_attempt = False
-                                        first.result(timeout=35)
-                                    else:
-                                        send(request, timeout=6)
-                                    with lock:
-                                        acknowledged.append(
-                                            (signal, request_id, time.monotonic())
-                                        )
-                                    break
-                                except grpc.RpcError as error:
-                                    with lock:
-                                        retry_codes.append(error.code())
-                                    if error.code() not in RETRYABLE_CODES:
-                                        raise
-                                    time.sleep(0.1)
-                            else:
-                                raise AssertionError(
-                                    "producer could not drain after recovery"
-                                )
+                        request = build(request_id)
+                        pending = first if item == 0 else None
+                        while time.monotonic() < end:
+                            timeout = 30 if pending is not None else 6
+                            started = (
+                                first_started
+                                if pending is not None
+                                else time.monotonic()
+                            )
+                            try:
+                                if pending is not None:
+                                    pending.result(timeout=timeout + 5)
+                                    pending = None
+                                else:
+                                    stub.Export(request, timeout=timeout)
+                                with lock:
+                                    acknowledged.append(
+                                        (signal, request_id, time.monotonic())
+                                    )
+                                break
+                            except grpc.RpcError as error:
+                                pending = None
+                                classify(signal, error, started, timeout)
+                                if error.code() not in RETRYABLE_CODES:
+                                    raise
+                                time.sleep(0.1)
+                        else:
+                            raise AssertionError(
+                                "producer could not drain after recovery"
+                            )
 
                 store.stop()
                 outage_started = time.monotonic()
                 alloy.write(alloy_ids)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                    jobs = [pool.submit(producer, index) for index in range(8)]
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers
+                ) as pool:
+                    jobs = [
+                        pool.submit(producer, signal, index)
+                        for signal in signals
+                        for index in range(8)
+                    ]
                     cohort_start.wait()
                     cohort_ready.wait()
-                    self.assertEqual(set(cohort), set(range(8)))
+                    self.assertEqual(
+                        set(cohort),
+                        {(signal, index) for signal in signals for index in range(8)},
+                    )
                     outage_end = time.monotonic() + 8
                     while time.monotonic() < outage_end:
                         document = engine_metrics(engine)
                         samples.append((document, rss_bytes(engine.process.pid)))
                         time.sleep(0.2)
-                    # Every known first RPC began while storage was stopped.
-                    # No successful response is allowed before recovery starts.
-                    for first, started in cohort.values():
-                        self.assertGreaterEqual(started, outage_started)
+                    # Every known first RPC, of both signals, began while
+                    # storage was stopped, and none of them may have been
+                    # answered with anything but the retryable refusal.
+                    for key, (first, started) in cohort.items():
+                        self.assertGreaterEqual(started, outage_started, key)
                         if first.done():
-                            self.assertIn(first.code(), RETRYABLE_CODES)
+                            self.assertEqual(
+                                first.code(), grpc.StatusCode.UNAVAILABLE, key
+                            )
                         # Otherwise this exact RPC is still pending at
                         # observation.
-                    # The engine must have given up on at least one block: an
-                    # outage that produced no failure would prove nothing.
+                    # The engine must have given up on at least one block and
+                    # must have retried at least one write before doing so: a
+                    # single-attempt flush would prove nothing about retries.
                     self.assertGreaterEqual(
                         wait_for_metric(engine, "flush.failures", 1, 30),
                         1,
                         "no block failed while the store was stopped",
                     )
+                    self.assertGreaterEqual(
+                        wait_for_metric(engine, "flush.retries", 1, 30),
+                        1,
+                        "no write was retried while the store was stopped",
+                    )
+                    # Alloy itself must have tried to export and been refused;
+                    # without this the test would pass if Alloy had simply sat
+                    # on its queue until the store came back.
+                    alloy_failures = []
+                    alloy_deadline = time.monotonic() + 30
+                    while time.monotonic() < alloy_deadline:
+                        alloy_failures = alloy.export_failures()
+                        if alloy_failures:
+                            break
+                        time.sleep(0.25)
+                    self.assertTrue(
+                        alloy_failures,
+                        "Alloy never attempted an export while the store was "
+                        "stopped:\n" + alloy.logs(),
+                    )
+                    # Alloy's own client deadline is 6s, so a refusal it was
+                    # still waiting for shows up as its deadline rather than
+                    # as a status. Those prove the attempt just as well; the
+                    # statuses the engine did return must all be UNAVAILABLE.
+                    alloy_deadlines = [
+                        line
+                        for line in alloy_failures
+                        if "code = DeadlineExceeded" in line
+                    ]
+                    alloy_refusals = [
+                        line
+                        for line in alloy_failures
+                        if "code = DeadlineExceeded" not in line
+                    ]
+                    for line in alloy_refusals:
+                        self.assertIn(
+                            "code = Unavailable",
+                            line,
+                            "Alloy was refused with something other than "
+                            "UNAVAILABLE",
+                        )
                     recovery_started = time.monotonic()
                     store.recover()
                     while not all(job.done() for job in jobs):
@@ -2305,21 +2417,30 @@ class OutageSlice(unittest.TestCase):
                         time.sleep(0.2)
                     for job in jobs:
                         job.result()
-                    self.assertEqual(set(cohort_finished), set(range(8)))
-                    for completed, code in cohort_finished.values():
+                    self.assertEqual(set(cohort_finished), set(cohort))
+                    for key, (completed, code) in cohort_finished.items():
                         self.assertTrue(
-                            code in RETRYABLE_CODES
+                            code == grpc.StatusCode.UNAVAILABLE
                             or (
                                 code == grpc.StatusCode.OK
                                 and completed >= recovery_started
                             ),
-                            "cohort RPC succeeded before storage recovery",
+                            f"cohort RPC {key} was decided with {code} before "
+                            "storage recovery",
                         )
                 wait_for_alloy(
                     store, directory, alloy_ids, timeout=max(1, end - time.monotonic())
                 )
                 self.assertTrue(
-                    retry_codes, "outage must cause retryable failures/timeouts"
+                    server_codes, "outage must cause retryable refusals"
+                )
+                # Both signals were refused by the stopped store. Logs and
+                # metrics run in independent threads precisely so that neither
+                # can reach the store only after the other was acknowledged.
+                self.assertEqual(
+                    {signal for signal, _ in server_codes},
+                    set(signals),
+                    "one signal never met the stopped store",
                 )
                 # No acknowledgement may predate recovery: every one of these
                 # requests was admitted while the store was unreachable, so an
@@ -2329,13 +2450,12 @@ class OutageSlice(unittest.TestCase):
                     [item for item in acknowledged if item[2] < recovery_started],
                     "a request was acknowledged while the store was stopped",
                 )
-                # Every refusal the exporter issued is the one retryable code;
-                # the rest of what a producer saw is its own deadline.
-                refusals = set(retry_codes) - CLIENT_GAVE_UP
+                # Every status the server returned is the one retryable code.
+                returned = {code for _, code in server_codes}
                 self.assertEqual(
-                    refusals,
+                    returned,
                     {grpc.StatusCode.UNAVAILABLE},
-                    f"non-retryable refusal during the outage: {refusals}",
+                    f"non-retryable refusal during the outage: {returned}",
                 )
                 self.assertEqual(
                     {(signal, rid) for signal, rid, _ in acknowledged},
@@ -2400,7 +2520,9 @@ class OutageSlice(unittest.TestCase):
                 ).fetchall()
             ]
             self.assertEqual(
-                set(stored_logs), expected_log_ids, "all precomputed log IDs must survive"
+                set(stored_logs),
+                expected_log_ids,
+                "all precomputed log IDs must survive",
             )
             duplicates["logs"] = len(stored_logs) - len(expected_log_ids)
             series = str(downloaded / "v=1/signal=metrics/dataset=series/**/*.parquet")
@@ -2424,13 +2546,20 @@ class OutageSlice(unittest.TestCase):
                     ).fetchall()
                 ]
                 self.assertEqual(
-                    set(stored), expected_metric_ids, f"missing precomputed {dataset} IDs"
+                    set(stored),
+                    expected_metric_ids,
+                    f"missing precomputed {dataset} IDs",
                 )
                 duplicates[dataset] = len(stored) - len(expected_metric_ids)
         self.assertTrue(all(count >= 0 for count in duplicates.values()))
-        codes = collections.Counter(code.name for code in retry_codes)
+        codes = collections.Counter(
+            f"{signal}/{code.name}" for signal, code in server_codes
+        )
         print(
-            f"{kind} outage: {len(retry_codes)} producer retries {dict(codes)}, "
+            f"{kind} outage: {len(server_codes)} server refusals {dict(codes)}, "
+            f"{len(local_waits)} client deadlines, "
+            f"Alloy {len(alloy_refusals)} refused exports and "
+            f"{len(alloy_deadlines)} own deadlines, "
             f"duplicate rows {duplicates}"
         )
 
