@@ -173,8 +173,8 @@ impl Exporter<OtapPdata> for SeriesParquet {
 ///
 /// The branches are ordered: the shutdown deadline outranks everything, so a
 /// node still cancels on time under a boundary that is always ready; then the
-/// window boundary, a resolved flush, completion delivery, rotation, and only
-/// then a new message. `accept` is false once the ACTIVE block is waiting to be rotated,
+/// window boundary, a resolved flush, completion delivery, the release of a
+/// decided block's flush slot, rotation, and only then a new message. `accept` is false once the ACTIVE block is waiting to be rotated,
 /// which is what turns a slow destination into backpressure on the channel
 /// rather than a third block. Once shutdown has been latched the node
 /// keeps taking force-drained pdata and refuses each one immediately with a
