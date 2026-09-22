@@ -771,6 +771,12 @@ impl Worker {
     /// reservations rather than measurements; validating them empirically is
     /// plan 3's work.
     pub(super) fn sample_metrics(&mut self) {
+        // A worker with no registered instruments -- every worker a test
+        // drives directly -- would compute the whole sample only to discard
+        // it, and this runs on every turn of the node's loop.
+        if self.metrics.is_none() {
+            return;
+        }
         let flushing = self.flushing.as_ref().map_or(0, |job| job.bytes);
         let pending = self.pending.as_ref().map_or(0, |parked| {
             parked.extracted.pinned_bytes
