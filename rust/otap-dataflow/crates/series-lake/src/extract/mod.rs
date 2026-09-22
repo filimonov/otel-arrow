@@ -260,10 +260,22 @@ pub(crate) fn denorm_lookup(
         (_, Value::Null) => None,
         _ => {
             stats.denorm_type_mismatch += 1;
-            *stats
+            // Only the first mismatch for a column allocates: a lookup by
+            // borrowed `&str` finds every later hit against the same key
+            // without cloning it again, which matters here because this runs
+            // once per values row in the request's hot path, not just once
+            // per descriptor.
+            match stats
                 .denorm_type_mismatch_by_column
-                .entry(d.column.clone())
-                .or_default() += 1;
+                .get_mut(d.column.as_str())
+            {
+                Some(count) => *count += 1,
+                None => {
+                    let _ = stats
+                        .denorm_type_mismatch_by_column
+                        .insert(d.column.clone(), 1);
+                }
+            }
             None
         }
     }

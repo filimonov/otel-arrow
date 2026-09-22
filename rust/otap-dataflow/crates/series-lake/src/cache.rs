@@ -157,6 +157,38 @@ mod tests {
         );
     }
 
+    /// Scenario: capacity 2, two ids committed in insertion order, the older
+    /// one read with `last_committed`, then a third id committed.
+    /// Guarantees: `last_committed` does not refresh recency -- the peeked id
+    /// is still the least recently used and is the one evicted -- and the
+    /// peek itself left every counter at its default.
+    #[test]
+    fn last_committed_does_not_refresh_recency() {
+        let p = PartitionId { date: 1, hour: 0 };
+        let mut c = SeriesCache::new(2);
+        c.mark_committed(id(1), p);
+        c.mark_committed(id(2), p);
+        assert_eq!(
+            c.last_committed(&id(1)),
+            Some(p),
+            "peek id 1 without touching it"
+        );
+        assert_eq!(
+            c.stats(),
+            CacheStats::default(),
+            "the peek recorded no hit, miss or eviction"
+        );
+        c.mark_committed(id(3), p); // evicts whichever id is least recently used
+        assert_eq!(c.len(), 2);
+        assert_eq!(
+            c.last_committed(&id(1)),
+            None,
+            "id 1 was evicted: the peek did not make it recently used"
+        );
+        assert_eq!(c.last_committed(&id(2)), Some(p));
+        assert_eq!(c.last_committed(&id(3)), Some(p));
+    }
+
     /// Scenario: capacity 2, three distinct ids touched in order.
     /// Guarantees: the least recently used id is evicted and counted; a lost entry reads as not committed.
     #[test]
