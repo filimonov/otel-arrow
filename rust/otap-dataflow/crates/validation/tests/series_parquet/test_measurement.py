@@ -2881,11 +2881,8 @@ class CiIndexContracts(unittest.TestCase):
     """The non-publishable CI index still fails on every hard gate."""
 
     def child(self, directory, run_id, failed=()):
-        """A child result with every CI gate recorded, `failed` ones failed."""
-        names = (
-            "delivery", "graph_edges", "minimum_samples", "rss_reconciliation",
-            "affinity_matched", "no_concurrent_build", "physical_cores_sufficient",
-        )
+        """A child with every required gate recorded, `failed` ones failed."""
+        names = measurement.REQUIRED_HARD_CHECKS + ("graph_edges",)
         child = {
             "run_id": run_id,
             "status": measurement.STATUS_FAILED,
@@ -2934,6 +2931,86 @@ class CiIndexContracts(unittest.TestCase):
             entry for entry in child["checks"] if entry["name"] != "rss_reconciliation"
         ]
         self.assertEqual(measure.ci_failures(child), ["rss_reconciliation"])
+
+    def without(self, name):
+        """A child that never recorded the gate `name`."""
+        child = self.child(temporary_directory(self), f"without-{name}")
+        child["checks"] = [entry for entry in child["checks"] if entry["name"] != name]
+        return child
+
+    # Scenario: a CI child never recorded the host lease check.
+    # Guarantees: the required set is the evaluator's own, so a missing
+    # validity gate fails CI just as a missing correctness gate does.
+    def test_a_missing_host_lease_check_fails(self):
+        self.assertEqual(
+            measure.ci_failures(self.without("host_lease_held")), ["host_lease_held"]
+        )
+
+    # Scenario: a CI child never recorded the core floor, the one gate a
+    # non-publishable host is exempt from, and recorded every other gate.
+    # Guarantees: the exemption covers exactly that gate and nothing else.
+    def test_a_missing_core_floor_alone_passes(self):
+        self.assertEqual(
+            measure.ci_failures(self.without("physical_cores_sufficient")), []
+        )
+        self.assertEqual(
+            set(measurement.REQUIRED_HARD_CHECKS) - set(measure.CI_REQUIRED_CHECKS),
+            {"physical_cores_sufficient"},
+        )
+
+
+class AnsweredEpochContracts(unittest.TestCase):
+    """A lifetime is sampled until it spans enough answered collections."""
+
+    class GrowingSampler:
+        """A sampler whose every read finds one more answered collection."""
+
+        def __init__(self, limit=None):
+            self.taken = []
+            self.limit = limit
+
+        @property
+        def samples(self):
+            """The samples so far, one more answered epoch per read."""
+            if self.limit is None or len(self.taken) < self.limit:
+                uptime = float(len(self.taken) + 1)
+                self.taken.append(
+                    {
+                        "monotonic_ns": len(self.taken),
+                        "workers": {
+                            "w": {
+                                "uptime_s": uptime,
+                                "generation": 0,
+                                "gauges": {measurement.LIVENESS_GAUGE: 1},
+                            }
+                        },
+                    }
+                )
+            return list(self.taken)
+
+    # Scenario: a lifetime has answered fewer than three collections when
+    # its drain is proven, and more arrive one per observation.
+    # Guarantees: sampling continues until exactly three answered epochs of
+    # every worker are present, and stops there rather than later.
+    def test_sampling_continues_until_three_answered_epochs(self):
+        sampler = self.GrowingSampler()
+        fewest = measure.await_answered_epochs(
+            sampler, ["w"],
+            deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+        )
+        self.assertEqual(fewest, measure.MINIMUM_EPOCHS)
+        # One sample establishes the uptime, each later one is an epoch.
+        self.assertEqual(len(sampler.taken), measure.MINIMUM_EPOCHS + 1)
+
+    # Scenario: the collections stop after two answered epochs.
+    # Guarantees: fewer than three is never accepted; the deadline fails.
+    def test_fewer_than_three_answered_epochs_never_stop_sampling(self):
+        sampler = self.GrowingSampler(limit=3)
+        with self.assertRaisesRegex(AssertionError, "answered epochs"):
+            _ = measure.await_answered_epochs(
+                sampler, ["w"],
+                deadline_ns=measurement.time.monotonic_ns() + int(0.3 * 10**9),
+            )
 
 
 def exporter_snapshot(metrics):

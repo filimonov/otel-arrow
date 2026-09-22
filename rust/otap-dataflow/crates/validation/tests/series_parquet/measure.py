@@ -263,6 +263,28 @@ def answered_epochs(samples):
     return answered
 
 
+def await_answered_epochs(sampler, workers, *, deadline_ns):
+    """Keep sampling until every worker has answered MINIMUM_EPOCHS epochs.
+
+    A release engine can take its input and drain inside one or two
+    collections. The lifetime's own samples must still span enough answered
+    epochs to be a measurement, so the sampler keeps running until they do:
+    an observable condition under a deadline, not a wait. Returns the
+    fewest answered epochs of any worker once it is enough.
+    """
+    def fewest():
+        """The fewest answered epochs any worker has in the samples."""
+        answered = answered_epochs(list(sampler.samples))
+        return min(answered.get(key, 0) for key in workers)
+
+    return measurement.wait_until(
+        fewest,
+        lambda count: count >= MINIMUM_EPOCHS,
+        deadline_ns=deadline_ns,
+        description=f"{MINIMUM_EPOCHS} answered epochs of every worker",
+    )
+
+
 class EnginePhase:
     """One engine lifetime of a measured run: ready, input, drain."""
 
@@ -335,22 +357,10 @@ class EnginePhase:
             )
         }
         self.drain["duration_s"] = (time.monotonic_ns() - started) / 1e9
-        # A release engine can take its input and drain inside one or two
-        # collections. The lifetime's own samples must still span enough
-        # answered epochs to be a measurement, so sampling continues until
-        # they do -- an observable condition under a deadline, not a wait.
-        workers = [worker["key"] for worker in self.workers]
-
-        def fewest():
-            """The fewest answered epochs any worker has in the samples."""
-            answered = answered_epochs(list(self.sampler.samples))
-            return min(answered.get(key, 0) for key in workers)
-
-        _ = measurement.wait_until(
-            fewest,
-            lambda count: count >= MINIMUM_EPOCHS,
+        _ = await_answered_epochs(
+            self.sampler,
+            [worker["key"] for worker in self.workers],
             deadline_ns=time.monotonic_ns() + READY_DEADLINE_S * 10**9,
-            description=f"{MINIMUM_EPOCHS} answered epochs of every worker",
         )
         self.sampler.stop()
         self.controls.raise_if_invalid()
@@ -862,27 +872,32 @@ def run_child(spec, output_dir, *, report_dir=None, restart=False,
     return result
 
 
-# The checks every run must record, whatever its topology.
-CI_ALWAYS = ("delivery", "graph_edges", "minimum_samples", "rss_reconciliation")
-
 # The one hard gate a non-publishable host is expected to fail: it is too
 # small to publish, which is why it runs in this mode. Every other hard gate
 # a child fails also fails the CI index.
 HOST_CAPACITY_CHECKS = ("physical_cores_sufficient",)
 
+# The gates a CI child must record: the evaluator's own required set, less
+# the host-capacity gate. Derived, so the two can never drift apart.
+CI_REQUIRED_CHECKS = tuple(
+    name for name in measurement.REQUIRED_HARD_CHECKS
+    if name not in HOST_CAPACITY_CHECKS
+)
+
 
 def ci_failures(child) -> list:
     """The hard gates that fail one child in the non-publishable CI mode.
 
-    Every required CI check must be present and passed, and every other hard
-    check the child recorded must have passed too, except the host-capacity
-    gate a runner too small to publish on necessarily fails.
+    Every gate the baseline evaluator requires, except the host-capacity
+    gate a runner too small to publish on necessarily fails, must be present
+    and passed; an absent gate fails. Every other hard check the child
+    recorded must have passed too.
     """
     statuses = {}
     for entry in child["checks"]:
         if entry["kind"] == measurement.CHECK_HARD:
             statuses.setdefault(entry["name"], []).append(entry["status"])
-    failed = [name for name in CI_ALWAYS if name not in statuses]
+    failed = [name for name in CI_REQUIRED_CHECKS if name not in statuses]
     for name, recorded in sorted(statuses.items()):
         if name in HOST_CAPACITY_CHECKS:
             continue
