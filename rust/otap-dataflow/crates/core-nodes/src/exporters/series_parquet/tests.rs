@@ -1781,6 +1781,41 @@ async fn worker_metrics_cover_live_memory_and_requests() {
     );
 }
 
+/// Scenario: a worker with registered instruments samples its telemetry.
+/// Guarantees: the worker publishes exactly its accounted bytes into the
+/// process-wide series accounting, so the engine residual subtracts what this
+/// worker actually retains.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_publishes_accounted_bytes_to_process_accounting() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.metrics = Some(super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    ));
+
+    assert_eq!(worker.accounting.bytes(), 0);
+    worker.admit(logs_pdata());
+    worker.sample_metrics();
+
+    let accounted = worker
+        .metrics
+        .as_ref()
+        .expect("registered")
+        .worker
+        .memory_accounted_bytes
+        .get();
+    assert!(accounted > 0);
+    assert_eq!(worker.accounting.bytes(), accounted);
+}
+
 /// Scenario: one block is abandoned after admission and a later block commits
 /// successfully.
 /// Guarantees: `series_emitted` excludes admitted/abandoned rows and

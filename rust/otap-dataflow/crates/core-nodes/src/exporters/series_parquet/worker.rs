@@ -55,6 +55,7 @@ use lake::cache::SeriesCache;
 use lake::clock::{WallClock, nanos_to_micros, nanos_to_secs};
 use lake::extract::Extracted;
 use otel_arrow_dfe_engine::clock;
+use otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
@@ -220,6 +221,12 @@ pub(super) struct Worker {
     /// `None` for a worker driven directly by a test, which keeps every call
     /// site a no-op rather than requiring a registry.
     pub(super) metrics: Option<Metrics>,
+    /// This worker's share of the process-wide series exporter memory total.
+    ///
+    /// Held for the worker's whole life so the engine monitor can subtract what
+    /// the exporters account for from the one process RSS sample it already
+    /// takes; dropping the worker withdraws its bytes and its registration.
+    pub(super) accounting: SeriesMemoryAccounting,
 }
 
 impl Worker {
@@ -264,6 +271,7 @@ impl Worker {
             token_high_water: size_of::<AckToken>(),
             samples: 0,
             metrics: None,
+            accounting: SeriesMemoryAccounting::register(),
         }
     }
 
@@ -767,9 +775,9 @@ impl Worker {
 
     /// Publish everything the worker can be asked about right now.
     ///
-    /// Called at the top of every loop turn and before every terminal return,
-    /// so the gauges describe the state the node is actually in rather than
-    /// the state it was in when something last happened.
+    /// Called on `CollectTelemetry` and before every terminal snapshot, so the
+    /// gauges describe the state the node is actually in at the moment it is
+    /// asked rather than the state it was in when something last happened.
     ///
     /// The accounted total is exactly what the worker retains: the ACTIVE
     /// block, the FLUSHING block, the one parked request, the completions the
@@ -782,7 +790,7 @@ impl Worker {
     pub(super) fn sample_metrics(&mut self) {
         // A worker with no registered instruments -- every worker a test
         // drives directly -- would compute the whole sample only to discard
-        // it, and this runs on every turn of the node's loop.
+        // it, including the linear scan over the live tokens.
         if self.metrics.is_none() {
             return;
         }
@@ -822,6 +830,7 @@ impl Worker {
             + cache
             + self.notify.bytes() as u64
             + (spare_tokens * size_of::<AckToken>()) as u64;
+        self.accounting.set(accounted);
         let budget = 2 * cfg.ingress.max_block_bytes as u64
             + cfg.ingress.max_extracted_bytes as u64
             + self.cfg.cache_entries as u64 * CACHE_ENTRY_BYTES

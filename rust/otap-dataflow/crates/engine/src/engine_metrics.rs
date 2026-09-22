@@ -41,7 +41,73 @@ use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use otel_arrow_dfe_telemetry::registry::{EntityKey, TelemetryRegistryHandle};
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use otel_arrow_dfe_telemetry_macros::metric_set;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// Number of series exporter workers currently registered in this process.
+static SERIES_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sum of the bytes those workers have most recently accounted for.
+static SERIES_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether some engine monitor already owns the process residual metric.
+///
+/// A process may run more than one engine monitor; only one of them registers
+/// and reports the residual, because the residual describes the process, not
+/// the engine.
+static SERIES_REPORTER_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// One worker's contribution to process-wide series exporter memory accounting.
+///
+/// A worker holds this for its whole life, so the residual distinguishes a
+/// worker that currently retains nothing from no worker at all. Dropping it
+/// withdraws exactly this worker's bytes and its registration, once.
+#[derive(Debug)]
+pub struct SeriesMemoryAccounting {
+    /// What this worker last published, so a later value can be applied as a delta.
+    bytes: u64,
+}
+
+impl SeriesMemoryAccounting {
+    /// Register one active exporter worker, including workers currently retaining zero bytes.
+    #[must_use]
+    pub fn register() -> Self {
+        let _ = SERIES_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self { bytes: 0 }
+    }
+
+    /// What this worker last published.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Replace this worker's accounted bytes without disturbing other workers.
+    pub fn set(&mut self, bytes: u64) {
+        if bytes >= self.bytes {
+            let _ = SERIES_ACCOUNTED_BYTES.fetch_add(bytes - self.bytes, Ordering::Relaxed);
+        } else {
+            let _ = SERIES_ACCOUNTED_BYTES.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
+        }
+        self.bytes = bytes;
+    }
+}
+
+impl Drop for SeriesMemoryAccounting {
+    fn drop(&mut self) {
+        self.set(0);
+        let _ = SERIES_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Process-scoped exporter residual; the engine monitor is its single reporter.
+#[metric_set(name = "exporter.series_parquet")]
+#[derive(Debug, Default, Clone)]
+pub struct SeriesProcessMetrics {
+    /// RSS minus the accounted sum, clamped to zero.
+    #[metric(name = "memory.unaccounted_rss_bytes", unit = "By")]
+    pub residual: Gauge<u64>,
+}
 
 /// Engine-wide metrics emitted once per engine instance.
 #[metric_set(name = "engine")]
@@ -94,6 +160,11 @@ pub struct EngineMetricsMonitor {
     num_cores: usize,
     /// Shared process-wide memory limiter state.
     memory_pressure_state: MemoryPressureState,
+    /// The process residual set, present only while a series worker is registered
+    /// and this monitor is the one that owns the reporting of it.
+    series: Option<MetricSet<SeriesProcessMetrics>>,
+    /// The engine entity the residual is reported on; there is no worker entity here.
+    series_entity: EntityKey,
 }
 
 impl EngineMetricsMonitor {
@@ -120,12 +191,49 @@ impl EngineMetricsMonitor {
             cpu_start: ProcessTime::now(),
             num_cores,
             memory_pressure_state,
+            series: None,
+            series_entity: entity_key,
+        }
+    }
+
+    /// Registers or unregisters the process residual to match the live worker count.
+    ///
+    /// The residual is meaningless without a worker to be a residual of, so no
+    /// metric set exists at zero workers. At least one worker, the first
+    /// monitor to win `SERIES_REPORTER_OWNED` reports it; a second monitor
+    /// leaves it alone, and can pick it up on a later update if the first
+    /// monitor is dropped.
+    fn sync_series_registration(&mut self) {
+        if SERIES_WORKERS.load(Ordering::Acquire) == 0 {
+            if let Some(series) = self.series.take() {
+                let _ = self.registry.unregister_metric_set(series.metric_set_key());
+                SERIES_REPORTER_OWNED.store(false, Ordering::Release);
+            }
+        } else if self.series.is_none()
+            && SERIES_REPORTER_OWNED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.series = Some(
+                self.registry
+                    .register_metric_set_for_entity::<SeriesProcessMetrics>(self.series_entity),
+            );
         }
     }
 
     /// Samples current engine-wide metrics (RSS, CPU utilization, etc.).
     pub fn update(&mut self) {
-        self.metrics.memory_rss.observe(get_rss_bytes());
+        // One RSS read per monitor update, shared by the engine gauge and the
+        // series residual: an exporter must never cost the process its own
+        // `/proc` sample.
+        let rss = get_rss_bytes();
+        self.metrics.memory_rss.observe(rss);
+        self.sync_series_registration();
+        if let Some(series) = &mut self.series {
+            series
+                .residual
+                .set(rss.saturating_sub(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed)));
+        }
 
         // Compute process-wide CPU utilization normalized across all cores.
         let now_wall = Instant::now();
@@ -161,6 +269,12 @@ impl EngineMetricsMonitor {
     /// Returns an error only if the metrics channel is permanently closed.
     /// A full channel is silently tolerated (non-blocking, try-send semantics).
     pub fn report(&mut self) -> Result<(), otel_arrow_dfe_telemetry::error::Error> {
+        // Rechecked here, not just in `update`, so the last worker leaving
+        // between the two never has its residual reported after it is gone.
+        self.sync_series_registration();
+        if let Some(series) = &mut self.series {
+            self.reporter.report(series)?;
+        }
         self.reporter.report(&mut self.metrics)
     }
 
@@ -174,6 +288,12 @@ impl EngineMetricsMonitor {
         deadline: Instant,
     ) -> Result<(), otel_arrow_dfe_telemetry::error::Error> {
         self.update();
+        if let Some(series) = &mut self.series {
+            let _ = self
+                .reporter
+                .report_reliably_until(series, deadline)
+                .await?;
+        }
         let _ = self
             .reporter
             .report_reliably_until(&mut self.metrics, deadline)
@@ -191,6 +311,10 @@ fn get_rss_bytes() -> u64 {
 
 impl Drop for EngineMetricsMonitor {
     fn drop(&mut self) {
+        if let Some(series) = self.series.take() {
+            let _ = self.registry.unregister_metric_set(series.metric_set_key());
+            SERIES_REPORTER_OWNED.store(false, Ordering::Release);
+        }
         let _ = self
             .registry
             .unregister_metric_set(self.metrics.metric_set_key());
@@ -216,12 +340,20 @@ mod tests {
             reporter,
             controller.memory_pressure_state(),
         );
-        monitor.update();
+        // `memory_stats` reads /proc, which can fail transiently under a loaded
+        // machine and then reports zero. Retrying a few times keeps the
+        // guarantee -- the monitor does report real RSS -- without failing the
+        // suite on one unlucky read.
+        let mut rss = 0;
+        for _ in 0..5 {
+            monitor.update();
+            rss = monitor.metrics.memory_rss.get();
+            if rss > 0 {
+                break;
+            }
+        }
 
-        assert!(
-            monitor.metrics.memory_rss.get() > 0,
-            "memory_rss should report non-zero process RSS"
-        );
+        assert!(rss > 0, "memory_rss should report non-zero process RSS");
     }
 
     #[test]
@@ -296,5 +428,86 @@ mod tests {
         assert_eq!(monitor.metrics.process_memory_usage_bytes.get(), 95);
         assert_eq!(monitor.metrics.process_memory_soft_limit_bytes.get(), 90);
         assert_eq!(monitor.metrics.process_memory_hard_limit_bytes.get(), 100);
+    }
+
+    /// Serializes the process-global accounting tests.
+    ///
+    /// Both of them assert on process-wide counters, so the workspace suite
+    /// running them on two threads at once would make each one observe the
+    /// other's registrations.
+    static SERIES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the shared lock, tolerating poisoning from an earlier failure.
+    ///
+    /// A failing assertion unwinds through the registration guards, which
+    /// restore the counters on the way out, so the next test still starts from
+    /// a consistent process state and should report its own failure rather
+    /// than a poisoned lock.
+    fn series_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Scenario: two exporter workers account memory and one exits.
+    /// Guarantees: the process total removes the exited worker and never subtracts another worker twice.
+    #[test]
+    fn series_accounting_releases_each_worker_once() {
+        let _guard = series_test_lock();
+        let baseline = SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed);
+        let mut a = SeriesMemoryAccounting::register();
+        let mut b = SeriesMemoryAccounting::register();
+        a.set(128);
+        b.set(256);
+        a.set(192);
+        assert_eq!(
+            SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed),
+            baseline + 448
+        );
+        drop(a);
+        assert_eq!(
+            SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed),
+            baseline + 256
+        );
+        b.set(0);
+        assert_eq!(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed), baseline);
+        drop(b);
+        assert_eq!(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed), baseline);
+    }
+
+    /// Scenario: a process has no series workers, then two, then no workers again.
+    /// Guarantees: only active workers expose residual telemetry and residual reuses the engine RSS sample.
+    #[test]
+    fn series_accounting_controls_process_metric_presence() {
+        let _guard = series_test_lock();
+        let registry = TelemetryRegistryHandle::new();
+        let controller = ControllerContext::new(registry.clone());
+        let entity = controller.register_engine_entity();
+        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
+        let mut monitor = EngineMetricsMonitor::new(
+            registry,
+            entity,
+            reporter,
+            controller.memory_pressure_state(),
+        );
+        monitor.update();
+        assert!(monitor.series.is_none());
+        let mut a = SeriesMemoryAccounting::register();
+        let b = SeriesMemoryAccounting::register();
+        a.set(128);
+        monitor.update();
+        assert_eq!(
+            monitor.series.as_ref().expect("registered").residual.get(),
+            monitor.metrics.memory_rss.get().saturating_sub(128)
+        );
+        drop(a);
+        monitor.update();
+        assert!(
+            monitor.series.is_some(),
+            "zero-byte worker is still registered"
+        );
+        drop(b);
+        monitor.update();
+        assert!(monitor.series.is_none());
     }
 }
