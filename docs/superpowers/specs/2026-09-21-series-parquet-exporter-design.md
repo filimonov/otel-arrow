@@ -1,7 +1,7 @@
 # Series Parquet Exporter: Design
 
 Date: 2026-09-21
-Status: approved for planning (revision 6, after three rounds of external
+Status: approved for planning (revision 7, after three rounds of external
 review)
 Scope: phases 1 and 2 of the series lake work (core crate and Dataflow
 exporter). Introspection HTTP API and traces are separate specs; section 10
@@ -18,6 +18,13 @@ exporter's acknowledgement invariant (1, 1.1), three deployment topologies
 buffered pipeline with a longer window (7.4), required plan-3 latency,
 restart, replay and duplicate measurements (9), and consistent retry,
 shutdown and deferred shared-writer wording throughout.
+
+What changed in revision 7: findings from executing plans 1 and 2 and from
+three investigations. Recorded the upstream exporter comparison (2),
+output-schema and identity-width rationale (3, 4), timestamp compatibility
+(5.4), portable point classification (5.5), consolidated limitations
+(5.7), the derived shutdown bound (7.1), measured results and required
+plan-3 scope (9.8, 9.9), and deferred partition granularity (10.2).
 
 ## 1. Problem
 
@@ -76,9 +83,8 @@ Verified on `main` at commit `5588c3e0d`:
 - `crates/core-nodes/src/exporters/parquet_exporter`: object-store backends
   (file, S3, Azure), retry options, Arrow-to-Parquet plumbing, telemetry.
   It writes the OTAP star schema (batch-local ids), has no byte budget, no
-  time partitions, no cross-batch dedup, drops the ack context, and its
-  age-based flush is dead when `target_rows_per_file` is set
-  (`writer.rs:298`). It shows the mandatory input steps: convert the payload
+  time partitions and no cross-batch dedup. It shows the mandatory input
+  steps: convert the payload
   to `OtapArrowRecords` with `try_into_with_default` and call
   `decode_transport_optimized_ids` before touching `parent_id` columns
   (`mod.rs:335-349`). Conversion allocates a full OTAP representation before
@@ -156,13 +162,56 @@ Verified on `main` at commit `5588c3e0d`:
   (`durable_buffer_processor/mod.rs:420`); no reusable cache with an entry
   budget and the semantics needed here exists.
 
-The existing `parquet_exporter` is not modified. The `should_flush` bug is
-fixed in a separate upstream PR and is out of scope here.
+This exporter exists separately from `exporter:parquet` because durable
+request decisions, bounded blocks and predictable visibility need a
+different ownership and flush model. Three verified properties of the
+upstream exporter matter:
+
+- It sends no acknowledgement at all. `mod.rs` drops the context with
+  `// Note: context is not used` and carries a TODO for retryable and
+  non-retryable nacks. With receiver `wait_for_result: false`, a producer's
+  OK means only that bytes were accepted into memory; with
+  `wait_for_result: true`, it waits until timeout (section 7.7).
+- Flush thresholds are per payload type and per partition, and files close
+  separately; there is no atomic file set. The current `writer.rs` delays a
+  parent file's close until its child files have closed, including resource,
+  scope and log attributes for logs. Partial visibility can expose attribute
+  files before log files; log-body files wait while their attributes remain
+  buffered (`test_doesnt_autoflush_parent_batch_if_children_not_flushed`).
+- In `writer.rs::should_flush`, the row and age conditions are joined by
+  `else if`. When `target_rows_per_file` is set, as it is by default to
+  100 million rows in `config.rs`, `flush_when_older_than` is never evaluated
+  at all. This looks like a defect worth reporting upstream.
+
+The [in-flight upstream patch][upstream-parquet-patch] adds
+content-hash ids, dimension-table semantics for the attribute tables and
+Hive time partitioning to `exporter:parquet`. The two designs are converging
+on the same idea from different directions. Two differences matter for
+future convergence:
+identity width (64-bit FNV-1a there, 128-bit XXH3 here; section 4), and
+re-emission policy. The patch clears its dedup cache on a UTC day change so
+each day partition is self-contained, at the cost of a midnight burst.
+This design re-emits per storage partition, spreading the cost across
+partitions and bounding its cache by entries and their byte charge
+(section 6.6).
+
+The existing `parquet_exporter` is not modified by this design. The patch
+and any fix to `should_flush` are separate upstream work.
+
+[upstream-parquet-patch]: ../../../otap-dataflow.patch
 
 ## 3. Architecture
 
 Two new crates under `rust/otap-dataflow/crates/`, keeping the diff against
 upstream additive: new files, one feature flag, one component-inventory entry.
+
+The exporter defines its own output schema instead of passing OTAP batches
+through. The Parquet writer tolerates a column switching between a plain
+type and a dictionary at the top level, but not inside a struct. The
+OTLP-to-OTAP encoder chooses encodings adaptively per batch, so a struct
+child switching encoding mid-file breaks the write. The upstream patch
+normalizes struct children for this reason; constructing the schemas of
+section 5 removes that class of failure here.
 
 ### 3.1 `series-lake` (engine-independent)
 
@@ -212,6 +261,14 @@ xxHash canonical big-endian representation, rendered as 32 lowercase hex
 characters in APIs and logs. `identity_bytes` is also stored in the `series`
 row (section 5.1) so that `xxh3_128(identity_bytes) == series_id` can be
 verified by any reader.
+
+The in-flight upstream patch derives ids with FNV-1a over 64 bits. An
+identity collision merges two distinct label sets into one descriptor row,
+so values are silently joined to the wrong labels. A 64-bit identity reaches
+the birthday range at a few billion distinct sets, and FNV additionally has
+weak avalanche on structured keys. This design uses 128-bit XXH3 with pinned
+golden vectors to give the identity adequate width and keep its encoding and
+hash stable across implementations.
 
 `identity_bytes` is built from typed values. Every value is
 `tag:u8 ++ len:u32_be ++ payload`:
@@ -390,9 +447,10 @@ number points. For a number point carrying no value, both value columns
 are null; flags are stored as received and never inferred. Histogram
 optionality is unchanged: `sum`, `min` and `max` may be absent, and a
 histogram without a distribution has empty lists, not null lists. The point
-kind is not duplicated in the values row: it is already `metric_type` in
+kind must come from `metric_type` in
 the series descriptor, obtained through the same join the reader already
-performs (section 5.5). Every other column is unchanged.
+performs (section 5.5), never from null-ness or `count`. Every other column
+is unchanged.
 
 With separate number and histogram datasets, a mixed metrics stream
 (gauges, counters and histograms from the same sources) costs two PUTs per
@@ -541,6 +599,15 @@ scope with `sort_key != none` can later be merged by a k-way merge without
 re-sorting; files with `sort_key=none` must be re-sorted; files in different
 scopes are never merged together.
 
+`time` is a microsecond timestamp, while `time_unix_nano` keeps the raw
+nanoseconds in a plain integer column. Iceberg v2 has no nanosecond timestamp
+type. The upstream patch records the failure mode: catalogs registering
+nanosecond files declare the column as microseconds but copy the Parquet
+footer min and max verbatim into manifest bounds. The bounds are then wrong
+by a factor of a thousand; a bounded time predicate prunes every file and
+silently returns no rows. Writing microseconds makes every layer agree by
+construction, while the integer column retains the original precision.
+
 ### 5.5 Reading the data
 
 Because descriptors repeat (eviction, new partition, restart, several
@@ -564,8 +631,9 @@ what it read.
 
 For metrics, use the same canonical view over
 `signal=metrics/dataset=series` and join the single
-`signal=metrics/dataset=values` dataset on `series_id`. The join supplies
-the point kind for both number and histogram rows:
+`signal=metrics/dataset=values` dataset on `series_id`. A reader must
+determine a point's kind from the descriptor's `metric_type` through this
+join, never from which columns are null and never from `count`:
 
 ```sql
 WITH series AS (
@@ -583,6 +651,18 @@ JOIN series AS s USING (series_id)
 
 The Spark recipe uses the same paths, `mergeSchema` and canonical
 descriptor selection; it needs no union of separate point-kind datasets.
+
+At the Parquet level a number row's list columns are null while a
+bucket-less histogram's are empty. DuckDB preserves that difference, but
+ClickHouse has no nullable `Array` and renders a null list as an empty one.
+List null-ness is therefore not portable; the descriptor join answers the
+same way in both readers.
+
+The measured test consequence is that a distribution-less histogram's empty
+lists are observable only when the same request also carries a shape that
+fills those columns. The OTAP transport drops a column whose every entry
+in a request is the type default. A test for empty lists must therefore
+include a histogram with buckets and bounds in that same request.
 
 ### 5.6 Request cost model
 
@@ -624,6 +704,35 @@ using fewer, larger workers, and a variable part (total bytes divided by
 `part_bytes`), which shrinks by raising `part_bytes` at the cost of buffer
 memory. Below about 15 s, files become too small for efficient row groups
 and multiply the reader's and compactor's work.
+
+### 5.7 Limitations
+
+Execution of plans 1 and 2 established these limits of the implementation:
+
+- A histogram `sum` of zero is indistinguishable from an absent sum after an
+  OTAP round trip when every sum in the request is the type default: the
+  transport drops that column. The same restriction applies to optional
+  metrics columns under that condition.
+- Only top-level OTLP protobuf framing is validated before conversion.
+  Nested messages are not validated; the shared lazy byte views can surface
+  corrupt nested content as missing fields instead of refusing it.
+- Multipart parts begun in the finalizing phase are not aborted. Once
+  Parquet finalization starts, the buffered writer cannot safely abort its
+  in-flight upload; those parts are left to a bucket lifecycle rule for
+  incomplete multipart uploads, including after a crash.
+- Sealing the values tables costs a transient of up to
+  `(V + 1) * run_target_bytes` for V buffered values runs: finalizing a values
+  dataset adds a run for what is still buffered.
+- A table's merge keys remain resident for the whole merge. A wide sort key
+  can approach a second copy of the table's payload. Merge chunk sizing is
+  based on average row width, so unusually wide rows can overshoot
+  `merge_chunk_bytes`.
+- Per-worker caches allow the same series to be described by several
+  writers. Readers tolerate this through the latest-descriptor join of
+  section 5.5, but it inflates `series` volume.
+
+The memory allowances of section 6.6 are design reservations. Plan 3 must
+validate them against resident memory, including these transients (9.9).
 
 ## 6. Buffering, memory and flush
 
@@ -787,7 +896,7 @@ completion.
    for every token to `notify`; drops the block.
 4. Any error before commit: abort the multipart upload best-effort, back off,
    retry the whole block with the same file names, until the absolute
-   `flush_retry_deadline` measured from the first attempt; the deadline also
+   `flush_retry_deadline` taken when the block is sealed; the deadline also
    cancels an in-flight attempt (same mechanism as step 2). An upload whose
    response was lost is retried like a failure; overwriting an identical
    object is safe. Past the deadline the task returns `Failed`; the node
@@ -927,12 +1036,34 @@ Control messages:
   token.
 - `CollectTelemetry`: report metrics.
 - Others: ignored. `DrainIngress` is never delivered to exporters, so the
-  exporter cannot flush early when draining begins. For the strict topology,
-  the README requires `shutdown deadline > window.interval +
-  flush_retry_deadline + upload time`, otherwise receivers give up on
-  outstanding requests before the exporter can commit them. With a durable
-  buffer upstream, producer requests finish at the WAL write; bundles not
-  committed by shutdown remain on disk for replay after restart.
+  exporter cannot flush early when draining begins.
+
+Receivers drain before the exporter is handed `Shutdown`. In the strict
+topology an OTLP receiver holds its responses until this node decides, and
+this node normally waits for the window boundary before sealing. With a
+long window both sides wait until the engine's drain timeout. With a durable
+buffer upstream, producer requests finish at the WAL write; bundles not
+committed by shutdown remain on disk for replay after restart.
+
+The derived worst case for an orderly shutdown is:
+
+```text
+window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) + notification margin
+```
+
+A block's absolute retry deadline is taken when it is sealed. The second
+block cannot seal until the first releases the flush slot, including abort
+cleanup, so the two retry windows are sequential. On the defaults the bound
+is `15 s + 2 * (60 s + 5 s) = 145 s`, plus notification margin. The two
+retry windows and abort allowances account for 130 s of the 145 s; twice
+the retry deadline alone is 120 s. Lowering `flush_retry_deadline` therefore
+buys most of the shutdown headroom.
+
+This does not fit the 60 s a SIGINT or SIGTERM grants. An orderly stop must
+use the admin shutdown API with an explicit sufficient timeout (180 s for
+the defaults), or a lower `flush_retry_deadline` that fits the full bound.
+The admin API also defaults to 60 s, so merely switching to it is not enough.
+Longer configured windows require a correspondingly longer timeout.
 
 ### 7.2 Acknowledgement contract
 
@@ -1418,8 +1549,9 @@ about shipped test coverage:
   new block.
 
 The buffer's memory and disk usage are reported separately from exporter
-memory. The full chaos and soak program remains deferred (section 10.3);
-this focused topology proof belongs to plan 3.
+memory. This topology proof and the thirty-minute soak and failure matrix
+of section 9.9 belong to plan 3. The longer nightly and qualification program
+remains deferred (section 10.3).
 
 ### 9.6 Benchmarks
 
@@ -1438,7 +1570,8 @@ encoder transient) and fails when they are exceeded.
 - Integration ready: 9.2, 9.4 and 9.5 pass for logs and metrics; this node
   acks its upstream only after object completion; producer acknowledgements
   follow the selected topology. Plan-3 buffered latency, restart, replay and
-  duplicate checks pass alongside the strict restart and outage tests.
+  duplicate checks pass alongside the strict restart and outage tests, and
+  the measurements and acceptance checks of 9.9 are complete.
 - Canary ready (after the deferred chaos and soak program of 10.3): nightly
   soak with storage latency, errors and restarts shows no RSS trend and no
   lost acknowledged records.
@@ -1447,6 +1580,61 @@ encoder transient) and fails when they are exceeded.
   migration. This is a rollout step, not part of this design.
 
 Every test carries `Scenario` and `Guarantees` doc comments.
+
+### 9.8 What has been measured
+
+These are verified results from plans 1 and 2 and the investigations,
+separate from the design requirements above:
+
+- The E2E suite runs 18 tests with Docker required
+  (`SERIES_REQUIRE_DOCKER=1`) and zero skips, covering both object stores
+  (MinIO and RustFS) and both readers (DuckDB and ClickHouse).
+- Duplicates under at-least-once delivery were observed and are tolerated by
+  the layout and both readers. A deterministic replay case asserts exact
+  multiplicities, including unchanged counts for records not replayed.
+- Merging the metrics datasets took a mixed metrics window from three files
+  to two: one `series` file and one `values` file.
+- The producer memory and throughput figures in section 7.6 come from the
+  [measured Alloy rig][alloy-research], with fixed response holds, queue
+  occupancy, resident memory and delivered records measured. They are
+  producer results, not measurements of this exporter's throughput ceiling.
+
+The exporter's per-core throughput ceiling, memory envelope and the
+failure-model behaviour required below have NOT yet been measured. The
+existing outage and replay cases do not establish the full failure matrix;
+these measurements are the subject of the next plan.
+
+### 9.9 Plan 3 requirements
+
+The next plan must complete all of the following, in addition to the
+durable-buffer topology proof already required by revision 6 in section 9.5:
+
+- A thirty-minute soak, reporting input and drain rates, resident memory
+  over time, descriptor coverage and stored record multiplicities. Every
+  acknowledged supported record must remain present after drain.
+- Maximum throughput per core and the share of time spent in extraction,
+  encoding and upload, using the staged benchmarks of section 9.6.
+- Write speed in records and bytes per second, for local storage and a real
+  S3 endpoint, with workload, core count and compression settings recorded.
+- Validation of the memory model against real resident memory, including
+  conversion, sealing, resident merge keys, encoding and upload transients.
+  Report the buffer's memory and disk separately; compare accounted bytes
+  and process RSS and explain the residual rather than treating engineering
+  reservations as measured ceilings.
+- Failure models covering S3 slowdown and server errors, process restarts,
+  hard kills, and network, DNS and TCP acknowledgement faults. Every case
+  must assert at-least-once after recovery and drain by stable input record
+  id: no acknowledged supported record missing, valid descriptor coverage,
+  and duplicate multiplicities counted. Run both the strict topology with
+  producer retry and the buffered topology with retained disk and lossless
+  retention.
+- The full section 9.5 durable-buffer proof: acknowledgement latency for
+  15 s and 120 s windows, mid-window kill and restart without producer
+  resends, retry after storage outage, and replay after ambiguous completion.
+
+These are required plan-3 measurements and acceptance checks. Section 10.3
+extends them to nightly and qualification durations; it does not defer this
+thirty-minute soak or failure matrix.
 
 ## 10. Deferred work
 
@@ -1520,6 +1708,9 @@ queue, which is the buffer-removal point.
 - Idempotent replay based on producer batch ids.
 - Commit manifests or a commit index for block-atomic reads (may return as an
   optional audit record).
+- Configurable partition granularity, day or hour, as the upstream patch
+  offers. This design fixes the hour; at low volume a day granularity gives
+  fewer directories and fewer files.
 - Typed attribute maps (the v1 format is lossy by decision).
 - Finer-grained interleaving of admission work with control handling
   (resumable extraction), if the section 6.7 bound proves too loose.
@@ -1527,8 +1718,8 @@ queue, which is the buffer-removal point.
 ### 10.3 Chaos and soak program (deferred, must not be forgotten)
 
 Deferred from v1 by decision, to run right after metrics land, on both
-end-to-end topologies of section 9.4, extending the focused plan-3 proof in
-section 9.5:
+end-to-end topologies of section 9.4, extending the required plan-3 topology
+proof, thirty-minute soak and failure matrix in sections 9.5 and 9.9:
 
 - A TCP proxy (toxiproxy or equivalent) between the exporter and the store
   injecting latency, bandwidth limits, resets, timeouts and outages while
@@ -1628,7 +1819,9 @@ implementation plan.
    v1 outage test (9.5).
 3. Metrics (number and histogram points in `metrics/values`) reusing the
    same machinery.
-4. Plan 3: benchmark suite and expansion-factor measurements, plus the
-   required buffered-topology latency, restart, replay and duplicate proof
-   (9.5); quality gates through "integration ready".
+4. Plan 3: per-core throughput, extraction/encoding/upload time shares,
+   write speed, resident-memory validation, a thirty-minute soak and the
+   at-least-once failure matrix (9.9), plus the required buffered-topology
+   latency, restart, replay and duplicate proof (9.5); quality gates through
+   "integration ready".
 5. Chaos and soak program (10.3), then the "canary ready" gate.
