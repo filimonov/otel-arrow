@@ -29,8 +29,15 @@
 //! attempt on the same names might still be in flight.
 //!
 //! Dropping the job cancels the write. The sink treats its cancellation token
-//! as a request to abort the upload rather than finish it, so a dropped owner
-//! never leaves a half-written object behind as a completed file.
+//! as a request to abort the upload rather than finish it while the upload is
+//! still writable. That does not make a cancelled or expired block leave no
+//! file behind: an object whose upload was already being finalized when the
+//! token fired may still complete, and so may one whose write finished in the
+//! very poll the deadline expired in if the owner has stopped listening. Such
+//! a file holds rows whose requests were nacked, which the producer's retry
+//! then writes again -- a duplicate that at-least-once delivery permits, never
+//! a loss. What the deadline does guarantee is that a write that has finished
+//! when it is polled is reported as the success it is, see [`write_until`].
 
 use super::token::AckToken;
 use otel_arrow_dfe_engine::clock;
@@ -91,9 +98,14 @@ pub(super) struct FlushDone {
 /// The Parquet writer wraps whatever the object store returned, so the storage
 /// origin of a `Parquet` error is found by walking its source chain rather
 /// than by its own variant.
+///
+/// A storage error that no retry can cure -- the credentials are refused, or
+/// the bucket or prefix does not exist -- is not retried either: repeating it
+/// until the deadline would only delay the same failure by the whole deadline
+/// and hide it behind a timeout.
 pub(super) fn retryable(error: &lake::Error) -> bool {
     match error {
-        lake::Error::ObjectStore(_) => true,
+        lake::Error::ObjectStore(e) => transient_store_error(e),
         lake::Error::Parquet(parquet::errors::ParquetError::External(source)) => {
             contains_storage_error(source.as_ref())
         }
@@ -102,11 +114,41 @@ pub(super) fn retryable(error: &lake::Error) -> bool {
     }
 }
 
-/// Whether an error or any of its sources came from storage or I/O.
+/// Whether an object store failure can succeed on a retry of the same write.
+fn transient_store_error(error: &object_store::Error) -> bool {
+    !matches!(
+        error,
+        object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. }
+            | object_store::Error::NotFound { .. }
+    )
+}
+
+/// Whether an I/O failure can succeed on a retry of the same write.
+fn transient_io_error(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+    )
+}
+
+/// Whether an error or any of its sources came from storage or I/O, and the
+/// first such source is one a retry can cure.
 fn contains_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
     loop {
-        if error.is::<object_store::Error>() || error.is::<std::io::Error>() {
-            return true;
+        if let Some(store) = error.downcast_ref::<object_store::Error>() {
+            return transient_store_error(store);
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            // An I/O error that carries an object store error is classified
+            // by what the store said.
+            return match io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<object_store::Error>())
+            {
+                Some(store) => transient_store_error(store),
+                None => transient_io_error(io),
+            };
         }
         match error.source() {
             Some(source) => error = source,
@@ -116,6 +158,11 @@ fn contains_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool
 }
 
 /// Write one sealed block, retrying storage failures until `deadline`.
+///
+/// The write is polled before the cancellation and the deadline: a write that
+/// has finished by the poll in which the deadline also expires is a success
+/// whose files exist, and nacking it would tell the producer to resend rows
+/// that are already durable.
 ///
 /// The result is published over `result_tx` the moment it is known. The task
 /// returns only once it has released everything it owns: on the deadline path
@@ -197,11 +244,11 @@ async fn write_until(
         tokio::pin!(write);
         let result = tokio::select! {
             biased;
+            result = &mut write => Ok(result),
             () = cancel.cancelled() => Err(last
                 .take()
                 .unwrap_or(lake::Error::Cancelled { abort_error: None })),
             () = clock::sleep_until(deadline) => Err(expired(attempts, last.take())),
-            result = &mut write => Ok(result),
         };
         let result = match result {
             Ok(result) => result,

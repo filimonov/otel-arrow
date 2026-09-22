@@ -353,11 +353,19 @@ impl Worker {
             reemit: false,
             emitted: [0; 3],
         };
-        let sink = Rc::new(lake::sink::Sink::new(
-            store,
-            cfg.lake.clone(),
-            lake::sink::FileNaming::new(&cfg.lake.writer_id),
-        ));
+        // The sink bounds its abort on the engine clock like every other wait
+        // of this node, so a simulated clock governs it too.
+        let sink = Rc::new(
+            lake::sink::Sink::new(
+                store,
+                cfg.lake.clone(),
+                lake::sink::FileNaming::new(&cfg.lake.writer_id),
+            )
+            .with_clock(lake::sink::SinkClock {
+                now: clock::now,
+                sleep_until: clock::sleep_until,
+            }),
+        );
         // One credit per in-flight request in each of the two blocks a window
         // pair can hold. Admission stops one short of it, so the last slot is
         // always free for a force-drained refusal once shutdown is latched.

@@ -2469,6 +2469,9 @@ const FAULT_MULTIPART_WEDGE: u8 = 5;
 const FAULT_SLOW_FAIL: u8 = 6;
 /// How long one write takes to fail under [`FAULT_SLOW_FAIL`].
 const SLOW_FAILURE: Duration = Duration::from_secs(20);
+/// Injection mode: every write is refused as `PermissionDenied`, the way a
+/// store answers credentials it does not accept.
+const FAULT_DENIED: u8 = 7;
 
 /// An object store that injects failures at the two entry points a Parquet
 /// write actually uses: a small single-shot PUT and the initiation of a
@@ -2595,6 +2598,12 @@ impl FaultStore {
         }
         if mode == FAULT_SLOW_FAIL {
             clock::sleep(SLOW_FAILURE).await;
+        }
+        if mode == FAULT_DENIED {
+            return Err(object_store::Error::PermissionDenied {
+                path: path.to_string(),
+                source: "injected: access denied".into(),
+            });
         }
         let path = path.as_ref();
         let fail = mode == 4
@@ -3336,6 +3345,115 @@ fn retry_classifier_distinguishes_encoding_from_storage() {
     assert!(!super::flush::retryable(&lake::Error::Cancelled {
         abort_error: None
     }));
+    // Refused credentials and a missing bucket or prefix are storage errors
+    // that no retry cures, however they are wrapped.
+    let denied = || object_store::Error::PermissionDenied {
+        path: "p".into(),
+        source: "denied".into(),
+    };
+    assert!(!super::flush::retryable(
+        &lake::Error::ObjectStore(denied())
+    ));
+    assert!(!super::flush::retryable(&lake::Error::ObjectStore(
+        object_store::Error::NotFound {
+            path: "p".into(),
+            source: "no such bucket".into(),
+        }
+    )));
+    assert!(!super::flush::retryable(&lake::Error::Parquet(
+        parquet::errors::ParquetError::External(Box::new(std::io::Error::other(denied())))
+    )));
+    assert!(!super::flush::retryable(&lake::Error::Parquet(
+        parquet::errors::ParquetError::External(Box::new(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )))
+    )));
+}
+
+/// Scenario: every write is refused as `PermissionDenied` under a
+/// sixty-second flush deadline.
+/// Guarantees: the block fails on its first attempt instead of being retried
+/// until the deadline, so refused credentials are reported at once with the
+/// store's own error rather than a minute later as a deadline expiry.
+#[tokio::test(flavor = "current_thread")]
+async fn a_permission_error_is_not_retried_until_the_deadline() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_DENIED, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_secs(60);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let ticker = ticking(&sim, Duration::from_millis(100));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            drop(ticker);
+            let finished = done.as_ref().expect("the flush resolves");
+            assert_eq!(finished.attempts, 1, "a refused credential is not retried");
+            let error = finished.result.as_ref().expect_err("the write is refused");
+            assert!(error.to_string().contains("access denied"), "{error}");
+        })
+        .await;
+}
+
+/// Scenario: the last object of a block is written in the same engine-clock
+/// step in which the block's retry deadline expires, so the write result and
+/// the deadline are both ready when the flush task is next polled.
+/// Guarantees: the flush reports the success, not a deadline expiry, so a
+/// block whose files exist is acknowledged rather than nacked and resent.
+#[tokio::test(flavor = "current_thread")]
+async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            // The series object parks first and is released well before the
+            // deadline; then the values object parks, and is released in the
+            // same step as the deadline.
+            store.entered.notified().await;
+            store.release.notify_one();
+            store.entered.notified().await;
+            store.release.notify_one();
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let finished = done.as_ref().expect("the flush resolves");
+            assert!(
+                finished.result.is_ok(),
+                "a finished write is not a deadline expiry: {:?}",
+                finished.result.as_ref().err()
+            );
+        })
+        .await;
 }
 
 /// One logs request carrying `records` log records of a single series, so its
@@ -3390,11 +3508,15 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             // encode in milliseconds; a small buffer capacity reaches the same
             // `put_multipart_opts`, `put_part` and `abort` calls at a block
             // size that costs nothing to build. The small row group is what
-            // makes the writer push parts while it is still writing, so the
-            // deadline finds it in the phase where an abort is attempted.
+            // makes the writer push parts while it is still writing, and the
+            // small merge chunk keeps it writing chunk after chunk, so it is
+            // still blocked on the wedged part -- in the phase where an abort
+            // is attempted -- when the deadline expires, even though the flush
+            // polls the write once more before it looks at the deadline.
             cfg.lake.upload.part_bytes = 4096;
             cfg.lake.upload.concurrency = 1;
             cfg.lake.parquet.row_group_bytes = 4096;
+            cfg.lake.sorting.merge_chunk_bytes = 4096;
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(cfg, store.clone(), wall, handler);
 

@@ -3,7 +3,10 @@
 
 //! Writes a sealed block to an object store as Parquet files (spec sections 5.3 to 5.4, 6.5).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
@@ -103,6 +106,171 @@ pub struct Sink {
     store: Arc<dyn ObjectStore>,
     cfg: LakeConfig,
     naming: FileNaming,
+    clock: SinkClock,
+}
+
+/// A sleep future of the sink's clock.
+pub type SinkSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// The monotonic clock the sink bounds its cleanup with.
+///
+/// Injectable so a caller that runs on a simulated clock -- the engine's, in
+/// the exporter -- bounds the abort on that same clock rather than on
+/// wall-clock tokio time a test cannot advance.
+#[derive(Clone, Copy)]
+pub struct SinkClock {
+    /// The current instant.
+    pub now: fn() -> Instant,
+    /// A future that completes at the given instant.
+    pub sleep_until: fn(Instant) -> SinkSleep,
+}
+
+impl Default for SinkClock {
+    fn default() -> Self {
+        Self {
+            now: Instant::now,
+            sleep_until: |at| Box::pin(tokio::time::sleep_until(at.into())),
+        }
+    }
+}
+
+impl std::fmt::Debug for SinkClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SinkClock")
+    }
+}
+
+/// The store one table is written through: the sink's own store, counting
+/// the multipart uploads it is creating.
+///
+/// `BufWriter::abort` can only abort an upload whose creation has finished;
+/// while it is still being created there is nothing to abort, and dropping the
+/// creation leaves an upload at the store that no abort is ever sent for. The
+/// count is what lets a cancelled write wait for exactly that creation, and
+/// for nothing else it may be blocked on.
+#[derive(Debug)]
+struct CreationWatch {
+    inner: Arc<dyn ObjectStore>,
+    creating: std::sync::atomic::AtomicUsize,
+    settled: tokio::sync::Notify,
+}
+
+/// Counts one multipart creation for as long as it is in flight.
+struct Creating<'a>(&'a CreationWatch);
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .creating
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.settled.notify_waiters();
+    }
+}
+
+impl CreationWatch {
+    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            creating: std::sync::atomic::AtomicUsize::new(0),
+            settled: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Whether a multipart upload is being created right now.
+    fn creating(&self) -> bool {
+        self.creating.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Resolves once no multipart upload is being created.
+    async fn settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a creation that ends between
+            // the check and the wait still wakes it.
+            let _ = notified.as_mut().enable();
+            if !self.creating() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl std::fmt::Display for CreationWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CreationWatch {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        let _ = self
+            .creating
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _creating = Creating(self);
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// `base + delta`, saturated at a year out rather than panicking on overflow.
+fn deadline_after(base: Instant, delta: Duration) -> Instant {
+    base.checked_add(delta)
+        .or_else(|| base.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+        .unwrap_or(base)
 }
 
 /// Smallest and largest `time_unix_nano` across the sealed runs of a table.
@@ -132,7 +300,18 @@ impl Sink {
     /// New sink.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, cfg: LakeConfig, naming: FileNaming) -> Self {
-        Self { store, cfg, naming }
+        Self {
+            store,
+            cfg,
+            naming,
+            clock: SinkClock::default(),
+        }
+    }
+
+    /// The same sink, bounding its cleanup on `clock` instead of tokio time.
+    #[must_use]
+    pub fn with_clock(self, clock: SinkClock) -> Self {
+        Self { clock, ..self }
     }
 
     /// File metadata of spec section 5.4.
@@ -179,26 +358,87 @@ impl Sink {
         kv
     }
 
-    /// Best-effort abort of a still-writable upload.
+    /// Best-effort abort of a still-writable upload, by `deadline`.
     ///
-    /// Bounded by `upload.abort_timeout`, so a wedged store cannot block the flush
+    /// Bounded, on the sink's clock, so a wedged store cannot block the flush
     /// task. Returns why the abort did not succeed, or `None` when it did.
-    async fn abort_upload(&self, writer: AsyncArrowWriter<ParquetObjectWriter>) -> Option<String> {
+    async fn abort_upload(
+        &self,
+        writer: AsyncArrowWriter<ParquetObjectWriter>,
+        deadline: Instant,
+    ) -> Option<String> {
         let mut buf: BufWriter = writer.into_inner().into_inner();
-        match tokio::time::timeout(self.cfg.upload.abort_timeout, buf.abort()).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e.to_string()),
-            Err(_elapsed) => Some(format!(
+        tokio::select! {
+            biased;
+            aborted = buf.abort() => aborted.err().map(|e| e.to_string()),
+            () = (self.clock.sleep_until)(deadline) => Some(format!(
                 "abort timed out after {:?}",
                 self.cfg.upload.abort_timeout
             )),
         }
     }
 
+    /// Run one writable-phase writer step, racing `cancel`.
+    ///
+    /// A step that is creating the multipart upload when the token fires is
+    /// not dropped at once: `BufWriter::abort` has nothing to abort until that
+    /// creation has finished, so dropping it would leave an upload at the
+    /// store with no abort ever sent for it. The step keeps being driven until
+    /// the creation has finished or the cleanup deadline -- taken once, at the
+    /// first cancellation, and shared with the abort that follows -- passes. A
+    /// step blocked on anything else, such as a part that does not land, is
+    /// dropped at once so the abort starts with the whole allowance. The step
+    /// reports `Cancelled` either way.
+    async fn step(
+        &self,
+        op: impl Future<Output = parquet::errors::Result<()>>,
+        watch: &CreationWatch,
+        cancel: &CancellationToken,
+        cleanup: &mut Option<Instant>,
+    ) -> Result<()> {
+        tokio::pin!(op);
+        tokio::select! {
+            biased;
+            result = &mut op => return result.map_err(Error::from),
+            () = cancel.cancelled() => {}
+        }
+        let deadline = *cleanup.get_or_insert_with(|| self.cleanup_deadline());
+        if !watch.creating() {
+            return Err(Error::Cancelled { abort_error: None });
+        }
+        tokio::select! {
+            biased;
+            _ = &mut op => Err(Error::Cancelled { abort_error: None }),
+            () = watch.settled() => Err(Error::Cancelled { abort_error: None }),
+            () = (self.clock.sleep_until)(deadline) => Err(Error::Cancelled {
+                abort_error: Some(format!(
+                    "the write in flight did not finish within {:?}, so a multipart upload \
+                     it was creating may be left to the bucket lifecycle rule",
+                    self.cfg.upload.abort_timeout
+                )),
+            }),
+        }
+    }
+
+    /// The instant the cleanup of a failed or cancelled write must end by.
+    fn cleanup_deadline(&self) -> Instant {
+        deadline_after((self.clock.now)(), self.cfg.upload.abort_timeout)
+    }
+
     /// Attach the outcome of the cleanup abort to the failure that triggered it.
+    ///
+    /// A cancellation that already carries a cleanup failure keeps it: the
+    /// abort that follows cannot see what the unsettled write left behind.
     fn with_abort(cause: Error, abort_error: Option<String>) -> Error {
         match (cause, abort_error) {
-            (Error::Cancelled { .. }, abort_error) => Error::Cancelled { abort_error },
+            (
+                Error::Cancelled {
+                    abort_error: earlier,
+                },
+                abort_error,
+            ) => Error::Cancelled {
+                abort_error: earlier.or(abort_error),
+            },
             (cause, None) => cause,
             (cause, Some(abort_error)) => Error::AbortFailed {
                 source: Box::new(cause),
@@ -242,9 +482,13 @@ impl Sink {
                 window_start_secs,
             )))
             .build();
-        let buf =
-            BufWriter::with_capacity(self.store.clone(), path.clone(), self.cfg.upload.part_bytes)
-                .with_max_concurrency(self.cfg.upload.concurrency);
+        let watch = Arc::new(CreationWatch::new(self.store.clone()));
+        let buf = BufWriter::with_capacity(
+            Arc::clone(&watch) as Arc<dyn ObjectStore>,
+            path.clone(),
+            self.cfg.upload.part_bytes,
+        )
+        .with_max_concurrency(self.cfg.upload.concurrency);
         let object_writer = ParquetObjectWriter::from_buf_writer(buf);
         let mut writer = AsyncArrowWriter::try_new(object_writer, schema, Some(props))?;
 
@@ -252,6 +496,7 @@ impl Sink {
         // failure aborts the multipart upload.
         let mut rows = 0usize;
         let mut failure: Option<Error> = None;
+        let mut cleanup: Option<Instant> = None;
         let mut merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
         loop {
             // Yield before every chunk. `AsyncArrowWriter::write` usually
@@ -274,11 +519,9 @@ impl Sink {
                     break;
                 }
             };
-            let step = tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
-                r = writer.write(&chunk) => r.map_err(Error::from),
-            };
+            let step = self
+                .step(writer.write(&chunk), &watch, cancel, &mut cleanup)
+                .await;
             if let Err(e) = step {
                 failure = Some(e);
                 break;
@@ -287,11 +530,9 @@ impl Sink {
             if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
                 || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
             {
-                let step = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
-                    r = writer.flush() => r.map_err(Error::from),
-                };
+                let step = self
+                    .step(writer.flush(), &watch, cancel, &mut cleanup)
+                    .await;
                 if let Err(e) = step {
                     failure = Some(e);
                     break;
@@ -299,11 +540,12 @@ impl Sink {
             }
         }
         if let Some(cause) = failure {
-            let abort_error = self.abort_upload(writer).await;
+            let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
+            let abort_error = self.abort_upload(writer, deadline).await;
             return Err(Self::with_abort(cause, abort_error));
         }
         if cancel.is_cancelled() {
-            let abort_error = self.abort_upload(writer).await;
+            let abort_error = self.abort_upload(writer, self.cleanup_deadline()).await;
             return Err(Error::Cancelled { abort_error });
         }
 
@@ -638,6 +880,86 @@ mod tests {
                 part: self.part,
                 abort: self.abort,
             }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// An `ObjectStore` whose multipart creation is slow: it cancels a token as
+    /// the values upload is being created and yields before the creation
+    /// finishes, so the cancellation lands while `BufWriter` is still
+    /// preparing the upload.
+    #[derive(Debug)]
+    struct CancelDuringCreate {
+        inner: Arc<dyn ObjectStore>,
+        token: CancellationToken,
+    }
+
+    impl std::fmt::Display for CancelDuringCreate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CancelDuringCreate({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CancelDuringCreate {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            if location.as_ref().contains("dataset=values") {
+                self.token.cancel();
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            self.inner.put_multipart_opts(location, options).await
         }
 
         async fn get_opts(
@@ -1225,6 +1547,40 @@ mod tests {
         assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
     }
 
+    /// Scenario: the cancellation lands while the values multipart upload is
+    /// still being created, before `BufWriter` has an upload it could abort.
+    /// Guarantees: the started creation is allowed to finish within
+    /// `upload.abort_timeout`, and the upload it created is then aborted
+    /// rather than left orphaned at the store with `abort_error: None`
+    /// claiming a clean cleanup; no values object is completed.
+    #[tokio::test]
+    async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let aborted = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(CancelDuringCreate {
+            inner: Arc::new(ControlledMultipart {
+                inner: local(&dir),
+                entered: Arc::new(Notify::new()),
+                aborted: aborted.clone(),
+                parts: Arc::new(AtomicUsize::new(0)),
+                part: PartBehavior::Fail,
+                abort: AbortBehavior::Delegate,
+            }),
+            token: token.clone(),
+        });
+        let cfg = upload_config();
+        let b = sealed_upload_block(&cfg);
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let got = sink.write_block(&b, &token).await;
+        assert!(got.is_err(), "a cancelled write fails: {got:?}");
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the upload created after the cancellation must be aborted"
+        );
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+    }
+
     /// Scenario: a part upload fails while the writer is still writable and the
     /// best-effort abort that follows fails as well.
     /// Guarantees: `AbortFailed` carries both the original write failure and the reason
@@ -1265,6 +1621,42 @@ mod tests {
         assert!(parts.load(Ordering::SeqCst) > 0);
         assert!(aborted.load(Ordering::SeqCst));
         assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+    }
+
+    /// Scenario: a part upload fails and the abort then hangs, with an hour of
+    /// `upload.abort_timeout`, on a sink whose injected clock reports every
+    /// deadline as already reached.
+    /// Guarantees: the abort ends on the injected clock -- at once -- rather
+    /// than after an hour of tokio time, so a caller running on a simulated
+    /// clock governs the sink's cleanup bound as well.
+    #[tokio::test]
+    async fn the_abort_is_bounded_on_the_injected_clock() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
+            inner: local(&dir),
+            entered: Arc::new(Notify::new()),
+            aborted: Arc::new(AtomicBool::new(false)),
+            parts: Arc::new(AtomicUsize::new(0)),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Hang,
+        });
+        let mut cfg = upload_config();
+        cfg.upload.abort_timeout = Duration::from_secs(3600);
+        let b = sealed_upload_block(&cfg);
+        let sink = Sink::new(store, cfg, FileNaming::new("w")).with_clock(SinkClock {
+            now: Instant::now,
+            sleep_until: |_| Box::pin(std::future::ready(())),
+        });
+        let got = tokio::time::timeout(
+            Duration::from_secs(30),
+            sink.write_block(&b, &CancellationToken::new()),
+        )
+        .await
+        .expect("the abort is bounded by the injected clock, not by tokio time");
+        let Err(Error::AbortFailed { abort_error, .. }) = got else {
+            panic!("expected AbortFailed, got {got:?}");
+        };
+        assert!(abort_error.contains("timed out"), "{abort_error}");
     }
 
     /// Scenario: a part upload fails and the best-effort abort then hangs, with a

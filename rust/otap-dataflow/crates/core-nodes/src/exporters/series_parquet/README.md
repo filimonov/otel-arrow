@@ -59,7 +59,10 @@ cancelled and
 given at most `upload.abort_timeout` to unwind; the flush slot stays occupied
 until that cleanup finishes. An encoding failure is not retried at all: only
 an object-store or I/O error is, so a bug in encoding fails the block on its
-first attempt instead of repeating it until the deadline. Its requests are
+first attempt instead of repeating it until the deadline. Refused credentials
+and a missing bucket or path are not retried either, because no retry of the
+same write can cure them. A write that has finished by the moment the
+deadline expires is reported as the success it is. Its requests are
 still nacked as retryable, because the producer holds the only copy of rows
 that are not durable. Only a fully successful write marks the descriptor
 cache, so the cache never claims durability for rows that were not stored.
@@ -1004,7 +1007,9 @@ become null; a negative converted timestamp becomes null and increments
   writer's abort is only safe before finalization starts. Configure a bucket
   lifecycle rule that removes incomplete multipart uploads; the exporter does
   not reclaim those parts. Multipart uploads begun before finalization are
-  aborted within `upload.abort_timeout`.
+  aborted within `upload.abort_timeout`, including one whose creation was
+  still in flight when the cancellation came: that creation is allowed to
+  finish within the same allowance so the abort has an upload to abort.
 - One Parquet row group can start several multipart upload parts at once
   whatever `upload.concurrency` says. The burst is bounded by
   `parquet.row_group_bytes`.
