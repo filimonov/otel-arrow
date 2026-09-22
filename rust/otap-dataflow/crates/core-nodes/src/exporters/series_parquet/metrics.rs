@@ -140,6 +140,8 @@ pub(super) enum NackReason {
     Unsupported,
     /// The node shut down before the request could be decided.
     Shutdown,
+    /// A writer invariant failed; the request is not at fault.
+    Internal,
 }
 
 /// The refusal class of one nacked request.
@@ -486,6 +488,7 @@ mod tests {
             (NackReason::Invalid, "invalid"),
             (NackReason::Unsupported, "unsupported"),
             (NackReason::Shutdown, "shutdown"),
+            (NackReason::Internal, "internal"),
         ] {
             metrics.nacks.with(NackAttrs { reason }).nacks.observe(1);
             let snapshots = metrics.nacks.terminal_snapshots();

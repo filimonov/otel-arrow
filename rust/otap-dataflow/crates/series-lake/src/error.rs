@@ -36,6 +36,12 @@ pub enum Error {
     /// pdata failure.
     #[error("pdata: {0}")]
     Pdata(String),
+    /// A writer invariant did not hold: the request's content is not at fault.
+    ///
+    /// Distinct from [`Error::Refused`] so a caller never reports its own bug
+    /// to a producer as a permanent refusal of the producer's data.
+    #[error("internal: {0}")]
+    Internal(String),
     /// Flush cancelled. `abort_error` is set when the best-effort multipart
     /// abort also failed or timed out.
     #[error("cancelled{}", match abort_error { Some(e) => format!(" (multipart abort failed: {e})"), None => String::new() })]
@@ -60,5 +66,10 @@ impl Error {
     /// Shorthand for an invalid-content refusal.
     pub fn invalid(msg: impl Into<String>) -> Self {
         Error::Refused(RefuseReason::Invalid(msg.into()))
+    }
+
+    /// Shorthand for a broken writer invariant.
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Error::Internal(msg.into())
     }
 }

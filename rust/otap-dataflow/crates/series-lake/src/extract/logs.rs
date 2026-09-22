@@ -211,7 +211,7 @@ pub(crate) fn extract_logs(
         vec![(Dataset::LogsValues, batches)]
     };
     if descriptors.is_empty() && !values.is_empty() {
-        return Err(Error::invalid("values without descriptors"));
+        return Err(Error::internal("values without descriptors"));
     }
     Ok(Extracted {
         signal: Signal::Logs,

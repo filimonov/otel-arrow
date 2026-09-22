@@ -113,7 +113,7 @@ fn normalize_key(col: &ArrayRef) -> ArrayRef {
 fn check_columns(batch: &RecordBatch, spec: &SortSpec) -> Result<()> {
     for k in &spec.keys {
         if batch.column_by_name(&k.column).is_none() {
-            return Err(Error::invalid(format!("sort column {} missing", k.column)));
+            return Err(Error::internal(format!("sort column {} missing", k.column)));
         }
     }
     Ok(())
@@ -125,7 +125,7 @@ fn sort_columns(batch: &RecordBatch, spec: &SortSpec) -> Result<Vec<SortColumn>>
         .map(|k| {
             let col = batch
                 .column_by_name(&k.column)
-                .ok_or_else(|| Error::invalid(format!("sort column {} missing", k.column)))?;
+                .ok_or_else(|| Error::internal(format!("sort column {} missing", k.column)))?;
             Ok(SortColumn {
                 values: normalize_key(col),
                 options: Some(SortSpec::options(k)),
@@ -320,7 +320,7 @@ pub fn merge_runs(
     // matter, so runs that differ solely in schema-level metadata merge fine and
     // the first run's metadata is carried into the output.
     if runs.iter().any(|r| r.schema().fields() != schema.fields()) {
-        return Err(Error::invalid("merge runs have different schemas"));
+        return Err(Error::internal("merge runs have different schemas"));
     }
     if spec.is_empty() {
         return Ok(MergeIter {

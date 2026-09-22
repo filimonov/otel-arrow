@@ -235,7 +235,7 @@ impl SortedTableBuffer {
             let index = schema.index_of("emitted_at")?;
             let expected = DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")));
             if schema.field(index).data_type() != &expected {
-                return Err(Error::invalid(
+                return Err(Error::internal(
                     "series emitted_at must be a UTC microsecond timestamp",
                 ));
             }
@@ -431,7 +431,7 @@ impl<T> Block<T> {
         token: T,
     ) -> Result<()> {
         if self.is_sealed() {
-            return Err(Error::invalid("block already sealed"));
+            return Err(Error::internal("block already sealed"));
         }
         let Extracted {
             signal,
@@ -448,7 +448,7 @@ impl<T> Block<T> {
                 .iter()
                 .map(|&i| {
                     descriptors.get(i).ok_or_else(|| {
-                        Error::invalid("reservation names a descriptor the request does not carry")
+                        Error::internal("reservation names a descriptor the request does not carry")
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1270,7 +1270,8 @@ mod tests {
 
     /// Scenario: a request offered to a block that has already been sealed.
     /// Guarantees: `admit` refuses rather than restamping the descriptor with the
-    /// earlier seal time or adding estimated bytes to the exact recount.
+    /// earlier seal time or adding estimated bytes to the exact recount, and
+    /// reports it as a writer invariant, not as a refusal of the request.
     #[test]
     fn admit_after_seal_is_rejected() {
         let cfg = LakeConfig::default();
@@ -1287,7 +1288,7 @@ mod tests {
         let err = block
             .admit(e2, r2, 2)
             .expect_err("a sealed block admits nothing");
-        assert!(matches!(err, Error::Refused(RefuseReason::Invalid(_))));
+        assert!(matches!(err, Error::Internal(_)));
         assert!(err.to_string().contains("already sealed"));
         assert_eq!(block.bytes, sealed_bytes);
         assert_eq!(block.request_count(), 1);

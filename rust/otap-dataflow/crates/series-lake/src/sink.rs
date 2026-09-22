@@ -362,7 +362,7 @@ impl Sink {
         // data. This is a runtime check, not a debug assertion: the files would
         // be just as wrong in a release build.
         if !block.is_sealed() {
-            return Err(Error::invalid("unsealed block"));
+            return Err(Error::internal("unsealed block"));
         }
         if cancel.is_cancelled() {
             return Err(Error::Cancelled { abort_error: None });

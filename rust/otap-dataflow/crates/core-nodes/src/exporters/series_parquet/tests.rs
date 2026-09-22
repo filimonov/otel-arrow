@@ -306,13 +306,18 @@ async fn validation_refusals_are_permanent() {
             assert!(worker.active.data.is_empty());
             assert!(worker.active.tokens.is_empty());
             assert!(!worker.rotation_requested);
-            for reason in ["unsupported", "too_large"] {
+            // The reason is the sentence the producer sees: it names the
+            // rule, the limit and the remedy, not a bare metric token.
+            for reason in [
+                "traces are not stored by series_parquet",
+                "exceeds ingress.max_request_bytes (1 bytes); split the batch upstream",
+            ] {
                 assert!(worker.notify.next().await.is_ok());
                 match rx.recv().await.expect("a refusal") {
                     PipelineCompletionMsg::DeliverNack { nack } => {
                         assert!(nack.permanent);
                         assert_eq!(nack.cause, NackCause::Refused);
-                        assert_eq!(nack.reason, reason);
+                        assert!(nack.reason.contains(reason), "reason: {}", nack.reason);
                     }
                     other => panic!("expected a nack, got {other:?}"),
                 }
@@ -387,7 +392,7 @@ async fn a_storage_failure_after_validation_is_retryable() {
             match rx.recv().await.expect("a storage failure") {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(!nack.permanent);
-                    assert_eq!(nack.reason, "storage");
+                    assert!(nack.reason.contains("retry"), "reason: {}", nack.reason);
                 }
                 other => panic!("expected a nack, got {other:?}"),
             }
@@ -498,7 +503,7 @@ async fn expect_shutdown_nack(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>)
         PipelineCompletionMsg::DeliverNack { nack } => {
             assert!(!nack.permanent);
             assert_eq!(nack.cause, NackCause::NodeShutdown);
-            assert_eq!(nack.reason, "shutdown");
+            assert_eq!(nack.reason, Outcome::Shutdown.sentence());
         }
         other => panic!("expected a nack, got {other:?}"),
     }
@@ -530,7 +535,7 @@ async fn the_deadline_decides_every_outstanding_request() {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(!nack.permanent);
                     assert_eq!(nack.cause, NackCause::NodeShutdown);
-                    assert_eq!(nack.reason, "shutdown");
+                    assert_eq!(nack.reason, Outcome::Shutdown.sentence());
                 }
                 other => panic!("expected a nack, got {other:?}"),
             }
@@ -562,9 +567,79 @@ fn each_failure_class_maps_to_its_outcome() {
         Outcome::Invalid
     );
     assert_eq!(
-        Failure::Retryable(lake::Error::invalid("flush failed")).outcome(),
+        Failure::Retryable(lake::Error::ObjectStore(object_store::Error::Generic {
+            store: "test",
+            source: "unreachable".into(),
+        }))
+        .outcome(),
         Outcome::Storage
     );
+    assert_eq!(
+        Failure::Retryable(lake::Error::internal("flush failed")).outcome(),
+        Outcome::Internal
+    );
+}
+
+/// Scenario: extraction fails on a writer invariant -- the column/builder
+/// mismatch a writer bug produces -- rather than on the request's content,
+/// and the failure is classified by the rule the admission path uses and then
+/// delivered.
+/// Guarantees: only a lake refusal is permanent. The internal error becomes a
+/// retryable nack labelled `internal`, and its reason is a sentence carrying
+/// the sanitized detail, so a producer never drops data because of an
+/// exporter bug and an operator can still see what went wrong.
+#[tokio::test(flavor = "current_thread")]
+async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
+    let cfg = worker_config();
+    let failure = Failure::classify(lake::Error::internal(
+        "column/builder mismatch for Str(None)\nsecond line",
+    ));
+    assert!(matches!(failure, Failure::Retryable(_)));
+    assert_eq!(failure.outcome(), Outcome::Internal);
+    assert!(!failure.outcome().refused());
+    let sentence = failure.sentence(super::worker::Stage::Extract, &cfg);
+    assert!(
+        sentence.contains("column/builder mismatch for Str(None) second line"),
+        "the detail is kept, on one line: {sentence}"
+    );
+    assert!(
+        Failure::classify(lake::Error::invalid("bad"))
+            .outcome()
+            .refused()
+    );
+
+    let (handler, mut rx) = effects(1);
+    let mut notify = Notifier::new(handler, 4);
+    let (token, payload) = AckToken::split(empty_pdata());
+    drop(payload);
+    notify.push_with(token, failure.outcome(), Some(sentence.clone().into()));
+    notify.next().await.expect("the completion is accepted");
+    match rx.recv().await.expect("a nack") {
+        PipelineCompletionMsg::DeliverNack { nack } => {
+            assert!(!nack.permanent);
+            assert_ne!(nack.cause, NackCause::Refused);
+            assert_eq!(nack.reason, sentence);
+        }
+        other => panic!("expected a nack, got {other:?}"),
+    }
+    assert_eq!(notify.outcomes()[Outcome::Internal as usize], 1);
+}
+
+/// Scenario: an error detail longer than the reason bound, and one holding
+/// control characters and multi-byte characters at the cut.
+/// Guarantees: the detail a nack reason carries is bounded, single-line and
+/// cut on a character boundary, so request-derived text cannot make a status
+/// message unbounded or split a character.
+#[test]
+fn a_reason_detail_is_bounded_and_single_line() {
+    let long = "x".repeat(10_000);
+    let cut = super::token::sanitized(&long);
+    assert!(cut.len() <= 256 + 3);
+    assert!(cut.ends_with("..."));
+    let wide = "\u{e9}".repeat(1_000);
+    let cut = super::token::sanitized(&wide);
+    assert!(cut.len() <= 256 + 3);
+    assert_eq!(super::token::sanitized("a\r\nb\tc"), "a  b c");
 }
 
 /// Scenario: the bounded engine completion channel fills while a second
@@ -861,7 +936,12 @@ async fn a_malformed_otlp_body_is_refused_atomically() {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(nack.permanent);
                     assert_eq!(nack.cause, NackCause::Refused);
-                    assert_eq!(nack.reason, "invalid");
+                    assert!(
+                        nack.reason
+                            .starts_with("invalid request content: malformed OTLP"),
+                        "reason: {}",
+                        nack.reason
+                    );
                 }
                 other => panic!("expected a framing refusal, got {other:?}"),
             }
@@ -926,7 +1006,12 @@ async fn a_malformed_otlp_metrics_body_is_refused_atomically() {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(nack.permanent);
                     assert_eq!(nack.cause, NackCause::Refused);
-                    assert_eq!(nack.reason, "invalid");
+                    assert!(
+                        nack.reason
+                            .starts_with("invalid request content: malformed OTLP"),
+                        "reason: {}",
+                        nack.reason
+                    );
                 }
                 other => panic!("expected a framing refusal, got {other:?}"),
             }
@@ -974,7 +1059,11 @@ async fn a_mixed_metrics_request_is_rejected_atomically() {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(nack.permanent);
                     assert_eq!(nack.cause, NackCause::Refused);
-                    assert_eq!(nack.reason, "unsupported");
+                    assert!(
+                        nack.reason.contains("set unsupported: drop"),
+                        "reason: {}",
+                        nack.reason
+                    );
                 }
                 other => panic!("expected an unsupported refusal, got {other:?}"),
             }
@@ -1119,7 +1208,11 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(nack.permanent);
                     assert_eq!(nack.cause, NackCause::Refused);
-                    assert_eq!(nack.reason, "too_large");
+                    assert!(
+                        nack.reason.contains("window.max_block_bytes (1 bytes)"),
+                        "reason: {}",
+                        nack.reason
+                    );
                 }
                 other => panic!("expected a block-budget refusal, got {other:?}"),
             }

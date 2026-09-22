@@ -26,6 +26,7 @@ use otel_arrow_dfe_pdata::OtapPayload;
 use std::collections::VecDeque;
 use std::future::{Future, pending};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// The completion a request is still owed, without its payload.
@@ -103,13 +104,43 @@ pub(super) enum Outcome {
     Storage,
     /// The node shut down before the request could be decided.
     Shutdown,
+    /// A writer invariant failed while handling the request; the request is
+    /// not at fault and the sender may retry.
+    Internal,
 }
 
 /// Number of [`Outcome`] variants, and so the width of the counter array.
-pub(super) const OUTCOMES: usize = 6;
+pub(super) const OUTCOMES: usize = 7;
+
+/// Longest detail an error may contribute to a nack reason, in bytes.
+///
+/// The reason is the status message a producer sees and logs, so it carries
+/// enough of the underlying error to act on but never an unbounded amount of
+/// request-derived text.
+const MAX_DETAIL_BYTES: usize = 256;
+
+/// A bounded, printable rendering of an error for a nack reason.
+///
+/// Control characters, including line breaks, become spaces so the reason
+/// stays one line, and the text is cut at a character boundary once it passes
+/// [`MAX_DETAIL_BYTES`].
+pub(super) fn sanitized(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len().min(MAX_DETAIL_BYTES + 3));
+    for c in detail.chars() {
+        if out.len() + c.len_utf8() > MAX_DETAIL_BYTES {
+            out.push_str("...");
+            break;
+        }
+        out.push(if c.is_control() { ' ' } else { c });
+    }
+    out
+}
 
 impl Outcome {
-    /// Stable reason string reported on the completion.
+    /// Stable machine token of the outcome: the metric label and log field.
+    ///
+    /// Never the reason a producer is told; that is a sentence, see
+    /// [`Outcome::sentence`].
     pub(super) fn reason(self) -> &'static str {
         match self {
             Self::Ack => "ack",
@@ -118,6 +149,32 @@ impl Outcome {
             Self::Unsupported => "unsupported",
             Self::Storage => "storage",
             Self::Shutdown => "shutdown",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The reason sentence a completion carries when its decision supplied
+    /// none of its own: what happened and what the sender should do.
+    pub(super) fn sentence(self) -> &'static str {
+        match self {
+            Self::Ack => "stored",
+            Self::TooLarge => {
+                "the request exceeds a series_parquet size budget; split the batch upstream"
+            }
+            Self::Invalid => "the request content is invalid; fix the producer",
+            Self::Unsupported => {
+                "the request carries data series_parquet does not store; route it elsewhere"
+            }
+            Self::Storage => {
+                "series_parquet could not write the block holding this request to object \
+                 storage; retry the request"
+            }
+            Self::Shutdown => {
+                "series_parquet shut down before the request was stored; retry the request"
+            }
+            Self::Internal => {
+                "series_parquet hit an internal error handling the request; retry the request"
+            }
         }
     }
 
@@ -129,6 +186,14 @@ impl Outcome {
 
 /// A completion send that has been started but has not resolved.
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), Error>>>>;
+
+/// One decided completion waiting for the send slot: the token, its outcome
+/// and, when the decision has something more specific to say than
+/// [`Outcome::sentence`], the reason sentence the sender is told.
+///
+/// The sentence is shared, because a failed block decides every one of its
+/// requests with the same one.
+type Queued = (AckToken, Outcome, Option<Rc<str>>);
 
 /// The single in-flight completion send, kept across polls.
 struct Sending {
@@ -146,7 +211,7 @@ pub(super) struct Notifier {
     /// Handle the completions are routed through.
     effects: EffectHandler<OtapPdata>,
     /// Completions waiting for the send slot.
-    queue: VecDeque<(AckToken, Outcome)>,
+    queue: VecDeque<Queued>,
     /// The one completion currently being sent, if any.
     sending: Option<Sending>,
     /// Maximum number of live completions, queued plus sending.
@@ -195,17 +260,17 @@ impl Notifier {
     pub(super) fn bytes(&self) -> usize {
         self.queue
             .iter()
-            .map(|(token, _)| token.external_bytes())
+            .map(|(token, _, _)| token.external_bytes())
             .sum::<usize>()
             + self.sending.as_ref().map_or(0, |sending| sending.bytes)
-            + self.queue.capacity() * size_of::<(AckToken, Outcome)>()
+            + self.queue.capacity() * size_of::<Queued>()
     }
 
     /// When the oldest outstanding completion was taken ownership of.
     pub(super) fn oldest(&self) -> Option<Instant> {
         self.queue
             .iter()
-            .map(|(token, _)| token.received)
+            .map(|(token, _, _)| token.received)
             .chain(self.sending.iter().map(|sending| sending.received))
             .min()
     }
@@ -246,6 +311,14 @@ impl Notifier {
     /// completions, and the last slot is kept for a shutdown outcome, so the
     /// node can always still decide one force-drained request.
     pub(super) fn push(&mut self, token: AckToken, outcome: Outcome) {
+        self.push_with(token, outcome, None);
+    }
+
+    /// Queue one decided request with the reason sentence its sender is told.
+    ///
+    /// `None` falls back to [`Outcome::sentence`]. The credit rule is the one
+    /// [`Notifier::push`] documents.
+    pub(super) fn push_with(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
         let reserved = usize::from(outcome != Outcome::Shutdown);
         assert!(
             self.len() + 1 + reserved <= self.capacity,
@@ -253,7 +326,7 @@ impl Notifier {
         );
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[outcome as usize] += 1;
-        self.queue.push_back((token, outcome));
+        self.queue.push_back((token, outcome, reason));
     }
 
     /// The engine call one decided completion is delivered by.
@@ -261,18 +334,25 @@ impl Notifier {
     /// Every delivery path goes through this, so a queued completion, a
     /// completion abandoned at the shutdown deadline and a force-drained
     /// refusal are reported identically.
+    ///
+    /// The nack reason is a sentence -- the decision's own when it supplied
+    /// one, the outcome's default otherwise -- because it is the status
+    /// message the producer sees. The machine token of the outcome stays the
+    /// metric label only.
     async fn delivery(
         effects: EffectHandler<OtapPdata>,
         token: AckToken,
         outcome: Outcome,
+        reason: Option<Rc<str>>,
     ) -> Result<(), Error> {
         let data = token.pdata();
+        let sentence = || reason.as_deref().unwrap_or(outcome.sentence()).to_owned();
         match outcome {
             Outcome::Ack => effects.notify_ack(AckMsg::new(data)).await,
             Outcome::Shutdown => {
                 effects
                     .notify_nack(NackMsg::new_with_cause(
-                        outcome.reason(),
+                        sentence(),
                         data,
                         NackCause::NodeShutdown,
                     ))
@@ -281,17 +361,13 @@ impl Notifier {
             refused if refused.refused() => {
                 effects
                     .notify_nack(NackMsg::new_permanent_with_cause(
-                        refused.reason(),
+                        sentence(),
                         data,
                         NackCause::Refused,
                     ))
                     .await
             }
-            other => {
-                effects
-                    .notify_nack(NackMsg::new(other.reason(), data))
-                    .await
-            }
+            _ => effects.notify_nack(NackMsg::new(sentence(), data)).await,
         }
     }
 
@@ -303,12 +379,12 @@ impl Notifier {
     /// resolves, which lets the caller use it as an idle `select` branch.
     pub(super) async fn next(&mut self) -> Result<(), Error> {
         if self.sending.is_none() {
-            let Some((token, outcome)) = self.queue.pop_front() else {
+            let Some((token, outcome, reason)) = self.queue.pop_front() else {
                 return pending().await;
             };
             let external = token.external_bytes();
             let received = token.received;
-            let future = Self::delivery(self.effects.clone(), token, outcome);
+            let future = Self::delivery(self.effects.clone(), token, outcome, reason);
             let bytes = external + size_of_val(&future);
             self.sending = Some(Sending {
                 bytes,
@@ -342,7 +418,7 @@ impl Notifier {
         drop(payload);
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[Outcome::Shutdown as usize] += 1;
-        self.deliver_now(token, Outcome::Shutdown);
+        self.deliver_now(token, Outcome::Shutdown, None);
     }
 
     /// Attempt one completion immediately, counting a send that would block.
@@ -351,10 +427,10 @@ impl Notifier {
     /// request and the completions abandoned once the shutdown deadline has
     /// elapsed. The token is released either way, so the request ends decided
     /// or counted as a delivery failure, never silently dropped.
-    fn deliver_now(&mut self, token: AckToken, outcome: Outcome) {
+    fn deliver_now(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
         use futures::FutureExt;
 
-        let delivered = Self::delivery(self.effects.clone(), token, outcome).now_or_never();
+        let delivered = Self::delivery(self.effects.clone(), token, outcome, reason).now_or_never();
         if !matches!(delivered, Some(Ok(()))) {
             self.failures += 1;
         }
@@ -374,8 +450,8 @@ impl Notifier {
         {
             self.failures += 1;
         }
-        while let Some((token, outcome)) = self.queue.pop_front() {
-            self.deliver_now(token, outcome);
+        while let Some((token, outcome, reason)) = self.queue.pop_front() {
+            self.deliver_now(token, outcome, reason);
         }
     }
 }
@@ -406,7 +482,7 @@ mod tests {
         drop(payload);
         let external = token.external_bytes();
         notify.push(token, Outcome::Ack);
-        let queue = notify.queue.capacity() * size_of::<(AckToken, Outcome)>();
+        let queue = notify.queue.capacity() * size_of::<Queued>();
         assert_eq!(notify.bytes(), queue + external);
 
         assert!(
@@ -443,7 +519,7 @@ mod tests {
             PipelineCompletionMsg::DeliverNack { nack } => {
                 assert!(nack.permanent);
                 assert_eq!(nack.cause, NackCause::Refused);
-                assert_eq!(nack.reason, "too_large");
+                assert_eq!(nack.reason, Outcome::TooLarge.sentence());
             }
             other => panic!("expected a nack, got {other:?}"),
         }
@@ -451,7 +527,7 @@ mod tests {
             PipelineCompletionMsg::DeliverNack { nack } => {
                 assert!(!nack.permanent);
                 assert_eq!(nack.cause, NackCause::Unspecified);
-                assert_eq!(nack.reason, "storage");
+                assert_eq!(nack.reason, Outcome::Storage.sentence());
             }
             other => panic!("expected a nack, got {other:?}"),
         }

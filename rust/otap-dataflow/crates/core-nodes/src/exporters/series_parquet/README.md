@@ -88,14 +88,23 @@ means every file for that request's block completed in the object store.
 | --- | --- | --- |
 | Durable | OK | none |
 | Content, schema or budget refusal | INVALID_ARGUMENT | fix the request |
-| Storage failure, flush deadline, shutdown | UNAVAILABLE | retry |
+| Storage failure, flush deadline, shutdown, internal error | UNAVAILABLE | retry |
 | Receiver admission exhausted | RESOURCE_EXHAUSTED | retry later |
 | Producer-side timeout | DEADLINE_EXCEEDED | retry; may duplicate |
 
 Content, schema and budget rejections are permanent. Storage and shutdown
 failures are retryable, and so is a request refused while the destination is
-unavailable. Producer disconnect does not remove rows that were already
-admitted.
+unavailable. An internal error of the exporter itself, such as a broken writer
+invariant or an Arrow failure while extracting a request, is retryable too:
+the request is not at fault, so it is never reported as a refusal. Producer
+disconnect does not remove rows that were already admitted.
+
+The status message of every nack is a sentence naming the rule or limit that
+decided it and what to do, for example `request of 20000000 bytes exceeds
+ingress.max_request_bytes (16777216 bytes); split the batch upstream or raise
+the limit`. Any error detail it quotes is cut to 256 bytes and kept on one
+line. The short machine form of the outcome is the `reason` label of the
+`nacks` metric.
 
 ### Give a producer attempt more than one window
 
@@ -852,7 +861,7 @@ Labelled sets, each with one closed enumeration:
 | Metric | Unit | Label | Values |
 | --- | --- | --- | --- |
 | `flush.count` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
-| `nacks` | `{request}` | `reason` | `storage`, `too_large`, `invalid`, `unsupported`, `shutdown` |
+| `nacks` | `{request}` | `reason` | `storage`, `too_large`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows_written`, `files_written` | `{row}`, `{file}` | `dataset` | `logs_series`, `logs_values`, `metrics_series`, `metrics_values` |
 | `series_emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped_unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |

@@ -136,7 +136,7 @@ pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extra
     }
     records
         .decode_transport_optimized_ids()
-        .map_err(|e| Error::Pdata(e.to_string()))?;
+        .map_err(|e| Error::invalid(format!("transport-optimized ids: {e}")))?;
     let mut budget = Budget::new(cfg);
     match records {
         OtapArrowRecords::Logs(_) => logs::extract_logs(records, cfg, &mut budget),
@@ -375,7 +375,7 @@ fn builder_for(dt: &DataType) -> Result<AnyBuilder> {
             AnyBuilder::ListF64(ListBuilder::new(Float64Builder::new()).with_field(f.clone()))
         }
         DataType::Binary => AnyBuilder::Bytes(BinaryBuilder::new()),
-        other => return Err(Error::invalid(format!("unsupported builder type {other}"))),
+        other => return Err(Error::internal(format!("unsupported builder type {other}"))),
     })
 }
 
@@ -417,7 +417,11 @@ fn append(b: &mut AnyBuilder, c: &Col) -> Result<()> {
         (AnyBuilder::Int(b), Col::Str(None)) => b.append_null(),
         (AnyBuilder::Double(b), Col::Str(None)) => b.append_null(),
         (AnyBuilder::Bool(b), Col::Str(None)) => b.append_null(),
-        (_, c) => return Err(Error::invalid(format!("column/builder mismatch for {c:?}"))),
+        (_, c) => {
+            return Err(Error::internal(format!(
+                "column/builder mismatch for {c:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -480,7 +484,7 @@ impl RowSink {
     pub(crate) fn push(&mut self, row: &ValuesRow, budget: &mut Budget) -> Result<()> {
         budget.charge_row(row.approx_bytes)?;
         if row.cols.len() != self.builders.len() {
-            return Err(Error::invalid("row width does not match dataset schema"));
+            return Err(Error::internal("row width does not match dataset schema"));
         }
         // Seal first: a slice must not grow past run_target_bytes.
         if self.rows_in_slice > 0 && self.slice_bytes + row.approx_bytes > self.run_target {
@@ -792,7 +796,7 @@ pub fn series_batch(
             let m = d
                 .metric
                 .as_ref()
-                .ok_or_else(|| Error::invalid("metrics descriptor without metric"))?;
+                .ok_or_else(|| Error::internal("metrics descriptor without metric"))?;
             cols.extend([
                 Col::Str(Some(m.name.clone())),
                 Col::Str(Some(m.unit.clone())),
