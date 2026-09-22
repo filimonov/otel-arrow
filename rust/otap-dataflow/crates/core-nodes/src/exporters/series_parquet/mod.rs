@@ -245,7 +245,7 @@ async fn drive(
                 }
             } => {
                 otel_warn!("series_parquet.shutdown_deadline_elapsed");
-                worker.abandon();
+                worker.abandon().await;
                 worker.sample_metrics();
                 return Ok(TerminalState::new(
                     deadline.expect("the deadline branch only fires with a deadline"),
@@ -363,7 +363,7 @@ async fn drive(
                         // received and no deadline was granted, so everything
                         // still held is decided before the error is reported.
                         otel_warn!("series_parquet.inbox_failed", error = %e);
-                        worker.abandon();
+                        worker.abandon().await;
                         return Err(e.into());
                     }
                 }

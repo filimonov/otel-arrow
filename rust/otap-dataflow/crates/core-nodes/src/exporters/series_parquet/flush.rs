@@ -46,6 +46,25 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 /// Upper bound the doubling backoff is clamped to.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
+/// Fallback horizon when `base + delta` is not representable.
+const FAR_FUTURE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// `base + delta`, saturated rather than panicking.
+///
+/// `Instant::add` panics on overflow, and every duration here is
+/// user-configurable: a `flush_retry_deadline` or an `abort_timeout` written
+/// as an absurd number of seconds would otherwise take the node down instead
+/// of behaving like the unreachable deadline the user asked for. Saturating
+/// upwards is the safe direction -- a deadline that is further away only means
+/// more retrying -- so the fallback is a year out, and finally `base` itself on
+/// a clock so close to the end of its representable range that even that does
+/// not fit.
+pub(super) fn deadline_at(base: Instant, delta: Duration) -> Instant {
+    base.checked_add(delta)
+        .or_else(|| base.checked_add(FAR_FUTURE))
+        .unwrap_or(base)
+}
+
 /// A flush that has resolved, with the block it was writing.
 pub(super) struct FlushDone {
     /// The sealed block, handed back so its descriptors and partition are
@@ -154,7 +173,7 @@ async fn write_until(
                     .unwrap_or(lake::Error::Cancelled { abort_error: None })),
             });
             attempt_cancel.cancel();
-            let cleanup_deadline = clock::now() + abort_timeout;
+            let cleanup_deadline = deadline_at(clock::now(), abort_timeout);
             tokio::select! {
                 biased;
                 _ = &mut write => {}
@@ -179,13 +198,13 @@ async fn write_until(
                 last = Some(error);
                 // Never past the deadline: the wait itself must not outlive
                 // the bound the block was given.
-                let wake = (clock::now() + delay).min(deadline);
+                let wake = deadline_at(clock::now(), delay).min(deadline);
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => {}
                     () = clock::sleep_until(wake) => {}
                 }
-                delay = (delay * 2).min(MAX_BACKOFF);
+                delay = delay.saturating_mul(2).min(MAX_BACKOFF);
             }
             Err(error) => {
                 let _ = result_tx.send(FlushDone {
@@ -245,7 +264,7 @@ impl FlushJob {
             sink,
             Rc::new(data),
             cancel.clone(),
-            started + retry_deadline,
+            deadline_at(started, retry_deadline),
             abort_timeout,
             result_tx,
         ));
@@ -280,6 +299,29 @@ impl FlushJob {
     /// same file names while an abandoned attempt might still be in flight.
     pub(super) async fn cleanup(&mut self) -> Result<(), JoinError> {
         (&mut self.handle).await
+    }
+
+    /// Cancel the write and release the task, within `deadline`.
+    ///
+    /// This is the terminal counterpart of [`FlushJob::cleanup`]: the node has
+    /// stopped serving its loop, so nothing will join the task later and
+    /// returning while it still owns the block, the sink handle and a
+    /// half-finished multipart abort would leave that abort to be cancelled by
+    /// runtime teardown. Waiting is bounded because the destination may be the
+    /// reason the node is shutting down: past `deadline` the task is aborted
+    /// and the abort itself is awaited, so the task is provably gone rather
+    /// than merely asked to stop.
+    pub(super) async fn shutdown(&mut self, deadline: Instant) {
+        self.cancel.cancel();
+        let joined = tokio::select! {
+            biased;
+            joined = &mut self.handle => Some(joined),
+            () = clock::sleep_until(deadline) => None,
+        };
+        if joined.is_none() {
+            self.handle.abort();
+            let _ = (&mut self.handle).await;
+        }
     }
 }
 

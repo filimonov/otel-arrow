@@ -44,7 +44,7 @@
 //! two blocks, one request and the completions in flight.
 
 use super::config::Config;
-use super::flush::{FlushDone, FlushJob};
+use super::flush::{self, FlushDone, FlushJob};
 use super::metrics::{
     DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs, NackReason,
 };
@@ -967,22 +967,32 @@ impl Worker {
 
     /// Decide everything still owned, once the shutdown deadline has elapsed.
     ///
-    /// The outstanding write is cancelled rather than awaited, because the
-    /// node has run out of time to wait for it, and every completion is
-    /// attempted once without blocking. A completion the engine cannot take
-    /// immediately is counted as a delivery failure and released, so the node
-    /// returns within its deadline and no request is left undecided.
-    pub(super) fn abandon(&mut self) {
+    /// Every completion is decided and delivered first, without blocking: a
+    /// completion the engine cannot take immediately is counted as a delivery
+    /// failure and released, so no request is left undecided whatever the
+    /// destination is doing.
+    ///
+    /// Only then are the two slot holders released. Both are cancelled and
+    /// then awaited within one shared `upload.abort_timeout`, because a task
+    /// that is still unwinding owns the block, the sink handle and possibly a
+    /// multipart abort in flight; returning while it does would leave that
+    /// abort to be cancelled by runtime teardown and the upload to be reclaimed
+    /// by the bucket's lifecycle rule instead. The wait is bounded and ends in
+    /// an abort that is itself awaited, so a destination that never answers
+    /// cannot hold the node open: this costs at most one abort timeout beyond
+    /// the shutdown deadline, and it buys the abort actually being attempted.
+    pub(super) async fn abandon(&mut self) {
         if let Some(pending) = self.pending.take() {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
-        if let Some(mut job) = self.flushing.take() {
+        let mut flushing = self.flushing.take();
+        if let Some(job) = &mut flushing {
             job.cancel.cancel();
             // Reported exactly as the `Error::Cancelled` completion branch
             // reports it: the write did not put its block in object storage,
-            // and the reason it did not is that it was cancelled. Dropping the
-            // job here instead of awaiting it must not make that flush vanish
-            // from the counters.
+            // and the reason it did not is that it was cancelled. Deciding the
+            // block here instead of awaiting its result must not make that
+            // flush vanish from the counters.
             if let Some(metrics) = &mut self.metrics {
                 metrics.worker.flush_duration.record(
                     clock::now()
@@ -996,11 +1006,19 @@ impl Worker {
                 self.notify.push(token, Outcome::Shutdown);
             }
         }
-        // A cleanup still in progress owes no completion; the node has run out
-        // of time to wait for it, so its cancellation token is fired by the
-        // drop and the task is left to the runtime.
-        let _ = self.cleaning.take();
+        // A block whose decision has already been published owes no completion;
+        // what it still owns is the write its supervisor is unwinding.
+        let mut cleaning = self.cleaning.take();
         self.fail_active(Outcome::Shutdown);
         self.notify.drain_now();
+        // One shared bound for both holders, so a node with a write and a
+        // cleanup outstanding does not wait twice.
+        let deadline = flush::deadline_at(clock::now(), self.cfg.lake.upload.abort_timeout);
+        if let Some(job) = &mut flushing {
+            job.shutdown(deadline).await;
+        }
+        if let Some(job) = &mut cleaning {
+            job.shutdown(deadline).await;
+        }
     }
 }

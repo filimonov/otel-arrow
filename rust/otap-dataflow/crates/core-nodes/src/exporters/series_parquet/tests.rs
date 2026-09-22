@@ -9,7 +9,7 @@ use super::worker::{Failure, Prepared, Worker};
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
 };
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::SignalType;
@@ -522,7 +522,7 @@ async fn the_deadline_decides_every_outstanding_request() {
                 .checked_sub(Duration::from_secs(1))
                 .expect("an instant one second in the past");
             worker.shutdown(elapsed);
-            worker.abandon();
+            worker.abandon().await;
 
             assert!(worker.is_idle());
             match rx.recv().await.expect("a shutdown refusal") {
@@ -2202,7 +2202,7 @@ async fn an_abandoned_flush_is_counted_as_cancelled() {
             worker.rotate();
             assert!(worker.flushing.is_some(), "a write is outstanding");
 
-            worker.abandon();
+            worker.abandon().await;
             let metrics = worker.metrics.as_ref().expect("metrics");
             assert_eq!(metrics.worker.flush_failures.get(), 1);
             assert_eq!(metrics.worker.flush_cancelled.get(), 1);
@@ -2263,6 +2263,10 @@ const FAULT_SERIES: u8 = 1;
 const FAULT_VALUES_ONCE: u8 = 2;
 /// Injection mode: every write parks until the test releases it.
 const FAULT_PARK: u8 = 3;
+/// Injection mode: a `values` multipart upload is initiated and then wedges --
+/// its parts never land and its abort never returns -- while everything else
+/// passes through.
+const FAULT_MULTIPART_WEDGE: u8 = 5;
 
 /// An object store that injects failures at the two entry points a Parquet
 /// write actually uses: a small single-shot PUT and the initiation of a
@@ -2289,6 +2293,52 @@ struct FaultStore {
     entered: tokio::sync::Notify,
     /// Releases one parked write under `FAULT_PARK`.
     release: tokio::sync::Notify,
+    /// Parts handed to a wedged multipart upload.
+    parts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Aborts attempted against a wedged multipart upload.
+    aborts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A real multipart upload that is initiated and then never progresses.
+///
+/// The underlying store initiates it, so the destination genuinely holds an
+/// unfinished upload; its parts then park and its abort never returns. That is
+/// the shape that makes the cleanup bound matter: abandoning the upload
+/// without an abort leaves a partial upload behind, and the abort is exactly
+/// the call that may never come back.
+#[derive(Debug)]
+struct WedgedUpload {
+    /// The upload the underlying store really initiated, held so it is only
+    /// released when this one is dropped.
+    _inner: Box<dyn MultipartUpload>,
+    /// Parts handed to this upload, shared with the store the test holds.
+    parts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Aborts attempted against this upload.
+    aborts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for WedgedUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        let _ = self.parts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Parked rather than delivered: the writer must still be in the phase
+        // where the sink aborts a failed upload when the deadline arrives. A
+        // part that lands immediately lets the writer reach the finalizing
+        // phase, which by design leaves a cancelled upload to the bucket's
+        // multipart lifecycle rule rather than aborting it.
+        Box::pin(std::future::pending())
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        std::future::pending().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        let _ = self
+            .aborts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
 }
 
 impl std::fmt::Display for FaultStore {
@@ -2352,7 +2402,17 @@ impl ObjectStore for FaultStore {
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.before(path).await?;
-        self.inner.put_multipart_opts(path, options).await
+        let inner = self.inner.put_multipart_opts(path, options).await?;
+        if self.mode.load(std::sync::atomic::Ordering::SeqCst) == FAULT_MULTIPART_WEDGE
+            && path.as_ref().contains("dataset=values/")
+        {
+            return Ok(Box::new(WedgedUpload {
+                _inner: inner,
+                parts: Arc::clone(&self.parts),
+                aborts: Arc::clone(&self.aborts),
+            }));
+        }
+        Ok(inner)
     }
 
     async fn get_opts(
@@ -2824,4 +2884,191 @@ fn retry_classifier_distinguishes_encoding_from_storage() {
     assert!(!super::flush::retryable(&lake::Error::Cancelled {
         abort_error: None
     }));
+}
+
+/// One logs request carrying `records` log records of a single series, so its
+/// values file is large enough to span several multipart chunks.
+fn bulk_logs_pdata(records: usize) -> OtapPdata {
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: (0..records)
+                    .map(|i| LogRecord {
+                        time_unix_nano: 1_789_960_500_000_000_000 + i as u64,
+                        event_name: "ready".to_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let bytes = encoded(&request);
+    let view = RawLogsData::try_new(&bytes).expect("valid logs bytes");
+    let payload = OtapPayload::from(encode_logs_otap_batch(&view).expect("encodes to OTAP"));
+    let mut context = Context::default();
+    context.set_source_node(7);
+    OtapPdata::new(context, payload)
+}
+
+/// Scenario: a values multipart upload is initiated and then wedges, its parts
+/// never landing and its abort never returning, while the block's absolute
+/// retry deadline expires.
+/// Guarantees: the retryable decision is published at the deadline, the
+/// FLUSHING slot stays occupied until the cleanup ends, the cleanup does end
+/// once the abort allowance elapses, and no completed values object is left in
+/// the store.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_MULTIPART_WEDGE, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            // Set past validation on purpose. The S3 minimum part size puts a
+            // real multipart upload out of reach of any block a unit test can
+            // encode in milliseconds; a small buffer capacity reaches the same
+            // `put_multipart_opts`, `put_part` and `abort` calls at a block
+            // size that costs nothing to build. The small row group is what
+            // makes the writer push parts while it is still writing, so the
+            // deadline finds it in the phase where an abort is attempted.
+            cfg.lake.upload.part_bytes = 4096;
+            cfg.lake.upload.concurrency = 1;
+            cfg.lake.parquet.row_group_bytes = 4096;
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            until("the wedged upload takes a part", || {
+                store.parts.load(std::sync::atomic::Ordering::SeqCst) > 0
+            })
+            .await;
+
+            // Only the retry deadline has elapsed: the abort allowance is
+            // untouched, so a decision that arrives now cannot have waited for
+            // the cleanup.
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(
+                done.as_ref().expect("the flush resolves").result.is_err(),
+                "the deadline fails the block"
+            );
+            worker.complete(done);
+            assert_eq!(
+                worker.notify.outcomes()[Outcome::Storage as usize],
+                1,
+                "the block is nacked as retryable storage"
+            );
+
+            // The slot the cleanup holds is the same FLUSHING slot.
+            worker.rotate();
+            assert!(worker.flushing.is_none(), "no second write is started");
+            assert!(worker.cleaning.is_some(), "the slot is still occupied");
+            until("the wedged upload is aborted", || {
+                store.aborts.load(std::sync::atomic::Ordering::SeqCst) > 0
+            })
+            .await;
+
+            let mut job = worker.cleaning.take().expect("the occupied slot");
+            sim.advance(Duration::from_secs(2));
+            job.cleanup().await.expect("the cleanup is bounded");
+            drop(job);
+
+            let path = lake::sink::object_path(
+                lake::schema::Dataset::LogsValues,
+                lake::clock::PartitionId::from_unix_secs(0),
+                0,
+                &lake::sink::FileNaming::new(&worker.cfg.lake.writer_id),
+                1,
+            );
+            assert!(
+                store.inner.head(&path).await.is_err(),
+                "a wedged upload never completes an object"
+            );
+        })
+        .await;
+}
+
+/// Scenario: the shutdown deadline elapses while a values multipart upload is
+/// wedged, so the abort its cancellation triggers never returns.
+/// Guarantees: every request is decided and delivered before any waiting, and
+/// the terminal return happens only once the supervising task has been
+/// released -- within `upload.abort_timeout`, ended by an abort of the task
+/// that is itself awaited.
+#[tokio::test(flavor = "current_thread")]
+async fn the_deadline_returns_only_once_the_flush_task_is_released() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_MULTIPART_WEDGE, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            cfg.lake.upload.part_bytes = 4096;
+            cfg.lake.upload.concurrency = 1;
+            cfg.lake.parquet.row_group_bytes = 4096;
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            until("the wedged upload takes a part", || {
+                store.parts.load(std::sync::atomic::Ordering::SeqCst) > 0
+            })
+            .await;
+            worker.shutdown(clock::now());
+
+            {
+                let mut abandoning = std::pin::pin!(worker.abandon());
+                assert!(
+                    futures::poll!(&mut abandoning).is_pending(),
+                    "a wedged upload is not released in one turn"
+                );
+                // The decision is already out: nothing a producer waits for is
+                // behind the release of the task.
+                match rx.recv().await.expect("a shutdown refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert_eq!(nack.cause, NackCause::NodeShutdown);
+                    }
+                    other => panic!("expected a nack, got {other:?}"),
+                }
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                    assert!(
+                        futures::poll!(&mut abandoning).is_pending(),
+                        "the abort never returns, so the slot is not released"
+                    );
+                }
+                assert!(
+                    store.aborts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    "the abandoned upload is aborted rather than dropped"
+                );
+
+                sim.advance(Duration::from_secs(2));
+                (&mut abandoning).await;
+            }
+            assert!(
+                worker.is_idle(),
+                "both slot holders are gone once the deadline returns"
+            );
+        })
+        .await;
 }

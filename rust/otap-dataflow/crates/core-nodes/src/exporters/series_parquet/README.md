@@ -23,7 +23,11 @@ unwind; the flush slot stays occupied until that cleanup has finished, so no
 next block writes the same names while an abandoned attempt might still be in
 flight. Only a fully successful write marks the descriptor cache, against the
 partition of the block that was written, so the cache never claims durability
-for rows that were not stored. Admission closes once the ACTIVE block is
+for rows that were not stored. At the shutdown deadline every request is
+decided and delivered first, and only then are both slot holders cancelled and
+released within one `upload.abort_timeout`, ended by aborting the task itself:
+a multipart upload the node started is given its abort rather than left to the
+bucket's lifecycle rule, without a wedged destination holding the node open. Admission closes once the ACTIVE block is
 waiting to be rotated, so no third block is ever needed and a slow destination
 becomes backpressure. A request the ACTIVE block cannot reserve room for is
 not refused: its extracted rows are parked, input closes until the next block
