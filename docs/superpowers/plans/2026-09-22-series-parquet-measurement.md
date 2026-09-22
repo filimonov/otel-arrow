@@ -630,11 +630,23 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - Finding 3 (`schema_fingerprint` hashes Arrow Display text; not reproducible by third parties; splits scope on an arrow bump): a format change to a persisted key. Recommended before first release; USER decides. If accepted it becomes Task 3d: crate-owned versioned type vocabulary, golden fingerprints for all four datasets plus one denormalized schema, `gen_golden.py` computing them independently, FORMAT.md updated.
 - Finding 8 (engine crate hard-codes one exporter's accounting): kept for the measurement campaign because Task 6 needs the residual; the offline-computation alternative and the generic registry go to plan 4. Task 6 must state the block-pair uncertainty of the in-process residual.
 - Findings 13 and 14 (identity-config marker per base_uri; lake-level writer facade): plan 4.
-- Format decision batch for the USER (would become Task 3d together with umbrella finding 3): C16 emit Parquet's native `SortingColumn` row-group metadata beside the private `sort_key`, and reuse or justify the `sort_columns` name; C17 model the fingerprint renderer on pdata's `SchemaIdBuilder` type codes; C22 spell non-finite doubles and bytes the way the workspace's OTLP JSON does (`Infinity`, base64) or document why not. All three touch persisted bytes or golden vectors, so they land together, once, before first release, or not at all.
+- Format batch APPROVED by the user 2026-09-22 as Task 3d, to run after 3c and before Task 4: umbrella finding 3 plus C16 emit Parquet's native `SortingColumn` row-group metadata beside the private `sort_key`, and reuse or justify the `sort_columns` name; C17 model the fingerprint renderer on pdata's `SchemaIdBuilder` type codes; C22 spell non-finite doubles and bytes the way the workspace's OTLP JSON does (`Infinity`, base64) or document why not. All three touch persisted bytes or golden vectors, so they land together, once, before first release, or not at all.
 - C2 (engine accounting parallels `retained_work.rs` and contradicts the engine RFC): same ruling as umbrella finding 8; plan 4 rebuilds it on `LocalRetainedAccount` with a handle passed through `PipelineContext`, engine-namespaced metric, its own engine PR.
-- C3 (pdata crate-private accessors), C13 (framing validation belongs in the pdata conversion): need pdata PRs; plan 4 / upstream PR 1.
+- C3 and C13 are NOT deferred after all (user 2026-09-22 23:5x): the pdata visibility widening (`StringArrayAccessor`, `FixedSizeBinaryArrayAccessor`, `AnyValueArrays`, `AttributeArrays`) joins Task 3b Item F, and `OtlpProtoBytes::validate_framing()` called from all four exporters joins Task 3c. Upstream they travel in the small engine/otap prep PR.
 - C18 (move the Python lane under `tools/`, orchestrator suites, harden-runner): upstream packaging; only when the user asks for an upstream PR. C19: observation, no action.
 - PR split and squash: only when the user asks for an upstream PR.
+
+### Task 3d: Format batch -- reproducible fingerprint, native sort metadata, OTLP-JSON spellings
+
+**Origin:** umbrella finding 3, consistency findings C16, C17, C22; approved by the user on 2026-09-22 to land once, before first release. All three touch persisted bytes or golden vectors, so they ship in one commit series with one FORMAT.md revision and regenerated golden files.
+
+**Expected wall-clock cost:** 2-4 hours; unit and golden tests only; one E2E run to prove readers still agree.
+
+- [ ] **Fingerprint:** render a crate-owned, versioned type vocabulary modelled on pdata's `SchemaIdBuilder` type codes (not Arrow `Display`), include top-level nullability, pin golden fingerprints for all four datasets plus one denormalized schema, and have `gen_golden.py` compute them independently in Python. FORMAT.md documents the exact rendering. A test asserts the documented rendering equals the code's.
+- [ ] **Native sort metadata:** emit Parquet's `SortingColumn` row-group metadata via `WriterProperties::set_sorting_columns` beside the private `sort_key`; reuse the `sort_columns` name from pdata `consts` or record in FORMAT.md why it differs. Verify DuckDB and ClickHouse read the files unchanged.
+- [ ] **Spellings:** `render_v1` spells non-finite doubles `Infinity`/`-Infinity`/`NaN` and bytes as base64, matching the workspace OTLP JSON, with golden vectors for each; FORMAT.md updated.
+- [ ] **Golden hashes move deliberately:** regenerate, review the diff of every golden file, and record the old and new fingerprints in FORMAT.md's revision note. This is the one sanctioned golden move; the plan-2 rule "no golden hash moved" resumes afterwards.
+- [ ] **Commit** per item, staged by name, one `breaking`-style chloggen note (pre-release format change), `cargo xtask check`, one E2E run.
 
 ### Task 4: Direct performance attribution and stage reconciliation
 
