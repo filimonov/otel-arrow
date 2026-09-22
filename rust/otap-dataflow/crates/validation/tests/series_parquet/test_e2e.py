@@ -2164,6 +2164,11 @@ RETRYABLE_CODES = {
 # every reported status server-originated by construction.
 CALL_WAIT = 6
 COHORT_WAIT = 60
+# A wait short enough to expire against a stopped store. A producer that gives
+# up on a call the exporter has already admitted, and then resends it, is how
+# at-least-once delivery produces a duplicate; this is what makes the standing
+# suite exercise duplicates rather than merely tolerate them.
+CALL_WAIT_SHORT = 1
 
 
 class OutageSlice(unittest.TestCase):
@@ -2184,8 +2189,41 @@ class OutageSlice(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     self.exercise_outage(kind, store, directory)
 
-    def exercise_outage(self, kind, store, directory):
-        """One store: stop it under load, recover it, and check the lake."""
+    # Scenario: the same outage, with producers that give up on a call after
+    # one second and resend it, so requests the exporter has already admitted
+    # are sent again.
+    # Guarantees: the resends duplicate rows rather than losing any, the
+    # duplicates are counted and reported, the layout and the readers'
+    # latest-descriptor join tolerate them, and giving up locally never turns
+    # a refusal into anything but UNAVAILABLE.
+    def test_short_client_waits_duplicate_rather_than_lose(self):
+        require_clickhouse()
+        with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
+            summary = self.exercise_outage(
+                "minio", store, directory, call_wait=CALL_WAIT_SHORT
+            )
+        # The point of this variant: the producers really did stop waiting on
+        # admitted calls, which is the only way this suite reaches the
+        # duplicate path at all.
+        self.assertGreater(
+            summary["client_waits"],
+            0,
+            "no client wait expired, so no request was resent after admission",
+        )
+        # Duplicates are permitted, not required: the exporter may still have
+        # decided every resent request before the producer gave up.
+        self.assertTrue(
+            all(count >= 0 for count in summary["duplicates"].values()),
+            summary["duplicates"],
+        )
+
+    def exercise_outage(self, kind, store, directory, call_wait=CALL_WAIT):
+        """One store: stop it under load, recover it, and check the lake.
+
+        `call_wait` is how long a producer waits out one ordinary call before
+        giving up on it and resending. Returns what the run observed, so a
+        caller can assert on the behavior its own variant is about.
+        """
         overrides = {
             # The flush deadline is shorter than the outage, so the exporter
             # cannot wait the store out: it has to fail blocks and refuse
@@ -2304,7 +2342,7 @@ class OutageSlice(unittest.TestCase):
                                 call, wait = pending, COHORT_WAIT
                                 pending = None
                             else:
-                                call, wait = stub.Export.future(request), CALL_WAIT
+                                call, wait = stub.Export.future(request), call_wait
                             try:
                                 call.result(timeout=wait)
                                 with lock:
@@ -2583,7 +2621,8 @@ class OutageSlice(unittest.TestCase):
             f"{signal}/{code.name}" for signal, code in server_codes
         )
         print(
-            f"{kind} outage: {len(server_codes)} server refusals {dict(codes)}, "
+            f"{kind} outage (client wait {call_wait}s): "
+            f"{len(server_codes)} server refusals {dict(codes)}, "
             f"{len(local_waits)} client waits expired, "
             f"flush failures/retries {counters['flush.failures']:.0f}"
             f"/{counters['flush.retries']:.0f}, "
@@ -2591,6 +2630,11 @@ class OutageSlice(unittest.TestCase):
             f"{len(alloy_deadlines)} own deadlines, "
             f"duplicate rows {duplicates}"
         )
+        return {
+            "duplicates": duplicates,
+            "client_waits": len(local_waits),
+            "server_codes": codes,
+        }
 
 
 if __name__ == "__main__":
