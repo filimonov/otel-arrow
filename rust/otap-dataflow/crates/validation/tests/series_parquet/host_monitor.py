@@ -9,8 +9,9 @@ and starts in milliseconds.
 
 The parent writes one JSON configuration line to its stdin, then commands
 (`watch`, `unwatch`, `stop`), one JSON object per line. The monitor ticks on
-schedule: each tick scans procfs for builds and re-checks every watched
-worker thread's allowed cores. A detection is written to stdout at once as
+schedule: each tick scans procfs for builds, enumerates the watched
+engine's threads and requires exactly the mapped worker threads, each on
+exactly its allowed cores. A detection is written to stdout at once as
 one JSON line; at `stop` it performs a last tick and writes its report. It
 never stops or signals any other process.
 
@@ -78,6 +79,33 @@ def observed_affinity(pid, tids, *, proc_root="/proc") -> dict:
                 allowed = set(parse_core_list(line.split(":", 1)[1].strip()))
         observed[tid] = allowed
     return observed
+
+
+def worker_threads(pid, names, *, proc_root="/proc") -> dict:
+    """Every thread of `pid` whose name is a worker name, with its cores.
+
+    The whole task list is enumerated, so a worker thread that appeared or
+    replaced a mapped one is seen, not only the threads already mapped.
+    Returns `{tid: allowed core set}`; a thread that exits while being read
+    is left out, exactly as if it had exited a moment earlier.
+    """
+    found = {}
+    for entry in Path(f"{proc_root}/{pid}/task").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            text = (entry / "status").read_text()
+        except OSError:
+            continue
+        name, allowed = None, None
+        for line in text.splitlines():
+            if line.startswith("Name:"):
+                name = line.split(":", 1)[1].strip()
+            elif line.startswith("Cpus_allowed_list:"):
+                allowed = set(parse_core_list(line.split(":", 1)[1].strip()))
+        if name in names:
+            found[int(entry.name)] = allowed
+    return found
 
 
 _SECRET_ARGUMENT = re.compile(
@@ -240,11 +268,31 @@ class Monitor:
             self.emit({"type": "build", "entry": entry})
         if self.watched is not None:
             expected = self.watched["expected"]
-            observed = observed_affinity(
-                self.watched["pid"], expected, proc_root=self.proc_root
-            )
             try:
+                if self.watched["names"]:
+                    # Every thread carrying a worker name is enumerated, so a
+                    # new, extra or replacing worker thread is a changed
+                    # mapping even for a single tick.
+                    observed = worker_threads(
+                        self.watched["pid"], self.watched["names"],
+                        proc_root=self.proc_root,
+                    )
+                else:
+                    observed = observed_affinity(
+                        self.watched["pid"], expected, proc_root=self.proc_root
+                    )
                 check_worker_affinity(observed, expected)
+            except (AssertionError, OSError) as error:
+                detail = (
+                    str(error)
+                    if isinstance(error, AssertionError)
+                    else f"affinity: engine tasks unreadable: {error}"
+                )
+                failure = {"detail": detail, "observed_unix": time.time()}
+                self.affinity_failure_count += 1
+                if len(self.affinity_failures) < 50:
+                    self.affinity_failures.append(failure)
+                self.emit({"type": "affinity", "entry": failure})
             except AssertionError as error:
                 failure = {"detail": str(error), "observed_unix": time.time()}
                 self.affinity_failure_count += 1
@@ -260,6 +308,7 @@ class Monitor:
                 "expected": {
                     int(tid): set(cores) for tid, cores in message["expected"].items()
                 },
+                "names": set(message.get("names") or ()),
             }
             self.emit({"type": "watching", "tids": sorted(self.watched["expected"])})
         elif message["cmd"] == "unwatch":

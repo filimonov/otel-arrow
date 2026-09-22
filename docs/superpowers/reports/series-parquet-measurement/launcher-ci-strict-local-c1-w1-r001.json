@@ -5,37 +5,37 @@
       "kind": "engine_log",
       "name": "engine.log",
       "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
-      "sha256": "5efbf8c5ed7868415cae193ae9ba626a903d177f8e74fb3c88819c5027406e8b",
-      "size_bytes": 4860
+      "sha256": "dfbe32ce6b5dcaaff36b449bf8e0c24a19b57fdd7bacdfd431d2c07dc5db26e6",
+      "size_bytes": 4656
     },
     {
       "kind": "engine_config",
       "name": "pipeline.yaml",
       "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
-      "sha256": "fec1aa315fb2351dbb23b858b75052bb0e887b28bb5197601019b995f1a7c9a3",
+      "sha256": "e7f236957444466bba46c5c680b5932dbbfc75ef9093e40b71c6c007589f24b1",
       "size_bytes": 2559
     },
     {
       "kind": "ledger",
       "name": "ledger.sqlite",
       "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
-      "sha256": "b38035e80769b7db4952e2bdee83afd8e78eeb9eff935c19690017c17720be70",
+      "sha256": "b5c5df3d380bb29860bcf35ead40231f72c31f495ccb375987f6f3befbf2eb73",
       "size_bytes": 3325952
     }
   ],
   "baseline_decision": {
     "action": "created",
-    "baseline_name": "baseline-launcher-ci-453a91d4afff7245.json",
+    "baseline_name": "baseline-launcher-ci-a97178b493d1d7ea.json",
     "detail": "no committed baseline describes this machine, configuration, workload and build profile",
-    "fingerprint": "453a91d4afff724552b8ed949b015f6c97a4afe2818febad98a305c27eee14bb",
+    "fingerprint": "a97178b493d1d7ea12e5089a45c96c3fd78b43cf500758c9a06e361e621b43db",
     "hard_gate_failures": [],
     "limit": 0.25,
     "regressions": {}
   },
   "baseline_files": [
     {
-      "name": "baseline-launcher-ci-453a91d4afff7245.json",
-      "sha256": "270debbad83e44fe69dcd4b8738dee5508b732bde47fe79dd27351bf7866cad2",
+      "name": "baseline-launcher-ci-a97178b493d1d7ea.json",
+      "sha256": "66012f75f222e45846bdc6d631e7a1f02fd6648732f6837c4968e21539309798",
       "size_bytes": 1485
     }
   ],
@@ -54,25 +54,25 @@
       "status": "passed"
     },
     {
-      "detail": "17 samples",
+      "detail": "18 samples",
       "kind": "hard",
       "name": "minimum_samples",
       "status": "passed"
     },
     {
-      "detail": "residual range [0, 32732872] bytes over 17 samples; tolerance 33554432 bytes; 0 positive and 0 negative beyond it",
+      "detail": "residual range [0, 30066864] bytes over 18 samples; tolerance 33554432 bytes; 0 positive and 0 negative beyond it",
       "kind": "hard",
       "name": "rss_reconciliation",
       "status": "passed"
     },
     {
-      "detail": "0 build processes seen in 154 scans; builder container starts 0",
+      "detail": "0 build processes seen in 145 scans; builder container starts 0",
       "kind": "hard",
       "name": "no_concurrent_build",
       "status": "passed"
     },
     {
-      "detail": "154 ticks, largest gap 0.063313556s",
+      "detail": "145 ticks, largest gap 0.063152683s",
       "kind": "hard",
       "name": "build_monitor_coverage",
       "status": "passed"
@@ -215,7 +215,7 @@
                   "config": {
                     "protocols": {
                       "grpc": {
-                        "listening_addr": "127.0.0.1:37073",
+                        "listening_addr": "127.0.0.1:52665",
                         "max_concurrent_requests": 128,
                         "timeout": "180s",
                         "wait_for_result": true
@@ -254,7 +254,7 @@
       },
       "version": "otel_dataflow/v1"
     },
-    "effective_sha256": "fec1aa315fb2351dbb23b858b75052bb0e887b28bb5197601019b995f1a7c9a3",
+    "effective_sha256": "e7f236957444466bba46c5c680b5932dbbfc75ef9093e40b71c6c007589f24b1",
     "requested": {
       "case": "launcher-ci",
       "cores": [
@@ -270,15 +270,15 @@
       "topology": "strict"
     }
   },
-  "elapsed_s": 7.682636622,
+  "elapsed_s": 7.237135642,
   "environment": {
     "build": {
       "allocator": "jemalloc",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/debug/df_engine",
-      "binary_sha256": "4267559356bbbdf2b9b052bed0f13a21b665e9a0e2610355b6981f3ec8ab5aff",
-      "binary_size_bytes": 1709200088,
+      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/df_engine",
+      "binary_sha256": "2b678bcb6715cb7dfeee683a724aa484a618685f25644bd3f180e81984f674f5",
+      "binary_size_bytes": 762526208,
       "features": "default,series_parquet,aws,durable-buffer",
-      "profile": "debug",
+      "profile": "release",
       "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
     },
     "build_monitor": {
@@ -289,8 +289,8 @@
         "gaps_over_limit_count": 0,
         "interval_s": 0.05,
         "limit_s": 0.1,
-        "max_gap_s": 0.063313556,
-        "ticks": 154
+        "max_gap_s": 0.063152683,
+        "ticks": 145
       },
       "detected": false,
       "docker": {
@@ -324,7 +324,7 @@
       },
       "observation_count": 0,
       "observations": [],
-      "scans": 154,
+      "scans": 145,
       "visibility": {
         "complete": true,
         "hidepid": null,
@@ -396,13 +396,13 @@
       "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 162157223406025,
-      "observed_utc": "2026-09-22T16:17:10Z",
+      "monotonic_ns": 163646847904402,
+      "observed_utc": "2026-09-22T16:42:00Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
       "requested_cores": [
@@ -480,26 +480,26 @@
           "expected_cores": [
             1
           ],
-          "last_cpu": 1,
+          "last_cpu": 16,
           "name": "df_engine",
-          "nspid": "3499572",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623333",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499572
+          "tid": 3623333
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 11,
+          "last_cpu": 2,
           "name": "metrics-aggrega",
-          "nspid": "3499599",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623357",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499599
+          "tid": 3623357
         },
         {
           "cpus_allowed_list": "0",
@@ -508,37 +508,37 @@
           ],
           "last_cpu": 0,
           "name": "pipeline-system",
-          "nspid": "3499600",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623358",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499600
+          "tid": 3623358
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 11,
+          "last_cpu": 14,
           "name": "observed-state-",
-          "nspid": "3499601",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623359",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499601
+          "tid": 3623359
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 22,
+          "last_cpu": 7,
           "name": "engine-metrics",
-          "nspid": "3499602",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623360",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499602
+          "tid": 3623360
         },
         {
           "cpus_allowed_list": "1",
@@ -547,11 +547,11 @@
           ],
           "last_cpu": 1,
           "name": "pipeline-defaul",
-          "nspid": "3499603",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623361",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499603
+          "tid": 3623361
         },
         {
           "cpus_allowed_list": "0-31",
@@ -560,24 +560,24 @@
           ],
           "last_cpu": 1,
           "name": "http-admin",
-          "nspid": "3499604",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623362",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499604
+          "tid": 3623362
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 18,
+          "last_cpu": 22,
           "name": "os-signal-handl",
-          "nspid": "3499605",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623363",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499605
+          "tid": 3623363
         },
         {
           "cpus_allowed_list": "1",
@@ -586,572 +586,585 @@
           ],
           "last_cpu": 1,
           "name": "tokio-rt-worker",
-          "nspid": "3499709",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3499572,
+          "nspid": "3623467",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499709
+          "tid": 3623467
+        },
+        {
+          "cpus_allowed_list": "1",
+          "expected_cores": [
+            1
+          ],
+          "last_cpu": 1,
+          "name": "tokio-rt-worker",
+          "nspid": "3623468",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3623333,
+          "role": "engine",
+          "tid": 3623468
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 0,
           "name": "python3",
-          "nspid": "3475481",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599249",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475481
+          "tid": 3599249
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 31,
           "name": "python3",
-          "nspid": "3475482",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599250",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475482
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3475483",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475483
+          "tid": 3599250
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 20,
           "name": "python3",
-          "nspid": "3475484",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599251",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475484
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3475485",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475485
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3475486",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475486
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3475487",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475487
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 4,
-          "name": "python3",
-          "nspid": "3475488",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475488
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "3475489",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475489
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "3475490",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475490
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3475491",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475491
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3475492",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475492
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 22,
-          "name": "python3",
-          "nspid": "3475493",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475493
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 11,
-          "name": "python3",
-          "nspid": "3475494",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475494
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 21,
-          "name": "python3",
-          "nspid": "3475495",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475495
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "3475496",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475496
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "3475497",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475497
+          "tid": 3599251
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 13,
           "name": "python3",
-          "nspid": "3475498",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599252",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475498
+          "tid": 3599252
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 22,
+          "last_cpu": 5,
           "name": "python3",
-          "nspid": "3475499",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599253",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475499
+          "tid": 3599253
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 3,
+          "last_cpu": 30,
           "name": "python3",
-          "nspid": "3475500",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599254",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475500
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 6,
-          "name": "python3",
-          "nspid": "3475501",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475501
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3475502",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475502
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "3475503",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475503
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 18,
-          "name": "python3",
-          "nspid": "3475504",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475504
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "3475505",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475505
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "3475506",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475506
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3475507",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475507
+          "tid": 3599254
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 14,
           "name": "python3",
-          "nspid": "3475508",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599255",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475508
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 7,
-          "name": "python3",
-          "nspid": "3475509",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475509
+          "tid": 3599255
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 0,
           "name": "python3",
-          "nspid": "3475510",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599256",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475510
+          "tid": 3599256
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 22,
+          "last_cpu": 27,
           "name": "python3",
-          "nspid": "3475511",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599257",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475511
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 18,
-          "name": "python3",
-          "nspid": "3475512",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475512
+          "tid": 3599257
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 24,
           "name": "python3",
-          "nspid": "3499571",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3599258",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499571
+          "tid": 3599258
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 14,
-          "name": "grpc_global_tim",
-          "nspid": "3499573",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3599259",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499573
+          "tid": 3599259
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "python3",
+          "nspid": "3599260",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599260
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3599261",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599261
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 31,
-          "name": "event_engine",
-          "nspid": "3499574",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "name": "python3",
+          "nspid": "3599262",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499574
+          "tid": 3599262
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 2,
-          "name": "event_engine",
-          "nspid": "3499575",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3599263",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499575
+          "tid": 3599263
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "3599264",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599264
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3599265",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599265
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3599266",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599266
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 18,
+          "name": "python3",
+          "nspid": "3599267",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599267
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "3599268",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599268
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 9,
-          "name": "event_engine",
-          "nspid": "3499576",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "name": "python3",
+          "nspid": "3599269",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499576
+          "tid": 3599269
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3599270",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599270
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "3599271",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599271
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3599272",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599272
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3599273",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599273
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3599274",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599274
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3599275",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599275
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "3599276",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599276
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3599277",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599277
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3599278",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599278
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3599279",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599279
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "3599280",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599280
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3623332",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623332
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "grpc_global_tim",
+          "nspid": "3623334",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623334
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 17,
+          "name": "event_engine",
+          "nspid": "3623335",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623335
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 1,
+          "name": "event_engine",
+          "nspid": "3623336",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623336
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 11,
           "name": "event_engine",
-          "nspid": "3499577",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623337",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499577
+          "tid": 3623337
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 27,
+          "last_cpu": 3,
           "name": "event_engine",
-          "nspid": "3499578",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623338",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499578
+          "tid": 3623338
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 4,
+          "name": "event_engine",
+          "nspid": "3623339",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623339
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "event_engine",
+          "nspid": "3623340",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623340
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "event_engine",
+          "nspid": "3623341",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623341
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "event_engine",
-          "nspid": "3499579",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623342",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499579
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "event_engine",
-          "nspid": "3499580",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499580
+          "tid": 3623342
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 3,
           "name": "event_engine",
-          "nspid": "3499581",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623343",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499581
+          "tid": 3623343
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 10,
+          "last_cpu": 1,
           "name": "event_engine",
-          "nspid": "3499582",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623344",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499582
+          "tid": 3623344
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 4,
+          "last_cpu": 5,
           "name": "event_engine",
-          "nspid": "3499583",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623345",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499583
+          "tid": 3623345
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "event_engine",
+          "nspid": "3623346",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623346
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 3,
           "name": "event_engine",
-          "nspid": "3499584",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623347",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499584
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "event_engine",
-          "nspid": "3499585",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499585
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "event_engine",
-          "nspid": "3499586",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499586
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "event_engine",
-          "nspid": "3499587",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499587
+          "tid": 3623347
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 10,
           "name": "event_engine",
-          "nspid": "3499588",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623348",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499588
+          "tid": 3623348
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 4,
+          "last_cpu": 3,
           "name": "event_engine",
-          "nspid": "3499589",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623349",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499589
+          "tid": 3623349
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 9,
+          "last_cpu": 10,
+          "name": "event_engine",
+          "nspid": "3623350",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623350
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 1,
           "name": "lifeguard",
-          "nspid": "3499590",
-          "observed_utc": "2026-09-22T16:17:10Z",
-          "pid": 3475481,
+          "nspid": "3623351",
+          "observed_utc": "2026-09-22T16:42:00Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499590
+          "tid": 3623351
         }
       ],
       "worker_cores": [
@@ -1166,20 +1179,20 @@
           "key": "default/main/core1",
           "last_cpu": 1,
           "name": "pipeline-defaul",
-          "tid": 3499603
+          "tid": 3623361
         }
       ]
     },
     "git": {
       "dirty": true,
-      "revision": "114605eb3507ce6d4a3db0fd1a77b6dafb07ab50"
+      "revision": "8a41e36f3ba6779c73792d4f9fbbe114b62e25fc"
     },
     "lease": {
-      "acquired_utc": "2026-09-22T16:17:04Z",
-      "owner": "3475481-1575549295a44bbba67a668c63688c18",
+      "acquired_utc": "2026-09-22T16:41:54Z",
+      "owner": "3599249-4bc1849c85b341e4b9ac818e05b60f13",
       "path": "/tmp/series-parquet-host-measurement.lock",
-      "pid": 3475481,
-      "released_utc": "2026-09-22T16:17:11Z",
+      "pid": 3599249,
+      "released_utc": "2026-09-22T16:42:01Z",
       "run_id": "launcher-ci-strict-local-c1-w1-r001"
     },
     "machine_identity_sha256": "5f95bfd263ecc79d6a58b132a0e4c62b8ad24560a98752b900cf7d285d8e2e5a",
@@ -1229,12 +1242,12 @@
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
         0.46,
-        0.31,
-        0.22
+        2.12,
+        1.99
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 162152213809432,
-      "observed_utc": "2026-09-22T16:17:05Z",
+      "monotonic_ns": 163641865786084,
+      "observed_utc": "2026-09-22T16:41:55Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
       "requested_cores": [
@@ -1312,26 +1325,26 @@
           "expected_cores": [
             1
           ],
-          "last_cpu": 1,
+          "last_cpu": 16,
           "name": "df_engine",
-          "nspid": "3499572",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623333",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499572
+          "tid": 3623333
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 11,
+          "last_cpu": 15,
           "name": "metrics-aggrega",
-          "nspid": "3499599",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623357",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499599
+          "tid": 3623357
         },
         {
           "cpus_allowed_list": "0",
@@ -1340,37 +1353,37 @@
           ],
           "last_cpu": 0,
           "name": "pipeline-system",
-          "nspid": "3499600",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623358",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499600
+          "tid": 3623358
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 11,
+          "last_cpu": 14,
           "name": "observed-state-",
-          "nspid": "3499601",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623359",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499601
+          "tid": 3623359
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 22,
+          "last_cpu": 7,
           "name": "engine-metrics",
-          "nspid": "3499602",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623360",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499602
+          "tid": 3623360
         },
         {
           "cpus_allowed_list": "1",
@@ -1379,598 +1392,598 @@
           ],
           "last_cpu": 1,
           "name": "pipeline-defaul",
-          "nspid": "3499603",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623361",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499603
+          "tid": 3623361
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 17,
+          "last_cpu": 8,
           "name": "http-admin",
-          "nspid": "3499604",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623362",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499604
+          "tid": 3623362
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [
             1
           ],
-          "last_cpu": 18,
+          "last_cpu": 22,
           "name": "os-signal-handl",
-          "nspid": "3499605",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3499572,
+          "nspid": "3623363",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3623333,
           "role": "engine",
-          "tid": 3499605
+          "tid": 3623363
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 16,
           "name": "python3",
-          "nspid": "3475481",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599249",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475481
+          "tid": 3599249
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 31,
           "name": "python3",
-          "nspid": "3475482",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599250",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475482
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3475483",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475483
+          "tid": 3599250
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 20,
           "name": "python3",
-          "nspid": "3475484",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599251",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475484
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3475485",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475485
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3475486",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475486
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3475487",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475487
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 4,
-          "name": "python3",
-          "nspid": "3475488",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475488
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "3475489",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475489
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "3475490",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475490
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3475491",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475491
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3475492",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475492
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 22,
-          "name": "python3",
-          "nspid": "3475493",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475493
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 11,
-          "name": "python3",
-          "nspid": "3475494",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475494
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 21,
-          "name": "python3",
-          "nspid": "3475495",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475495
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "3475496",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475496
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "3475497",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475497
+          "tid": 3599251
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 13,
           "name": "python3",
-          "nspid": "3475498",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599252",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475498
+          "tid": 3599252
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 22,
+          "last_cpu": 5,
           "name": "python3",
-          "nspid": "3475499",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599253",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475499
+          "tid": 3599253
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 3,
+          "last_cpu": 30,
           "name": "python3",
-          "nspid": "3475500",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599254",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475500
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 6,
-          "name": "python3",
-          "nspid": "3475501",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475501
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3475502",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475502
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "3475503",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475503
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 18,
-          "name": "python3",
-          "nspid": "3475504",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475504
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "3475505",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475505
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "3475506",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475506
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3475507",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3475507
+          "tid": 3599254
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 14,
           "name": "python3",
-          "nspid": "3475508",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599255",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475508
+          "tid": 3599255
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "3599256",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599256
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3599257",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599257
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3599258",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599258
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3599259",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599259
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "python3",
+          "nspid": "3599260",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599260
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3599261",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599261
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 31,
+          "name": "python3",
+          "nspid": "3599262",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599262
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3599263",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599263
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 7,
           "name": "python3",
-          "nspid": "3475509",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599264",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475509
+          "tid": 3599264
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 0,
+          "last_cpu": 25,
           "name": "python3",
-          "nspid": "3475510",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599265",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475510
+          "tid": 3599265
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 22,
+          "last_cpu": 10,
           "name": "python3",
-          "nspid": "3475511",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599266",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475511
+          "tid": 3599266
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 18,
           "name": "python3",
-          "nspid": "3475512",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599267",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3475512
+          "tid": 3599267
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 2,
+          "last_cpu": 20,
           "name": "python3",
-          "nspid": "3499571",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3599268",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499571
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "grpc_global_tim",
-          "nspid": "3499573",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499573
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 31,
-          "name": "event_engine",
-          "nspid": "3499574",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499574
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "event_engine",
-          "nspid": "3499575",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499575
+          "tid": 3599268
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 9,
-          "name": "event_engine",
-          "nspid": "3499576",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "name": "python3",
+          "nspid": "3599269",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499576
+          "tid": 3599269
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 0,
-          "name": "event_engine",
-          "nspid": "3499577",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3599270",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499577
+          "tid": 3599270
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 27,
-          "name": "event_engine",
-          "nspid": "3499578",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "3599271",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499578
+          "tid": 3599271
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 0,
-          "name": "event_engine",
-          "nspid": "3499579",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3599272",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499579
+          "tid": 3599272
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3599273",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599273
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 12,
-          "name": "event_engine",
-          "nspid": "3499580",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "name": "python3",
+          "nspid": "3599274",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499580
+          "tid": 3599274
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 3,
-          "name": "event_engine",
-          "nspid": "3499581",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3599275",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499581
+          "tid": 3599275
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "3599276",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599276
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3599277",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599277
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3599278",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599278
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3599279",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599279
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "3599280",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3599280
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 1,
+          "name": "python3",
+          "nspid": "3623332",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623332
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "grpc_global_tim",
+          "nspid": "3623334",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623334
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "event_engine",
+          "nspid": "3623335",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623335
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "event_engine",
+          "nspid": "3623336",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623336
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 10,
           "name": "event_engine",
-          "nspid": "3499582",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623337",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499582
+          "tid": 3623337
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "event_engine",
+          "nspid": "3623338",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623338
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "event_engine",
+          "nspid": "3623339",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623339
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "event_engine",
+          "nspid": "3623340",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623340
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "event_engine",
+          "nspid": "3623341",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623341
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 4,
           "name": "event_engine",
-          "nspid": "3499583",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623342",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499583
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "event_engine",
-          "nspid": "3499584",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499584
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "event_engine",
-          "nspid": "3499585",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
-          "role": "harness",
-          "tid": 3499585
+          "tid": 3623342
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "event_engine",
-          "nspid": "3499586",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623343",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499586
+          "tid": 3623343
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 14,
+          "last_cpu": 3,
           "name": "event_engine",
-          "nspid": "3499587",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623344",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499587
+          "tid": 3623344
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 31,
+          "last_cpu": 5,
           "name": "event_engine",
-          "nspid": "3499588",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623345",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499588
+          "tid": 3623345
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 4,
+          "last_cpu": 15,
           "name": "event_engine",
-          "nspid": "3499589",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623346",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499589
+          "tid": 3623346
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 9,
+          "last_cpu": 2,
+          "name": "event_engine",
+          "nspid": "3623347",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623347
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "event_engine",
+          "nspid": "3623348",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623348
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 1,
+          "name": "event_engine",
+          "nspid": "3623349",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623349
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "event_engine",
+          "nspid": "3623350",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
+          "role": "harness",
+          "tid": 3623350
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 0,
           "name": "lifeguard",
-          "nspid": "3499590",
-          "observed_utc": "2026-09-22T16:17:05Z",
-          "pid": 3475481,
+          "nspid": "3623351",
+          "observed_utc": "2026-09-22T16:41:55Z",
+          "pid": 3599249,
           "role": "harness",
-          "tid": 3499590
+          "tid": 3623351
         }
       ],
       "worker_cores": [
@@ -1985,38 +1998,38 @@
           "key": "default/main/core1",
           "last_cpu": 1,
           "name": "pipeline-defaul",
-          "tid": 3499603
+          "tid": 3623361
         }
       ]
     }
   },
   "ephemeral_values": {
-    "<receiver_listening_addr>": "127.0.0.1:37073"
+    "<receiver_listening_addr>": "127.0.0.1:52665"
   },
   "events": [
     {
-      "detail": "3475481-1575549295a44bbba67a668c63688c18",
+      "detail": "3599249-4bc1849c85b341e4b9ac818e05b60f13",
       "kind": "host_controls_opened",
-      "monotonic_ns": 162150539372264,
-      "observed_utc": "2026-09-22T16:17:04Z"
+      "monotonic_ns": 163640642892563,
+      "observed_utc": "2026-09-22T16:41:54Z"
     },
     {
       "detail": "{\"engine\": [1], \"engine_observability\": [0], \"engine_reserved\": [2, 3, 4], \"producer\": [5, 6], \"reader\": [8], \"store\": [7]}",
       "kind": "core_allocation",
-      "monotonic_ns": 162150540402958,
-      "observed_utc": "2026-09-22T16:17:04Z"
+      "monotonic_ns": 163640643911184,
+      "observed_utc": "2026-09-22T16:41:54Z"
     },
     {
-      "detail": "3499572",
+      "detail": "3623333",
       "kind": "engine_shut_down",
-      "monotonic_ns": 162157325448931,
-      "observed_utc": "2026-09-22T16:17:11Z"
+      "monotonic_ns": 163646956320286,
+      "observed_utc": "2026-09-22T16:42:00Z"
     },
     {
       "detail": "",
       "kind": "host_controls_closed",
-      "monotonic_ns": 162158189757057,
-      "observed_utc": "2026-09-22T16:17:11Z"
+      "monotonic_ns": 163647848188000,
+      "observed_utc": "2026-09-22T16:42:01Z"
     }
   ],
   "mandatory_metrics": [
@@ -2042,20 +2055,20 @@
     "unexpected_records": "lower_is_better"
   },
   "metrics": {
-    "ack_latency_p50_s": 1.485645101,
-    "ack_latency_p99_s": 1.946036887,
+    "ack_latency_p50_s": 1.415834608,
+    "ack_latency_p99_s": 1.870796003,
     "corrupt_records": 0,
     "duplicate_records": 0,
     "missing_records": 0,
-    "peak_rss_bytes": 196845568,
+    "peak_rss_bytes": 107278336,
     "records_acked_records": 10000,
-    "throughput_records_per_s": 4740.000679308458,
+    "throughput_records_per_s": 5094.080055714565,
     "unexpected_records": 0
   },
   "metrics_unavailable": {},
   "observations": {
-    "ack_latency_max_s": 1.962559918,
-    "input_duration_s": 2.109704339,
+    "ack_latency_max_s": 1.899190607,
+    "input_duration_s": 1.963062985,
     "ledger": {
       "attempts_by_outcome": {
         "ack": 100,
@@ -2115,13 +2128,13 @@
           "default/main/core1": 4
         },
         "buffer_path": null,
-        "config_sha256": "fec1aa315fb2351dbb23b858b75052bb0e887b28bb5197601019b995f1a7c9a3",
+        "config_sha256": "e7f236957444466bba46c5c680b5932dbbfc75ef9093e40b71c6c007589f24b1",
         "cores": [
           1
         ],
         "drain": {
           "drained": true,
-          "duration_s": 2.825270954,
+          "duration_s": 2.556116087,
           "empty_epochs_by_worker": {
             "default/main/core1": 3
           },
@@ -2134,7 +2147,7 @@
             },
             "restarts_by_worker": {}
           },
-          "sample_count": 41,
+          "sample_count": 46,
           "unanswered_epochs_by_worker": {}
         },
         "edges": [
@@ -2143,179 +2156,188 @@
             "exporter"
           ]
         ],
-        "idle_rss_bytes": 133005312,
+        "idle_rss_bytes": 67121152,
         "inputs": [
           {
             "concurrency": 100,
-            "finished_ns": 162154395783319,
+            "finished_ns": 163644289382726,
             "outcomes": {
               "ack": 100
             },
             "requests": 100,
-            "started_ns": 162152286078980
+            "started_ns": 163642326319741
           }
         ],
         "label": "engine-1",
-        "pid": 3499572,
+        "pid": 3623333,
         "residuals": [
           {
             "accounted_growth_bytes": 0,
             "file_growth_bytes": 0,
             "heap_high_water_growth_bytes": 0,
-            "monotonic_ns": 162152235496944,
+            "monotonic_ns": 163641875116233,
             "residual_bytes": 0,
-            "rss_bytes": 133005312,
+            "rss_bytes": 67121152,
             "rss_growth_bytes": 0
           },
           {
             "accounted_growth_bytes": 0,
-            "file_growth_bytes": 12713984,
+            "file_growth_bytes": 0,
             "heap_high_water_growth_bytes": 0,
-            "monotonic_ns": 162152510922015,
-            "residual_bytes": 626688,
-            "rss_bytes": 146345984,
-            "rss_growth_bytes": 13340672
+            "monotonic_ns": 163642130714072,
+            "residual_bytes": 0,
+            "rss_bytes": 67121152,
+            "rss_growth_bytes": 0
           },
           {
             "accounted_growth_bytes": 0,
-            "file_growth_bytes": 12845056,
+            "file_growth_bytes": 5177344,
             "heap_high_water_growth_bytes": 0,
-            "monotonic_ns": 162153063734541,
-            "residual_bytes": 1773568,
-            "rss_bytes": 147623936,
-            "rss_growth_bytes": 14618624
+            "monotonic_ns": 163642401518340,
+            "residual_bytes": 618496,
+            "rss_bytes": 72916992,
+            "rss_growth_bytes": 5795840
           },
           {
-            "accounted_growth_bytes": 666204,
-            "file_growth_bytes": 21495808,
-            "heap_high_water_growth_bytes": 764216,
-            "monotonic_ns": 162153488111797,
-            "residual_bytes": 32732872,
-            "rss_bytes": 187998208,
-            "rss_growth_bytes": 54992896
+            "accounted_growth_bytes": 918620,
+            "file_growth_bytes": 5177344,
+            "heap_high_water_growth_bytes": 1046352,
+            "monotonic_ns": 163642891971069,
+            "residual_bytes": 1214640,
+            "rss_bytes": 74559488,
+            "rss_growth_bytes": 7438336
           },
           {
-            "accounted_growth_bytes": 666204,
-            "file_growth_bytes": 21495808,
-            "heap_high_water_growth_bytes": 764216,
-            "monotonic_ns": 162153759882899,
-            "residual_bytes": 32732872,
-            "rss_bytes": 187998208,
-            "rss_growth_bytes": 54992896
+            "accounted_growth_bytes": 918620,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 1046352,
+            "monotonic_ns": 163643376181562,
+            "residual_bytes": 30066864,
+            "rss_bytes": 107278336,
+            "rss_growth_bytes": 40157184
           },
           {
-            "accounted_growth_bytes": 666204,
-            "file_growth_bytes": 21495808,
-            "heap_high_water_growth_bytes": 764216,
-            "monotonic_ns": 162154031188881,
-            "residual_bytes": 32732872,
-            "rss_bytes": 187998208,
-            "rss_growth_bytes": 54992896
+            "accounted_growth_bytes": 918620,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 1046352,
+            "monotonic_ns": 163643633878434,
+            "residual_bytes": 30066864,
+            "rss_bytes": 107278336,
+            "rss_growth_bytes": 40157184
           },
           {
-            "accounted_growth_bytes": 20010304,
-            "file_growth_bytes": 21495808,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162154302485736,
-            "residual_bytes": 29379568,
-            "rss_bytes": 197156864,
-            "rss_growth_bytes": 64151552
+            "accounted_growth_bytes": 22096632,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163643891315708,
+            "residual_bytes": 16054424,
+            "rss_bytes": 107188224,
+            "rss_growth_bytes": 40067072
           },
           {
-            "accounted_growth_bytes": 20010304,
-            "file_growth_bytes": 21561344,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162154576817603,
-            "residual_bytes": 22989808,
-            "rss_bytes": 190832640,
-            "rss_growth_bytes": 57827328
+            "accounted_growth_bytes": 22096632,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163644148958170,
+            "residual_bytes": 16054424,
+            "rss_bytes": 107188224,
+            "rss_growth_bytes": 40067072
           },
           {
-            "accounted_growth_bytes": 20010304,
-            "file_growth_bytes": 21561344,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162154849551500,
-            "residual_bytes": 22944752,
-            "rss_bytes": 190787584,
-            "rss_growth_bytes": 57782272
+            "accounted_growth_bytes": 22096632,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163644407113379,
+            "residual_bytes": 12167320,
+            "rss_bytes": 103301120,
+            "rss_growth_bytes": 36179968
           },
           {
-            "accounted_growth_bytes": 20010304,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162155119804648,
-            "residual_bytes": 23038960,
-            "rss_bytes": 190947328,
-            "rss_growth_bytes": 57942016
-          },
-          {
-            "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162155390606407,
-            "residual_bytes": 23038960,
-            "rss_bytes": 190947328,
-            "rss_growth_bytes": 57942016
+            "accounted_growth_bytes": 22096632,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163644665190887,
+            "residual_bytes": 12167320,
+            "rss_bytes": 103301120,
+            "rss_growth_bytes": 36179968
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162155660869773,
-            "residual_bytes": 22940656,
-            "rss_bytes": 190849024,
-            "rss_growth_bytes": 57843712
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163644922522353,
+            "residual_bytes": 12392600,
+            "rss_bytes": 103526400,
+            "rss_growth_bytes": 36405248
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162155932628944,
-            "residual_bytes": 22957040,
-            "rss_bytes": 190865408,
-            "rss_growth_bytes": 57860096
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163645177930825,
+            "residual_bytes": 12392600,
+            "rss_bytes": 103526400,
+            "rss_growth_bytes": 36405248
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162156206047613,
-            "residual_bytes": 22785008,
-            "rss_bytes": 190693376,
-            "rss_growth_bytes": 57688064
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163645435380509,
+            "residual_bytes": 12109976,
+            "rss_bytes": 103243776,
+            "rss_growth_bytes": 36122624
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162156475711701,
-            "residual_bytes": 22649840,
-            "rss_bytes": 190558208,
-            "rss_growth_bytes": 57552896
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163645691923461,
+            "residual_bytes": 12122264,
+            "rss_bytes": 103256064,
+            "rss_growth_bytes": 36134912
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162156744916423,
-            "residual_bytes": 22776816,
-            "rss_bytes": 190685184,
-            "rss_growth_bytes": 57679872
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163645950511247,
+            "residual_bytes": 12044440,
+            "rss_bytes": 103178240,
+            "rss_growth_bytes": 36057088
           },
           {
             "accounted_growth_bytes": 25600,
-            "file_growth_bytes": 21626880,
-            "heap_high_water_growth_bytes": 13276176,
-            "monotonic_ns": 162157014539955,
-            "residual_bytes": 22858736,
-            "rss_bytes": 190767104,
-            "rss_growth_bytes": 57761792
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163646209157501,
+            "residual_bytes": 12109976,
+            "rss_bytes": 103243776,
+            "rss_growth_bytes": 36122624
+          },
+          {
+            "accounted_growth_bytes": 25600,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163646467740167,
+            "residual_bytes": 12171416,
+            "rss_bytes": 103305216,
+            "rss_growth_bytes": 36184064
+          },
+          {
+            "accounted_growth_bytes": 25600,
+            "file_growth_bytes": 9043968,
+            "heap_high_water_growth_bytes": 14968680,
+            "monotonic_ns": 163646725915466,
+            "residual_bytes": 12294296,
+            "rss_bytes": 103428096,
+            "rss_growth_bytes": 36306944
           }
         ],
-        "sample_count": 17,
+        "sample_count": 18,
         "sampler_errors": [],
         "stale_gap_s_by_worker": {
-          "default/main/core1": 1.252614853
+          "default/main/core1": 1.031206645
         },
         "workers": [
           {
@@ -2330,7 +2352,7 @@
     ],
     "residual_checks": [
       {
-        "detail": "residual range [0, 32732872] bytes over 17 samples; tolerance 33554432 bytes; 0 positive and 0 negative beyond it",
+        "detail": "residual range [0, 30066864] bytes over 18 samples; tolerance 33554432 bytes; 0 positive and 0 negative beyond it",
         "kind": "hard",
         "name": "rss_reconciliation",
         "status": "passed"
@@ -2345,46 +2367,46 @@
     {
       "load_average_1_5_15": [
         0.46,
-        0.31,
-        0.22
+        2.12,
+        1.99
       ],
-      "monotonic_ns": 162152235496944,
-      "observed_utc": "2026-09-22T16:17:05Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 133005312,
+      "monotonic_ns": 163641875116233,
+      "observed_utc": "2026-09-22T16:41:55Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 67121152,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162152255940787,
+        "monotonic_ns": 163641880006961,
         "num_threads": 8,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 133005312,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 67121152,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 42663936,
+        "smaps_anonymous_bytes": 33058816,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 87896064,
-        "smaps_private_dirty_bytes": 42663936,
+        "smaps_private_clean_bytes": 31674368,
+        "smaps_private_dirty_bytes": 33058816,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 42663936,
-        "smaps_pss_bytes": 130578432,
-        "smaps_pss_dirty_bytes": 42663936,
-        "smaps_pss_file_bytes": 87914496,
+        "smaps_pss_anon_bytes": 33058816,
+        "smaps_pss_bytes": 64754688,
+        "smaps_pss_dirty_bytes": 33058816,
+        "smaps_pss_file_bytes": 31695872,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 133005312,
-        "smaps_rss_bytes": 133005312,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 67121152,
+        "smaps_rss_bytes": 67121152,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
-        "stime_ticks": 15,
-        "utime_ticks": 68,
-        "vsize_bytes": 345878528
+        "stime_ticks": 14,
+        "utime_ticks": 6,
+        "vsize_bytes": 220209152
       },
       "workers": {
         "default/main/core1": {
@@ -2403,55 +2425,55 @@
             "series_cache.entries": 0
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 5671080,
+          "pipeline_memory_usage_bytes": 5666888,
           "reported": true,
-          "uptime_s": 1.001985401
+          "uptime_s": 1.001025071
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.46,
+        2.12,
+        1.99
       ],
-      "monotonic_ns": 162152510922015,
-      "observed_utc": "2026-09-22T16:17:06Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 146345984,
+      "monotonic_ns": 163642130714072,
+      "observed_utc": "2026-09-22T16:41:55Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 67121152,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162152603226167,
+        "monotonic_ns": 163642137562463,
         "num_threads": 8,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 146345984,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 67121152,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 43290624,
+        "smaps_anonymous_bytes": 33058816,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 100610048,
-        "smaps_private_dirty_bytes": 43290624,
+        "smaps_private_clean_bytes": 31674368,
+        "smaps_private_dirty_bytes": 33058816,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 43290624,
-        "smaps_pss_bytes": 143919104,
-        "smaps_pss_dirty_bytes": 43290624,
-        "smaps_pss_file_bytes": 100628480,
+        "smaps_pss_anon_bytes": 33058816,
+        "smaps_pss_bytes": 64754688,
+        "smaps_pss_dirty_bytes": 33058816,
+        "smaps_pss_file_bytes": 31695872,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 146345984,
-        "smaps_rss_bytes": 146345984,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 67121152,
+        "smaps_rss_bytes": 67121152,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
-        "stime_ticks": 15,
-        "utime_ticks": 70,
-        "vsize_bytes": 345878528
+        "stime_ticks": 14,
+        "utime_ticks": 6,
+        "vsize_bytes": 220209152
       },
       "workers": {
         "default/main/core1": {
@@ -2470,55 +2492,55 @@
             "series_cache.entries": 0
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 5671080,
+          "pipeline_memory_usage_bytes": 5666888,
           "reported": true,
-          "uptime_s": 1.001985401
+          "uptime_s": 1.001025071
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.46,
+        2.12,
+        1.99
       ],
-      "monotonic_ns": 162153063734541,
-      "observed_utc": "2026-09-22T16:17:06Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 147447808,
+      "monotonic_ns": 163642401518340,
+      "observed_utc": "2026-09-22T16:41:56Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 72916992,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162153161159835,
+        "monotonic_ns": 163642496416750,
         "num_threads": 8,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 147623936,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 72916992,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 44437504,
+        "smaps_anonymous_bytes": 33677312,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 100741120,
-        "smaps_private_dirty_bytes": 44437504,
+        "smaps_private_clean_bytes": 36851712,
+        "smaps_private_dirty_bytes": 33677312,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 44437504,
-        "smaps_pss_bytes": 145197056,
-        "smaps_pss_dirty_bytes": 44437504,
-        "smaps_pss_file_bytes": 100759552,
+        "smaps_pss_anon_bytes": 33677312,
+        "smaps_pss_bytes": 70550528,
+        "smaps_pss_dirty_bytes": 33677312,
+        "smaps_pss_file_bytes": 36873216,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 147623936,
-        "smaps_rss_bytes": 147623936,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 72916992,
+        "smaps_rss_bytes": 72916992,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
-        "stime_ticks": 15,
-        "utime_ticks": 72,
-        "vsize_bytes": 352169984
+        "stime_ticks": 14,
+        "utime_ticks": 6,
+        "vsize_bytes": 220209152
       },
       "workers": {
         "default/main/core1": {
@@ -2537,524 +2559,524 @@
             "series_cache.entries": 0
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 5671080,
+          "pipeline_memory_usage_bytes": 5666888,
           "reported": true,
-          "uptime_s": 1.001985401
+          "uptime_s": 1.001025071
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162153488111797,
-      "observed_utc": "2026-09-22T16:17:07Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 187998208,
+      "monotonic_ns": 163642891971069,
+      "observed_utc": "2026-09-22T16:41:56Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 74240000,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162153507966805,
-        "num_threads": 9,
+        "monotonic_ns": 163642967084729,
+        "num_threads": 8,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 187998208,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 74240000,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 76161024,
+        "smaps_anonymous_bytes": 35319808,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109391872,
-        "smaps_private_dirty_bytes": 76161024,
+        "smaps_private_clean_bytes": 36851712,
+        "smaps_private_dirty_bytes": 35287040,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 76161024,
-        "smaps_pss_bytes": 185571328,
-        "smaps_pss_dirty_bytes": 76161024,
-        "smaps_pss_file_bytes": 109410304,
+        "smaps_pss_anon_bytes": 35319808,
+        "smaps_pss_bytes": 72193024,
+        "smaps_pss_dirty_bytes": 35319808,
+        "smaps_pss_file_bytes": 36873216,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 187998208,
-        "smaps_rss_bytes": 187998208,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 74526720,
+        "smaps_rss_bytes": 74559488,
+        "smaps_shared_clean_bytes": 2387968,
+        "smaps_shared_dirty_bytes": 32768,
+        "smaps_shared_hugetlb_bytes": 0,
+        "smaps_shmempmdmapped_bytes": 0,
+        "smaps_swap_bytes": 0,
+        "smaps_swappss_bytes": 0,
+        "stime_ticks": 14,
+        "utime_ticks": 7,
+        "vsize_bytes": 226500608
+      },
+      "workers": {
+        "default/main/core1": {
+          "core_id": 1,
+          "gauges": {
+            "block.active_bytes": 917468,
+            "block.flushing_bytes": 0,
+            "block.pending_bytes": 0,
+            "block.pending_slot_occupied": 0,
+            "block.requests_pending": 4,
+            "memory.accounted_bytes": 1901660,
+            "memory.budget_bytes": 1637851136,
+            "notify.queued": 0,
+            "notify.token_bytes": 983040,
+            "oldest_unacked_seconds": 0.448239454,
+            "series_cache.entries": 9
+          },
+          "generation": 0,
+          "pipeline_memory_usage_bytes": 6713240,
+          "reported": true,
+          "uptime_s": 2.001130041
+        }
+      }
+    },
+    {
+      "load_average_1_5_15": [
+        0.74,
+        2.16,
+        2.0
+      ],
+      "monotonic_ns": 163643376181562,
+      "observed_utc": "2026-09-22T16:41:57Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 107278336,
+      "procfs": {
+        "clock_ticks_per_s": 100,
+        "monotonic_ns": 163643382570187,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 107278336,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
+        "smaps_anonhugepages_bytes": 0,
+        "smaps_anonymous_bytes": 64172032,
+        "smaps_filepmdmapped_bytes": 0,
+        "smaps_ksm_bytes": 0,
+        "smaps_lazyfree_bytes": 0,
+        "smaps_locked_bytes": 0,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 64172032,
+        "smaps_private_hugetlb_bytes": 0,
+        "smaps_pss_anon_bytes": 64172032,
+        "smaps_pss_bytes": 104911872,
+        "smaps_pss_dirty_bytes": 64172032,
+        "smaps_pss_file_bytes": 40739840,
+        "smaps_pss_shmem_bytes": 0,
+        "smaps_referenced_bytes": 107278336,
+        "smaps_rss_bytes": 107278336,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 15,
-        "utime_ticks": 93,
-        "vsize_bytes": 397275136
+        "utime_ticks": 9,
+        "vsize_bytes": 265330688
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 665068,
+            "block.active_bytes": 917468,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 3,
-            "memory.accounted_bytes": 1649244,
+            "block.requests_pending": 4,
+            "memory.accounted_bytes": 1901660,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.629080625,
-            "series_cache.entries": 8
+            "oldest_unacked_seconds": 0.448239454,
+            "series_cache.entries": 9
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 6435296,
+          "pipeline_memory_usage_bytes": 6713240,
           "reported": true,
-          "uptime_s": 2.00062002
+          "uptime_s": 2.001130041
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162153759882899,
-      "observed_utc": "2026-09-22T16:17:07Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 187998208,
+      "monotonic_ns": 163643633878434,
+      "observed_utc": "2026-09-22T16:41:57Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 107278336,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162153779252140,
-        "num_threads": 9,
+        "monotonic_ns": 163643639997971,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 187998208,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 107278336,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 76161024,
+        "smaps_anonymous_bytes": 64172032,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109391872,
-        "smaps_private_dirty_bytes": 76161024,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 64172032,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 76161024,
-        "smaps_pss_bytes": 185571328,
-        "smaps_pss_dirty_bytes": 76161024,
-        "smaps_pss_file_bytes": 109410304,
+        "smaps_pss_anon_bytes": 64172032,
+        "smaps_pss_bytes": 104911872,
+        "smaps_pss_dirty_bytes": 64172032,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 187998208,
-        "smaps_rss_bytes": 187998208,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 107278336,
+        "smaps_rss_bytes": 107278336,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 15,
-        "utime_ticks": 95,
-        "vsize_bytes": 397275136
+        "utime_ticks": 9,
+        "vsize_bytes": 265330688
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 665068,
+            "block.active_bytes": 917468,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 3,
-            "memory.accounted_bytes": 1649244,
+            "block.requests_pending": 4,
+            "memory.accounted_bytes": 1901660,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.629080625,
-            "series_cache.entries": 8
+            "oldest_unacked_seconds": 0.448239454,
+            "series_cache.entries": 9
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 6435296,
+          "pipeline_memory_usage_bytes": 6713240,
           "reported": true,
-          "uptime_s": 2.00062002
+          "uptime_s": 2.001130041
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162154031188881,
-      "observed_utc": "2026-09-22T16:17:07Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 187998208,
+      "monotonic_ns": 163643891315708,
+      "observed_utc": "2026-09-22T16:41:57Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 107188224,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162154050481794,
-        "num_threads": 9,
+        "monotonic_ns": 163643897690003,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 187998208,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 107188224,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 76161024,
+        "smaps_anonymous_bytes": 64081920,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109391872,
-        "smaps_private_dirty_bytes": 76161024,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 64081920,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 76161024,
-        "smaps_pss_bytes": 185571328,
-        "smaps_pss_dirty_bytes": 76161024,
-        "smaps_pss_file_bytes": 109410304,
+        "smaps_pss_anon_bytes": 64081920,
+        "smaps_pss_bytes": 104821760,
+        "smaps_pss_dirty_bytes": 64081920,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 187998208,
-        "smaps_rss_bytes": 187998208,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 107188224,
+        "smaps_rss_bytes": 107188224,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 15,
-        "utime_ticks": 97,
-        "vsize_bytes": 397275136
+        "utime_ticks": 10,
+        "vsize_bytes": 265330688
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 665068,
+            "block.active_bytes": 22067224,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 3,
-            "memory.accounted_bytes": 1649244,
+            "block.requests_pending": 94,
+            "memory.accounted_bytes": 23079672,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.629080625,
-            "series_cache.entries": 8
-          },
-          "generation": 0,
-          "pipeline_memory_usage_bytes": 6435296,
-          "reported": true,
-          "uptime_s": 2.00062002
-        }
-      }
-    },
-    {
-      "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
-      ],
-      "monotonic_ns": 162154302485736,
-      "observed_utc": "2026-09-22T16:17:08Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 196845568,
-      "procfs": {
-        "clock_ticks_per_s": 100,
-        "monotonic_ns": 162154323791259,
-        "num_threads": 9,
-        "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 197132288,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
-        "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 85319680,
-        "smaps_filepmdmapped_bytes": 0,
-        "smaps_ksm_bytes": 0,
-        "smaps_lazyfree_bytes": 0,
-        "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109391872,
-        "smaps_private_dirty_bytes": 85319680,
-        "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 85319680,
-        "smaps_pss_bytes": 194729984,
-        "smaps_pss_dirty_bytes": 85319680,
-        "smaps_pss_file_bytes": 109410304,
-        "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 197156864,
-        "smaps_rss_bytes": 197156864,
-        "smaps_shared_clean_bytes": 2445312,
-        "smaps_shared_dirty_bytes": 0,
-        "smaps_shared_hugetlb_bytes": 0,
-        "smaps_shmempmdmapped_bytes": 0,
-        "smaps_swap_bytes": 0,
-        "smaps_swappss_bytes": 0,
-        "stime_ticks": 16,
-        "utime_ticks": 104,
-        "vsize_bytes": 397275136
-      },
-      "workers": {
-        "default/main/core1": {
-          "core_id": 1,
-          "gauges": {
-            "block.active_bytes": 19979888,
-            "block.flushing_bytes": 0,
-            "block.pending_bytes": 0,
-            "block.pending_slot_occupied": 0,
-            "block.requests_pending": 85,
-            "memory.accounted_bytes": 20993344,
-            "memory.budget_bytes": 1637851136,
-            "notify.queued": 0,
-            "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.876166107,
+            "oldest_unacked_seconds": 0.558214004,
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 18947256,
+          "pipeline_memory_usage_bytes": 20635568,
           "reported": true,
-          "uptime_s": 3.001072216
+          "uptime_s": 3.000920746
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162154576817603,
-      "observed_utc": "2026-09-22T16:17:08Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190832640,
+      "monotonic_ns": 163644148958170,
+      "observed_utc": "2026-09-22T16:41:57Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 107188224,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162154597592289,
-        "num_threads": 9,
+        "monotonic_ns": 163644155842921,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190832640,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 107188224,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78929920,
+        "smaps_anonymous_bytes": 64081920,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109457408,
-        "smaps_private_dirty_bytes": 78929920,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 64081920,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78929920,
-        "smaps_pss_bytes": 188405760,
-        "smaps_pss_dirty_bytes": 78929920,
-        "smaps_pss_file_bytes": 109475840,
+        "smaps_pss_anon_bytes": 64081920,
+        "smaps_pss_bytes": 104821760,
+        "smaps_pss_dirty_bytes": 64081920,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190832640,
-        "smaps_rss_bytes": 190832640,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 107188224,
+        "smaps_rss_bytes": 107188224,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
-        "stime_ticks": 16,
-        "utime_ticks": 117,
-        "vsize_bytes": 424538112
+        "stime_ticks": 15,
+        "utime_ticks": 10,
+        "vsize_bytes": 265330688
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 19979888,
+            "block.active_bytes": 22067224,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 85,
-            "memory.accounted_bytes": 20993344,
+            "block.requests_pending": 94,
+            "memory.accounted_bytes": 23079672,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.876166107,
+            "oldest_unacked_seconds": 0.558214004,
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 18947256,
+          "pipeline_memory_usage_bytes": 20635568,
           "reported": true,
-          "uptime_s": 3.001072216
+          "uptime_s": 3.000920746
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162154849551500,
-      "observed_utc": "2026-09-22T16:17:08Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190787584,
+      "monotonic_ns": 163644407113379,
+      "observed_utc": "2026-09-22T16:41:58Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103301120,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162154867848758,
-        "num_threads": 9,
+        "monotonic_ns": 163644413936130,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190787584,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 103301120,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78884864,
+        "smaps_anonymous_bytes": 60194816,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109457408,
-        "smaps_private_dirty_bytes": 78884864,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60194816,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78884864,
-        "smaps_pss_bytes": 188360704,
-        "smaps_pss_dirty_bytes": 78884864,
-        "smaps_pss_file_bytes": 109475840,
+        "smaps_pss_anon_bytes": 60194816,
+        "smaps_pss_bytes": 100934656,
+        "smaps_pss_dirty_bytes": 60194816,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190787584,
-        "smaps_rss_bytes": 190787584,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103301120,
+        "smaps_rss_bytes": 103301120,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 16,
-        "utime_ticks": 125,
-        "vsize_bytes": 424538112
+        "utime_ticks": 12,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 19979888,
+            "block.active_bytes": 22067224,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 85,
-            "memory.accounted_bytes": 20993344,
+            "block.requests_pending": 94,
+            "memory.accounted_bytes": 23079672,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.876166107,
+            "oldest_unacked_seconds": 0.558214004,
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 18947256,
+          "pipeline_memory_usage_bytes": 20635568,
           "reported": true,
-          "uptime_s": 3.001072216
+          "uptime_s": 3.000920746
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162155119804648,
-      "observed_utc": "2026-09-22T16:17:08Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190947328,
+      "monotonic_ns": 163644665190887,
+      "observed_utc": "2026-09-22T16:41:58Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103301120,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162155138426398,
-        "num_threads": 9,
+        "monotonic_ns": 163644671283275,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190947328,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 103301120,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78979072,
+        "smaps_anonymous_bytes": 60194816,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78979072,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60194816,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78979072,
-        "smaps_pss_bytes": 188520448,
-        "smaps_pss_dirty_bytes": 78979072,
-        "smaps_pss_file_bytes": 109541376,
+        "smaps_pss_anon_bytes": 60194816,
+        "smaps_pss_bytes": 100934656,
+        "smaps_pss_dirty_bytes": 60194816,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190947328,
-        "smaps_rss_bytes": 190947328,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103301120,
+        "smaps_rss_bytes": 103301120,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 16,
-        "utime_ticks": 133,
-        "vsize_bytes": 424538112
+        "utime_ticks": 13,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
           "core_id": 1,
           "gauges": {
-            "block.active_bytes": 19979888,
+            "block.active_bytes": 22067224,
             "block.flushing_bytes": 0,
             "block.pending_bytes": 0,
             "block.pending_slot_occupied": 0,
-            "block.requests_pending": 85,
-            "memory.accounted_bytes": 20993344,
+            "block.requests_pending": 94,
+            "memory.accounted_bytes": 23079672,
             "memory.budget_bytes": 1637851136,
             "notify.queued": 0,
             "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.876166107,
+            "oldest_unacked_seconds": 0.558214004,
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 18947256,
+          "pipeline_memory_usage_bytes": 20635568,
           "reported": true,
-          "uptime_s": 3.001072216
+          "uptime_s": 3.000920746
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162155390606407,
-      "observed_utc": "2026-09-22T16:17:09Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190947328,
+      "monotonic_ns": 163644922522353,
+      "observed_utc": "2026-09-22T16:41:58Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103526400,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162155408624362,
-        "num_threads": 9,
+        "monotonic_ns": 163644926710786,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190947328,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 103526400,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78979072,
+        "smaps_anonymous_bytes": 60420096,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78979072,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60420096,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78979072,
-        "smaps_pss_bytes": 188520448,
-        "smaps_pss_dirty_bytes": 78979072,
-        "smaps_pss_file_bytes": 109541376,
+        "smaps_pss_anon_bytes": 60420096,
+        "smaps_pss_bytes": 101159936,
+        "smaps_pss_dirty_bytes": 60420096,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190947328,
-        "smaps_rss_bytes": 190947328,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103526400,
+        "smaps_rss_bytes": 103526400,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 16,
-        "utime_ticks": 140,
-        "vsize_bytes": 424538112
+        "utime_ticks": 14,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
@@ -3073,55 +3095,323 @@
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 15799232,
+          "pipeline_memory_usage_bytes": 16090240,
           "reported": true,
-          "uptime_s": 4.00099306
+          "uptime_s": 4.001280767
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162155660869773,
-      "observed_utc": "2026-09-22T16:17:09Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190849024,
+      "monotonic_ns": 163645177930825,
+      "observed_utc": "2026-09-22T16:41:58Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103526400,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162155680648006,
-        "num_threads": 9,
+        "monotonic_ns": 163645184111752,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 103526400,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
+        "smaps_anonhugepages_bytes": 0,
+        "smaps_anonymous_bytes": 60420096,
+        "smaps_filepmdmapped_bytes": 0,
+        "smaps_ksm_bytes": 0,
+        "smaps_lazyfree_bytes": 0,
+        "smaps_locked_bytes": 0,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60420096,
+        "smaps_private_hugetlb_bytes": 0,
+        "smaps_pss_anon_bytes": 60420096,
+        "smaps_pss_bytes": 101159936,
+        "smaps_pss_dirty_bytes": 60420096,
+        "smaps_pss_file_bytes": 40739840,
+        "smaps_pss_shmem_bytes": 0,
+        "smaps_referenced_bytes": 103526400,
+        "smaps_rss_bytes": 103526400,
+        "smaps_shared_clean_bytes": 2387968,
+        "smaps_shared_dirty_bytes": 0,
+        "smaps_shared_hugetlb_bytes": 0,
+        "smaps_shmempmdmapped_bytes": 0,
+        "smaps_swap_bytes": 0,
+        "smaps_swappss_bytes": 0,
+        "stime_ticks": 16,
+        "utime_ticks": 16,
+        "vsize_bytes": 290496512
+      },
+      "workers": {
+        "default/main/core1": {
+          "core_id": 1,
+          "gauges": {
+            "block.active_bytes": 0,
+            "block.flushing_bytes": 0,
+            "block.pending_bytes": 0,
+            "block.pending_slot_occupied": 0,
+            "block.requests_pending": 0,
+            "memory.accounted_bytes": 1008640,
+            "memory.budget_bytes": 1637851136,
+            "notify.queued": 0,
+            "notify.token_bytes": 983040,
+            "oldest_unacked_seconds": 0.0,
+            "series_cache.entries": 200
+          },
+          "generation": 0,
+          "pipeline_memory_usage_bytes": 16090240,
+          "reported": true,
+          "uptime_s": 4.001280767
+        }
+      }
+    },
+    {
+      "load_average_1_5_15": [
+        0.74,
+        2.16,
+        2.0
+      ],
+      "monotonic_ns": 163645435380509,
+      "observed_utc": "2026-09-22T16:41:59Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103243776,
+      "procfs": {
+        "clock_ticks_per_s": 100,
+        "monotonic_ns": 163645440682703,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 103243776,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
+        "smaps_anonhugepages_bytes": 0,
+        "smaps_anonymous_bytes": 60137472,
+        "smaps_filepmdmapped_bytes": 0,
+        "smaps_ksm_bytes": 0,
+        "smaps_lazyfree_bytes": 0,
+        "smaps_locked_bytes": 0,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60137472,
+        "smaps_private_hugetlb_bytes": 0,
+        "smaps_pss_anon_bytes": 60137472,
+        "smaps_pss_bytes": 100877312,
+        "smaps_pss_dirty_bytes": 60137472,
+        "smaps_pss_file_bytes": 40739840,
+        "smaps_pss_shmem_bytes": 0,
+        "smaps_referenced_bytes": 103243776,
+        "smaps_rss_bytes": 103243776,
+        "smaps_shared_clean_bytes": 2387968,
+        "smaps_shared_dirty_bytes": 0,
+        "smaps_shared_hugetlb_bytes": 0,
+        "smaps_shmempmdmapped_bytes": 0,
+        "smaps_swap_bytes": 0,
+        "smaps_swappss_bytes": 0,
+        "stime_ticks": 16,
+        "utime_ticks": 17,
+        "vsize_bytes": 290496512
+      },
+      "workers": {
+        "default/main/core1": {
+          "core_id": 1,
+          "gauges": {
+            "block.active_bytes": 0,
+            "block.flushing_bytes": 0,
+            "block.pending_bytes": 0,
+            "block.pending_slot_occupied": 0,
+            "block.requests_pending": 0,
+            "memory.accounted_bytes": 1008640,
+            "memory.budget_bytes": 1637851136,
+            "notify.queued": 0,
+            "notify.token_bytes": 983040,
+            "oldest_unacked_seconds": 0.0,
+            "series_cache.entries": 200
+          },
+          "generation": 0,
+          "pipeline_memory_usage_bytes": 16090240,
+          "reported": true,
+          "uptime_s": 4.001280767
+        }
+      }
+    },
+    {
+      "load_average_1_5_15": [
+        0.74,
+        2.16,
+        2.0
+      ],
+      "monotonic_ns": 163645691923461,
+      "observed_utc": "2026-09-22T16:41:59Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103256064,
+      "procfs": {
+        "clock_ticks_per_s": 100,
+        "monotonic_ns": 163645698465755,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 103256064,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
+        "smaps_anonhugepages_bytes": 0,
+        "smaps_anonymous_bytes": 60149760,
+        "smaps_filepmdmapped_bytes": 0,
+        "smaps_ksm_bytes": 0,
+        "smaps_lazyfree_bytes": 0,
+        "smaps_locked_bytes": 0,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60149760,
+        "smaps_private_hugetlb_bytes": 0,
+        "smaps_pss_anon_bytes": 60149760,
+        "smaps_pss_bytes": 100889600,
+        "smaps_pss_dirty_bytes": 60149760,
+        "smaps_pss_file_bytes": 40739840,
+        "smaps_pss_shmem_bytes": 0,
+        "smaps_referenced_bytes": 103256064,
+        "smaps_rss_bytes": 103256064,
+        "smaps_shared_clean_bytes": 2387968,
+        "smaps_shared_dirty_bytes": 0,
+        "smaps_shared_hugetlb_bytes": 0,
+        "smaps_shmempmdmapped_bytes": 0,
+        "smaps_swap_bytes": 0,
+        "smaps_swappss_bytes": 0,
+        "stime_ticks": 16,
+        "utime_ticks": 18,
+        "vsize_bytes": 290496512
+      },
+      "workers": {
+        "default/main/core1": {
+          "core_id": 1,
+          "gauges": {
+            "block.active_bytes": 0,
+            "block.flushing_bytes": 0,
+            "block.pending_bytes": 0,
+            "block.pending_slot_occupied": 0,
+            "block.requests_pending": 0,
+            "memory.accounted_bytes": 1008640,
+            "memory.budget_bytes": 1637851136,
+            "notify.queued": 0,
+            "notify.token_bytes": 983040,
+            "oldest_unacked_seconds": 0.0,
+            "series_cache.entries": 200
+          },
+          "generation": 0,
+          "pipeline_memory_usage_bytes": 16090240,
+          "reported": true,
+          "uptime_s": 4.001280767
+        }
+      }
+    },
+    {
+      "load_average_1_5_15": [
+        0.74,
+        2.16,
+        2.0
+      ],
+      "monotonic_ns": 163645950511247,
+      "observed_utc": "2026-09-22T16:41:59Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103178240,
+      "procfs": {
+        "clock_ticks_per_s": 100,
+        "monotonic_ns": 163645957859493,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 103178240,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
+        "smaps_anonhugepages_bytes": 0,
+        "smaps_anonymous_bytes": 60071936,
+        "smaps_filepmdmapped_bytes": 0,
+        "smaps_ksm_bytes": 0,
+        "smaps_lazyfree_bytes": 0,
+        "smaps_locked_bytes": 0,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60071936,
+        "smaps_private_hugetlb_bytes": 0,
+        "smaps_pss_anon_bytes": 60071936,
+        "smaps_pss_bytes": 100811776,
+        "smaps_pss_dirty_bytes": 60071936,
+        "smaps_pss_file_bytes": 40739840,
+        "smaps_pss_shmem_bytes": 0,
+        "smaps_referenced_bytes": 103178240,
+        "smaps_rss_bytes": 103178240,
+        "smaps_shared_clean_bytes": 2387968,
+        "smaps_shared_dirty_bytes": 0,
+        "smaps_shared_hugetlb_bytes": 0,
+        "smaps_shmempmdmapped_bytes": 0,
+        "smaps_swap_bytes": 0,
+        "smaps_swappss_bytes": 0,
+        "stime_ticks": 16,
+        "utime_ticks": 19,
+        "vsize_bytes": 290496512
+      },
+      "workers": {
+        "default/main/core1": {
+          "core_id": 1,
+          "gauges": {
+            "block.active_bytes": 0,
+            "block.flushing_bytes": 0,
+            "block.pending_bytes": 0,
+            "block.pending_slot_occupied": 0,
+            "block.requests_pending": 0,
+            "memory.accounted_bytes": 1008640,
+            "memory.budget_bytes": 1637851136,
+            "notify.queued": 0,
+            "notify.token_bytes": 983040,
+            "oldest_unacked_seconds": 0.0,
+            "series_cache.entries": 200
+          },
+          "generation": 0,
+          "pipeline_memory_usage_bytes": 16091376,
+          "reported": true,
+          "uptime_s": 5.001171704
+        }
+      }
+    },
+    {
+      "load_average_1_5_15": [
+        0.74,
+        2.16,
+        2.0
+      ],
+      "monotonic_ns": 163646209157501,
+      "observed_utc": "2026-09-22T16:41:59Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103243776,
+      "procfs": {
+        "clock_ticks_per_s": 100,
+        "monotonic_ns": 163646216419279,
+        "num_threads": 10,
         "open_fd_count": 37,
-        "pid": 3499572,
-        "rss_bytes": 190849024,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 103243776,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78880768,
+        "smaps_anonymous_bytes": 60137472,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78880768,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60137472,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78880768,
-        "smaps_pss_bytes": 188422144,
-        "smaps_pss_dirty_bytes": 78880768,
-        "smaps_pss_file_bytes": 109541376,
+        "smaps_pss_anon_bytes": 60137472,
+        "smaps_pss_bytes": 100877312,
+        "smaps_pss_dirty_bytes": 60137472,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190849024,
-        "smaps_rss_bytes": 190849024,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103243776,
+        "smaps_rss_bytes": 103243776,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 16,
-        "utime_ticks": 147,
-        "vsize_bytes": 424538112
+        "utime_ticks": 21,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
@@ -3140,55 +3430,55 @@
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 15799232,
+          "pipeline_memory_usage_bytes": 16091376,
           "reported": true,
-          "uptime_s": 4.00099306
+          "uptime_s": 5.001171704
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162155932628944,
-      "observed_utc": "2026-09-22T16:17:09Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190865408,
+      "monotonic_ns": 163646467740167,
+      "observed_utc": "2026-09-22T16:42:00Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103305216,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162155954001446,
-        "num_threads": 9,
-        "open_fd_count": 37,
-        "pid": 3499572,
-        "rss_bytes": 190865408,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "monotonic_ns": 163646474390339,
+        "num_threads": 10,
+        "open_fd_count": 36,
+        "pid": 3623333,
+        "rss_bytes": 103305216,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78897152,
+        "smaps_anonymous_bytes": 60198912,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78897152,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60198912,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78897152,
-        "smaps_pss_bytes": 188438528,
-        "smaps_pss_dirty_bytes": 78897152,
-        "smaps_pss_file_bytes": 109541376,
+        "smaps_pss_anon_bytes": 60198912,
+        "smaps_pss_bytes": 100938752,
+        "smaps_pss_dirty_bytes": 60198912,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190865408,
-        "smaps_rss_bytes": 190865408,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103305216,
+        "smaps_rss_bytes": 103305216,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
         "stime_ticks": 16,
-        "utime_ticks": 154,
-        "vsize_bytes": 424538112
+        "utime_ticks": 22,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
@@ -3207,55 +3497,55 @@
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 15799232,
+          "pipeline_memory_usage_bytes": 16091376,
           "reported": true,
-          "uptime_s": 4.00099306
+          "uptime_s": 5.001171704
         }
       }
     },
     {
       "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
+        0.74,
+        2.16,
+        2.0
       ],
-      "monotonic_ns": 162156206047613,
-      "observed_utc": "2026-09-22T16:17:09Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190693376,
+      "monotonic_ns": 163646725915466,
+      "observed_utc": "2026-09-22T16:42:00Z",
+      "process_pid": 3623333,
+      "process_rss_bytes": 103428096,
       "procfs": {
         "clock_ticks_per_s": 100,
-        "monotonic_ns": 162156223778915,
-        "num_threads": 9,
+        "monotonic_ns": 163646735793241,
+        "num_threads": 10,
         "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190693376,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
+        "pid": 3623333,
+        "rss_bytes": 103428096,
+        "smaps_5c93c4d9a000-7ffee5333000 ---p 00000000 00_bytes": 0,
         "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78725120,
+        "smaps_anonymous_bytes": 60321792,
         "smaps_filepmdmapped_bytes": 0,
         "smaps_ksm_bytes": 0,
         "smaps_lazyfree_bytes": 0,
         "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78725120,
+        "smaps_private_clean_bytes": 40718336,
+        "smaps_private_dirty_bytes": 60321792,
         "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78725120,
-        "smaps_pss_bytes": 188266496,
-        "smaps_pss_dirty_bytes": 78725120,
-        "smaps_pss_file_bytes": 109541376,
+        "smaps_pss_anon_bytes": 60321792,
+        "smaps_pss_bytes": 101061632,
+        "smaps_pss_dirty_bytes": 60321792,
+        "smaps_pss_file_bytes": 40739840,
         "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190693376,
-        "smaps_rss_bytes": 190693376,
-        "smaps_shared_clean_bytes": 2445312,
+        "smaps_referenced_bytes": 103428096,
+        "smaps_rss_bytes": 103428096,
+        "smaps_shared_clean_bytes": 2387968,
         "smaps_shared_dirty_bytes": 0,
         "smaps_shared_hugetlb_bytes": 0,
         "smaps_shmempmdmapped_bytes": 0,
         "smaps_swap_bytes": 0,
         "smaps_swappss_bytes": 0,
-        "stime_ticks": 17,
-        "utime_ticks": 162,
-        "vsize_bytes": 424538112
+        "stime_ticks": 16,
+        "utime_ticks": 24,
+        "vsize_bytes": 290496512
       },
       "workers": {
         "default/main/core1": {
@@ -3274,216 +3564,15 @@
             "series_cache.entries": 200
           },
           "generation": 0,
-          "pipeline_memory_usage_bytes": 15800368,
+          "pipeline_memory_usage_bytes": 16091376,
           "reported": true,
-          "uptime_s": 5.000615323
-        }
-      }
-    },
-    {
-      "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
-      ],
-      "monotonic_ns": 162156475711701,
-      "observed_utc": "2026-09-22T16:17:10Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190558208,
-      "procfs": {
-        "clock_ticks_per_s": 100,
-        "monotonic_ns": 162156492980255,
-        "num_threads": 9,
-        "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190558208,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
-        "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78589952,
-        "smaps_filepmdmapped_bytes": 0,
-        "smaps_ksm_bytes": 0,
-        "smaps_lazyfree_bytes": 0,
-        "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78589952,
-        "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78589952,
-        "smaps_pss_bytes": 188131328,
-        "smaps_pss_dirty_bytes": 78589952,
-        "smaps_pss_file_bytes": 109541376,
-        "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190558208,
-        "smaps_rss_bytes": 190558208,
-        "smaps_shared_clean_bytes": 2445312,
-        "smaps_shared_dirty_bytes": 0,
-        "smaps_shared_hugetlb_bytes": 0,
-        "smaps_shmempmdmapped_bytes": 0,
-        "smaps_swap_bytes": 0,
-        "smaps_swappss_bytes": 0,
-        "stime_ticks": 17,
-        "utime_ticks": 170,
-        "vsize_bytes": 424538112
-      },
-      "workers": {
-        "default/main/core1": {
-          "core_id": 1,
-          "gauges": {
-            "block.active_bytes": 0,
-            "block.flushing_bytes": 0,
-            "block.pending_bytes": 0,
-            "block.pending_slot_occupied": 0,
-            "block.requests_pending": 0,
-            "memory.accounted_bytes": 1008640,
-            "memory.budget_bytes": 1637851136,
-            "notify.queued": 0,
-            "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.0,
-            "series_cache.entries": 200
-          },
-          "generation": 0,
-          "pipeline_memory_usage_bytes": 15800368,
-          "reported": true,
-          "uptime_s": 5.000615323
-        }
-      }
-    },
-    {
-      "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
-      ],
-      "monotonic_ns": 162156744916423,
-      "observed_utc": "2026-09-22T16:17:10Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190685184,
-      "procfs": {
-        "clock_ticks_per_s": 100,
-        "monotonic_ns": 162156762487230,
-        "num_threads": 9,
-        "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190685184,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
-        "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78716928,
-        "smaps_filepmdmapped_bytes": 0,
-        "smaps_ksm_bytes": 0,
-        "smaps_lazyfree_bytes": 0,
-        "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78716928,
-        "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78716928,
-        "smaps_pss_bytes": 188258304,
-        "smaps_pss_dirty_bytes": 78716928,
-        "smaps_pss_file_bytes": 109541376,
-        "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190685184,
-        "smaps_rss_bytes": 190685184,
-        "smaps_shared_clean_bytes": 2445312,
-        "smaps_shared_dirty_bytes": 0,
-        "smaps_shared_hugetlb_bytes": 0,
-        "smaps_shmempmdmapped_bytes": 0,
-        "smaps_swap_bytes": 0,
-        "smaps_swappss_bytes": 0,
-        "stime_ticks": 17,
-        "utime_ticks": 177,
-        "vsize_bytes": 424538112
-      },
-      "workers": {
-        "default/main/core1": {
-          "core_id": 1,
-          "gauges": {
-            "block.active_bytes": 0,
-            "block.flushing_bytes": 0,
-            "block.pending_bytes": 0,
-            "block.pending_slot_occupied": 0,
-            "block.requests_pending": 0,
-            "memory.accounted_bytes": 1008640,
-            "memory.budget_bytes": 1637851136,
-            "notify.queued": 0,
-            "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.0,
-            "series_cache.entries": 200
-          },
-          "generation": 0,
-          "pipeline_memory_usage_bytes": 15800368,
-          "reported": true,
-          "uptime_s": 5.000615323
-        }
-      }
-    },
-    {
-      "load_average_1_5_15": [
-        0.51,
-        0.32,
-        0.23
-      ],
-      "monotonic_ns": 162157014539955,
-      "observed_utc": "2026-09-22T16:17:10Z",
-      "process_pid": 3499572,
-      "process_rss_bytes": 190767104,
-      "procfs": {
-        "clock_ticks_per_s": 100,
-        "monotonic_ns": 162157032522431,
-        "num_threads": 9,
-        "open_fd_count": 36,
-        "pid": 3499572,
-        "rss_bytes": 190767104,
-        "smaps_595ab6d80000-7ffcc0884000 ---p 00000000 00_bytes": 0,
-        "smaps_anonhugepages_bytes": 0,
-        "smaps_anonymous_bytes": 78798848,
-        "smaps_filepmdmapped_bytes": 0,
-        "smaps_ksm_bytes": 0,
-        "smaps_lazyfree_bytes": 0,
-        "smaps_locked_bytes": 0,
-        "smaps_private_clean_bytes": 109522944,
-        "smaps_private_dirty_bytes": 78798848,
-        "smaps_private_hugetlb_bytes": 0,
-        "smaps_pss_anon_bytes": 78798848,
-        "smaps_pss_bytes": 188340224,
-        "smaps_pss_dirty_bytes": 78798848,
-        "smaps_pss_file_bytes": 109541376,
-        "smaps_pss_shmem_bytes": 0,
-        "smaps_referenced_bytes": 190767104,
-        "smaps_rss_bytes": 190767104,
-        "smaps_shared_clean_bytes": 2445312,
-        "smaps_shared_dirty_bytes": 0,
-        "smaps_shared_hugetlb_bytes": 0,
-        "smaps_shmempmdmapped_bytes": 0,
-        "smaps_swap_bytes": 0,
-        "smaps_swappss_bytes": 0,
-        "stime_ticks": 17,
-        "utime_ticks": 185,
-        "vsize_bytes": 424538112
-      },
-      "workers": {
-        "default/main/core1": {
-          "core_id": 1,
-          "gauges": {
-            "block.active_bytes": 0,
-            "block.flushing_bytes": 0,
-            "block.pending_bytes": 0,
-            "block.pending_slot_occupied": 0,
-            "block.requests_pending": 0,
-            "memory.accounted_bytes": 1008640,
-            "memory.budget_bytes": 1637851136,
-            "notify.queued": 0,
-            "notify.token_bytes": 983040,
-            "oldest_unacked_seconds": 0.0,
-            "series_cache.entries": 200
-          },
-          "generation": 0,
-          "pipeline_memory_usage_bytes": 15800368,
-          "reported": true,
-          "uptime_s": 5.000615323
+          "uptime_s": 5.001171704
         }
       }
     }
   ],
   "schema_version": 1,
-  "started_utc": "2026-09-22T16:17:04Z",
+  "started_utc": "2026-09-22T16:41:54Z",
   "status": "passed",
   "workload": {
     "body_bytes": 1024,

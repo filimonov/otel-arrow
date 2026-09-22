@@ -1439,13 +1439,20 @@ class BuildMonitor:
         if not self._acknowledged.wait(30):
             raise AssertionError(f"the monitor did not apply {message['cmd']}")
 
-    def watch(self, pid, expected):
-        """Check `expected` ({tid: cores}) of process `pid` on every tick."""
+    def watch(self, pid, expected, names=()):
+        """Check `expected` ({tid: cores}) of process `pid` on every tick.
+
+        With worker thread `names`, every tick enumerates all of the
+        process's threads and requires the threads carrying those names to
+        be exactly the expected TIDs, so an extra or replacing worker thread
+        fails even if it exists for a single tick.
+        """
         self._command(
             {
                 "cmd": "watch",
                 "pid": int(pid),
                 "expected": {str(tid): sorted(cores) for tid, cores in expected.items()},
+                "names": sorted(set(names)),
             }
         )
 
@@ -3504,8 +3511,20 @@ class RunControls:
         return snapshot
 
     def watch_workers(self, pid, snapshot):
-        """Have every monitor tick re-check the workers `snapshot` mapped."""
-        self.monitor.watch(pid, worker_tids(snapshot))
+        """Have every monitor tick re-check the workers `snapshot` mapped.
+
+        The worker thread names come from the mapped threads themselves, so
+        any other thread by that name appearing later is an extra worker.
+        """
+        self.monitor.watch(
+            pid,
+            worker_tids(snapshot),
+            names=[
+                thread["name"]
+                for thread in snapshot.get("worker_threads", [])
+                if thread.get("name")
+            ],
+        )
 
     def unwatch_workers(self):
         """Stop re-checking workers, before the engine is deliberately stopped."""

@@ -335,6 +335,23 @@ class EnginePhase:
             )
         }
         self.drain["duration_s"] = (time.monotonic_ns() - started) / 1e9
+        # A release engine can take its input and drain inside one or two
+        # collections. The lifetime's own samples must still span enough
+        # answered epochs to be a measurement, so sampling continues until
+        # they do -- an observable condition under a deadline, not a wait.
+        workers = [worker["key"] for worker in self.workers]
+
+        def fewest():
+            """The fewest answered epochs any worker has in the samples."""
+            answered = answered_epochs(list(self.sampler.samples))
+            return min(answered.get(key, 0) for key in workers)
+
+        _ = measurement.wait_until(
+            fewest,
+            lambda count: count >= MINIMUM_EPOCHS,
+            deadline_ns=time.monotonic_ns() + READY_DEADLINE_S * 10**9,
+            description=f"{MINIMUM_EPOCHS} answered epochs of every worker",
+        )
         self.sampler.stop()
         self.controls.raise_if_invalid()
         return report
@@ -366,12 +383,21 @@ class EnginePhase:
 
 
 def engine_binary() -> Path:
-    """The engine binary a local run launches."""
+    """The engine binary a measured run launches: the release build.
+
+    `DF_ENGINE` may name another binary, but `prepare_build` refuses any
+    profile other than release, so a debug engine can never be measured.
+    """
     return Path(
         os.environ.get(
-            "DF_ENGINE", measurement.test_e2e.WORKSPACE / "target/debug/df_engine"
+            "DF_ENGINE", measurement.test_e2e.WORKSPACE / "target/release/df_engine"
         )
     )
+
+
+# The only build profile a measured or publishable case may run. A debug
+# engine's memory and speed describe the debug build, not the exporter.
+MEASURED_PROFILE = "release"
 
 
 def prepare_build() -> dict:
@@ -379,12 +405,24 @@ def prepare_build() -> dict:
 
     Hashing the binary and asking `rustc` for its version are work this
     harness does, and a `rustc` running while the monitor watches is a
-    concurrent build; both happen before the host controls open.
+    concurrent build; both happen before the host controls open. Any
+    profile other than release is refused here, before anything runs.
     """
-    return {
-        "build": measurement.engine_build(engine_binary()),
-        "git": measurement.git_provenance(),
-    }
+    binary = engine_binary()
+    if not binary.is_file():
+        raise AssertionError(
+            f"no engine binary at {binary}; build the release engine with "
+            f"cargo build --release --locked -p otel-arrow-dfe --bin df_engine "
+            f"--features series_parquet,aws,durable-buffer"
+        )
+    build = measurement.engine_build(binary)
+    if build["profile"] != MEASURED_PROFILE:
+        raise AssertionError(
+            f"measured cases require a release df_engine; {binary} is a "
+            f"{build['profile']} build. Build with --release, or point "
+            f"DF_ENGINE at target/release/df_engine"
+        )
+    return {"build": build, "git": measurement.git_provenance()}
 
 
 def local_experiment(spec, result, output_dir, controls, *, restart=False,
@@ -419,12 +457,18 @@ def local_experiment(spec, result, output_dir, controls, *, restart=False,
         raise AssertionError(
             "the build provenance is gathered before the host controls open"
         )
+    if provenance["build"]["profile"] != MEASURED_PROFILE:
+        raise AssertionError(
+            f"measured cases require a release df_engine, not "
+            f"{provenance['build']['profile']}"
+        )
     result["environment"]["build"] = provenance["build"]
     result["environment"]["git"] = provenance["git"]
     buffer_path = output_dir / "buffer" if buffered else None
     merge = engine_merge(spec)
     phases = []
     engine = None
+    binary = Path(provenance["build"]["binary"])
     ledger = measurement.Ledger(output_dir / "ledger.sqlite")
     data_root = None
     try:
@@ -437,6 +481,7 @@ def local_experiment(spec, result, output_dir, controls, *, restart=False,
             buffer_path=buffer_path,
             cores=list(spec.cores),
             merge=merge,
+            binary=binary,
         )
         data_root = engine.data
         # The receiver's port is chosen fresh for every launch.
@@ -479,6 +524,7 @@ def local_experiment(spec, result, output_dir, controls, *, restart=False,
                 buffer_path=buffer_path,
                 cores=list(spec.cores),
                 merge=merge,
+                binary=binary,
             )
             result["config"]["effective_restart"] = engine.config
             record_restart(result, previous, engine, inventory)
@@ -759,8 +805,9 @@ def launcher_ci_case(output_dir, report_dir=None, **options) -> dict:
 
     `publish=false` is the CI mode for a runner that is not a publishable
     measurement host: nothing reaches the report directory, no baseline is
-    evaluated, and the index passes on correctness, graph, restart and
-    affinity checks alone. Validity failures are still recorded as failed.
+    evaluated, and the index fails whenever a child fails any hard gate
+    except the core floor such a host necessarily fails; the RSS
+    reconciliation is one of the gates it enforces.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -815,17 +862,33 @@ def run_child(spec, output_dir, *, report_dir=None, restart=False,
     return result
 
 
-# The checks a non-publishable CI run must still pass: what it delivered and
-# how it was launched, not whether the host could publish a measurement.
-CI_CHECKS = (
-    "delivery",
-    "graph_edges",
-    "buffer_path_retained",
-    "restart_graph_and_cores_unchanged",
-    "affinity_matched",
-    "minimum_samples",
-    "environment_snapshots_complete",
-)
+# The checks every run must record, whatever its topology.
+CI_ALWAYS = ("delivery", "graph_edges", "minimum_samples", "rss_reconciliation")
+
+# The one hard gate a non-publishable host is expected to fail: it is too
+# small to publish, which is why it runs in this mode. Every other hard gate
+# a child fails also fails the CI index.
+HOST_CAPACITY_CHECKS = ("physical_cores_sufficient",)
+
+
+def ci_failures(child) -> list:
+    """The hard gates that fail one child in the non-publishable CI mode.
+
+    Every required CI check must be present and passed, and every other hard
+    check the child recorded must have passed too, except the host-capacity
+    gate a runner too small to publish on necessarily fails.
+    """
+    statuses = {}
+    for entry in child["checks"]:
+        if entry["kind"] == measurement.CHECK_HARD:
+            statuses.setdefault(entry["name"], []).append(entry["status"])
+    failed = [name for name in CI_ALWAYS if name not in statuses]
+    for name, recorded in sorted(statuses.items()):
+        if name in HOST_CAPACITY_CHECKS:
+            continue
+        if any(status != measurement.STATUS_PASSED for status in recorded):
+            failed.append(name)
+    return sorted(set(failed))
 
 
 def run_legacy_suite(output_dir) -> dict:
@@ -881,14 +944,7 @@ def write_index(case, output_dir, report_dir, children, *, publishable, legacy=N
             passed = child["status"] == measurement.STATUS_PASSED
             detail = f"{child['run_id']}: {child['status']}"
         else:
-            statuses = {entry["name"]: entry["status"] for entry in child["checks"]}
-            needed = [
-                name for name in CI_CHECKS
-                if name in statuses or name in ("delivery", "graph_edges")
-            ]
-            failed = [
-                name for name in needed if statuses.get(name) != measurement.STATUS_PASSED
-            ]
+            failed = ci_failures(child)
             passed = not failed
             detail = f"{child['run_id']}: failed CI checks {failed}"
         checks.append(

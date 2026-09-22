@@ -57,6 +57,10 @@ jobs:
       # measurement lease, so a measured step never runs beside a compiler.
       - name: Build the real engine
         run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer
+      # Measured cases refuse any build but release; the fixture suite above
+      # keeps the debug build.
+      - name: Build the release engine for measurement
+        run: cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer
       - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"

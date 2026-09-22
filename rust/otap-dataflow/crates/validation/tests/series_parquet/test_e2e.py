@@ -319,6 +319,7 @@ class Engine:
         cores=None,
         launcher=None,
         merge=None,
+        binary=None,
     ):
         self.root = Path(directory)
         self.data = self.root / "data"
@@ -356,7 +357,11 @@ class Engine:
         # The hash of the exact file the engine reads, so a result records
         # the configuration that ran rather than the one that was meant.
         self.config_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
-        binary = Path(os.environ.get("DF_ENGINE", WORKSPACE / "target/debug/df_engine"))
+        # A measurement names its release binary; the fixture tests keep the
+        # debug build or `DF_ENGINE`, exactly as before.
+        binary = Path(
+            binary or os.environ.get("DF_ENGINE", WORKSPACE / "target/debug/df_engine")
+        )
         if not binary.is_file():
             raise AssertionError(f"build the feature-enabled engine first: {binary}")
         self.binary = binary

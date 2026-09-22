@@ -43,8 +43,16 @@ directory, `ordinal` numbers a repeated trial, `cores` pins the workers to
 explicit core ids. `launcher-ci` also takes `legacy_tests=false` to skip the
 original suite and `publish=false`, the CI mode for a runner that is not a
 publishable measurement host: nothing reaches the report directory, no
-baseline is evaluated, and the index passes on delivery, graph, restart,
-affinity and sample checks alone, with every validity failure still recorded.
+baseline is evaluated, and the index fails whenever a child fails any hard
+gate -- delivery, graph, restart, affinity, samples, RSS reconciliation,
+lease, monitor coverage, environment -- except the eight-core floor that such
+a host is too small to meet.
+
+Every measured case runs the release engine, `target/release/df_engine`
+unless `DF_ENGINE` names another binary, and refuses any other build profile
+before it starts: a debug engine's memory and speed describe the debug
+build, not the exporter. The fixture suite `test_e2e.py` keeps using the
+debug build.
 
 The remaining subcommands (`stages`, `attribution`,
 `capacity`, `memory`, `soak`, `fault-preflight`, `failures`, `buffered`,
@@ -55,7 +63,7 @@ each is implemented by its own task.
 
 | Variable | Effect |
 | --- | --- |
-| `DF_ENGINE` | The engine binary to run. Defaults to `target/debug/df_engine`. |
+| `DF_ENGINE` | The engine binary to run. The fixture suite defaults to `target/debug/df_engine`; measured cases default to `target/release/df_engine` and refuse any non-release profile. |
 | `SERIES_REQUIRE_DOCKER` | `1` makes missing images and Docker a failure rather than a skip. |
 | `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling a failure rather than a skip. |
 | `SERIES_MEASURE_LONG` | `1` opts in to throughput sweeps, profiled memory runs, the soak and long failure runs. |
@@ -116,8 +124,10 @@ each of them once.
 - **Monitor.** `host_monitor.py` runs as its own process, so a busy harness
   cannot stretch its schedule. Every 50 ms it scans procfs for compilers,
   linkers and container build clients, and for any process descending from
-  a build daemon; an idle `buildkitd` is not a build. It re-checks every
-  mapped worker thread's allowed cores on each tick. A tick gap over 100 ms,
+  a build daemon; an idle `buildkitd` is not a build. On each tick it also
+  enumerates every thread of the engine and requires the threads carrying a
+  worker name to be exactly the mapped worker TIDs, each allowed exactly its
+  own core, so an extra or replacing worker fails even for a single tick. A tick gap over 100 ms,
   a procfs that hides other processes, or a Docker that is installed but
   cannot be asked about builder containers makes the coverage incomplete and
   the run invalid. Any build seen after preflight invalidates the run even
@@ -184,8 +194,9 @@ directory.
 
 ## Reproducing a measurement
 
-1. Build the engine with the features the case needs:
-   `cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer`.
+1. Build the release engine with the features the case needs:
+   `cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer`.
+   The fixture suite additionally needs the same command without `--release`.
 2. Read the run's `environment` block. Match the machine, the core
    allocation and the build profile, or expect a new baseline rather than a
    comparison.

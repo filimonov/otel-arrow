@@ -2781,6 +2781,161 @@ class FingerprintEphemeralContracts(unittest.TestCase):
         )
 
 
+def fake_task(root, pid, tid, name, cores):
+    """One injected thread of an injected process, renamed into place."""
+    task = root / str(pid) / "task"
+    task.mkdir(exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=root.parent))
+    _ = (staging / "status").write_text(
+        f"Name:\t{name}\nPid:\t{tid}\nCpus_allowed_list:\t{cores}\n", encoding="ascii"
+    )
+    staging.rename(task / str(tid))
+
+
+class WorkerEnumerationContracts(unittest.TestCase):
+    """Every tick sees every worker thread, not only the mapped ones."""
+
+    # Scenario: the engine's one mapped worker keeps its core, but a second
+    # thread with the worker name exists for about one tick and is gone.
+    # Guarantees: the monitor enumerates all of the engine's threads on
+    # every tick, so the transient extra worker is a mapping failure that
+    # invalidates the run even though it vanished again.
+    def test_a_transient_extra_worker_fails_the_mapping(self):
+        root = fake_proc(self)
+        fake_process(root, 900, "df_engine")
+        fake_task(root, 900, 900, "df_engine", "0-31")
+        fake_task(root, 900, 901, "pipeline-defaul", "1")
+        fake_task(root, 900, 902, "tokio-rt-worker", "1")
+        monitor = measurement.BuildMonitor(proc_root=root, docker=False).start()
+        self.addCleanup(monitor._abandon)
+        monitor.watch(900, {901: {1}}, names=["pipeline-defaul"])
+        fake_task(root, 900, 903, "pipeline-defaul", "2")
+        _ = measurement.wait_until(
+            monitor.invalid.is_set,
+            bool,
+            deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+            description="the monitor seeing the extra worker",
+        )
+        shutil.rmtree(root / "900" / "task" / "903")
+        report = monitor.stop()
+        self.assertGreaterEqual(report["affinity_failure_count"], 1)
+        self.assertIn("TID mapping mismatch", report["affinity_failures"][0]["detail"])
+        self.assertIn("903", report["affinity_failures"][0]["detail"])
+
+    # Scenario: the mapped worker thread is replaced by a new thread with
+    # the same name on the same core.
+    # Guarantees: a replacing worker is a changed mapping, never a pass.
+    def test_a_replaced_worker_fails_the_mapping(self):
+        root = fake_proc(self)
+        fake_process(root, 910, "df_engine")
+        fake_task(root, 910, 911, "pipeline-defaul", "1")
+        found = measurement.host_monitor.worker_threads(
+            910, {"pipeline-defaul"}, proc_root=root
+        )
+        measurement.check_worker_affinity(found, {911: {1}})
+        shutil.rmtree(root / "910" / "task" / "911")
+        fake_task(root, 910, 912, "pipeline-defaul", "1")
+        found = measurement.host_monitor.worker_threads(
+            910, {"pipeline-defaul"}, proc_root=root
+        )
+        with self.assertRaisesRegex(AssertionError, "TID mapping mismatch"):
+            measurement.check_worker_affinity(found, {911: {1}})
+
+
+class ReleaseProfileContracts(unittest.TestCase):
+    """A measured case runs the release engine or does not run."""
+
+    def binary(self, profile):
+        """A stand-in engine binary inside a target directory of `profile`."""
+        directory = temporary_directory(self) / profile
+        directory.mkdir()
+        path = directory / "df_engine"
+        _ = path.write_bytes(b"not really an engine")
+        return path
+
+    # Scenario: a measured case is pointed at a debug engine build.
+    # Guarantees: it is refused before any lease or run, with an error
+    # that says a release engine is required and how to build one.
+    def test_a_debug_engine_is_refused(self):
+        with mock.patch.dict(os.environ, {"DF_ENGINE": str(self.binary("debug"))}):
+            with self.assertRaisesRegex(AssertionError, "require a release df_engine"):
+                _ = measure.prepare_build()
+
+    # Scenario: the same case is pointed at a release engine build.
+    # Guarantees: the release profile is accepted and recorded.
+    def test_a_release_engine_is_accepted(self):
+        with mock.patch.dict(os.environ, {"DF_ENGINE": str(self.binary("release"))}):
+            provenance = measure.prepare_build()
+        self.assertEqual(provenance["build"]["profile"], "release")
+
+    # Scenario: no DF_ENGINE is set.
+    # Guarantees: the measured default is the release binary, never debug.
+    def test_the_default_engine_is_the_release_build(self):
+        environment = dict(os.environ)
+        environment.pop("DF_ENGINE", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(measure.engine_binary().parent.name, "release")
+
+
+class CiIndexContracts(unittest.TestCase):
+    """The non-publishable CI index still fails on every hard gate."""
+
+    def child(self, directory, run_id, failed=()):
+        """A child result with every CI gate recorded, `failed` ones failed."""
+        names = (
+            "delivery", "graph_edges", "minimum_samples", "rss_reconciliation",
+            "affinity_matched", "no_concurrent_build", "physical_cores_sufficient",
+        )
+        child = {
+            "run_id": run_id,
+            "status": measurement.STATUS_FAILED,
+            "checks": [
+                measurement.check(
+                    name,
+                    measurement.CHECK_HARD,
+                    measurement.STATUS_FAILED if name in failed else measurement.STATUS_PASSED,
+                )
+                for name in names
+            ],
+            "config": {"requested": {"topology": "strict"}},
+            "metrics": {},
+            "baseline_files": [],
+        }
+        _ = (directory / f"{run_id}.json").write_text("{}\n", encoding="ascii")
+        return child
+
+    # Scenario: a CI child passes every gate but the RSS reconciliation, and
+    # another fails only the core floor of a small runner.
+    # Guarantees: the RSS failure fails the CI index; the core floor alone,
+    # which such a runner cannot meet, does not.
+    def test_a_failed_hard_gate_fails_the_ci_index(self):
+        directory = temporary_directory(self)
+        small = self.child(directory, "small-host", failed=("physical_cores_sufficient",))
+        self.assertEqual(measure.ci_failures(small), [])
+        residual = self.child(
+            directory, "residual", failed=("rss_reconciliation", "physical_cores_sufficient")
+        )
+        self.assertEqual(measure.ci_failures(residual), ["rss_reconciliation"])
+        index = measure.write_index(
+            "ci-test", directory, directory, [small, residual], publishable=False
+        )
+        self.assertEqual(index["status"], measurement.STATUS_FAILED)
+        passing = measure.write_index(
+            "ci-test-small", directory, directory, [small], publishable=False
+        )
+        self.assertEqual(passing["status"], measurement.STATUS_PASSED)
+
+    # Scenario: a CI child never recorded its RSS reconciliation at all.
+    # Guarantees: an absent required gate is a failure, never a pass.
+    def test_an_absent_required_gate_fails(self):
+        directory = temporary_directory(self)
+        child = self.child(directory, "absent")
+        child["checks"] = [
+            entry for entry in child["checks"] if entry["name"] != "rss_reconciliation"
+        ]
+        self.assertEqual(measure.ci_failures(child), ["rss_reconciliation"])
+
+
 def exporter_snapshot(metrics):
     """A JSON snapshot carrying one exporter metric set with `metrics`."""
     return {
