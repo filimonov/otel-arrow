@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Metrics extraction: number and histogram points (spec section 5.1).
+//!
+//! Both point kinds write into the single `metrics/values` dataset through one
+//! [`RowSink`], each leaving the other kind's columns null. The point kind is
+//! not stored in the row: readers take it from `metric_type` in the series
+//! descriptor through the join of spec section 5.5.
 
 use std::collections::{HashMap, HashSet};
 
@@ -279,7 +284,12 @@ fn explicit_bounds_at(a: &Option<ListArray>, row: usize) -> Result<Vec<f64>> {
         .collect()
 }
 
-/// The eight leading columns shared by both values datasets, plus their bytes.
+/// Bytes a merged values row's fixed per-kind cells retain: the two value
+/// columns, the four histogram scalars and the two list cells' overhead. Every
+/// row pays them because every row carries all fourteen columns, null or not.
+const PER_KIND_FIXED_BYTES: usize = 16 + 32 + 48;
+
+/// The eight leading columns shared by both point kinds, plus their bytes.
 fn common_cols(
     id: SeriesId,
     m: &MetricRow,
@@ -390,6 +400,9 @@ pub(crate) fn extract_metrics(
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let mut values = Vec::new();
     let mut pinned_bytes = 0;
+    // Number and histogram points share one dataset (spec 5.1), so they share
+    // one sink; each kind writes the other's columns as null.
+    let mut sink = RowSink::new(Dataset::MetricsValues, cfg)?;
 
     // Number points.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
@@ -401,7 +414,6 @@ pub(crate) fn extract_metrics(
         let iv = plain(b, INT_VALUE, &DataType::Int64)?;
         let dv = plain(b, DOUBLE_VALUE, &DataType::Float64)?;
         let fl = plain(b, FLAGS, &DataType::UInt32)?;
-        let mut sink = RowSink::new(Dataset::MetricsNumber, cfg)?;
         for row in 0..b.num_rows() {
             let metric_id = opt_u16_at(&parent, row)
                 .ok_or_else(|| Error::invalid("number point without parent metric id"))?;
@@ -426,10 +438,17 @@ pub(crate) fn extract_metrics(
             );
             cols.push(Col::Int(opt_i64(&iv, row)));
             cols.push(Col::Double(opt_f64(&dv, row)));
-            approx += 16;
+            // Histogram columns of a number point: null, not zero.
+            cols.push(Col::Int(None));
+            cols.push(Col::Double(None));
+            cols.push(Col::Double(None));
+            cols.push(Col::Double(None));
+            cols.push(Col::ListI64(None));
+            cols.push(Col::ListF64(None));
+            approx += PER_KIND_FIXED_BYTES;
             approx += push_denorm(
                 &mut cols,
-                Dataset::MetricsNumber,
+                Dataset::MetricsValues,
                 resource,
                 scope,
                 point_attrs,
@@ -444,11 +463,6 @@ pub(crate) fn extract_metrics(
                 budget,
             )?;
             c.stats.rows += 1;
-        }
-        let (batches, pinned) = sink.finish(budget)?;
-        pinned_bytes += pinned;
-        if !batches.is_empty() {
-            values.push((Dataset::MetricsNumber, batches));
         }
     }
 
@@ -466,7 +480,6 @@ pub(crate) fn extract_metrics(
         let fl = plain(b, FLAGS, &DataType::UInt32)?;
         let bc = list_col(b, HISTOGRAM_BUCKET_COUNTS)?;
         let eb = list_col(b, HISTOGRAM_EXPLICIT_BOUNDS)?;
-        let mut sink = RowSink::new(Dataset::MetricsHistogram, cfg)?;
         for row in 0..b.num_rows() {
             let metric_id = opt_u16_at(&parent, row)
                 .ok_or_else(|| Error::invalid("histogram point without parent metric id"))?;
@@ -506,16 +519,19 @@ pub(crate) fn extract_metrics(
                 flags_at(&fl, row),
                 &mut c.stats,
             );
+            // Value columns of a histogram point: null, not zero.
+            cols.push(Col::Int(None));
+            cols.push(Col::Double(None));
             cols.push(Col::Int(Some(cnt)));
             cols.push(Col::Double(opt_f64(&sum, row)));
             cols.push(Col::Double(opt_f64(&min, row)));
             cols.push(Col::Double(opt_f64(&max, row)));
-            approx += 32 + counts.len() * 8 + bounds.len() * 8 + 48;
-            cols.push(Col::ListI64(counts));
-            cols.push(Col::ListF64(bounds));
+            approx += PER_KIND_FIXED_BYTES + counts.len() * 8 + bounds.len() * 8;
+            cols.push(Col::ListI64(Some(counts)));
+            cols.push(Col::ListF64(Some(bounds)));
             approx += push_denorm(
                 &mut cols,
-                Dataset::MetricsHistogram,
+                Dataset::MetricsValues,
                 resource,
                 scope,
                 point_attrs,
@@ -531,11 +547,14 @@ pub(crate) fn extract_metrics(
             )?;
             c.stats.rows += 1;
         }
-        let (batches, pinned) = sink.finish(budget)?;
-        pinned_bytes += pinned;
-        if !batches.is_empty() {
-            values.push((Dataset::MetricsHistogram, batches));
-        }
+    }
+
+    // One sink for both point kinds, so a mixed request still produces a single
+    // values file. Number rows precede histogram rows within the request.
+    let (batches, pinned) = sink.finish(budget)?;
+    pinned_bytes += pinned;
+    if !batches.is_empty() {
+        values.push((Dataset::MetricsValues, batches));
     }
 
     // Descriptors of metrics that only had unsupported points are not emitted.
@@ -789,13 +808,22 @@ mod tests {
                 "exemplar attributes leaked into a series"
             );
         }
-        let number = out
+        // One dataset holds both point kinds: the three number rows come first,
+        // the single histogram row last, in one batch.
+        let vals = out
             .values
             .iter()
-            .find(|(d, _)| *d == Dataset::MetricsNumber)
-            .expect("number")
+            .find(|(d, _)| *d == Dataset::MetricsValues)
+            .expect("values")
             .1[0]
             .clone();
+        assert_eq!(
+            out.values.len(),
+            1,
+            "metrics write exactly one values dataset"
+        );
+        assert_eq!(vals.num_rows(), 4);
+        let number = vals.slice(0, 3);
         assert_eq!(number.num_rows(), 3);
         let vi = number
             .column_by_name("value_int")
@@ -822,7 +850,21 @@ mod tests {
         assert_eq!(name.value(0), "cpu");
         // Every remaining column of the number row 0, a point with time 10ns,
         // no start time, no flags and an integer value.
-        assert_eq!(number.num_columns(), 10);
+        assert_eq!(number.num_columns(), 16);
+        // The histogram columns of a number row are null, not zero.
+        for col in [
+            "count",
+            "sum",
+            "min",
+            "max",
+            "bucket_counts",
+            "explicit_bounds",
+        ] {
+            assert!(
+                number.column_by_name(col).expect(col).is_null(0),
+                "{col} must be null on a number row"
+            );
+        }
         assert_eq!(
             number
                 .column_by_name("producer_id")
@@ -862,21 +904,18 @@ mod tests {
                 .value(0),
             0
         );
-        let hist = out
-            .values
-            .iter()
-            .find(|(d, _)| *d == Dataset::MetricsHistogram)
-            .expect("hist")
-            .1[0]
-            .clone();
+        let hist = vals.slice(3, 1);
         assert_eq!(hist.num_rows(), 1);
+        // The value columns of a histogram row are null.
+        assert!(hist.column_by_name("value_int").expect("vi").is_null(0));
+        assert!(hist.column_by_name("value_double").expect("vd").is_null(0));
         let bc = hist
             .column_by_name("bucket_counts")
             .expect("bc")
             .as_list::<i32>();
         assert_eq!(bc.value(0).as_primitive::<Int64Type>().values(), &[1i64, 2]);
         // Every remaining column of the single histogram row.
-        assert_eq!(hist.num_columns(), 14);
+        assert_eq!(hist.num_columns(), 16);
         assert_eq!(
             hist.column_by_name("series_id")
                 .expect("hid")
@@ -1141,8 +1180,8 @@ mod tests {
         let number = out
             .values
             .iter()
-            .find(|(d, _)| *d == Dataset::MetricsNumber)
-            .expect("number");
+            .find(|(d, _)| *d == Dataset::MetricsValues)
+            .expect("values");
         assert_eq!(number.1[0].num_rows(), 1);
     }
 
@@ -1230,8 +1269,8 @@ mod tests {
         let number = out
             .values
             .iter()
-            .find(|(d, _)| *d == Dataset::MetricsNumber)
-            .expect("number")
+            .find(|(d, _)| *d == Dataset::MetricsValues)
+            .expect("values")
             .1[0]
             .clone();
         let row_ids = number

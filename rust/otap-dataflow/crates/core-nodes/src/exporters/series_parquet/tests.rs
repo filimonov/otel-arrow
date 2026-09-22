@@ -3820,7 +3820,13 @@ fn startup_rejects_invalid_configuration() {
         ("upload", serde_json::json!({"concurrency": 0})),
         ("upload", serde_json::json!({"part_bytes": "1MiB"})),
         ("parquet", serde_json::json!({"compression": "snappy"})),
-        ("metrics", serde_json::json!({"values_sort": ["value_int"]})),
+        (
+            "metrics",
+            serde_json::json!({"values_sort": ["no_such_column"]}),
+        ),
+        // `attrs` is a Map column of logs/values: present, but not a type the
+        // Arrow row format can sort by.
+        ("logs", serde_json::json!({"values_sort": ["attrs"]})),
         (
             "logs",
             serde_json::json!({"denormalize": [{"path": "resource.x", "column": "SERIES_ID"}]}),

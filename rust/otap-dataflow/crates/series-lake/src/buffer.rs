@@ -1224,23 +1224,16 @@ mod tests {
             block.spec_for(Dataset::LogsValues).keys(),
             cfg.logs.values_sort.as_slice()
         );
-        for ds in [Dataset::MetricsNumber, Dataset::MetricsHistogram] {
-            assert_eq!(
-                block.spec_for(ds).keys(),
-                cfg.metrics.values_sort.as_slice(),
-                "{} follows the metrics sort",
-                ds.name()
-            );
-        }
+        assert_eq!(
+            block.spec_for(Dataset::MetricsValues).keys(),
+            cfg.metrics.values_sort.as_slice(),
+            "the merged metrics values dataset follows the metrics sort"
+        );
 
         let mut off = cfg.clone();
         off.sorting.enabled = false;
         let block: Block<u32> = Block::new(0, 1, &off);
-        for ds in [
-            Dataset::LogsValues,
-            Dataset::MetricsNumber,
-            Dataset::MetricsHistogram,
-        ] {
+        for ds in [Dataset::LogsValues, Dataset::MetricsValues] {
             assert!(
                 block.spec_for(ds).is_empty(),
                 "{} is unsorted when sorting is disabled",

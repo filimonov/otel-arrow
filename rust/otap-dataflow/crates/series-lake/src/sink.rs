@@ -953,11 +953,11 @@ mod tests {
     }
 
     /// Scenario: a metrics block carrying both a gauge and a histogram.
-    /// Guarantees: the series dataset is written before both value datasets, each value
-    /// dataset gets its own file under its own Hive prefix, and each file's row count
-    /// matches the flush report.
+    /// Guarantees: the series dataset is written before the single merged values
+    /// dataset, the two point kinds share one file rather than costing a second
+    /// PUT, and the file's row count matches the flush report.
     #[tokio::test]
-    async fn metrics_block_writes_series_before_both_value_datasets() {
+    async fn metrics_block_writes_series_before_the_merged_values_dataset() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(10);
@@ -974,18 +974,10 @@ mod tests {
             .await
             .expect("write");
         let order: Vec<Dataset> = report.files.iter().map(|(d, _, _)| *d).collect();
-        assert_eq!(
-            order,
-            vec![
-                Dataset::MetricsSeries,
-                Dataset::MetricsNumber,
-                Dataset::MetricsHistogram
-            ]
-        );
+        assert_eq!(order, vec![Dataset::MetricsSeries, Dataset::MetricsValues]);
         assert_eq!(parquet_count(dir.path(), "dataset=series"), 1);
-        assert_eq!(parquet_count(dir.path(), "dataset=number"), 1);
-        assert_eq!(parquet_count(dir.path(), "dataset=histogram"), 1);
-        assert_eq!(walkdir_count(dir.path()), 3);
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 1);
+        assert_eq!(walkdir_count(dir.path()), 2);
         for (ds, path, rows) in &report.files {
             assert!(*rows > 0, "{ds:?} wrote no rows");
             let kv = file_kv(dir.path(), path);

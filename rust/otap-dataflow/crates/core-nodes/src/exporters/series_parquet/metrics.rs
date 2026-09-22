@@ -168,10 +168,8 @@ pub(super) enum DatasetLabel {
     LogsValues,
     /// `signal=metrics/dataset=series`.
     MetricsSeries,
-    /// `signal=metrics/dataset=number`.
-    MetricsNumber,
-    /// `signal=metrics/dataset=histogram`.
-    MetricsHistogram,
+    /// `signal=metrics/dataset=values`, holding number and histogram points.
+    MetricsValues,
 }
 
 impl From<Dataset> for DatasetLabel {
@@ -180,8 +178,7 @@ impl From<Dataset> for DatasetLabel {
             Dataset::LogsSeries => Self::LogsSeries,
             Dataset::LogsValues => Self::LogsValues,
             Dataset::MetricsSeries => Self::MetricsSeries,
-            Dataset::MetricsNumber => Self::MetricsNumber,
-            Dataset::MetricsHistogram => Self::MetricsHistogram,
+            Dataset::MetricsValues => Self::MetricsValues,
         }
     }
 }
@@ -504,8 +501,7 @@ mod tests {
             (DatasetLabel::LogsSeries, "logs_series"),
             (DatasetLabel::LogsValues, "logs_values"),
             (DatasetLabel::MetricsSeries, "metrics_series"),
-            (DatasetLabel::MetricsNumber, "metrics_number"),
-            (DatasetLabel::MetricsHistogram, "metrics_histogram"),
+            (DatasetLabel::MetricsValues, "metrics_values"),
         ] {
             metrics
                 .written

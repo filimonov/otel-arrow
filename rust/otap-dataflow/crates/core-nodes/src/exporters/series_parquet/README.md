@@ -13,9 +13,13 @@
 series descriptors plus narrow values datasets, on a local filesystem or on
 S3-compatible object storage. Files land under
 `v=1/signal=<signal>/dataset=<dataset>/date=<date>/hour=<hour>/`. The `series`
-dataset holds one descriptor row per identity; the values datasets
-(`values` for logs, `number` and `histogram` for metrics) hold the records and
-join back on `series_id`. The normative on-disk format is
+dataset holds one descriptor row per identity; the `values` dataset of each
+signal holds the records and joins back on `series_id`. Metric number and
+histogram points share one `signal=metrics/dataset=values` dataset whose
+columns are the union of both kinds, each kind leaving the other's columns
+null, so a mixed metrics stream costs one PUT request per window instead of
+two. The point kind is `metric_type` in the descriptor the join already
+supplies. The normative on-disk format is
 [`crates/series-lake/docs/FORMAT.md`](../../../../series-lake/docs/FORMAT.md).
 
 The worker owns exactly one ACTIVE block and at most one FLUSHING block, plus
@@ -265,9 +269,11 @@ null and increments `denormalize.type_mismatch{column}`.
 locality and good compression. For queries that filter on service or
 environment, place that denormalized physical column first, for example
 `service_name, series_id, time_unix_nano`; this improves row-group pruning at
-some cost in per-series locality. A sort key must exist in every values
-dataset of that signal, so `value_int` is refused for metrics because the
-histogram dataset has no such column. Null placement defaults to last. Series
+some cost in per-series locality. A sort key must exist in the values dataset
+of that signal and be of a sortable type, so a map column such as `attrs` is
+refused. `value_int` is a valid metrics sort key now that both point kinds
+share one dataset, but it is null on every histogram row. Null placement
+defaults to last. Series
 files always sort by `series_id` and this is not configurable. Disabling
 values sorting preserves schemas and delivery guarantees.
 
@@ -661,6 +667,65 @@ FROM parquet_schema('/tmp/series-parquet/**/*.parquet');
 Different fingerprints can still mean a supported additive change; compare the
 physical columns before concluding that two files are incompatible.
 
+Metrics read the same way against one values dataset. The descriptor join
+supplies the point kind, so no union of per-kind datasets is needed:
+
+```sql
+CREATE VIEW metrics_series AS
+SELECT * FROM read_parquet(
+  '/tmp/series-parquet/v=1/signal=metrics/dataset=series/**/*.parquet',
+  hive_partitioning=true, union_by_name=true, filename=true)
+QUALIFY row_number() OVER
+  (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC)=1;
+SELECT v.*, s.metric_name, s.metric_type FROM read_parquet(
+  '/tmp/series-parquet/v=1/signal=metrics/dataset=values/**/*.parquet',
+  hive_partitioning=true, union_by_name=true) v
+JOIN metrics_series s USING(series_id)
+WHERE s.metric_type = 'histogram';
+```
+
+Filter on `s.metric_type` to read one point kind, or on `v.count IS NOT NULL`
+to select histogram rows without consulting the descriptor.
+
+## Request cost
+
+Requests to object storage are the fixed cost of a short window. Assumptions:
+S3 Standard, PUT at 0.005 USD per 1000 requests, a 30-day month, and one
+writer is one pipeline worker. One signal writes one values file per window,
+and the file stays below `upload.part_bytes`, so one file is one PUT. With a
+stable series set, `series` is written once per hour partition.
+
+The files/hour column counts values files; monthly PUTs include `series`. The
+100-writer and 1000-writer columns multiply the per-writer USD figures.
+
+| Window interval | Values files/hour/writer | PUT/month/writer | USD/month/writer | USD/month, 100 writers | USD/month, 1000 writers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5 s | 720 | 519120 | 2.60 | 260.00 | 2600.00 |
+| 15 s | 240 | 173520 | 0.87 | 87.00 | 870.00 |
+| 20 s | 180 | 130320 | 0.65 | 65.00 | 650.00 |
+| 30 s | 120 | 87120 | 0.44 | 44.00 | 440.00 |
+| 60 s | 60 | 43920 | 0.22 | 22.00 | 220.00 |
+| 120 s | 30 | 22320 | 0.11 | 11.00 | 110.00 |
+
+The `series` contribution is 720 PUT/month/writer whatever the window. Because
+number and histogram points share one metrics values dataset, a mixed metrics
+stream pays these figures once rather than twice.
+
+Three things change the picture:
+
+- Every window containing a new series adds one PUT; churn dominates at short
+  windows.
+- Logs plus metrics in one pipeline roughly doubles the total, because each
+  signal writes its own file set.
+- A file above `upload.part_bytes` becomes a multipart upload: one Create, one
+  UploadPart per part and one Complete.
+
+Request cost has a fixed part (writers times windows), which shrinks by using
+fewer, larger workers, and a variable part (total bytes divided by
+`upload.part_bytes`), which shrinks by raising `part_bytes` at the cost of
+buffer memory. Below about 15 s, files become too small for efficient row
+groups and multiply the reader's and compactor's work.
+
 ## Telemetry
 
 Every metric set is registered under the descriptor name
@@ -702,7 +767,7 @@ Labelled sets, each with one closed enumeration:
 | --- | --- | --- | --- |
 | `flush.count` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
 | `nacks` | `{request}` | `reason` | `storage`, `too_large`, `invalid`, `unsupported`, `shutdown` |
-| `rows_written`, `files_written` | `{row}`, `{file}` | `dataset` | `logs_series`, `logs_values`, `metrics_series`, `metrics_number`, `metrics_histogram` |
+| `rows_written`, `files_written` | `{row}`, `{file}` | `dataset` | `logs_series`, `logs_values`, `metrics_series`, `metrics_values` |
 | `series_emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped_unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |
 | `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |

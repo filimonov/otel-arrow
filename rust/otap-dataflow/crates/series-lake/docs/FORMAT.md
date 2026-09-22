@@ -111,14 +111,13 @@ be constant per `series_id`.
 
 ## 2. Datasets
 
-Five datasets, one Parquet schema each:
+Four datasets, one Parquet schema each:
 
 ```text
 signal=logs/dataset=series
 signal=logs/dataset=values
 signal=metrics/dataset=series
-signal=metrics/dataset=number
-signal=metrics/dataset=histogram
+signal=metrics/dataset=values
 ```
 
 Later additions (`dataset=exp_histogram`, `dataset=summary`,
@@ -184,7 +183,7 @@ attrs                    MAP<STRING, STRING>  # log attributes outside the allow
 # denormalized columns (section 3)
 ```
 
-`metrics/number`:
+`metrics/values` (number and histogram points share one schema):
 
 ```text
 metric_name           STRING               # required, dictionary encoded
@@ -195,29 +194,37 @@ start_time_unix_nano  INT64 null
 flags                 INT32
 value_int             INT64  null          # set when the point carries as_int
 value_double          DOUBLE null          # set when the point carries as_double
-# both null when the point carries no value; flags are stored as received
-# and never inferred
-# denormalized columns
-```
-
-`metrics/histogram`:
-
-```text
-metric_name           STRING               # required, dictionary encoded
-time                  TIMESTAMP(us, UTC) null
-time_unix_nano        INT64 null
-start_time            TIMESTAMP(us, UTC) null
-start_time_unix_nano  INT64 null
-flags                 INT32
-count                 INT64
+count                 INT64  null
 sum                   DOUBLE null
 min                   DOUBLE null
 max                   DOUBLE null
-bucket_counts         LIST<INT64>   # required list, non-null items
-explicit_bounds       LIST<DOUBLE>  # required list, non-null items
-# both lists are empty when the point has no distribution
+bucket_counts         LIST<INT64>  null    # non-null items
+explicit_bounds       LIST<DOUBLE> null    # non-null items
 # denormalized columns
 ```
+
+The columns are the union of the two point kinds and every per-kind column
+is nullable:
+
+- A number point fills `value_int` or `value_double` and leaves `count`,
+  `sum`, `min`, `max`, `bucket_counts` and `explicit_bounds` null. A number
+  point carrying no value at all leaves both value columns null; flags are
+  stored as received and never inferred.
+- A histogram point fills `count` and, when present, `sum`, `min` and `max`,
+  and leaves `value_int` and `value_double` null. A histogram without a
+  distribution stores two empty lists, not two null lists, so an empty list
+  and a null list distinguish "histogram without buckets" from "not a
+  histogram row".
+
+The point kind is not stored in the values row. It is `metric_type` in the
+`series` descriptor and readers obtain it through the join they already
+perform (section 6). The two kinds share one dataset because a mixed metrics
+stream would otherwise cost two PUT requests per window even when every
+descriptor is already cached; an all-null column inside a row group costs
+only definition levels plus the column-chunk metadata, far less than a
+second file's footer, metadata and request. The tradeoff is that min/max
+statistics on `value_double` become less selective when the histogram rows
+of the same file leave it null.
 
 Counts use signed 64-bit integers because Spark maps Parquet `UINT64` to
 `DECIMAL(20,0)` while DuckDB maps it to `UBIGINT`; OTLP counts never
@@ -321,6 +328,8 @@ both recipes and how to detect incompatible mixes.
 ```text
 <base>/v=1/signal=logs/dataset=values/date=2026-09-21/hour=03/
     part-20260921T031500Z-<writer_id>-<boot_id>-<seq>.parquet
+<base>/v=1/signal=metrics/dataset=values/date=2026-09-21/hour=03/
+    part-20260921T031500Z-<writer_id>-<boot_id>-<seq>.parquet
 ```
 
 - `date` and `hour` (two digits, zero-padded) come from the block's
@@ -333,10 +342,9 @@ both recipes and how to detect incompatible mixes.
   same names with the same content; `boot_id` makes collisions with other
   blocks or processes impossible in practice. No conditional-put semantics
   are used.
-- No manifest. Within a block the `series` file is written first, then the
-  values files in the fixed order `values` (logs) or `number`, `histogram`
-  (metrics). Completed objects become visible atomically per object (object
-  store semantics).
+- No manifest. Within a block, for each signal the `series` file is written
+  first, then that signal's single `values` file. Completed objects become
+  visible atomically per object (object store semantics).
 - Visibility guarantees, stated narrowly: readers may observe a block
   partially (some files present) while it is being written or after a
   permanent failure; rows of a nacked request may therefore exist in storage
@@ -384,6 +392,30 @@ SELECT * FROM read_parquet('<base>/v=1/signal=logs/dataset=series/**/*.parquet',
 QUALIFY row_number() OVER
   (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) = 1
 ```
+
+For metrics, build the same canonical view over
+`signal=metrics/dataset=series` and join the single
+`signal=metrics/dataset=values` dataset on `series_id`. The join supplies the
+point kind for number and histogram rows alike, so no union of per-kind
+datasets is needed:
+
+```sql
+WITH series AS (
+  SELECT * FROM read_parquet(
+    '<base>/v=1/signal=metrics/dataset=series/**/*.parquet',
+    hive_partitioning = true, union_by_name = true, filename = true)
+  QUALIFY row_number() OVER
+    (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) = 1
+)
+SELECT v.*, s.metric_type
+FROM read_parquet('<base>/v=1/signal=metrics/dataset=values/**/*.parquet',
+                  hive_partitioning = true, union_by_name = true) AS v
+JOIN series AS s USING (series_id)
+```
+
+Filter on `s.metric_type` to read one point kind, or on `v.count IS NOT NULL`
+to select histogram rows without the join. The Spark recipe uses the same
+paths with `mergeSchema` and the same canonical descriptor selection.
 
 The README documents this view for DuckDB and Spark. Descriptor coverage
 guarantee: for every values row in partition `P` written by worker `W`, at

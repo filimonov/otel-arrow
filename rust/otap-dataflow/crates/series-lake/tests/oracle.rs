@@ -426,7 +426,7 @@ impl MetricsHead {
     }
 }
 
-/// Every column of one `metrics_number` row.
+/// Every column a number point fills in `metrics/values`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NumberRow {
     head: MetricsHead,
@@ -435,7 +435,7 @@ struct NumberRow {
     denorm: Vec<Option<String>>,
 }
 
-/// Every column of one `metrics_histogram` row.
+/// Every column a histogram point fills in `metrics/values`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct HistogramRow {
     head: MetricsHead,
@@ -954,10 +954,25 @@ async fn number_case(
         .collect();
     let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
 
-    let values = files.get(&Dataset::MetricsNumber).expect("number file");
+    let values = files
+        .get(&Dataset::MetricsValues)
+        .expect("metrics values file");
     let mut actual: Vec<NumberRow> = Vec::new();
     for b in values {
         for row in 0..b.num_rows() {
+            for col in [
+                "count",
+                "sum",
+                "min",
+                "max",
+                "bucket_counts",
+                "explicit_bounds",
+            ] {
+                prop_assert!(
+                    b.column_by_name(col).expect("column").is_null(row),
+                    "a number row leaves {col} null in the merged dataset"
+                );
+            }
             actual.push(NumberRow {
                 head: MetricsHead::read(b, row),
                 value_int: opt_i64_at(b, "value_int", row),
@@ -1109,11 +1124,17 @@ async fn histogram_case(
     let model_series: BTreeMap<Vec<u8>, ExpectedSeries> = recs.iter().map(identity).collect();
 
     let values = files
-        .get(&Dataset::MetricsHistogram)
-        .expect("histogram file");
+        .get(&Dataset::MetricsValues)
+        .expect("metrics values file");
     let mut actual: Vec<HistogramRow> = Vec::new();
     for b in values {
         for row in 0..b.num_rows() {
+            for col in ["value_int", "value_double"] {
+                prop_assert!(
+                    b.column_by_name(col).expect("column").is_null(row),
+                    "a histogram row leaves {col} null in the merged dataset"
+                );
+            }
             actual.push(HistogramRow {
                 head: MetricsHead::read(b, row),
                 count: b

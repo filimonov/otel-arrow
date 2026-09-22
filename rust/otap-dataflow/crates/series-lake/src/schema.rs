@@ -19,20 +19,21 @@ pub enum Dataset {
     LogsValues,
     /// `signal=metrics/dataset=series`
     MetricsSeries,
-    /// `signal=metrics/dataset=number`
-    MetricsNumber,
-    /// `signal=metrics/dataset=histogram`
-    MetricsHistogram,
+    /// `signal=metrics/dataset=values`
+    ///
+    /// Number and histogram points share one schema: the per-kind columns are
+    /// nullable and the point kind is read from the series descriptor's
+    /// `metric_type` through the join readers already perform (spec 5.1).
+    MetricsValues,
 }
 
 impl Dataset {
     /// All datasets, in write order per signal (series first).
-    pub const ALL: [Dataset; 5] = [
+    pub const ALL: [Dataset; 4] = [
         Dataset::LogsSeries,
         Dataset::LogsValues,
         Dataset::MetricsSeries,
-        Dataset::MetricsNumber,
-        Dataset::MetricsHistogram,
+        Dataset::MetricsValues,
     ];
 
     /// Signal of the dataset.
@@ -49,9 +50,7 @@ impl Dataset {
     pub fn name(self) -> &'static str {
         match self {
             Dataset::LogsSeries | Dataset::MetricsSeries => "series",
-            Dataset::LogsValues => "values",
-            Dataset::MetricsNumber => "number",
-            Dataset::MetricsHistogram => "histogram",
+            Dataset::LogsValues | Dataset::MetricsValues => "values",
         }
     }
 
@@ -59,6 +58,15 @@ impl Dataset {
     #[must_use]
     pub fn is_series(self) -> bool {
         matches!(self, Dataset::LogsSeries | Dataset::MetricsSeries)
+    }
+
+    /// Values dataset of the same signal.
+    #[must_use]
+    pub fn values_of(signal: Signal) -> Dataset {
+        match signal {
+            Signal::Logs => Dataset::LogsValues,
+            Signal::Metrics => Dataset::MetricsValues,
+        }
     }
 
     /// Series dataset of the same signal.
@@ -172,7 +180,10 @@ pub fn dataset_schema(ds: Dataset, cfg: &LakeConfig) -> SchemaRef {
             Field::new("flags", DataType::Int32, false),
             Field::new("attrs", map_string_string(), false),
         ]),
-        Dataset::MetricsNumber | Dataset::MetricsHistogram => {
+        Dataset::MetricsValues => {
+            // Union of the number and histogram columns. Every per-kind column
+            // is nullable: a number point leaves the six histogram columns
+            // null, a histogram point leaves both value columns null.
             fields.extend([
                 Field::new("metric_name", DataType::Utf8, false),
                 Field::new("time", ts_us(), true),
@@ -180,30 +191,23 @@ pub fn dataset_schema(ds: Dataset, cfg: &LakeConfig) -> SchemaRef {
                 Field::new("start_time", ts_us(), true),
                 Field::new("start_time_unix_nano", DataType::Int64, true),
                 Field::new("flags", DataType::Int32, false),
+                Field::new("value_int", DataType::Int64, true),
+                Field::new("value_double", DataType::Float64, true),
+                Field::new("count", DataType::Int64, true),
+                Field::new("sum", DataType::Float64, true),
+                Field::new("min", DataType::Float64, true),
+                Field::new("max", DataType::Float64, true),
+                Field::new(
+                    "bucket_counts",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                    true,
+                ),
+                Field::new(
+                    "explicit_bounds",
+                    DataType::List(Arc::new(Field::new("item", DataType::Float64, false))),
+                    true,
+                ),
             ]);
-            if ds == Dataset::MetricsNumber {
-                fields.extend([
-                    Field::new("value_int", DataType::Int64, true),
-                    Field::new("value_double", DataType::Float64, true),
-                ]);
-            } else {
-                fields.extend([
-                    Field::new("count", DataType::Int64, false),
-                    Field::new("sum", DataType::Float64, true),
-                    Field::new("min", DataType::Float64, true),
-                    Field::new("max", DataType::Float64, true),
-                    Field::new(
-                        "bucket_counts",
-                        DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
-                        false,
-                    ),
-                    Field::new(
-                        "explicit_bounds",
-                        DataType::List(Arc::new(Field::new("item", DataType::Float64, false))),
-                        false,
-                    ),
-                ]);
-            }
         }
     }
     for d in denorm_columns(ds, cfg) {
@@ -298,7 +302,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            names(Dataset::MetricsNumber),
+            names(Dataset::MetricsValues),
             [
                 "series_id",
                 "producer_id",
@@ -309,20 +313,7 @@ mod tests {
                 "start_time_unix_nano",
                 "flags",
                 "value_int",
-                "value_double"
-            ]
-        );
-        assert_eq!(
-            names(Dataset::MetricsHistogram),
-            [
-                "series_id",
-                "producer_id",
-                "metric_name",
-                "time",
-                "time_unix_nano",
-                "start_time",
-                "start_time_unix_nano",
-                "flags",
+                "value_double",
                 "count",
                 "sum",
                 "min",
@@ -357,6 +348,37 @@ mod tests {
                 "description"
             ]
         );
+    }
+
+    /// Scenario: the merged `metrics/values` schema under the default config.
+    /// Guarantees: every column that only one point kind fills is nullable, so
+    /// a number row can leave the histogram columns null and a histogram row
+    /// can leave both value columns null in the one dataset.
+    #[test]
+    fn metrics_values_per_kind_columns_are_nullable() {
+        let cfg = LakeConfig::default();
+        let schema = dataset_schema(Dataset::MetricsValues, &cfg);
+        for name in [
+            "value_int",
+            "value_double",
+            "count",
+            "sum",
+            "min",
+            "max",
+            "bucket_counts",
+            "explicit_bounds",
+        ] {
+            let (_, f) = schema
+                .column_with_name(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(f.is_nullable(), "{name} must be nullable");
+        }
+        for name in ["series_id", "producer_id", "metric_name", "flags"] {
+            let (_, f) = schema
+                .column_with_name(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(!f.is_nullable(), "{name} must stay required");
+        }
     }
 
     /// Scenario: a resource-path and an attrs-path denormalized column for logs.

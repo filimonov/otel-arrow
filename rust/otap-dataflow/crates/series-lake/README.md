@@ -75,6 +75,12 @@ first successful seal timestamp remains fixed across flush retries.
 - One Parquet row group can start several multipart upload parts at once
   whatever `upload.concurrency` says; the burst is bounded by
   `parquet.row_group_bytes`.
+- Number and histogram points share one `metrics/values` dataset, so half the
+  rows of a mixed stream leave `value_double` null and the other half leave
+  `count`, `sum`, `min` and `max` null. Parquet min/max statistics on those
+  columns are correspondingly less selective than they were when each point
+  kind had its own file. The merge exists to keep a mixed metrics stream at
+  one PUT request per window per signal.
 - Traces are refused.
 
 ## Reading the data
@@ -119,6 +125,36 @@ latest = (series.withColumn("rn", row_number().over(
           .filter("rn = 1").drop("rn", "_file"))
 values.join(latest, "series_id").select("time", "resource_attrs", "body")
 ```
+
+Metrics read the same way, against one values dataset: number and histogram
+points share `signal=metrics/dataset=values`, and the point kind comes from
+`metric_type` in the descriptor that the join already supplies.
+
+```sql
+CREATE VIEW metrics_values AS
+  SELECT * FROM read_parquet('s3://bucket/v=1/signal=metrics/dataset=values/**/*.parquet',
+                             hive_partitioning = true, union_by_name = true);
+CREATE VIEW metrics_series AS
+  SELECT * FROM read_parquet('s3://bucket/v=1/signal=metrics/dataset=series/**/*.parquet',
+                             hive_partitioning = true, union_by_name = true,
+                             filename = true);
+CREATE VIEW metrics_series_latest AS
+  SELECT * EXCLUDE (rn, filename) FROM (
+    SELECT *, row_number() OVER
+      (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) AS rn
+    FROM metrics_series) WHERE rn = 1;
+-- gauges and counters
+SELECT v.time, s.metric_name, coalesce(v.value_double, v.value_int) AS value
+FROM metrics_values v JOIN metrics_series_latest s USING (series_id)
+WHERE s.metric_type IN ('gauge', 'sum');
+-- histograms
+SELECT v.time, s.metric_name, v.count, v.sum, v.bucket_counts, v.explicit_bounds
+FROM metrics_values v JOIN metrics_series_latest s USING (series_id)
+WHERE s.metric_type = 'histogram';
+```
+
+The per-kind columns are nullable, so `v.count IS NOT NULL` selects histogram
+rows without consulting the descriptor at all.
 
 Both recipes need `union_by_name` / `mergeSchema` because denormalized columns
 may be added over time. To detect an incompatible mix, compare the

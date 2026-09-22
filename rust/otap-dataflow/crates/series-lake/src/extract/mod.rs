@@ -307,10 +307,12 @@ pub(crate) enum Col {
     Fixed(Option<Vec<u8>>),
     /// Map<Utf8, Utf8>.
     Map(Vec<(String, Option<String>)>),
-    /// List<Int64>. Constructed by the histogram dataset.
-    ListI64(Vec<i64>),
-    /// List<Float64>. Constructed by the histogram dataset.
-    ListF64(Vec<f64>),
+    /// List<Int64>. `None` is a null list, which a number point writes into
+    /// the merged metrics values dataset.
+    ListI64(Option<Vec<i64>>),
+    /// List<Float64>. `None` is a null list, which a number point writes into
+    /// the merged metrics values dataset.
+    ListF64(Option<Vec<f64>>),
     /// Binary.
     Bytes(Vec<u8>),
 }
@@ -396,14 +398,20 @@ fn append(b: &mut AnyBuilder, c: &Col) -> Result<()> {
             }
             b.append(true)?;
         }
-        (AnyBuilder::ListI64(b), Col::ListI64(items)) => {
-            b.values().append_slice(items);
-            b.append(true);
-        }
-        (AnyBuilder::ListF64(b), Col::ListF64(items)) => {
-            b.values().append_slice(items);
-            b.append(true);
-        }
+        (AnyBuilder::ListI64(b), Col::ListI64(items)) => match items {
+            Some(items) => {
+                b.values().append_slice(items);
+                b.append(true);
+            }
+            None => b.append_null(),
+        },
+        (AnyBuilder::ListF64(b), Col::ListF64(items)) => match items {
+            Some(items) => {
+                b.values().append_slice(items);
+                b.append(true);
+            }
+            None => b.append_null(),
+        },
         (AnyBuilder::Bytes(b), Col::Bytes(v)) => b.append_value(v),
         // Denormalized columns arrive as Col::Str(None) when absent, whatever their type.
         (AnyBuilder::Int(b), Col::Str(None)) => b.append_null(),

@@ -80,6 +80,11 @@ def log_request(request_id):
     return req
 
 
+# One metric request carries one gauge point and one histogram point, and both
+# land in the single `signal=metrics/dataset=values` dataset.
+POINTS_PER_METRIC = 2
+
+
 def metric_request(request_id, unsupported=False):
     """Build an OTLP metrics request with one gauge and one histogram point.
 
@@ -347,12 +352,14 @@ class LocalSlice(unittest.TestCase):
 class MetricsSlice(unittest.TestCase):
     """Metrics admission, unsupported policy and content refusals."""
 
-    # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request.
+    # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request
+    # and land in the single merged metrics values dataset.
     # Guarantees: integer precision, histogram shape and wrapped timestamp
-    # nullability survive Parquet; and each point row joins on series_id to
+    # nullability survive Parquet; the two point kinds share one file with the
+    # other kind's columns null; and each point row joins on series_id to
     # exactly one descriptor carrying the metric name, unit, kind,
-    # temporality, scope and point attributes, so the identity split is
-    # readable back with the latest-descriptor join the README documents.
+    # temporality, scope and point attributes, so the point kind is readable
+    # back through the latest-descriptor join the README documents.
     def test_number_and_histogram(self):
         with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
             try:
@@ -360,24 +367,38 @@ class MetricsSlice(unittest.TestCase):
                     metric_request("metric-0"), timeout=20
                 )
                 with duckdb.connect() as db:
-                    number = str(
-                        engine.data / "v=1/signal=metrics/dataset=number/**/*.parquet"
+                    values = str(
+                        engine.data / "v=1/signal=metrics/dataset=values/**/*.parquet"
+                    )
+                    # Both kinds share one file: exactly one values file exists.
+                    self.assertEqual(
+                        len(
+                            list(
+                                engine.data.glob(
+                                    "v=1/signal=metrics/dataset=values/**/*.parquet"
+                                )
+                            )
+                        ),
+                        1,
                     )
                     rows = db.execute(
-                        "SELECT value_int, time_unix_nano FROM read_parquet(?)",
-                        [number],
+                        "SELECT value_int, time_unix_nano, count, sum, min, max, "
+                        "bucket_counts, explicit_bounds FROM read_parquet(?) "
+                        "WHERE value_int IS NOT NULL",
+                        [values],
                     ).fetchall()
-                    self.assertEqual(rows, [(2**63 - 1, None)])
-                    histogram = str(
-                        engine.data
-                        / "v=1/signal=metrics/dataset=histogram/**/*.parquet"
+                    # The number row leaves every histogram column null.
+                    self.assertEqual(
+                        rows, [(2**63 - 1, None, None, None, None, None, None, None)]
                     )
                     rows = db.execute(
-                        "SELECT count, bucket_counts, explicit_bounds "
-                        "FROM read_parquet(?)",
-                        [histogram],
+                        "SELECT count, bucket_counts, explicit_bounds, "
+                        "value_int, value_double "
+                        "FROM read_parquet(?) WHERE count IS NOT NULL",
+                        [values],
                     ).fetchall()
-                    self.assertEqual(rows, [(3, [1, 2], [1.0])])
+                    # The histogram row leaves both value columns null.
+                    self.assertEqual(rows, [(3, [1, 2], [1.0], None, None)])
                     # One descriptor per series: the newest wins, ties broken
                     # by filename, exactly as the crate README prescribes.
                     series = str(
@@ -392,18 +413,14 @@ class MetricsSlice(unittest.TestCase):
                         f"AS rn FROM read_parquet('{series}', "
                         "union_by_name = true, filename = true)) WHERE rn = 1"
                     )
+                    # The point kind comes from the descriptor, not the row.
                     joined = db.execute(
                         "SELECT s.metric_name, s.unit, s.metric_type, "
                         "s.temporality, s.scope_name, s.attrs['request.id'], "
                         "v.producer_id "
                         "FROM read_parquet(?) v JOIN latest s USING (series_id) "
-                        "UNION ALL "
-                        "SELECT s.metric_name, s.unit, s.metric_type, "
-                        "s.temporality, s.scope_name, s.attrs['request.id'], "
-                        "h.producer_id "
-                        "FROM read_parquet(?) h JOIN latest s USING (series_id) "
                         "ORDER BY 1",
-                        [number, histogram],
+                        [values],
                     ).fetchall()
                 self.assertEqual(
                     joined,
@@ -455,7 +472,7 @@ class MetricsSlice(unittest.TestCase):
                             self.assertTrue(
                                 list(
                                     engine.data.glob(
-                                        "v=1/signal=metrics/dataset=number/"
+                                        "v=1/signal=metrics/dataset=values/"
                                         "**/*.parquet"
                                     )
                                 )
@@ -807,18 +824,29 @@ def require_clickhouse():
     return None
 
 
+# The per-attempt client timeout the tests give Alloy. The shipped config
+# resolves to 180s, which is sized for a 15s production window and a 60s flush
+# deadline; these tests run a one-second window and want an expired attempt to
+# be visible inside their own waits, so they set the value explicitly through
+# `SERIES_ALLOY_TIMEOUT` rather than inheriting whatever the config ships.
+ALLOY_ATTEMPT_TIMEOUT = "6s"
+
+
 class AlloyProducer:
     """Grafana Alloy tailing a file into the engine's OTLP gRPC receiver.
 
     The container runs on the host network so that it can reach a receiver
     bound to loopback, and the reference River config the repository ships is
     the one it runs: the test exercises the documented deployment rather than
-    a fixture of its own.
+    a fixture of its own. Only the attempt timeout is overridden, through the
+    `SERIES_ALLOY_TIMEOUT` variable the config itself reads, so that the test
+    owns the one value its own timing depends on.
     """
 
-    def __init__(self, directory, engine):
+    def __init__(self, directory, engine, timeout=ALLOY_ATTEMPT_TIMEOUT):
         self.root = Path(directory) / "alloy"
         self.engine = engine
+        self.timeout = timeout
         self.name = "series-alloy-" + uuid.uuid4().hex
         self.container = None
 
@@ -837,6 +865,7 @@ class AlloyProducer:
             "--network", "host", "--user", f"{os.getuid()}:{os.getgid()}",
             "--mount", f"type=bind,src={self.root.resolve()},dst=/input,readonly",
             "-e", f"OTLP_ENDPOINT=127.0.0.1:{self.engine.grpc_port}",
+            "-e", f"SERIES_ALLOY_TIMEOUT={self.timeout}",
             image, "run", "--storage.path=/tmp/alloy-state",
             f"--server.http.listen-addr=127.0.0.1:{port}", "/input/config.alloy",
         ]
@@ -1042,15 +1071,13 @@ REQUIRED_COLUMNS = {
         "observed_time_unix_nano", "severity_number", "severity_text", "body",
         "event_name", "trace_id", "span_id", "flags", "attrs", "service_name",
     },
-    ("metrics", "number"): {
+    # One merged metrics values dataset: the union of the number and the
+    # histogram columns, each kind leaving the other's columns null.
+    ("metrics", "values"): {
         "series_id", "producer_id", "metric_name", "time", "time_unix_nano",
         "start_time", "start_time_unix_nano", "flags", "value_int",
-        "value_double", "service_name",
-    },
-    ("metrics", "histogram"): {
-        "series_id", "producer_id", "metric_name", "time", "time_unix_nano",
-        "start_time", "start_time_unix_nano", "flags", "count", "sum", "min",
-        "max", "bucket_counts", "explicit_bounds", "service_name",
+        "value_double", "count", "sum", "min", "max", "bucket_counts",
+        "explicit_bounds", "service_name",
     },
     ("logs", "series"): {
         "series_id", "identity_bytes", "emitted_at", "resource_schema_url",
@@ -1075,6 +1102,14 @@ def canonical_column(kind, column):
     decimals: the two engines print floating point differently, and both read
     the same Parquet bytes, so the comparison is exact down to the sign of a
     zero.
+
+    List columns are the one place the two readers cannot be made to agree:
+    ClickHouse has no nullable Array, so it reads a null Parquet list as an
+    empty array while DuckDB keeps it NULL. Both renderings therefore collapse
+    a null list and an empty list to the empty string. The distinction that
+    loses -- a number row's null `bucket_counts` against a distribution-less
+    histogram's empty one -- is asserted directly against the files in
+    `verify_files` and in `MetricsSlice.test_number_and_histogram`.
     """
     if kind == "VARCHAR":
         return f"coalesce({column}, 'null')", f"ifNull({column}, 'null')"
@@ -1114,17 +1149,17 @@ def canonical_column(kind, column):
     if kind in ("BIGINT[]", "INTEGER[]"):
         return (
             f"coalesce(array_to_string(list_transform({column}, "
-            "x -> coalesce(CAST(x AS VARCHAR), 'null')), ','), 'null')",
+            "x -> coalesce(CAST(x AS VARCHAR), 'null')), ','), '')",
             f"ifNull(arrayStringConcat(arrayMap(x -> ifNull(toString(x), 'null'), "
-            f"{column}), ','), 'null')",
+            f"{column}), ','), '')",
         )
     if kind == "DOUBLE[]":
         return (
             f"coalesce(array_to_string(list_transform({column}, "
-            "x -> coalesce(CAST(CAST(x AS BIT) AS VARCHAR), 'null')), ','), 'null')",
+            "x -> coalesce(CAST(CAST(x AS BIT) AS VARCHAR), 'null')), ','), '')",
             "ifNull(arrayStringConcat(arrayMap(x -> if(isNull(x), 'null', "
             f"bin(reverse(reinterpretAsFixedString(assumeNotNull(x))))), {column}), "
-            "','), 'null')",
+            "','), '')",
         )
     raise AssertionError(f"no canonical rendering for {kind} column {column}")
 
@@ -1177,14 +1212,14 @@ def verify_readers(
     alloy_ids = set(alloy_ids)
     producer = alloy_producer_id()
     with duckdb.connect() as db, clickhouse_reader(root) as clickhouse:
-        for signal, dataset in (
-            ("logs", "values"),
-            ("metrics", "number"),
-            ("metrics", "histogram"),
-        ):
+        for signal, dataset in (("logs", "values"), ("metrics", "values")):
             relative = f"v=1/signal={signal}/dataset={dataset}/**/*.parquet"
             paths = sorted(root.glob(relative))
-            expected_count = len(log_ids) if signal == "logs" else metric_count
+            # Every metric request carries one number and one histogram point,
+            # and both now land in the same values dataset.
+            expected_count = (
+                len(log_ids) if signal == "logs" else POINTS_PER_METRIC * metric_count
+            )
             if not paths:
                 test.assertEqual(expected_count, 0, f"missing {signal}/{dataset}")
                 continue
@@ -1443,7 +1478,7 @@ class DockerStore:
 # boot id and sequence have fixed shapes, so the split stays unambiguous.
 PART_NAME = re.compile(
     r"^v=1/signal=(?P<signal>logs|metrics)"
-    r"/dataset=(?P<dataset>series|values|number|histogram)"
+    r"/dataset=(?P<dataset>series|values)"
     r"/date=(?P<date>\d{4}-\d{2}-\d{2})/hour=(?P<hour>\d{2})"
     r"/part-(?P<stamp>\d{8}T\d{6}Z)-(?P<writer>.+)"
     r"-(?P<boot>[0-9a-f]{32})-(?P<seq>\d{8,})\.parquet$"
@@ -1488,7 +1523,7 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
     coverage = set()
     values = []
     bodies = []
-    counts = {"number": 0, "histogram": 0}
+    metric_rows = 0
     with duckdb.connect() as db:
         for path in files:
             partitions = dict(
@@ -1538,7 +1573,7 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                         ),
                     )
                 values.extend((signal, partition, worker, row[0]) for row in keys)
-                if dataset == "values":
+                if signal == "logs":
                     bodies.extend(
                         row[0]
                         for row in db.execute(
@@ -1546,22 +1581,45 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                         ).fetchall()
                     )
                 else:
-                    counts[dataset] += len(keys)
+                    metric_rows += len(keys)
+                    # Each row fills one point kind's columns and leaves the
+                    # other kind's null, and no row fills both.
+                    mixed = db.execute(
+                        "SELECT count(*) FROM read_parquet(?) WHERE "
+                        "(value_int IS NOT NULL OR value_double IS NOT NULL) "
+                        "AND count IS NOT NULL",
+                        [str(path)],
+                    ).fetchone()[0]
+                    test.assertEqual(
+                        mixed, 0, "a values row carries both point kinds"
+                    )
+                    # A null list means "not a histogram row"; a histogram
+                    # without a distribution stores an empty list instead.
+                    # The two readers cannot tell these apart, so the
+                    # invariant is checked here, against the file itself.
+                    inconsistent = db.execute(
+                        "SELECT count(*) FROM read_parquet(?) WHERE "
+                        "(bucket_counts IS NULL) <> (count IS NULL) OR "
+                        "(explicit_bounds IS NULL) <> (count IS NULL)",
+                        [str(path)],
+                    ).fetchone()[0]
+                    test.assertEqual(
+                        inconsistent,
+                        0,
+                        "list nullability must follow the point kind",
+                    )
         test.assertTrue(
             set(values).issubset(coverage),
             "descriptor coverage per partition and worker",
         )
         test.assertTrue(set(log_ids).issubset(set(bodies)))
+        expected_metric_rows = POINTS_PER_METRIC * metric_count
         if not allow_duplicates:
             test.assertEqual(sorted(bodies), sorted(log_ids))
-            test.assertEqual(counts, {"number": metric_count, "histogram": metric_count})
+            test.assertEqual(metric_rows, expected_metric_rows)
         else:
-            test.assertGreaterEqual(counts["number"], metric_count)
-            test.assertGreaterEqual(counts["histogram"], metric_count)
-        for signal, datasets in (
-            ("logs", ("values",)),
-            ("metrics", ("number", "histogram")),
-        ):
+            test.assertGreaterEqual(metric_rows, expected_metric_rows)
+        for signal, datasets in (("logs", ("values",)), ("metrics", ("values",))):
             series = [
                 str(p)
                 for p in files
@@ -2184,17 +2242,16 @@ def stored_multiplicity(root):
                 "DESC, filename DESC)=1",
                 [[str(path) for path in series]],
             )
-        for dataset in ("number", "histogram"):
-            counts[dataset] = tally(
-                sorted(
-                    (root / f"v=1/signal=metrics/dataset={dataset}").rglob(
-                        "*.parquet"
-                    )
-                ),
-                "SELECT s.attrs['request.id'], count(*) FROM "
-                "read_parquet(?, union_by_name=true) v JOIN canonical s "
-                "USING(series_id) GROUP BY 1",
-            )
+        # One merged values dataset, so one tally: an id that was stored once
+        # contributes POINTS_PER_METRIC rows here.
+        counts["metrics"] = tally(
+            sorted(
+                (root / "v=1/signal=metrics/dataset=values").rglob("*.parquet")
+            ),
+            "SELECT s.attrs['request.id'], count(*) FROM "
+            "read_parquet(?, union_by_name=true) v JOIN canonical s "
+            "USING(series_id) GROUP BY 1",
+        )
     return counts
 
 
@@ -2505,10 +2562,11 @@ class OutageSlice(unittest.TestCase):
                         "Alloy never attempted an export while the store was "
                         "stopped:\n" + alloy.logs(),
                     )
-                    # Alloy's own client deadline is 6s, so a refusal it was
-                    # still waiting for shows up as its deadline rather than
-                    # as a status. Those prove the attempt just as well; the
-                    # statuses the engine did return must all be UNAVAILABLE.
+                    # Alloy's own client deadline is ALLOY_ATTEMPT_TIMEOUT,
+                    # which this test sets, so a refusal it was still waiting
+                    # for shows up as its deadline rather than as a status.
+                    # Those prove the attempt just as well; the statuses the
+                    # engine did return must all be UNAVAILABLE.
                     alloy_deadlines = [
                         line
                         for line in alloy_failures
@@ -2684,24 +2742,25 @@ class OutageSlice(unittest.TestCase):
                 "filename DESC)=1",
                 [series],
             )
-            for dataset in ("number", "histogram"):
-                path = str(
-                    downloaded / f"v=1/signal=metrics/dataset={dataset}/**/*.parquet"
-                )
-                stored = [
-                    row[0]
-                    for row in db.execute(
-                        "SELECT s.attrs['request.id'] FROM read_parquet(?) v "
-                        "JOIN series s USING(series_id)",
-                        [path],
-                    ).fetchall()
-                ]
-                self.assertEqual(
-                    set(stored),
-                    expected_metric_ids,
-                    f"missing precomputed {dataset} IDs",
-                )
-                duplicates[dataset] = len(stored) - len(expected_metric_ids)
+            path = str(downloaded / "v=1/signal=metrics/dataset=values/**/*.parquet")
+            stored = [
+                row[0]
+                for row in db.execute(
+                    "SELECT s.attrs['request.id'] FROM read_parquet(?) v "
+                    "JOIN series s USING(series_id)",
+                    [path],
+                ).fetchall()
+            ]
+            self.assertEqual(
+                set(stored),
+                expected_metric_ids,
+                "missing precomputed metric IDs",
+            )
+            # Each stored request id accounts for POINTS_PER_METRIC rows, so
+            # only rows beyond that are duplicates.
+            duplicates["metrics"] = len(stored) - POINTS_PER_METRIC * len(
+                expected_metric_ids
+            )
         forced = {}
         if resend:
             after_counts = stored_multiplicity(downloaded)
@@ -2723,7 +2782,11 @@ class OutageSlice(unittest.TestCase):
                             f"replayed {request_id} was not stored again in "
                             f"{dataset}",
                         )
-                        self.assertGreaterEqual(count, 2, f"{dataset} {request_id}")
+                        self.assertGreaterEqual(
+                            count,
+                            2 if dataset == "logs" else 2 * POINTS_PER_METRIC,
+                            f"{dataset} {request_id}",
+                        )
                     else:
                         self.assertEqual(
                             count,
