@@ -967,32 +967,35 @@ impl Worker {
 
     /// Decide everything still owned, once the shutdown deadline has elapsed.
     ///
-    /// Every completion is decided and delivered first, without blocking: a
-    /// completion the engine cannot take immediately is counted as a delivery
-    /// failure and released, so no request is left undecided whatever the
-    /// destination is doing.
+    /// The whole decision is taken and delivered before anything is cancelled,
+    /// and it is taken without a single await: the parked write cannot run
+    /// between the two halves, so no completion can be waiting behind the
+    /// unwinding of the write it belongs to. A completion the engine cannot
+    /// take immediately is counted as a delivery failure and released, so no
+    /// request is left undecided whatever the destination is doing.
     ///
-    /// Only then are the two slot holders released. Both are cancelled and
-    /// then awaited within one shared `upload.abort_timeout`, because a task
-    /// that is still unwinding owns the block, the sink handle and possibly a
-    /// multipart abort in flight; returning while it does would leave that
-    /// abort to be cancelled by runtime teardown and the upload to be reclaimed
-    /// by the bucket's lifecycle rule instead. The wait is bounded and ends in
-    /// an abort that is itself awaited, so a destination that never answers
-    /// cannot hold the node open: this costs at most one abort timeout beyond
-    /// the shutdown deadline, and it buys the abort actually being attempted.
+    /// Only then are the two slot holders cancelled and released. Both are
+    /// awaited within one shared `upload.abort_timeout`, because a task that is
+    /// still unwinding owns the block, the sink handle and possibly a multipart
+    /// abort in flight; returning while it does would leave that abort to be
+    /// cancelled by runtime teardown and the upload to be reclaimed by the
+    /// bucket's lifecycle rule instead. The wait is bounded and ends in an
+    /// abort that is itself awaited, so a destination that never answers cannot
+    /// hold the node open: this costs at most one abort timeout beyond the
+    /// shutdown deadline, and it buys the abort actually being attempted.
     pub(super) async fn abandon(&mut self) {
+        // Phase one: decide and deliver. Nothing here awaits, and nothing here
+        // cancels.
         if let Some(pending) = self.pending.take() {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
         let mut flushing = self.flushing.take();
         if let Some(job) = &mut flushing {
-            job.cancel.cancel();
             // Reported exactly as the `Error::Cancelled` completion branch
-            // reports it: the write did not put its block in object storage,
-            // and the reason it did not is that it was cancelled. Deciding the
-            // block here instead of awaiting its result must not make that
-            // flush vanish from the counters.
+            // reports it: the write will not put its block in object storage,
+            // and the reason it will not is that it is about to be cancelled.
+            // Deciding the block here instead of awaiting its result must not
+            // make that flush vanish from the counters.
             if let Some(metrics) = &mut self.metrics {
                 metrics.worker.flush_duration.record(
                     clock::now()
@@ -1011,8 +1014,8 @@ impl Worker {
         let mut cleaning = self.cleaning.take();
         self.fail_active(Outcome::Shutdown);
         self.notify.drain_now();
-        // One shared bound for both holders, so a node with a write and a
-        // cleanup outstanding does not wait twice.
+        // Phase two: cancel and release, with one shared bound so a node
+        // holding a write and a cleanup does not wait twice.
         let deadline = flush::deadline_at(clock::now(), self.cfg.lake.upload.abort_timeout);
         if let Some(job) = &mut flushing {
             job.shutdown(deadline).await;

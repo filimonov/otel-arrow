@@ -3036,20 +3036,46 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
             .await;
             worker.shutdown(clock::now());
 
+            let cancel = worker
+                .flushing
+                .as_ref()
+                .expect("a rotated block is flushing")
+                .cancel
+                .clone();
+            assert!(
+                !cancel.is_cancelled(),
+                "nothing is cancelled before the decision is taken"
+            );
+
             {
                 let mut abandoning = std::pin::pin!(worker.abandon());
                 assert!(
                     futures::poll!(&mut abandoning).is_pending(),
                     "a wedged upload is not released in one turn"
                 );
-                // The decision is already out: nothing a producer waits for is
-                // behind the release of the task.
-                match rx.recv().await.expect("a shutdown refusal") {
-                    PipelineCompletionMsg::DeliverNack { nack } => {
+                // No runtime turn has elapsed since that poll, so both of the
+                // next two assertions describe the state at the moment the
+                // decision phase suspended. The completion is already in the
+                // channel, and the write has not yet been able to observe the
+                // cancellation, whose store-visible effect is the abort.
+                assert_eq!(
+                    store.aborts.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "the write is cancelled only after the decision is delivered"
+                );
+                let delivered = futures::poll!(std::pin::pin!(rx.recv()));
+                match delivered {
+                    std::task::Poll::Ready(Ok(PipelineCompletionMsg::DeliverNack { nack })) => {
                         assert_eq!(nack.cause, NackCause::NodeShutdown);
                     }
-                    other => panic!("expected a nack, got {other:?}"),
+                    other => panic!("expected a delivered nack, got {other:?}"),
                 }
+                // The cancellation belongs to the same turn as the delivery it
+                // follows, so it is never deferred past the bounded wait.
+                assert!(
+                    cancel.is_cancelled(),
+                    "the write is cancelled in the turn that decided it"
+                );
                 for _ in 0..64 {
                     tokio::task::yield_now().await;
                     assert!(
