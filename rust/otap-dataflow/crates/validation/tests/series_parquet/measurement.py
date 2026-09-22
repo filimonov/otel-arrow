@@ -13,6 +13,7 @@ Nothing here starts an engine, a container or a build. The real end-to-end
 helpers live in `test_e2e.py` and are extended, never duplicated.
 """
 import collections
+import concurrent.futures
 import dataclasses
 import datetime
 import fcntl
@@ -36,8 +37,10 @@ import uuid
 import duckdb
 
 try:  # Imported as a package module by `python3 -m crates...`.
+    from . import host_monitor
     from . import test_e2e
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
+    import host_monitor
     import test_e2e
 
 # The one JSON shape every run file, index and baseline declares.
@@ -135,11 +138,13 @@ EXPORTER_EMPTY_GAUGES = (
     "notify.queued",
 )
 
-# The buffered topology's additional emptiness evidence. Task 2 introduces
-# the topology; the drain proof already knows what it has to see.
+# The buffered topology's additional emptiness evidence, named as a running
+# buffer publishes it. `items.queued` is partitioned by signal, so its value
+# for one buffer instance is the sum over that instance's signal labels;
+# `in.flight` is a single gauge.
 BUFFER_EMPTY_GAUGES = (
     ("processor.durable_buffer.items", "queued"),
-    ("processor.durable_buffer", "in_flight"),
+    ("processor.durable_buffer", "in.flight"),
 )
 
 # How many advances of every worker's collection-updated uptime the drain
@@ -159,7 +164,7 @@ SAFE_JSON_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
 
 # Commands whose presence means somebody is compiling or building an image
 # while a measurement runs.
-BUILD_COMMANDS = ("cargo", "rustc", "cc1", "cc1plus", "ld", "buildkitd", "buildx")
+BUILD_COMMANDS = ("cargo", "rustc", "cc1", "cc1plus", "ld", "buildx")
 
 
 def utc_now():
@@ -679,7 +684,11 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(str(self.path), isolation_level=None)
+        # Producer threads record their own attempts. Every use of the
+        # connection holds `self.lock`, so sharing it across threads is safe.
+        self.connection = sqlite3.connect(
+            str(self.path), isolation_level=None, check_same_thread=False
+        )
         self.lock = threading.Lock()
         with self.lock:
             cursor = self.connection.cursor()
@@ -892,19 +901,9 @@ def core_topology() -> dict:
     }
 
 
-def parse_core_list(text: str):
-    """Expand a kernel core list such as `0-3,8` into explicit ids."""
-    cores = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            low, high = part.split("-", 1)
-            cores.extend(range(int(low), int(high) + 1))
-        else:
-            cores.append(int(part))
-    return sorted(cores)
+# Kernel core lists are parsed by the monitor's own function, so the
+# in-process checks and the monitor process read them identically.
+parse_core_list = host_monitor.parse_core_list
 
 
 def available_physical_cores(sibling_groups, available) -> int:
@@ -968,6 +967,7 @@ def thread_affinity(pid, role, expected_cores):
                     "tid": tid,
                     "role": role,
                     "name": None,
+                    "nspid": None,
                     "cpus_allowed_list": None,
                     "last_cpu": None,
                     "expected_cores": list(expected_cores or []),
@@ -982,6 +982,9 @@ def thread_affinity(pid, role, expected_cores):
                 "tid": tid,
                 "role": role,
                 "name": fields.get("Name"),
+                # The PID in each nested namespace, outermost first: a
+                # container launcher's engine has a host PID and its own.
+                "nspid": fields.get("NSpid"),
                 "cpus_allowed_list": fields.get("Cpus_allowed_list"),
                 "last_cpu": thread_last_cpu(pid, tid),
                 "expected_cores": list(expected_cores or []),
@@ -1083,6 +1086,11 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
     each worker is compared with its own core, never with the process-wide
     list.
     """
+    if hasattr(roles, "pid") and hasattr(roles, "launcher"):
+        # An engine stands for its own role, on its requested cores.
+        roles = {"engine": (roles.pid, list(roles.cores or ()))}
+    elif roles is None:
+        roles = {"harness": os.getpid()}
     topology = core_topology()
     # The effective affinity of this process already reflects its cgroup
     # cpuset, so it is the set of cores a run started from here may use.
@@ -1159,20 +1167,143 @@ def assert_affinity(snapshot) -> None:
             f"workers run on cores {snapshot.get('worker_cores')}, the run "
             f"requested {snapshot['requested_cores']}"
         )
-    mismatched = []
-    for thread in snapshot.get("worker_threads", []):
-        expected = sorted(thread["expected_cores"])
-        observed = thread["cpus_allowed_list"]
-        if observed is None or parse_core_list(observed) != expected:
-            mismatched.append(
-                {
-                    "tid": thread["tid"],
-                    "expected_cores": expected,
-                    "cpus_allowed_list": observed,
-                }
+    threads = snapshot.get("worker_threads", [])
+    if "worker_cores" in snapshot and len(threads) != len(snapshot["worker_cores"]):
+        raise AssertionError(
+            f"worker affinity mismatch: {len(threads)} worker threads mapped "
+            f"for {len(snapshot['worker_cores'])} workers"
+        )
+    observed = {
+        thread["tid"]: (
+            None
+            if thread["cpus_allowed_list"] is None
+            else set(parse_core_list(thread["cpus_allowed_list"]))
+        )
+        for thread in threads
+    }
+    expected = {thread["tid"]: set(thread["expected_cores"]) for thread in threads}
+    try:
+        check_worker_affinity(observed, expected)
+    except AssertionError as error:
+        raise AssertionError(f"worker affinity mismatch: {error}")
+
+
+# The one per-worker affinity rule. The monitor process applies it on every
+# tick and the snapshots apply it at each edge.
+check_worker_affinity = host_monitor.check_worker_affinity
+
+
+def worker_tids(snapshot) -> dict:
+    """Each mapped worker's TID and the one core it must be allowed."""
+    return {
+        thread["tid"]: set(thread["expected_cores"])
+        for thread in snapshot.get("worker_threads", [])
+    }
+
+
+observed_affinity = host_monitor.observed_affinity
+
+
+# How many physical cores each role of a publishable measurement may use.
+# The engine owns up to four; a one-worker run still reserves the other
+# three, so nothing else is placed where a larger run would put a worker.
+ENGINE_RESERVED_CORES = 4
+ROLE_CORES = (("producer", 2), ("store", 1), ("reader", 1))
+
+
+def role_allocation(sibling_groups, available, engine_cores, *, strict=True) -> dict:
+    """Place every role on its own physical cores, SMT siblings excluded.
+
+    The controller runs its own observability pipeline on the first core
+    the engine may use, so that physical core is never a worker's. The
+    engine's workers take `engine_cores`, the rest of its four-core
+    reservation follows, and then the producer, store and reader each take
+    whole physical cores of their own. A role is given the lowest logical
+    core of each physical core it owns; the siblings of every owned core are
+    given to nobody. Anything that cannot be placed this way is an error, so
+    a run never silently shares a core between roles.
+
+    `strict=False` is for a host too small to publish on: a role that finds
+    no free physical core gets fewer, possibly none, and runs unpinned. Such
+    a run fails `physical_cores_sufficient` and can never be a baseline.
+    """
+    allowed = sorted(set(int(core) for core in available))
+    if not allowed:
+        raise AssertionError("no cores are available to this run")
+    group_of = {}
+    for group in sibling_groups:
+        for core in group:
+            group_of[int(core)] = tuple(sorted(int(item) for item in group))
+    observability = allowed[0]
+    taken = {group_of.get(observability, (observability,))}
+    allocation = {"engine_observability": [observability]}
+    engine_cores = [int(core) for core in engine_cores]
+    if len(engine_cores) > ENGINE_RESERVED_CORES:
+        raise AssertionError(
+            f"{len(engine_cores)} engine workers exceed the "
+            f"{ENGINE_RESERVED_CORES}-core engine reservation"
+        )
+    for core in engine_cores:
+        group = group_of.get(core, (core,))
+        if core not in allowed:
+            raise AssertionError(f"engine core {core} is not available to this run")
+        if group in taken:
+            raise AssertionError(
+                f"engine core {core} shares physical core {list(group)} with "
+                f"another role"
             )
-    if mismatched:
-        raise AssertionError(f"worker affinity mismatch: {mismatched}")
+        taken.add(group)
+    allocation["engine"] = sorted(engine_cores)
+    free = [
+        group
+        for group in sorted({group_of.get(core, (core,)) for core in allowed})
+        if group not in taken and group[0] in allowed
+    ]
+
+    def claim(count, role):
+        """Give `role` the lowest logical core of `count` free physical cores."""
+        if len(free) < count and not strict:
+            count = len(free)
+        if len(free) < count:
+            raise AssertionError(
+                f"no physical core is left for {role}: the run needs one "
+                f"physical core per role and SMT siblings are never shared"
+            )
+        owned = [free.pop(0) for _ in range(count)]
+        allocation[role] = sorted(
+            min(core for core in group if core in allowed) for group in owned
+        )
+
+    reserved = ENGINE_RESERVED_CORES - len(engine_cores)
+    if reserved:
+        claim(reserved, "engine_reserved")
+    for role, count in ROLE_CORES:
+        claim(count, role)
+    return allocation
+
+
+def run_pinned(cores, function, *args, **kwargs):
+    """Run `function` in a thread confined to `cores` and return its result.
+
+    Only that thread and the threads it starts inherit the confinement, so
+    the harness's own view of the cores available to the run is unchanged.
+    """
+    outcome = {}
+
+    def body():
+        """Pin, then call."""
+        try:
+            os.sched_setaffinity(0, set(cores))
+            outcome["value"] = function(*args, **kwargs)
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=body, name="pinned-role")
+    thread.start()
+    thread.join()
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
 
 
 def environment_match(start, end) -> dict:
@@ -1181,6 +1312,8 @@ def environment_match(start, end) -> dict:
         "cpu_model",
         "logical_core_count",
         "physical_core_count",
+        "sibling_groups",
+        "available_cores",
         "ram_bytes",
         "kernel",
     )
@@ -1195,79 +1328,229 @@ def environment_match(start, end) -> dict:
 class BuildMonitor:
     """Watch for a compiler or image build running beside a measurement.
 
+    The watching runs in `host_monitor.py`, a separate process with no
+    dependencies, so that a harness busy producing load cannot stretch the
+    time between two observations. Every tick reads the comm, parent and
+    start time of every process in `proc_root`, and the command line of any
+    candidate. A compiler, linker or container build client is a build. A
+    build daemon such as `buildkitd` is not a build while it is idle -- a
+    builder container may stay up for days -- but any process descending
+    from it is a build step. Detection is sticky: a build seen after
+    preflight invalidates the run even if it has finished by the end.
+
+    Ticks are scheduled from their own start times, at most `interval_s`
+    apart; the largest gap actually observed is reported, because a gap is a
+    window in which a build could have run unobserved. Worker threads
+    registered with `watch` are checked against their expected affinity on
+    every tick as well. At stop, Docker's own event log for the run interval
+    is read for builder containers that started while the run was going.
+
     The monitor never stops or signals anything: another user's build is
     their business, and the only consequence here is that this run's
     performance numbers are invalid. Evidence of what was seen is preserved.
     """
 
-    def __init__(self, *, interval_s=1.0, own_pids=()):
+    # The coverage a publishable run needs: no two ticks further apart.
+    COVERAGE_LIMIT_S = 0.1
+
+    def __init__(self, *, interval_s=0.05, own_pids=(), proc_root="/proc",
+                 docker=None):
         self.interval_s = interval_s
         self.own_pids = set(own_pids)
+        self.proc_root = Path(proc_root)
+        self.docker = docker
         self.observations = []
         self.scans = 0
-        self._stop = threading.Event()
-        self._thread = None
+        self.affinity_failures = []
+        self.docker_report = {}
+        self.visibility = {}
+        self.invalid = threading.Event()
+        self.started_unix = None
+        self.child = None
+        self.final = None
+        self._reader = None
+        self._started = threading.Event()
+        self._done = threading.Event()
+        self._acknowledged = threading.Event()
         self._lock = threading.Lock()
 
+    def rules(self) -> dict:
+        """The detection rules, read when used so that tests may patch them."""
+        return {
+            "build_commands": list(BUILD_COMMANDS),
+            "build_daemons": list(BUILD_DAEMONS),
+            "container_clients": list(DOCKER_CLIENTS),
+        }
+
     def scan(self):
-        """One pass over procfs, returning the build processes found."""
-        found = []
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid in self.own_pids or pid == os.getpid():
-                continue
-            try:
-                comm = (entry / "comm").read_text().strip()
-                cmdline = (entry / "cmdline").read_bytes().decode(
-                    "ascii", "replace"
-                ).replace("\x00", " ").strip()
-            except OSError:
-                continue
-            if comm in BUILD_COMMANDS or _is_docker_build(cmdline):
-                found.append(
-                    {
-                        "pid": pid,
-                        "comm": comm,
-                        "cmdline": cmdline[:200],
-                        "observed_utc": utc_now(),
-                    }
-                )
+        """One in-process pass over procfs with the monitor's own rules."""
+        found = host_monitor.scan(
+            self.proc_root, self.rules(), self.own_pids | {os.getpid()}
+        )
         with self._lock:
             self.scans += 1
             self.observations.extend(found)
+        if found:
+            self.invalid.set()
         return found
 
-    def _run(self):
-        """Scan on the configured interval until asked to stop."""
-        while not self._stop.is_set():
-            _ = self.scan()
-            _ = self._stop.wait(self.interval_s)
+    def _send(self, message):
+        """Write one command to the monitor process."""
+        if self.child is None or self.child.poll() is not None:
+            raise AssertionError("the monitor process is not running")
+        self.child.stdin.write(json.dumps(message, sort_keys=True) + "\n")
+        self.child.stdin.flush()
+
+    def _read(self):
+        """Collect the monitor process's lines until it ends."""
+        for line in self.child.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            kind = message.get("type")
+            if kind == "started":
+                self._started.set()
+            elif kind == "build":
+                with self._lock:
+                    self.observations.append(message["entry"])
+                self.invalid.set()
+            elif kind == "affinity":
+                with self._lock:
+                    self.affinity_failures.append(message["entry"])
+                self.invalid.set()
+            elif kind in ("watching", "unwatched"):
+                self._acknowledged.set()
+            elif kind == "report":
+                self.final = message
+        self._started.set()
+        self._acknowledged.set()
+        self._done.set()
+
+    def _command(self, message):
+        """Send one command and wait until the monitor has applied it.
+
+        The monitor applies commands between ticks, so once this returns no
+        later tick uses the old watch set: a worker that is about to be shut
+        down deliberately is never observed missing.
+        """
+        self._acknowledged.clear()
+        self._send(message)
+        if not self._acknowledged.wait(30):
+            raise AssertionError(f"the monitor did not apply {message['cmd']}")
+
+    def watch(self, pid, expected):
+        """Check `expected` ({tid: cores}) of process `pid` on every tick."""
+        self._command(
+            {
+                "cmd": "watch",
+                "pid": int(pid),
+                "expected": {str(tid): sorted(cores) for tid, cores in expected.items()},
+            }
+        )
+
+    def unwatch(self):
+        """Stop checking worker affinity, before a deliberate stop or restart."""
+        if self.child is not None and self.child.poll() is None:
+            self._command({"cmd": "unwatch"})
 
     def start(self):
-        """Begin scanning in the background."""
-        _ = self.scan()
-        self._thread = threading.Thread(target=self._run, name="build-monitor")
-        self._thread.daemon = True
-        self._thread.start()
+        """Check what can be observed, then start the monitor process."""
+        self.started_unix = time.time()
+        self.visibility = procfs_visibility(self.proc_root)
+        self.docker_report = {"start": docker_builders(self.docker)}
+        self.child = subprocess.Popen(
+            [sys.executable, str(Path(host_monitor.__file__).resolve())],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="ascii",
+            errors="replace",
+        )
+        self._reader = threading.Thread(target=self._read, name="monitor-reader")
+        self._reader.daemon = True
+        self._reader.start()
+        self._send(
+            {
+                "interval_s": self.interval_s,
+                "limit_s": self.COVERAGE_LIMIT_S,
+                "proc_root": str(self.proc_root),
+                "rules": self.rules(),
+                "own_pids": sorted(self.own_pids | {os.getpid()}),
+            }
+        )
+        if not self._started.wait(30) or self.child.poll() is not None:
+            self._abandon()
+            raise AssertionError("the monitor process did not start")
         return self
 
+    def _abandon(self):
+        """End a monitor process that did not start or did not stop."""
+        if self.child is not None and self.child.poll() is None:
+            self.child.kill()
+            _ = self.child.wait(10)
+
+    def coverage(self) -> dict:
+        """How continuously the ticks covered the run."""
+        final = self.final or {}
+        return {
+            "interval_s": self.interval_s,
+            "limit_s": self.COVERAGE_LIMIT_S,
+            "ticks": final.get("ticks", 0),
+            "max_gap_s": final.get("max_gap_s"),
+            "gaps_over_limit_count": final.get("gaps_over_limit_count", 0),
+            "gaps_over_limit": final.get("gaps_over_limit", []),
+        }
+
     def stop(self) -> dict:
-        """Stop scanning and report everything seen."""
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self.interval_s * 5 + 5)
-            if self._thread.is_alive():
-                raise AssertionError("the build monitor thread did not stop")
-            self._thread = None
-        _ = self.scan()
+        """Stop the monitor process and report everything seen."""
+        if self.child is not None:
+            try:
+                self._send({"cmd": "stop"})
+            except (AssertionError, OSError):
+                pass
+            try:
+                _ = self.child.wait(30)
+            except subprocess.TimeoutExpired:
+                self._abandon()
+                raise AssertionError("the monitor process did not stop")
+            self.child.stdin.close()
+            if not self._done.wait(30):
+                raise AssertionError("the monitor output was not read to its end")
+            self.child.stdout.close()
+            if self.final is None:
+                raise AssertionError(
+                    f"the monitor process ended with status "
+                    f"{self.child.returncode} and no report"
+                )
+            self.child = None
+        docker = dict(self.docker_report)
+        docker["end"] = docker_builders(self.docker)
+        docker["events"] = docker_build_events(
+            self.docker, self.started_unix, time.time()
+        )
+        self.docker_report = docker
+        if docker["events"].get("builder_starts"):
+            self.invalid.set()
+        coverage = self.coverage()
+        final = self.final or {}
         with self._lock:
+            self.scans += final.get("ticks", 0)
+            observations = list(self.observations)
             return {
                 "scans": self.scans,
-                "detected": bool(self.observations),
-                "observations": self.observations[:50],
-                "observation_count": len(self.observations),
+                "detected": bool(observations)
+                or bool(docker["events"].get("builder_starts")),
+                "observations": observations[:50],
+                "observation_count": len(observations),
+                "coverage": coverage,
+                "visibility": self.visibility,
+                "docker": docker,
+                "affinity_failures": [
+                    {"observed_utc": entry.get("observed_unix"), "detail": entry["detail"]}
+                    for entry in self.affinity_failures[:50]
+                ],
+                "affinity_failure_count": len(self.affinity_failures),
             }
 
     def __enter__(self):
@@ -1277,11 +1560,152 @@ class BuildMonitor:
         self.report = self.stop()
 
 
-def _is_docker_build(cmdline: str) -> bool:
-    """Whether a command line is a container image build."""
-    if "docker" not in cmdline and "podman" not in cmdline:
-        return False
-    return " build" in cmdline or cmdline.endswith(" build")
+# A daemon whose presence alone is not a build. Anything descending from it
+# is a build step.
+BUILD_DAEMONS = ("buildkitd",)
+
+# Clients whose command line decides whether they are building an image.
+DOCKER_CLIENTS = ("docker", "podman", "docker-buildx", "buildctl", "nerdctl")
+
+_is_docker_build = host_monitor.is_container_build
+
+
+def procfs_visibility(proc_root="/proc") -> dict:
+    """Whether this process can see every other process in procfs.
+
+    A procfs mounted with `hidepid` hides other users' processes, and a
+    build this monitor cannot see is a build it cannot report. PID 1 is
+    readable exactly when other processes are visible.
+    """
+    report = {"proc_root": str(proc_root), "hidepid": None}
+    try:
+        for line in Path("/proc/self/mountinfo").read_text().splitlines():
+            parts = line.split(" - ", 1)
+            if len(parts) == 2 and parts[1].startswith("proc "):
+                options = parts[1].split()[-1]
+                for option in options.split(","):
+                    if option.startswith("hidepid="):
+                        report["hidepid"] = option.split("=", 1)[1]
+    except OSError as error:
+        report["mountinfo_error"] = str(error)
+    try:
+        _ = (Path(proc_root) / "1" / "comm").read_text()
+        report["other_processes_visible"] = True
+    except OSError:
+        report["other_processes_visible"] = False
+    report["complete"] = bool(report["other_processes_visible"]) and report[
+        "hidepid"
+    ] in (None, "0", "off")
+    return report
+
+
+def _docker(arguments, timeout=10):
+    """Run one Docker CLI query, returning (ok, stdout or error)."""
+    try:
+        done = subprocess.run(
+            ["docker", *arguments], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, str(error)
+    if done.returncode != 0:
+        return False, done.stderr.strip()[:500]
+    return True, done.stdout
+
+
+def docker_builders(docker=None) -> dict:
+    """The builder containers Docker is running now, or why it cannot say.
+
+    `docker` None means: use Docker when its CLI is installed. A host with
+    no Docker CLI has no Docker build namespace to watch; a host whose CLI
+    cannot reach its daemon has one that is unobservable.
+    """
+    if docker is False or (docker is None and shutil.which("docker") is None):
+        return {"available": False, "observable": True, "reason": "no docker CLI"}
+    ok, output = _docker(
+        ["ps", "--no-trunc", "--format", "{{.ID}} {{.Image}} {{.Names}}"]
+    )
+    if not ok:
+        return {"available": True, "observable": False, "reason": output}
+    builders = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and _is_builder(parts[1], parts[2]):
+            builders.append({"id": parts[0][:12], "image": parts[1], "name": parts[2]})
+    return {"available": True, "observable": True, "builders": builders}
+
+
+def _is_builder(image: str, name: str) -> bool:
+    """Whether a container is an image builder."""
+    return "buildkit" in image or name.startswith("buildx_buildkit")
+
+
+def docker_build_events(docker, since_unix, until_unix) -> dict:
+    """Builder containers Docker started during the run interval.
+
+    An already running builder is an idle daemon and is only recorded; one
+    that started inside the interval was started for a build.
+    """
+    if docker is False or (docker is None and shutil.which("docker") is None):
+        return {"observable": True, "reason": "no docker CLI", "builder_starts": []}
+    if since_unix is None:
+        return {"observable": False, "reason": "the monitor never started",
+                "builder_starts": []}
+    ok, output = _docker(
+        [
+            "events",
+            "--since", f"{since_unix:.3f}",
+            "--until", f"{max(until_unix, since_unix):.3f}",
+            "--filter", "type=container",
+            "--filter", "event=start",
+            "--format", "{{json .}}",
+        ],
+        timeout=20,
+    )
+    if not ok:
+        return {"observable": False, "reason": output, "builder_starts": []}
+    starts = []
+    count = 0
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        count += 1
+        attributes = (event.get("Actor") or {}).get("Attributes") or {}
+        image = attributes.get("image", event.get("from", ""))
+        name = attributes.get("name", "")
+        if _is_builder(image, name):
+            starts.append({"image": image, "name": name, "time": event.get("time")})
+    return {
+        "observable": True,
+        "container_start_count": count,
+        "builder_starts": starts,
+    }
+
+
+def build_activity(proc_root="/proc") -> list:
+    """The build processes running on this host right now.
+
+    One in-process scan with the rules the continuous monitor applies, for a
+    preflight that must refuse to start next to a build.
+    """
+    return BuildMonitor(proc_root=proc_root, docker=False).scan()
+
+
+# The one host-visible lease every launcher, checkout and container shares,
+# so that two measurements on one physical host can never overlap.
+DEFAULT_LEASE_PATH = "/tmp/series-parquet-host-measurement.lock"
+
+
+def process_start_ticks(pid):
+    """A process's start time in clock ticks since boot, or None.
+
+    With the PID it identifies one process even after the PID is reused.
+    """
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 class HostLease:
@@ -1296,14 +1720,12 @@ class HostLease:
     held the lease.
     """
 
-    def __init__(self, path=None, *, owner=None):
+    def __init__(self, path=None, *, owner=None, run_id=None):
         self.path = Path(
-            path
-            or os.environ.get(
-                "SERIES_MEASURE_LEASE", "/tmp/series-measure-host.lease"
-            )
+            path or os.environ.get("SERIES_MEASURE_LEASE", DEFAULT_LEASE_PATH)
         )
         self.owner = owner or f"{os.getpid()}-{uuid.uuid4().hex}"
+        self.run_id = run_id
         self.acquired_utc = None
         self.released_utc = None
         self._fd = None
@@ -1335,7 +1757,13 @@ class HostLease:
         self.acquired_utc = utc_now()
         # The holder record is diagnostic only; the lock is the lease.
         record = json.dumps(
-            {"owner": self.owner, "pid": os.getpid(), "acquired_utc": self.acquired_utc},
+            {
+                "owner": self.owner,
+                "pid": os.getpid(),
+                "process_start_ticks": process_start_ticks(os.getpid()),
+                "run_id": self.run_id,
+                "acquired_utc": self.acquired_utc,
+            },
             sort_keys=True,
         ).encode("ascii")
         os.ftruncate(fd, 0)
@@ -1393,6 +1821,8 @@ class HostLease:
         return {
             "path": str(self.path),
             "owner": self.owner,
+            "pid": os.getpid(),
+            "run_id": self.run_id,
             "acquired_utc": self.acquired_utc,
             "released_utc": self.released_utc,
         }
@@ -1402,6 +1832,10 @@ class HostLease:
 
     def __exit__(self, *exc):
         self.release()
+
+
+# The plan's name for the lease. It is the same object: one lease, one lock.
+MeasurementLease = HostLease
 
 
 # --------------------------------------------------------------------------
@@ -1562,16 +1996,38 @@ def require_gauge(worker, metric_set, name):
     return value
 
 
-def sample_engine(engine, *, expected_workers: int, buffered=False) -> dict:
-    """One timestamped strict sample of every worker and of the process.
+def require_signal_gauge(worker, metric_set, name):
+    """One gauge of one entity, summed over its signal partitions.
 
-    The engine's own JSON telemetry is read with zeroes retained, so an
-    absent gauge is distinguishable from a zero one. Process values such as
-    resident memory are kept apart from per-worker values and are never
-    summed across workers.
+    A gauge published once per signal describes one instance in several
+    parts, so the parts are added -- but only within one entity. A gauge two
+    entities publish is ambiguous, a part that is not a number is an error,
+    and a gauge that is absent in both forms is absent, never zero.
     """
-    monotonic_ns = time.monotonic_ns()
-    document = test_e2e.engine_metrics(engine)
+    slot = f"{metric_set}:{name}"
+    if slot in worker["metrics"]:
+        return require_gauge(worker, metric_set, name)
+    entities = worker["labelled"].get(slot)
+    if not entities:
+        raise AssertionError(f"worker {worker['key']} publishes no {slot}")
+    if len(entities) != 1:
+        raise AssertionError(
+            f"worker {worker['key']} publishes {slot} for "
+            f"{sorted(entities)}; the sample cannot attribute it"
+        )
+    parts = next(iter(entities.values()))
+    total = 0
+    for label, value in sorted(parts.items()):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise AssertionError(
+                f"worker {worker['key']} reports {slot}[{label}] as {value!r}"
+            )
+        total += value
+    return total
+
+
+def sample_document(document, *, expected_workers: int, buffered=False) -> dict:
+    """The strict per-worker part of one sample, from one JSON response."""
     parsed = parse_telemetry(document, expected_workers=expected_workers)
     workers = {}
     for key, worker in parsed["workers"].items():
@@ -1582,6 +2038,14 @@ def sample_engine(engine, *, expected_workers: int, buffered=False) -> dict:
         uptime = require_gauge(worker, "pipeline", "uptime")
         entry = {
             "key": key,
+            # The heap the worker's pipeline holds now, as the engine's own
+            # allocation tracking counts it: every node, not only the
+            # exporter's accounted share.
+            "pipeline_memory_usage_bytes": require_gauge(
+                worker, "pipeline", "memory.usage"
+            ),
+            "group_id": worker["group_id"],
+            "pipeline_id": worker["pipeline_id"],
             "core_id": worker["core_id"],
             "generation": worker["generation"],
             "uptime_s": uptime,
@@ -1594,16 +2058,47 @@ def sample_engine(engine, *, expected_workers: int, buffered=False) -> dict:
         }
         if buffered:
             entry["buffer"] = {
-                f"{metric_set}:{name}": require_gauge(worker, metric_set, name)
+                f"{metric_set}:{name}": require_signal_gauge(worker, metric_set, name)
                 for metric_set, name in BUFFER_EMPTY_GAUGES
             }
         workers[key] = entry
-    pid = engine.process.pid
+    return {"workers": workers, "process": parsed["process"]}
+
+
+def worker_identities(sample) -> list:
+    """The worker identities one sample names, as the affinity map needs."""
+    return [
+        {
+            "key": worker["key"],
+            "group_id": worker["group_id"],
+            "pipeline_id": worker["pipeline_id"],
+            "core_id": worker["core_id"],
+            "generation": worker["generation"],
+        }
+        for _key, worker in sorted(sample["workers"].items())
+    ]
+
+
+def sample_engine(engine, *, expected_workers: int, buffered=False) -> dict:
+    """One timestamped strict sample of every worker and of the process.
+
+    The engine's own JSON telemetry is read with zeroes retained, so an
+    absent gauge is distinguishable from a zero one. Process values such as
+    resident memory are kept apart from per-worker values and are never
+    summed across workers. The process is the engine's host PID, which the
+    launcher reports, never a wrapper's.
+    """
+    monotonic_ns = time.monotonic_ns()
+    document = test_e2e.engine_metrics(engine)
+    parsed = sample_document(
+        document, expected_workers=expected_workers, buffered=buffered
+    )
+    pid = getattr(engine, "pid", None) or engine.process.pid
     return {
         "monotonic_ns": monotonic_ns,
         "observed_utc": utc_now(),
         "scrape_timestamp": document.get("timestamp"),
-        "workers": workers,
+        "workers": parsed["workers"],
         "process": parsed["process"],
         "process_rss_bytes": test_e2e.rss_bytes(pid),
         "process_pid": pid,
@@ -1805,6 +2300,354 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
         f"{DRAIN_EMPTY_EPOCHS} for each of {expected_workers} workers; "
         f"unanswered={dict(unanswered)}; epochs={tracker.as_json()}"
     )
+
+
+# --------------------------------------------------------------------------
+# Producer, background sampler, residual and build provenance
+# --------------------------------------------------------------------------
+
+EXPORT_METHODS = {
+    "logs": (
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+        test_e2e.logs_pb.ExportLogsServiceResponse,
+        "rejected_log_records",
+    ),
+    "metrics": (
+        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+        test_e2e.metrics_pb.ExportMetricsServiceResponse,
+        "rejected_data_points",
+    ),
+}
+
+
+class Producer:
+    """Send deterministic requests exactly once each and ledger every outcome.
+
+    The wire bytes `build_request` produced are what is sent: the call
+    passes them through without re-serializing, so the ledger's wire hash is
+    the hash of the bytes on the wire. Sender threads are confined to the
+    producer's cores. There is no retry: a healthy measurement requires
+    multiplicity exactly one, and a failed attempt is recorded with its
+    classification and left failed.
+    """
+
+    def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight):
+        self.channel = channel
+        self.ledger = ledger
+        self.workload = workload
+        self.cores = set(cores)
+        self.timeout_s = timeout_s
+        self.max_in_flight = max_in_flight
+        self.calls = {
+            signal: channel.unary_unary(
+                method,
+                request_serializer=None,
+                response_deserializer=response.FromString,
+            )
+            for signal, (method, response, _field) in EXPORT_METHODS.items()
+        }
+
+    def _pin(self):
+        """Confine one sender thread to the producer's cores."""
+        if self.cores:
+            os.sched_setaffinity(0, self.cores)
+
+    def send_one(self, index):
+        """Send request `index` once and record what happened."""
+        signal, wire, rows = build_request(self.workload, index)
+        start = time.monotonic_ns()
+        _ = self.ledger.add_request(index, signal, wire, rows, send_ns=start)
+        try:
+            response = self.calls[signal](wire, timeout=self.timeout_s)
+        except test_e2e.grpc.RpcError as error:
+            finish = time.monotonic_ns()
+            code = error.code()
+            outcome = (
+                OUTCOME_RETRYABLE
+                if code in test_e2e.RETRYABLE_CODES
+                else OUTCOME_PERMANENT
+            )
+            self.ledger.attempt(index, 1, start, finish, outcome, str(code))
+            return outcome
+        except Exception as error:
+            finish = time.monotonic_ns()
+            self.ledger.attempt(
+                index, 1, start, finish, OUTCOME_LOCAL, f"{type(error).__name__}"
+            )
+            return OUTCOME_LOCAL
+        finish = time.monotonic_ns()
+        rejected = getattr(
+            response.partial_success, EXPORT_METHODS[signal][2], 0
+        )
+        if rejected:
+            self.ledger.attempt(
+                index, 1, start, finish, OUTCOME_PARTIAL, f"rejected={rejected}"
+            )
+            return OUTCOME_PARTIAL
+        self.ledger.attempt(index, 1, start, finish, OUTCOME_ACK)
+        self.ledger.ack(index, finish)
+        return OUTCOME_ACK
+
+    def send(self, indexes) -> dict:
+        """Send every request in `indexes` with bounded concurrency."""
+        indexes = list(indexes)
+        workers = max(1, min(self.max_in_flight, len(indexes)))
+        started = time.monotonic_ns()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, initializer=self._pin,
+            thread_name_prefix="producer",
+        ) as pool:
+            outcomes = collections.Counter(pool.map(self.send_one, indexes))
+        return {
+            "requests": len(indexes),
+            "concurrency": workers,
+            "started_ns": started,
+            "finished_ns": time.monotonic_ns(),
+            "outcomes": dict(outcomes),
+        }
+
+
+def compact_sample(sample) -> dict:
+    """What a result keeps of one sample: every number, no raw label maps."""
+    return {
+        "monotonic_ns": sample["monotonic_ns"],
+        "observed_utc": sample.get("observed_utc"),
+        "process_pid": sample.get("process_pid"),
+        "process_rss_bytes": sample.get("process_rss_bytes"),
+        "procfs": sample.get("procfs"),
+        "load_average_1_5_15": sample.get("load_average_1_5_15"),
+        "workers": {
+            key: {
+                name: worker[name]
+                for name in (
+                    "core_id", "generation", "uptime_s", "reported", "gauges", "buffer",
+                    "pipeline_memory_usage_bytes",
+                )
+                if name in worker
+            }
+            for key, worker in sorted(sample["workers"].items())
+        },
+    }
+
+
+def load_average():
+    """The host's 1, 5 and 15 minute load averages."""
+    with open("/proc/loadavg", encoding="ascii") as handle:
+        return [float(value) for value in handle.read().split()[:3]]
+
+
+class Sampler:
+    """Sample one engine's telemetry and procfs on a fixed period.
+
+    Each sample carries the strict per-worker telemetry, the process's
+    procfs figures and the host load, on one monotonic timeline. A sample
+    that fails is recorded as an error with its time, never as a zero.
+    """
+
+    def __init__(self, engine, *, expected_workers, buffered, period_s=0.25,
+                 controls=None, phase=""):
+        self.engine = engine
+        self.expected_workers = expected_workers
+        self.buffered = buffered
+        self.period_s = period_s
+        self.controls = controls
+        self.phase = phase
+        self.samples = []
+        self.errors = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def once(self):
+        """One sample, with the process figures of the same instant."""
+        sample = sample_engine(
+            self.engine, expected_workers=self.expected_workers, buffered=self.buffered
+        )
+        sample["procfs"] = procfs_process_sample(sample["process_pid"])
+        sample["load_average_1_5_15"] = load_average()
+        sample["phase"] = self.phase
+        return sample
+
+    def _run(self):
+        """Sample until stopped."""
+        while not self._stop.is_set():
+            try:
+                self.samples.append(self.once())
+            except Exception as error:
+                self.errors.append(
+                    {
+                        "monotonic_ns": time.monotonic_ns(),
+                        "phase": self.phase,
+                        "error": f"{type(error).__name__}: {error}"[:500],
+                    }
+                )
+            _ = self._stop.wait(self.period_s)
+
+    def start(self):
+        """Begin sampling in the background."""
+        self._thread = threading.Thread(target=self._run, name="sampler")
+        self._thread.daemon = True
+        self._thread.start()
+        return self
+
+    def stop(self):
+        """Stop sampling and wait for the thread."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+            if self._thread.is_alive():
+                raise AssertionError("the sampler thread did not stop")
+            self._thread = None
+        return self
+
+
+def _memory_terms(sample) -> dict:
+    """The measured memory terms of one sample, all in bytes."""
+    procfs = sample["procfs"]
+    workers = sample["workers"].values()
+    return {
+        "rss_bytes": procfs["smaps_rss_bytes"],
+        "anonymous_bytes": procfs["smaps_anonymous_bytes"],
+        "file_bytes": procfs["smaps_rss_bytes"] - procfs["smaps_anonymous_bytes"],
+        "accounted_bytes": sum(
+            worker["gauges"]["memory.accounted_bytes"] for worker in workers
+        ),
+        "heap_bytes": sum(worker["pipeline_memory_usage_bytes"] for worker in workers),
+    }
+
+
+def rss_residuals(samples, idle) -> list:
+    """The signed unexplained RSS of each sample against one idle reference.
+
+    Every term is measured, none is a reservation. `idle` is a sample taken
+    at readiness before any input: its resident set is the runtime term. The
+    growth of file-backed resident pages -- executable and library text
+    faulted in as new code paths run, and any mapped file -- is read from
+    `smaps_rollup` and is a runtime term too. The workers' heap, as the
+    engine's own allocation tracking counts it, includes the exporter's
+    accounted bytes; because an allocator keeps freed pages resident, the
+    heap term is its high-water mark since readiness. What remains of the
+    anonymous growth is the residual. It is signed: tracked heap that is not
+    resident is a negative residual and is kept, never clamped to zero.
+    """
+    reference = _memory_terms(idle)
+    residuals = []
+    heap_high = reference["heap_bytes"]
+    for sample in samples:
+        workers = sample["workers"].values()
+        if not workers or not all(worker_reported(worker) for worker in workers):
+            continue
+        if "smaps_rss_bytes" not in (sample.get("procfs") or {}):
+            continue
+        terms = _memory_terms(sample)
+        heap_high = max(heap_high, terms["heap_bytes"])
+        heap_growth = heap_high - reference["heap_bytes"]
+        accounted_growth = terms["accounted_bytes"] - reference["accounted_bytes"]
+        file_growth = terms["file_bytes"] - reference["file_bytes"]
+        residuals.append(
+            {
+                "monotonic_ns": sample["monotonic_ns"],
+                "rss_bytes": terms["rss_bytes"],
+                "rss_growth_bytes": terms["rss_bytes"] - reference["rss_bytes"],
+                "file_growth_bytes": file_growth,
+                "accounted_growth_bytes": accounted_growth,
+                "heap_high_water_growth_bytes": heap_growth,
+                "residual_bytes": (terms["rss_bytes"] - reference["rss_bytes"])
+                - file_growth
+                - heap_growth,
+            }
+        )
+    return residuals
+
+
+# The plan's frozen diagnostic uncertainty for the RSS reconciliation.
+RESIDUAL_FLOOR_BYTES = 32 * 1024 * 1024
+RESIDUAL_PEAK_FRACTION = 0.10
+
+
+def residual_check(residuals, peak_rss_bytes) -> dict:
+    """Fail an unexplained positive, or a persistent negative, residual.
+
+    The tolerance is `max(32MiB, 0.10 * peak_RSS)`, declared before the run.
+    A positive residual beyond it in any sample fails; a negative one fails
+    when it persists, that is in more than half of the samples.
+    """
+    tolerance = max(RESIDUAL_FLOOR_BYTES, RESIDUAL_PEAK_FRACTION * peak_rss_bytes)
+    if not residuals:
+        return check(
+            "rss_reconciliation", CHECK_HARD, STATUS_FAILED,
+            "no sample carried both RSS and every worker's accounted bytes",
+        )
+    positive = [entry for entry in residuals if entry["residual_bytes"] > tolerance]
+    negative = [entry for entry in residuals if entry["residual_bytes"] < -tolerance]
+    persistent = len(negative) * 2 > len(residuals)
+    largest = max(entry["residual_bytes"] for entry in residuals)
+    smallest = min(entry["residual_bytes"] for entry in residuals)
+    return check(
+        "rss_reconciliation",
+        CHECK_HARD,
+        STATUS_FAILED if positive or persistent else STATUS_PASSED,
+        f"residual range [{smallest}, {largest}] bytes over {len(residuals)} "
+        f"samples; tolerance {int(tolerance)} bytes; {len(positive)} positive "
+        f"and {len(negative)} negative beyond it",
+    )
+
+
+def percentile(values, fraction):
+    """The nearest-rank percentile of a non-empty list."""
+    ordered = sorted(values)
+    if not ordered:
+        raise AssertionError("a percentile of no values is undefined")
+    rank = max(1, int(-(-fraction * len(ordered) // 1)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def engine_build(binary) -> dict:
+    """The engine build a run used: profile, features, allocator, toolchain.
+
+    The profile is read from the target directory the binary was built into.
+    Cargo does not record the feature set inside the binary, so the features
+    and allocator are the ones the build step declared through
+    `SERIES_ENGINE_FEATURES` and `SERIES_ENGINE_ALLOCATOR`, defaulting to the
+    documented `series_parquet,aws,durable-buffer` build on the workspace's
+    default jemalloc allocator. The binary hash is provenance, outside the
+    fingerprint.
+    """
+    binary = Path(binary)
+    profile = binary.parent.name if binary.parent.name in ("debug", "release") else (
+        "custom:" + binary.parent.name
+    )
+    try:
+        toolchain = subprocess.run(
+            ["rustc", "--version"], capture_output=True, text=True, timeout=30,
+            cwd=str(test_e2e.WORKSPACE),
+        ).stdout.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        toolchain = "unknown"
+    return {
+        "profile": profile,
+        "features": os.environ.get(
+            "SERIES_ENGINE_FEATURES", "default,series_parquet,aws,durable-buffer"
+        ),
+        "allocator": os.environ.get("SERIES_ENGINE_ALLOCATOR", "jemalloc"),
+        "toolchain": toolchain,
+        "binary": str(binary),
+        "binary_sha256": file_digest(binary),
+        "binary_size_bytes": binary.stat().st_size,
+    }
+
+
+def git_provenance() -> dict:
+    """The source revision a run measured, and whether the tree was dirty."""
+    def git(*arguments):
+        """One git query from the repository root."""
+        done = subprocess.run(
+            ["git", *arguments], capture_output=True, text=True, timeout=30,
+            cwd=str(REPO_ROOT),
+        )
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"revision": git("rev-parse", "HEAD"), "dirty": bool(status)}
 
 
 # --------------------------------------------------------------------------
@@ -2520,21 +3363,31 @@ class RunControls:
     after its final drain, naming the process of each role, the workers the
     telemetry reported and the cores the run requested; every snapshot
     asserts worker affinity and aborts the run on a mismatch or an
-    unattributable worker. `close` stops the monitor, checks the lease is
-    still held, compares the two snapshots and records every outcome as a
-    hard check, whatever happened in between. None of these steps is
-    optional: a missing one leaves its hard check failed or absent, and the
-    baseline evaluator rejects a run without the complete set.
+    unattributable worker. Between them, `watch_workers` has the monitor
+    re-check every mapped worker thread on each tick, and `checkpoint`
+    re-verifies the mapping at a phase boundary such as a restart. `close`
+    stops the monitor, checks the lease is still held, compares the two
+    snapshots and records every outcome as a hard check, whatever happened
+    in between. None of these steps is optional: a missing one leaves its
+    hard check failed or absent, and the baseline evaluator rejects a run
+    without the complete set.
+
+    Processes that are not the engine -- a prebuilt benchmark, a producer, a
+    store -- are registered with `register`, so an engine-less run still
+    records their observed thread affinity in both snapshots.
     """
 
     EDGES = ("start", "end")
 
-    def __init__(self, result, *, lease_path=None, lease_wait_s=60.0,
-                 build_interval_s=1.0):
+    def __init__(self, result, *, lease_path=None, lease_wait_s=0.0,
+                 build_interval_s=0.05, proc_root="/proc", docker=None):
         self.result = result
-        self.lease = HostLease(lease_path)
+        self.lease = HostLease(lease_path, run_id=result.get("run_id"))
         self.lease_wait_s = lease_wait_s
-        self.monitor = BuildMonitor(interval_s=build_interval_s)
+        self.monitor = BuildMonitor(
+            interval_s=build_interval_s, proc_root=proc_root, docker=docker
+        )
+        self.roles = {}
         self.taken = {}
         self.affinity_failures = []
         self.opened = False
@@ -2558,33 +3411,74 @@ class RunControls:
         self.opened = True
         environment = self.result["environment"]
         environment["machine_identity_sha256"] = machine_identity_sha256()
+        environment["lease"] = self.lease.as_json()
         record_event(self.result, "host_controls_opened", self.lease.owner)
         return self
 
-    def snapshot(self, edge, roles, *, workers, requested_cores):
+    def register(self, role, pid, cores=()):
+        """Name a process of this run so both snapshots observe it."""
+        self.roles[role] = (int(pid), [int(core) for core in cores])
+
+    def allocate(self, allocation):
+        """Record the run's role placement, which is part of its fingerprint.
+
+        Two roles on one physical core would compete, so an allocation that
+        places them on SMT siblings of one core is refused here.
+        """
+        groups = {}
+        for group in core_topology()["sibling_groups"]:
+            for core in group:
+                groups[core] = tuple(group)
+        owners = {}
+        for role, cores in sorted(allocation.items()):
+            for core in cores:
+                group = groups.get(int(core), (int(core),))
+                if group in owners and owners[group] != role:
+                    raise AssertionError(
+                        f"roles {owners[group]} and {role} share physical core "
+                        f"{list(group)}"
+                    )
+                owners[group] = role
+        self.result["environment"]["core_allocation"] = {
+            role: sorted(int(core) for core in cores)
+            for role, cores in sorted(allocation.items())
+        }
+        record_event(
+            self.result, "core_allocation", json.dumps(allocation, sort_keys=True)
+        )
+
+    def _observe(self, edge, roles, workers, requested_cores):
+        """One environment snapshot over every registered and named role."""
+        merged = dict(self.roles)
+        merged.update(roles or {})
+        if "engine" in merged and not workers:
+            raise AssertionError(
+                f"the {edge} snapshot names no workers; a measured run must "
+                f"attribute every worker thread"
+            )
+        return environment_snapshot(
+            merged, workers=workers or (), requested_cores=requested_cores
+        )
+
+    def snapshot(self, edge, roles=None, *, workers=(), requested_cores=None):
         """Record one edge's environment and assert worker affinity on it.
 
         `roles` maps each role to `(pid, cores)`. The start edge also fixes
         the run's normalized role placement, which is part of its
-        fingerprint.
+        fingerprint, unless `allocate` already recorded it.
         """
         if edge not in self.EDGES:
             raise ValueError(f"an environment snapshot edge is start or end: {edge}")
         if not self.opened:
             raise AssertionError("snapshot before the host controls were opened")
-        if not workers:
-            raise AssertionError(
-                f"the {edge} snapshot names no workers; a measured run must "
-                f"attribute every worker thread"
-            )
-        snapshot = environment_snapshot(
-            roles, workers=workers, requested_cores=requested_cores
-        )
+        snapshot = self._observe(edge, roles, workers, requested_cores)
         self.result["environment"][edge] = snapshot
-        if edge == "start":
+        if edge == "start" and "core_allocation" not in self.result["environment"]:
+            merged = dict(self.roles)
+            merged.update(roles or {})
             self.result["environment"]["core_allocation"] = {
                 role: sorted({int(core) for core in value[1]})
-                for role, value in sorted(roles.items())
+                for role, value in sorted(merged.items())
                 if isinstance(value, tuple) and value[1]
             }
         try:
@@ -2595,6 +3489,43 @@ class RunControls:
             raise
         self.taken[edge] = snapshot
         return snapshot
+
+    def checkpoint(self, label, roles=None, *, workers=(), requested_cores=None):
+        """Re-verify worker affinity at a phase boundary, such as a restart."""
+        if not self.opened:
+            raise AssertionError("checkpoint before the host controls were opened")
+        snapshot = self._observe(label, roles, workers, requested_cores)
+        self.result["environment"].setdefault("checkpoints", {})[label] = snapshot
+        try:
+            assert_affinity(snapshot)
+        except AssertionError as error:
+            self.affinity_failures.append(f"{label}: {error}")
+            raise
+        return snapshot
+
+    def watch_workers(self, pid, snapshot):
+        """Have every monitor tick re-check the workers `snapshot` mapped."""
+        self.monitor.watch(pid, worker_tids(snapshot))
+
+    def unwatch_workers(self):
+        """Stop re-checking workers, before the engine is deliberately stopped."""
+        self.monitor.unwatch()
+
+    def raise_if_invalid(self):
+        """Stop the run cleanly as soon as the monitor has invalidated it.
+
+        Nothing is killed: the run stops itself, keeps every observation and
+        fails its checks when the controls close.
+        """
+        if self.monitor.invalid.is_set():
+            builds = [
+                {key: entry[key] for key in ("pid", "comm", "reason")}
+                for entry in self.monitor.observations[:5]
+            ]
+            raise AssertionError(
+                f"the run was invalidated while measuring: builds={builds} "
+                f"affinity={self.monitor.affinity_failures[:3]}"
+            )
 
     def close(self):
         """Stop the controls and record each of their outcomes, once.
@@ -2629,15 +3560,16 @@ class RunControls:
                     "detected": None,
                     "error": f"{type(error).__name__}: {error}",
                 }
-                checks.append(
-                    check(
-                        "no_concurrent_build",
-                        CHECK_HARD,
-                        STATUS_FAILED,
-                        f"the build monitor failed to stop, so build activity "
-                        f"is unobservable: {error}",
+                for name in ("no_concurrent_build", "build_monitor_coverage"):
+                    checks.append(
+                        check(
+                            name,
+                            CHECK_HARD,
+                            STATUS_FAILED,
+                            f"the build monitor failed to stop, so build "
+                            f"activity is unobservable: {error}",
+                        )
                     )
-                )
             if report is not None:
                 environment["build_monitor"] = report
                 checks.append(
@@ -2646,8 +3578,14 @@ class RunControls:
                         CHECK_HARD,
                         STATUS_FAILED if report["detected"] else STATUS_PASSED,
                         f"{report['observation_count']} build processes seen in "
-                        f"{report['scans']} scans",
+                        f"{report['scans']} scans; builder container starts "
+                        f"{len(report['docker']['events'].get('builder_starts', []))}",
                     )
+                )
+                checks.append(coverage_check(report))
+                self.affinity_failures.extend(
+                    f"tick {entry['observed_utc']}: {entry['detail']}"
+                    for entry in report["affinity_failures"]
                 )
             try:
                 self.lease.assert_held()
@@ -2664,14 +3602,15 @@ class RunControls:
                     "the host controls were never opened",
                 )
             )
-            checks.append(
-                check(
-                    "no_concurrent_build",
-                    CHECK_HARD,
-                    STATUS_FAILED,
-                    "no build monitor ran, so build activity is unobservable",
+            for name in ("no_concurrent_build", "build_monitor_coverage"):
+                checks.append(
+                    check(
+                        name,
+                        CHECK_HARD,
+                        STATUS_FAILED,
+                        "no build monitor ran, so build activity is unobservable",
+                    )
                 )
-            )
         complete = all(edge in self.taken for edge in self.EDGES)
         checks.append(
             check(
@@ -2703,7 +3642,7 @@ class RunControls:
             )
         if self.affinity_failures:
             affinity_status, affinity_detail = STATUS_FAILED, "; ".join(
-                self.affinity_failures
+                self.affinity_failures[:10]
             )
         elif complete:
             affinity_status, affinity_detail = STATUS_PASSED, "every worker on its own core"
@@ -2727,6 +3666,35 @@ class RunControls:
                 f"{start.get('physical_core_count')}",
             )
         )
+
+
+def coverage_check(report) -> dict:
+    """Whether the build monitor could have missed a build.
+
+    It could if two ticks were further apart than the coverage limit, if
+    procfs hides other processes, or if Docker is installed but could not
+    be asked about builder containers.
+    """
+    problems = []
+    coverage = report["coverage"]
+    if coverage["gaps_over_limit_count"]:
+        problems.append(
+            f"{coverage['gaps_over_limit_count']} tick gaps over "
+            f"{coverage['limit_s']}s, largest {coverage['max_gap_s']}s"
+        )
+    if not report["visibility"].get("complete"):
+        problems.append(f"procfs visibility {report['visibility']}")
+    docker = report["docker"]
+    for part in ("start", "end", "events"):
+        if not docker.get(part, {}).get("observable", False):
+            problems.append(f"docker {part} unobservable: {docker.get(part)}")
+    return check(
+        "build_monitor_coverage",
+        CHECK_HARD,
+        STATUS_FAILED if problems else STATUS_PASSED,
+        "; ".join(problems)
+        or f"{coverage['ticks']} ticks, largest gap {coverage['max_gap_s']}s",
+    )
 
 
 def settle_status(result) -> None:
@@ -2758,6 +3726,7 @@ CORRECTNESS_CHECKS = ("delivery",)
 VALIDITY_CHECKS = (
     "host_lease_held",
     "no_concurrent_build",
+    "build_monitor_coverage",
     "environment_snapshots_complete",
     "environment_matched",
     "affinity_matched",
@@ -2793,6 +3762,35 @@ def canonicalize_run_paths(value, run_dir):
             for root in roots:
                 if item == root or item.startswith(root + os.sep):
                     return RUN_DIR_TOKEN + item[len(root):]
+        return item
+
+    return rewrite(value)
+
+
+def canonicalize_ephemeral_values(value, ephemeral):
+    """Replace each declared per-run value, exactly, by its token.
+
+    A launcher binds its receiver to a fresh ephemeral port, which is as
+    much a per-run artifact as the run directory. The run declares each such
+    value in `ephemeral_values` as `{token: value}`; a string equal to a
+    declared value becomes the token, and nothing else is touched, so an
+    undeclared difference still separates two fingerprints.
+    """
+    for token, actual in ephemeral.items():
+        if not (isinstance(token, str) and token.startswith("<") and token.endswith(">")):
+            raise AssertionError(f"an ephemeral token is written <name>: {token!r}")
+        if not isinstance(actual, str) or not actual:
+            raise AssertionError(f"ephemeral value {token} must be a non-empty string")
+    replacements = {actual: token for token, actual in ephemeral.items()}
+
+    def rewrite(item):
+        """Rewrite one node of the configuration tree."""
+        if isinstance(item, dict):
+            return {key: rewrite(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [rewrite(child) for child in item]
+        if isinstance(item, str) and item in replacements:
+            return replacements[item]
         return item
 
     return rewrite(value)
@@ -2853,7 +3851,11 @@ def fingerprint_material(result) -> dict:
         "machine": machine,
         "available_cores": sorted(int(core) for core in available),
         "role_placement": dict(sorted(roles.items())),
-        "config": canonicalize_run_paths(config, run_dir),
+        "config": canonicalize_ephemeral_values(
+            canonicalize_run_paths(config, run_dir),
+            result.get("ephemeral_values") or {},
+        ),
+        "ephemeral_tokens": sorted(result.get("ephemeral_values") or {}),
         "workload": workload,
         "schedule": {
             key: schedule[key]

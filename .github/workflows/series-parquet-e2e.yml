@@ -18,6 +18,12 @@ jobs:
   writer-reader-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # One measurement at a time per physical host: jobs that could share a
+    # runner host queue behind each other instead of measuring concurrently.
+    # The in-run host lease enforces the same rule on any machine.
+    concurrency:
+      group: series-parquet-host-measurement
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: rust/otap-dataflow
@@ -27,6 +33,8 @@ jobs:
       SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
       SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
       SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
+      SERIES_ENGINE_FEATURES: default,series_parquet,aws,durable-buffer
+      SERIES_ARTIFACT_DIR: /tmp/series-parquet-artifacts/tests
     steps:
       - uses: actions/checkout@v4
       - name: Install native build prerequisites
@@ -45,9 +53,32 @@ jobs:
         run: |
           python3 -m venv /tmp/series-parquet-venv
           /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+      # Build and provisioning finish before any step takes the host
+      # measurement lease, so a measured step never runs beside a compiler.
       - name: Build the real engine
-        run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
+        run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer
       - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
           SERIES_REQUIRE_DOCKER=1 python3 -m unittest crates.validation.tests.series_parquet.test_e2e -v
+      - name: Measurement harness contracts
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
+      # The strict and buffered launcher smokes with the same oracle. A hosted
+      # runner is not a publishable measurement host, so nothing is published
+      # and no baseline is evaluated; delivery, graph, restart and affinity
+      # must still pass, and every validity check is recorded as observed.
+      - name: Strict and buffered launcher smokes
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          python3 -m crates.validation.tests.series_parquet.measure run \
+            --case launcher-ci --output-dir /tmp/series-parquet-artifacts/launcher-ci \
+            --option publish=false --option legacy_tests=false
+      - name: Retain measurement results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: series-parquet-measurement
+          path: /tmp/series-parquet-artifacts
+          if-no-files-found: warn

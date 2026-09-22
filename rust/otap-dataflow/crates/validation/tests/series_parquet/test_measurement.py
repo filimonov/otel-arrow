@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -375,7 +376,10 @@ def telemetry(uptime, *, gauges=None, drop=(), workers=1, generation=0):
             {
                 "name": "pipeline",
                 "attributes": identity,
-                "metrics": [{"name": "uptime", "value": uptime}],
+                "metrics": [
+                    {"name": "uptime", "value": uptime},
+                    {"name": "memory.usage", "value": 5 * 1024 * 1024},
+                ],
             }
         )
         sets.append(
@@ -501,6 +505,57 @@ class TelemetryContracts(unittest.TestCase):
         )
         worker = next(iter(sample["workers"].values()))
         self.assertNotIn("memory.unaccounted_rss_bytes", worker["gauges"])
+
+
+class BufferGaugeContracts(unittest.TestCase):
+    """The buffer's per-signal gauges are one instance's value in parts."""
+
+    def worker(self, labelled):
+        """A worker carrying only labelled buffer metrics."""
+        return {"key": "default/main/core1", "metrics": {}, "labelled": labelled}
+
+    # Scenario: the buffer publishes `items.queued` once per signal for its
+    # one instance on a worker.
+    # Guarantees: the parts are added within that instance, so a queued
+    # metrics item is not hidden by an empty logs queue.
+    def test_signal_parts_of_one_instance_are_added(self):
+        worker = self.worker(
+            {
+                "processor.durable_buffer.items:queued": {
+                    "node.id=buffer": {
+                        "signal=logs": 0, "signal=metrics": 2, "signal=traces": 0,
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            measurement.require_signal_gauge(
+                worker, "processor.durable_buffer.items", "queued"
+            ),
+            2,
+        )
+
+    # Scenario: two buffer instances on one worker publish the gauge, or no
+    # instance publishes it at all.
+    # Guarantees: an ambiguous gauge and an absent gauge are errors, never a
+    # sum across instances and never zero.
+    def test_ambiguous_or_absent_signal_gauges_fail(self):
+        worker = self.worker(
+            {
+                "processor.durable_buffer.items:queued": {
+                    "node.id=one": {"signal=logs": 0},
+                    "node.id=two": {"signal=logs": 0},
+                }
+            }
+        )
+        with self.assertRaisesRegex(AssertionError, "cannot attribute"):
+            _ = measurement.require_signal_gauge(
+                worker, "processor.durable_buffer.items", "queued"
+            )
+        with self.assertRaisesRegex(AssertionError, "publishes no"):
+            _ = measurement.require_signal_gauge(
+                self.worker({}), "processor.durable_buffer", "in.flight"
+            )
 
 
 class DrainContracts(unittest.TestCase):
@@ -787,6 +842,23 @@ class AffinityContracts(unittest.TestCase):
         snapshot = self.snapshot([first], requested=[second])
         with self.assertRaisesRegex(AssertionError, "requested"):
             measurement.assert_affinity(snapshot)
+
+    # Scenario: a worker expected on core 4 can actually run on cores 4 and 5.
+    # Guarantees: runtime pinning warnings cannot silently validate a measurement.
+    def test_affinity_mismatch_aborts(self):
+        with self.assertRaisesRegex(AssertionError, "affinity"):
+            measurement.check_worker_affinity({123: {4, 5}}, {123: {4}})
+
+    # Scenario: a mapped worker thread is gone, or a new one appeared, since
+    # the mapping was made.
+    # Guarantees: a changed TID set is a mapping mismatch, never a pass, and
+    # an unchanged exact mapping passes.
+    def test_a_changed_worker_mapping_aborts(self):
+        with self.assertRaisesRegex(AssertionError, "TID mapping mismatch"):
+            measurement.check_worker_affinity({124: {4}}, {123: {4}})
+        with self.assertRaisesRegex(AssertionError, "tid=123 actual=None"):
+            measurement.check_worker_affinity({123: None}, {123: {4}})
+        measurement.check_worker_affinity({123: {4}, 124: {6}}, {123: {4}, 124: {6}})
 
     # Scenario: a run may use both SMT siblings of one core, one sibling of
     # another, and nothing of a third.
@@ -2072,10 +2144,8 @@ class CommandContracts(unittest.TestCase):
         _ = controls.open()
 
         def stop_monitor():
-            """Stop the real monitor thread the patched stop left running."""
-            controls.monitor._stop.set()
-            if controls.monitor._thread is not None:
-                controls.monitor._thread.join(10)
+            """End the real monitor process the patched stop left running."""
+            controls.monitor._abandon()
 
         self.addCleanup(stop_monitor)
         with mock.patch.object(
@@ -2120,6 +2190,594 @@ class CommandContracts(unittest.TestCase):
         document = self.published(report)
         self.assertEqual(
             self.checks_of(document)["host_lease_held"], measurement.STATUS_FAILED
+        )
+
+
+def fake_process(root, pid, comm, *, ppid=1, cmdline=""):
+    """One injected procfs process: comm, stat with its parent, cmdline.
+
+    The entry is assembled beside the tree and renamed into it, so the
+    monitor process never reads half of it.
+    """
+    staging = Path(tempfile.mkdtemp(dir=root.parent))
+    _ = (staging / "comm").write_text(comm + "\n", encoding="ascii")
+    fields = ["S", str(ppid)] + ["0"] * 17 + ["4242"] + ["0"] * 20
+    _ = (staging / "stat").write_text(
+        f"{pid} ({comm}) " + " ".join(fields) + "\n", encoding="ascii"
+    )
+    _ = (staging / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode("ascii"))
+    staging.rename(root / str(pid))
+
+
+def fake_proc(case):
+    """An injected procfs tree holding only an init process."""
+    root = temporary_directory(case) / "proc"
+    root.mkdir()
+    fake_process(root, 1, "init", ppid=0)
+    return root
+
+
+class InjectedProcContracts(unittest.TestCase):
+    """Monitor decisions, driven by injected procfs observations."""
+
+    rules = {
+        "build_commands": list(measurement.BUILD_COMMANDS),
+        "build_daemons": list(measurement.BUILD_DAEMONS),
+        "container_clients": list(measurement.DOCKER_CLIENTS),
+    }
+
+    # Scenario: a builder container's buildkitd runs with no build step.
+    # Guarantees: an idle build daemon does not invalidate a run, so a
+    # machine that merely hosts a builder can still measure.
+    def test_an_idle_build_daemon_is_not_a_build(self):
+        root = fake_proc(self)
+        fake_process(root, 50, "buildkitd")
+        self.assertEqual(measurement.host_monitor.scan(root, self.rules, set()), [])
+
+    # Scenario: the same daemon starts a build step.
+    # Guarantees: a process descending from a build daemon is a build, with
+    # its ancestry recorded as evidence.
+    def test_a_build_step_under_a_daemon_is_a_build(self):
+        root = fake_proc(self)
+        fake_process(root, 50, "buildkitd")
+        fake_process(root, 51, "runc", ppid=50)
+        fake_process(root, 52, "sh", ppid=51)
+        found = measurement.host_monitor.scan(root, self.rules, set())
+        self.assertEqual(sorted(entry["pid"] for entry in found), [51, 52])
+        self.assertEqual(found[1]["ancestry"][0], {"pid": 51, "comm": "runc"})
+
+    # Scenario: a docker client runs `docker buildx build` with a secret
+    # build argument, beside a docker client that only lists containers.
+    # Guarantees: the build client is a build, the listing client is not,
+    # and the secret's value never reaches the evidence.
+    def test_container_build_clients_are_builds_and_secrets_are_redacted(self):
+        root = fake_proc(self)
+        fake_process(
+            root, 60, "docker",
+            cmdline="docker buildx build --build-arg API_TOKEN=hunter2 .",
+        )
+        fake_process(root, 61, "docker", cmdline="docker ps")
+        found = measurement.host_monitor.scan(root, self.rules, set())
+        self.assertEqual([entry["pid"] for entry in found], [60])
+        self.assertNotIn("hunter2", found[0]["cmdline"])
+        self.assertIn("API_TOKEN=<redacted>", found[0]["cmdline"])
+
+    # Scenario: the monitor's ticks were once further apart than the
+    # coverage limit.
+    # Guarantees: a window the monitor could not see invalidates the run.
+    def test_a_coverage_gap_fails_the_coverage_check(self):
+        report = {
+            "coverage": {"gaps_over_limit_count": 1, "limit_s": 0.1,
+                         "max_gap_s": 0.9, "ticks": 10},
+            "visibility": {"complete": True},
+            "docker": {part: {"observable": True} for part in ("start", "end", "events")},
+        }
+        self.assertEqual(
+            measurement.coverage_check(report)["status"], measurement.STATUS_FAILED
+        )
+        report["coverage"]["gaps_over_limit_count"] = 0
+        self.assertEqual(
+            measurement.coverage_check(report)["status"], measurement.STATUS_PASSED
+        )
+
+    # Scenario: Docker is installed but its daemon cannot be asked about
+    # builder containers, or procfs hides other users' processes.
+    # Guarantees: an inaccessible build namespace invalidates the run.
+    def test_an_unobservable_build_namespace_fails_the_coverage_check(self):
+        report = {
+            "coverage": {"gaps_over_limit_count": 0, "limit_s": 0.1,
+                         "max_gap_s": 0.05, "ticks": 10},
+            "visibility": {"complete": True},
+            "docker": {
+                "start": {"observable": True},
+                "end": {"observable": False, "reason": "permission denied"},
+                "events": {"observable": True},
+            },
+        }
+        self.assertIn(
+            "docker end unobservable", measurement.coverage_check(report)["detail"]
+        )
+        report["docker"]["end"] = {"observable": True}
+        report["visibility"] = {"complete": False, "hidepid": "2"}
+        self.assertEqual(
+            measurement.coverage_check(report)["status"], measurement.STATUS_FAILED
+        )
+
+    # Scenario: a compiler appears while the monitor process runs and is
+    # gone again before the monitor stops.
+    # Guarantees: the separate monitor process reports the build as soon as
+    # it ticks, keeps it after the build has gone, and reports its own tick
+    # coverage when it stops.
+    def test_the_monitor_process_reports_a_transient_build(self):
+        root = fake_proc(self)
+        monitor = measurement.BuildMonitor(proc_root=root, docker=False).start()
+        self.addCleanup(monitor._abandon)
+        fake_process(root, 7100, "rustc")
+        _ = measurement.wait_until(
+            monitor.invalid.is_set,
+            bool,
+            deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+            description="the monitor process reporting the build",
+        )
+        shutil.rmtree(root / "7100")
+        report = monitor.stop()
+        self.assertTrue(report["detected"])
+        self.assertEqual(report["observations"][0]["pid"], 7100)
+        self.assertGreaterEqual(report["coverage"]["ticks"], 2)
+        self.assertIsNotNone(report["coverage"]["max_gap_s"])
+
+
+class ControlledRunContracts(unittest.TestCase):
+    """Each host-control failure invalidates a run and publishes no baseline."""
+
+    # The measured-body helpers the command contracts already define.
+    isolated = CommandContracts.isolated
+    experiment = CommandContracts.experiment
+    published = CommandContracts.published
+    checks_of = CommandContracts.checks_of
+
+    def setUp(self):
+        self.lease = self.isolated()
+        self.core = sorted(os.sched_getaffinity(0))[-1]
+        self.report = temporary_directory(self) / "report"
+
+    def details_of(self, document):
+        """The detail of each named check in a result document."""
+        return {entry["name"]: entry["detail"] for entry in document["checks"]}
+
+    def run_body(self, body, **options):
+        """One run_case with this test's lease and report directory."""
+        return measure.run_case(
+            measure.harness_local_spec(),
+            temporary_directory(self),
+            experiment=body,
+            report_dir=self.report,
+            lease_path=self.lease,
+            **options,
+        )
+
+    def document(self):
+        """The published result of this test's run."""
+        return self.published(self.report)
+
+    # Scenario: a cargo build appears in procfs after the start snapshot,
+    # while traffic would be flowing, and exits before the run ends.
+    # Guarantees: the monitor sees it, the run stops itself cleanly, the
+    # detection is kept although the build is gone, and no baseline is
+    # written.
+    def test_a_build_appearing_midway_invalidates_the_run(self):
+        root = fake_proc(self)
+        measured = self.experiment(core=self.core)
+
+        def body(spec, result, output_dir, controls):
+            """Measure, then meet a build partway through."""
+            fake_process(root, 7000, "cargo", cmdline="cargo build --release")
+            _ = measurement.wait_until(
+                controls.monitor.invalid.is_set,
+                bool,
+                deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+                description="the monitor seeing the build",
+            )
+            shutil.rmtree(root / "7000")
+            controls.raise_if_invalid()
+            measured(spec, result, output_dir, controls)
+
+        # The isolated controls ignore real compilers on this machine; the
+        # injected tree is the only place this monitor may find one.
+        with mock.patch.object(measurement, "BUILD_COMMANDS", ("cargo",)):
+            with self.assertRaisesRegex(AssertionError, "invalidated while measuring"):
+                _ = self.run_body(body, proc_root=root)
+        document = self.document()
+        checks = self.checks_of(document)
+        self.assertEqual(checks["no_concurrent_build"], measurement.STATUS_FAILED)
+        self.assertIn(
+            7000,
+            [entry["pid"] for entry in document["environment"]["build_monitor"]["observations"]],
+        )
+        self.assertEqual(document["baseline_files"], [])
+
+    # Scenario: another run on this host already holds the measurement lease.
+    # Guarantees: the second run aborts before its body sends any traffic,
+    # names the holder's run, records the failed lease check and publishes
+    # no baseline.
+    def test_a_second_lease_holder_aborts_before_traffic(self):
+        holder = measurement.MeasurementLease(self.lease, run_id="other-run").acquire()
+        self.addCleanup(holder.release)
+        started = []
+
+        def body(*_arguments):
+            """A body that must never run."""
+            started.append(True)
+
+        with self.assertRaisesRegex(AssertionError, "other-run"):
+            _ = self.run_body(body)
+        self.assertEqual(started, [])
+        document = self.document()
+        self.assertEqual(
+            self.checks_of(document)["host_lease_held"],
+            measurement.STATUS_FAILED,
+        )
+        self.assertEqual(document["baseline_files"], [])
+
+    # Scenario: the core topology the run ends on differs from the one it
+    # started on.
+    # Guarantees: a changed CPU or core configuration fails the environment
+    # match and cannot become a baseline.
+    def test_a_changed_core_configuration_invalidates_the_run(self):
+        measured = self.experiment(core=self.core)
+        real = measurement.core_topology
+
+        def changed():
+            """The same machine reporting one sibling group fewer."""
+            topology = real()
+            topology["sibling_groups"] = topology["sibling_groups"][:-1]
+            topology["physical_core_count"] -= 1
+            return topology
+
+        def body(spec, result, output_dir, controls):
+            """Measure, with the end snapshot seeing another topology."""
+            original = controls.snapshot
+
+            def snapshot(edge, *arguments, **keywords):
+                """Take the end snapshot under the changed topology."""
+                if edge != "end":
+                    return original(edge, *arguments, **keywords)
+                with mock.patch.object(measurement, "core_topology", changed):
+                    return original(edge, *arguments, **keywords)
+
+            controls.snapshot = snapshot
+            measured(spec, result, output_dir, controls)
+
+        with self.assertRaisesRegex(AssertionError, "environment_matched"):
+            _ = self.run_body(body)
+        document = self.document()
+        self.assertEqual(
+            self.checks_of(document)["environment_matched"],
+            measurement.STATUS_FAILED,
+        )
+        self.assertIn("sibling_groups", document["environment"]["match"]["differences"])
+        self.assertEqual(document["baseline_files"], [])
+
+    # Scenario: a pinned worker is widened to a second core after the start
+    # snapshot, while the monitor watches it.
+    # Guarantees: the monitor's own tick catches the widened worker, so a
+    # pinning that holds only at the edges cannot validate a measurement.
+    def test_a_worker_widened_midway_fails_affinity(self):
+        first, second = two_cores(self)
+        widen = threading.Event()
+        widened = threading.Event()
+
+        def worker_body():
+            """A stand-in worker that widens itself when told."""
+            name_this_thread(
+                measurement.worker_thread_name("default", "main", first, 0)[
+                    : measurement.COMM_WIDTH
+                ]
+            )
+            os.sched_setaffinity(0, {first})
+            run_on(first)
+            state["tid"] = threading.get_native_id()
+            ready.set()
+            _ = widen.wait(10)
+            os.sched_setaffinity(0, {first, second})
+            widened.set()
+            _ = release.wait(10)
+
+        state = {}
+        ready = threading.Event()
+        release = threading.Event()
+        thread = threading.Thread(target=worker_body)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(ready.wait(10))
+
+        def body(_spec, result, _output_dir, controls):
+            """Map the worker, watch it, then widen it."""
+            roles = {"engine": (os.getpid(), [first])}
+            snapshot = controls.snapshot(
+                "start", roles, workers=[worker_identity(first)],
+                requested_cores=[first],
+            )
+            controls.watch_workers(os.getpid(), snapshot)
+            widen.set()
+            self.assertTrue(widened.wait(10))
+            _ = measurement.wait_until(
+                controls.monitor.invalid.is_set,
+                bool,
+                deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+                description="the monitor seeing the widened worker",
+            )
+            controls.raise_if_invalid()
+
+        with self.assertRaisesRegex(AssertionError, "invalidated while measuring"):
+            _ = self.run_body(body)
+        document = self.document()
+        self.assertEqual(
+            self.checks_of(document)["affinity_matched"],
+            measurement.STATUS_FAILED,
+        )
+        self.assertIn(
+            f"tid={state['tid']}",
+            self.details_of(document)["affinity_matched"],
+        )
+        self.assertEqual(document["baseline_files"], [])
+
+
+class LauncherContracts(unittest.TestCase):
+    """The topology and launcher options, checked before anything launches."""
+
+    def config(self, **options):
+        """One engine configuration with fixed ports and paths."""
+        return measurement.test_e2e.engine_config(
+            grpc_port=4317, data=Path("/runs/r/data"), **options
+        )
+
+    # Scenario: the buffered topology on one explicitly chosen core.
+    # Guarantees: the buffer sits between receiver and exporter with the
+    # measurement settings verbatim, including the explicit null max age,
+    # and the worker is pinned by a core_set naming exactly that core.
+    def test_the_buffered_graph_inserts_one_buffer(self):
+        config = self.config(
+            topology="buffered", buffer_path=Path("/runs/r/buffer"), cores=[3]
+        )
+        self.assertEqual(
+            measurement.test_e2e.graph_edges(config),
+            [("receiver", "buffer"), ("buffer", "exporter")],
+        )
+        nodes = config["groups"]["default"]["pipelines"]["main"]["nodes"]
+        self.assertEqual(
+            nodes["buffer"],
+            {
+                "type": "processor:durable_buffer",
+                "config": {
+                    "path": "/runs/r/buffer",
+                    "retention_size_cap": "1GiB",
+                    "size_cap_policy": "backpressure",
+                    "max_age": None,
+                    "otlp_handling": "pass_through",
+                },
+            },
+        )
+        self.assertEqual(
+            config["policies"]["resources"]["core_allocation"],
+            {"type": "core_set", "set": [{"start": 3, "end": 3}]},
+        )
+
+    # Scenario: a buffered engine is configured again for a restart, on a
+    # new receiver port, with the same cores and buffer directory, and the
+    # directory already holds retained data.
+    # Guarantees: the restart keeps the graph, the core ids and the buffer
+    # path, and building the configuration never touches retained data.
+    def test_a_restart_keeps_cores_graph_and_buffer_path(self):
+        retained = temporary_directory(self) / "buffer"
+        (retained / "core_3").mkdir(parents=True)
+        _ = (retained / "core_3" / "segment").write_bytes(b"retained")
+        before = measurement.test_e2e.engine_config(
+            grpc_port=4317, data=Path("/runs/r/data"), topology="buffered",
+            buffer_path=retained, cores=[3],
+        )
+        after = measurement.test_e2e.engine_config(
+            grpc_port=4318, data=Path("/runs/r/data"), topology="buffered",
+            buffer_path=retained, cores=[3],
+        )
+        self.assertEqual(
+            measurement.test_e2e.graph_edges(before),
+            measurement.test_e2e.graph_edges(after),
+        )
+        for key in ("policies",):
+            self.assertEqual(before[key], after[key])
+        nodes = lambda config: config["groups"]["default"]["pipelines"]["main"]["nodes"]
+        self.assertEqual(nodes(before)["buffer"], nodes(after)["buffer"])
+        self.assertEqual((retained / "core_3" / "segment").read_bytes(), b"retained")
+
+    # Scenario: a connection names two recipients, or asks to broadcast.
+    # Guarantees: a request that could reach more than one instance is
+    # refused before launch.
+    def test_multiple_recipient_routing_is_refused(self):
+        config = self.config()
+        pipeline = config["groups"]["default"]["pipelines"]["main"]
+        pipeline["connections"] = [{"from": "receiver", "to": ["exporter", "other"]}]
+        with self.assertRaisesRegex(AssertionError, "2 recipients"):
+            _ = measurement.test_e2e.graph_edges(config)
+        pipeline["connections"] = [
+            {"from": "receiver", "to": "exporter",
+             "policies": {"dispatch": "broadcast"}}
+        ]
+        with self.assertRaisesRegex(AssertionError, "dispatch policy"):
+            _ = measurement.test_e2e.graph_edges(config)
+
+    # Scenario: the fixture tests build their configuration without any of
+    # the new options.
+    # Guarantees: legacy calls produce exactly the configuration they always
+    # did.
+    def test_legacy_configuration_is_unchanged(self):
+        expected = measurement.test_e2e.yaml.safe_load(
+            (measurement.test_e2e.WORKSPACE / "configs/series-parquet-local.yaml").read_text()
+        )
+        nodes = expected["groups"]["default"]["pipelines"]["main"]["nodes"]
+        nodes["receiver"]["config"]["protocols"]["grpc"]["listening_addr"] = (
+            "127.0.0.1:4317"
+        )
+        nodes["exporter"]["config"]["storage"] = {"file": {"base_uri": "/runs/r/data"}}
+        nodes["exporter"]["config"]["window"]["interval"] = "1s"
+        nodes["exporter"]["config"]["unsupported"] = "drop"
+        self.assertEqual(self.config(overrides={"unsupported": "drop"}), expected)
+
+    # Scenario: a measurement overrides one nested exporter setting.
+    # Guarantees: the override is merged map by map, so the sibling settings
+    # of the example configuration are kept.
+    def test_measurement_overrides_are_deep_merged(self):
+        config = self.config(merge={"exporter": {"window": {"interval": "2s"}}})
+        window = config["groups"]["default"]["pipelines"]["main"]["nodes"][
+            "exporter"
+        ]["config"]["window"]
+        self.assertEqual(window["interval"], "2s")
+        self.assertEqual(window["max_block_bytes"], "500MiB")
+        with self.assertRaisesRegex(ValueError, "names no node"):
+            _ = self.config(merge={"nowhere": {}})
+
+    # Scenario: the local launcher starts a process.
+    # Guarantees: the PID it reports is the host PID of the process it
+    # started, which every RSS, affinity and kill operation uses.
+    def test_the_local_launcher_reports_the_host_pid(self):
+        launcher = measurement.test_e2e.LocalLauncher()
+        with open(os.devnull, "w", encoding="ascii") as log:
+            process = launcher.start(
+                [sys.executable, "-c", "pass"], log, dict(os.environ)
+            )
+        self.assertEqual(launcher.pid(process), process.pid)
+        self.assertEqual(process.wait(10), 0)
+
+
+class PlacementContracts(unittest.TestCase):
+    """Roles on physical cores of their own."""
+
+    groups = [[core, core + 16] for core in range(16)]
+
+    # Scenario: a one-worker run on a sixteen-core SMT machine.
+    # Guarantees: the observability core, the worker, the engine's reserved
+    # cores and every other role each own a whole physical core, and no
+    # role is given an SMT sibling of another role's core.
+    def test_roles_own_whole_physical_cores(self):
+        allocation = measurement.role_allocation(self.groups, range(32), [1])
+        self.assertEqual(
+            allocation,
+            {
+                "engine_observability": [0],
+                "engine": [1],
+                "engine_reserved": [2, 3, 4],
+                "producer": [5, 6],
+                "store": [7],
+                "reader": [8],
+            },
+        )
+        used = [core for cores in allocation.values() for core in cores]
+        self.assertFalse(set(used) & {core + 16 for core in used})
+
+    # Scenario: a worker is asked for on the observability core's sibling,
+    # or the machine has too few physical cores.
+    # Guarantees: a shared physical core is refused, and a strict placement
+    # that cannot fit raises instead of doubling roles up.
+    def test_shared_or_insufficient_cores_are_refused(self):
+        with self.assertRaisesRegex(AssertionError, "shares physical core"):
+            _ = measurement.role_allocation(self.groups, range(32), [16])
+        with self.assertRaisesRegex(AssertionError, "no physical core is left"):
+            _ = measurement.role_allocation(self.groups[:4], range(4), [1])
+        loose = measurement.role_allocation(
+            self.groups[:4], range(4), [1], strict=False
+        )
+        self.assertEqual(loose["engine"], [1])
+        self.assertEqual(loose["reader"], [])
+
+
+class ReconciliationContracts(unittest.TestCase):
+    """The RSS residual is signed, measured term by term, and bounded."""
+
+    def sample(self, *, rss, anonymous, heap, accounted, reported=True):
+        """One sample carrying the memory terms the residual reads."""
+        return {
+            "monotonic_ns": 0,
+            "procfs": {"smaps_rss_bytes": rss, "smaps_anonymous_bytes": anonymous},
+            "workers": {
+                "w": {
+                    "pipeline_memory_usage_bytes": heap,
+                    "gauges": {
+                        "memory.accounted_bytes": accounted,
+                        measurement.LIVENESS_GAUGE: 1 if reported else 0,
+                    },
+                }
+            },
+        }
+
+    # Scenario: RSS grows by code pages faulted in and by heap that the
+    # allocator keeps resident after it was freed.
+    # Guarantees: both are measured terms, so neither is a residual; only
+    # anonymous growth beyond the heap high-water mark remains.
+    def test_file_pages_and_retained_heap_are_explained(self):
+        MiB = 1024 * 1024
+        idle = self.sample(rss=100 * MiB, anonymous=40 * MiB, heap=5 * MiB, accounted=MiB)
+        peak = self.sample(rss=150 * MiB, anonymous=70 * MiB, heap=35 * MiB, accounted=20 * MiB)
+        after = self.sample(rss=150 * MiB, anonymous=70 * MiB, heap=6 * MiB, accounted=MiB)
+        residuals = measurement.rss_residuals([peak, after], idle)
+        self.assertEqual([entry["residual_bytes"] for entry in residuals], [0, 0])
+        self.assertEqual(residuals[0]["file_growth_bytes"], 20 * MiB)
+
+    # Scenario: resident memory grows well beyond every measured term.
+    # Guarantees: an unexplained positive residual above the frozen
+    # tolerance fails, and a sample the workers did not answer is skipped.
+    def test_an_unexplained_growth_fails(self):
+        MiB = 1024 * 1024
+        idle = self.sample(rss=100 * MiB, anonymous=40 * MiB, heap=5 * MiB, accounted=MiB)
+        grown = self.sample(rss=160 * MiB, anonymous=100 * MiB, heap=5 * MiB, accounted=MiB)
+        silent = self.sample(
+            rss=100 * MiB, anonymous=40 * MiB, heap=0, accounted=0, reported=False
+        )
+        residuals = measurement.rss_residuals([grown, silent], idle)
+        self.assertEqual(len(residuals), 1)
+        self.assertEqual(
+            measurement.residual_check(residuals, 160 * MiB)["status"],
+            measurement.STATUS_FAILED,
+        )
+
+    # Scenario: accounted heap is reported that is never resident, in most
+    # samples.
+    # Guarantees: a persistent negative residual is kept and fails; it is
+    # never clamped to zero.
+    def test_a_persistent_negative_residual_fails(self):
+        MiB = 1024 * 1024
+        idle = self.sample(rss=100 * MiB, anonymous=40 * MiB, heap=5 * MiB, accounted=MiB)
+        short = self.sample(rss=100 * MiB, anonymous=40 * MiB, heap=60 * MiB, accounted=MiB)
+        residuals = measurement.rss_residuals([short, short, short], idle)
+        self.assertLess(residuals[0]["residual_bytes"], 0)
+        self.assertEqual(
+            measurement.residual_check(residuals, 100 * MiB)["status"],
+            measurement.STATUS_FAILED,
+        )
+
+
+class FingerprintEphemeralContracts(unittest.TestCase):
+    """A declared per-run value is the one difference a fingerprint ignores."""
+
+    # Scenario: two runs differ only in the receiver's ephemeral port, which
+    # each declares; a third differs in an undeclared setting.
+    # Guarantees: the declared port does not separate the fingerprints, and
+    # an undeclared difference still does.
+    def test_declared_ephemeral_values_are_canonicalized(self):
+        def result_with(port, interval="15s"):
+            """A result whose effective config names one listening port."""
+            document = measured_result()
+            document["config"]["effective"] = {
+                "receiver": {"listening_addr": f"127.0.0.1:{port}"},
+                "window": {"interval": interval},
+            }
+            document["ephemeral_values"] = {"<receiver_listening_addr>": f"127.0.0.1:{port}"}
+            return document
+
+        first = measurement.baseline_fingerprint(result_with(40001))
+        self.assertEqual(first, measurement.baseline_fingerprint(result_with(40002)))
+        self.assertNotEqual(
+            first, measurement.baseline_fingerprint(result_with(40002, interval="1s"))
         )
 
 

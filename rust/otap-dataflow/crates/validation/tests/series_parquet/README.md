@@ -22,14 +22,31 @@ python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
 python3 -m crates.validation.tests.series_parquet.measure run \
   --case harness-contracts --output-dir /tmp/series-contracts
 
+# The smallest real-engine measurement, under the enforced host controls.
+python3 -m crates.validation.tests.series_parquet.measure run \
+  --case harness-local --output-dir /tmp/series-measure
+
+# The launcher lane: the original suite with Docker required, then a strict
+# and a buffered local smoke; the buffered one restarts its engine on the
+# same cores and the same retained buffer directory halfway through.
+python3 -m crates.validation.tests.series_parquet.measure run \
+  --case launcher-ci --output-dir /tmp/series-launcher
+
 # Stage one published evidence tree by exact file name, before a commit.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
   --index ../../docs/superpowers/reports/series-parquet-measurement/harness-contracts.json
 ```
 
-`run --case harness-local` is registered and its spec validates, but its
-measured body arrives with the topology, launcher and enforced host controls
-of plan 3 task 2. The remaining subcommands (`stages`, `attribution`,
+Case options are passed as `--option name=value`, decoded as JSON when they
+parse: `report_dir` publishes somewhere other than the committed report
+directory, `ordinal` numbers a repeated trial, `cores` pins the workers to
+explicit core ids. `launcher-ci` also takes `legacy_tests=false` to skip the
+original suite and `publish=false`, the CI mode for a runner that is not a
+publishable measurement host: nothing reaches the report directory, no
+baseline is evaluated, and the index passes on delivery, graph, restart,
+affinity and sample checks alone, with every validity failure still recorded.
+
+The remaining subcommands (`stages`, `attribution`,
 `capacity`, `memory`, `soak`, `fault-preflight`, `failures`, `buffered`,
 `remediate`, `report`) are named here so the command line is one contract;
 each is implemented by its own task.
@@ -42,7 +59,8 @@ each is implemented by its own task.
 | `SERIES_REQUIRE_DOCKER` | `1` makes missing images and Docker a failure rather than a skip. |
 | `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling a failure rather than a skip. |
 | `SERIES_MEASURE_LONG` | `1` opts in to throughput sweeps, profiled memory runs, the soak and long failure runs. |
-| `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-measure-host.lease`. |
+| `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-parquet-host-measurement.lock`, shared by every checkout and launcher on the host. |
+| `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series_parquet,aws,durable-buffer` and `jemalloc`. |
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
@@ -78,12 +96,48 @@ each of them once.
   epoch resets the empty streak, because an unobserved epoch may have been
   busy, and the drain report records how many such epochs it saw.
 - **Environment.** Every run records a start and an end snapshot with the CPU
-  model, logical and physical core counts, total RAM, kernel, load averages
-  and the observed per-thread affinity from `/proc/PID/task/*/status`. A
+  model, logical and physical core counts, SMT sibling groups, the cores the
+  run may use, total RAM, kernel, load averages and the observed per-thread
+  affinity from `/proc/PID/task/*/status`. Any difference between the two
+  snapshots in machine or core configuration invalidates the run. A
   requested-versus-observed affinity mismatch or an ambiguous worker mapping
-  aborts the run. A concurrent compiler or image build invalidates it, and
-  nobody else's process is ever stopped. One exclusive host lease covers the
-  whole run.
+  aborts it.
+- **Host lease.** One exclusive `flock` on
+  `/tmp/series-parquet-host-measurement.lock` covers the whole run, from
+  before the engine starts until after the end snapshot. A busy lease aborts
+  the run before any traffic, and the lock file records the holder's PID,
+  process start time and run id.
+- **Placement.** Roles own whole physical cores: the engine's observability
+  pipeline takes the first core the engine may use, the workers take theirs
+  through a `core_set`, the rest of the engine's four-core reservation is
+  kept free, and the producer (two cores), store and reader (one each)
+  follow. No role is given an SMT sibling of another role's core. A
+  publishable run needs eight available physical cores.
+- **Monitor.** `host_monitor.py` runs as its own process, so a busy harness
+  cannot stretch its schedule. Every 50 ms it scans procfs for compilers,
+  linkers and container build clients, and for any process descending from
+  a build daemon; an idle `buildkitd` is not a build. It re-checks every
+  mapped worker thread's allowed cores on each tick. A tick gap over 100 ms,
+  a procfs that hides other processes, or a Docker that is installed but
+  cannot be asked about builder containers makes the coverage incomplete and
+  the run invalid. Any build seen after preflight invalidates the run even
+  if it has gone by the end; the run stops itself, keeps the evidence and
+  never stops anybody else's process.
+- **Topologies and launchers.** `Engine` takes keyword-only `topology`
+  (`strict` or `buffered`), `buffer_path`, `cores`, `launcher` and `merge`;
+  every old call is unchanged. The buffered topology inserts one
+  `processor:durable_buffer` with `size_cap_policy: backpressure` and
+  `max_age: null`; every connection must have exactly one recipient and no
+  dispatch policy. A launcher provides `start(argv, log, env)` and
+  `pid(process)`, and every RSS, affinity and kill operation uses the host
+  PID it reports. A restart reuses the same cores and the same buffer
+  directory, and the run checks both.
+- **RSS reconciliation.** Every term is measured: the resident set at
+  readiness, the growth of file-backed resident pages, and the high-water
+  mark of the workers' heap as the engine's allocation tracking counts it,
+  which includes the exporter's accounted bytes. The signed remainder of the
+  anonymous growth is the residual; above `max(32MiB, 0.10 * peak RSS)` in
+  any sample, or persistently below its negative, it fails the run.
 - **Units.** Every metric name ends in its unit (`_bytes`, `_s`, `_ns`,
   `_records_per_s`, `_cpu_ns_per_record`, ...). An unavailable value is null
   with a reason and never zero, and a passed run cannot be missing a
@@ -131,7 +185,7 @@ directory.
 ## Reproducing a measurement
 
 1. Build the engine with the features the case needs:
-   `cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws`.
+   `cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer`.
 2. Read the run's `environment` block. Match the machine, the core
    allocation and the build profile, or expect a new baseline rather than a
    comparison.

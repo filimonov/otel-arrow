@@ -4,6 +4,7 @@
 import collections
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -127,6 +128,180 @@ def metric_request(request_id, unsupported=False):
     return req
 
 
+class LocalLauncher:
+    """Start the engine as a child process of this harness, on this host.
+
+    A launcher owns only how the engine process starts and which host PID
+    it has. Every RSS, affinity and kill operation uses that host PID, so a
+    container launcher returns the engine's host PID, never the PID of a
+    Docker CLI that happens to wait for it.
+    """
+
+    kind = "local"
+
+    def start(self, argv, log, env):
+        """Start `argv` with its output in `log` and return the process."""
+        return subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env)
+
+    def pid(self, process):
+        """The host PID of the engine this launcher started."""
+        return process.pid
+
+
+TOPOLOGIES = ("strict", "buffered")
+
+# The node the buffered topology inserts between the receiver and the
+# exporter, and the settings every buffered measurement runs with: a bounded
+# retention that pushes back rather than dropping, and no age limit, so that
+# nothing retained is ever discarded for being old.
+BUFFER_NODE = "buffer"
+BUFFER_RETENTION_SIZE_CAP = "1GiB"
+
+
+def deep_merge(base, patch):
+    """Merge `patch` into `base` in place, map by map, and return `base`.
+
+    A nested map is merged key by key; any other value, lists included,
+    replaces what was there. An explicit `None` is kept as a setting.
+    """
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def engine_config(
+    *,
+    grpc_port,
+    data,
+    storage=None,
+    overrides=None,
+    interval="1s",
+    telemetry_interval=None,
+    log_level=None,
+    topology="strict",
+    buffer_path=None,
+    cores=None,
+    merge=None,
+):
+    """The complete configuration one engine launch serializes.
+
+    Without the keyword-only measurement settings this is exactly the
+    configuration the fixture tests always ran. `topology="buffered"`
+    inserts the durable buffer between the receiver and the exporter,
+    `cores` pins one worker to each named core through a `core_set`, and
+    `merge` deep-merges nested maps into the named nodes' configurations
+    (and `engine` into the engine section). The result is what gets hashed
+    and recorded, so nothing is changed after it is returned.
+    """
+    if topology not in TOPOLOGIES:
+        raise ValueError(f"topology must be one of {TOPOLOGIES}: {topology}")
+    config = yaml.safe_load(
+        (WORKSPACE / "configs/series-parquet-local.yaml").read_text()
+    )
+    pipeline = config["groups"]["default"]["pipelines"]["main"]
+    nodes = pipeline["nodes"]
+    nodes["receiver"]["config"]["protocols"]["grpc"]["listening_addr"] = (
+        f"127.0.0.1:{grpc_port}"
+    )
+    export = nodes["exporter"]["config"]
+    export["storage"] = storage or {"file": {"base_uri": str(data)}}
+    export["window"]["interval"] = interval
+    if overrides:
+        for key, value in overrides.items():
+            export[key] = value
+    if log_level:
+        # Set explicitly rather than through RUST_LOG, which the engine
+        # only consults when the configuration omits a level: a test that
+        # reads a DEBUG event must not depend on the caller's environment.
+        config["engine"]["telemetry"]["logs"] = {"level": log_level}
+    if telemetry_interval:
+        # The exporter's gauges are sampled when the engine collects
+        # telemetry, so a test that has to observe a short-lived state
+        # needs the collection to be faster than that state.
+        config["engine"]["telemetry"]["reporting_interval"] = telemetry_interval
+    if topology == "buffered":
+        if buffer_path is None:
+            raise ValueError("the buffered topology needs an explicit buffer_path")
+        nodes[BUFFER_NODE] = {
+            "type": "processor:durable_buffer",
+            "config": {
+                "path": str(buffer_path),
+                "retention_size_cap": BUFFER_RETENTION_SIZE_CAP,
+                "size_cap_policy": "backpressure",
+                "max_age": None,
+                "otlp_handling": "pass_through",
+            },
+        }
+        # A single destination resolves to `one_of` in the configuration
+        # API, so each request reaches exactly one buffer instance.
+        pipeline["connections"] = [
+            {"from": "receiver", "to": BUFFER_NODE},
+            {"from": BUFFER_NODE, "to": "exporter"},
+        ]
+    elif buffer_path is not None:
+        raise ValueError("buffer_path is only meaningful for the buffered topology")
+    if cores is not None:
+        cores = [int(core) for core in cores]
+        if not cores or len(set(cores)) != len(cores):
+            raise ValueError(f"cores must name distinct core ids: {cores}")
+        config["policies"]["resources"]["core_allocation"] = {
+            "type": "core_set",
+            "set": [{"start": core, "end": core} for core in cores],
+        }
+    for name, patch in (merge or {}).items():
+        if name == "engine":
+            deep_merge(config["engine"], patch)
+        elif name in nodes:
+            deep_merge(nodes[name].setdefault("config", {}), patch)
+        else:
+            raise ValueError(f"a merged override names no node: {name}")
+    return config
+
+
+def graph_edges(config):
+    """The measured pipeline's edges, each checked to have one recipient.
+
+    Every connection must name a single destination and no dispatch policy,
+    so each request reaches exactly one instance downstream; a broadcast or
+    a multiple-recipient connection is refused here, before launch.
+    """
+    pipeline = config["groups"]["default"]["pipelines"]["main"]
+    edges = []
+    for connection in pipeline["connections"]:
+        target = connection["to"]
+        if isinstance(target, list):
+            if len(target) != 1:
+                raise AssertionError(
+                    f"connection {connection} has {len(target)} recipients; a "
+                    f"measured request must reach exactly one instance"
+                )
+            target = target[0]
+        if (connection.get("policies") or {}).get("dispatch") is not None:
+            raise AssertionError(
+                f"connection {connection} sets a dispatch policy; a measured "
+                f"request must reach exactly one instance"
+            )
+        edges.append((connection["from"], target))
+    sources = collections.Counter(source for source, _ in edges)
+    targets = collections.Counter(target for _, target in edges)
+    fanned = sorted(
+        name for name, count in list(sources.items()) + list(targets.items())
+        if count > 1
+    )
+    if fanned:
+        raise AssertionError(f"nodes {fanned} fan out or in; the graph is {edges}")
+    return edges
+
+
+EXPECTED_EDGES = {
+    "strict": [("receiver", "exporter")],
+    "buffered": [("receiver", BUFFER_NODE), (BUFFER_NODE, "exporter")],
+}
+
+
 class Engine:
     """A real `df_engine` process running the series Parquet example config."""
 
@@ -138,44 +313,55 @@ class Engine:
         interval="1s",
         telemetry_interval=None,
         log_level=None,
+        *,
+        topology="strict",
+        buffer_path=None,
+        cores=None,
+        launcher=None,
+        merge=None,
     ):
         self.root = Path(directory)
         self.data = self.root / "data"
         self.data.mkdir(exist_ok=True)
         self.grpc_port = free_port()
         self.admin_port = free_port()
-        self.config = yaml.safe_load(
-            (WORKSPACE / "configs/series-parquet-local.yaml").read_text()
+        self.topology = topology
+        self.cores = None if cores is None else [int(core) for core in cores]
+        # The buffer directory is used as given. A restart passes the same
+        # path again and finds its retained segments; nothing here creates a
+        # fresh one or replaces what is already there.
+        self.buffer_path = None if buffer_path is None else Path(buffer_path)
+        self.launcher = launcher or LocalLauncher()
+        self.config = engine_config(
+            grpc_port=self.grpc_port,
+            data=self.data,
+            storage=storage,
+            overrides=overrides,
+            interval=interval,
+            telemetry_interval=telemetry_interval,
+            log_level=log_level,
+            topology=topology,
+            buffer_path=self.buffer_path,
+            cores=self.cores,
+            merge=merge,
         )
-        nodes = self.config["groups"]["default"]["pipelines"]["main"]["nodes"]
-        nodes["receiver"]["config"]["protocols"]["grpc"]["listening_addr"] = (
-            f"127.0.0.1:{self.grpc_port}"
-        )
-        export = nodes["exporter"]["config"]
-        export["storage"] = storage or {"file": {"base_uri": str(self.data)}}
-        export["window"]["interval"] = interval
-        if overrides:
-            for key, value in overrides.items():
-                export[key] = value
-        if log_level:
-            # Set explicitly rather than through RUST_LOG, which the engine
-            # only consults when the configuration omits a level: a test that
-            # reads a DEBUG event must not depend on the caller's environment.
-            self.config["engine"]["telemetry"]["logs"] = {"level": log_level}
-        if telemetry_interval:
-            # The exporter's gauges are sampled when the engine collects
-            # telemetry, so a test that has to observe a short-lived state
-            # needs the collection to be faster than that state.
-            self.config["engine"]["telemetry"]["reporting_interval"] = (
-                telemetry_interval
+        self.edges = graph_edges(self.config)
+        if self.edges != EXPECTED_EDGES[topology]:
+            raise AssertionError(
+                f"the {topology} graph is {self.edges}, expected "
+                f"{EXPECTED_EDGES[topology]}"
             )
         self.path = self.root / "pipeline.yaml"
         self.path.write_text(yaml.safe_dump(self.config))
+        # The hash of the exact file the engine reads, so a result records
+        # the configuration that ran rather than the one that was meant.
+        self.config_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
         binary = Path(os.environ.get("DF_ENGINE", WORKSPACE / "target/debug/df_engine"))
         if not binary.is_file():
             raise AssertionError(f"build the feature-enabled engine first: {binary}")
+        self.binary = binary
         self.log = (self.root / "engine.log").open("w+")
-        self.process = subprocess.Popen(
+        self.process = self.launcher.start(
             [
                 str(binary),
                 "--config",
@@ -183,9 +369,10 @@ class Engine:
                 "--http-admin-bind",
                 f"127.0.0.1:{self.admin_port}",
             ],
-            stdout=self.log,
-            stderr=subprocess.STDOUT,
+            self.log,
+            dict(os.environ),
         )
+        self.pid = self.launcher.pid(self.process)
         self.channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
         try:
             grpc.channel_ready_future(self.channel).result(timeout=30)
@@ -911,12 +1098,16 @@ class AlloyProducer:
     owns the one value its own timing depends on.
     """
 
-    def __init__(self, directory, engine, timeout=ALLOY_ATTEMPT_TIMEOUT):
+    def __init__(self, directory, engine, timeout=ALLOY_ATTEMPT_TIMEOUT, *,
+                 admin_port=None):
         self.root = Path(directory) / "alloy"
         self.engine = engine
         self.timeout = timeout
         self.name = "series-alloy-" + uuid.uuid4().hex
         self.container = None
+        # Alloy's own HTTP server, which serves readiness and its metrics.
+        # A measurement may choose the port; otherwise a free one is taken.
+        self.admin_port = admin_port
 
     def __enter__(self):
         if not sys.platform.startswith("linux"):
@@ -927,7 +1118,8 @@ class AlloyProducer:
         self.lines.write_text("")
         config = self.root / "config.alloy"
         config.write_text((WORKSPACE / "configs/series-parquet.alloy").read_text())
-        port = free_port()
+        port = self.admin_port or free_port()
+        self.admin_port = port
         args = [
             "docker", "run", "--pull=never", "--detach", "--name", self.name,
             "--network", "host", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -978,6 +1170,69 @@ class AlloyProducer:
             timeout=10,
         )
         return done.stdout + done.stderr
+
+    def host_pid(self):
+        """The host PID of the Alloy process inside its container.
+
+        Docker reports the container's init process as seen from the host,
+        which is Alloy itself because the image runs it directly. RSS and
+        affinity are read from this PID, never from the Docker CLI.
+        """
+        if not self.container:
+            raise AssertionError("Alloy is not running")
+        pid = int(
+            subprocess.check_output(
+                ["docker", "inspect", "--format", "{{.State.Pid}}", self.container],
+                text=True,
+                timeout=10,
+            ).strip()
+        )
+        if pid <= 0:
+            raise AssertionError(f"Alloy container reports host pid {pid}")
+        return pid
+
+    # The sending-queue series Alloy's exporter publishes. `send_failed` is
+    # deliberately not among the reliable ones: with the shipped infinite
+    # retry it counts only sends the exporter gave up on, which is none.
+    QUEUE_METRICS = {
+        "otelcol_exporter_queue_size": "queue_size_records",
+        "otelcol_exporter_queue_capacity": "queue_capacity_records",
+        "otelcol_exporter_enqueue_failed_log_records": "enqueue_failed_records",
+    }
+
+    def queue_metrics(self):
+        """Alloy's sending-queue occupancy, capacity and enqueue failures.
+
+        Read from Alloy's own metrics endpoint and restricted to the series
+        exporter's logs queue. A series Alloy does not publish -- the enqueue
+        failure counter appears only after a first failure -- is reported as
+        None, never as zero. `send_failed_log_records` is returned for reference only,
+        under a name that says it is not a loss counter.
+        """
+        url = f"http://127.0.0.1:{self.admin_port}/metrics"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            body = response.read().decode("ascii", "replace")
+        found = dict.fromkeys(self.QUEUE_METRICS.values())
+        found["send_failed_records_unreliable"] = None
+        for line in body.splitlines():
+            # The exporter keeps one queue per data type; this producer only
+            # sends logs, so the logs queue is the one it fills.
+            if (
+                line.startswith("#")
+                or "otelcol.exporter.otlp.series" not in line
+                or 'data_type="logs"' not in line
+            ):
+                continue
+            name = line.split("{", 1)[0]
+            value = float(line.rsplit(" ", 1)[-1])
+            if name in self.QUEUE_METRICS:
+                key = self.QUEUE_METRICS[name]
+                found[key] = (found[key] or 0) + value
+            elif name == "otelcol_exporter_send_failed_log_records":
+                found["send_failed_records_unreliable"] = (
+                    found["send_failed_records_unreliable"] or 0
+                ) + value
+        return found
 
     def export_failures(self):
         """Alloy's own record of an export it tried and the engine refused.
