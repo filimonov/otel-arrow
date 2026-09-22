@@ -1,11 +1,16 @@
 # Series Parquet Exporter: Design
 
 Date: 2026-09-21
-Status: approved for planning (revision 4, after three rounds of external
+Status: approved for planning (revision 5, after three rounds of external
 review)
 Scope: phases 1 and 2 of the series lake work (core crate and Dataflow
 exporter). Introspection HTTP API and traces are separate specs; section 10
 records what was deferred and why.
+
+What changed in revision 5: merged metrics values (5.1), request cost model
+(5.6), workers, sources and threading (6.8), network distribution and
+producer timeouts (7.6), and the deferred shared writer with parallel
+preparation (10.4).
 
 ## 1. Problem
 
@@ -276,14 +281,13 @@ representation hashes identically.
 
 ### 5.1 Datasets
 
-Five datasets, one Parquet schema each:
+Four datasets, one Parquet schema each:
 
 ```text
 signal=logs/dataset=series
 signal=logs/dataset=values
 signal=metrics/dataset=series
-signal=metrics/dataset=number
-signal=metrics/dataset=histogram
+signal=metrics/dataset=values
 ```
 
 Later additions (`dataset=exp_histogram`, `dataset=summary`,
@@ -342,7 +346,7 @@ attrs                    MAP<STRING, STRING>  # log attributes outside the allow
 # denormalized columns (section 5.2)
 ```
 
-`metrics/number`:
+`metrics/values` (number and histogram points share one schema):
 
 ```text
 metric_name           STRING               # required, dictionary encoded
@@ -353,23 +357,34 @@ start_time_unix_nano  INT64 null
 flags                 INT32
 value_int             INT64  null          # set when the point carries as_int
 value_double          DOUBLE null          # set when the point carries as_double
-# both null when the point carries no value; flags are stored as received
-# and never inferred
+count                 INT64 null
+sum                   DOUBLE null
+min                   DOUBLE null
+max                   DOUBLE null
+bucket_counts         LIST<INT64> null     # empty for histogram without distribution
+explicit_bounds       LIST<DOUBLE> null    # empty for histogram without distribution
 # denormalized columns
 ```
 
-`metrics/histogram`:
+`value_int` and `value_double` are null for histogram points; `count`,
+`sum`, `min`, `max`, `bucket_counts` and `explicit_bounds` are null for
+number points. For a number point carrying no value, both value columns
+are null; flags are stored as received and never inferred. Histogram
+optionality is unchanged: `sum`, `min` and `max` may be absent, and a
+histogram without a distribution has empty lists, not null lists. The point
+kind is not duplicated in the values row: it is already `metric_type` in
+the series descriptor, obtained through the same join the reader already
+performs (section 5.5). Every other column is unchanged.
 
-```text
-metric_name, time, time_unix_nano, start_time, start_time_unix_nano, flags
-count            INT64
-sum              DOUBLE null
-min              DOUBLE null
-max              DOUBLE null
-bucket_counts    LIST<INT64>             # empty when the point has no distribution
-explicit_bounds  LIST<DOUBLE>            # empty when the point has no distribution
-# denormalized columns
-```
+With separate number and histogram datasets, a mixed metrics stream
+(gauges, counters and histograms from the same sources) costs two PUTs per
+window even when every descriptor is already cached. The goal is one PUT
+per window per signal in steady state. An all-null column inside a row
+group costs only definition levels plus the column-chunk metadata, far
+less than a second file's footer, metadata and request. The tradeoff is
+that min/max statistics on `value_double` become less selective when half
+the rows are null. Logs and metrics in one pipeline still cost one file
+per signal because their schemas differ.
 
 Counts use signed 64-bit integers because Spark maps Parquet `UINT64` to
 `DECIMAL(20,0)` while DuckDB maps it to `UBIGINT`; OTLP counts never
@@ -464,6 +479,8 @@ both recipes and how to detect incompatible mixes.
 ```text
 <base>/v=1/signal=logs/dataset=values/date=2026-09-21/hour=03/
     part-20260921T031500Z-<writer_id>-<boot_id>-<seq>.parquet
+<base>/v=1/signal=metrics/dataset=values/date=2026-09-21/hour=03/
+    part-20260921T031500Z-<writer_id>-<boot_id>-<seq>.parquet
 ```
 
 - `date` and `hour` (two digits, zero-padded) come from the block's
@@ -474,10 +491,9 @@ both recipes and how to detect incompatible mixes.
   Retries overwrite the same names with the same content; `boot_id` makes
   collisions with other blocks or processes impossible in practice. No
   conditional-put semantics are used.
-- No manifest. Within a block the `series` file is written first, then the
-  values files in the fixed order `values` (logs) or `number`, `histogram`
-  (metrics). Completed objects become visible atomically per object (object
-  store semantics).
+- No manifest. Within a block, for each signal the `series` file is written
+  first, then its single `values` file. Completed objects become visible
+  atomically per object (object store semantics).
 - Visibility guarantees, stated narrowly: readers may observe a block
   partially (some files present) while it is being written or after a
   permanent failure; rows of a nacked request may therefore exist in storage
@@ -526,6 +542,69 @@ dataset of the same signal in partition `P`, written by `W`, and that
 descriptor became visible before the values file. A reader that lists values
 files first and series files second therefore always finds descriptors for
 what it read.
+
+For metrics, use the same canonical view over
+`signal=metrics/dataset=series` and join the single
+`signal=metrics/dataset=values` dataset on `series_id`. The join supplies
+the point kind for both number and histogram rows:
+
+```sql
+WITH series AS (
+  SELECT * FROM read_parquet(
+    '<base>/v=1/signal=metrics/dataset=series/**/*.parquet',
+    hive_partitioning = true, union_by_name = true, filename = true)
+  QUALIFY row_number() OVER
+    (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) = 1
+)
+SELECT v.*, s.metric_type
+FROM read_parquet('<base>/v=1/signal=metrics/dataset=values/**/*.parquet',
+                  hive_partitioning = true, union_by_name = true) AS v
+JOIN series AS s USING (series_id)
+```
+
+The Spark recipe uses the same paths, `mergeSchema` and canonical
+descriptor selection; it needs no union of separate point-kind datasets.
+
+### 5.6 Request cost model
+
+Assumptions: S3 Standard, PUT at 0.005 USD per 1000 requests, a 30-day
+month, and one writer is one pipeline worker (section 6.8). One signal
+writes one values file per window; the file stays below
+`upload.part_bytes`, so one file is one PUT. With a stable series set,
+`series` is written once per hour partition.
+
+The files/hour column counts values files; monthly PUTs include `series`.
+The 100-writer and 1000-writer columns multiply the stated USD/writer
+figures by 100 and 1000.
+
+| Window interval | Values files/hour/writer | PUT/month/writer | USD/month/writer | USD/month, 100 writers | USD/month, 1000 writers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5 s | 720 | 519120 | 2.60 | 260.00 | 2600.00 |
+| 15 s | 240 | 173520 | 0.87 | 87.00 | 870.00 |
+| 20 s | 180 | 130320 | 0.65 | 65.00 | 650.00 |
+| 30 s | 120 | 87120 | 0.44 | 44.00 | 440.00 |
+| 60 s | 60 | 43920 | 0.22 | 22.00 | 220.00 |
+| 120 s | 30 | 22320 | 0.11 | 11.00 | 110.00 |
+
+The `series` contribution is 720 PUT/month/writer regardless of the
+window. Before the merge in section 5.1, the values figures for a mixed
+number and histogram stream were exactly double; the `series` contribution
+was unchanged.
+
+Three things change the picture:
+
+- Every window containing a new series adds one PUT; churn dominates at
+  short windows.
+- Logs plus metrics in one pipeline roughly doubles the total, because
+  each signal writes its own file set.
+- A file above `part_bytes` becomes a multipart upload: one Create, one
+  UploadPart per part and one Complete.
+
+Request cost has a fixed part (writers times windows), which shrinks by
+using fewer, larger workers, and a variable part (total bytes divided by
+`part_bytes`), which shrinks by raising `part_bytes` at the cost of buffer
+memory. Below about 15 s, files become too small for efficient row groups
+and multiply the reader's and compactor's work.
 
 ## 6. Buffering, memory and flush
 
@@ -747,6 +826,46 @@ interleaved at chunk granularity (`merge_chunk_bytes`) through the awaits on
 the writer and the upload. A test measures shutdown latency under a
 saturated inbox and asserts it stays below a documented bound.
 
+### 6.8 Workers, sources and threading
+
+One writer is one pipeline worker, not one source. The OTLP receiver
+accepts from arbitrarily many producers; `producer_id` comes from a
+per-record resource attribute (section 5.1), not from the connection.
+Hundreds or thousands of sources share one writer and one file set. The
+number of sources does not enter the cost model; it affects series
+cardinality and bytes per window.
+
+Workers are shared-nothing: each runs on its own `LocalSet` with `!Send`
+nodes and `Rc` state, its own writer id and boot id, its own series cache
+and its own budgets. Total retained request memory is workers times
+(ACTIVE + FLUSHING + one pending request + completion tokens); the cache
+and workspace terms in section 6.6 also apply per worker.
+
+Inside a worker, execution is single-threaded. The exporter's admission
+state needs no mutex and no atomic on the hot path. The flush runs as a
+`spawn_local` task interleaved with admission on the same thread, which
+makes the ACTIVE/FLUSHING overlap possible. Parquet encoding and ZSTD run
+inline in that task, so encoding sets the per-core throughput ceiling,
+not I/O concurrency. Yield points between merge chunks keep control
+messages and cancellation responsive; measuring this ceiling is plan 3's
+job. `upload.concurrency` bounds in-flight multipart parts: request
+concurrency, not threads.
+
+These execution properties follow from `engine/src/runtime_pipeline.rs`
+(current-thread runtime and `LocalSet`),
+`core-nodes/src/exporters/series_parquet/worker.rs` and `flush.rs`
+(per-worker state and `spawn_local`), and `series-lake/src/sink.rs`
+(inline encoding, chunk yields and multipart concurrency).
+
+Consequences:
+
+- The same series arriving at two workers is described by both. Descriptor
+  rows are duplicated between writers, harmless for readers taking the
+  latest descriptor per series id (section 5.5), but inflating `series`
+  volume.
+- There is no work stealing. A hot producer pinned to one worker saturates
+  that core while others idle.
+
 ## 7. Dataflow integration
 
 In v1, the shutdown deadline is supplied by the admin shutdown API timeout; a
@@ -924,6 +1043,48 @@ sum of `memory.accounted_bytes` over all workers. A growing unaccounted
 value is the signal that the bound is being bypassed by Arrow, the allocator
 or `object_store`. The README states the memory bound as part of the public
 contract, with the process-level formula.
+
+### 7.6 Network distribution and producer timeouts
+
+The engine creates a `SO_REUSEPORT` listener per worker on the same port
+(`engine/src/effect_handler.rs`). The kernel distributes TCP connections
+by a hash of the connection four-tuple. This distributes connections, not
+requests; it is a lottery rather than a balancer.
+
+For ten sources with one connection each:
+
+| Workers | Connections held by the busiest worker, of 10 | Probability that some worker is idle |
+| ---: | ---: | ---: |
+| 2 | 6.2 | 0 percent |
+| 4 | 4.2 | 22 percent |
+| 8 | 3.0 | 97 percent |
+
+More workers than sources leaves workers idle, and a skew like 5/3/2/0 is
+ordinary. A gRPC connection is long lived and multiplexes requests as
+HTTP/2 streams, so its assignment is sticky until the producer reconnects.
+This helps descriptor locality (a source's series are described by one
+writer) and hurts balance (a hot source is stuck on one core).
+Per-connection stream concurrency follows `max_concurrent_streams`, which
+tracks `max_concurrent_requests` by default
+(`otap/src/otap_grpc/common.rs`).
+
+The binding operational constraint is the producer timeout. With
+`wait_for_result: true`, the response is held until the request's rows are
+durable. A request arriving just after a rotation waits nearly a whole
+window plus the flush. The producer's timeout must exceed
+`window.interval` plus the flush time by a clear margin; the reference
+configuration uses 180 s (section 7.2 gives the full receiver-side bound).
+A shorter timeout makes the producer give up and resend, safe under
+at-least-once delivery but multiplying traffic and rows. This was observed
+with a six-second exporter timeout in the outage test, which produced
+deadline errors and duplicate rows.
+
+Mitigations for skew: fewer and larger workers (also cheaper by section
+5.6), a client configured with several endpoints and a round-robin policy
+instead of a single connection, or an L7 proxy balancing per request.
+Periodic reconnection would reshuffle the hash, but the gRPC server
+currently exposes keepalive settings (TCP and HTTP/2), not a maximum
+connection age.
 
 ## 8. Error handling
 
@@ -1180,6 +1341,59 @@ end-to-end topology of section 9.4:
 
 The "canary ready" gate of section 9.7 depends on this program.
 
+### 10.4 Shared writer with parallel preparation
+
+Proposal: one writer per process instead of one per worker. Workers keep
+doing extraction and series computation thread-locally. At the flush
+deadline a w-way merge combines every worker's sorted runs, row groups are
+built once, and the result goes out as a multipart upload with several
+parts in parallel when large, or a single PUT when small.
+
+With eight workers and a 15 s window, this gives one file set per window
+instead of eight: PUTs divided by eight, eight times fewer files for
+readers and compaction, better compression because dictionaries and RLE
+see more rows, sharper row-group statistics, and no duplicate descriptors
+between writers.
+
+Obstacles:
+
+- `Block`, `Extracted` and the sink live in the engine's `!Send` LocalSet
+  ownership path. The flush shares `Block` and the sink through `Rc`;
+  `Extracted` is owned worker-local data. Ownership shared across threads
+  must move from `Rc` to `Arc`, and the block's thread-local accounting
+  must become transferable. Arrow arrays are already Arc-based, so no
+  data copy is required, but the ownership change is pervasive.
+- Effect handlers are per worker and `!Send`. The writer cannot
+  acknowledge another worker's tokens and must signal durable completion
+  back to each worker, which complicates shutdown ordering.
+- The ACTIVE plus FLUSHING invariant becomes process-wide and needs a
+  global reservation.
+- The blast radius of a failed write grows from one worker to every
+  worker of that window.
+
+If built, share the writer but NOT the cache. Keep per-worker caches and
+deduplicate descriptors during the merge, which already runs ordered by
+series id. This is correct because a per-worker cache errs only in the
+safe direction: it skips emission only for a series it saw committed in
+this partition. With a shared writer, "committed" is a global fact, so a
+worker may over-emit, which the merge removes, but can never under-emit.
+This keeps the per-request hot path lock-free; a shared LRU would have to
+be sharded because recency mutates on read.
+
+The merge stays sequential and is cheap: key comparison and interleave.
+The expensive part is encoding and compression. Parquet 58 exposes
+`ArrowColumnWriter` and `ArrowRowGroupWriterFactory` for encoding columns
+on a pool and assembling the row group, after which parts upload
+concurrently.
+
+This is not to be built before plan 3 reports the share of time spent in
+extraction, encoding and upload and the per-core throughput ceiling. If
+one core covers a typical load, one worker per process yields one file
+per window with no shared writer at all, and this item reduces to a
+deployment recommendation. Only if the measurements demand it does this
+become a spec revision touching sections 3, 6 and 7 plus its own
+implementation plan.
+
 ## 11. Implementation order
 
 1. `series-lake` alone: canonical encoding with golden vectors, extract,
@@ -1188,7 +1402,8 @@ The "canary ready" gate of section 9.7 depends on this program.
 2. Vertical slice for logs: `receiver:otlp` to `exporter:series_parquet` to
    `LocalFileSystem`, read with DuckDB, real gRPC producer, real ack. Then
    the same against MinIO, plus the v1 outage test (9.5).
-3. Metrics (`number`, `histogram`) reusing the same machinery.
+3. Metrics (number and histogram points in `metrics/values`) reusing the
+   same machinery.
 4. Benchmark suite and expansion-factor measurements; quality gates through
    "integration ready".
 5. Chaos and soak program (10.3), then the "canary ready" gate.
