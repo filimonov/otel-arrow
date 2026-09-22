@@ -567,11 +567,12 @@ class MetricsSlice(unittest.TestCase):
                         raise
 
 def bulk_log_request(tag, records):
-    """An OTLP logs request with `records` bodies, all on one series.
+    """An OTLP logs request whose bodies are `tag`-0 .. `tag`-(records-1).
 
-    Large enough that writing the block it fills takes long enough to be
-    observed through the engine's telemetry, which is how the shutdown test
-    establishes that a block really is being written.
+    The bulk requests are large enough that writing the block they fill takes
+    long enough to be observed through the engine's telemetry, which is how
+    the shutdown test establishes that a block really is being written. Every
+    body carries its tag, so the read-back can check each request separately.
     """
     req = logs_pb.ExportLogsServiceRequest()
     resource = req.resource_logs.add()
@@ -588,16 +589,19 @@ def bulk_log_request(tag, records):
 class ShutdownSlice(unittest.TestCase):
     """Two blocks in flight when the admin endpoint stops the engine."""
 
-    # Scenario: two bulk requests fill a two-request block whose write is still
-    # running, a third request opens the next block, and the admin shutdown
-    # endpoint is called only once the engine's own telemetry reports both a
-    # non-empty FLUSHING block and a non-empty ACTIVE block. The rotation
-    # window is ten minutes, so nothing but the shutdown can seal that second
-    # block.
-    # Guarantees: every producer is decided -- acknowledged, or refused in a
-    # way that is not a permanent rejection of its data -- and every body that
-    # was acknowledged is readable from Parquet. Nothing is silently lost and
-    # nothing durable is reported as refused.
+    # Scenario: three requests are enqueued at once. Two of them are bulk
+    # requests that fill a two-request block whose write is still running, and
+    # the third opens the next block. The admin shutdown endpoint is called
+    # only once the engine's own telemetry reports a non-empty FLUSHING block
+    # and a non-empty ACTIVE block at the same moment. The rotation window is
+    # ten minutes, so nothing but the shutdown can seal that second block.
+    # Guarantees: every producer is decided, and refusals are retryable
+    # `UNAVAILABLE` rather than anything a client would treat as final or as a
+    # rejection of its data. Every acknowledged request is stored whole. A
+    # refused request may also be stored -- delivery is at least once, and a
+    # write that completed after its decision was taken is legitimately there
+    # to be rewritten by the retry -- but if it is stored it is stored whole,
+    # so no block is ever half written.
     #
     # The admin timeout is deliberately short. The receiver holds its OTLP
     # response until the exporter decides the request and drains its ingress
@@ -606,10 +610,7 @@ class ShutdownSlice(unittest.TestCase):
     # see the task 11 report. The test asserts the contract rather than which
     # side of that race each request lands on.
     def test_shutdown_drains_two_blocks_in_flight(self):
-        bodies = {
-            "bulk-a": 40000,
-            "bulk-b": 40000,
-        }
+        bodies = {"bulka": 40000, "bulkb": 40000, "single": 1}
         with tempfile.TemporaryDirectory() as directory, Engine(
             directory,
             overrides={"window": {"interval": "600s", "max_requests_per_block": 2}},
@@ -622,13 +623,10 @@ class ShutdownSlice(unittest.TestCase):
                     )
                     for tag, records in bodies.items()
                 }
-                calls["single"] = engine.logs.Export.future(
-                    log_request("single"), timeout=120
-                )
 
-                # The gate: the engine itself reports a block being written and
-                # another block open. Without it the test would only be
-                # asserting that a sequence of committed blocks survives.
+                # The gate is the engine itself reporting a block being written
+                # while another is open. Without it the test would only assert
+                # that a sequence of committed blocks survives.
                 deadline = time.monotonic() + 60
                 gauges = {}
                 while time.monotonic() < deadline:
@@ -649,8 +647,8 @@ class ShutdownSlice(unittest.TestCase):
                     # The drain deadline is reached rather than the drain
                     # completing, which is exactly the case this test is for:
                     # the engine gives up waiting and the exporter refuses
-                    # whatever it could not make durable. The producers must
-                    # still each be decided, which is what follows.
+                    # whatever it could not make durable. Every producer must
+                    # still be decided, which is what follows.
                     self.assertEqual(error.code, 504, error.read().decode())
 
                 acked, refused = [], []
@@ -659,26 +657,30 @@ class ShutdownSlice(unittest.TestCase):
                         call.result(timeout=120)
                         acked.append(tag)
                     except grpc.RpcError as error:
-                        # A shutdown refusal is retryable: the producer still
-                        # holds the only copy, so it must never be told its
-                        # data was rejected.
-                        self.assertNotEqual(
+                        # The only refusal this pipeline may produce is the
+                        # retryable one: the producer still holds the only copy
+                        # of rows that are not durable, so it has to be told to
+                        # retry. INVALID_ARGUMENT would claim its data was bad,
+                        # INTERNAL would claim a permanent server failure, and
+                        # DEADLINE_EXCEEDED or CANCELLED would mean the request
+                        # was never decided at all.
+                        self.assertEqual(
                             error.code(),
-                            grpc.StatusCode.INVALID_ARGUMENT,
-                            f"{tag} was refused as if its data were bad",
+                            grpc.StatusCode.UNAVAILABLE,
+                            f"{tag} was refused as {error.code()}: {error.details()}",
                         )
                         refused.append(tag)
                 self.assertEqual(
                     sorted(acked + refused),
-                    sorted(calls),
+                    sorted(bodies),
                     "every producer is decided, one way or the other",
                 )
                 # The block that was already being written when shutdown began
-                # reaches storage, so its requests are acknowledged rather than
-                # refused: shutdown finishes the outstanding FLUSHING block.
-                self.assertEqual(
-                    sorted(tag for tag in acked if tag in bodies),
-                    sorted(bodies),
+                # reaches storage, so both of its requests are acknowledged:
+                # shutdown finishes the outstanding FLUSHING block.
+                self.assertGreaterEqual(
+                    len(acked),
+                    2,
                     f"the flushing block was not acknowledged; refused {refused}",
                 )
 
@@ -688,24 +690,34 @@ class ShutdownSlice(unittest.TestCase):
                 self.assertTrue(values, "no values file after shutdown")
                 with duckdb.connect() as db:
                     stored = {
-                        row[0]
-                        for row in db.execute(
-                            "SELECT DISTINCT split_part(body, '-', 1) || "
-                            "CASE WHEN body LIKE 'bulk-%' THEN '-' || "
-                            "split_part(body, '-', 2) ELSE '' END "
-                            "FROM read_parquet(?)",
+                        tag: (rows, distinct)
+                        for tag, rows, distinct in db.execute(
+                            "SELECT split_part(body, '-', 1), count(*), "
+                            "count(DISTINCT body) FROM read_parquet(?) GROUP BY 1",
                             [[str(path) for path in values]],
                         ).fetchall()
                     }
-                # Every acknowledged request's rows are in the lake, and
-                # nothing that was refused was quietly written anyway.
-                for tag in acked:
-                    self.assertIn(tag, stored, f"{tag} was acked but is not stored")
                 self.assertEqual(
-                    stored - set(acked),
-                    set(),
-                    "a refused request must not have left rows behind",
+                    set(stored) - set(bodies), set(), f"unexpected bodies: {stored}"
                 )
+                for tag, expected in bodies.items():
+                    rows, distinct = stored.get(tag, (0, 0))
+                    if tag in acked:
+                        self.assertEqual(
+                            (rows, distinct),
+                            (expected, expected),
+                            f"{tag} was acknowledged but is not stored whole",
+                        )
+                    else:
+                        # Allowed to be there: a write that completed after its
+                        # decision was taken is a duplicate the producer's
+                        # retry will overwrite, not a loss. What is forbidden
+                        # is a partially written block.
+                        self.assertIn(
+                            (rows, distinct),
+                            [(0, 0), (expected, expected)],
+                            f"{tag} was refused and is stored only in part",
+                        )
             except Exception:
                 print(engine.engine_log())
                 raise

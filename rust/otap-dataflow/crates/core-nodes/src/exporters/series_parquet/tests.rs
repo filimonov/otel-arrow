@@ -3713,9 +3713,11 @@ async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
         .await;
 }
 
-/// Scenario: the flush task has already published a successful result when the
-/// shutdown deadline elapses, so the loop's biased deadline branch reaches the
-/// worker in the same turn as a ready, durable result.
+/// Scenario: the real `drive` loop is polled for the first time in a state
+/// where its shutdown deadline has already elapsed and the flush task has
+/// already published a successful result that nothing has taken yet. The
+/// deadline branch is biased above the branch that awaits that result, so both
+/// are ready in the same poll and the deadline wins it.
 /// Guarantees: the block whose files exist is acknowledged and its descriptors
 /// are committed, rather than refused as uncommitted work, so shutdown never
 /// asks a producer to resend rows that are already in object storage.
@@ -3725,10 +3727,19 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(object_store::memory::InMemory::new());
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
             let (handler, mut rx) = effects(4);
+            let (pdata_tx, control_tx, inbox) = inbox(2);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let metrics = super::metrics::Metrics::register(&context, &cfg.lake);
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(metrics);
 
             worker.admit(logs_pdata());
             let id = *worker
@@ -3741,9 +3752,15 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
             let partition = worker.active.data.partition;
             worker.rotate();
 
-            // The supervising task publishes its decision immediately before
-            // it returns, so this is the state the deadline branch can win:
-            // the result is ready and nothing has taken it yet.
+            // The write parks, then is released, and the supervising task runs
+            // to completion. The loop has not been created yet, so nothing can
+            // take the result it publishes: that is the state the deadline
+            // branch has to be able to win.
+            store.entered.notified().await;
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.release.notify_waiters();
             until("the flush publishes its result", || {
                 worker
                     .flushing
@@ -3751,13 +3768,24 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
                     .is_some_and(|job| job.task_finished())
             })
             .await;
-            assert!(
-                worker.flushing.is_some(),
-                "the result is still sitting in the flush job"
-            );
 
-            worker.shutdown(clock::now());
-            worker.abandon().await;
+            // An already-elapsed deadline, so the deadline sleep and the flush
+            // result are both ready the first time the loop is polled.
+            let elapsed = clock::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("an instant one second in the past");
+            worker.shutdown(elapsed);
+
+            let terminal = super::drive(&mut worker, inbox)
+                .await
+                .expect("the loop returns at its deadline");
+            let snapshots = terminal.metrics();
+            assert_eq!(
+                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                0,
+                "a block whose files exist is never refused"
+            );
+            assert_eq!(terminal_value(snapshots, "acks", &[]), 1);
 
             assert!(
                 worker.cache.is_committed(&id, partition),
@@ -3768,6 +3796,8 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
                 other => panic!("expected an ack for a durable block, got {other:?}"),
             }
             assert!(worker.is_idle(), "nothing is left holding a slot");
+            drop(pdata_tx);
+            drop(control_tx);
         })
         .await;
 }
