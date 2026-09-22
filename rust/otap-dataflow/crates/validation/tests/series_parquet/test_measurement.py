@@ -7,12 +7,15 @@ every later task's real measurement is read against: the ledger, the loss
 oracle, the result schema, the collection-epoch rule, the baseline policy and
 the publication and staging rules.
 """
+import ctypes
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -581,6 +584,39 @@ class DrainContracts(unittest.TestCase):
                 deadline_ns=measurement.time.monotonic_ns() + int(0.4 * 10**9),
             )
 
+    # Scenario: a worker is empty, then does not answer one collection, then
+    # is empty for two more.
+    # Guarantees: an unanswered epoch breaks the run of empty epochs, so the
+    # sequence empty, unanswered, empty, empty is two consecutive empty
+    # epochs and not three, and busy state hidden behind an unanswered epoch
+    # cannot prove drainage.
+    def test_an_unanswered_epoch_breaks_the_empty_streak(self):
+        quiet = {measurement.LIVENESS_GAUGE: 0}
+        documents = [
+            telemetry(1.0),
+            telemetry(2.0),
+            telemetry(3.0, gauges=quiet),
+            telemetry(4.0),
+            telemetry(5.0),
+        ]
+        with self.assertRaisesRegex(AssertionError, "drain deadline"):
+            _ = measurement.observe_drain(
+                self.responses(documents),
+                expected_workers=1,
+                buffered=False,
+                deadline_ns=measurement.time.monotonic_ns() + int(0.4 * 10**9),
+            )
+        # One more answered empty epoch completes a genuine run of three.
+        report = measurement.observe_drain(
+            self.responses(documents + [telemetry(6.0)]),
+            expected_workers=1,
+            buffered=False,
+            deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9,
+        )
+        self.assertEqual(
+            list(report["unanswered_epochs_by_worker"].values()), [1]
+        )
+
     # Scenario: a worker reports a lower uptime than it did a moment ago
     # within one deployment generation.
     # Guarantees: an uptime that goes backwards is an error rather than a new
@@ -602,78 +638,155 @@ class DrainContracts(unittest.TestCase):
         self.assertEqual(sum(tracker.restarts.values()), 1)
 
 
+# prctl(PR_SET_NAME) names the calling thread, which is how the controller's
+# worker threads get the `comm` the mapping reads.
+PR_SET_NAME = 15
+
+
+def name_this_thread(name):
+    """Set the calling thread's kernel `comm`, as the engine's workers do."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_NAME, name.encode("ascii"), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_NAME) failed")
+
+
+def run_on(core):
+    """Spin on the calling thread until it has actually run on `core`."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    deadline = measurement.time.monotonic_ns() + 5 * 10**9
+    while libc.sched_getcpu() != core:
+        if measurement.time.monotonic_ns() > deadline:
+            raise AssertionError(f"the thread never ran on core {core}")
+
+
+class WorkerThread:
+    """A real thread of this process standing in for one engine worker.
+
+    It names itself with the truncated worker `comm`, runs on `run_core` so
+    that its last-run CPU is that core, then optionally widens its allowed
+    set to `allowed` before blocking. The kernel therefore reports exactly
+    the evidence an engine worker would: a name shared with every other
+    worker, a last-run CPU, and an allowed-core list.
+    """
+
+    def __init__(self, case, *, run_core, allowed=None, core_name=None):
+        self.ready = threading.Event()
+        self.release = threading.Event()
+        self.error = None
+        self.tid = None
+        name = measurement.worker_thread_name(
+            "default", "main", core_name if core_name is not None else run_core, 0
+        )[: measurement.COMM_WIDTH]
+
+        def body():
+            """Name, place and park the thread until the test releases it."""
+            try:
+                name_this_thread(name)
+                os.sched_setaffinity(0, {run_core})
+                run_on(run_core)
+                if allowed is not None:
+                    os.sched_setaffinity(0, set(allowed))
+                self.tid = threading.get_native_id()
+            except BaseException as error:
+                self.error = error
+            finally:
+                self.ready.set()
+            _ = self.release.wait()
+
+        self.thread = threading.Thread(target=body, name="worker-stand-in")
+        self.thread.start()
+        case.addCleanup(self.stop)
+        if not self.ready.wait(10) or self.error is not None:
+            raise AssertionError(f"the stand-in worker did not start: {self.error}")
+
+    def stop(self):
+        """Release and join the thread."""
+        self.release.set()
+        self.thread.join(10)
+
+
+def two_cores(case):
+    """Two distinct cores this process may run on, or skip."""
+    cores = sorted(os.sched_getaffinity(0))
+    if len(cores) < 2:
+        raise unittest.SkipTest("the worker mapping tests need two allowed cores")
+    return cores[-2], cores[-1]
+
+
+def worker_identity(core):
+    """One expected worker identity as the telemetry reports it."""
+    return {
+        "key": f"default/main/core{core}",
+        "group_id": "default",
+        "pipeline_id": "main",
+        "core_id": core,
+        "generation": 0,
+    }
+
+
 class AffinityContracts(unittest.TestCase):
     """A worker whose affinity cannot be attributed is not a measurement."""
 
-    def worker(self, core=3, group="default"):
-        """One expected worker identity as the telemetry reports it."""
-        return {
-            "key": f"{group}/main/core{core}/gen0",
-            "group_id": group,
-            "pipeline_id": "main",
-            "core_id": core,
-            "generation": 0,
-        }
-
-    def thread(self, name, cpus, tid=101):
-        """One observed thread of the engine process."""
-        return {
-            "pid": 1,
-            "tid": tid,
-            "role": "engine",
-            "name": name,
-            "cpus_allowed_list": cpus,
-            "expected_cores": [3],
-        }
-
-    # Scenario: the kernel truncates two workers' thread names to the same
-    # fifteen-character `comm`.
-    # Guarantees: an ambiguous worker mapping aborts the run rather than
-    # attributing an affinity to a guess.
-    def test_ambiguous_worker_mapping_aborts(self):
-        workers = [self.worker(core=1), self.worker(core=1, group="defaultX")]
-        _, ambiguous = measurement.select_worker_threads([], workers)
-        self.assertTrue(ambiguous)
-        with self.assertRaisesRegex(AssertionError, "ambiguous"):
-            measurement.assert_affinity(
-                {"worker_threads": [], "ambiguous_workers": ambiguous}
-            )
-
-    # Scenario: the worker thread is allowed to run on every core although
-    # one was requested.
-    # Guarantees: a requested-versus-observed affinity mismatch aborts.
-    def test_affinity_mismatch_aborts(self):
-        name = measurement.worker_thread_name("default", "main", 3, 0)
-        threads = [self.thread(name[: measurement.COMM_WIDTH], "0-31")]
-        snapshot = measurement.environment_snapshot({}, workers=[self.worker()])
-        snapshot["thread_affinity"] = threads
-        selected, ambiguous = measurement.select_worker_threads(
-            threads, [self.worker()]
+    def snapshot(self, workers, *, requested=None, role_cores=()):
+        """Observe this process as the engine role, against `workers`."""
+        return measurement.environment_snapshot(
+            {"engine": (os.getpid(), list(role_cores))},
+            workers=[worker_identity(core) for core in workers],
+            requested_cores=requested,
         )
-        snapshot["worker_threads"] = [
-            dict(thread, key=key) for key, thread in selected.items()
-        ]
-        snapshot["ambiguous_workers"] = ambiguous
+
+    # Scenario: two workers of the default group run on two cores, so the
+    # kernel reports both threads as `pipeline-defaul`.
+    # Guarantees: each worker is mapped to its own thread by the core it
+    # runs on, not reported ambiguous because the truncated names collide.
+    def test_workers_with_one_truncated_name_map_by_core(self):
+        first, second = two_cores(self)
+        one = WorkerThread(self, run_core=first)
+        other = WorkerThread(self, run_core=second)
+        snapshot = self.snapshot([first, second], requested=[first, second])
+        self.assertEqual(snapshot["ambiguous_workers"], [])
+        mapped = {thread["key"]: thread["tid"] for thread in snapshot["worker_threads"]}
+        self.assertEqual(
+            mapped,
+            {f"default/main/core{first}": one.tid, f"default/main/core{second}": other.tid},
+        )
+        measurement.assert_affinity(snapshot)
+
+    # Scenario: the engine role is allowed both requested cores, and one
+    # worker thread is allowed both as well although it should own one.
+    # Guarantees: each worker is compared with its own core, never with the
+    # process-wide list, so the widened worker aborts the run.
+    def test_each_worker_is_compared_with_its_own_core(self):
+        first, second = two_cores(self)
+        _ = WorkerThread(self, run_core=first, allowed=(first, second))
+        _ = WorkerThread(self, run_core=second)
+        snapshot = self.snapshot(
+            [first, second], requested=[first, second], role_cores=[first, second]
+        )
+        self.assertEqual(snapshot["ambiguous_workers"], [])
         with self.assertRaisesRegex(AssertionError, "affinity mismatch"):
             measurement.assert_affinity(snapshot)
 
-    # Scenario: the worker thread is pinned to exactly the requested core.
-    # Guarantees: a matching affinity passes, so the abort is a real check
-    # rather than one that always fires.
-    def test_matching_affinity_passes(self):
-        name = measurement.worker_thread_name("default", "main", 3, 0)
-        threads = [self.thread(name[: measurement.COMM_WIDTH], "3")]
-        selected, ambiguous = measurement.select_worker_threads(
-            threads, [self.worker()]
-        )
-        measurement.assert_affinity(
-            {
-                "worker_threads": [
-                    dict(thread, key=key) for key, thread in selected.items()
-                ],
-                "ambiguous_workers": ambiguous,
-            }
-        )
+    # Scenario: the telemetry names a worker on a core where no thread with
+    # the worker name ever ran.
+    # Guarantees: a worker that cannot be attributed to exactly one thread
+    # aborts the run instead of borrowing another worker's thread.
+    def test_an_unattributable_worker_aborts(self):
+        first, second = two_cores(self)
+        _ = WorkerThread(self, run_core=second, core_name=first)
+        snapshot = self.snapshot([first])
+        self.assertTrue(snapshot["ambiguous_workers"])
+        with self.assertRaisesRegex(AssertionError, "ambiguous"):
+            measurement.assert_affinity(snapshot)
+
+    # Scenario: the workers run on a core set other than the one requested.
+    # Guarantees: a correctly pinned worker on the wrong core still aborts.
+    def test_workers_on_unrequested_cores_abort(self):
+        first, second = two_cores(self)
+        _ = WorkerThread(self, run_core=first)
+        snapshot = self.snapshot([first], requested=[second])
+        with self.assertRaisesRegex(AssertionError, "requested"):
+            measurement.assert_affinity(snapshot)
 
     # Scenario: a kernel core list names a range and a single core.
     # Guarantees: an observed allowed set is compared as core ids rather than
@@ -716,6 +829,43 @@ class AffinityContracts(unittest.TestCase):
         self.assertIn("ram_bytes", match["differences"])
 
 
+def blocked_child(case, code):
+    """A child Python process that runs `code` and then blocks on stdin.
+
+    Closing its stdin is what ends it, so no test waits on a fixed sleep and
+    no child outlives the test that started it.
+    """
+    child = subprocess.Popen(
+        [sys.executable, "-c", code + "\nimport sys\nsys.stdin.read()\n"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    def finish():
+        """Close the child's stdin, then make sure it has exited."""
+        if child.stdin and not child.stdin.closed:
+            child.stdin.close()
+        try:
+            _ = child.wait(10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            _ = child.wait(10)
+        if child.stdout:
+            child.stdout.close()
+
+    case.addCleanup(finish)
+    return child
+
+
+def read_line(child, *, seconds=10):
+    """One line of a child's stdout, under a monotonic deadline."""
+    ready, _, _ = select.select([child.stdout], [], [], seconds)
+    if not ready:
+        raise AssertionError(f"child {child.pid} wrote nothing within {seconds}s")
+    return child.stdout.readline().strip()
+
+
 class BuildAndLeaseContracts(unittest.TestCase):
     """A measurement owns the machine and says so."""
 
@@ -724,11 +874,8 @@ class BuildAndLeaseContracts(unittest.TestCase):
     # stopping anybody else's process.
     def test_a_concurrent_build_is_detected(self):
         monitor = measurement.BuildMonitor(interval_s=0.05)
-        child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"]
-        )
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
+        child = blocked_child(self, "print('ready', flush=True)")
+        self.assertEqual(read_line(child), "ready")
         with mock.patch.object(
             measurement, "BUILD_COMMANDS", (Path(sys.executable).name,)
         ):
@@ -765,28 +912,93 @@ class BuildAndLeaseContracts(unittest.TestCase):
         self.addCleanup(third.release)
         third.assert_held()
 
-    # Scenario: a measurement is killed and leaves its lease file behind.
-    # Guarantees: a lease whose holder no longer exists is reclaimed rather
-    # than blocking the machine forever.
-    def test_a_stale_lease_is_reclaimed(self):
+    # Scenario: another process holds the lease and is then killed with
+    # SIGKILL, so it runs no cleanup at all.
+    # Guarantees: the kernel releases the lock with the process, so the
+    # lease is available again without deleting anything, and it was
+    # genuinely exclusive while the holder lived.
+    def test_a_killed_holder_releases_the_lease(self):
+        path = temporary_directory(self) / "host.lease"
+        holder = blocked_child(
+            self,
+            "import fcntl, os\n"
+            f"fd = os.open({str(path)!r}, os.O_CREAT | os.O_RDWR, 0o644)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('locked', flush=True)",
+        )
+        self.assertEqual(read_line(holder), "locked")
+        with self.assertRaisesRegex(AssertionError, "another measurement holds"):
+            _ = measurement.HostLease(path).acquire(
+                deadline_ns=measurement.time.monotonic_ns()
+            )
+        holder.kill()
+        _ = holder.wait(10)
+        lease = measurement.HostLease(path).acquire(
+            deadline_ns=measurement.time.monotonic_ns() + 10 * 10**9
+        )
+        self.addCleanup(lease.release)
+        lease.assert_held()
+        self.assertTrue(path.exists(), "the lease file is never removed")
+
+    # Scenario: a crashed run left a lease file with a holder record behind
+    # but holds no lock on it.
+    # Guarantees: a leftover file is not a lease; only a held lock excludes.
+    def test_a_leftover_lease_file_is_not_a_lease(self):
         path = temporary_directory(self) / "host.lease"
         _ = path.write_text(
             json.dumps({"owner": "gone", "pid": 2**22, "acquired_utc": "x"}),
             encoding="ascii",
         )
         lease = measurement.HostLease(path).acquire(
-            deadline_ns=measurement.time.monotonic_ns() + 10**9
+            deadline_ns=measurement.time.monotonic_ns()
         )
         self.addCleanup(lease.release)
         lease.assert_held()
+        self.assertEqual(lease._read_holder()["owner"], lease.owner)
+
+    # Scenario: the lease file is removed and recreated while a run holds
+    # the lock on the original.
+    # Guarantees: the run notices it no longer excludes anyone, because a
+    # lock on a replaced file protects nothing.
+    def test_a_replaced_lease_file_is_detected(self):
+        path = temporary_directory(self) / "host.lease"
+        lease = measurement.HostLease(path).acquire()
+        self.addCleanup(lease.release)
+        path.unlink()
+        _ = path.write_text("{}\n", encoding="ascii")
+        with self.assertRaisesRegex(AssertionError, "replaced"):
+            lease.assert_held()
+
+
+def passed_hard_checks(*, except_names=()):
+    """Every required hard gate, passed, apart from the named ones."""
+    return [
+        measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+        for name in measurement.REQUIRED_HARD_CHECKS
+        if name not in except_names
+    ]
+
+
+MEASURED_METRICS = {
+    "throughput_records_per_s": 1000.0,
+    "ack_p99_s": 0.5,
+    "peak_rss_bytes": 100.0,
+}
+MEASURED_DIRECTIONS = {
+    "throughput_records_per_s": measurement.HIGHER_IS_BETTER,
+    "ack_p99_s": measurement.LOWER_IS_BETTER,
+    "peak_rss_bytes": measurement.LOWER_IS_BETTER,
+}
 
 
 def measured_result(**overrides) -> dict:
-    """A minimal valid passed run, for the schema and baseline contracts."""
+    """A minimal valid passed run carrying every fingerprint input."""
     snapshot = {
         "cpu_model": "Test CPU",
         "logical_core_count": 32,
         "physical_core_count": 16,
+        "sibling_groups": [[core, core + 16] for core in range(16)],
+        "available_cores": list(range(32)),
         "ram_bytes": 64 * 1024**3,
         "kernel": "Linux-test",
         "load_average_1_5_15": [0.1, 0.2, 0.3],
@@ -799,11 +1011,12 @@ def measured_result(**overrides) -> dict:
         {
             "status": measurement.STATUS_PASSED,
             "elapsed_s": 1.0,
+            "run_dir": "/runs/t-001",
             "environment": {
                 "start": dict(snapshot),
                 "end": dict(snapshot),
                 "machine_identity_sha256": "m",
-                "core_allocation": {"engine": [0]},
+                "core_allocation": {"engine": [0], "producer": [2, 3]},
                 "build": {
                     "profile": "release",
                     "features": "series_parquet",
@@ -811,26 +1024,37 @@ def measured_result(**overrides) -> dict:
                     "toolchain": "1.88",
                 },
             },
-            "config": {"requested": {}, "effective": {"window": {"interval": "15s"}}},
-            "workload": Workload().as_json(),
-            "metrics": {
-                "throughput_records_per_s": 1000.0,
-                "ack_p99_s": 0.5,
-                "peak_rss_bytes": 100.0,
+            "config": {
+                "requested": {},
+                "effective": {
+                    "window": {"interval": "15s"},
+                    "storage": {"file": {"base_uri": "/runs/t-001/data"}},
+                },
             },
+            "workload": Workload().as_json(),
+            "workload_schedule": {
+                "duration_s": 30,
+                "rate_requests_per_s": "closed_loop",
+                "max_in_flight": 128,
+            },
+            "metrics": dict(MEASURED_METRICS),
+            "metric_directions": dict(MEASURED_DIRECTIONS),
             "mandatory_metrics": ["throughput_records_per_s"],
-            "checks": [
-                measurement.check(
-                    "delivery", measurement.CHECK_HARD, measurement.STATUS_PASSED
-                ),
-                measurement.check(
-                    "rss_reconciliation",
-                    measurement.CHECK_HARD,
-                    measurement.STATUS_PASSED,
-                ),
-            ],
+            "checks": passed_hard_checks(),
         }
     )
+    if "metrics" in overrides and "metric_directions" not in overrides:
+        # A test that replaces the metrics keeps the declared direction of
+        # each one it kept, so it tests what it names rather than tripping
+        # over a stale direction for a metric it removed.
+        overrides = dict(
+            overrides,
+            metric_directions={
+                name: MEASURED_DIRECTIONS[name]
+                for name in overrides["metrics"]
+                if name in MEASURED_DIRECTIONS
+            },
+        )
     result.update(overrides)
     return result
 
@@ -917,23 +1141,122 @@ class BaselineContracts(unittest.TestCase):
             result["baseline_candidate"]["fingerprint"], decision["fingerprint"]
         )
 
-    # Scenario: the machine, configuration, workload or build profile
-    # changed.
+    # Scenario: the machine, its core topology, the cores available to the
+    # run, the role placement, the configuration, the workload, its rate or
+    # duration, or the build profile changed.
     # Guarantees: the fingerprint changes with each of them, so a run is
     # never compared against a different environment.
     def test_the_fingerprint_covers_every_declared_input(self):
         base = measurement.baseline_fingerprint(measured_result())
-        for mutate in (
-            lambda r: r["environment"]["start"].update(ram_bytes=1),
-            lambda r: r["environment"].update(core_allocation={"engine": [7]}),
-            lambda r: r["config"].update(effective={"window": {"interval": "1s"}}),
-            lambda r: r.update(workload=Workload(seed=1).as_json()),
-            lambda r: r["environment"]["build"].update(allocator="jemalloc"),
+        for label, mutate in (
+            ("ram", lambda r: r["environment"]["start"].update(ram_bytes=1)),
+            (
+                "siblings",
+                lambda r: r["environment"]["start"].update(
+                    sibling_groups=[[core] for core in range(32)]
+                ),
+            ),
+            (
+                "available cores",
+                lambda r: r["environment"]["start"].update(
+                    available_cores=list(range(8))
+                ),
+            ),
+            (
+                "placement",
+                lambda r: r["environment"].update(
+                    core_allocation={"engine": [7], "producer": [2, 3]}
+                ),
+            ),
+            (
+                "config",
+                lambda r: r["config"]["effective"].update(
+                    window={"interval": "1s"}
+                ),
+            ),
+            (
+                "path outside the run directory",
+                lambda r: r["config"]["effective"].update(
+                    storage={"file": {"base_uri": "/elsewhere/data"}}
+                ),
+            ),
+            ("workload", lambda r: r.update(workload=Workload(seed=1).as_json())),
+            (
+                "rate",
+                lambda r: r["workload_schedule"].update(rate_requests_per_s=500),
+            ),
+            ("duration", lambda r: r["workload_schedule"].update(duration_s=60)),
+            (
+                "allocator",
+                lambda r: r["environment"]["build"].update(allocator="jemalloc"),
+            ),
         ):
-            with self.subTest(mutate=mutate):
+            with self.subTest(changed=label):
                 result = measured_result()
                 mutate(result)
                 self.assertNotEqual(measurement.baseline_fingerprint(result), base)
+
+    # Scenario: two runs differ only in their core sibling topology, one of
+    # them on a machine without SMT.
+    # Guarantees: they hash differently, so a measurement taken with SMT
+    # siblings is never compared against one taken without.
+    def test_sibling_topology_changes_the_fingerprint(self):
+        smt = measured_result()
+        flat = measured_result()
+        flat["environment"]["start"]["sibling_groups"] = [
+            [core] for core in range(32)
+        ]
+        self.assertNotEqual(
+            measurement.baseline_fingerprint(smt),
+            measurement.baseline_fingerprint(flat),
+        )
+
+    # Scenario: a fingerprint input was never recorded, or recorded as null.
+    # Guarantees: the fingerprint refuses rather than hashing the absence,
+    # which would let runs with unknown and different environments match.
+    def test_a_missing_fingerprint_input_raises(self):
+        for label, mutate in (
+            (
+                "siblings",
+                lambda r: r["environment"]["start"].pop("sibling_groups"),
+            ),
+            (
+                "machine identity",
+                lambda r: r["environment"].update(machine_identity_sha256=None),
+            ),
+            ("placement", lambda r: r["environment"].pop("core_allocation")),
+            ("toolchain", lambda r: r["environment"]["build"].pop("toolchain")),
+            ("schedule rate", lambda r: r["workload_schedule"].pop("rate_requests_per_s")),
+            ("run directory", lambda r: r.pop("run_dir")),
+            ("effective config", lambda r: r["config"].update(effective={})),
+        ):
+            with self.subTest(missing=label):
+                result = measured_result()
+                mutate(result)
+                with self.assertRaisesRegex(AssertionError, "fingerprint input"):
+                    _ = measurement.baseline_fingerprint(result)
+
+    # Scenario: the same configuration runs twice, each in its own run
+    # directory.
+    # Guarantees: only paths under the run directory are canonicalized, so
+    # the two runs share a fingerprint while a path elsewhere still counts.
+    def test_only_run_directory_paths_are_canonicalized(self):
+        first = measured_result()
+        second = measured_result(run_dir="/runs/t-002")
+        second["config"]["effective"]["storage"]["file"]["base_uri"] = (
+            "/runs/t-002/data"
+        )
+        self.assertEqual(
+            measurement.baseline_fingerprint(first),
+            measurement.baseline_fingerprint(second),
+        )
+        self.assertEqual(
+            measurement.canonicalize_run_paths(
+                {"a": "/runs/t-001/x", "b": "/runs/t-0011/x", "c": ["/runs/t-001"]},
+                "/runs/t-001",
+            ),
+            {"a": "<run_dir>/x", "b": "/runs/t-0011/x", "c": ["<run_dir>"]},
+        )
 
     # Scenario: the source revision and binary changed but nothing else did.
     # Guarantees: provenance is recorded outside the fingerprint, so a new
@@ -1040,47 +1363,137 @@ class BaselineContracts(unittest.TestCase):
         self.assertNotIn("baseline_candidate", result)
 
     # Scenario: a baseline records a metric this run did not report.
-    # Guarantees: only identical metric schemas are compared.
-    def test_schemas_must_match_to_compare(self):
+    # Guarantees: a run missing part of the baseline's schema is not
+    # compared.
+    def test_a_missing_metric_fails_the_schema(self):
         first = measured_result()
         fingerprint = measurement.baseline_fingerprint(first)
         baseline = measurement.new_baseline(first, fingerprint)
         other = measured_result(
             metrics={"throughput_records_per_s": 1000.0},
-            mandatory_metrics=["throughput_records_per_s"],
+            metric_directions={
+                "throughput_records_per_s": measurement.HIGHER_IS_BETTER
+            },
         )
-        with self.assertRaisesRegex(AssertionError, "ack_p99_s"):
+        with self.assertRaisesRegex(AssertionError, "missing .*ack_p99_s"):
             _ = measurement.evaluate_baseline(
                 other, baselines={fingerprint: baseline}
             )
 
+    # Scenario: a run reports every baseline metric and one the baseline
+    # never had.
+    # Guarantees: the metric-name sets must be exactly equal, so an extra
+    # metric fails rather than escaping comparison.
+    def test_an_extra_metric_fails_the_schema(self):
+        first = measured_result()
+        fingerprint = measurement.baseline_fingerprint(first)
+        baseline = measurement.new_baseline(first, fingerprint)
+        other = measured_result(
+            metrics=dict(MEASURED_METRICS, backlog_ratio=0.1),
+            metric_directions=dict(
+                MEASURED_DIRECTIONS, backlog_ratio=measurement.LOWER_IS_BETTER
+            ),
+        )
+        with self.assertRaisesRegex(AssertionError, "extra .*backlog_ratio"):
+            _ = measurement.evaluate_baseline(
+                other, baselines={fingerprint: baseline}
+            )
+
+    # Scenario: a run carries no hard checks at all, or only some of them.
+    # Guarantees: an empty or incomplete hard-gate set is rejected, naming
+    # every absent gate, and no baseline is built from it.
+    def test_an_incomplete_hard_gate_set_is_rejected(self):
+        for label, checks in (
+            ("empty", []),
+            ("no residual", passed_hard_checks(except_names=("rss_reconciliation",))),
+            ("no correctness", passed_hard_checks(except_names=("delivery",))),
+            (
+                "no build monitor",
+                passed_hard_checks(except_names=("no_concurrent_build",)),
+            ),
+        ):
+            with self.subTest(gates=label):
+                result = measured_result(checks=checks)
+                with self.assertRaisesRegex(AssertionError, "absent"):
+                    _ = measurement.evaluate_baseline(result, baselines={})
+                self.assertNotIn("baseline_candidate", result)
+
     # Scenario: a baseline reference value is zero and the new run is not.
-    # Guarantees: a zero reference permits no positive increase unless a
-    # predeclared resolution floor covers it.
+    # Guarantees: a zero reference permits no worsening unless a predeclared
+    # resolution floor covers it.
     def test_a_zero_reference_permits_no_increase(self):
-        self.assertEqual(
-            measurement.signed_regression("flush_failures_count", 0, 0), 0.0
-        )
-        self.assertEqual(
-            measurement.signed_regression("flush_failures_count", 3, 0),
-            float("inf"),
-        )
-        self.assertEqual(
-            measurement.signed_regression("flush_failures_count", 3, 0, floor=5),
-            0.0,
-        )
+        lower = measurement.LOWER_IS_BETTER
+        self.assertEqual(measurement.signed_regression(0, 0, lower), 0.0)
+        self.assertEqual(measurement.signed_regression(3, 0, lower), float("inf"))
+        self.assertEqual(measurement.signed_regression(3, 0, lower, floor=5), 0.0)
 
     # Scenario: a metric where a larger value is better falls, and one where
     # a smaller value is better rises.
-    # Guarantees: the direction decides the sign of a regression, not its
-    # threshold.
-    def test_regression_direction_follows_the_metric(self):
+    # Guarantees: the declared direction decides the sign of a regression.
+    def test_regression_sign_follows_the_declared_direction(self):
         self.assertAlmostEqual(
-            measurement.signed_regression("x_records_per_s", 50.0, 100.0), 0.5
+            measurement.signed_regression(50.0, 100.0, measurement.HIGHER_IS_BETTER),
+            0.5,
         )
         self.assertAlmostEqual(
-            measurement.signed_regression("x_bytes", 150.0, 100.0), 0.5
+            measurement.signed_regression(150.0, 100.0, measurement.LOWER_IS_BETTER),
+            0.5,
         )
+
+    # Scenario: a backlog ratio doubles against a matching baseline.
+    # Guarantees: a ratio is not assumed to improve upwards; its declared
+    # lower-is-better direction makes the rise a failing regression.
+    def test_a_rising_backlog_ratio_is_a_regression(self):
+        metrics = dict(MEASURED_METRICS, backlog_ratio=0.1)
+        directions = dict(
+            MEASURED_DIRECTIONS, backlog_ratio=measurement.LOWER_IS_BETTER
+        )
+        first = measured_result(metrics=metrics, metric_directions=directions)
+        fingerprint = measurement.baseline_fingerprint(first)
+        baseline = measurement.new_baseline(first, fingerprint)
+        worse = measured_result(
+            metrics=dict(metrics, backlog_ratio=0.2), metric_directions=directions
+        )
+        with self.assertRaisesRegex(AssertionError, "backlog_ratio"):
+            _ = measurement.evaluate_baseline(
+                worse, baselines={fingerprint: baseline}
+            )
+
+    # Scenario: a run reports a metric without declaring its direction, or
+    # declares a direction that is not one of the two.
+    # Guarantees: a metric with no valid direction is an error, never a
+    # guess from its name.
+    def test_a_metric_without_a_direction_is_an_error(self):
+        directions = dict(MEASURED_DIRECTIONS)
+        del directions["ack_p99_s"]
+        with self.assertRaisesRegex(AssertionError, "declare no direction"):
+            _ = measurement.evaluate_baseline(
+                measured_result(metric_directions=directions), baselines={}
+            )
+        with self.assertRaisesRegex(AssertionError, "unknown"):
+            measurement.validate_result(
+                measured_result(
+                    metric_directions=dict(MEASURED_DIRECTIONS, ack_p99_s="sideways")
+                )
+            )
+
+    # Scenario: a baseline and a later run declare opposite directions for
+    # the same metric.
+    # Guarantees: the comparison refuses rather than signing a regression by
+    # whichever run happens to be newer.
+    def test_a_changed_direction_is_refused(self):
+        first = measured_result()
+        fingerprint = measurement.baseline_fingerprint(first)
+        baseline = measurement.new_baseline(first, fingerprint)
+        flipped = measured_result(
+            metric_directions=dict(
+                MEASURED_DIRECTIONS, ack_p99_s=measurement.HIGHER_IS_BETTER
+            )
+        )
+        with self.assertRaisesRegex(AssertionError, "directions differ"):
+            _ = measurement.evaluate_baseline(
+                flipped, baselines={fingerprint: baseline}
+            )
 
 
 class PublicationContracts(unittest.TestCase):
@@ -1246,15 +1659,109 @@ class CommandContracts(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "harness-contracts"):
             _ = measure.run_named("no-such-case", temporary_directory(self))
 
-    # Scenario: a measured experiment fails part way through.
+    def isolated(self):
+        """Host controls confined to this test: a private lease, no builds."""
+        lease = temporary_directory(self) / "host.lease"
+        for patcher in (
+            mock.patch.object(measurement, "BUILD_COMMANDS", ("no-such-command",)),
+            mock.patch.object(measurement, "MINIMUM_PHYSICAL_CORES", 1),
+        ):
+            _ = patcher.start()
+            self.addCleanup(patcher.stop)
+        return lease
+
+    def experiment(self, *, core, throughput=1000.0, end=True, requested=None):
+        """A measured body that does everything a real one must.
+
+        It places a stand-in worker thread on `core`, takes both snapshots
+        through the controls, records a build, an effective configuration
+        with a path under the run directory, metrics with declared
+        directions, and the correctness, sample and residual checks.
+        """
+        case = self
+
+        def body(_spec, result, output_dir, controls):
+            """Run the lifecycle a real experiment runs."""
+            worker = WorkerThread(case, run_core=core)
+            try:
+                measured(result, output_dir, controls)
+            finally:
+                # Like an engine that is shut down, the worker is gone once
+                # the run ends, so the next run maps its own worker alone.
+                worker.stop()
+
+        def measured(result, output_dir, controls):
+            """Everything a measured body records between its snapshots."""
+            roles = {"engine": (os.getpid(), [core])}
+            workers = [worker_identity(core)]
+            wanted = requested if requested is not None else [core]
+            _ = controls.snapshot(
+                "start", roles, workers=workers, requested_cores=wanted
+            )
+            result["environment"]["build"] = {
+                "profile": "debug",
+                "features": "series_parquet",
+                "allocator": "jemalloc",
+                "toolchain": "rustc-test",
+                "binary_sha256": "0" * 64,
+            }
+            result["config"]["effective"] = {
+                "storage": {"file": {"base_uri": str(Path(output_dir) / "data")}},
+                "window": {"interval": "1s"},
+            }
+            result["metrics"] = {
+                "throughput_records_per_s": throughput,
+                "peak_rss_bytes": 1000.0,
+            }
+            result["metric_directions"] = {
+                "throughput_records_per_s": measurement.HIGHER_IS_BETTER,
+                "peak_rss_bytes": measurement.LOWER_IS_BETTER,
+            }
+            result["mandatory_metrics"] = sorted(result["metrics"])
+            for name in ("delivery", "minimum_samples", "rss_reconciliation"):
+                result["checks"].append(
+                    measurement.check(
+                        name, measurement.CHECK_HARD, measurement.STATUS_PASSED
+                    )
+                )
+            if end:
+                _ = controls.snapshot(
+                    "end", roles, workers=workers, requested_cores=wanted
+                )
+            result["status"] = measurement.STATUS_PASSED
+
+        return body
+
+    def run_measured(self, directory, report, body, lease, *, ordinal=1, **options):
+        """One run_case call with this test's isolated controls."""
+        return measure.run_case(
+            measure.harness_local_spec(ordinal=ordinal),
+            directory,
+            experiment=body,
+            report_dir=report,
+            lease_path=lease,
+            **options,
+        )
+
+    def published(self, report, *, ordinal=1):
+        """The published result document of one harness-local run."""
+        spec = measure.harness_local_spec(ordinal=ordinal)
+        return json.loads((report / f"{spec.run_id}.json").read_text(encoding="ascii"))
+
+    def checks_of(self, document):
+        """The status of each named check in a result document."""
+        return {entry["name"]: entry["status"] for entry in document["checks"]}
+
+    # Scenario: a measured case is run with no measured body at all.
     # Guarantees: the run's JSON is still written and published, with both
     # environment snapshots and a failed status.
     def test_a_failed_run_still_writes_its_file(self):
+        lease = self.isolated()
         directory = temporary_directory(self)
         report = temporary_directory(self) / "report"
         spec = measure.harness_local_spec()
         with self.assertRaises(NotImplementedError):
-            _ = measure.run_case(spec, directory, report_dir=report)
+            _ = measure.run_case(spec, directory, report_dir=report, lease_path=lease)
         for location in (directory, report):
             document = json.loads(
                 (location / f"{spec.run_id}.json").read_text(encoding="ascii")
@@ -1266,34 +1773,161 @@ class CommandContracts(unittest.TestCase):
                 any(event["kind"] == "failed" for event in document["events"])
             )
 
-    # Scenario: a measured body reports its metrics and checks.
-    # Guarantees: the contract around the body -- one file per run, both
-    # snapshots, an environment match and a published tree -- holds for a run
-    # that succeeded as well as for one that failed.
-    def test_a_successful_run_publishes_its_evidence(self):
-        directory = temporary_directory(self)
+    # Scenario: the first valid run of a fingerprint, then a second run of
+    # the same fingerprint in its own run directory.
+    # Guarantees: the first run writes its candidate baseline atomically,
+    # references it by hash in `baseline_files` and publishes it; the second
+    # run is compared against it and writes no new one.
+    def test_the_first_valid_run_writes_a_baseline_and_the_next_compares(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
         report = temporary_directory(self) / "report"
-        spec = measure.harness_local_spec()
+        first_dir = temporary_directory(self)
+        first = self.run_measured(first_dir, report, self.experiment(core=core), lease)
+        self.assertEqual(first["status"], measurement.STATUS_PASSED)
+        self.assertEqual(first["baseline_decision"]["action"], "created")
+        self.assertEqual(len(first["baseline_files"]), 1)
+        entry = first["baseline_files"][0]
+        self.assertEqual(entry["name"], first["baseline_decision"]["baseline_name"])
+        for location in (first_dir, report):
+            path = location / entry["name"]
+            self.assertEqual(measurement.file_digest(path), entry["sha256"])
+        self.assertFalse(list(first_dir.glob("*.tmp")), "no temporary file remains")
+        baseline = json.loads((report / entry["name"]).read_text(encoding="ascii"))
+        self.assertEqual(baseline["fingerprint"], first["baseline_decision"]["fingerprint"])
+        self.assertEqual(
+            self.checks_of(self.published(report)),
+            dict.fromkeys(
+                sorted(self.checks_of(self.published(report))), measurement.STATUS_PASSED
+            ),
+        )
 
-        def experiment(_spec, result, _output_dir):
-            result["metrics"] = {"throughput_records_per_s": 10.0}
-            result["mandatory_metrics"] = ["throughput_records_per_s"]
-            result["checks"] = [
-                measurement.check(
-                    "delivery", measurement.CHECK_HARD, measurement.STATUS_PASSED
+        second = self.run_measured(
+            temporary_directory(self), report, self.experiment(core=core), lease,
+            ordinal=2,
+        )
+        self.assertEqual(second["baseline_decision"]["action"], "compared")
+        self.assertEqual(second["baseline_files"], [])
+        self.assertEqual(
+            second["baseline_decision"]["fingerprint"],
+            first["baseline_decision"]["fingerprint"],
+            "only the run directory differs, and it is canonicalized",
+        )
+
+    # Scenario: a later run of the same fingerprint loses more than a
+    # quarter of its throughput.
+    # Guarantees: the regression fails the run, and the failed result is
+    # still published with the decision that failed it.
+    def test_a_regressed_run_fails_and_is_published(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        report = temporary_directory(self) / "report"
+        _ = self.run_measured(temporary_directory(self), report, self.experiment(core=core), lease)
+        with self.assertRaisesRegex(AssertionError, "throughput_records_per_s"):
+            _ = self.run_measured(
+                temporary_directory(self),
+                report,
+                self.experiment(core=core, throughput=700.0),
+                lease,
+                ordinal=2,
+            )
+        document = self.published(report, ordinal=2)
+        self.assertEqual(document["status"], measurement.STATUS_FAILED)
+        self.assertEqual(
+            document["baseline_decision"]["worse_than_limit"],
+            ["throughput_records_per_s"],
+        )
+
+    # Scenario: the experiment never takes its end snapshot.
+    # Guarantees: the snapshot check fails, the run is failed, and no
+    # baseline is written from it.
+    def test_a_missing_end_snapshot_fails_the_run(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        report = temporary_directory(self) / "report"
+        with self.assertRaisesRegex(AssertionError, "environment_snapshots_complete"):
+            _ = self.run_measured(
+                temporary_directory(self),
+                report,
+                self.experiment(core=core, end=False),
+                lease,
+            )
+        document = self.published(report)
+        self.assertEqual(document["status"], measurement.STATUS_FAILED)
+        self.assertEqual(
+            self.checks_of(document)["environment_snapshots_complete"],
+            measurement.STATUS_FAILED,
+        )
+        self.assertEqual(document["baseline_files"], [])
+        self.assertIn("fallback", document["environment"]["end"])
+
+    # Scenario: the workers run on a core the run did not request.
+    # Guarantees: the start snapshot aborts the run, and the published result
+    # records the failed affinity check.
+    def test_an_affinity_mismatch_aborts_the_run(self):
+        lease = self.isolated()
+        first, second = two_cores(self)
+        report = temporary_directory(self) / "report"
+        with self.assertRaisesRegex(AssertionError, "requested"):
+            _ = self.run_measured(
+                temporary_directory(self),
+                report,
+                self.experiment(core=first, requested=[second]),
+                lease,
+            )
+        document = self.published(report)
+        self.assertEqual(
+            self.checks_of(document)["affinity_matched"], measurement.STATUS_FAILED
+        )
+        self.assertEqual(document["baseline_files"], [])
+
+    # Scenario: a compiler starts while the run is measuring.
+    # Guarantees: the build monitor invalidates the run and records what it
+    # saw, and no baseline is written from it.
+    def test_a_concurrent_build_invalidates_the_run(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        report = temporary_directory(self) / "report"
+        builder = blocked_child(self, "print('ready', flush=True)")
+        self.assertEqual(read_line(builder), "ready")
+        with mock.patch.object(
+            measurement, "BUILD_COMMANDS", (Path(sys.executable).name,)
+        ):
+            with self.assertRaisesRegex(AssertionError, "no_concurrent_build"):
+                _ = self.run_measured(
+                    temporary_directory(self),
+                    report,
+                    self.experiment(core=core),
+                    lease,
                 )
-            ]
-            result["status"] = measurement.STATUS_PASSED
+        document = self.published(report)
+        self.assertEqual(
+            self.checks_of(document)["no_concurrent_build"], measurement.STATUS_FAILED
+        )
+        self.assertTrue(document["environment"]["build_monitor"]["detected"])
+        self.assertEqual(builder.poll(), None, "the monitor must not stop it")
 
-        outcome = measure.run_case(
-            spec, directory, experiment=experiment, report_dir=report
+    # Scenario: another measurement already holds the host lease.
+    # Guarantees: the run does not start measuring, fails with the lease
+    # check recorded, and still publishes its result.
+    def test_a_held_lease_stops_the_run(self):
+        lease = self.isolated()
+        core = sorted(os.sched_getaffinity(0))[-1]
+        holder = measurement.HostLease(lease).acquire()
+        self.addCleanup(holder.release)
+        report = temporary_directory(self) / "report"
+        with self.assertRaisesRegex(AssertionError, "another measurement holds"):
+            _ = self.run_measured(
+                temporary_directory(self),
+                report,
+                self.experiment(core=core),
+                lease,
+                lease_wait_s=0,
+            )
+        document = self.published(report)
+        self.assertEqual(
+            self.checks_of(document)["host_lease_held"], measurement.STATUS_FAILED
         )
-        self.assertEqual(outcome["status"], measurement.STATUS_PASSED)
-        document = json.loads(
-            (report / f"{spec.run_id}.json").read_text(encoding="ascii")
-        )
-        self.assertTrue(document["environment"]["match"]["matched"])
-        self.assertEqual(document["metrics"]["throughput_records_per_s"], 10.0)
 
 
 def exporter_snapshot(metrics):
@@ -1458,7 +2092,10 @@ class HelperContracts(unittest.TestCase):
         class Sample(measurement.MeasurementTestCase):
             """A test case that only records where it would write."""
 
-            def test_nothing(self):
+            # Scenario: a measurement test case is set up by the runner.
+            # Guarantees: its base class has prepared a retained output
+            # directory before the test body runs.
+            def test_records_its_output_directory(self):
                 """Record the directory the base class prepared."""
                 seen.append(self.output_dir)
 

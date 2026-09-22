@@ -13,9 +13,9 @@ Nothing here starts an engine, a container or a build. The real end-to-end
 helpers live in `test_e2e.py` and are extended, never duplicated.
 """
 import collections
-import contextlib
 import dataclasses
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -102,9 +102,6 @@ UNIT_SUFFIXES = (
     "_ratio",
 )
 
-# Higher is better for these; for every other metric lower is better. The
-# direction decides the sign of a regression, never its threshold.
-HIGHER_IS_BETTER_SUFFIXES = ("_per_s", "_ratio")
 
 # The single numerical boundary of the Controller baseline policy. It lives
 # here alone so that no task can quietly choose a kinder one.
@@ -928,8 +925,22 @@ def thread_status(pid: int, tid: int) -> dict:
     return fields
 
 
+# `/proc/PID/task/TID/stat` field 39 is the CPU the thread last ran on. The
+# fields after the parenthesised command start at field 3.
+STAT_LAST_CPU_INDEX = 39 - 3
+
+
+def thread_last_cpu(pid: int, tid: int):
+    """The CPU one thread last ran on, or None when it cannot be read."""
+    try:
+        stat = Path(f"/proc/{pid}/task/{tid}/stat").read_text()
+        return int(stat.rsplit(") ", 1)[1].split()[STAT_LAST_CPU_INDEX])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def thread_affinity(pid, role, expected_cores):
-    """Every thread of one process, with its observed allowed core set."""
+    """Every thread of one process, with its allowed and last-run cores."""
     observed = []
     task = Path(f"/proc/{pid}/task")
     for entry in sorted(task.iterdir(), key=lambda item: int(item.name)):
@@ -946,6 +957,7 @@ def thread_affinity(pid, role, expected_cores):
                     "role": role,
                     "name": None,
                     "cpus_allowed_list": None,
+                    "last_cpu": None,
                     "expected_cores": list(expected_cores or []),
                     "reason": "thread exited during observation",
                     "observed_utc": utc_now(),
@@ -959,6 +971,7 @@ def thread_affinity(pid, role, expected_cores):
                 "role": role,
                 "name": fields.get("Name"),
                 "cpus_allowed_list": fields.get("Cpus_allowed_list"),
+                "last_cpu": thread_last_cpu(pid, tid),
                 "expected_cores": list(expected_cores or []),
                 "observed_utc": utc_now(),
             }
@@ -971,17 +984,24 @@ def worker_thread_name(group_id, pipeline_id, core_id, generation) -> str:
     return f"pipeline-{group_id}-{pipeline_id}-core-{core_id}-gen-{generation}"
 
 
-# Linux truncates a thread's `comm` to fifteen characters plus a terminator,
-# so a worker is identified by the truncation of its full name.
+# Linux truncates a thread's `comm` to fifteen characters plus a terminator.
+# Every worker of the default group therefore reads `pipeline-defaul`, so the
+# name narrows the candidates but never identifies a worker on its own.
 COMM_WIDTH = 15
 
 
 def select_worker_threads(threads, workers):
-    """Map each expected worker identity to exactly one observed thread.
+    """Map each expected worker to exactly one thread by core evidence.
 
-    `workers` are the identities the telemetry reported. A worker with no
-    thread, or with more than one, is an ambiguous mapping: the caller must
-    abort rather than measure an affinity it cannot attribute.
+    The truncated name selects the candidate threads; the worker's own core
+    selects among them, through the CPU each candidate last ran on. A worker
+    pinned as requested runs only on its core, so it is the one candidate
+    that last ran there. A worker with no such candidate, with several, or
+    whose thread another worker already claimed is an ambiguous mapping, and
+    the caller must abort rather than measure an affinity it cannot
+    attribute. A thread that last ran on the right core but may run
+    elsewhere is still mapped, and its allowed set then fails the per-worker
+    comparison in `assert_affinity`.
     """
     by_comm = collections.defaultdict(list)
     for thread in threads:
@@ -989,16 +1009,7 @@ def select_worker_threads(threads, workers):
             by_comm[thread["name"]].append(thread)
     selected = {}
     ambiguous = []
-    expected_comms = collections.Counter()
-    for worker in workers:
-        expected_comms[
-            worker_thread_name(
-                worker["group_id"],
-                worker["pipeline_id"],
-                worker["core_id"],
-                worker["generation"],
-            )[:COMM_WIDTH]
-        ] += 1
+    claimed = {}
     for worker in workers:
         full = worker_thread_name(
             worker["group_id"],
@@ -1008,34 +1019,57 @@ def select_worker_threads(threads, workers):
         )
         comm = full[:COMM_WIDTH]
         candidates = by_comm.get(comm, [])
-        if expected_comms[comm] != 1:
+        on_core = [
+            thread for thread in candidates if thread.get("last_cpu") == worker["core_id"]
+        ]
+        evidence = {
+            "worker": worker["key"],
+            "thread_name": full,
+            "comm": comm,
+            "core_id": worker["core_id"],
+            "candidates": [
+                {"tid": thread["tid"], "last_cpu": thread.get("last_cpu")}
+                for thread in candidates
+            ],
+        }
+        if len(on_core) != 1:
             ambiguous.append(
-                {
-                    "worker": worker,
-                    "thread_name": full,
-                    "reason": f"{expected_comms[comm]} workers share comm {comm!r}",
-                }
+                dict(
+                    evidence,
+                    reason=(
+                        f"{len(on_core)} of {len(candidates)} threads named "
+                        f"{comm!r} last ran on core {worker['core_id']}"
+                    ),
+                )
             )
-        elif len(candidates) != 1:
+            continue
+        thread = on_core[0]
+        if thread["tid"] in claimed:
             ambiguous.append(
-                {
-                    "worker": worker,
-                    "thread_name": full,
-                    "reason": f"{len(candidates)} threads carry comm {comm!r}",
-                }
+                dict(
+                    evidence,
+                    reason=(
+                        f"thread {thread['tid']} is already mapped to worker "
+                        f"{claimed[thread['tid']]}"
+                    ),
+                )
             )
-        else:
-            selected[worker["key"]] = candidates[0]
+            continue
+        claimed[thread["tid"]] = worker["key"]
+        selected[worker["key"]] = dict(thread, core_id=worker["core_id"])
     return selected, ambiguous
 
 
-def environment_snapshot(roles, *, workers=(), absent=None) -> dict:
+def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None) -> dict:
     """A start or end environment snapshot.
 
-    `roles` maps a role name to a process id, or to `None` when the role has
-    no process in this run. Every role without a process carries an explicit
-    reason, because an absent observation can never support a passed
-    measurement.
+    `roles` maps a role name to a process id, or to `(pid, cores)`, or to
+    `None` when the role has no process in this run. Every role without a
+    process carries an explicit reason, because an absent observation can
+    never support a passed measurement. `workers` are the identities the
+    telemetry reported and `requested_cores` the core set the run asked for;
+    each worker is compared with its own core, never with the process-wide
+    list.
     """
     topology = core_topology()
     with open("/proc/loadavg", encoding="ascii") as handle:
@@ -1058,6 +1092,7 @@ def environment_snapshot(roles, *, workers=(), absent=None) -> dict:
         "logical_core_count": topology["logical_core_count"],
         "physical_core_count": topology["physical_core_count"],
         "sibling_groups": topology["sibling_groups"],
+        "available_cores": sorted(os.sched_getaffinity(0)),
         "ram_bytes": ram_bytes(),
         "kernel": platform.platform(),
         "load_average_1_5_15": load,
@@ -1073,30 +1108,42 @@ def environment_snapshot(roles, *, workers=(), absent=None) -> dict:
                     "tid": thread["tid"],
                     "name": thread["name"],
                     "cpus_allowed_list": thread["cpus_allowed_list"],
-                    "expected_cores": thread["expected_cores"],
+                    "last_cpu": thread.get("last_cpu"),
+                    "expected_cores": [thread["core_id"]],
                 }
                 for key, thread in selected.items()
             ),
             key=lambda item: item["key"],
         )
         snapshot["ambiguous_workers"] = ambiguous
+        snapshot["worker_cores"] = sorted(worker["core_id"] for worker in workers)
+        if requested_cores is not None:
+            snapshot["requested_cores"] = sorted(requested_cores)
     return snapshot
 
 
 def assert_affinity(snapshot) -> None:
     """Abort when an observed worker affinity is not the requested one.
 
-    An ambiguous worker mapping aborts as well: an affinity that cannot be
-    attributed to a known worker is not evidence that the worker was pinned.
+    Three conditions abort: a worker that cannot be attributed to exactly
+    one thread, a worker core set that is not the requested one, and a
+    worker thread whose allowed set is anything other than its own core. An
+    affinity that cannot be attributed to a known worker is not evidence
+    that the worker was pinned.
     """
     ambiguous = snapshot.get("ambiguous_workers") or []
     if ambiguous:
         raise AssertionError(f"ambiguous worker thread mapping: {ambiguous}")
+    if "requested_cores" in snapshot and snapshot["requested_cores"] != snapshot.get(
+        "worker_cores"
+    ):
+        raise AssertionError(
+            f"workers run on cores {snapshot.get('worker_cores')}, the run "
+            f"requested {snapshot['requested_cores']}"
+        )
     mismatched = []
     for thread in snapshot.get("worker_threads", []):
         expected = sorted(thread["expected_cores"])
-        if not expected:
-            continue
         observed = thread["cpus_allowed_list"]
         if observed is None or parse_core_list(observed) != expected:
             mismatched.append(
@@ -1222,9 +1269,13 @@ def _is_docker_build(cmdline: str) -> bool:
 class HostLease:
     """An exclusive host measurement lease held for a whole run.
 
-    The lease is a file created with O_EXCL so that two measurement
-    processes on this machine cannot overlap. A lease whose holder is gone
-    is reclaimed, because a crashed run must not block the machine forever.
+    The lease is an exclusive `fcntl.flock` on an open descriptor of a fixed
+    lock file, held from `acquire` to `release`. The kernel releases the
+    lock when the holding process exits however it exits, so a crashed run
+    frees the machine without any reclamation step. The lock file itself is
+    never removed: unlinking a locked file would let a second process create
+    a fresh file of the same name and lock that, and both would believe they
+    held the lease.
     """
 
     def __init__(self, path=None, *, owner=None):
@@ -1237,76 +1288,78 @@ class HostLease:
         self.owner = owner or f"{os.getpid()}-{uuid.uuid4().hex}"
         self.acquired_utc = None
         self.released_utc = None
-        self._held = False
+        self._fd = None
 
     def acquire(self, *, deadline_ns=None):
-        """Take the lease, waiting for a stale holder to be reclaimed."""
+        """Take the lease, waiting under a monotonic deadline for a holder."""
+        if self._fd is not None:
+            raise AssertionError(f"the lease {self.path} is already held by this run")
         deadline_ns = deadline_ns or (time.monotonic_ns() + 60 * 10**9)
-        while True:
-            try:
-                handle = os.open(
-                    str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
-                )
-            except FileExistsError:
-                if self._reclaim_stale():
-                    continue
-                remaining = (deadline_ns - time.monotonic_ns()) / 1e9
-                if remaining <= 0:
-                    raise AssertionError(
-                        f"another measurement holds {self.path}: "
-                        f"{self._read_holder()}"
-                    )
-                _ = threading.Event().wait(min(0.2, remaining))
-                continue
-            with os.fdopen(handle, "w", encoding="ascii") as stream:
-                self.acquired_utc = utc_now()
-                json.dump(
-                    {
-                        "owner": self.owner,
-                        "pid": os.getpid(),
-                        "acquired_utc": self.acquired_utc,
-                    },
-                    stream,
-                    sort_keys=True,
-                )
-            self._held = True
-            return self
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+        wake = threading.Event()
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = (deadline_ns - time.monotonic_ns()) / 1e9
+                    if remaining <= 0:
+                        raise AssertionError(
+                            f"another measurement holds {self.path}: "
+                            f"{self._read_holder()}"
+                        )
+                    _ = wake.wait(min(0.2, remaining))
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        self.acquired_utc = utc_now()
+        # The holder record is diagnostic only; the lock is the lease.
+        record = json.dumps(
+            {"owner": self.owner, "pid": os.getpid(), "acquired_utc": self.acquired_utc},
+            sort_keys=True,
+        ).encode("ascii")
+        os.ftruncate(fd, 0)
+        _ = os.pwrite(fd, record + b"\n", 0)
+        os.fsync(fd)
+        return self
 
     def _read_holder(self):
-        """Whatever the lease file currently claims, or None."""
+        """Whatever the lock file's diagnostic record claims, or None."""
         try:
             return json.loads(self.path.read_text(encoding="ascii"))
         except (OSError, ValueError):
             return None
 
-    def _reclaim_stale(self) -> bool:
-        """Remove a lease whose holder no longer exists, if there is one."""
-        holder = self._read_holder()
-        if holder is None:
-            # A half-written lease file left by a killed process.
-            with contextlib.suppress(OSError):
-                self.path.unlink()
-            return True
-        pid = holder.get("pid")
-        if isinstance(pid, int) and not Path(f"/proc/{pid}").exists():
-            with contextlib.suppress(OSError):
-                self.path.unlink()
-            return True
-        return False
-
     def assert_held(self):
-        """Fail unless this process still owns the lease it took."""
-        holder = self._read_holder()
-        if not self._held or not holder or holder.get("owner") != self.owner:
-            raise AssertionError(f"the host measurement lease was lost: {holder}")
+        """Fail unless this run still holds the lock on the lease file.
+
+        The descriptor must still be open and must still be the file at the
+        lease path: a lock on a file that was replaced or removed excludes
+        nobody.
+        """
+        if self._fd is None:
+            raise AssertionError(f"the host measurement lease {self.path} is not held")
+        try:
+            held = os.fstat(self._fd)
+            current = os.stat(self.path)
+        except OSError as error:
+            raise AssertionError(f"the host measurement lease was lost: {error}")
+        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+            raise AssertionError(
+                f"the lease file {self.path} was replaced while this run held it"
+            )
 
     def release(self):
-        """Give the lease back, if it is still ours."""
-        if self._held and (self._read_holder() or {}).get("owner") == self.owner:
-            with contextlib.suppress(OSError):
-                self.path.unlink()
+        """Give the lease back by unlocking and closing the descriptor."""
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
         self.released_utc = utc_now()
-        self._held = False
 
     def as_json(self) -> dict:
         """The lease identity and lifetime for a result file."""
@@ -1672,8 +1725,9 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
 
     Repeated responses carrying an unchanged uptime add no observation at
     all, so a fast poller cannot manufacture a proof out of one collection.
-    Any nonempty worker resets that worker's streak, and a deadline that
-    expires without the streaks is a failure, never a pass.
+    A nonempty epoch resets that worker's streak, and so does an epoch the
+    worker did not answer, because an unobserved epoch may have been busy. A
+    deadline that expires without the streaks is a failure, never a pass.
     """
     tracker = EpochTracker()
     wake = threading.Event()
@@ -1689,9 +1743,12 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
             worker = sample["workers"][key]
             if not worker_reported(worker):
                 # The uptime advanced but this worker did not answer the
-                # collection, so the epoch says nothing about it: it is
-                # neither an empty observation nor a nonempty one.
+                # collection. Its state during that epoch is unobserved, and
+                # an unobserved epoch may have been busy, so the empty
+                # epochs either side of it are not consecutive: the streak
+                # starts again.
                 unanswered[key] += 1
+                streak[key] = 0
                 continue
             if worker_is_empty(worker, buffered=buffered):
                 streak[key] += 1
@@ -2251,13 +2308,6 @@ def check(name, kind, status, detail="") -> dict:
     return {"name": name, "kind": kind, "status": status, "detail": detail}
 
 
-def metric_direction(name: str) -> str:
-    """Whether a larger value of one metric is better or worse."""
-    if name.endswith(HIGHER_IS_BETTER_SUFFIXES):
-        return "higher_is_better"
-    return "lower_is_better"
-
-
 def validate_result(result) -> None:
     """Refuse to write a result that cannot be read as evidence.
 
@@ -2303,6 +2353,11 @@ def validate_result(result) -> None:
     for name in unavailable:
         if result["metrics"].get(name) is not None:
             raise AssertionError(f"metric {name} has both a value and a reason")
+    for name, direction in (result.get("metric_directions") or {}).items():
+        if direction not in DIRECTIONS:
+            raise AssertionError(f"metric {name} has unknown direction {direction!r}")
+        if name not in result["metrics"]:
+            raise AssertionError(f"direction declared for unreported metric {name}")
     mandatory = result.get("mandatory_metrics", [])
     if result["status"] == STATUS_PASSED:
         absent = [name for name in mandatory if result["metrics"].get(name) is None]
@@ -2323,21 +2378,34 @@ def validate_result(result) -> None:
                 raise AssertionError(f"check {entry!r} is missing {field}")
 
 
-def write_result(path, result) -> Path:
-    """Write one result file atomically, after validating it."""
+def write_json_atomic(path, document) -> Path:
+    """Write one JSON document so that no reader ever sees a partial file.
+
+    The document is encoded strictly -- sorted keys, ASCII, no non-finite
+    numbers -- into a temporary file in the destination directory, flushed
+    to disk and renamed over the destination in one step.
+    """
     path = Path(path)
-    validate_result(result)
     encoded = (
         json.dumps(
-            result, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False
+            document, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False
         )
         + "\n"
-    )
+    ).encode("ascii")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
-    _ = temporary.write_text(encoded, encoding="ascii")
+    with open(temporary, "wb") as handle:
+        _ = handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
     _ = temporary.replace(path)
     return path
+
+
+def write_result(path, result) -> Path:
+    """Write one result file atomically, after validating it."""
+    validate_result(result)
+    return write_json_atomic(path, result)
 
 
 def file_digest(path) -> str:
@@ -2400,40 +2468,341 @@ def record_event(result, kind, detail="") -> None:
     )
 
 
+def machine_identity_sha256():
+    """A hash of this machine's persistent identity, or None if unreadable.
+
+    Only the hash is recorded. A machine whose identity cannot be read has
+    no fingerprint, so its runs can be recorded but never compared.
+    """
+    for candidate in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            identity = Path(candidate).read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if identity:
+            return hashlib.sha256(identity.encode("ascii")).hexdigest()
+    return None
+
+
+class RunControls:
+    """The host controls every measured run holds from start to end.
+
+    `open` takes the exclusive host lease and starts the build monitor
+    before anything is measured. The experiment calls `snapshot("start",
+    ...)` immediately before measured traffic and `snapshot("end", ...)`
+    after its final drain, naming the process of each role, the workers the
+    telemetry reported and the cores the run requested; every snapshot
+    asserts worker affinity and aborts the run on a mismatch or an
+    unattributable worker. `close` stops the monitor, checks the lease is
+    still held, compares the two snapshots and records every outcome as a
+    hard check, whatever happened in between. None of these steps is
+    optional: a missing one leaves its hard check failed or absent, and the
+    baseline evaluator rejects a run without the complete set.
+    """
+
+    EDGES = ("start", "end")
+
+    def __init__(self, result, *, lease_path=None, lease_wait_s=60.0,
+                 build_interval_s=1.0):
+        self.result = result
+        self.lease = HostLease(lease_path)
+        self.lease_wait_s = lease_wait_s
+        self.monitor = BuildMonitor(interval_s=build_interval_s)
+        self.taken = {}
+        self.affinity_failures = []
+        self.opened = False
+        self.closed = False
+
+    def open(self):
+        """Take the lease and start watching for builds, in that order."""
+        self.lease.acquire(
+            deadline_ns=time.monotonic_ns() + int(self.lease_wait_s * 10**9)
+        )
+        _ = self.monitor.start()
+        self.opened = True
+        environment = self.result["environment"]
+        environment["machine_identity_sha256"] = machine_identity_sha256()
+        record_event(self.result, "host_controls_opened", self.lease.owner)
+        return self
+
+    def snapshot(self, edge, roles, *, workers, requested_cores):
+        """Record one edge's environment and assert worker affinity on it.
+
+        `roles` maps each role to `(pid, cores)`. The start edge also fixes
+        the run's normalized role placement, which is part of its
+        fingerprint.
+        """
+        if edge not in self.EDGES:
+            raise ValueError(f"an environment snapshot edge is start or end: {edge}")
+        if not self.opened:
+            raise AssertionError("snapshot before the host controls were opened")
+        if not workers:
+            raise AssertionError(
+                f"the {edge} snapshot names no workers; a measured run must "
+                f"attribute every worker thread"
+            )
+        snapshot = environment_snapshot(
+            roles, workers=workers, requested_cores=requested_cores
+        )
+        self.result["environment"][edge] = snapshot
+        if edge == "start":
+            self.result["environment"]["core_allocation"] = {
+                role: sorted({int(core) for core in value[1]})
+                for role, value in sorted(roles.items())
+                if isinstance(value, tuple) and value[1]
+            }
+        try:
+            assert_affinity(snapshot)
+        except AssertionError as error:
+            self.affinity_failures.append(f"{edge}: {error}")
+            self.taken[edge] = snapshot
+            raise
+        self.taken[edge] = snapshot
+        return snapshot
+
+    def close(self):
+        """Stop the controls and record each of their outcomes, once."""
+        if self.closed:
+            return
+        self.closed = True
+        environment = self.result["environment"]
+        checks = self.result["checks"]
+        if self.opened:
+            report = self.monitor.stop()
+            environment["build_monitor"] = report
+            checks.append(
+                check(
+                    "no_concurrent_build",
+                    CHECK_HARD,
+                    STATUS_FAILED if report["detected"] else STATUS_PASSED,
+                    f"{report['observation_count']} build processes seen in "
+                    f"{report['scans']} scans",
+                )
+            )
+            try:
+                self.lease.assert_held()
+                lease_status, lease_detail = STATUS_PASSED, str(self.lease.path)
+            except AssertionError as error:
+                lease_status, lease_detail = STATUS_FAILED, str(error)
+            checks.append(check("host_lease_held", CHECK_HARD, lease_status, lease_detail))
+        else:
+            checks.append(
+                check(
+                    "host_lease_held",
+                    CHECK_HARD,
+                    STATUS_FAILED,
+                    "the host controls were never opened",
+                )
+            )
+            checks.append(
+                check(
+                    "no_concurrent_build",
+                    CHECK_HARD,
+                    STATUS_FAILED,
+                    "no build monitor ran, so build activity is unobservable",
+                )
+            )
+        complete = all(edge in self.taken for edge in self.EDGES)
+        checks.append(
+            check(
+                "environment_snapshots_complete",
+                CHECK_HARD,
+                STATUS_PASSED if complete else STATUS_FAILED,
+                f"taken: {sorted(self.taken)}",
+            )
+        )
+        if complete:
+            match = environment_match(self.taken["start"], self.taken["end"])
+            environment["match"] = match
+            checks.append(
+                check(
+                    "environment_matched",
+                    CHECK_HARD,
+                    STATUS_PASSED if match["matched"] else STATUS_FAILED,
+                    json.dumps(match["differences"], sort_keys=True),
+                )
+            )
+        else:
+            checks.append(
+                check(
+                    "environment_matched",
+                    CHECK_HARD,
+                    STATUS_FAILED,
+                    "a start and an end snapshot are both required",
+                )
+            )
+        if self.affinity_failures:
+            affinity_status, affinity_detail = STATUS_FAILED, "; ".join(
+                self.affinity_failures
+            )
+        elif complete:
+            affinity_status, affinity_detail = STATUS_PASSED, "every worker on its own core"
+        else:
+            affinity_status, affinity_detail = (
+                STATUS_FAILED,
+                "worker affinity was not observed at both edges",
+            )
+        checks.append(check("affinity_matched", CHECK_HARD, affinity_status, affinity_detail))
+        start = self.taken.get("start") or {}
+        physical = start.get("physical_core_count")
+        checks.append(
+            check(
+                "physical_cores_sufficient",
+                CHECK_HARD,
+                STATUS_PASSED
+                if isinstance(physical, int) and physical >= MINIMUM_PHYSICAL_CORES
+                else STATUS_FAILED,
+                f"{physical} physical cores, {MINIMUM_PHYSICAL_CORES} required",
+            )
+        )
+        if self.opened:
+            self.lease.release()
+            environment["lease"] = self.lease.as_json()
+        record_event(self.result, "host_controls_closed")
+
+
+def settle_status(result) -> None:
+    """A passed run with any failed check is a failed run."""
+    if result["status"] == STATUS_PASSED and any(
+        entry["status"] == STATUS_FAILED for entry in result["checks"]
+    ):
+        result["status"] = STATUS_FAILED
+
+
 # --------------------------------------------------------------------------
 # Baselines
 # --------------------------------------------------------------------------
 
 
+# The two ways a measured quantity can get worse. Every baseline metric
+# carries one of them explicitly: a metric name does not decide it, because
+# the same suffix names quantities that improve in opposite directions (a
+# throughput ratio and a backlog ratio, for instance).
+HIGHER_IS_BETTER = "higher_is_better"
+LOWER_IS_BETTER = "lower_is_better"
+DIRECTIONS = (HIGHER_IS_BETTER, LOWER_IS_BETTER)
+
+# The hard gates a measured run must carry, each passed, before it may be
+# compared or establish a baseline. A missing gate is not a passed gate: a
+# run that never checked delivery, never checked its environment or never
+# reconciled its memory has not shown that any of them held.
+CORRECTNESS_CHECKS = ("delivery",)
+VALIDITY_CHECKS = (
+    "host_lease_held",
+    "no_concurrent_build",
+    "environment_snapshots_complete",
+    "environment_matched",
+    "affinity_matched",
+    "physical_cores_sufficient",
+    "minimum_samples",
+)
+RESIDUAL_CHECKS = ("rss_reconciliation",)
+REQUIRED_HARD_CHECKS = CORRECTNESS_CHECKS + VALIDITY_CHECKS + RESIDUAL_CHECKS
+
+RUN_DIR_TOKEN = "<run_dir>"
+
+
+def canonicalize_run_paths(value, run_dir):
+    """Replace the run directory prefix of every path under it by a token.
+
+    Only paths under this run's own directory are rewritten: they are the
+    one part of an effective configuration that differs between otherwise
+    identical runs. Every other string, including other paths, is kept
+    exactly, so two configurations that point at different places outside
+    the run directory never share a fingerprint.
+    """
+    roots = sorted(
+        {str(Path(run_dir)), os.path.realpath(str(run_dir))}, key=len, reverse=True
+    )
+
+    def rewrite(item):
+        """Rewrite one node of the configuration tree."""
+        if isinstance(item, dict):
+            return {key: rewrite(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [rewrite(child) for child in item]
+        if isinstance(item, str):
+            for root in roots:
+                if item == root or item.startswith(root + os.sep):
+                    return RUN_DIR_TOKEN + item[len(root):]
+        return item
+
+    return rewrite(value)
+
+
+def _required(value, path):
+    """One fingerprint input, or an error naming the input that is absent."""
+    if value is None or (isinstance(value, (dict, list, str)) and not value):
+        raise AssertionError(
+            f"fingerprint input {path} is missing; a run whose environment, "
+            f"configuration, workload or build is unrecorded cannot be compared"
+        )
+    return value
+
+
+def fingerprint_material(result) -> dict:
+    """Everything a baseline fingerprint covers, each input required.
+
+    Machine identity and topology, including the sibling groups and the
+    cores available to the run; the normalized placement of each role on
+    cores; the effective configuration with run-directory paths
+    canonicalized; the workload with its offered rate, duration and
+    concurrency; and the build profile, features, allocator and toolchain.
+    """
+    environment = _required(result.get("environment"), "environment")
+    start = _required(environment.get("start"), "environment.start")
+    machine = {
+        "identity_sha256": environment.get("machine_identity_sha256"),
+        "cpu_model": start.get("cpu_model"),
+        "logical_core_count": start.get("logical_core_count"),
+        "physical_core_count": start.get("physical_core_count"),
+        "sibling_groups": start.get("sibling_groups"),
+        "ram_bytes": start.get("ram_bytes"),
+        "kernel": start.get("kernel"),
+    }
+    for key, value in machine.items():
+        _ = _required(value, f"machine.{key}")
+    available = _required(start.get("available_cores"), "environment.start.available_cores")
+    placement = _required(environment.get("core_allocation"), "environment.core_allocation")
+    roles = {}
+    for role, cores in placement.items():
+        cores = _required(cores, f"environment.core_allocation.{role}")
+        roles[str(role)] = sorted({int(core) for core in cores})
+    run_dir = _required(result.get("run_dir"), "run_dir")
+    config = _required(result.get("config", {}).get("effective"), "config.effective")
+    workload = _required(result.get("workload"), "workload")
+    schedule = _required(result.get("workload_schedule"), "workload_schedule")
+    for key in ("duration_s", "rate_requests_per_s", "max_in_flight"):
+        _ = _required(schedule.get(key), f"workload_schedule.{key}")
+    build = _required(environment.get("build"), "environment.build")
+    build_fields = {}
+    for key in ("profile", "features", "allocator", "toolchain"):
+        build_fields[key] = _required(build.get(key), f"environment.build.{key}")
+    return {
+        "case": _required(result.get("case"), "case"),
+        "machine": machine,
+        "available_cores": sorted(int(core) for core in available),
+        "role_placement": dict(sorted(roles.items())),
+        "config": canonicalize_run_paths(config, run_dir),
+        "workload": workload,
+        "schedule": {
+            key: schedule[key]
+            for key in ("duration_s", "rate_requests_per_s", "max_in_flight")
+        },
+        "build": build_fields,
+    }
+
+
 def baseline_fingerprint(result) -> str:
     """The identity a baseline may only be compared within.
 
-    Machine, core allocation, effective configuration, workload and build
-    profile. The source revision and the binary hash are deliberately not in
-    it: they are provenance, so a new implementation on the same machine and
+    The source revision and the binary hash are deliberately not in it: they
+    are provenance, so a new implementation on the same machine and
     configuration is compared rather than excused.
     """
-    environment = result.get("environment", {})
-    start = environment.get("start", {})
-    material = {
-        "case": result["case"],
-        "machine": {
-            "identity_sha256": environment.get("machine_identity_sha256"),
-            "cpu_model": start.get("cpu_model"),
-            "logical_core_count": start.get("logical_core_count"),
-            "physical_core_count": start.get("physical_core_count"),
-            "ram_bytes": start.get("ram_bytes"),
-            "kernel": start.get("kernel"),
-        },
-        "core_allocation": environment.get("core_allocation"),
-        "config": result.get("config", {}).get("effective"),
-        "workload": result.get("workload"),
-        "build": {
-            key: environment.get("build", {}).get(key)
-            for key in ("profile", "features", "allocator", "toolchain")
-        },
-    }
-    encoded = json.dumps(material, sort_keys=True, ensure_ascii=True, allow_nan=False)
+    encoded = json.dumps(
+        fingerprint_material(result), sort_keys=True, ensure_ascii=True, allow_nan=False
+    )
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
@@ -2442,22 +2811,44 @@ def baseline_name(case, fingerprint) -> str:
     return f"baseline-{case}-{fingerprint[:16]}.json"
 
 
+def metric_directions(result) -> dict:
+    """The declared direction of every metric, or an error naming the gap."""
+    declared = result.get("metric_directions") or {}
+    missing = sorted(name for name in result["metrics"] if name not in declared)
+    if missing:
+        raise AssertionError(
+            f"metrics {missing} declare no direction; a regression cannot be "
+            f"signed without knowing whether larger is better"
+        )
+    invalid = {
+        name: value for name, value in declared.items() if value not in DIRECTIONS
+    }
+    if invalid:
+        raise AssertionError(f"unknown metric directions {invalid}")
+    extra = sorted(set(declared) - set(result["metrics"]))
+    if extra:
+        raise AssertionError(f"directions declared for unreported metrics {extra}")
+    return {name: declared[name] for name in sorted(result["metrics"])}
+
+
 def new_baseline(result, fingerprint) -> dict:
     """A baseline candidate built from one valid run."""
+    unavailable = sorted(
+        name for name, value in result["metrics"].items() if value is None
+    )
+    if unavailable:
+        raise AssertionError(
+            f"a baseline cannot be built from unavailable metrics {unavailable}"
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "artifact_kind": "baseline",
         "case": result["case"],
         "fingerprint": fingerprint,
         "created_utc": utc_now(),
-        "metric_schema": sorted(
-            name for name, value in result["metrics"].items() if value is not None
-        ),
-        "metrics": {
-            name: value
-            for name, value in sorted(result["metrics"].items())
-            if value is not None
-        },
+        "metric_schema": sorted(result["metrics"]),
+        "metrics": dict(sorted(result["metrics"].items())),
+        "directions": metric_directions(result),
         "resolution_floor": dict(result.get("resolution_floor", {})),
         "source_run_ids": [result["run_id"]],
         "provenance": {
@@ -2491,32 +2882,40 @@ def load_baselines(report_dir, case) -> dict:
     return found
 
 
-def signed_regression(name, value, reference, floor=None):
+def signed_regression(value, reference, direction, floor=None):
     """How much worse one metric got, as a signed fraction of the baseline.
 
-    Positive is worse in the metric's own direction, whichever that is. A
-    zero reference permits no increase at all unless the baseline declared a
+    Positive is worse in the metric's declared direction. A zero reference
+    permits no worsening at all unless the baseline declared a
     measurement-resolution floor that covers the new value.
     """
-    direction = metric_direction(name)
+    if direction not in DIRECTIONS:
+        raise AssertionError(f"unknown metric direction {direction!r}")
     if reference == 0:
         if value == 0:
             return 0.0
         if floor is not None and abs(value) <= floor:
             return 0.0
-        return float("inf") if direction == "lower_is_better" else float("-inf")
-    if direction == "lower_is_better":
+        worse = value > 0 if direction == LOWER_IS_BETTER else value < 0
+        return float("inf") if worse else float("-inf")
+    if direction == LOWER_IS_BETTER:
         return (value - reference) / abs(reference)
     return (reference - value) / abs(reference)
 
 
 def hard_gate_failures(result) -> list:
-    """Every hard check this run did not pass, whatever its status."""
-    return [
-        entry["name"]
-        for entry in result.get("checks", [])
-        if entry["kind"] == CHECK_HARD and entry["status"] != STATUS_PASSED
-    ]
+    """Every hard check this run did not pass, and every required one absent."""
+    present = {}
+    for entry in result.get("checks", []):
+        if entry["kind"] == CHECK_HARD:
+            present.setdefault(entry["name"], []).append(entry["status"])
+    failed = sorted(
+        name
+        for name, statuses in present.items()
+        if any(status != STATUS_PASSED for status in statuses)
+    )
+    missing = sorted(name for name in REQUIRED_HARD_CHECKS if name not in present)
+    return failed + [f"{name} (absent)" for name in missing]
 
 
 def evaluate_baseline(result: dict, *, baselines: dict = None) -> dict:
@@ -2524,25 +2923,27 @@ def evaluate_baseline(result: dict, *, baselines: dict = None) -> dict:
 
     Hard gates come first: correctness, measurement validity and the
     accounted-versus-RSS residual fail on every run, whether or not a
-    baseline exists, and a run that fails one never creates a baseline. Only
-    then is the fingerprint resolved. A matching baseline is compared against
-    and left untouched, so small regressions cannot ratchet it upward; a new
-    fingerprint writes a candidate baseline beside the result instead of
-    comparing against something it does not describe.
+    baseline exists, and a run that fails one never creates a baseline. The
+    complete required set must be present; an empty or partial set is a
+    failure, never a pass. Only then is the fingerprint resolved, and a
+    fingerprint with any unrecorded input is itself a failure. A matching
+    baseline is compared against and left untouched, so small regressions
+    cannot ratchet it upward; a new fingerprint produces a candidate baseline
+    for the caller to write beside the result.
 
     The decision is attached to the result either way. A hard failure or a
     failed regression raises, and the caller still publishes the failed JSON.
     """
-    failures = hard_gate_failures(result)
-    fingerprint = baseline_fingerprint(result)
     decision = {
-        "fingerprint": fingerprint,
+        "fingerprint": None,
         "limit": REGRESSION_LIMIT,
         "action": "rejected",
-        "hard_gate_failures": failures,
+        "hard_gate_failures": [],
         "regressions": {},
     }
     result["baseline_decision"] = decision
+    failures = hard_gate_failures(result)
+    decision["hard_gate_failures"] = failures
     if failures:
         raise AssertionError(f"hard gates failed, no baseline may be written: {failures}")
     if result["status"] != STATUS_PASSED:
@@ -2551,6 +2952,9 @@ def evaluate_baseline(result: dict, *, baselines: dict = None) -> dict:
             f"run {result['run_id']} is {result['status']}; it cannot be "
             f"compared or establish a baseline"
         )
+    fingerprint = baseline_fingerprint(result)
+    decision["fingerprint"] = fingerprint
+    directions = metric_directions(result)
     if baselines is None:
         baselines = load_baselines(
             resolve_report_dir(result.get("report_dir")), result["case"]
@@ -2567,26 +2971,43 @@ def evaluate_baseline(result: dict, *, baselines: dict = None) -> dict:
         return decision
     decision["action"] = "compared"
     decision["baseline_name"] = baseline_name(result["case"], fingerprint)
-    schema = list(reference.get("metric_schema", sorted(reference["metrics"])))
-    mismatch = [name for name in schema if result["metrics"].get(name) is None]
-    if mismatch:
+    schema = set(reference.get("metric_schema") or reference["metrics"])
+    reported = set(result["metrics"])
+    if schema != reported:
         raise AssertionError(
-            f"the baseline compares metrics this run did not report: {mismatch}"
+            f"metric schemas differ from baseline {decision['baseline_name']}: "
+            f"missing {sorted(schema - reported)}, extra {sorted(reported - schema)}"
+        )
+    unavailable = sorted(name for name in schema if result["metrics"][name] is None)
+    if unavailable:
+        raise AssertionError(
+            f"the baseline compares metrics this run did not report: {unavailable}"
+        )
+    reference_directions = reference.get("directions") or {}
+    changed = sorted(
+        name
+        for name in schema
+        if reference_directions.get(name) != directions[name]
+    )
+    if changed:
+        raise AssertionError(
+            f"metric directions differ from the baseline or are missing there: "
+            f"{changed}"
         )
     floors = reference.get("resolution_floor", {})
     worse = []
-    for name in schema:
+    for name in sorted(schema):
         value = result["metrics"][name]
         change = signed_regression(
-            name, value, reference["metrics"][name], floors.get(name)
+            value, reference["metrics"][name], directions[name], floors.get(name)
         )
+        unbounded = change in (float("inf"), float("-inf"))
         decision["regressions"][name] = {
             "value": value,
             "reference": reference["metrics"][name],
-            "direction": metric_direction(name),
-            "signed_regression": None if change in (float("inf"), float("-inf"))
-            else change,
-            "unbounded": change in (float("inf"), float("-inf")),
+            "direction": directions[name],
+            "signed_regression": None if unbounded else change,
+            "unbounded": unbounded,
         }
         if change > REGRESSION_LIMIT:
             worse.append(name)

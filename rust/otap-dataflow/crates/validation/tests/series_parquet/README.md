@@ -74,9 +74,9 @@ each of them once.
   answer carries its metric names with every value zero, which looks exactly
   like a drained worker. `memory.budget_bytes` is computed from
   configuration constants and is never zero while the worker is alive, so it
-  is the marker: a worker whose budget reads zero is not an observation, its
-  epoch counts towards neither an empty nor a nonempty streak, and the drain
-  report records how many such epochs it saw.
+  is the marker: a worker whose budget reads zero is not an observation. Its
+  epoch resets the empty streak, because an unobserved epoch may have been
+  busy, and the drain report records how many such epochs it saw.
 - **Environment.** Every run records a start and an end snapshot with the CPU
   model, logical and physical core counts, total RAM, kernel, load averages
   and the observed per-thread affinity from `/proc/PID/task/*/status`. A

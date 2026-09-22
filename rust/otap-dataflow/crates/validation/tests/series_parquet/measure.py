@@ -222,52 +222,88 @@ def run_named(case: str, output_dir, **options) -> dict:
 
 
 def run_case(spec: measurement.RunSpec, output_dir, *, experiment=None,
-             report_dir=None) -> dict:
-    """Perform one experiment and always write and publish its result.
+             report_dir=None, evaluate=True, lease_path=None,
+             lease_wait_s=60.0) -> dict:
+    """Perform one experiment under the host controls and publish its result.
 
-    `experiment(spec, result, output_dir)` is the measured body. Task 1 owns
-    the contract around it and validates that contract; the body itself
-    arrives with the topology, launcher and enforced host controls of task 2,
-    which is why calling this without one is an explicit refusal rather than
-    an empty passed result.
+    The lifecycle is fixed and every step is mandatory:
 
-    Whatever the body did, the result is written in `finally` and published,
-    including a failure: a run that ended badly leaves evidence rather than
-    nothing, and the caller's exit status reports it.
+    1. open the host controls -- the exclusive lease, then the build monitor;
+    2. run `experiment(spec, result, output_dir, controls)`, which must call
+       `controls.snapshot("start", ...)` before measured traffic and
+       `controls.snapshot("end", ...)` after its final drain, and must add
+       the correctness, sample-count and residual checks;
+    3. close the controls, recording the lease, build, snapshot, environment,
+       affinity and core-count checks;
+    4. settle the status, so a run with any failed check is failed;
+    5. apply the Controller baseline policy through `evaluate_baseline`,
+       unless `evaluate` is false because the run is one child of a family
+       whose policy is applied to the family after its stability checks;
+    6. on a new fingerprint, write the candidate baseline atomically beside
+       the result and reference it, by hash, in `baseline_files`.
+
+    Whatever happened, the result is written and published from `finally`,
+    so a run that failed at any step leaves its evidence. Calling this
+    without an experiment is an explicit refusal: the measured body arrives
+    with task 2.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic_ns()
     result = measurement.new_result(spec)
     result["config"]["requested"] = spec.as_json()
+    result["run_dir"] = str(output_dir)
+    result["workload_schedule"] = {
+        "duration_s": spec.duration_s,
+        "rate_requests_per_s": spec.overrides.get(
+            "rate_requests_per_s", "closed_loop"
+        ),
+        "max_in_flight": spec.max_in_flight,
+    }
     if report_dir is not None:
         result["report_dir"] = str(report_dir)
-
-    result["environment"]["start"] = measurement.environment_snapshot(
-        {"harness": os.getpid()}
+    controls = measurement.RunControls(
+        result, lease_path=lease_path, lease_wait_s=lease_wait_s
     )
     try:
+        controls.open()
         if experiment is None:
             raise NotImplementedError(
                 f"case {spec.case} has no measured body yet: the topology, "
                 "launcher and enforced host controls arrive in task 2"
             )
-        experiment(spec, result, output_dir)
+        experiment(spec, result, output_dir, controls)
+        controls.close()
+        measurement.settle_status(result)
+        if evaluate:
+            decision = measurement.evaluate_baseline(result)
+            if decision["action"] == "created":
+                candidate = result.pop("baseline_candidate")
+                path = measurement.write_json_atomic(
+                    output_dir / decision["baseline_name"], candidate
+                )
+                result["baseline_files"].append(measurement.file_entry(path))
     except BaseException as error:
         result["status"] = measurement.STATUS_FAILED
         measurement.record_event(result, "failed", f"{type(error).__name__}: {error}")
         raise
     finally:
+        controls.close()
+        measurement.settle_status(result)
+        # Both snapshots are required in every file. An edge the experiment
+        # never reached is filled from the harness alone and marked as such;
+        # it cannot satisfy the snapshot check, which already failed.
+        for edge in measurement.RunControls.EDGES:
+            if edge not in result["environment"]:
+                snapshot = measurement.environment_snapshot({"harness": os.getpid()})
+                snapshot["fallback"] = (
+                    "the experiment did not reach this edge; this is the "
+                    "harness process only"
+                )
+                result["environment"][edge] = snapshot
+        result.pop("baseline_candidate", None)
         result["elapsed_s"] = (time.monotonic_ns() - started) / 1e9
-        result["environment"]["end"] = measurement.environment_snapshot(
-            {"harness": os.getpid()}
-        )
-        result["environment"]["match"] = measurement.environment_match(
-            result["environment"]["start"], result["environment"]["end"]
-        )
-        index = measurement.write_result(
-            output_dir / f"{spec.run_id}.json", result
-        )
+        index = measurement.write_result(output_dir / f"{spec.run_id}.json", result)
         _ = measurement.publish_result_tree(index, result["report_dir"])
     return result
 
