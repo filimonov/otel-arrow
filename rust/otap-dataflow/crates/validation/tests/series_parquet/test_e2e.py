@@ -116,6 +116,7 @@ class Engine:
         overrides=None,
         interval="1s",
         telemetry_interval=None,
+        log_level=None,
     ):
         self.root = Path(directory)
         self.data = self.root / "data"
@@ -135,6 +136,11 @@ class Engine:
         if overrides:
             for key, value in overrides.items():
                 export[key] = value
+        if log_level:
+            # Set explicitly rather than through RUST_LOG, which the engine
+            # only consults when the configuration omits a level: a test that
+            # reads a DEBUG event must not depend on the caller's environment.
+            self.config["engine"]["telemetry"]["logs"] = {"level": log_level}
         if telemetry_interval:
             # The exporter's gauges are sampled when the engine collects
             # telemetry, so a test that has to observe a short-lived state
@@ -1871,11 +1877,16 @@ class DockerSlice(unittest.TestCase):
                     "retry_timeout": "1s",
                 },
             }
+            # The exporter announces the first attempt of a flush at DEBUG
+            # and only a retry at INFO. This test compares the two, so it asks
+            # the engine for DEBUG logs; nothing else here depends on the
+            # level.
             with Engine(
                 directory,
                 storage=store.storage,
                 overrides=overrides,
                 telemetry_interval="50ms",
+                log_level="debug",
             ) as engine:
                 try:
                     store.stop()

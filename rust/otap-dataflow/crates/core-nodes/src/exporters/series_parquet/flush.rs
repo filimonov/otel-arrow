@@ -152,17 +152,35 @@ async fn write_until(
         // so an operator can see that a retry rewrites objects rather than
         // adding any. Every object of a block shares one file name and differs
         // only in its dataset directory, so the name and the count are the
-        // whole set; both are bounded by the schema, not by the data.
+        // whole set.
+        //
+        // The first attempt of a flush is the ordinary case and says nothing
+        // an operator needs at INFO -- one line per written block already
+        // exists -- so it is emitted at DEBUG. A retry is the event worth
+        // reporting, and it is rare by construction. The file name is a log
+        // field only: it is unbounded in cardinality (window, boot id and
+        // sequence all move) and never labels a metric, where attempts are
+        // counted instead.
         let planned = sink.planned_paths(&data);
-        otel_info!(
-            "series_parquet.flush_attempt",
-            attempt = attempts,
-            file = planned
-                .first()
-                .and_then(object_store::path::Path::filename)
-                .unwrap_or(""),
-            objects = planned.len()
-        );
+        let file = planned
+            .first()
+            .and_then(object_store::path::Path::filename)
+            .unwrap_or("");
+        if attempts > 1 {
+            otel_info!(
+                "series_parquet.flush_attempt",
+                attempt = attempts,
+                file = file,
+                objects = planned.len()
+            );
+        } else {
+            otel_debug!(
+                "series_parquet.flush_attempt",
+                attempt = attempts,
+                file = file,
+                objects = planned.len()
+            );
+        }
         // A child token so the attempt can be cancelled on the deadline
         // without cancelling the job itself, whose token also serves the
         // owner's drop.
