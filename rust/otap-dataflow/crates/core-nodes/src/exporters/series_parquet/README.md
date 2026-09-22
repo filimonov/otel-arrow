@@ -27,10 +27,11 @@ converted, because the shared byte views decode lazily: without that check a
 truncated request would be acknowledged as stored. Corruption inside a nested
 message is not validated and still surfaces as missing fields. Rotation
 follows aligned wall-clock windows: a block covers one `window.interval`
-window and is sealed when that window ends, so the node writes one file set
-per window rather than one per request, and two writers of the same lake agree
-on where a window starts. A block that reaches `window.max_block_bytes` or
-`window.max_requests_per_block` is sealed early. The waiting is done on the
+window and is sealed when that window ends, so the boundary-driven case writes
+one file set per window rather than one per request, and two writers of the
+same lake agree on where a window starts. A block that reaches
+`window.max_block_bytes` or `window.max_requests_per_block` is sealed before
+its window ends, which writes more than one file set for that window. The waiting is done on the
 engine's monotonic clock, so a wall clock that steps backwards cannot reopen a
 window that was already written and boundaries missed while the node was busy
 coalesce into one rotation. Later tasks add telemetry and a drain-aware

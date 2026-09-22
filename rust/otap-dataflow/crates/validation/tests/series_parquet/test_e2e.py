@@ -1,11 +1,13 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 """Real OTLP producer, df_engine process and Parquet reader."""
+import collections
 import os
 from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.request
 
@@ -23,6 +25,24 @@ def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def window_start(path):
+    """The window start recorded in a part file's name.
+
+    Files are named `part-<YYYYMMDDTHHMMSSZ>-<writer>-<boot>-<seq>.parquet`,
+    so the second field is the start of the window the block covered. Two
+    files of the same window differ only in the sequence number.
+    """
+    return path.name.split("-")[1]
+
+
+def by_window(paths):
+    """Group part files by the window their name records."""
+    grouped = collections.defaultdict(list)
+    for path in paths:
+        grouped[window_start(path)].append(path)
+    return grouped
 
 
 def log_request(request_id):
@@ -175,16 +195,23 @@ class LocalSlice(unittest.TestCase):
                 print(engine.engine_log())
                 raise
 
-    # Scenario: four concurrent logs requests reach an exporter whose rotation
-    # interval is three seconds.
-    # Guarantees: every request is acknowledged and durable, and the requests
-    # share a window rather than each producing a file set of their own, so
-    # rotation really is driven by the window and not by the request.
+    # Scenario: four concurrent logs requests are submitted immediately after
+    # an aligned boundary of a three-second rotation interval.
+    # Guarantees: every request is acknowledged and durable, and every window
+    # that received data wrote exactly one file set, so rotation is driven by
+    # the window and not by the request. The submissions are aligned to a
+    # boundary so that they normally share a single window; grouping the files
+    # by the window their name records is what makes the assertion exact
+    # rather than a tolerance on the file count, and it stays exact if a
+    # submission does straddle a boundary.
     def test_one_window_writes_one_file_set(self):
         with tempfile.TemporaryDirectory() as directory, Engine(
             directory, interval="3s"
         ) as engine:
             try:
+                # Boundaries are aligned to Unix time, so this waits for the
+                # start of a window rather than for an arbitrary instant.
+                time.sleep(-time.time() % 3.0)
                 calls = [
                     engine.logs.Export.future(log_request(f"request-{n}"), timeout=30)
                     for n in range(4)
@@ -194,12 +221,29 @@ class LocalSlice(unittest.TestCase):
                 values = list(
                     engine.data.glob("v=1/signal=logs/dataset=values/**/*.parquet")
                 )
-                self.assertTrue(values, "no values file after four exports")
-                self.assertLess(
-                    len(values),
-                    4,
-                    "one file set per request means the window is not rotating",
+                series = list(
+                    engine.data.glob("v=1/signal=logs/dataset=series/**/*.parquet")
                 )
+                self.assertTrue(values, "no values file after four exports")
+                self.assertTrue(series, "no series file after four exports")
+                values_by_window = by_window(values)
+                for window, paths in sorted(values_by_window.items()):
+                    self.assertEqual(
+                        len(paths),
+                        1,
+                        f"window {window} wrote {len(paths)} values files: {paths}",
+                    )
+                # A descriptor is written once per partition, so a later
+                # window need not write a series file at all; the ones that do
+                # write exactly one, and they belong to a window that has
+                # values.
+                for window, paths in sorted(by_window(series).items()):
+                    self.assertEqual(
+                        len(paths),
+                        1,
+                        f"window {window} wrote {len(paths)} series files: {paths}",
+                    )
+                    self.assertIn(window, values_by_window)
                 with duckdb.connect() as db:
                     rows = db.execute(
                         "SELECT body FROM read_parquet(?) ORDER BY body",

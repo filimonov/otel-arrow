@@ -21,8 +21,10 @@
 //!
 //! Rotation is driven by aligned wall-clock windows: a block covers one
 //! window of the configured interval and is sealed when that window ends, so
-//! the node writes one file set per window rather than one per request. A
-//! block that fills its byte or request budget first is sealed early. The
+//! the boundary-driven case writes one file set per window rather than one
+//! per request. That is the normal case rather than a guarantee: a block that
+//! fills its byte or request budget is sealed before its window ends, which
+//! puts more than one file set in that window. The
 //! waiting is done on the engine's monotonic clock rather than on an engine
 //! periodic timer, which is cancelled before a node's receivers are drained;
 //! see [`window`] for what that buys.
