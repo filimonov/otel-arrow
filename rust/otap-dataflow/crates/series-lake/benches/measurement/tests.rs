@@ -39,6 +39,8 @@ const SEAL_AT_US: i64 = 1_789_960_500_000_000;
 const LOGGERS: usize = 7;
 /// Distinct `series.slot` values in the metrics fixture.
 const SLOTS: usize = 5;
+/// Samples the fixture-weight comparison takes of each configuration.
+const SAMPLES: usize = 30;
 
 /// A failed expectation, as an error the process exits on.
 fn ensure(condition: bool, what: impl Into<String>) -> Result<()> {
@@ -185,7 +187,15 @@ fn lake_config() -> LakeConfig {
 }
 
 fn bench_config(root: &Path) -> BenchConfig {
+    bench_config_with(root, 0)
+}
+
+/// The same configuration with `extra` synthetic series marked committed,
+/// which makes the per-iteration cache warm-up heavier without changing
+/// anything a stage admits.
+fn bench_config_with(root: &Path, extra: usize) -> BenchConfig {
     BenchConfig {
+        extra_committed_series: extra,
         workload_config_id: "self-test".into(),
         lake: lake_config(),
         storage: Some(serde_json::json!({"file": {"base_uri": root.join("store")}})),
@@ -399,34 +409,41 @@ fn input_file_round_trips(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// Scenario: every stage is asked for one iteration's input, and the input
-// is inspected for the setup that stage needs -- the warmed series cache a
-// cumulative layer admits into, the destination paths a local layer writes
-// to, the sink a store layer flushes through and the pre-encoded objects an
-// upload sends.
-// Guarantees: no stage builds its own setup while it is timed; everything
-// but the stage's own work is handed to `run` already built.
-fn every_stage_is_handed_its_setup(root: &Path) -> Result<()> {
+// Scenario: every stage prepares one iteration's input and then runs it,
+// with the pieces of per-iteration setup it builds counted.
+// Guarantees: `run` builds none of its own setup -- the counter never
+// advances across a timed call -- while `prepare` builds it, and two
+// preparations of a stage that writes name different destinations, so no
+// iteration can overwrite what an earlier one wrote.
+fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
-    let expected = [
-        (StageName::OtlpNoop, "wire"),
-        (StageName::OtlpConvert, "wire"),
-        (StageName::OtlpExtractHash, "wire"),
-        (StageName::OtlpSort, "wire+cache"),
-        (StageName::OtlpParquetLocal, "wire+cache+paths"),
-        (StageName::OtlpParquetZstd, "wire+cache+paths"),
-        (StageName::OtlpMinio, "wire+cache+sink"),
-        (StageName::Convert, "wire"),
-        (StageName::Extract, "records"),
-        (StageName::SortSeal, "extracted+cache"),
-        (StageName::Merge, "fixture"),
-        (StageName::Encode, "buffers"),
-        (StageName::LocalWrite, "objects+paths"),
-        (StageName::Upload, "objects+paths"),
-        (StageName::Sink, "sink"),
+    let needs_setup = [
+        StageName::OtlpSort,
+        StageName::OtlpParquetLocal,
+        StageName::OtlpParquetZstd,
+        StageName::OtlpMinio,
+        StageName::SortSeal,
+        StageName::LocalWrite,
+        StageName::Upload,
+        StageName::Sink,
+    ];
+    let needs_cache = [
+        StageName::OtlpSort,
+        StageName::OtlpParquetLocal,
+        StageName::OtlpParquetZstd,
+        StageName::OtlpMinio,
+        StageName::SortSeal,
+    ];
+    let writes = [
+        StageName::OtlpParquetLocal,
+        StageName::OtlpParquetZstd,
+        StageName::OtlpMinio,
+        StageName::LocalWrite,
+        StageName::Upload,
+        StageName::Sink,
     ];
     let input = fixture_inputs(root)?.remove(0);
-    for (name, carries) in expected {
+    for name in StageName::ALL {
         let stage = Stage::new(
             name,
             bench_config(root),
@@ -434,57 +451,203 @@ fn every_stage_is_handed_its_setup(root: &Path) -> Result<()> {
             stages::zstd(),
             true,
         )?;
+        let before = stage.setup_built();
         let prepared = stage.prepare()?;
+        let destinations = prepared.destinations();
+        let carries = prepared.carries();
         ensure(
-            prepared.carries() == carries,
+            !carries.is_empty(),
+            format!("{} says nothing about what it was handed", name.as_str()),
+        )?;
+        ensure(
+            carries.contains("cache") == needs_cache.contains(&name),
+            format!("{} reports carrying {carries:?}", name.as_str()),
+        )?;
+        let prepared_count = stage.setup_built();
+        if needs_setup.contains(&name) {
+            ensure(
+                prepared_count > before,
+                format!("{} built no setup while preparing", name.as_str()),
+            )?;
+        }
+        let output = stage.run(prepared)?;
+        ensure(
+            stage.setup_built() == prepared_count,
             format!(
-                "{} is handed {:?}, expected {carries:?}",
+                "{} built {} pieces of setup inside the timed run",
                 name.as_str(),
-                prepared.carries()
+                stage.setup_built() - prepared_count
             ),
         )?;
-        // Two preparations never name the same destination, so nothing an
-        // iteration writes can be an overwrite of an earlier one.
-        let again = stage.prepare()?;
-        ensure(again.carries() == carries, "the second preparation differs")?;
+        let _ = stage.observe(&output)?;
+        drop(output);
+        if writes.contains(&name) {
+            ensure(
+                !destinations.is_empty(),
+                format!("{} names no destination", name.as_str()),
+            )?;
+            let next = stage.prepare()?.destinations();
+            ensure(
+                next != destinations,
+                format!(
+                    "{} prepares the same destination twice: {destinations:?}",
+                    name.as_str()
+                ),
+            )?;
+        }
     }
     Ok(())
 }
 
-// Scenario: the same trivial operation is sampled twice, once with a
-// preparation that costs two milliseconds and once with one that costs ten
-// times as much.
-// Guarantees: a stage's measured time does not move when its fixture grows,
-// because the fixture is built outside the timer.
-fn fixture_cost_does_not_move_the_measurement() -> Result<()> {
-    let busy = |length: Duration| {
-        let started = Instant::now();
-        let mut work = 0u64;
-        while started.elapsed() < length {
-            work = std::hint::black_box(work.wrapping_add(1));
-        }
-        work
-    };
-    let sample = |cost: Duration| -> Result<u128> {
+// Scenario: the cumulative sort layer is sampled twice through the real
+// sampling loop, once with its ordinary fixture and once with a cache
+// warm-up two hundred thousand entries heavier, which is more than an
+// order of magnitude more per-iteration setup for exactly the same
+// admitted work.
+// Guarantees: the preparation really did get heavier, the loop prepares
+// once per sample, and the measured per-iteration time stays within a
+// quarter of the light fixture's -- the fixture is built outside the timer.
+fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("store"))?;
+    let input = fixture_inputs(root)?.remove(0);
+    let sample = |extra: usize| -> Result<(u128, u128, u64)> {
+        let stage = Stage::new(
+            StageName::OtlpSort,
+            bench_config_with(root, extra),
+            input.clone(),
+            stages::zstd(),
+            true,
+        )?;
+        let before = stage.setup_built();
         let samples = super::sample_loop(
             Clock::Thread,
-            50,
+            SAMPLES,
             Duration::ZERO,
-            || Ok(busy(cost)),
-            |value| Ok(std::hint::black_box(value.wrapping_mul(3))),
+            || stage.prepare(),
+            |prepared| stage.run(prepared),
             |_| Ok(Vec::new()),
+        )?;
+        ensure(
+            stage.setup_built() - before == samples.sample_count as u64,
+            format!(
+                "{} caches for {} samples: preparation is not once per sample",
+                stage.setup_built() - before,
+                samples.sample_count
+            ),
         )?;
         let mut walls: Vec<u128> = samples.samples.iter().map(|s| s.wall_ns).collect();
         walls.sort_unstable();
-        Ok(walls[walls.len() / 2])
+        Ok((
+            walls[walls.len() / 2],
+            samples.prepare_ns_total / samples.sample_count.max(1) as u128,
+            samples.sample_count as u64,
+        ))
     };
-    let small = sample(Duration::from_millis(2))?;
-    let large = sample(Duration::from_millis(20))?;
-    let bound = Duration::from_millis(1).as_nanos();
+    let (light_run, light_prepare, count) = sample(0)?;
+    let (heavy_run, heavy_prepare, _) = sample(200_000)?;
+    ensure(count >= SAMPLES as u64, "too few samples to compare")?;
     ensure(
-        small < bound && large < bound,
-        format!("samples of {small} and {large} ns carry their preparation"),
+        heavy_prepare > light_prepare * 3,
+        format!(
+            "the heavy fixture prepared in {heavy_prepare} ns against \
+             {light_prepare} ns: it is not heavier, so the test proves nothing"
+        ),
     )?;
+    let tolerance = light_run / 4;
+    ensure(
+        heavy_run < light_run + tolerance,
+        format!(
+            "the measured run grew from {light_run} ns to {heavy_run} ns when only \
+             the fixture grew: preparation is inside the timer"
+        ),
+    )?;
+    Ok(())
+}
+
+// Scenario: the artifacts of two Criterion attempts of one layer, written
+// under the ids those attempts ran with, are read back.
+// Guarantees: each attempt is read under its own id, an id whose artifact
+// is missing is a loud error naming it rather than another attempt's
+// numbers, and Criterion's own sanitization of an id is applied.
+fn criterion_artifacts_are_read_per_attempt(root: &Path) -> Result<()> {
+    let home = root.join("criterion-home");
+    let write = |function: &str, times: &[f64]| -> Result<()> {
+        let directory = home
+            .join(stages::criterion_directory_name("otlp_sort"))
+            .join(stages::criterion_directory_name(function))
+            .join("new");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("sample.json"),
+            serde_json::to_vec(&serde_json::json!({"times": times, "iters": [1.0]}))?,
+        )?;
+        Ok(())
+    };
+    write("logs", &[1e9, 5e8])?;
+    write("logs-attempt2", &[2e9])?;
+    write("logs/slash", &[4e9])?;
+    let first = stages::criterion_measured_seconds(&home, "otlp_sort", "logs")?;
+    let second = stages::criterion_measured_seconds(&home, "otlp_sort", "logs-attempt2")?;
+    ensure(
+        (first - 1.5).abs() < 1e-9 && (second - 2.0).abs() < 1e-9,
+        format!("attempts read back as {first} and {second} seconds"),
+    )?;
+    let sanitized = stages::criterion_measured_seconds(&home, "otlp_sort", "logs/slash")?;
+    ensure(
+        (sanitized - 4.0).abs() < 1e-9,
+        format!("a sanitized id read back as {sanitized} seconds"),
+    )?;
+    match stages::criterion_measured_seconds(&home, "otlp_sort", "logs-attempt3") {
+        Ok(value) => {
+            return Err(format!("a missing attempt answered with {value} seconds").into());
+        }
+        Err(error) => ensure(
+            error.to_string().contains("logs-attempt3"),
+            format!("the refusal does not name the missing id: {error}"),
+        )?,
+    }
+    Ok(())
+}
+
+// Scenario: the stages that store an object are run and their results are
+// inspected for what a completed write means.
+// Guarantees: every upload, local write and sink result records that
+// completion is object-store visibility with verified bytes and not host
+// power-loss durability, so no reader can take it for a durability claim.
+fn store_stages_record_completion_semantics(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("store"))?;
+    let input = fixture_inputs(root)?.remove(0);
+    for name in [StageName::LocalWrite, StageName::Upload, StageName::Sink] {
+        let stage = Stage::new(
+            name,
+            bench_config(root),
+            input.clone(),
+            stages::zstd(),
+            true,
+        )?;
+        let output = stage.run(stage.prepare()?)?;
+        let observation = stage.observe(&output)?;
+        drop(output);
+        let recorded = observation
+            .extra
+            .get("completion_semantics")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        ensure(
+            recorded.contains("read back") && recorded.contains("not host power-loss"),
+            format!("{} records completion as {recorded:?}", name.as_str()),
+        )?;
+        ensure(
+            observation
+                .extra
+                .get("objects_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default()
+                > 0,
+            format!("{} counted no objects", name.as_str()),
+        )?;
+    }
     Ok(())
 }
 
@@ -531,9 +694,11 @@ pub fn run() -> Result<()> {
     stage_names_are_the_contract()?;
     input_file_round_trips(root)?;
     input_generation_is_excluded_from_timing()?;
-    fixture_cost_does_not_move_the_measurement()?;
     diagnostic_encoding_matches_sink(root)?;
     stage_row_counts_are_exact(root)?;
-    every_stage_is_handed_its_setup(root)?;
+    run_never_builds_its_own_setup(root)?;
+    a_heavier_fixture_does_not_move_the_measurement(root)?;
+    criterion_artifacts_are_read_per_attempt(root)?;
+    store_stages_record_completion_semantics(root)?;
     Ok(())
 }

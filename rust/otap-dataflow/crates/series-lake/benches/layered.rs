@@ -60,28 +60,6 @@ fn criterion_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("target/criterion"))
 }
 
-/// The measured seconds of the group Criterion has just written.
-///
-/// Criterion reports its own samples, so the process reads back what it
-/// actually timed rather than trusting the estimate it started from.
-fn measured_seconds(home: &std::path::Path, group: &str, function: &str) -> Result<f64> {
-    let path = home
-        .join(group)
-        .join(function)
-        .join("new")
-        .join("sample.json");
-    let sample: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let times = sample
-        .get("times")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("Criterion wrote no sample times")?;
-    Ok(times
-        .iter()
-        .filter_map(serde_json::Value::as_f64)
-        .sum::<f64>()
-        / 1e9)
-}
-
 /// How long a group must run to time `minimum` of the stage's own work.
 ///
 /// Criterion measures only the routine, but schedules from a warm-up that
@@ -159,7 +137,21 @@ fn main() -> Result<()> {
         // What the layer was handed, so the recorded result says that its
         // setup existed before the timer started.
         let prepared_carries = prepared.carries();
+        // What this iteration would write, and how much per-iteration setup
+        // the layer had built before anything was timed. The counter must
+        // not advance across the run below, and the recorded numbers say so.
+        let prepared_destinations = prepared.destinations();
+        let setup_before_run = stage.setup_built();
         let (output, run) = stages::timed(|| stage.run(prepared))?;
+        let setup_after_run = stage.setup_built();
+        if setup_after_run != setup_before_run {
+            return Err(format!(
+                "{} built {} pieces of setup inside its timed run",
+                layer.as_str(),
+                setup_after_run - setup_before_run
+            )
+            .into());
+        }
         let observation = stage.observe(&output)?;
         drop(output);
         let failed: Vec<String> = observation
@@ -180,6 +172,9 @@ fn main() -> Result<()> {
         summaries.push(serde_json::json!({
             "stage": stage.name().as_str(),
             "prepared_input": prepared_carries,
+            "prepared_destinations": prepared_destinations,
+            "setup_built_in_prepare": setup_before_run,
+            "setup_built_in_run": setup_after_run - setup_before_run,
             "clock": layer.clock(),
             "records": stage.records(),
             "fixture_retained_bytes": stage.fixture_retained_bytes(),
@@ -246,9 +241,19 @@ fn main() -> Result<()> {
                 );
             });
             group.finish();
-            let measured =
-                measured_seconds(&criterion_home(), layer.as_str(), &cfg.workload_config_id)?;
+            // Read back the artifact of the id this attempt ran with. Any
+            // other id would schedule the next attempt from a measurement
+            // that is not this one.
+            let measured = stages::criterion_measured_seconds(
+                &criterion_home(),
+                layer.as_str(),
+                &function_id,
+            )?;
+            // Each attempt names the id it ran under, so the harness can
+            // read every attempt's own artifact back and refuse a record
+            // whose seconds are not that artifact's.
             attempts.push(serde_json::json!({
+                "function_id": function_id.as_str(),
                 "measurement_time_s": group_measurement_time.as_secs_f64(),
                 "measured_wall_s": measured,
             }));

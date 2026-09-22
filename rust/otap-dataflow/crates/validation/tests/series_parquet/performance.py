@@ -125,9 +125,46 @@ INPUT_REPRESENTATIONS = {
 # rates their input actually has.
 PRE_ENCODED_INPUT_STAGES = ("local_write", "upload")
 
+# The stages that store an object. Each one records what a completed write
+# means, so that no reader takes it for a durability claim.
+STORE_STAGES = ("local_write", "upload", "sink", "otlp_minio")
+
 # The rates a pre-encoded-input stage must report beside its per-record
 # metrics.
 RATE_FIELDS = ("objects_per_s", "input_bytes_per_s", "output_bytes_per_s")
+
+
+# What a stages family starts before any child takes the host lease, and
+# what runs inside each measured window. The setup phase runs no build:
+# `rustc --version` starts the compiler executable only to print its
+# version, and `--describe` asks an already built bench what it is. The
+# compiler-free claim each child records covers its own measured window,
+# between the start and end snapshots the out-of-process build monitor
+# brackets, and not this setup phase.
+SETUP_SUBPROCESSES = {
+    "before_any_lease": [
+        "git status and git rev-parse HEAD, for the source provenance",
+        "rustc --version, for the toolchain of every build fingerprint; it "
+        "compiles nothing",
+        "each prebuilt bench executable with --describe, to identify it "
+        "without building anything",
+        "docker info and docker image inspect, to confirm the daemon and the "
+        "local object store image",
+        "docker run, docker port, docker inspect and docker update, to start "
+        "and pin the object store container",
+    ],
+    "inside_each_measured_window": [
+        "the prebuilt bench executable or the engine under measurement",
+        "host_monitor.py, the out-of-process build monitor",
+        "docker ps and docker events, asked by that monitor",
+    ],
+    "compiler_free_claim": (
+        "covers measured windows only: no cargo, rustc, cc1 or ld process "
+        "was seen by the build monitor inside any child's measured window. "
+        "The setup phase above starts rustc once, for --version, and never "
+        "invokes cargo or builds anything"
+    ),
+}
 
 DENOMINATOR = (
     "logical upstream records of the input file (log records or metric "
@@ -269,6 +306,15 @@ def validate_stage_result(result: dict) -> None:
             f"stage result {result['stage']!r} does not say what its "
             f"per-record metrics divide by"
         )
+    if result["stage"] in STORE_STAGES:
+        semantics = result.get("completion_semantics")
+        if not semantics or "power-loss" not in semantics:
+            raise AssertionError(
+                f"stage result {result['stage']!r} stores an object and must "
+                f"record what a completed write means, including that it is "
+                f"not host power-loss durability; it records "
+                f"{semantics!r}"
+            )
     if result["stage"] in PRE_ENCODED_INPUT_STAGES:
         rates = result.get("rates") or {}
         for name in RATE_FIELDS:
@@ -943,13 +989,48 @@ def heap_metrics(report, records) -> dict:
     }
 
 
+# What Criterion replaces when it turns a benchmark id into a directory
+# name, and the length it truncates that name to. Copied from
+# `criterion::report::make_filename_safe`.
+CRITERION_UNSAFE = '?"/\\*<>:|^'
+CRITERION_NAME_LEN = 64
+
+
+def criterion_directory_name(component) -> str:
+    """Criterion's own directory name for one component of a benchmark id."""
+    name = "".join("_" if char in CRITERION_UNSAFE else char for char in component)
+    # Criterion truncates to a byte length at a character boundary.
+    encoded = name.encode("utf-8")[:CRITERION_NAME_LEN]
+    return encoded.decode("utf-8", errors="ignore")
+
+
 def criterion_estimates(home, stage, function) -> dict:
     """Criterion's own estimates and raw samples of one benchmark.
+
+    The artifacts are read under the id the benchmark actually ran with,
+    through Criterion's own sanitization of that id: a layer whose group
+    was repeated has one directory per attempt, and reading another
+    attempt's files would publish a distribution that is not the selected
+    one. A missing artifact is refused by name; it is never answered from
+    a neighbouring id.
 
     The artifacts are hashed as they are read, so a stage result names the
     exact files its distribution came from.
     """
-    directory = Path(home) / stage / function / "new"
+    directory = (
+        Path(home)
+        / criterion_directory_name(stage)
+        / criterion_directory_name(function)
+        / "new"
+    )
+    if not (directory / "estimates.json").is_file():
+        siblings = sorted(
+            path.name for path in (Path(home) / criterion_directory_name(stage)).glob("*")
+        ) if (Path(home) / criterion_directory_name(stage)).is_dir() else []
+        raise AssertionError(
+            f"Criterion wrote no estimates for {stage}/{function} at "
+            f"{directory}; the group directory holds {siblings}"
+        )
     estimates = json.loads((directory / "estimates.json").read_text(encoding="ascii"))
     samples = json.loads((directory / "sample.json").read_text(encoding="ascii"))
     times = samples["times"]
@@ -971,6 +1052,41 @@ def criterion_estimates(home, stage, function) -> dict:
             if (directory / name).is_file()
         ],
     }
+
+
+def criterion_attempts_agree(home, stage, summary) -> None:
+    """Refuse a layer whose attempt record is not its own artifacts.
+
+    The layer bench repeats a group under a new id until it has measured a
+    second of work, and records, per attempt, the id it ran under and the
+    seconds it read back. Every attempt's own artifact is read here and has
+    to carry exactly those seconds, and the last attempt has to be the one
+    the stage result publishes. A bench that read a stale id back -- every
+    attempt then repeats the first attempt's seconds -- is refused, as is
+    an attempt whose artifact is missing.
+    """
+    attempts = summary.get("group_attempts")
+    if not attempts:
+        raise AssertionError(f"the {stage} layer recorded no Criterion attempts")
+    for index, attempt in enumerate(attempts, start=1):
+        function = attempt.get("function_id")
+        if not function:
+            raise AssertionError(
+                f"attempt {index} of the {stage} layer does not name its id"
+            )
+        read = criterion_estimates(home, stage, function)["measured_wall_s"]
+        recorded = attempt.get("measured_wall_s")
+        if not _finite(recorded) or abs(read - recorded) > 1e-9 * max(1.0, read):
+            raise AssertionError(
+                f"attempt {index} of the {stage} layer recorded {recorded} s but "
+                f"its own artifact {function!r} measured {read} s: the attempt "
+                f"was scheduled from another attempt's samples"
+            )
+    if attempts[-1]["function_id"] != summary.get("criterion_function_id"):
+        raise AssertionError(
+            f"the {stage} layer publishes {summary.get('criterion_function_id')!r} "
+            f"but its last attempt ran as {attempts[-1]['function_id']!r}"
+        )
 
 
 def criterion_samples_ok(estimates) -> tuple:
@@ -1110,6 +1226,10 @@ def bench_config_document(plan, job, run_dir) -> dict:
         "scratch_dir": str(Path(run_dir) / "scratch"),
         "cache_entries": 200000,
         "committed_fraction": config["committed_fraction"],
+        # A measured configuration marks no synthetic series committed;
+        # the knob exists for the self-test that proves the cache warm-up
+        # is outside the timer.
+        "extra_committed_series": 0,
         "window_start_secs": measurement.LOG_BASE_TIME_NS // 10**9,
         "seal_at_us": measurement.LOG_BASE_TIME_NS // 1000,
     }
@@ -1358,9 +1478,8 @@ def criterion_experiment(plan, job, spec, result, run_dir, controls):
     summary = json.loads(summary_path.read_text(encoding="ascii"))[0]
     # Criterion writes each repeated attempt of one benchmark id under its
     # own name, and the layer bench reports which one it finished on.
-    estimates = criterion_estimates(
-        home, job["stage"], summary.get("criterion_function_id") or job["config_id"]
-    )
+    criterion_attempts_agree(home, job["stage"], summary)
+    estimates = criterion_estimates(home, job["stage"], summary["criterion_function_id"])
     records = summary["records"]
     samples_ok, samples_detail = criterion_samples_ok(estimates)
     failed = [
@@ -2557,6 +2676,9 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
     result["environment"]["engines"] = plan["engines"]
     result["environment"]["core_allocation"] = plan["allocation"]
     result["environment"]["git"] = plan["git"]
+    # What the family's own setup phase starts, and what the compiler-free
+    # claim every child records does and does not cover.
+    result["environment"]["setup_subprocesses"] = SETUP_SUBPROCESSES
     result["family_ordinal"] = plan["family_ordinal"]
     checks = result["checks"]
     for aggregate in aggregates:

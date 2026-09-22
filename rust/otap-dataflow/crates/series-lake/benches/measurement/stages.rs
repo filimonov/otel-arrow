@@ -371,6 +371,14 @@ pub struct BenchConfig {
     /// Fraction of the input's series marked committed in the block's
     /// partition before admission, which sets the cache hit distribution.
     pub committed_fraction: f64,
+    /// Synthetic series marked committed that the input never carries.
+    ///
+    /// They make the per-iteration cache warm-up heavier without changing
+    /// anything the stage admits, which is how a self-test proves that the
+    /// warm-up is outside the timer. A measured configuration leaves it at
+    /// zero.
+    #[serde(default)]
+    pub extra_committed_series: usize,
     /// Window start of every block, in Unix seconds.
     pub window_start_secs: i64,
     /// Fixed seal stamp, in Unix microseconds.
@@ -684,6 +692,75 @@ pub fn sink_equivalence<T>(
     Ok(result)
 }
 
+/// Characters Criterion replaces when it turns a benchmark id into a
+/// directory name, and the length it truncates that name to.
+const CRITERION_UNSAFE: [char; 10] = ['?', '"', '/', '\\', '*', '<', '>', ':', '|', '^'];
+const CRITERION_NAME_LEN: usize = 64;
+
+/// Criterion's own directory name for one component of a benchmark id.
+///
+/// Copied from `criterion::report::make_filename_safe`, so an artifact is
+/// read back from the directory Criterion actually wrote rather than from
+/// the id as the caller spelled it.
+#[must_use]
+pub fn criterion_directory_name(component: &str) -> String {
+    let mut name = component.replace(CRITERION_UNSAFE, "_");
+    if name.len() > CRITERION_NAME_LEN {
+        let mut end = CRITERION_NAME_LEN;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    name
+}
+
+/// The seconds of work Criterion measured for one benchmark id.
+///
+/// The id is the one that benchmark actually ran with: a group that is
+/// repeated under a new id has its own artifacts, and reading another id's
+/// would schedule the next attempt from a stale measurement and publish a
+/// distribution that is not the one selected. A missing artifact is an
+/// error that names the id and what the group directory does hold; it is
+/// never answered from another id's files.
+///
+/// # Errors
+/// Refuses a missing or unreadable artifact, and one carrying no samples.
+pub fn criterion_measured_seconds(home: &FsPath, group: &str, function: &str) -> Result<f64> {
+    let directory = home
+        .join(criterion_directory_name(group))
+        .join(criterion_directory_name(function));
+    let path = directory.join("new").join("sample.json");
+    if !path.is_file() {
+        let siblings: Vec<String> = directory
+            .parent()
+            .and_then(|parent| std::fs::read_dir(parent).ok())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "Criterion wrote no sample for {group}/{function} at {}; the group \
+             directory holds {siblings:?}",
+            path.display()
+        )
+        .into());
+    }
+    let sample: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let times = sample
+        .get("times")
+        .and_then(serde_json::Value::as_array)
+        .filter(|times| !times.is_empty())
+        .ok_or_else(|| format!("{} carries no sample times", path.display()))?;
+    Ok(times
+        .iter()
+        .filter_map(serde_json::Value::as_f64)
+        .sum::<f64>()
+        / 1e9)
+}
+
 /// A process-unique token for scratch and object names.
 fn uuid_like() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -850,6 +927,28 @@ pub enum Destination {
 }
 
 impl Prepared {
+    /// Where this input's iteration will write, if anywhere.
+    ///
+    /// Two preparations of one stage must name different destinations, so
+    /// that no iteration overwrites what an earlier one wrote. The sink is
+    /// rendered through its debug form, which carries its file identity.
+    #[must_use]
+    pub fn destinations(&self) -> Vec<String> {
+        match self {
+            Prepared::Cumulative(_, _, Destination::Files(paths)) => paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Prepared::Cumulative(_, _, Destination::Sink(sink)) | Prepared::Sink(sink) => {
+                vec![format!("{sink:?}")]
+            }
+            Prepared::Objects(objects) => {
+                objects.iter().map(|(path, _)| path.to_string()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// What this input carries, for the self-test that proves every stage
     /// is handed its whole setup instead of building it while timed.
     #[must_use]
@@ -963,6 +1062,10 @@ pub struct Stage {
     capacity: Vec<usize>,
     /// Whether timed buffers are pre-reserved (timing mode only).
     reserve_output: bool,
+    /// How many pieces of per-iteration setup this stage has built: one
+    /// count per warmed cache, sink and destination path set. A timed run
+    /// must never advance it, which is what the self-test asserts.
+    setup_built: AtomicU64,
     /// Fixture checks made while preparing, reported with every output.
     fixture_checks: Vec<Check>,
     /// Fixture numbers reported with every output.
@@ -1010,6 +1113,7 @@ impl Stage {
             table_names: Vec::new(),
             capacity: Vec::new(),
             reserve_output,
+            setup_built: AtomicU64::new(0),
             fixture_checks: Vec::new(),
             fixture_extra: serde_json::Map::new(),
             serial: AtomicU64::new(0),
@@ -1097,8 +1201,11 @@ impl Stage {
 
     /// The series the configured committed fraction marks committed.
     fn committed_series(&self) -> Result<Vec<SeriesId>> {
+        let synthetic: Vec<SeriesId> = (0..self.cfg.extra_committed_series)
+            .map(|index| series_id(&format!("bench-synthetic-{index}").into_bytes()))
+            .collect();
         if self.cfg.committed_fraction <= 0.0 {
-            return Ok(Vec::new());
+            return Ok(synthetic);
         }
         let mut all = BTreeSet::new();
         for request in convert_extract(wire(&self.input), &self.cfg.lake)? {
@@ -1107,11 +1214,18 @@ impl Stage {
             }
         }
         let keep = (all.len() as f64 * self.cfg.committed_fraction).round() as usize;
-        Ok(all.into_iter().take(keep).collect())
+        Ok(all.into_iter().take(keep).chain(synthetic).collect())
+    }
+
+    /// How many pieces of per-iteration setup this stage has built.
+    #[must_use]
+    pub fn setup_built(&self) -> u64 {
+        self.setup_built.load(Ordering::Relaxed)
     }
 
     /// A series cache warmed to the configured hit distribution.
     fn warm_cache(&self) -> SeriesCache {
+        let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
         let mut cache = SeriesCache::new(self.cfg.cache_entries);
         let partition = otel_arrow_dfe_series_lake::clock::PartitionId::from_unix_secs(
             self.cfg.window_start_secs,
@@ -1125,6 +1239,7 @@ impl Stage {
     /// A sink with a file identity no earlier iteration used, so every
     /// iteration writes new objects instead of overwriting one.
     fn new_sink(&self) -> Result<Sink> {
+        let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
         let store = self.store.clone().ok_or("this stage has no store")?;
         let naming = FileNaming {
             writer_id: self.cfg.lake.writer_id.clone(),
@@ -1239,6 +1354,7 @@ impl Stage {
             }
             StageName::OtlpParquetLocal | StageName::OtlpParquetZstd => {
                 let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+                let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
                 let paths = self
                     .table_names
                     .iter()
@@ -1272,6 +1388,7 @@ impl Stage {
             StageName::Merge => Prepared::Fixture,
             StageName::LocalWrite | StageName::Upload => {
                 let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+                let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
                 Prepared::Objects(
                     self.encoded
                         .iter()

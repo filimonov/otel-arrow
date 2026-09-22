@@ -8,6 +8,7 @@ oracle, the result schema, the collection-epoch rule, the baseline policy and
 the publication and staging rules.
 """
 import ctypes
+import inspect
 import json
 import os
 from pathlib import Path
@@ -3360,6 +3361,11 @@ class StageContracts(unittest.TestCase):
             "output_representation": "extracted_rows",
             "denominator": performance.DENOMINATOR,
             "rates": {name: 1.0 for name in performance.RATE_FIELDS},
+            "completion_semantics": (
+                "the store reported the object written and the bytes were read "
+                "back and verified; this is object-store visibility, not host "
+                "power-loss durability"
+            ),
         }
         result.update(overrides)
         return result
@@ -3455,6 +3461,157 @@ class StageContracts(unittest.TestCase):
         del timing["metrics"]["cpu_ns_per_record"]
         with self.assertRaisesRegex(AssertionError, "cpu_ns_per_record"):
             performance.validate_child_result(timing, "timing")
+
+    # Scenario: a layer's Criterion group was repeated, so each attempt
+    # wrote its artifacts under its own id, and the harness is asked for an
+    # attempt whose artifacts are not there.
+    # Guarantees: each attempt is read under the id it ran with, through
+    # Criterion's own sanitization of that id, and a missing artifact is
+    # refused by name instead of being answered from a neighbouring id.
+    def test_criterion_artifacts_are_read_per_attempt(self):
+        home = temporary_directory(self)
+        def write(function, times):
+            """One attempt's artifacts, as Criterion writes them."""
+            directory = (
+                home
+                / performance.criterion_directory_name("otlp_sort")
+                / performance.criterion_directory_name(function)
+                / "new"
+            )
+            directory.mkdir(parents=True)
+            _ = (directory / "sample.json").write_text(
+                json.dumps({"times": times, "iters": [1.0] * len(times)})
+            )
+            _ = (directory / "estimates.json").write_text(
+                json.dumps(
+                    {
+                        "median": {"point_estimate": sum(times) / len(times)},
+                        "mean": {"point_estimate": sum(times) / len(times)},
+                        "std_dev": {"point_estimate": 0.0},
+                    }
+                )
+            )
+        write("logs-1k", [1e9, 5e8])
+        write("logs-1k-attempt2", [2e9])
+        write("logs/slash", [4e9])
+        first = performance.criterion_estimates(home, "otlp_sort", "logs-1k")
+        second = performance.criterion_estimates(home, "otlp_sort", "logs-1k-attempt2")
+        self.assertAlmostEqual(first["measured_wall_s"], 1.5)
+        self.assertAlmostEqual(second["measured_wall_s"], 2.0)
+        sanitized = performance.criterion_estimates(home, "otlp_sort", "logs/slash")
+        self.assertAlmostEqual(sanitized["measured_wall_s"], 4.0)
+        with self.assertRaisesRegex(AssertionError, "logs-1k-attempt3"):
+            _ = performance.criterion_estimates(home, "otlp_sort", "logs-1k-attempt3")
+
+    # Scenario: a stages family records the subprocesses its setup phase
+    # starts, and the functions that start them are read for the command
+    # each one runs.
+    # Guarantees: every setup command the harness actually runs -- the git
+    # provenance, the rustc version probe, the --describe probe and the
+    # Docker store setup -- is named in the recorded list, and the
+    # compiler-free claim says it covers measured windows only.
+    def test_setup_subprocesses_are_recorded(self):
+        recorded = " ".join(performance.SETUP_SUBPROCESSES["before_any_lease"])
+        for function, token in (
+            (measurement.git_provenance, "rev-parse"),
+            (measurement.engine_build, "rustc"),
+            (performance.describe_bench, "--describe"),
+            (performance.test_e2e.require_docker_image, "info"),
+            (performance.test_e2e.require_docker_image, "inspect"),
+            (performance.pin_container, "update"),
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, inspect.getsource(function))
+                self.assertIn(token, recorded)
+        claim = performance.SETUP_SUBPROCESSES["compiler_free_claim"]
+        self.assertIn("measured windows only", claim)
+        self.assertIn("rustc once, for --version", claim)
+
+    # Scenario: a layer's group ran three attempts, and its record is read
+    # against the artifacts each attempt wrote -- once as the fixed bench
+    # records it, once as the stale bench did, repeating the first
+    # attempt's 0.78 s for every attempt while the published third attempt
+    # measured 1.88 s, and once with an attempt's artifact missing.
+    # Guarantees: only a record whose every attempt carries its own
+    # artifact's seconds is accepted; the stale readback and a missing
+    # artifact are refused by name.
+    def test_criterion_attempts_are_their_own_artifacts(self):
+        home = temporary_directory(self)
+        measured = {
+            "logs": [0.5e9, 0.280718548e9],
+            "logs-attempt2": [0.9e9],
+            "logs-attempt3": [1.0e9, 0.8843071e9],
+        }
+        for function, times in measured.items():
+            directory = (
+                home / "otlp_noop" / performance.criterion_directory_name(function)
+                / "new"
+            )
+            directory.mkdir(parents=True)
+            _ = (directory / "sample.json").write_text(
+                json.dumps({"times": times, "iters": [1.0] * len(times)})
+            )
+            _ = (directory / "estimates.json").write_text(
+                json.dumps({name: {"point_estimate": 1.0}
+                            for name in ("median", "mean", "std_dev")})
+            )
+        def summary(seconds):
+            """A layer summary whose attempts recorded `seconds`."""
+            return {
+                "criterion_function_id": "logs-attempt3",
+                "group_attempts": [
+                    {"function_id": function, "measured_wall_s": value}
+                    for function, value in zip(measured, seconds)
+                ],
+            }
+        performance.criterion_attempts_agree(
+            home, "otlp_noop", summary([0.780718548, 0.9, 1.8843071])
+        )
+        with self.assertRaisesRegex(AssertionError, "attempt 2 .* 0.780718548 s"):
+            performance.criterion_attempts_agree(
+                home, "otlp_noop", summary([0.780718548] * 3)
+            )
+        shutil.rmtree(home / "otlp_noop" / "logs-attempt2")
+        with self.assertRaisesRegex(AssertionError, "logs-attempt2"):
+            performance.criterion_attempts_agree(
+                home, "otlp_noop", summary([0.780718548, 0.9, 1.8843071])
+            )
+        with self.assertRaisesRegex(AssertionError, "does not name its id"):
+            performance.criterion_attempts_agree(
+                home, "otlp_noop",
+                {"criterion_function_id": "logs",
+                 "group_attempts": [{"measured_wall_s": 0.780718548}]},
+            )
+
+    # Scenario: a stage that stores an object reports its metrics without
+    # saying what a completed write means.
+    # Guarantees: every storing stage records that completion is
+    # object-store visibility with verified bytes and not host power-loss
+    # durability, so a reader cannot take it for a durability claim.
+    def test_store_stages_record_completion_semantics(self):
+        for stage in performance.STORE_STAGES:
+            result = self.complete_stage_result(
+                stage=stage,
+                input_representation=performance.INPUT_REPRESENTATIONS[stage],
+                output_representation="stored_objects",
+                completion_semantics=None,
+            )
+            with self.subTest(stage=stage):
+                with self.assertRaisesRegex(AssertionError, "completed write"):
+                    performance.validate_stage_result(result)
+                weak = dict(result, completion_semantics="the object was written")
+                with self.assertRaisesRegex(AssertionError, "completed write"):
+                    performance.validate_stage_result(weak)
+                performance.validate_stage_result(
+                    dict(
+                        result,
+                        completion_semantics=(
+                            "the store reported the object written and the bytes "
+                            "were read back and verified; this is object-store "
+                            "visibility, not host power-loss durability"
+                        ),
+                    )
+                )
 
     # Scenario: a Criterion group takes its thirty samples but accumulates
     # only 0.57 s of measured work, because its batched preparation costs
