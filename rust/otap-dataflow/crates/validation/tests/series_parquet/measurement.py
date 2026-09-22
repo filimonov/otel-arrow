@@ -2861,17 +2861,27 @@ def fingerprint_material(result) -> dict:
         },
         "build": build_fields,
     }
-    _reject_nulls(material, "fingerprint")
+    # Every harness-supplied input is checked for nulls at any depth. The
+    # effective engine configuration is the one exception: it is hashed
+    # verbatim, because an explicit null there is a real setting -- the
+    # durable buffer's `max_age: null` disables age-based retention -- and
+    # not an input the harness failed to record. Its presence is still
+    # required above.
+    for key, value in material.items():
+        if key != "config":
+            _reject_nulls(value, f"fingerprint.{key}")
     return material
 
 
 def _reject_nulls(value, path):
-    """Fail on a null anywhere in the fingerprint material, naming it.
+    """Fail on a null anywhere in one harness-supplied input, naming it.
 
     A null hashes as JSON `null`, so two runs that each failed to record the
     same nested input would share a fingerprint while describing different
     environments. An input that is genuinely absent must be omitted by the
     code that records it, or recorded as an explicit value, never as null.
+    This does not apply to the effective engine configuration, whose nulls
+    are settings.
     """
     if value is None:
         raise AssertionError(

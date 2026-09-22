@@ -1256,17 +1256,17 @@ class BaselineContracts(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "fingerprint input"):
                     _ = measurement.baseline_fingerprint(result)
 
-    # Scenario: a fingerprint input is present but null, at the top of a
-    # member or deep inside the effective configuration.
-    # Guarantees: a null at any depth is refused rather than hashed as JSON
-    # null, which would let two runs that each failed to record the same
-    # input share a fingerprint.
+    # Scenario: a harness-supplied fingerprint input is present but null,
+    # in the workload, the machine topology or the schedule.
+    # Guarantees: a null at any depth of those inputs is refused rather than
+    # hashed as JSON null, which would let two runs that each failed to
+    # record the same input share a fingerprint.
     def test_a_nested_null_fingerprint_input_raises(self):
         for label, mutate in (
             ("workload seed", lambda r: r["workload"].update(seed=None)),
             (
-                "nested configuration value",
-                lambda r: r["config"]["effective"]["window"].update(interval=None),
+                "environment build member",
+                lambda r: r["environment"]["build"].update(features=None),
             ),
             (
                 "nested sibling group member",
@@ -1284,6 +1284,30 @@ class BaselineContracts(unittest.TestCase):
                 mutate(result)
                 with self.assertRaisesRegex(AssertionError, "fingerprint input"):
                     _ = measurement.baseline_fingerprint(result)
+
+    # Scenario: the effective engine configuration sets the durable
+    # buffer's `max_age` to an explicit null, as the plan requires.
+    # Guarantees: an explicit null in the engine's own configuration is a
+    # setting, so the run fingerprints successfully instead of being refused
+    # like an unrecorded harness input.
+    def test_an_explicit_null_engine_setting_fingerprints(self):
+        result = measured_result()
+        result["config"]["effective"]["durable_buffer"] = {"max_age": None}
+        self.assertEqual(len(measurement.baseline_fingerprint(result)), 64)
+
+    # Scenario: two runs differ only in whether `max_age` is an explicit null
+    # or one hour.
+    # Guarantees: the null is hashed as a real value, so the two settings
+    # have different fingerprints and are never compared with each other.
+    def test_an_explicit_null_setting_differs_from_a_value(self):
+        unset = measured_result()
+        unset["config"]["effective"]["durable_buffer"] = {"max_age": None}
+        hourly = measured_result()
+        hourly["config"]["effective"]["durable_buffer"] = {"max_age": "1h"}
+        self.assertNotEqual(
+            measurement.baseline_fingerprint(unset),
+            measurement.baseline_fingerprint(hourly),
+        )
 
     # Scenario: the same configuration runs twice, each in its own run
     # directory.
