@@ -185,12 +185,15 @@ impl Exporter<OtapPdata> for SeriesParquet {
 /// The branches are ordered: the shutdown deadline outranks everything, so a
 /// node still cancels on time under a boundary that is always ready; then the
 /// window boundary, a resolved flush, completion delivery, the release of a
-/// decided block's flush slot, rotation, and only then a new message. `accept` is false once the ACTIVE block is waiting to be rotated,
-/// which is what turns a slow destination into backpressure on the channel
-/// rather than a third block. Once shutdown has been latched the node
-/// keeps taking force-drained pdata and refuses each one immediately with a
-/// retryable `NodeShutdown` nack, spending the completion credit that was
-/// reserved for exactly that.
+/// decided block's flush slot, rotation, and only then a new message.
+/// `accept` is false once the ACTIVE block is waiting to be rotated, which is
+/// what turns a slow destination into backpressure on the channel rather than
+/// a third block. Once shutdown has been latched the node keeps taking
+/// force-drained pdata and refuses each one with a retryable `NodeShutdown`
+/// nack: sent at once when the completion channel has room, and otherwise
+/// queued in the notifier, which the loop keeps serving until the deadline.
+/// Normal completions never take the notifier's last slot, so a saturated
+/// node can still queue at least one such refusal.
 async fn run(
     cfg: config::Config,
     store: Arc<dyn object_store::ObjectStore>,

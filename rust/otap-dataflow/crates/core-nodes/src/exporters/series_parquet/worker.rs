@@ -359,7 +359,8 @@ impl Worker {
             lake::sink::FileNaming::new(&cfg.lake.writer_id),
         ));
         // One credit per in-flight request in each of the two blocks a window
-        // pair can hold, with the last slot reserved for a shutdown outcome.
+        // pair can hold. Admission stops one short of it, so the last slot is
+        // always free for a force-drained refusal once shutdown is latched.
         let notify = Notifier::new(effects, 2 * cfg.window.max_requests_per_block);
         let cache = SeriesCache::new(cfg.cache_entries);
         Self {

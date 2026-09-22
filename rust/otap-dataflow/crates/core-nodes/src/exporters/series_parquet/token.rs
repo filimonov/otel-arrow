@@ -296,8 +296,9 @@ impl Notifier {
     /// `live` counts every token that will eventually reach this queue, not
     /// only the ones already in it: a token held by a block is a completion
     /// the notifier has yet to be handed. False once the only slot left is the
-    /// reserved one, so the worker stops admitting rather than spending the
-    /// credit that lets the node decide one force-drained request.
+    /// last one, so the worker stops admitting rather than spending the slot
+    /// [`Notifier::force_shutdown`] queues a refusal in when the completion
+    /// channel is full.
     pub(super) fn has_credit(&self, live: usize) -> bool {
         live + 1 < self.capacity
     }
@@ -308,8 +309,9 @@ impl Notifier {
     /// that would exceed the bound is a worker bug rather than a runtime
     /// condition. The bound is checked after the insertion, not before it: a
     /// normal outcome may take the notifier up to `capacity - 1` live
-    /// completions, and the last slot is kept for a shutdown outcome, so the
-    /// node can always still decide one force-drained request.
+    /// completions, and the last slot is kept for a shutdown outcome: the
+    /// shutdown decision of a completion the worker already holds, or a
+    /// force-drained refusal queued by [`Notifier::force_shutdown`].
     pub(super) fn push(&mut self, token: AckToken, outcome: Outcome) {
         self.push_with(token, outcome, None);
     }
@@ -382,15 +384,7 @@ impl Notifier {
             let Some((token, outcome, reason)) = self.queue.pop_front() else {
                 return pending().await;
             };
-            let external = token.external_bytes();
-            let received = token.received;
-            let future = Self::delivery(self.effects.clone(), token, outcome, reason);
-            let bytes = external + size_of_val(&future);
-            self.sending = Some(Sending {
-                bytes,
-                received,
-                future: Box::pin(future),
-            });
+            self.install(token, outcome, reason);
         }
         let result = self
             .sending
@@ -406,31 +400,87 @@ impl Notifier {
         result
     }
 
-    /// Refuse one force-drained request without queueing it.
+    /// Start the send of one completion in the single send slot.
     ///
-    /// Called after shutdown is latched, when the notifier may already be at
-    /// capacity. The retryable `NodeShutdown` nack is attempted once,
-    /// immediately; a send that would block is counted as a failure and the
-    /// token is released rather than parked, so force-drain never stalls on a
-    /// full completion channel.
+    /// The future is outside tokio's cooperative budget. A send that is
+    /// polled once and dropped when it reports `Pending` loses the token it
+    /// owns, and the budget reports `Pending` after 128 operations in one task
+    /// poll however much room the completion channel has, so every path that
+    /// polls a send once -- the force-drain refusal and the deadline drain --
+    /// would otherwise decide at most that many requests per poll.
+    fn install(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
+        let external = token.external_bytes();
+        let received = token.received;
+        let future = tokio::task::coop::unconstrained(Self::delivery(
+            self.effects.clone(),
+            token,
+            outcome,
+            reason,
+        ));
+        let bytes = external + size_of_val(&future);
+        self.sending = Some(Sending {
+            bytes,
+            received,
+            future: Box::pin(future),
+        });
+    }
+
+    /// Refuse one force-drained request with a retryable `NodeShutdown` nack.
+    ///
+    /// Called after shutdown is latched, possibly many times within one poll
+    /// of the node. With the send slot free and nothing queued ahead, the send
+    /// is started and polled once, and one that cannot finish yet stays in the
+    /// slot rather than being dropped. Otherwise the refusal waits in the queue
+    /// behind the others, which the node keeps serving until its deadline. The
+    /// queue is bounded: normal completions stop one short of `capacity`
+    /// (see [`Notifier::has_credit`]), so a saturated node still has at least
+    /// one slot for a refusal here. Only past `capacity` is a refusal attempted
+    /// once and, if the channel is full, counted as a delivery failure and
+    /// released, so force-drain never grows memory without bound and never
+    /// stalls on a full completion channel.
     pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
+        use futures::FutureExt;
+
         let (token, payload) = AckToken::split(data);
         drop(payload);
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[Outcome::Shutdown as usize] += 1;
+        if self.sending.is_none() && self.queue.is_empty() {
+            self.install(token, Outcome::Shutdown, None);
+            let sending = self.sending.as_mut().expect("send was installed");
+            if let Some(result) = sending.future.as_mut().now_or_never() {
+                self.sending = None;
+                if result.is_err() {
+                    self.failures += 1;
+                }
+            }
+            return;
+        }
+        if self.len() < self.capacity {
+            self.queue.push_back((token, Outcome::Shutdown, None));
+            return;
+        }
         self.deliver_now(token, Outcome::Shutdown, None);
     }
 
     /// Attempt one completion immediately, counting a send that would block.
     ///
     /// Used only on the paths that must not park a token: a force-drained
-    /// request and the completions abandoned once the shutdown deadline has
-    /// elapsed. The token is released either way, so the request ends decided
-    /// or counted as a delivery failure, never silently dropped.
+    /// request past the queue bound and the completions abandoned once the
+    /// shutdown deadline has elapsed. The token is released either way, so the
+    /// request ends decided or counted as a delivery failure, never silently
+    /// dropped. The attempt is outside the cooperative budget, so a full
+    /// completion channel is the only reason it can fail to be taken.
     fn deliver_now(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
         use futures::FutureExt;
 
-        let delivered = Self::delivery(self.effects.clone(), token, outcome, reason).now_or_never();
+        let delivered = tokio::task::coop::unconstrained(Self::delivery(
+            self.effects.clone(),
+            token,
+            outcome,
+            reason,
+        ))
+        .now_or_never();
         if !matches!(delivered, Some(Ok(()))) {
             self.failures += 1;
         }
@@ -441,12 +491,16 @@ impl Notifier {
     /// Called when the shutdown deadline has elapsed and the node is about to
     /// return. Whatever the engine cannot take immediately is counted as a
     /// delivery failure and released, so the node leaves nothing undecided and
-    /// still returns within its deadline.
+    /// still returns within its deadline. Every attempt is outside the
+    /// cooperative budget, so a completion channel with room takes them all.
     pub(super) fn drain_now(&mut self) {
         use futures::FutureExt;
 
         if let Some(mut sending) = self.sending.take()
-            && !matches!(sending.future.as_mut().now_or_never(), Some(Ok(())))
+            && !matches!(
+                tokio::task::coop::unconstrained(sending.future.as_mut()).now_or_never(),
+                Some(Ok(()))
+            )
         {
             self.failures += 1;
         }
@@ -539,14 +593,17 @@ mod tests {
         assert!(notify.token_high_water() > 0);
     }
 
-    /// Scenario: a force-drained request is refused while the completion
-    /// channel still has room, and then another while it is full.
-    /// Guarantees: the first is delivered immediately as a retryable
-    /// `NodeShutdown` nack, the second is counted as a delivery failure and
-    /// released, and neither enters the queue, so forced drain never blocks
-    /// and never leaves a request undecided in the notifier.
+    /// Scenario: force-drained requests are refused while the completion
+    /// channel has room for one, so the second has to wait, a third finds the
+    /// notifier at capacity, and the channel is then drained.
+    /// Guarantees: the first is delivered at once, the second stays in the
+    /// send slot and is delivered once the channel has room rather than being
+    /// dropped, and only the third, past the notifier's bound, is counted as a
+    /// delivery failure and released, so force-drain is bounded, never
+    /// blocks, and loses a refusal only when both the channel and the bound
+    /// are exhausted.
     #[tokio::test(flavor = "current_thread")]
-    async fn forced_shutdown_refusals_bypass_the_queue() {
+    async fn forced_shutdown_refusals_wait_in_the_bound_then_fail() {
         let (handler, mut rx) = effects(1);
         let mut notify = Notifier::new(handler, 1);
 
@@ -555,19 +612,89 @@ mod tests {
         assert!(notify.is_empty());
 
         // The channel now holds the first refusal, so the second cannot be
-        // handed over without blocking.
+        // handed over without blocking: it keeps the send slot.
+        notify.force_shutdown(empty_pdata());
+        assert_eq!(notify.failures(), 0);
+        assert_eq!(notify.len(), 1);
+
+        // The notifier is at its bound of one, so the third is attempted
+        // once, finds the channel full and is counted.
         notify.force_shutdown(empty_pdata());
         assert_eq!(notify.failures(), 1);
-        assert!(notify.is_empty());
-        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 2);
+        assert_eq!(notify.len(), 1);
+        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 3);
 
-        match rx.recv().await.expect("shutdown refusal") {
-            PipelineCompletionMsg::DeliverNack { nack } => {
-                assert!(!nack.permanent);
-                assert_eq!(nack.cause, NackCause::NodeShutdown);
+        for _ in 0..2 {
+            match rx.recv().await.expect("shutdown refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                }
+                other => panic!("expected a nack, got {other:?}"),
             }
-            other => panic!("expected a nack, got {other:?}"),
+            if !notify.is_empty() {
+                notify.next().await.expect("the waiting refusal is sent");
+            }
         }
+        assert!(notify.is_empty());
+    }
+
+    /// Scenario: three hundred decided completions -- more than tokio's
+    /// cooperative budget of 128 operations per task poll -- are drained at
+    /// the shutdown deadline into a completion channel with room for all of
+    /// them.
+    /// Guarantees: every one is delivered and none is counted as a failure,
+    /// because the drain is not throttled by the runtime's cooperative
+    /// budget, so a restart hands each producer a retryable nack instead of
+    /// leaving it to its own timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deadline_drain_delivers_more_than_the_coop_budget() {
+        const N: usize = 300;
+        let (handler, mut rx) = effects(N);
+        let mut notify = Notifier::new(handler, N + 1);
+        for _ in 0..N {
+            let (token, payload) = AckToken::split(empty_pdata());
+            drop(payload);
+            notify.push(token, Outcome::Shutdown);
+        }
+        notify.drain_now();
+        assert_eq!(notify.failures(), 0);
+        assert!(notify.is_empty());
+        let mut delivered = 0;
+        while let Ok(message) = rx.try_recv() {
+            assert!(matches!(message, PipelineCompletionMsg::DeliverNack { .. }));
+            delivered += 1;
+        }
+        assert_eq!(delivered, N);
+    }
+
+    /// Scenario: three hundred force-drained requests arrive after shutdown
+    /// has been latched, one after the other within a single task poll, while
+    /// the completion channel has room for all of them.
+    /// Guarantees: each is refused with a delivered retryable `NodeShutdown`
+    /// nack and none is counted as a delivery failure, so the force-drain path
+    /// is not silently truncated by the cooperative budget either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_drained_refusals_beyond_the_coop_budget_are_all_delivered() {
+        const N: usize = 300;
+        let (handler, mut rx) = effects(N);
+        let mut notify = Notifier::new(handler, 8);
+        for _ in 0..N {
+            notify.force_shutdown(empty_pdata());
+        }
+        assert_eq!(notify.failures(), 0);
+        let mut delivered = 0;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            delivered += 1;
+        }
+        assert_eq!(delivered + notify.len(), N);
+        assert_eq!(delivered, N);
     }
 
     /// Scenario: one completion is parked in a blocked send and a second,
