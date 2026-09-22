@@ -23,11 +23,21 @@
 //! that steps backwards cannot reopen a window that was already flushed, and
 //! several boundaries missed while the node was busy coalesce into a single
 //! rotation at the latest one.
+//!
+//! A wall clock that steps backwards by more than one interval would, on the
+//! wall clock alone, keep the ACTIVE block open -- and every request in it
+//! unacknowledged -- for the whole length of the step. So the monotonic clock
+//! also bounds a window's life: once one interval of monotonic time has
+//! passed since the last rotation while the wall clock is still short of the
+//! next boundary, the block is rotated anyway. The window start stays floored
+//! at the last consumed boundary, so the replacement block covers the same
+//! window and re-emits its descriptors rather than claiming an earlier one,
+//! and every sleep is bounded by that same monotonic interval.
 
 use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_series_lake::clock::{WakeOutcome, WallClock, WindowClock, nanos_to_secs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The window boundary the worker is currently waiting for.
 pub(super) struct Window {
@@ -37,6 +47,26 @@ pub(super) struct Window {
     pub(super) clock: WindowClock,
     /// Monotonic sleep that expires at the next boundary.
     pub(super) sleep: clock::Sleep,
+    /// Monotonic instant the current window was opened or last rotated at.
+    rotated_at: Instant,
+    /// Window length, for the monotonic bound on a window's life.
+    interval: Duration,
+    /// Whether the last rotation was taken on monotonic time with the wall
+    /// clock short of the boundary, so the next block keeps the same window
+    /// start and must re-emit its descriptors.
+    pub(super) floored: bool,
+}
+
+/// How far the wall clock may trail the next boundary once a monotonic
+/// interval has passed and still count as rate drift rather than a step.
+///
+/// A slewing wall clock runs a few hundred parts per million slow, so it
+/// reaches a boundary slightly after the monotonic interval does; rotating
+/// then would seal the block a moment early with the old window start and
+/// write an extra file set per window. A shortfall this small is slept off
+/// instead, and anything larger is a step and rotates at once.
+fn drift_tolerance(interval: Duration) -> Duration {
+    Duration::from_secs(1) + interval / 1000
 }
 
 impl Window {
@@ -44,21 +74,42 @@ impl Window {
     pub(super) fn new(interval: Duration, wall: Arc<dyn WallClock>) -> Self {
         let nanos = wall.now_unix_nanos();
         let clock = WindowClock::new(interval, nanos_to_secs(nanos));
-        let sleep = Self::arm(clock.next_boundary(nanos_to_secs(nanos)), nanos);
-        Self { wall, clock, sleep }
+        let rotated_at = clock::now();
+        let sleep = Self::arm(
+            clock.next_boundary(nanos_to_secs(nanos)),
+            nanos,
+            rotated_at + interval,
+        );
+        Self {
+            wall,
+            clock,
+            sleep,
+            rotated_at,
+            interval,
+            floored: false,
+        }
     }
 
-    /// A monotonic sleep expiring when the wall clock reaches `target_secs`.
+    /// A monotonic sleep expiring when the wall clock reaches `target_secs`,
+    /// or at `cap` if that comes first.
     ///
     /// The distance is measured in wall time and then handed to the monotonic
     /// clock, so a wall-clock step is absorbed by the wake that follows it
-    /// rather than by an arbitrarily long or negative sleep. A target that is
-    /// already in the past becomes a zero delay; callers only ever arm a
-    /// target strictly ahead of `now_nanos`, so this does not spin.
-    fn arm(target_secs: i64, now_nanos: i64) -> clock::Sleep {
+    /// rather than by an arbitrarily long or negative sleep; `cap` is what
+    /// keeps a step backwards from turning into a sleep as long as the step.
+    /// A target that is already in the past becomes a zero delay; callers only
+    /// ever arm a target strictly ahead of `now_nanos`, so this does not spin.
+    fn arm(target_secs: i64, now_nanos: i64, cap: Instant) -> clock::Sleep {
         let delay = (i128::from(target_secs) * 1_000_000_000 - i128::from(now_nanos)).max(0);
         let nanos = u64::try_from(delay).unwrap_or(u64::MAX);
-        clock::sleep_until(clock::now() + Duration::from_nanos(nanos))
+        let now = clock::now();
+        let at = now.checked_add(Duration::from_nanos(nanos)).unwrap_or(cap);
+        clock::sleep_until(at.min(cap.max(now)))
+    }
+
+    /// The monotonic instant the current window must be rotated by.
+    fn deadline(&self) -> Instant {
+        self.rotated_at + self.interval
     }
 
     /// Consume an expired sleep, re-arm it, and say whether to rotate.
@@ -68,14 +119,39 @@ impl Window {
     /// sleep armed for the boundary that is still owed. Nothing here depends
     /// on the rotation actually happening, so a rotation blocked by an
     /// outstanding flush keeps the window timer running.
+    ///
+    /// A wake that finds the wall clock short of the boundary still rotates
+    /// once a whole interval of monotonic time has passed since the last
+    /// rotation, unless the shortfall is small enough to be drift (see
+    /// [`drift_tolerance`]). The window clock's last boundary is left where it
+    /// is, so the next block keeps the same, floored window start.
     pub(super) fn wake(&mut self) -> bool {
         let nanos = self.wall.now_unix_nanos();
         let now = nanos_to_secs(nanos);
         let (rotate, target) = match self.clock.on_wake(now) {
-            WakeOutcome::RotationRequested { .. } => (true, self.clock.next_boundary(now)),
-            WakeOutcome::TooEarly { sleep_until } => (false, sleep_until),
+            WakeOutcome::RotationRequested { .. } => {
+                self.floored = false;
+                (true, self.clock.next_boundary(now))
+            }
+            WakeOutcome::TooEarly { sleep_until } => {
+                let shortfall = i128::from(sleep_until) * 1_000_000_000 - i128::from(nanos);
+                let tolerance = drift_tolerance(self.interval).as_nanos() as i128;
+                let stalled = clock::now() >= self.deadline() && shortfall > tolerance;
+                if stalled {
+                    self.floored = true;
+                }
+                (stalled, sleep_until)
+            }
         };
-        self.sleep = Self::arm(target, nanos);
+        if rotate {
+            self.rotated_at = clock::now();
+        }
+        // A drift shortfall is slept off past the monotonic deadline, but
+        // never by more than the tolerance that classified it as drift.
+        let cap = self
+            .deadline()
+            .max(clock::now() + drift_tolerance(self.interval));
+        self.sleep = Self::arm(target, nanos, cap);
         rotate
     }
 
@@ -96,8 +172,14 @@ impl Window {
         let boundary = self.clock.effective_boundary(admission_secs);
         if boundary > self.clock.last_boundary() {
             let _ = self.clock.on_wake(admission_secs);
+            self.rotated_at = clock::now();
+            self.floored = false;
             let nanos = self.wall.now_unix_nanos();
-            self.sleep = Self::arm(self.clock.next_boundary(nanos_to_secs(nanos)), nanos);
+            self.sleep = Self::arm(
+                self.clock.next_boundary(nanos_to_secs(nanos)),
+                nanos,
+                self.deadline(),
+            );
         }
         boundary
     }

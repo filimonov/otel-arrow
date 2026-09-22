@@ -42,7 +42,11 @@ before its window ends, which writes more than one file set for that window
 and re-emits that block's descriptors. The waiting is done on the engine's
 monotonic clock, so a wall clock that steps backwards cannot reopen a window
 that was already written, and boundaries missed while the worker was busy
-coalesce into one rotation.
+coalesce into one rotation. A window also ends after one interval of monotonic
+time: if the wall clock has stepped back by more than about a second, the
+block is rotated anyway, and its replacement keeps the same window start and
+re-emits its descriptors, so a backward step delays acknowledgements by at
+most one interval instead of by the length of the step.
 
 A storage failure is retried against the identical sealed block, with the same
 file names and the same bytes, until an absolute deadline taken when the block

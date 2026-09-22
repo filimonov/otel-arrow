@@ -719,11 +719,14 @@ impl Worker {
         // A worker would have to seal one block per nanosecond for six hundred
         // years to reach this.
         self.seq = self.seq.saturating_add(1);
-        // A block opened for the window the sealed one already covered, at
-        // the request of a byte or request threshold, cannot assume that
-        // block's descriptors are durable: it writes its own copies.
+        // A block opened for the window the sealed one already covered cannot
+        // assume that block's descriptors are durable: it writes its own
+        // copies. A byte or request threshold opens one, and so does a window
+        // rotated on monotonic time while the wall clock has stepped back
+        // (see `window`), which keeps the floored start.
         let reemit = start == self.active.data.window_start_secs
-            && matches!(self.reason, FlushReason::Bytes | FlushReason::Requests);
+            && (matches!(self.reason, FlushReason::Bytes | FlushReason::Requests)
+                || (self.reason == FlushReason::Time && self.window.floored));
         OwnedBlock {
             data: Block::new(start, seq, &self.cfg.lake),
             tokens: Vec::new(),

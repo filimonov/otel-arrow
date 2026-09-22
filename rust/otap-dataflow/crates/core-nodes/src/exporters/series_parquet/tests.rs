@@ -1303,6 +1303,108 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
         .await;
 }
 
+/// Scenario: a request joins the ACTIVE block of a fifteen-second window and
+/// the wall clock then steps back by an hour, far more than one interval,
+/// while the engine's monotonic clock keeps running.
+/// Guarantees: the block is still rotated within one interval of monotonic
+/// time since the window started, instead of waiting out the hour the wall
+/// clock now claims is left; the block that replaces it keeps the floored
+/// window start and re-emits its descriptors. A backward step therefore
+/// delays acknowledgements by at most one interval and never reopens or
+/// reorders a window.
+#[tokio::test(flavor = "current_thread")]
+async fn a_backward_clock_step_rotates_within_one_monotonic_interval() {
+    use futures::FutureExt;
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(100_000 * 1_000_000_000));
+            let mut cfg = worker_config();
+            cfg.window.interval = Duration::from_secs(15);
+            cfg.lake.window_interval = Duration::from_secs(15);
+            let mut worker = Worker::new(
+                cfg,
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::clone(&wall) as _,
+                handler,
+            );
+            assert_eq!(worker.active.data.window_start_secs, 99_990);
+            worker.admit(logs_pdata());
+            assert_eq!(worker.active.tokens.len(), 1);
+
+            wall.set((100_000 - 3600) * 1_000_000_000);
+            let mut rotated_after = None;
+            for elapsed in 1..=3600_u64 {
+                sim.advance(Duration::from_secs(1));
+                tokio::task::yield_now().await;
+                if worker.window.sleep.as_mut().now_or_never().is_some() {
+                    worker.wake_window();
+                    if worker.rotation_requested {
+                        rotated_after = Some(elapsed);
+                        break;
+                    }
+                }
+            }
+            let rotated_after = rotated_after.expect("the block is rotated");
+            assert!(
+                rotated_after <= 15,
+                "rotated only after {rotated_after} s of monotonic time"
+            );
+            worker.rotate();
+            assert!(worker.flushing.is_some(), "the block is written");
+            assert_eq!(
+                worker.active.data.window_start_secs, 99_990,
+                "the window start never moves backwards"
+            );
+            assert!(worker.active.reemit, "the same window re-emits descriptors");
+        })
+        .await;
+}
+
+/// Scenario: the wall clock runs half a second slow over one fifteen-second
+/// window, so the monotonic interval ends just before the wall clock reaches
+/// the boundary.
+/// Guarantees: that shortfall is treated as drift, not as a backward step: no
+/// early rotation with the old window start happens, and the ordinary
+/// boundary rotation follows once the wall clock arrives, so a slewing clock
+/// does not add a file set per window.
+#[tokio::test(flavor = "current_thread")]
+async fn wall_clock_drift_is_not_mistaken_for_a_backward_step() {
+    use futures::FutureExt;
+
+    let sim = clock::SimClock::new();
+    let _clock_guard = sim.install();
+    let wall = Arc::new(lake::clock::TestWallClock::new(99_990 * 1_000_000_000));
+    let mut window = super::window::Window::new(Duration::from_secs(15), Arc::clone(&wall) as _);
+
+    sim.advance(Duration::from_secs(15));
+    wall.set(100_004_500_000_000);
+    tokio::task::yield_now().await;
+    assert!(
+        window.sleep.as_mut().now_or_never().is_some(),
+        "the monotonic bound fires"
+    );
+    assert!(!window.wake(), "half a second short is drift, not a step");
+    assert!(!window.floored);
+
+    sim.advance(Duration::from_millis(500));
+    wall.set(100_005 * 1_000_000_000);
+    tokio::task::yield_now().await;
+    assert!(
+        window.sleep.as_mut().now_or_never().is_some(),
+        "the drift is slept off"
+    );
+    assert!(window.wake(), "the boundary itself rotates");
+    assert!(
+        !window.floored,
+        "a boundary rotation moves the window start"
+    );
+    assert_eq!(window.clock.last_boundary(), 100_005);
+}
+
 /// Take one completion, require it to be an ack, and say which request it
 /// belonged to.
 async fn expect_ack(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>) -> Option<usize> {
