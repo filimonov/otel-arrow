@@ -25,9 +25,15 @@ payload and conversion batches are released as soon as its rows are
 extracted. An OTLP body's top-level protobuf framing is validated before it is
 converted, because the shared byte views decode lazily: without that check a
 truncated request would be acknowledged as stored. Corruption inside a nested
-message is not validated and still surfaces as missing fields. Rotation timing is still a placeholder: a block is sealed as
-soon as it holds a request, so this writes one file set per request until the
-window timer lands. Later tasks add that timer, telemetry and a drain-aware
+message is not validated and still surfaces as missing fields. Rotation
+follows aligned wall-clock windows: a block covers one `window.interval`
+window and is sealed when that window ends, so the node writes one file set
+per window rather than one per request, and two writers of the same lake agree
+on where a window starts. A block that reaches `window.max_block_bytes` or
+`window.max_requests_per_block` is sealed early. The waiting is done on the
+engine's monotonic clock, so a wall clock that steps backwards cannot reopen a
+window that was already written and boundaries missed while the node was busy
+coalesce into one rotation. Later tasks add telemetry and a drain-aware
 shutdown. Only logs are accepted; metrics and traces are permanently refused.
 
 ## Configuration

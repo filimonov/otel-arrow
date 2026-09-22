@@ -19,10 +19,13 @@
 //! offered to the next block before any newer request. At most one request is
 //! parked, which is what keeps the worker to two blocks and one request.
 //!
-//! Rotation timing is not yet the window timer: a block is sealed as soon as
-//! it holds a request, so this still writes one file set per request. A later
-//! task replaces the trigger with the aligned window clock without changing
-//! what an ack means.
+//! Rotation is driven by aligned wall-clock windows: a block covers one
+//! window of the configured interval and is sealed when that window ends, so
+//! the node writes one file set per window rather than one per request. A
+//! block that fills its byte or request budget first is sealed early. The
+//! waiting is done on the engine's monotonic clock rather than on an engine
+//! periodic timer, which is cancelled before a node's receivers are drained;
+//! see [`window`] for what that buys.
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -58,6 +61,7 @@ mod flush;
 #[cfg(test)]
 mod tests;
 mod token;
+mod window;
 mod worker;
 
 /// Declares the series Parquet exporter as a local exporter factory.
@@ -160,9 +164,10 @@ impl Exporter<OtapPdata> for SeriesParquet {
 
 /// Drive one worker until shutdown completes or its deadline elapses.
 ///
-/// The branches are ordered: the shutdown deadline outranks everything, then a
-/// resolved flush, then completion delivery, then rotation, and only then a new
-/// message. `accept` is false once the ACTIVE block is waiting to be rotated,
+/// The branches are ordered: the shutdown deadline outranks everything, so a
+/// node still cancels on time under a boundary that is always ready; then the
+/// window boundary, a resolved flush, completion delivery, rotation, and only
+/// then a new message. `accept` is false once the ACTIVE block is waiting to be rotated,
 /// which is what turns a slow destination into backpressure on the channel
 /// rather than a third block. Once shutdown has been latched the node
 /// keeps taking force-drained pdata and refuses each one immediately with a
@@ -215,6 +220,17 @@ async fn run(
                     deadline.expect("the deadline branch only fires with a deadline"),
                     std::iter::empty::<MetricSetSnapshot>(),
                 ));
+            }
+
+            // The window boundary is the rotation trigger, so it is served
+            // before anything that could add to the block that is about to be
+            // sealed. `wake` re-arms the sleep whether or not it rotated, so a
+            // rotation the flush slot cannot take yet still keeps its timer.
+            () = worker.window.sleep.as_mut(), if deadline.is_none() => {
+                if worker.window.wake() {
+                    worker.rotation_requested = true;
+                }
+                notify_turns = 0;
             }
 
             // A resolved flush is what turns a block's requests into

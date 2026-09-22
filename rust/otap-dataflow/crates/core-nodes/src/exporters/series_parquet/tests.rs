@@ -854,8 +854,10 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
         .await;
 }
 
-/// Scenario: a request is parked by the running node, and a newer, distinct
-/// request is sent while it waits.
+/// Scenario: three requests reach the running node; the block takes two of
+/// them and the third has to wait for the next one. The exporter's wall clock
+/// is advanced in step with real time, so the window boundaries it sleeps on
+/// actually arrive.
 /// Guarantees: the parked request reaches storage before the newer one, and
 /// the newer one is not taken off the channel while a request is parked, so
 /// backpressure is real rather than a third block. Each request carries its
@@ -875,36 +877,48 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
             let (handler, mut rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
 
+            // The node sleeps on aligned wall-clock boundaries, so the wall
+            // clock has to move for a block to ever be sealed by its window.
+            let wall_ticker = tokio::task::spawn_local({
+                let wall = wall.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        wall.advance(20_000_000);
+                    }
+                }
+            });
+
+            // A block reserves room for two requests but is only rotated by
+            // the window or a third one, so the third request is parked
+            // rather than left on the channel.
+            let mut cfg = worker_config();
+            cfg.window.max_requests_per_block = 3;
+            cfg.lake.ingress.max_requests_per_block = 2;
             let node = tokio::task::spawn_local(super::run(
-                worker_config(),
+                cfg,
                 Arc::new(object_store::memory::InMemory::new()),
                 Arc::clone(&wall) as _,
                 inbox,
                 handler,
             ));
 
-            // The first request opens and seals the first block, leaving an
-            // empty block aligned to the window that starts at zero.
-            pdata_tx
-                .send_async(logs_pdata_from(1))
-                .await
-                .expect("the first request enqueues");
-            assert_eq!(expect_ack(&mut rx).await, Some(1));
+            // The first two fill the room the block reserves; the third
+            // cannot be reserved against it and waits for the next block.
+            for source in 1..=3 {
+                pdata_tx
+                    .send_async(logs_pdata_from(source))
+                    .await
+                    .expect("a request enqueues");
+            }
 
-            // Both of the next two belong to a later window, so the first of
-            // them cannot join the block in hand and is parked.
-            wall.set(5 * 1_000_000_000);
-            pdata_tx
-                .send_async(logs_pdata_from(2))
-                .await
-                .expect("the parked request enqueues");
-            pdata_tx
-                .send_async(logs_pdata_from(3))
-                .await
-                .expect("the newer request enqueues");
-
-            assert_eq!(expect_ack(&mut rx).await, Some(2));
-            assert_eq!(expect_ack(&mut rx).await, Some(3));
+            // Whichever block each of them landed in, the blocks are written
+            // in order, so the completions arrive in the order the requests
+            // were admitted.
+            for source in 1..=3 {
+                assert_eq!(expect_ack(&mut rx).await, Some(source));
+            }
+            wall_ticker.abort();
 
             drop(pdata_tx);
             control_tx
@@ -945,4 +959,141 @@ fn logs_pdata_from(source: usize) -> OtapPdata {
     let mut context = Context::default();
     context.set_source_node(source);
     OtapPdata::new(context, logs_payload())
+}
+
+/// Scenario: a boundary sleep fires after the wall clock has jumped forward
+/// past several windows, and afterwards the wall clock steps backwards.
+/// Guarantees: the missed windows coalesce into one rotation at the latest
+/// boundary, the sleep is re-armed for the window that follows it, and the
+/// backward step neither re-fires the boundary that was already consumed nor
+/// leaves the node without an armed sleep.
+#[tokio::test(flavor = "current_thread")]
+async fn busy_rotation_rearms_boundary_sleep() {
+    let sim = clock::SimClock::new();
+    let _clock_guard = sim.install();
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut window = super::window::Window::new(Duration::from_secs(15), wall.clone());
+
+    // Four windows pass while the node is busy; one sleep covers them all.
+    wall.set(65_000_000_000);
+    sim.advance(Duration::from_secs(15));
+    window.sleep.as_mut().await;
+    assert!(window.wake(), "a crossed boundary asks for a rotation");
+    assert_eq!(window.clock.last_boundary(), 60);
+    assert_eq!(window.clock.next_boundary(65), 75);
+    assert!(
+        futures::poll!(window.sleep.as_mut()).is_pending(),
+        "the next boundary is armed rather than already elapsed"
+    );
+
+    // The wall clock steps back behind the boundary that was just consumed.
+    wall.set(50_000_000_000);
+    sim.advance(Duration::from_secs(10));
+    window.sleep.as_mut().await;
+    assert!(!window.wake(), "a consumed boundary is not fired twice");
+    assert_eq!(window.clock.last_boundary(), 60);
+    assert!(
+        futures::poll!(window.sleep.as_mut()).is_pending(),
+        "a too-early wake still re-arms the sleep"
+    );
+}
+
+/// Scenario: two requests are extracted immediately before and immediately
+/// after a one-second window boundary.
+/// Guarantees: the earlier request stays in the ACTIVE block and does not
+/// seal it by itself, and the later one is parked for the next window with
+/// admission closed, so each request belongs to exactly one window.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_time_assigns_exactly_one_window() {
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(999_999_999));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::clone(&wall) as _,
+        handler,
+    );
+
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.data.window_start_secs, 0);
+    assert_eq!(worker.active.tokens.len(), 1);
+    assert!(
+        !worker.rotation_requested,
+        "one request no longer seals a block"
+    );
+
+    wall.set(1_000_000_001);
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.tokens.len(), 1);
+    assert!(worker.pending.is_some());
+    assert!(worker.rotation_requested);
+    assert!(!worker.accept());
+}
+
+/// Scenario: a window boundary is reached while the one flush slot is still
+/// taken by the previous block.
+/// Guarantees: the rotation stays requested until the slot frees, and the
+/// sleep is re-armed for the following boundary straight away, so a blocked
+/// rotation does not cost the node its window timer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_boundary_while_flushing_keeps_the_rotation_and_rearms() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let (handler, _rx) = effects(8);
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::clone(&wall) as _,
+                handler,
+            );
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            assert!(worker.flushing.is_some(), "the flush slot is taken");
+
+            wall.set(3_000_000_000);
+            sim.advance(Duration::from_secs(1));
+            worker.window.sleep.as_mut().await;
+            if worker.window.wake() {
+                worker.rotation_requested = true;
+            }
+            worker.rotate();
+
+            assert!(
+                worker.rotation_requested,
+                "a rotation blocked by a flush stays owed"
+            );
+            assert_eq!(worker.window.clock.last_boundary(), 3);
+            assert!(
+                futures::poll!(worker.window.sleep.as_mut()).is_pending(),
+                "the following boundary is armed while the rotation waits"
+            );
+        })
+        .await;
+}
+
+/// Scenario: a block reaches its request limit inside one window.
+/// Guarantees: the rotation is requested by the limit rather than by the
+/// window, so a burst is not held until the boundary, and admission closes
+/// until the block has been sealed.
+#[tokio::test(flavor = "current_thread")]
+async fn the_request_limit_asks_for_a_rotation_within_a_window() {
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config_with_requests(2),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+
+    worker.admit(logs_pdata());
+    assert!(!worker.rotation_requested);
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.tokens.len(), 2);
+    assert!(worker.rotation_requested, "a full block is sealed at once");
+    assert!(!worker.accept());
 }

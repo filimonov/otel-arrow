@@ -38,6 +38,7 @@
 use super::config::Config;
 use super::flush::{FlushDone, FlushJob};
 use super::token::{AckToken, Notifier, Outcome};
+use super::window::Window;
 use lake::buffer::Block;
 use lake::cache::SeriesCache;
 use lake::clock::{WallClock, nanos_to_micros, nanos_to_secs};
@@ -159,6 +160,8 @@ pub(super) struct Worker {
     pub(super) rotation_requested: bool,
     /// The shutdown deadline, once one has been latched.
     pub(super) deadline: Option<Instant>,
+    /// The aligned window the ACTIVE block belongs to, and its boundary sleep.
+    pub(super) window: Window,
     /// Source of wall-clock time for window alignment and seal stamps.
     wall: Arc<dyn WallClock>,
     /// Shared with each flush task for the duration of its write.
@@ -176,10 +179,9 @@ impl Worker {
         wall: Arc<dyn WallClock>,
         effects: EffectHandler<OtapPdata>,
     ) -> Self {
-        let secs = nanos_to_secs(wall.now_unix_nanos());
-        let windows = lake::clock::WindowClock::new(cfg.window.interval, secs);
+        let window = Window::new(cfg.window.interval, Arc::clone(&wall));
         let active = OwnedBlock {
-            data: Block::new(windows.last_boundary(), 0, &cfg.lake),
+            data: Block::new(window.clock.last_boundary(), 0, &cfg.lake),
             tokens: Vec::new(),
         };
         let sink = Rc::new(lake::sink::Sink::new(
@@ -200,6 +202,7 @@ impl Worker {
             notify,
             rotation_requested: false,
             deadline: None,
+            window,
             wall,
             sink,
             seq: 1,
@@ -357,11 +360,9 @@ impl Worker {
         }
         // A request that arrived after the ACTIVE block's window ended belongs
         // to the next block, not to the one still in hand.
-        let windows = lake::clock::WindowClock::new(
-            self.cfg.window.interval,
-            self.active.data.window_start_secs,
-        );
-        if windows.effective_boundary(pending.admission_secs) > self.active.data.window_start_secs {
+        if self.window.admission_boundary(pending.admission_secs)
+            > self.active.data.window_start_secs
+        {
             self.park(pending);
             return;
         }
@@ -395,11 +396,14 @@ impl Worker {
         match self.active.data.admit(pending.extracted, reservation, ()) {
             Ok(()) => {
                 self.active.tokens.push(pending.token);
-                // Rotation timing is not this task's: until the window timer
-                // lands, a block is sealed as soon as it holds a request, so
-                // an acknowledged request is durable without waiting for a
-                // later one to arrive.
-                self.rotation_requested = true;
+                // The window boundary is the normal rotation trigger; these
+                // two only bring it forward, so a burst is written as soon as
+                // it has filled a block rather than held until the boundary.
+                // A rotation that was already owed stays owed: an admission
+                // cannot cancel a boundary that has been consumed.
+                self.rotation_requested |= self.active.data.bytes
+                    >= self.cfg.window.max_block_bytes
+                    || self.active.tokens.len() >= self.cfg.window.max_requests_per_block;
             }
             Err(error) => {
                 // A failed admission leaves the block partially updated by
@@ -457,7 +461,9 @@ impl Worker {
     /// The window start never moves backwards, so a wall clock that steps back
     /// cannot make a later block claim an earlier partition.
     ///
-    /// A parked request also pulls the start forward to its own window. Without
+    /// A parked request also pulls the start forward to its own window, and it
+    /// does so through the same floor: parking one consumed its boundary, so
+    /// the window clock cannot report anything earlier afterwards. Without
     /// that, a wall clock that steps back between parking a request and opening
     /// the next block would produce a block the parked request is once again
     /// too late for: it would be parked again, rotated again, and the node
@@ -465,15 +471,10 @@ impl Worker {
     /// block is being opened, so the block is opened for its window.
     fn new_active(&mut self) -> OwnedBlock {
         let secs = nanos_to_secs(self.wall.now_unix_nanos());
-        let windows = lake::clock::WindowClock::new(self.cfg.window.interval, secs);
-        let parked = self
-            .pending
-            .as_ref()
-            .map_or(0, |pending| windows.boundary(pending.admission_secs));
-        let start = windows
-            .last_boundary()
-            .max(self.active.data.window_start_secs)
-            .max(parked);
+        let start = self
+            .window
+            .admission_boundary(secs)
+            .max(self.active.data.window_start_secs);
         let seq = self.seq;
         // A worker would have to seal one block per nanosecond for six hundred
         // years to reach this.

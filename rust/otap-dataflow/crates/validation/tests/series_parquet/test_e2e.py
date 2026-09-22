@@ -45,7 +45,7 @@ def log_request(request_id):
 class Engine:
     """A real `df_engine` process running the series Parquet example config."""
 
-    def __init__(self, directory, storage=None, overrides=None):
+    def __init__(self, directory, storage=None, overrides=None, interval="1s"):
         self.root = Path(directory)
         self.data = self.root / "data"
         self.data.mkdir(exist_ok=True)
@@ -60,7 +60,7 @@ class Engine:
         )
         export = nodes["exporter"]["config"]
         export["storage"] = storage or {"file": {"base_uri": str(self.data)}}
-        export["window"]["interval"] = "1s"
+        export["window"]["interval"] = interval
         if overrides:
             for key, value in overrides.items():
                 export[key] = value
@@ -135,7 +135,9 @@ class LocalSlice(unittest.TestCase):
     # Scenario: a real gRPC logs request reaches a local series exporter.
     # Guarantees: a successful OTLP response has both descriptor and values
     # files, the values row carries the body that was sent, and the values row
-    # joins to exactly one series row on series_id.
+    # joins to exactly one series row on series_id. The response arrives once
+    # the window the request was admitted to has been written, which the
+    # one-second test interval keeps short.
     def test_local_logs_are_durable_at_ack(self):
         with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
             try:
@@ -168,6 +170,42 @@ class LocalSlice(unittest.TestCase):
                     joined,
                     [("request-0", "producer-1", "series-e2e", "series.logger")],
                 )
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+    # Scenario: four concurrent logs requests reach an exporter whose rotation
+    # interval is three seconds.
+    # Guarantees: every request is acknowledged and durable, and the requests
+    # share a window rather than each producing a file set of their own, so
+    # rotation really is driven by the window and not by the request.
+    def test_one_window_writes_one_file_set(self):
+        with tempfile.TemporaryDirectory() as directory, Engine(
+            directory, interval="3s"
+        ) as engine:
+            try:
+                calls = [
+                    engine.logs.Export.future(log_request(f"request-{n}"), timeout=30)
+                    for n in range(4)
+                ]
+                for call in calls:
+                    call.result()
+                values = list(
+                    engine.data.glob("v=1/signal=logs/dataset=values/**/*.parquet")
+                )
+                self.assertTrue(values, "no values file after four exports")
+                self.assertLess(
+                    len(values),
+                    4,
+                    "one file set per request means the window is not rotating",
+                )
+                with duckdb.connect() as db:
+                    rows = db.execute(
+                        "SELECT body FROM read_parquet(?) ORDER BY body",
+                        [[str(path) for path in values]],
+                    ).fetchall()
+                self.assertEqual(rows, [(f"request-{n}",) for n in range(4)])
                 engine.shutdown()
             except Exception:
                 print(engine.engine_log())
