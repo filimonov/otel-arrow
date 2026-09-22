@@ -718,6 +718,10 @@ Use 1s measurement windows initially so producer concurrency cannot cap the low-
 
 Matrix: local, MinIO and RustFS; one and four explicitly allocated physical cores; logs-only and 80/20 logs/metric-point mixed workloads; 1KiB bodies and a documented 8KiB variant; 10k hot series and cardinality churn; production ZSTD. Use the same seed and record counts for comparable trials. Limit the primary exhaustive search to mixed/1KiB/hot-series; run the other workload rows as fixed-rate confirmations at 80% of its capacity and bracket separately if they fail. These confirmations cannot be labelled their own maxima. Diagnostic uncompressed numbers come only from Task 3.
 
+Producer fan-in is a required dimension of this task, because the deployment target is dozens to hundreds of senders, not a handful. Repeat the winning rate with 1, 8, 64 and 256 concurrent OTLP client connections at the same offered rate and the same record count, spread across the reserved producer cores. Record, per producer count: accepted records/s, the number of connections each worker terminates, the spread of that distribution across workers, engine CPU per worker, exporter RSS, series-cache occupancy and descriptor duplication across workers, plus producer p50/p95/p99 ACK latency. A connection distribution that leaves any worker idle while another saturates is reported as a fan-in limit with its SO_REUSEPORT hashing evidence, not as an encoding ceiling.
+
+The campaign's headline acceptance number is 100,000 to 1,000,000 records/s sustained, where a record is one metric point or one compact log line. Report the measured sustainable rate, the number of physical cores required to reach 1,000,000 records/s, and, when that rate is not reachable on this host, the measured ceiling with the limiting stage named from the Task 3 and Task 4 attribution. Neither a shortfall nor an extrapolation is a failure of this task; an unreported one is.
+
 - [ ] **Step 4: Record completed bytes and per-core costs without double counting**
 
 Maintain separate denominators for offered wire bytes, accepted supported records, unique stored values, physical stored rows including duplicates, and completed Parquet object bytes. Local byte totals use completed files; S3 uses HEAD content lengths, cross-checked against downloads. Exclude incomplete multipart parts from successful write speed and report their bytes separately where the store exposes them. Report both steady-state interval write speed and `total completed bytes / time from first send to final completion`, so tail drain cannot disappear from the throughput claim.
@@ -1654,6 +1658,7 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - Spec 10.2 compactor and any compaction scheduling, manifests, discovery metadata or deduplication facility.
 - Any change to the on-disk format, partitioning, dataset layout, schema semantics, series identity or compression contract. Diagnostic uncompressed benchmark output is not shipped as a new format option.
 - Spec 10.3 hours-long nightly runs, 24-72-hour qualification, random chaos, production failpoint hooks and canary/production rollout. This exclusion does not defer the mandatory 30-minute soak or deterministic failure matrix.
+- Extrapolating the measured rate to host classes that were never measured. Task 5 reports cores required for 1,000,000 records/s on this host only.
 - Claiming power-loss durability from a process-kill test, exactly-once delivery, production-wide capacity from one host, or a universal memory bound from sampled RSS.
 
 ## Amendments (2026-09-22)
