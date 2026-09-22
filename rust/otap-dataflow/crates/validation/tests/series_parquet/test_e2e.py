@@ -1576,6 +1576,117 @@ def verify_layout(test, root, path, metadata):
     return match
 
 
+def scan_objects(test, root, db):
+    """Check every part file's own invariants and report what it holds.
+
+    This is the workload-independent half of `verify_files`: the layout, the
+    recorded row count, the declared sort key, the descriptor identity hash,
+    the per-point-kind column nullability, and the rule that every values row
+    of a partition is covered by a descriptor of the same signal, partition
+    and writer. None of it depends on which records a producer sent, so a
+    measurement run with its own deterministic workload checks exactly the
+    same invariants as the fixture tests rather than restating them.
+
+    Returns the part files, the descriptor coverage set, the values keys, the
+    logs bodies and the number of metrics values rows.
+    """
+    files = sorted(Path(root).rglob("*.parquet"))
+    test.assertTrue(files)
+    coverage = set()
+    values = []
+    bodies = []
+    metric_rows = 0
+    for path in files:
+        partitions = dict(
+            part.split("=", 1) for part in path.parts if "=" in part
+        )
+        metadata = dict(
+            db.execute(
+                "SELECT decode(key), decode(value) FROM parquet_kv_metadata(?)",
+                [str(path)],
+            ).fetchall()
+        )
+        verify_layout(test, root, path, metadata)
+        signal = partitions["signal"]
+        dataset = partitions["dataset"]
+        worker = (metadata["writer_id"], metadata["boot_id"])
+        partition = (partitions["date"], partitions["hour"])
+        # Hashing the whole row forces every column to be decoded, so a
+        # file that cannot be read at all fails here; the count is what
+        # the recorded row count is checked against. The hash is summed in
+        # SQL rather than fetched, which keeps timestamp conversion (and
+        # its optional pytz dependency) out of the reader.
+        rows = db.execute(
+            "SELECT count(*), sum(hash(t)) FROM "
+            "read_parquet(?, hive_partitioning=false) t",
+            [str(path)],
+        ).fetchone()[0]
+        test.assertEqual(int(metadata["row_count"]), rows)
+        if dataset == "series":
+            ids = db.execute(
+                "SELECT series_id, identity_bytes FROM read_parquet(?)", [str(path)]
+            ).fetchall()
+            test.assertEqual(
+                [row[0] for row in ids], sorted(row[0] for row in ids)
+            )
+            for series_id, identity in ids:
+                test.assertEqual(xxhash.xxh3_128_digest(identity), series_id)
+                coverage.add((signal, partition, worker, series_id))
+        else:
+            keys = db.execute(
+                "SELECT series_id, time_unix_nano FROM read_parquet(?)", [str(path)]
+            ).fetchall()
+            if metadata["sort_key"] != "none":
+                test.assertEqual(
+                    keys,
+                    sorted(
+                        keys, key=lambda row: (row[0], row[1] is None, row[1] or 0)
+                    ),
+                )
+            values.extend((signal, partition, worker, row[0]) for row in keys)
+            if signal == "logs":
+                bodies.extend(
+                    row[0]
+                    for row in db.execute(
+                        "SELECT body FROM read_parquet(?)", [str(path)]
+                    ).fetchall()
+                )
+            else:
+                metric_rows += len(keys)
+                # Each row fills one point kind's columns and leaves the
+                # other kind's null, and no row fills both.
+                mixed = db.execute(
+                    "SELECT count(*) FROM read_parquet(?) WHERE "
+                    "(value_int IS NOT NULL OR value_double IS NOT NULL) "
+                    "AND count IS NOT NULL",
+                    [str(path)],
+                ).fetchone()[0]
+                test.assertEqual(
+                    mixed, 0, "a values row carries both point kinds"
+                )
+                # A file-level encoding invariant, not a classification
+                # rule: the writer leaves both lists null on a number row
+                # and stores empty lists on a distribution-less histogram.
+                # Readers classify by the descriptor, because ClickHouse
+                # renders a null Parquet list as [] and cannot see this.
+                inconsistent = db.execute(
+                    "SELECT count(*) FROM read_parquet(?) WHERE "
+                    "(bucket_counts IS NULL) <> (count IS NULL) OR "
+                    "(explicit_bounds IS NULL) <> (count IS NULL)",
+                    [str(path)],
+                ).fetchone()[0]
+                test.assertEqual(
+                    inconsistent,
+                    0,
+                    "list nullability must follow the point kind",
+                )
+    test.assertTrue(
+        set(values).issubset(coverage),
+        "descriptor coverage per partition and worker",
+    )
+    return files, coverage, values, bodies, metric_rows
+
+
 def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
     """Read every downloaded part file and check the lake's own invariants.
 
@@ -1586,100 +1697,9 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
     same signal, partition and writer, which is what makes the lake readable
     without a catalog.
     """
-    files = sorted(Path(root).rglob("*.parquet"))
-    test.assertTrue(files)
-    coverage = set()
-    values = []
-    bodies = []
-    metric_rows = 0
     with duckdb.connect() as db:
-        for path in files:
-            partitions = dict(
-                part.split("=", 1) for part in path.parts if "=" in part
-            )
-            metadata = dict(
-                db.execute(
-                    "SELECT decode(key), decode(value) FROM parquet_kv_metadata(?)",
-                    [str(path)],
-                ).fetchall()
-            )
-            verify_layout(test, root, path, metadata)
-            signal = partitions["signal"]
-            dataset = partitions["dataset"]
-            worker = (metadata["writer_id"], metadata["boot_id"])
-            partition = (partitions["date"], partitions["hour"])
-            # Hashing the whole row forces every column to be decoded, so a
-            # file that cannot be read at all fails here; the count is what
-            # the recorded row count is checked against. The hash is summed in
-            # SQL rather than fetched, which keeps timestamp conversion (and
-            # its optional pytz dependency) out of the reader.
-            rows = db.execute(
-                "SELECT count(*), sum(hash(t)) FROM "
-                "read_parquet(?, hive_partitioning=false) t",
-                [str(path)],
-            ).fetchone()[0]
-            test.assertEqual(int(metadata["row_count"]), rows)
-            if dataset == "series":
-                ids = db.execute(
-                    "SELECT series_id, identity_bytes FROM read_parquet(?)", [str(path)]
-                ).fetchall()
-                test.assertEqual(
-                    [row[0] for row in ids], sorted(row[0] for row in ids)
-                )
-                for series_id, identity in ids:
-                    test.assertEqual(xxhash.xxh3_128_digest(identity), series_id)
-                    coverage.add((signal, partition, worker, series_id))
-            else:
-                keys = db.execute(
-                    "SELECT series_id, time_unix_nano FROM read_parquet(?)", [str(path)]
-                ).fetchall()
-                if metadata["sort_key"] != "none":
-                    test.assertEqual(
-                        keys,
-                        sorted(
-                            keys, key=lambda row: (row[0], row[1] is None, row[1] or 0)
-                        ),
-                    )
-                values.extend((signal, partition, worker, row[0]) for row in keys)
-                if signal == "logs":
-                    bodies.extend(
-                        row[0]
-                        for row in db.execute(
-                            "SELECT body FROM read_parquet(?)", [str(path)]
-                        ).fetchall()
-                    )
-                else:
-                    metric_rows += len(keys)
-                    # Each row fills one point kind's columns and leaves the
-                    # other kind's null, and no row fills both.
-                    mixed = db.execute(
-                        "SELECT count(*) FROM read_parquet(?) WHERE "
-                        "(value_int IS NOT NULL OR value_double IS NOT NULL) "
-                        "AND count IS NOT NULL",
-                        [str(path)],
-                    ).fetchone()[0]
-                    test.assertEqual(
-                        mixed, 0, "a values row carries both point kinds"
-                    )
-                    # A file-level encoding invariant, not a classification
-                    # rule: the writer leaves both lists null on a number row
-                    # and stores empty lists on a distribution-less histogram.
-                    # Readers classify by the descriptor, because ClickHouse
-                    # renders a null Parquet list as [] and cannot see this.
-                    inconsistent = db.execute(
-                        "SELECT count(*) FROM read_parquet(?) WHERE "
-                        "(bucket_counts IS NULL) <> (count IS NULL) OR "
-                        "(explicit_bounds IS NULL) <> (count IS NULL)",
-                        [str(path)],
-                    ).fetchone()[0]
-                    test.assertEqual(
-                        inconsistent,
-                        0,
-                        "list nullability must follow the point kind",
-                    )
-        test.assertTrue(
-            set(values).issubset(coverage),
-            "descriptor coverage per partition and worker",
+        files, _coverage, _values, bodies, metric_rows = scan_objects(
+            test, root, db
         )
         test.assertTrue(set(log_ids).issubset(set(bodies)))
         expected_metric_rows = POINTS_PER_METRIC * metric_count
