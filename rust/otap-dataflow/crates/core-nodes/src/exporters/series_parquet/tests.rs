@@ -21,8 +21,9 @@ use otel_arrow_dfe_engine::control::{
     PipelineCompletionMsg, PipelineCompletionMsgReceiver, pipeline_completion_msg_channel,
 };
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
+use otel_arrow_dfe_engine::local::exporter::Exporter;
 use otel_arrow_dfe_engine::local::message::LocalReceiver;
-use otel_arrow_dfe_engine::message::{ExporterInbox, Receiver};
+use otel_arrow_dfe_engine::message::{ExporterInbox, Message, Receiver};
 use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_pdata::OtapPayload;
@@ -2293,6 +2294,11 @@ struct FaultStore {
     entered: tokio::sync::Notify,
     /// Releases one parked write under `FAULT_PARK`.
     release: tokio::sync::Notify,
+    /// Writes currently parked inside the store under `FAULT_PARK`.
+    parked: std::sync::atomic::AtomicUsize,
+    /// Parked writes whose future was dropped rather than released, which is
+    /// what a cancelled node has to produce.
+    parked_drops: std::sync::atomic::AtomicUsize,
     /// Parts handed to a wedged multipart upload.
     parts: Arc<std::sync::atomic::AtomicUsize>,
     /// Aborts attempted against a wedged multipart upload.
@@ -2353,7 +2359,38 @@ impl FaultStore {
         self.entered.notify_one();
         let mode = self.mode.load(std::sync::atomic::Ordering::SeqCst);
         if mode == FAULT_PARK {
+            /// Accounts for one parked write for as long as its future lives.
+            ///
+            /// A write that is released decrements the live count only; one
+            /// whose future is dropped while still parked also counts as a
+            /// drop, which is the observable form of "cancellation released
+            /// the write rather than leaking it".
+            struct Parked<'a> {
+                /// Writes still parked.
+                live: &'a std::sync::atomic::AtomicUsize,
+                /// Parked writes whose future was dropped.
+                drops: &'a std::sync::atomic::AtomicUsize,
+                /// Whether the park ended by release rather than by a drop.
+                released: bool,
+            }
+            impl Drop for Parked<'_> {
+                fn drop(&mut self) {
+                    let _ = self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if !self.released {
+                        let _ = self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+            let _ = self
+                .parked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut guard = Parked {
+                live: &self.parked,
+                drops: &self.parked_drops,
+                released: false,
+            };
             self.release.notified().await;
+            guard.released = true;
         }
         let path = path.as_ref();
         let fail = mode == 4
@@ -2467,6 +2504,27 @@ impl Drop for Ticker {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Advance both the engine clock and the wall clock, a second per turn.
+///
+/// Window boundaries are aligned to wall time but waited for on the engine
+/// clock, so a test that needs boundaries to keep arriving has to move both.
+/// One boundary is reached per turn, and the sleep the node re-arms is not
+/// ready again until the next one, so the other select branches keep their
+/// turn rather than being starved by a boundary that is always ready.
+fn ticking_windows(sim: &clock::SimClock, wall: &Arc<lake::clock::TestWallClock>) -> Ticker {
+    let sim = sim.clone();
+    let wall = Arc::clone(wall);
+    Ticker(tokio::task::spawn_local(async move {
+        let mut secs = 0_i64;
+        loop {
+            tokio::task::yield_now().await;
+            secs = secs.saturating_add(1);
+            wall.set(secs.saturating_mul(1_000_000_000));
+            sim.advance(Duration::from_secs(1));
+        }
+    }))
 }
 
 /// Start advancing `sim` by `step` on every turn of the current runtime.
@@ -3095,6 +3153,562 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
                 worker.is_idle(),
                 "both slot holders are gone once the deadline returns"
             );
+        })
+        .await;
+}
+
+/// Build a real exporter inbox over local channels, with `capacity` pdata
+/// slots.
+///
+/// The engine's own inbox is used rather than a stand-in, because the
+/// behaviour under test is the engine's: a latched Shutdown is released only
+/// after the buffered pdata has been force-drained past a closed admission
+/// gate, and it is the inbox that decides when that happens.
+fn inbox(
+    capacity: usize,
+) -> (
+    mpsc::Sender<OtapPdata>,
+    mpsc::Sender<NodeControlMsg<OtapPdata>>,
+    ExporterInbox<OtapPdata>,
+) {
+    let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(8);
+    let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(capacity);
+    let inbox = ExporterInbox::new(
+        Receiver::Local(LocalReceiver::mpsc(control_rx)),
+        Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+        7,
+        Interests::empty(),
+    );
+    (pdata_tx, control_tx, inbox)
+}
+
+/// A worker configuration whose storage points at a directory that exists.
+///
+/// Only the tests that drive the real [`Exporter::start`] entry point need it:
+/// `start` builds the configured object store before the test replaces it, and
+/// a local file store refuses a base URI that is not there.
+fn startable_config(requests: usize) -> Config {
+    let mut cfg: Config = serde_json::from_value(serde_json::json!({
+        "storage": {"file": {"base_uri": std::env::temp_dir().to_string_lossy()}},
+        "window": {"interval": "1s", "max_requests_per_block": requests}
+    }))
+    .expect("valid config");
+    cfg.lake.ingress.max_requests_per_block = requests;
+    cfg
+}
+
+/// Scenario: the inbox already holds buffered pdata when a Shutdown is
+/// latched, so the request is force-drained past a closed admission gate.
+/// Guarantees: the forced message exposes the latched deadline before the
+/// Shutdown control message is released, and the request is refused with a
+/// retryable `NodeShutdown` nack that is never counted as a delivery failure.
+#[tokio::test(flavor = "current_thread")]
+async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (pdata_tx, control_tx, mut inbox) = inbox(2);
+            let deadline = clock::now() + Duration::from_secs(1);
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline,
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+
+            // Admission is closed, yet the buffered request is still handed
+            // over: that is the force-drain the exporter has to decide.
+            let data = match inbox.recv_when(false).await.expect("a forced request") {
+                Message::PData(data) => data,
+                other => panic!("expected forced pdata, got {other:?}"),
+            };
+            assert_eq!(
+                inbox.shutdown_deadline(),
+                Some(deadline),
+                "the latched deadline is visible before the control message is released"
+            );
+
+            let (handler, mut rx) = effects(1);
+            let mut notify = Notifier::new(handler, 2);
+            notify.force_shutdown(data);
+            assert_eq!(
+                notify.failures(),
+                0,
+                "a free completion slot takes the refusal immediately"
+            );
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            drop(pdata_tx);
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: the shutdown deadline elapses with a parked write holding the
+/// FLUSHING slot, a populated ACTIVE block and one parked request.
+/// Guarantees: the parked request is nacked the moment shutdown is latched,
+/// every remaining uncommitted token of both blocks is nacked at the deadline,
+/// and the worker is left holding nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn deadline_nacks_both_blocks_and_pending() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(16);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+            let mut worker = Worker::new(cfg, store.clone(), wall.clone(), handler);
+
+            // FLUSHING: one request, rotated into a write that never returns.
+            worker.admit(logs_pdata());
+            worker.rotate();
+            store.entered.notified().await;
+            // ACTIVE: one request in the block that is still open.
+            worker.admit(logs_pdata());
+            // Parked: a request whose admission window is later than the one
+            // the ACTIVE block was opened for, and no block can be opened for
+            // it while the flush slot is held.
+            wall.set(1_000_000_000);
+            worker.admit(logs_pdata());
+            assert!(worker.pending.is_some());
+            assert_eq!(worker.active.tokens.len(), 1);
+            assert_eq!(
+                worker
+                    .flushing
+                    .as_ref()
+                    .expect("a rotated block is flushing")
+                    .tokens
+                    .len(),
+                1
+            );
+
+            worker.shutdown(clock::now());
+            assert!(
+                worker.pending.is_none(),
+                "the parked request is decided when shutdown is latched"
+            );
+            assert_eq!(worker.notify.len(), 1);
+
+            let _ticker = ticking(&sim, Duration::from_millis(50));
+            worker.abandon().await;
+
+            for _ in 0..3 {
+                match rx.recv().await.expect("a shutdown refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(!nack.permanent);
+                        assert_eq!(nack.cause, NackCause::NodeShutdown);
+                    }
+                    other => panic!("expected a nack, got {other:?}"),
+                }
+            }
+            assert!(worker.flushing.is_none());
+            assert!(worker.cleaning.is_none());
+            assert!(worker.is_idle(), "nothing is left undecided");
+        })
+        .await;
+}
+
+/// Scenario: shutdown is latched with one block already flushing and a second
+/// block open, and storage recovers well before the deadline.
+/// Guarantees: the node finishes the outstanding FLUSHING block, then rotates
+/// and flushes the ACTIVE one, both requests are acknowledged only after their
+/// files exist, and nothing is nacked.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_commits_both_blocks_before_deadline() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let cfg = worker_config();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let metrics = super::metrics::Metrics::register(&context, &cfg.lake);
+            let node = tokio::task::spawn_local(super::run(
+                cfg,
+                store.clone(),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                Some(metrics),
+            ));
+
+            // Four requests fill a block, so the node rotates it immediately
+            // and its write parks.
+            for _ in 0..4 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request of the first block enqueues");
+            }
+            store.entered.notified().await;
+            // The fifth joins the block that replaced it; the flush slot is
+            // busy, so that block is still ACTIVE when shutdown arrives.
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request of the second block enqueues");
+            // The inbox serves control before pdata, so the shutdown below
+            // would force-drain the fifth request rather than let it be
+            // admitted. The marker is behind it in the same pdata channel, so
+            // its completion proves the fifth request is already in a block.
+            marker(&pdata_tx, &mut rx, 99).await;
+
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            // Releasing the latched Shutdown is what closing the upstream
+            // pdata channel does, exactly as the engine does it.
+            drop(pdata_tx);
+            // Storage heals, so both blocks can reach object storage inside
+            // the deadline.
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.release.notify_waiters();
+
+            for _ in 0..5 {
+                assert!(
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                            .await
+                            .expect("a completion arrives")
+                            .expect("a completion arrives"),
+                        PipelineCompletionMsg::DeliverAck { .. }
+                    ),
+                    "a block that reached storage before the deadline is acknowledged"
+                );
+            }
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            let snapshots = terminal.metrics();
+            // Five requests in two blocks, plus the row-less marker.
+            assert_eq!(terminal_value(snapshots, "acks", &[]), 6);
+            assert_eq!(
+                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                0
+            );
+            // One values file per block: the block shutdown found flushing and
+            // the block it then rotated and flushed itself.
+            let written: Vec<String> = store
+                .writes
+                .lock()
+                .expect("writes lock")
+                .iter()
+                .map(|(path, _)| path.clone())
+                .filter(|path| path.contains("dataset=values/"))
+                .collect();
+            assert_eq!(written.len(), 2, "both blocks reached storage: {written:?}");
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: the real `SeriesParquet::start` future is aborted while a storage
+/// write is parked and will never return.
+/// Guarantees: cancellation drops the parked write and releases the block, the
+/// sink and the object store within the configured abort timeout, so a node
+/// torn down mid-flush leaves nothing owned by a task nobody joins.
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_start_cancels_flush_task() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(2);
+            let (pdata_tx, control_tx, inbox) = inbox(2);
+            let mut cfg = startable_config(1);
+            cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+            let mut exporter = super::SeriesParquet::new(cfg);
+            exporter.store_override = Some(store.clone());
+            let node = tokio::task::spawn_local(Box::new(exporter).start(inbox, handler));
+
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            store.entered.notified().await;
+            assert_eq!(
+                store.parked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the write is parked inside the store"
+            );
+
+            node.abort();
+            match node.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("start was not aborted"),
+            }
+            until("the cancelled node releases the store", || {
+                Arc::strong_count(&store) == 1
+                    && store.parked.load(std::sync::atomic::Ordering::SeqCst) == 0
+            })
+            .await;
+            assert_eq!(
+                store.parked_drops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the parked write future was dropped rather than leaked"
+            );
+            drop(pdata_tx);
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: a backlog of buffered requests is force-drained while the
+/// completion channel is already full and nothing will ever read it.
+/// Guarantees: every request still gets exactly one shutdown decision, each
+/// undeliverable decision is counted as a delivery failure rather than parked,
+/// and the node returns instead of waiting for completion credit.
+#[tokio::test(flavor = "current_thread")]
+async fn saturated_inbox_shutdown_stays_bounded() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (pdata_tx, control_tx, inbox) = inbox(32);
+            let (handler, _completion_rx) = effects(1);
+            // One delivered completion is enough to fill the channel, so every
+            // decision the node takes from here on cannot be handed over.
+            // Two slots, because the last one of a notifier is reserved for a
+            // shutdown outcome and this priming completion is a normal one.
+            let mut prime = Notifier::new(handler.clone(), 2);
+            let (token, payload) = AckToken::split(empty_pdata());
+            drop(payload);
+            prime.push(token, Outcome::Ack);
+            prime.next().await.expect("the completion channel fills");
+
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let metrics = super::metrics::Metrics::register(&context, &cfg.lake);
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+
+            for _ in 0..32 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("the inbox fills");
+            }
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "saturated".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            drop(pdata_tx);
+
+            let terminal = tokio::time::timeout(
+                Duration::from_secs(2),
+                super::run(
+                    cfg,
+                    store,
+                    Arc::new(lake::clock::TestWallClock::new(0)),
+                    inbox,
+                    handler,
+                    Some(metrics),
+                ),
+            )
+            .await
+            .expect("shutdown stays bounded with a full completion channel")
+            .expect("the node succeeds");
+
+            let snapshots = terminal.metrics();
+            assert_eq!(
+                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                32,
+                "every force-drained request is decided exactly once"
+            );
+            assert_eq!(
+                terminal_value(snapshots, "notify.failures", &[]),
+                32,
+                "every undeliverable decision is counted rather than dropped silently"
+            );
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: window boundaries keep arriving while the one flush slot is held
+/// by a write that never returns and the completion channel is already full,
+/// and a telemetry control message and then a shutdown are sent into that.
+/// Guarantees: the real node re-arms its boundary timer rather than losing or
+/// spinning on it, still serves control messages, and observes the shutdown it
+/// is then sent, counting the completion it could never hand over instead of
+/// waiting for it.
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_completion_keeps_boundary_and_control_live() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (pdata_tx, control_tx, inbox) = inbox(4);
+            let (handler, _completion_rx) = effects(1);
+            // Two slots, because the last one of a notifier is reserved for a
+            // shutdown outcome and this priming completion is a normal one.
+            let mut prime = Notifier::new(handler.clone(), 2);
+            let (token, payload) = AckToken::split(empty_pdata());
+            drop(payload);
+            prime.push(token, Outcome::Ack);
+            prime.next().await.expect("the completion channel fills");
+
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let metrics = super::metrics::Metrics::register(&context, &cfg.lake);
+            let node = tokio::task::spawn_local(super::run(
+                cfg,
+                store.clone(),
+                wall.clone(),
+                inbox,
+                handler,
+                Some(metrics),
+            ));
+
+            // Boundaries keep arriving for the rest of the test, so the
+            // request reaches a sealed block whichever turn the node admits it
+            // on, and every later boundary is one the node meets with its
+            // flush slot already held.
+            let _ticker = ticking_windows(&sim, &wall);
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            store.entered.notified().await;
+
+            let (samples, reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(64);
+            control_tx
+                .send_async(NodeControlMsg::CollectTelemetry {
+                    metrics_reporter: reporter,
+                })
+                .await
+                .expect("the telemetry control enqueues");
+            until(
+                "telemetry is served while everything else is blocked",
+                || samples.try_recv().is_ok(),
+            )
+            .await;
+
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(1),
+                    reason: "blocked completions".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            drop(pdata_tx);
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            assert_eq!(
+                terminal_value(terminal.metrics(), "notify.failures", &[]),
+                1,
+                "the undeliverable decision is counted, not retried forever"
+            );
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: the inbox latches a Shutdown it cannot release yet, because an
+/// upstream sender is still alive, and hands the node a telemetry control
+/// message while it drains.
+/// Guarantees: the node takes the latched deadline from the inbox rather than
+/// waiting for a Shutdown message it has not been given, so the block it holds
+/// is sealed and acknowledged instead of waiting for a window boundary ten
+/// minutes away.
+#[tokio::test(flavor = "current_thread")]
+async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(4);
+            let mut cfg = worker_config();
+            // Far enough away that nothing but the shutdown can seal a block.
+            cfg.window.interval = Duration::from_secs(600);
+            let node = tokio::task::spawn_local(super::run(
+                cfg,
+                store,
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            // Behind it in the same channel, so its completion proves the
+            // request before it is already in the ACTIVE block.
+            marker(&pdata_tx, &mut rx, 99).await;
+
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "latched".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            // The inbox holds that message back while `pdata_tx` is alive, so
+            // this is the only thing the node is handed after the latch.
+            let (_samples, metrics_reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(8);
+            control_tx
+                .send_async(NodeControlMsg::CollectTelemetry { metrics_reporter })
+                .await
+                .expect("the telemetry control enqueues");
+
+            assert!(
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("the held block is sealed without its window ending")
+                        .expect("a completion arrives"),
+                    PipelineCompletionMsg::DeliverAck { .. }
+                ),
+                "the block the node was holding reached storage"
+            );
+            node.abort();
+            drop(pdata_tx);
+            drop(control_tx);
         })
         .await;
 }

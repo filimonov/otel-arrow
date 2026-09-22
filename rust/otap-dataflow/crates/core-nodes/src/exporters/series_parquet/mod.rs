@@ -118,6 +118,13 @@ pub struct SeriesParquet {
     >,
     /// Instruments registered by the factory, moved into the worker at start.
     metrics: Option<metrics::Metrics>,
+    /// Object store injected in place of the one the configuration names.
+    ///
+    /// The only seam a test uses to drive the real [`Exporter::start`] entry
+    /// point: everything else about the node -- the inbox, the select loop,
+    /// the worker and its flush tasks -- is the production path.
+    #[cfg(test)]
+    store_override: Option<Arc<dyn object_store::ObjectStore>>,
 }
 
 impl SeriesParquet {
@@ -128,6 +135,8 @@ impl SeriesParquet {
             config,
             token_provider: None,
             metrics: None,
+            #[cfg(test)]
+            store_override: None,
         }
     }
 }
@@ -157,6 +166,8 @@ impl Exporter<OtapPdata> for SeriesParquet {
                 error: format!("error initializing object store {e}"),
                 source_detail: format_error_sources(&e),
             })?;
+        #[cfg(test)]
+        let store = self.store_override.take().unwrap_or(store);
         run(
             self.config.clone(),
             store,
@@ -357,6 +368,7 @@ async fn drive(
                     }
                     Ok(Message::Control(_)) => {}
                     Err(e) => {
+
                         // The inbox closes only when it releases the Shutdown
                         // it latched, so this is the channel failing rather
                         // than the node shutting down. Nothing more can be
@@ -366,6 +378,16 @@ async fn drive(
                         worker.abandon().await;
                         return Err(e.into());
                     }
+                }
+                // Read after every message the inbox hands over, not only
+                // after the Shutdown control message: the engine latches the
+                // deadline before it releases that message, and anything it
+                // hands over in between -- a force-drained request, a
+                // telemetry collection -- must not leave the worker believing
+                // it still has all the time in the world. The error arm above
+                // returns, so this runs only for a message that arrived.
+                if let Some(deadline) = inbox.shutdown_deadline() {
+                    worker.shutdown(deadline);
                 }
             }
 

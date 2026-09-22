@@ -27,7 +27,20 @@ for rows that were not stored. At the shutdown deadline every request is
 decided and delivered first, and only then are both slot holders cancelled and
 released within one `upload.abort_timeout`, ended by aborting the task itself:
 a multipart upload the node started is given its abort rather than left to the
-bucket's lifecycle rule, without a wedged destination holding the node open. Admission closes once the ACTIVE block is
+bucket's lifecycle rule, without a wedged destination holding the node open.
+An orderly shutdown runs in a fixed order: the parked request is nacked the
+moment the deadline is latched, because nothing will open a block for it; the
+outstanding FLUSHING block is finished, so a block that still reaches storage
+is acknowledged rather than refused; and only then is the ACTIVE block rotated
+and flushed. A request force-drained after the latch is refused immediately
+with a retryable `NodeShutdown` nack instead of being parked, so a full
+completion channel cannot stall the drain. At the deadline each remaining
+decision is attempted once and whatever the completion channel will not take
+is counted as a delivery failure and released: the producer sees its own
+timeout and retries, and committed data is never re-exported. The cleanup that
+follows is bounded by `upload.abort_timeout` and admits no new data; it
+releases the write tasks only, and neither extends the producer notification
+deadline nor the engine's drain deadline. Admission closes once the ACTIVE block is
 waiting to be rotated, so no third block is ever needed and a slow destination
 becomes backpressure. A request the ACTIVE block cannot reserve room for is
 not refused: its extracted rows are parked, input closes until the next block

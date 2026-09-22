@@ -528,5 +528,89 @@ class MetricsSlice(unittest.TestCase):
                         print(engine.engine_log())
                         raise
 
+class ShutdownSlice(unittest.TestCase):
+    """Two blocks in flight when the admin endpoint stops the engine."""
+
+    # Scenario: two requests fill a two-request block, which is sealed and
+    # written, a third request opens the next block, and the admin shutdown
+    # endpoint is called while that third producer is still outstanding.
+    # Guarantees: every producer observes an acknowledgement rather than a
+    # refusal or a drain timeout, and all three bodies are readable from
+    # Parquet and still join to their series rows, so a shutdown that arrives
+    # with one block written and one open loses nothing.
+    #
+    # The rotation window is left at one second on purpose. The receiver holds
+    # its OTLP response until the exporter decides the request, and it drains
+    # its ingress before the exporter is handed the Shutdown control message,
+    # so a window longer than that drain wait would make the two wait for each
+    # other until the drain times out. That ordering is the engine's, not this
+    # node's; see the task 11 report.
+    def test_shutdown_drains_both_blocks(self):
+        with tempfile.TemporaryDirectory() as directory, Engine(
+            directory,
+            overrides={"window": {"interval": "1s", "max_requests_per_block": 2}},
+        ) as engine:
+            try:
+                filling = [
+                    engine.logs.Export.future(
+                        log_request(f"shutdown-block-a-{n}"), timeout=60
+                    )
+                    for n in range(2)
+                ]
+                for call in filling:
+                    call.result(timeout=60)
+                # The block that took those two is written, so this one opens
+                # the next block, which is still ACTIVE as shutdown begins.
+                waiting = engine.logs.Export.future(
+                    log_request("shutdown-block-b"), timeout=60
+                )
+                engine.shutdown(seconds=60)
+                # A durable decision: an OK OTLP response means the rows are
+                # in the lake.
+                waiting.result(timeout=60)
+                values = list(
+                    engine.data.glob("v=1/signal=logs/dataset=values/**/*.parquet")
+                )
+                series = list(
+                    engine.data.glob("v=1/signal=logs/dataset=series/**/*.parquet")
+                )
+                self.assertTrue(values, "no values file after shutdown")
+                self.assertTrue(series, "no series file after shutdown")
+                with duckdb.connect() as db:
+                    rows = db.execute(
+                        "SELECT body FROM read_parquet(?) ORDER BY body",
+                        [[str(path) for path in values]],
+                    ).fetchall()
+                    # Counted as a membership test rather than a join: a
+                    # block opened inside a window whose predecessor was
+                    # sealed by the request limit re-emits its descriptors,
+                    # so the same series id legitimately appears in both
+                    # series files and a join would multiply the rows.
+                    described = db.execute(
+                        "SELECT count(*) FROM read_parquet(?) v WHERE "
+                        "v.series_id IN (SELECT series_id FROM read_parquet(?))",
+                        [
+                            [str(path) for path in values],
+                            [str(path) for path in series],
+                        ],
+                    ).fetchall()
+                self.assertEqual(
+                    rows,
+                    [
+                        ("shutdown-block-a-0",),
+                        ("shutdown-block-a-1",),
+                        ("shutdown-block-b",),
+                    ],
+                )
+                self.assertEqual(
+                    described,
+                    [(3,)],
+                    "every acknowledged row has its descriptor in the lake",
+                )
+            except Exception:
+                print(engine.engine_log())
+                raise
+
+
 if __name__ == "__main__":
     unittest.main()
