@@ -913,9 +913,9 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
                 assert_eq!(expect_ack(&mut rx).await, Some(source));
             }
 
-            // The block the parked request now sits in is sealed by its
-            // window, which is reached by moving both clocks explicitly.
-            settle().await;
+            // Those acks are delivered after the rotation that admitted the
+            // third request, so the block it sits in already exists. Its
+            // window is reached by moving both clocks explicitly.
             wall.set(1_100_000_000);
             sim.advance(Duration::from_secs(1));
             assert_eq!(expect_ack(&mut rx).await, Some(3));
@@ -1043,11 +1043,22 @@ struct GatedStore {
     inner: Arc<object_store::memory::InMemory>,
     /// Permits to write; empty until the test releases the parked flush.
     gate: Arc<tokio::sync::Semaphore>,
+    /// Writes that have reached the gate, counted before they park on it.
+    ///
+    /// This is the signal that a flush has actually started: a test waits for
+    /// it instead of guessing that the node has got that far.
+    entered: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GatedStore {
-    /// Wait for the gate, leaving it open for the writes that follow.
+    /// Announce a write, then wait for the gate.
+    ///
+    /// The count is raised before the wait, so a test observing it knows the
+    /// write is parked rather than still to come.
     async fn pass(&self) {
+        let _ = self
+            .entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let permit = self.gate.acquire().await.expect("the gate is never closed");
         drop(permit);
     }
@@ -1119,15 +1130,60 @@ impl ObjectStore for GatedStore {
     }
 }
 
-/// Give the node task every turn it can use before the test looks again.
+/// Give the node task turns until `condition` holds, or fail the test.
 ///
-/// Both clocks the node reads are simulated here, so there is nothing to wait
-/// for: the node only needs turns on the single-threaded runtime it shares
-/// with the test. Yielding a fixed number of times hands it those turns
-/// without introducing real time, which a sleep would.
-async fn settle() {
-    for _ in 0..64 {
+/// Both clocks the node reads are simulated, so there is nothing to wait for:
+/// the node only needs turns on the single-threaded runtime it shares with
+/// the test. The bound is a failure rather than a timeout, so a condition
+/// that never holds fails loudly instead of letting the test carry on
+/// against a node that has not done what the test is about to assert.
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if condition() {
+            return;
+        }
         tokio::task::yield_now().await;
+    }
+    panic!("{what} never happened");
+}
+
+/// Wait until one row-less marker request has been taken and decided.
+///
+/// Two observations in one, and neither is a guess about timing. The pdata
+/// channel these tests use holds a single message, so handing the marker over
+/// proves the request before it has been taken off the channel, and the
+/// completion the marker earns proves the node has finished deciding it. A
+/// request carrying no rows is decided without touching a block, so the
+/// marker changes nothing else about the worker's state.
+async fn marker(
+    tx: &mpsc::Sender<OtapPdata>,
+    rx: &mut PipelineCompletionMsgReceiver<OtapPdata>,
+    tag: usize,
+) {
+    let mut context = Context::default();
+    context.set_source_node(tag);
+    tx.send_async(OtapPdata::new(
+        context,
+        OtapPayload::empty(SignalType::Logs),
+    ))
+    .await
+    .expect("the marker enqueues");
+    assert_eq!(
+        expect_completion(rx).await,
+        Some(tag),
+        "the marker request is decided"
+    );
+}
+
+/// Take one completion and say which request it belonged to, ack or nack.
+async fn expect_completion(rx: &mut PipelineCompletionMsgReceiver<OtapPdata>) -> Option<usize> {
+    match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a completion arrives")
+        .expect("a completion arrives")
+    {
+        PipelineCompletionMsg::DeliverAck { ack } => ack.accepted.into_parts().0.source_node(),
+        PipelineCompletionMsg::DeliverNack { nack } => (*nack.refused).into_parts().0.source_node(),
     }
 }
 
@@ -1138,17 +1194,15 @@ async fn stored_files(store: &object_store::memory::InMemory) -> usize {
 }
 
 /// Scenario: two window boundaries are crossed while the one flush slot is
-/// held by a write the test has parked, with one request parked for a later
-/// window, a newer request queued behind it and control traffic arriving
-/// throughout. The parked write is then released without the clock moving
-/// again.
-/// Guarantees: the boundaries coalesce into exactly one rotation, which is
-/// served the moment the flush completes rather than at the next boundary;
-/// control stays served while pdata admission is closed; and the parked
-/// request enters the new block before the request queued after it, which is
-/// not admitted while one is parked.
+/// held by a write the test has parked. Nothing is parked and no block is
+/// full, so the boundary is the only thing that can ask for a rotation. The
+/// write is then released without the clock moving again.
+/// Guarantees: a boundary reached while the flush slot is busy is not lost,
+/// the rotation it asks for is served the moment the flush completes rather
+/// than at the next boundary, and two missed boundaries produce one rotation
+/// rather than two.
 #[tokio::test(flavor = "current_thread")]
-async fn a_boundary_while_flushing_rotates_once_when_the_flush_completes() {
+async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let sim = clock::SimClock::new();
@@ -1156,15 +1210,18 @@ async fn a_boundary_while_flushing_rotates_once_when_the_flush_completes() {
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let inner = Arc::new(object_store::memory::InMemory::new());
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let store = Arc::new(GatedStore {
                 inner: Arc::clone(&inner),
                 gate: Arc::clone(&gate),
+                entered: Arc::clone(&entered),
             });
+            let writes = || entered.load(std::sync::atomic::Ordering::SeqCst);
 
-            // One control slot, so a second control message can only be
-            // handed over once the node has taken the first.
+            // One slot in each channel, so handing a message over is itself
+            // the proof that the node has taken the previous one.
             let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(1);
-            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(8);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(1);
             let inbox = ExporterInbox::new(
                 Receiver::Local(LocalReceiver::mpsc(control_rx)),
                 Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
@@ -1185,47 +1242,31 @@ async fn a_boundary_while_flushing_rotates_once_when_the_flush_completes() {
                 .send_async(logs_pdata_from(1))
                 .await
                 .expect("the first request enqueues");
-            settle().await;
+            marker(&pdata_tx, &mut rx, 10).await;
 
-            // The 1 s boundary seals it, and the write parks on the gate.
+            // The 1 s boundary seals that block, and its write parks on the
+            // gate: the flush slot is now held.
             wall.set(1_100_000_000);
             sim.advance(Duration::from_secs(1));
-            settle().await;
-            assert_eq!(stored_files(&inner).await, 0, "the flush is parked");
+            until("the first block's write reaches the store", || writes() > 0).await;
 
-            // The second request joins the new ACTIVE block, which cannot be
-            // written while the first block holds the flush slot.
+            // The second request joins the block that replaced it, which
+            // cannot be written while the flush slot is held.
             pdata_tx
                 .send_async(logs_pdata_from(2))
                 .await
                 .expect("the second request enqueues");
-            settle().await;
+            marker(&pdata_tx, &mut rx, 11).await;
 
-            // The wall clock moves past the ACTIVE block's window without the
-            // boundary sleep firing, so the third request is parked rather
-            // than admitted to a block whose window has ended.
-            wall.set(2_100_000_000);
-            pdata_tx
-                .send_async(logs_pdata_from(3))
-                .await
-                .expect("the third request enqueues");
-            settle().await;
-
-            // A fourth request queues behind the parked one. Admission is
-            // closed, so it stays on the channel.
-            pdata_tx
-                .send_async(logs_pdata_from(4))
-                .await
-                .expect("the fourth request enqueues");
-
-            // Two further boundaries pass while the flush is still parked.
-            wall.set(4_100_000_000);
+            // Two more boundaries pass while the write is still parked. No
+            // request is parked and no budget is reached, so nothing but
+            // these boundaries can ask for the rotation that follows.
+            wall.set(3_100_000_000);
             sim.advance(Duration::from_secs(2));
-            settle().await;
 
-            // Control is served even though pdata admission is closed and the
-            // flush is parked: the second message can only be handed over
-            // once the node has taken the first.
+            // Control outranks the inbox but is outranked by the boundary, so
+            // two control messages handed over through a one-slot channel
+            // prove the node has served the boundary that was ready first.
             for _ in 0..2 {
                 tokio::time::timeout(
                     Duration::from_secs(5),
@@ -1241,27 +1282,158 @@ async fn a_boundary_while_flushing_rotates_once_when_the_flush_completes() {
                 "nothing is written while the flush is parked"
             );
 
-            // Releasing the write is the only thing that changes; the clock
-            // stays where it is, so anything written from here is written by
+            // Releasing the write is the only thing that changes: the clock
+            // stays where it is, so the second block can only be written by
             // the rotation the boundaries left owed.
             gate.add_permits(1);
             assert_eq!(expect_ack(&mut rx).await, Some(1));
             assert_eq!(
                 expect_ack(&mut rx).await,
                 Some(2),
-                "the owed rotation is served on completion, not at the next boundary"
+                "the boundary's rotation is served on completion, not at the next boundary"
             );
-            settle().await;
+
+            // The marker gives the node the turns a third rotation would need
+            // before the file count is read.
+            marker(&pdata_tx, &mut rx, 12).await;
             assert_eq!(
                 stored_files(&inner).await,
                 4,
                 "two boundaries missed while flushing are one rotation, not two"
             );
 
+            drop(pdata_tx);
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins");
+            if let Err(error) = terminal {
+                panic!("unexpected node failure: {error}");
+            }
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: a request is parked for a later window while the one flush slot
+/// is held by a write the test has parked, a newer request queues behind it,
+/// and control traffic arrives throughout. The write is then released without
+/// the clock moving again.
+/// Guarantees: the parked request enters the block the completed flush opens,
+/// ahead of the request that was queued behind it, which is not admitted
+/// while one is parked; control stays served while pdata admission is closed;
+/// and the flush that follows is a single rotation.
+#[tokio::test(flavor = "current_thread")]
+async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let inner = Arc::new(object_store::memory::InMemory::new());
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let store = Arc::new(GatedStore {
+                inner: Arc::clone(&inner),
+                gate: Arc::clone(&gate),
+                entered: Arc::clone(&entered),
+            });
+            let writes = || entered.load(std::sync::atomic::Ordering::SeqCst);
+
+            let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(1);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(1);
+            let inbox = ExporterInbox::new(
+                Receiver::Local(LocalReceiver::mpsc(control_rx)),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+                0,
+                Interests::empty(),
+            );
+            let (handler, mut rx) = effects(8);
+            let node = tokio::task::spawn_local(super::run(
+                worker_config(),
+                store as Arc<dyn ObjectStore>,
+                Arc::clone(&wall) as _,
+                inbox,
+                handler,
+            ));
+
+            pdata_tx
+                .send_async(logs_pdata_from(1))
+                .await
+                .expect("the first request enqueues");
+            marker(&pdata_tx, &mut rx, 10).await;
+
+            wall.set(1_100_000_000);
+            sim.advance(Duration::from_secs(1));
+            until("the first block's write reaches the store", || writes() > 0).await;
+
+            pdata_tx
+                .send_async(logs_pdata_from(2))
+                .await
+                .expect("the second request enqueues");
+            marker(&pdata_tx, &mut rx, 11).await;
+
+            // The wall clock moves past the ACTIVE block's window without the
+            // boundary sleep firing, so the third request is parked rather
+            // than admitted to a block whose window has ended.
+            wall.set(2_100_000_000);
+            pdata_tx
+                .send_async(logs_pdata_from(3))
+                .await
+                .expect("the third request enqueues");
+
+            // The one-slot channel takes this only once the third request has
+            // been taken off it, so the fourth is queued behind a parked one.
+            // Admission is closed, so it stays on the channel.
+            pdata_tx
+                .send_async(logs_pdata_from(4))
+                .await
+                .expect("the fourth request enqueues");
+
+            // Control is served even though pdata admission is closed and the
+            // flush is parked.
+            for _ in 0..2 {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    control_tx.send_async(NodeControlMsg::TimerTick {}),
+                )
+                .await
+                .expect("control is still served while the flush is parked")
+                .expect("the control message enqueues");
+            }
+            assert_eq!(
+                stored_files(&inner).await,
+                0,
+                "nothing is written while the flush is parked"
+            );
+
+            // Releasing the write opens the block the parked request has been
+            // waiting for, without the clock moving again.
+            gate.add_permits(1);
+            assert_eq!(expect_ack(&mut rx).await, Some(1));
+            assert_eq!(expect_ack(&mut rx).await, Some(2));
+            until("both blocks are written", || writes() == 4).await;
+
+            // The marker is taken only once the fourth request has been, so
+            // by this point both it and the parked request are admitted.
+            marker(&pdata_tx, &mut rx, 12).await;
+            assert_eq!(
+                stored_files(&inner).await,
+                4,
+                "the resumed request's block is not sealed before its window ends"
+            );
+
             // The next boundary seals the block the parked request entered,
             // together with the request that was queued behind it.
             wall.set(5_100_000_000);
-            sim.advance(Duration::from_secs(1));
+            sim.advance(Duration::from_secs(2));
             assert_eq!(
                 expect_ack(&mut rx).await,
                 Some(3),
