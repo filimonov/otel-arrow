@@ -294,7 +294,10 @@ class MetricsSlice(unittest.TestCase):
 
     # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request.
     # Guarantees: integer precision, histogram shape and wrapped timestamp
-    # nullability survive Parquet, and both metric datasets are written.
+    # nullability survive Parquet; and each point row joins on series_id to
+    # exactly one descriptor carrying the metric name, unit, kind,
+    # temporality, scope and point attributes, so the identity split is
+    # readable back with the latest-descriptor join the README documents.
     def test_number_and_histogram(self):
         with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
             try:
@@ -302,24 +305,74 @@ class MetricsSlice(unittest.TestCase):
                     metric_request("metric-0"), timeout=20
                 )
                 with duckdb.connect() as db:
-                    pattern = str(
+                    number = str(
                         engine.data / "v=1/signal=metrics/dataset=number/**/*.parquet"
                     )
                     rows = db.execute(
                         "SELECT value_int, time_unix_nano FROM read_parquet(?)",
-                        [pattern],
+                        [number],
                     ).fetchall()
                     self.assertEqual(rows, [(2**63 - 1, None)])
-                    pattern = str(
+                    histogram = str(
                         engine.data
                         / "v=1/signal=metrics/dataset=histogram/**/*.parquet"
                     )
                     rows = db.execute(
                         "SELECT count, bucket_counts, explicit_bounds "
                         "FROM read_parquet(?)",
-                        [pattern],
+                        [histogram],
                     ).fetchall()
                     self.assertEqual(rows, [(3, [1, 2], [1.0])])
+                    # One descriptor per series: the newest wins, ties broken
+                    # by filename, exactly as the crate README prescribes.
+                    series = str(
+                        engine.data / "v=1/signal=metrics/dataset=series/**/*.parquet"
+                    )
+                    # A view cannot take a bound parameter, and the path comes
+                    # from this test's own temporary directory.
+                    db.execute(
+                        "CREATE VIEW latest AS SELECT * EXCLUDE (rn, filename) "
+                        "FROM (SELECT *, row_number() OVER (PARTITION BY "
+                        "series_id ORDER BY emitted_at DESC, filename DESC) "
+                        f"AS rn FROM read_parquet('{series}', "
+                        "union_by_name = true, filename = true)) WHERE rn = 1"
+                    )
+                    joined = db.execute(
+                        "SELECT s.metric_name, s.unit, s.metric_type, "
+                        "s.temporality, s.scope_name, s.attrs['request.id'], "
+                        "v.producer_id "
+                        "FROM read_parquet(?) v JOIN latest s USING (series_id) "
+                        "UNION ALL "
+                        "SELECT s.metric_name, s.unit, s.metric_type, "
+                        "s.temporality, s.scope_name, s.attrs['request.id'], "
+                        "h.producer_id "
+                        "FROM read_parquet(?) h JOIN latest s USING (series_id) "
+                        "ORDER BY 1",
+                        [number, histogram],
+                    ).fetchall()
+                self.assertEqual(
+                    joined,
+                    [
+                        (
+                            "histogram",
+                            "s",
+                            "histogram",
+                            "cumulative",
+                            "series-e2e",
+                            "metric-0",
+                            "producer-1",
+                        ),
+                        (
+                            "integer",
+                            "1",
+                            "gauge",
+                            "",
+                            "series-e2e",
+                            "metric-0",
+                            "producer-1",
+                        ),
+                    ],
+                )
                 engine.shutdown()
             except Exception:
                 print(engine.engine_log())

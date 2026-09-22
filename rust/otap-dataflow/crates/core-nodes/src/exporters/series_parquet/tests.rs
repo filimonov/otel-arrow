@@ -32,7 +32,8 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMe
 use otel_arrow_dfe_pdata::proto::opentelemetry::collector::trace::v1::ExportTraceServiceRequest;
 use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
-    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint,
+    metric, number_data_point,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
@@ -227,6 +228,54 @@ fn traces_payload() -> OtapPayload {
     };
     otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(bytes::Bytes::from(encoded(&request)))
         .into()
+}
+
+/// One metrics request carrying a supported gauge point and an unsupported
+/// summary point, which is what the `unsupported` policy decides.
+fn mixed_metrics_payload() -> OtapPayload {
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![
+                    Metric {
+                        name: "requests".to_owned(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_789_960_500_000_000_000,
+                                value: Some(number_data_point::Value::AsInt(1)),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    },
+                    Metric {
+                        name: "latency".to_owned(),
+                        data: Some(metric::Data::Summary(Summary {
+                            data_points: vec![SummaryDataPoint {
+                                time_unix_nano: 1_789_960_500_000_000_000,
+                                count: 1,
+                                sum: 2.0,
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let bytes = encoded(&request);
+    let view = RawMetricsData::try_new(&bytes).expect("valid metrics bytes");
+    OtapPayload::from(encode_metrics_otap_batch(&view).expect("encodes to OTAP"))
+}
+
+/// One mixed metrics request that still carries a routing frame.
+fn mixed_metrics_pdata() -> OtapPdata {
+    let mut context = Context::default();
+    context.set_source_node(7);
+    OtapPdata::new(context, mixed_metrics_payload())
 }
 
 /// Scenario: a traces request reaches an exporter that has no traces schema,
@@ -852,6 +901,109 @@ async fn a_malformed_otlp_metrics_body_is_refused_atomically() {
                 }
                 other => panic!("expected a framing refusal, got {other:?}"),
             }
+        })
+        .await;
+}
+
+/// Scenario: one metrics request carries a supported gauge point next to an
+/// unsupported summary point, under the default `unsupported: reject`.
+/// Guarantees: the whole request is refused as one permanent `unsupported`
+/// nack and the ACTIVE block keeps the bytes and the request count it had, so
+/// the policy is applied atomically and the supported half of a rejected
+/// request is never stored. Nothing is parked, because the refusal judges the
+/// request's own content rather than whichever block happened to be active.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mixed_metrics_request_is_rejected_atomically() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let cfg = worker_config();
+            assert_eq!(
+                cfg.lake.unsupported,
+                lake::config::UnsupportedPolicy::Reject
+            );
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            // A request admitted first, so the assertion is that the rejected
+            // request left a non-empty block exactly as it found it rather
+            // than that an empty block stayed empty.
+            worker.admit(logs_pdata());
+            let bytes = worker.active.data.bytes;
+            let requests = worker.active.tokens.len();
+            assert_eq!(requests, 1);
+
+            worker.admit(mixed_metrics_pdata());
+            assert_eq!(worker.active.data.bytes, bytes);
+            assert_eq!(worker.active.tokens.len(), requests);
+            assert!(worker.pending.is_none());
+            assert_eq!(worker.live_tokens(), requests + 1);
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert_eq!(nack.reason, "unsupported");
+                }
+                other => panic!("expected an unsupported refusal, got {other:?}"),
+            }
+            // Exactly one completion, and it belongs to the rejected request:
+            // the admitted one is still owed by the ACTIVE block.
+            assert_eq!(worker.live_tokens(), requests);
+        })
+        .await;
+}
+
+/// Scenario: the same mixed metrics request arrives under
+/// `unsupported: drop`, and the block it lands in is rotated and written.
+/// Guarantees: the gauge point is admitted, the summary point is counted as
+/// dropped rather than stored, and the request is acknowledged only once its
+/// block has been written, so a dropped point does not make the request ack
+/// early or fail.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut cfg = worker_config();
+            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Drop;
+            let mut worker = Worker::new(cfg, store, wall, handler);
+
+            // Prepared rather than admitted in one step, because the drop
+            // counters live in the extraction and are consumed by admission.
+            let Prepared::Ready(pending) = worker.prepare(mixed_metrics_pdata()) else {
+                panic!("the drop policy admits the supported points");
+            };
+            assert_eq!(pending.extracted.stats.dropped_unsupported, 1);
+            assert_eq!(pending.extracted.stats.rows, 1);
+            worker.offer(pending);
+            assert_eq!(worker.active.tokens.len(), 1);
+            assert!(!worker.active.data.is_empty());
+            assert!(worker.pending.is_none());
+
+            worker.rotate();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), rx.recv())
+                    .await
+                    .is_err(),
+                "a dropped point does not acknowledge the request early"
+            );
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            assert!(worker.notify.next().await.is_ok());
+            assert!(matches!(
+                rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
         })
         .await;
 }
