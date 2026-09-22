@@ -627,7 +627,9 @@ mod tests {
 
     /// Scenario: a denormalized column declared `int64` over a string resource
     /// attribute.
-    /// Guarantees: the cell is stored as null and `denorm_type_mismatch` counts it.
+    /// Guarantees: the cell is stored as null, `denorm_type_mismatch` counts it,
+    /// and the per-column breakdown attributes every mismatch to the configured
+    /// physical column name and sums back to the aggregate.
     #[test]
     fn denorm_type_mismatch_is_counted() {
         let mut cfg = cfg();
@@ -644,6 +646,11 @@ mod tests {
             .column_by_name("service_name")
             .expect("service_name");
         assert!(svc.is_null(0));
+        assert_eq!(
+            out.stats.denorm_type_mismatch_by_column.get("service_name"),
+            Some(&out.stats.denorm_type_mismatch),
+            "the whole aggregate is attributed to the one mismatching column"
+        );
     }
 
     /// Scenario: a log record whose `time_unix_nano` is above `i64::MAX`, so it

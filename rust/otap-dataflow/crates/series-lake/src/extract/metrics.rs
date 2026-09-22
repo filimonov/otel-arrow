@@ -360,7 +360,17 @@ pub(crate) fn extract_metrics(
                 UnsupportedPolicy::Reject => {
                     return Err(Error::Refused(RefuseReason::Unsupported(format!("{pt:?}"))));
                 }
-                UnsupportedPolicy::Drop => c.stats.dropped_unsupported += b.num_rows() as u64,
+                UnsupportedPolicy::Drop => {
+                    let rows = b.num_rows() as u64;
+                    c.stats.dropped_unsupported += rows;
+                    match pt {
+                        ArrowPayloadType::ExpHistogramDataPoints => {
+                            c.stats.dropped_exp_histogram += rows;
+                        }
+                        ArrowPayloadType::SummaryDataPoints => c.stats.dropped_summary += rows,
+                        _ => unreachable!("loop contains only the two unsupported point tables"),
+                    }
+                }
             }
         }
     }
@@ -988,7 +998,9 @@ mod tests {
     }
 
     /// Scenario: an exponential histogram under reject and under drop.
-    /// Guarantees: reject refuses the whole request; drop yields zero rows and counts one drop.
+    /// Guarantees: reject refuses the whole request; drop yields zero rows,
+    /// counts one drop in the aggregate and attributes it to the exponential
+    /// histogram counter specifically, leaving the summary counter at zero.
     #[test]
     fn exp_histogram_policy() {
         let md = data(vec![Metric {
@@ -1018,13 +1030,74 @@ mod tests {
         let out = extract_metrics(&records, &cfg, &mut budget).expect("drop");
         assert_eq!(out.stats.rows, 0);
         assert_eq!(out.stats.dropped_unsupported, 1);
+        assert_eq!(out.stats.dropped_exp_histogram, 1);
+        assert_eq!(out.stats.dropped_summary, 0);
         assert!(out.values.is_empty());
+    }
+
+    /// Scenario: an exponential histogram and a summary, with a different
+    /// point count each, dropped together in one request.
+    /// Guarantees: the two per-kind counters split the aggregate exactly by
+    /// kind rather than merging or double counting, so the domain stays
+    /// closed to the two unsupported point kinds (spec 5.1).
+    #[test]
+    fn exp_histogram_and_summary_drops_are_split_by_kind() {
+        let md = data(vec![
+            Metric {
+                name: "e".into(),
+                data: Some(metric::Data::ExponentialHistogram(ExponentialHistogram {
+                    aggregation_temporality: AggregationTemporality::Delta as i32,
+                    data_points: vec![
+                        ExponentialHistogramDataPoint {
+                            time_unix_nano: 1,
+                            count: 1,
+                            ..Default::default()
+                        },
+                        ExponentialHistogramDataPoint {
+                            time_unix_nano: 2,
+                            count: 1,
+                            ..Default::default()
+                        },
+                    ],
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "q".into(),
+                data: Some(metric::Data::Summary(Summary {
+                    data_points: vec![SummaryDataPoint {
+                        time_unix_nano: 20,
+                        count: 2,
+                        sum: 4.0,
+                        ..Default::default()
+                    }],
+                })),
+                ..Default::default()
+            },
+        ]);
+        let records = encode_metrics(&md);
+        let cfg = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            ..Default::default()
+        };
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("drop");
+        assert_eq!(out.stats.dropped_exp_histogram, 2);
+        assert_eq!(out.stats.dropped_summary, 1);
+        assert_eq!(out.stats.dropped_unsupported, 3);
+        assert_eq!(
+            out.stats.dropped_exp_histogram + out.stats.dropped_summary,
+            out.stats.dropped_unsupported,
+            "the per-kind split sums to the aggregate with no other kind mixed in"
+        );
     }
 
     /// Scenario: a gauge and a summary in the same request under the drop policy.
     /// Guarantees: the summary never reaches temporality validation (pdata supplies
-    /// no temporality for summaries), the request succeeds, the gauge rows survive
-    /// and the summary points are counted as dropped.
+    /// no temporality for summaries), the request succeeds, the gauge rows survive,
+    /// the summary points are counted as dropped in the aggregate, and attributed
+    /// to the summary counter specifically, leaving the exponential-histogram
+    /// counter at zero.
     #[test]
     fn summary_is_dropped_without_failing_temporality_validation() {
         let md = data(vec![
@@ -1062,6 +1135,8 @@ mod tests {
         let out = extract_metrics(&records, &cfg, &mut budget).expect("drop");
         assert_eq!(out.stats.rows, 1);
         assert_eq!(out.stats.dropped_unsupported, 1);
+        assert_eq!(out.stats.dropped_summary, 1);
+        assert_eq!(out.stats.dropped_exp_histogram, 0);
         assert_eq!(out.descriptors.len(), 1);
         let number = out
             .values

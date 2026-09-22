@@ -63,6 +63,17 @@ impl SeriesCache {
         self.insert(id, Some(partition));
     }
 
+    /// Last durable descriptor partition, without changing recency or hit counters.
+    ///
+    /// `peek` leaves LRU order untouched, unlike [`SeriesCache::is_committed`],
+    /// so a caller that only wants to know where a descriptor last landed --
+    /// for diagnostics, not an admission decision -- does not itself keep an
+    /// unrelated entry alive at another entry's expense.
+    #[must_use]
+    pub fn last_committed(&self, id: &SeriesId) -> Option<PartitionId> {
+        self.inner.peek(id).copied().flatten()
+    }
+
     fn insert(&mut self, id: SeriesId, p: Option<PartitionId>) {
         if self.inner.len() == self.inner.cap().get() && !self.inner.contains(&id) {
             self.stats.evictions += 1;
@@ -121,6 +132,29 @@ mod tests {
         // present with p -> hit, asked for q -> miss.
         assert_eq!(c.stats().hits, 1);
         assert_eq!(c.stats().misses, 3);
+    }
+
+    /// Scenario: an id that was never touched, one only touched, one committed
+    /// in one partition then another, all read with `last_committed`.
+    /// Guarantees: `last_committed` reports the most recent committed
+    /// partition (or none) and never counts as a hit or a miss.
+    #[test]
+    fn last_committed_reads_without_touching_stats_or_recency() {
+        let p = PartitionId { date: 1, hour: 0 };
+        let q = PartitionId { date: 1, hour: 1 };
+        let mut c = SeriesCache::new(10);
+        assert_eq!(c.last_committed(&id(1)), None, "never seen");
+        c.touch(id(2));
+        assert_eq!(c.last_committed(&id(2)), None, "touched but not committed");
+        c.mark_committed(id(3), p);
+        assert_eq!(c.last_committed(&id(3)), Some(p));
+        c.mark_committed(id(3), q);
+        assert_eq!(c.last_committed(&id(3)), Some(q), "the newer commit wins");
+        assert_eq!(
+            c.stats(),
+            CacheStats::default(),
+            "peeking never records a hit, miss or eviction"
+        );
     }
 
     /// Scenario: capacity 2, three distinct ids touched in order.

@@ -90,6 +90,17 @@ pub struct ExtractStats {
     pub timestamp_out_of_range: u64,
     /// Denormalized values stored as null because of a type mismatch.
     pub denorm_type_mismatch: u64,
+    /// Dropped exponential histogram points.
+    pub dropped_exp_histogram: u64,
+    /// Dropped summary points.
+    pub dropped_summary: u64,
+    /// Mismatches keyed only by configured physical column name.
+    ///
+    /// Bounded by the number of configured denormalize columns (spec 6.2 step
+    /// 4 fixes that set at startup), never by request content: the key is
+    /// always one of `cfg.logs.denormalize`/`cfg.metrics.denormalize`'s
+    /// `column` names, so no attacker-controlled label can grow this map.
+    pub denorm_type_mismatch_by_column: std::collections::BTreeMap<String, u64>,
 }
 
 /// Result of extracting one request.
@@ -249,6 +260,10 @@ pub(crate) fn denorm_lookup(
         (_, Value::Null) => None,
         _ => {
             stats.denorm_type_mismatch += 1;
+            *stats
+                .denorm_type_mismatch_by_column
+                .entry(d.column.clone())
+                .or_default() += 1;
             None
         }
     }
@@ -852,6 +867,7 @@ pub(crate) fn descriptor_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DenormType, Denormalize};
     use crate::error::RefuseReason;
     use arrow::array::{StringArray, UInt8Array, UInt16Array};
     use arrow::buffer::{BooleanBuffer, NullBuffer};
@@ -930,6 +946,44 @@ mod tests {
             Value::Str(String::new())
         );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
+    }
+
+    /// Scenario: two configured columns that both mismatch, looked up three
+    /// times apiece against an attribute list that cannot satisfy either
+    /// declared type.
+    /// Guarantees: `denorm_type_mismatch_by_column` holds exactly one entry
+    /// per configured column name -- bounded by the number of denormalize
+    /// columns configured at startup, not by how many times a column is
+    /// looked up -- each entry counts its own column's lookups only, and the
+    /// entries sum to the aggregate `denorm_type_mismatch`.
+    #[test]
+    fn denorm_type_mismatch_by_column_is_bounded_by_configured_columns() {
+        let a = Denormalize {
+            path: "resource.svc".into(),
+            column: "col_a".into(),
+            ty: DenormType::Int64,
+        };
+        let b = Denormalize {
+            path: "resource.svc".into(),
+            column: "col_b".into(),
+            ty: DenormType::Bool,
+        };
+        let resource = vec![("svc".to_string(), Value::Str("not-an-int".into()))];
+        let mut stats = ExtractStats::default();
+        for d in [&a, &a, &a, &b, &b] {
+            assert!(denorm_lookup(d, &resource, &[], &[], &mut stats).is_none());
+        }
+        assert_eq!(
+            stats.denorm_type_mismatch_by_column.len(),
+            2,
+            "one entry per configured column, however many times it is looked up"
+        );
+        assert_eq!(stats.denorm_type_mismatch_by_column.get("col_a"), Some(&3));
+        assert_eq!(stats.denorm_type_mismatch_by_column.get("col_b"), Some(&2));
+        assert_eq!(
+            stats.denorm_type_mismatch_by_column.values().sum::<u64>(),
+            stats.denorm_type_mismatch
+        );
     }
 
     /// Scenario: an attribute list holding a bytes value, which `render_v1`

@@ -346,12 +346,40 @@ impl<T> Block<T> {
         token_bytes: usize,
         cfg: &LakeConfig,
     ) -> Result<Reservation> {
+        self.reserve_with_reemit(extracted, cache, token_bytes, cfg, false)
+    }
+
+    /// Compute what admitting `extracted` would add, optionally repeating every
+    /// descriptor not already pending in this block.
+    ///
+    /// With `reemit` false this is exactly [`Block::reserve`]: a descriptor
+    /// already committed in this block's partition is suppressed. With `reemit`
+    /// true, a descriptor is reserved again even when the cache already reports
+    /// it committed here, as long as this block does not already carry it --
+    /// the case a byte-triggered rotation inside one aligned window needs (spec
+    /// 7.4): the new block starts a new partition-cache suppression window of
+    /// its own only once its descriptors are written, so its series rows must
+    /// be re-emitted rather than assumed present from the block it replaced.
+    /// The cache itself is never disabled or cleared; only this one reservation
+    /// ignores its answer.
+    ///
+    /// # Errors
+    /// Returns `Error::Refused` with one of the three reasons documented on
+    /// [`Block::reserve`].
+    pub fn reserve_with_reemit(
+        &self,
+        extracted: &Extracted,
+        cache: &mut SeriesCache,
+        token_bytes: usize,
+        cfg: &LakeConfig,
+        reemit: bool,
+    ) -> Result<Reservation> {
         let limits = &cfg.ingress;
         let mut bytes = extracted.pinned_bytes + token_bytes;
         let mut new_series = Vec::new();
         for (i, d) in extracted.descriptors.iter().enumerate() {
             let committed_here = cache.is_committed(&d.series_id, self.partition);
-            if !committed_here && !self.pending_series.contains(&d.series_id) {
+            if (reemit || !committed_here) && !self.pending_series.contains(&d.series_id) {
                 new_series.push(i);
                 bytes += d.series_row_bytes() + limits.pending_series_entry_bytes;
             }
@@ -1271,6 +1299,25 @@ mod tests {
         assert_eq!(block.bytes, sealed_bytes);
         assert_eq!(block.request_count(), 1);
         assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
+    }
+
+    /// Scenario: a byte rotation begins another block in a partition with a committed descriptor.
+    /// Guarantees: explicit re-emission reserves the descriptor again without disabling the cache globally.
+    #[test]
+    fn byte_rotation_can_force_descriptor_reemission() {
+        let cfg = LakeConfig::default();
+        let mut cache = SeriesCache::new(10);
+        let e = extracted(&cfg, "h", 1);
+        let id = e.descriptors[0].series_id;
+        let block: Block<()> = Block::new(0, 1, &cfg);
+        cache.mark_committed(id, block.partition);
+        let normal = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+        assert!(normal.new_series.is_empty());
+        let forced = block
+            .reserve_with_reemit(&e, &mut cache, 16, &cfg, true)
+            .expect("reserve");
+        assert_eq!(forced.new_series, vec![0]);
+        assert!(forced.bytes > normal.bytes);
     }
 
     /// Scenario: a buffer with a tiny run target receives several batches.
