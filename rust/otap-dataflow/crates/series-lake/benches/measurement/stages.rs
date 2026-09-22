@@ -54,6 +54,19 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Sequence number of every block a stage builds.
 const SEQ: u64 = 1;
 
+/// What a completed write means in every stage that stores an object.
+///
+/// The store has reported the object written -- a completed multipart
+/// upload or `PUT` on S3, a closed file on the local backend -- and the
+/// stage has read it back and compared its size and bytes. It is not a
+/// claim about host power-loss durability: `object_store` does not fsync
+/// its local backend, and no backend used here promises the bytes survive
+/// a power cut.
+const COMPLETION_SEMANTICS: &str = "the store reported the object written and \
+    the bytes were read back and verified; object_store does not fsync its \
+    local backend, so this is object-store visibility, not host power-loss \
+    durability";
+
 /// Accounted bytes of one request's acknowledgement token.
 ///
 /// The exporter charges its real token here; the bench has none, so it
@@ -781,6 +794,16 @@ fn block_rows<T>(block: &Block<T>) -> (usize, usize) {
 }
 
 /// Write bytes through a `BufWriter` exactly as the sink's upload path does.
+///
+/// What completion means here: the future resolves once the writer has
+/// shut down, which is the point at which the object store reports the
+/// object written -- a completed multipart upload or `PUT` on S3, and a
+/// closed file on the local backend. Every iteration then reads the object
+/// back and compares its size and hash, so completion means the object is
+/// visible in the store and holds the bytes that were written. It is not a
+/// claim about host power-loss durability: `object_store`'s local backend
+/// does not fsync, and no backend here promises the bytes survive a power
+/// cut.
 async fn put_buffered(
     store: Arc<dyn ObjectStore>,
     path: Path,
@@ -803,13 +826,47 @@ pub enum Prepared {
     Records(Vec<OtapArrowRecords>),
     /// Extracted requests and a freshly warmed series cache.
     Extracted(Vec<Extracted>, SeriesCache),
-    /// Nothing beyond the stage's own retained fixture, plus a fresh
-    /// iteration number that names new objects.
-    Fixture(u64),
+    /// Nothing beyond the stage's own retained fixture.
+    Fixture,
     /// Pre-reserved output buffers for the encoder, one per table.
     Buffers(Vec<Vec<u8>>),
     /// A sink with a fresh file identity.
     Sink(Box<Sink>),
+    /// A cumulative layer: wire bytes, the warmed cache it admits into and
+    /// the destination this iteration writes to.
+    Cumulative(Vec<OtlpProtoBytes>, SeriesCache, Destination),
+    /// Pre-encoded objects with the path each one is written to.
+    Objects(Vec<(Path, Bytes)>),
+}
+
+/// Where one iteration of a cumulative layer puts what it produced.
+pub enum Destination {
+    /// Nothing is written; the merge is consumed and dropped.
+    None,
+    /// One local file per table, in table order, created by the stage.
+    Files(Vec<PathBuf>),
+    /// A sink with a fresh file identity.
+    Sink(Box<Sink>),
+}
+
+impl Prepared {
+    /// What this input carries, for the self-test that proves every stage
+    /// is handed its whole setup instead of building it while timed.
+    #[must_use]
+    pub fn carries(&self) -> &'static str {
+        match self {
+            Prepared::Wire(_) => "wire",
+            Prepared::Records(_) => "records",
+            Prepared::Extracted(_, _) => "extracted+cache",
+            Prepared::Fixture => "fixture",
+            Prepared::Buffers(_) => "buffers",
+            Prepared::Sink(_) => "sink",
+            Prepared::Cumulative(_, _, Destination::None) => "wire+cache",
+            Prepared::Cumulative(_, _, Destination::Files(_)) => "wire+cache+paths",
+            Prepared::Cumulative(_, _, Destination::Sink(_)) => "wire+cache+sink",
+            Prepared::Objects(_) => "objects+paths",
+        }
+    }
 }
 
 /// What one run produced, retained until it has been observed.
@@ -899,6 +956,9 @@ pub struct Stage {
     chunks: Vec<(Dataset, Vec<RecordBatch>)>,
     /// Pre-encoded bytes of the persistence stages.
     encoded: Vec<(Dataset, Bytes)>,
+    /// The non-empty tables of a sealed block, in write order, so that a
+    /// cumulative layer's destination paths are built before it is timed.
+    table_names: Vec<&'static str>,
     /// Output capacity estimates from the encoder's warm-up.
     capacity: Vec<usize>,
     /// Whether timed buffers are pre-reserved (timing mode only).
@@ -947,6 +1007,7 @@ impl Stage {
             block: None,
             chunks: Vec::new(),
             encoded: Vec::new(),
+            table_names: Vec::new(),
             capacity: Vec::new(),
             reserve_output,
             fixture_checks: Vec::new(),
@@ -1025,7 +1086,11 @@ impl Stage {
                 })
                 .sum(),
             Prepared::Buffers(buffers) => buffers.iter().map(Vec::capacity).sum(),
-            Prepared::Wire(_) | Prepared::Fixture(_) | Prepared::Sink(_) => 0,
+            Prepared::Cumulative(_, _, _)
+            | Prepared::Objects(_)
+            | Prepared::Wire(_)
+            | Prepared::Fixture
+            | Prepared::Sink(_) => 0,
         };
         bytes as u64
     }
@@ -1057,6 +1122,17 @@ impl Stage {
         cache
     }
 
+    /// A sink with a file identity no earlier iteration used, so every
+    /// iteration writes new objects instead of overwriting one.
+    fn new_sink(&self) -> Result<Sink> {
+        let store = self.store.clone().ok_or("this stage has no store")?;
+        let naming = FileNaming {
+            writer_id: self.cfg.lake.writer_id.clone(),
+            boot_id: format!("bench{}", uuid_like().replace('-', "x")),
+        };
+        Ok(Sink::new(store, self.cfg.lake.clone(), naming))
+    }
+
     /// A freshly sealed block of the whole input.
     fn sealed_block(&self) -> Result<Block<()>> {
         let extracted = convert_extract(wire(&self.input), &self.cfg.lake)?;
@@ -1078,6 +1154,17 @@ impl Stage {
             StageName::OtlpSort => {
                 let block = self.sealed_block()?;
                 self.record_merged_bytes(&block)?;
+            }
+            StageName::OtlpParquetLocal | StageName::OtlpParquetZstd => {
+                // The tables a block of this input holds, in write order.
+                // Their names are what the per-iteration destination paths
+                // are built from, outside the timer.
+                let block = self.sealed_block()?;
+                self.table_names = block
+                    .tables()
+                    .filter(|table| !table.is_empty())
+                    .map(|table| table.dataset().name())
+                    .collect();
             }
             StageName::Sink => {
                 let block = self.sealed_block()?;
@@ -1146,11 +1233,32 @@ impl Stage {
             StageName::OtlpNoop
             | StageName::OtlpConvert
             | StageName::OtlpExtractHash
-            | StageName::OtlpSort
-            | StageName::OtlpParquetLocal
-            | StageName::OtlpParquetZstd
-            | StageName::OtlpMinio
             | StageName::Convert => Prepared::Wire(wire(&self.input)),
+            StageName::OtlpSort => {
+                Prepared::Cumulative(wire(&self.input), self.warm_cache(), Destination::None)
+            }
+            StageName::OtlpParquetLocal | StageName::OtlpParquetZstd => {
+                let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+                let paths = self
+                    .table_names
+                    .iter()
+                    .map(|name| {
+                        self.cfg
+                            .scratch_dir
+                            .join(format!("{name}-{}-{serial:08}.parquet", std::process::id()))
+                    })
+                    .collect();
+                Prepared::Cumulative(
+                    wire(&self.input),
+                    self.warm_cache(),
+                    Destination::Files(paths),
+                )
+            }
+            StageName::OtlpMinio => Prepared::Cumulative(
+                wire(&self.input),
+                self.warm_cache(),
+                Destination::Sink(Box::new(self.new_sink()?)),
+            ),
             StageName::Extract => Prepared::Records(
                 wire(&self.input)
                     .into_iter()
@@ -1161,8 +1269,25 @@ impl Stage {
                 convert_extract(wire(&self.input), &self.cfg.lake)?,
                 self.warm_cache(),
             ),
-            StageName::Merge | StageName::LocalWrite | StageName::Upload => {
-                Prepared::Fixture(self.serial.fetch_add(1, Ordering::Relaxed))
+            StageName::Merge => Prepared::Fixture,
+            StageName::LocalWrite | StageName::Upload => {
+                let serial = self.serial.fetch_add(1, Ordering::Relaxed);
+                Prepared::Objects(
+                    self.encoded
+                        .iter()
+                        .map(|(dataset, data)| {
+                            (
+                                Path::from(format!(
+                                    "bench/{}/{}-{}-{serial:08}.parquet",
+                                    self.name.as_str(),
+                                    dataset.name(),
+                                    std::process::id()
+                                )),
+                                data.clone(),
+                            )
+                        })
+                        .collect(),
+                )
             }
             StageName::Encode => Prepared::Buffers(
                 self.capacity
@@ -1176,14 +1301,7 @@ impl Stage {
                     })
                     .collect(),
             ),
-            StageName::Sink => {
-                let store = self.store.clone().ok_or("the sink stage has no store")?;
-                let naming = FileNaming {
-                    writer_id: self.cfg.lake.writer_id.clone(),
-                    boot_id: format!("bench{}", uuid_like().replace('-', "x")),
-                };
-                Prepared::Sink(Box::new(Sink::new(store, self.cfg.lake.clone(), naming)))
-            }
+            StageName::Sink => Prepared::Sink(Box::new(self.new_sink()?)),
         })
     }
 
@@ -1225,36 +1343,35 @@ impl Stage {
                 parts.push(("seal", seal));
                 Retained::Block(Box::new(block), cache.stats())
             }
-            (StageName::OtlpSort, Prepared::Wire(wire)) => {
+            (StageName::OtlpSort, Prepared::Cumulative(wire, mut cache, Destination::None)) => {
                 let extracted = convert_extract(wire, lake)?;
-                let mut cache = self.warm_cache();
                 let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
                 block.seal(self.cfg.seal_at_us)?;
                 let (values, series) = merge_consume(&block, lake)?;
                 Retained::Merged(values, series)
             }
-            (StageName::Merge, Prepared::Fixture(_)) => {
+            (StageName::Merge, Prepared::Fixture) => {
                 let block = self.block.as_ref().ok_or("merge has no block")?;
                 let (values, series) = merge_consume(block, lake)?;
                 Retained::Merged(values, series)
             }
-            (StageName::OtlpParquetLocal | StageName::OtlpParquetZstd, Prepared::Wire(wire)) => {
+            (
+                StageName::OtlpParquetLocal | StageName::OtlpParquetZstd,
+                Prepared::Cumulative(wire, mut cache, Destination::Files(paths)),
+            ) => {
                 let compression = if self.name == StageName::OtlpParquetZstd {
                     zstd()
                 } else {
                     Compression::UNCOMPRESSED
                 };
                 let extracted = convert_extract(wire, lake)?;
-                let mut cache = self.warm_cache();
                 let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
                 block.seal(self.cfg.seal_at_us)?;
                 let mut files = Vec::new();
-                let serial = uuid_like();
-                for (dataset, encoded) in encode_block(&block, lake, compression)? {
-                    let path = self
-                        .cfg
-                        .scratch_dir
-                        .join(format!("{}-{serial}.parquet", dataset.name()));
+                for ((dataset, encoded), path) in encode_block(&block, lake, compression)?
+                    .into_iter()
+                    .zip(paths)
+                {
                     let mut file = std::fs::File::create(&path)?;
                     file.write_all(&encoded)?;
                     drop(file);
@@ -1279,19 +1396,12 @@ impl Stage {
                 }
                 Retained::Encoded(files, observed)
             }
-            (StageName::LocalWrite | StageName::Upload, Prepared::Fixture(serial)) => {
+            (StageName::LocalWrite | StageName::Upload, Prepared::Objects(prepared)) => {
                 let store = self.store.clone().ok_or("no store")?;
                 let objects = self.runtime.block_on(async {
                     let mut objects = Vec::new();
-                    for (dataset, data) in &self.encoded {
-                        let path = Path::from(format!(
-                            "bench/{}/{}-{}-{serial:08}.parquet",
-                            self.name.as_str(),
-                            dataset.name(),
-                            std::process::id()
-                        ));
-                        let length =
-                            put_buffered(store.clone(), path.clone(), data.clone(), lake).await?;
+                    for (path, data) in prepared {
+                        let length = put_buffered(store.clone(), path.clone(), data, lake).await?;
                         objects.push((path, length));
                     }
                     Ok::<_, Box<dyn std::error::Error>>(objects)
@@ -1305,20 +1415,16 @@ impl Stage {
                         .block_on(sink.write_block(block, &CancellationToken::new()))?,
                 )
             }
-            (StageName::OtlpMinio, Prepared::Wire(wire)) => {
-                let store = self.store.clone().ok_or("no store")?;
+            (
+                StageName::OtlpMinio,
+                Prepared::Cumulative(wire, mut cache, Destination::Sink(sink)),
+            ) => {
                 let (block, prepare) = timed(|| {
                     let extracted = convert_extract(wire, lake)?;
-                    let mut cache = self.warm_cache();
                     let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
                     block.seal(self.cfg.seal_at_us)?;
                     Ok::<_, Box<dyn std::error::Error>>(block)
                 })?;
-                let naming = FileNaming {
-                    writer_id: lake.writer_id.clone(),
-                    boot_id: format!("bench{}", uuid_like().replace('-', "x")),
-                };
-                let sink = Sink::new(store, lake.clone(), naming);
                 let (report, write) = timed_process(|| {
                     self.runtime
                         .block_on(sink.write_block(&block, &CancellationToken::new()))
@@ -1461,6 +1567,7 @@ impl Stage {
                 ("parquet_bytes", bytes as u64, values, Some(series))
             }
             Retained::Files(files) => {
+                let _ = extra.insert("objects_count".into(), files.len().into());
                 let mut matched = true;
                 let mut pairs = Vec::new();
                 for (dataset, path, data) in files {
@@ -1509,6 +1616,8 @@ impl Stage {
                     objects.len() == self.encoded.len(),
                     format!("{} objects", objects.len()),
                 ));
+                let _ = extra.insert("objects_count".into(), objects.len().into());
+                let _ = extra.insert("completion_semantics".into(), COMPLETION_SEMANTICS.into());
                 ("stored_objects", bytes as u64, expected, None)
             }
             Retained::Flushed(report) => {
@@ -1543,6 +1652,8 @@ impl Stage {
                     pairs.push((*dataset, body));
                 }
                 let (values, series) = parquet_rows(pairs)?;
+                let _ = extra.insert("objects_count".into(), report.files.len().into());
+                let _ = extra.insert("completion_semantics".into(), COMPLETION_SEMANTICS.into());
                 checks.push(Check::new(
                     "descriptor_coverage",
                     series == expected_series - self.committed.len().min(expected_series),

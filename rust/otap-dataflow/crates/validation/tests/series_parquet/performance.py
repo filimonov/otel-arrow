@@ -85,7 +85,54 @@ STAGE_METRICS = (
 )
 
 # The identifying fields of every registered stage result.
-STAGE_FIELDS = ("stage", "mode", "sample_count", "repetition", "fingerprint")
+STAGE_FIELDS = (
+    "stage",
+    "mode",
+    "sample_count",
+    "repetition",
+    "fingerprint",
+    "input_representation",
+    "output_representation",
+    "denominator",
+)
+
+# What each stage is handed and what its per-record denominator therefore
+# divides. Every per-record metric of every stage divides by the input
+# file's logical records -- the log records or metric points a producer
+# sent -- whatever form the stage's own input takes, so a stage that is
+# handed already encoded bytes says so here and reports object and byte
+# rates beside its per-record ones.
+INPUT_REPRESENTATIONS = {
+    "otlp_noop": "otlp_wire_bytes",
+    "otlp_convert": "otlp_wire_bytes",
+    "otlp_extract_hash": "otlp_wire_bytes",
+    "otlp_sort": "otlp_wire_bytes",
+    "otlp_parquet_local": "otlp_wire_bytes",
+    "otlp_parquet_zstd": "otlp_wire_bytes",
+    "otlp_minio": "otlp_wire_bytes",
+    "convert": "otlp_wire_bytes",
+    "extract": "otap_arrow_records",
+    "sort_seal": "extracted_rows",
+    "merge": "sealed_block",
+    "encode": "merged_chunks",
+    "local_write": "pre_encoded_parquet_bytes",
+    "upload": "pre_encoded_parquet_bytes",
+    "sink": "sealed_block",
+}
+
+# The stages whose timed input is already encoded: their per-record rates
+# describe work that is not per record at all, so they also report the
+# rates their input actually has.
+PRE_ENCODED_INPUT_STAGES = ("local_write", "upload")
+
+# The rates a pre-encoded-input stage must report beside its per-record
+# metrics.
+RATE_FIELDS = ("objects_per_s", "input_bytes_per_s", "output_bytes_per_s")
+
+DENOMINATOR = (
+    "logical upstream records of the input file (log records or metric "
+    "points), whatever form this stage's own input takes"
+)
 
 # What each profile must measure. A heap profile never supplies a
 # throughput, and a timing profile never supplies an allocation.
@@ -212,6 +259,25 @@ def validate_stage_result(result: dict) -> None:
             f"stage result {result['stage']!r} does not say which child "
             f"measured {missing}"
         )
+    if result["input_representation"] != INPUT_REPRESENTATIONS[result["stage"]]:
+        raise AssertionError(
+            f"stage result {result['stage']!r} claims to have been handed "
+            f"{result['input_representation']!r}"
+        )
+    if not result["denominator"]:
+        raise AssertionError(
+            f"stage result {result['stage']!r} does not say what its "
+            f"per-record metrics divide by"
+        )
+    if result["stage"] in PRE_ENCODED_INPUT_STAGES:
+        rates = result.get("rates") or {}
+        for name in RATE_FIELDS:
+            if not _finite(rates.get(name)):
+                raise AssertionError(
+                    f"stage result {result['stage']!r} times already encoded "
+                    f"input and must report {name}, not only a per-record "
+                    f"rate; it reports {rates.get(name)!r}"
+                )
 
 
 def validate_child_result(result: dict, profile: str) -> None:
@@ -793,6 +859,42 @@ def coefficient_of_variation(values) -> float:
     return math.sqrt(variance) / abs(mean)
 
 
+def stage_rates(stage, timing_child) -> dict:
+    """The rates a stage's own input and output have, per measured second.
+
+    A per-record rate divides by the input file's logical records however
+    the stage is fed, so a stage handed already encoded bytes -- `upload`
+    and `local_write` -- also reports how many objects and how many bytes a
+    second of its measured time moves. Everything here is measured: the
+    object count and the output bytes come from the stage's own
+    verification, and the seconds from its own timer.
+    """
+    observations = timing_child.get("observations") or {}
+    report = observations.get("bench_report") or {}
+    observation = report.get("observation") or {}
+    extra = observation.get("extra") or {}
+    metrics = timing_child.get("metrics") or {}
+    wall_ns_per_record = metrics.get("wall_ns_per_record")
+    records = report.get("records")
+    if not (_finite(wall_ns_per_record) and records and wall_ns_per_record > 0):
+        return {}
+    seconds = wall_ns_per_record * records / 1e9
+    output_bytes = observation.get("output_bytes") or 0
+    rates = {
+        "records_per_s": records / seconds,
+        "output_bytes_per_s": output_bytes / seconds,
+    }
+    objects = extra.get("objects_count")
+    if objects is not None:
+        rates["objects_per_s"] = objects / seconds
+        rates["bytes_per_object"] = (output_bytes / objects) if objects else 0.0
+    if stage in PRE_ENCODED_INPUT_STAGES:
+        # The input of these stages is the encoded object itself, so the
+        # bytes they were handed are the bytes they wrote.
+        rates["input_bytes_per_s"] = output_bytes / seconds
+    return rates
+
+
 def stage_mode(stage) -> str:
     """The mode a stage is measured in by the purpose-built bench."""
     if stage in ASYNC_STAGES:
@@ -869,6 +971,31 @@ def criterion_estimates(home, stage, function) -> dict:
             if (directory / name).is_file()
         ],
     }
+
+
+def criterion_samples_ok(estimates) -> tuple:
+    """Whether one Criterion group is a measurement, and why.
+
+    Every timing process must take at least thirty samples and accumulate
+    one second of measured work; Criterion's are no exception. Criterion
+    schedules its iterations from a warm-up that also pays for the batched
+    preparation, so the layer bench scales its group's measurement time by
+    that ratio -- and a group that still measured less than a second fails
+    here rather than being excused by the purpose-built timing process of
+    the same stage.
+    """
+    passed = (
+        estimates["sample_count"] >= MINIMUM_SAMPLES
+        and min(estimates["iterations_per_sample"], default=0) >= 1
+        and estimates["measured_wall_s"] >= MINIMUM_MEASURED_S
+    )
+    detail = (
+        f"{estimates['sample_count']} Criterion samples, "
+        f"{estimates['measured_wall_s']:.3f}s measured over "
+        f"{sum(estimates['iterations_per_sample'])} iterations; "
+        f"{MINIMUM_SAMPLES} samples and {MINIMUM_MEASURED_S}s required"
+    )
+    return passed, detail
 
 
 def dhat_totals(path) -> dict:
@@ -1229,8 +1356,13 @@ def criterion_experiment(plan, job, spec, result, run_dir, controls):
     if code != 0:
         raise AssertionError(f"the layered bench exited {code}: {process.tail()}")
     summary = json.loads(summary_path.read_text(encoding="ascii"))[0]
-    estimates = criterion_estimates(home, job["stage"], job["config_id"])
+    # Criterion writes each repeated attempt of one benchmark id under its
+    # own name, and the layer bench reports which one it finished on.
+    estimates = criterion_estimates(
+        home, job["stage"], summary.get("criterion_function_id") or job["config_id"]
+    )
     records = summary["records"]
+    samples_ok, samples_detail = criterion_samples_ok(estimates)
     failed = [
         check for check in summary["observation"]["checks"] if not check["passed"]
     ]
@@ -1238,21 +1370,8 @@ def criterion_experiment(plan, job, spec, result, run_dir, controls):
         result,
         delivered=not failed,
         detail=f"layer verification: {failed or 'every check passed'}",
-        # Criterion schedules its own iterations from a warm-up that
-        # includes the batched preparation, so a layer whose measured
-        # operation is shorter than its preparation finishes its 5s group
-        # having timed less than that. The one-second rule is enforced on
-        # the purpose-built timing process of the same stage, which times
-        # the same operation without Criterion's scheduling.
-        samples_ok=(
-            estimates["sample_count"] >= MINIMUM_SAMPLES
-            and min(estimates["iterations_per_sample"]) >= 1
-        ),
-        samples_detail=(
-            f"{estimates['sample_count']} Criterion samples, "
-            f"{estimates['measured_wall_s']:.3f}s measured over "
-            f"{sum(estimates['iterations_per_sample'])} iterations"
-        ),
+        samples_ok=samples_ok,
+        samples_detail=samples_detail,
     )
     settle_child(
         result,
@@ -2010,6 +2129,11 @@ def composite_stage_results(aggregates, children) -> list:
                     "criterion", {}
                 ).get("sample_count") or len(child.get("samples") or [])
             noop = stage == "otlp_noop" and mode == "pipeline"
+            timing_child = (
+                members.get(("timing", repetition))
+                or members.get(("pipeline", repetition))
+                or {}
+            )
             composite = {
                 "stage": stage,
                 "mode": mode,
@@ -2028,37 +2152,35 @@ def composite_stage_results(aggregates, children) -> list:
                     "none"
                     if noop
                     else (
-                        (
-                            members.get(("timing", repetition))
-                            or members.get(("pipeline", repetition))
-                            or {}
-                        )
-                        .get("observations", {})
+                        timing_child.get("observations", {})
                         .get("bench_report", {})
                         .get("observation", {})
                         .get("representation", "none")
                     )
+                ),
+                # What the stage was handed, what its per-record metrics
+                # divide by, and -- where the input is already encoded --
+                # the rates that input actually has. A reader never has to
+                # guess the denominator of a per-record number.
+                "input_representation": INPUT_REPRESENTATIONS[stage],
+                "denominator": DENOMINATOR,
+                "rates": stage_rates(stage, timing_child),
+                "completion_semantics": (
+                    timing_child.get("observations", {})
+                    .get("bench_report", {})
+                    .get("observation", {})
+                    .get("extra", {})
+                    .get("completion_semantics")
                 ),
                 "descriptor_oracle": (
                     "not_applicable: the noop pipeline stores nothing"
                     if stage == "otlp_noop"
                     else "checked: every stage output was read back and counted"
                 ),
-                "cores": (
-                    (
-                        members.get(("timing", repetition))
-                        or members.get(("pipeline", repetition))
-                        or {}
-                    )
-                    .get("config", {})
-                    .get("requested", {})
-                    .get("cores", [])
-                ),
-                "workload": (
-                    members.get(("timing", repetition))
-                    or members.get(("pipeline", repetition))
-                    or {}
-                ).get("workload", {}),
+                "cores": timing_child.get("config", {})
+                .get("requested", {})
+                .get("cores", []),
+                "workload": timing_child.get("workload", {}),
             }
             try:
                 validate_stage_result(composite)
@@ -2098,7 +2220,23 @@ def stage_summaries(stage_results) -> list:
                 "workload_config_id": config_id,
                 "compression": compression,
                 "repetitions": len(members),
+                "input_representation": members[0]["input_representation"],
                 "output_representation": members[0]["output_representation"],
+                "denominator": members[0]["denominator"],
+                "rates": {
+                    name: median(
+                        [
+                            member["rates"][name]
+                            for member in members
+                            if _finite((member.get("rates") or {}).get(name))
+                        ]
+                        or [0.0]
+                    )
+                    for name in sorted(
+                        {key for member in members for key in (member.get("rates") or {})}
+                    )
+                },
+                "completion_semantics": members[0].get("completion_semantics"),
                 "descriptor_oracle": members[0]["descriptor_oracle"],
                 "metrics": {
                     name: {

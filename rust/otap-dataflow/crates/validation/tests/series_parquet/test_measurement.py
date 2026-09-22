@@ -3346,20 +3346,64 @@ class StageContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "allocated_bytes_per_record"):
             performance.validate_stage_result({"stage": "otlp_noop", "metrics": {}})
 
+    def complete_stage_result(self, stage="extract", **overrides):
+        """A stage result that satisfies the whole contract."""
+        result = {
+            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
+            "stage": stage,
+            "mode": performance.stage_mode(stage),
+            "sample_count": 30,
+            "repetition": 1,
+            "fingerprint": {"timing": "a"},
+            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
+            "input_representation": performance.INPUT_REPRESENTATIONS[stage],
+            "output_representation": "extracted_rows",
+            "denominator": performance.DENOMINATOR,
+            "rates": {name: 1.0 for name in performance.RATE_FIELDS},
+        }
+        result.update(overrides)
+        return result
+
+    # Scenario: a stage result does not say what it was handed, or what its
+    # per-record numbers divide by, and a stage that times already encoded
+    # input reports only a per-record rate.
+    # Guarantees: the denominator of every registered number is explicit,
+    # and a stage fed encoded bytes also reports the object and byte rates
+    # its input actually has, so an attribution never has to guess.
+    def test_denominators_are_explicit(self):
+        performance.validate_stage_result(self.complete_stage_result())
+        for field in ("input_representation", "denominator"):
+            partial = self.complete_stage_result()
+            del partial[field]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(AssertionError, field):
+                    performance.validate_stage_result(partial)
+        wrong = self.complete_stage_result(input_representation="otlp_wire_bytes")
+        with self.assertRaisesRegex(AssertionError, "handed"):
+            performance.validate_stage_result(wrong)
+        empty = self.complete_stage_result(denominator="")
+        with self.assertRaisesRegex(AssertionError, "divide by"):
+            performance.validate_stage_result(empty)
+        for stage in performance.PRE_ENCODED_INPUT_STAGES:
+            encoded = self.complete_stage_result(
+                stage=stage,
+                input_representation=performance.INPUT_REPRESENTATIONS[stage],
+                output_representation="stored_objects",
+                rates={"records_per_s": 1.0},
+            )
+            with self.subTest(stage=stage):
+                with self.assertRaisesRegex(AssertionError, "objects_per_s"):
+                    performance.validate_stage_result(encoded)
+            performance.validate_stage_result(
+                dict(encoded, rates={name: 1.0 for name in performance.RATE_FIELDS})
+            )
+
     # Scenario: a stage result carries every metric but not the fields that
     # say which stage, mode, repetition and build it describes.
     # Guarantees: an unidentifiable measurement is refused, so a result can
     # never be compared against one of another profile or repetition.
     def test_identifying_fields_are_required(self):
-        complete = {
-            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
-            "stage": "extract",
-            "mode": "isolated",
-            "sample_count": 30,
-            "repetition": 1,
-            "fingerprint": {"timing": "a"},
-            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
-        }
+        complete = self.complete_stage_result()
         performance.validate_stage_result(dict(complete))
         for field in performance.STAGE_FIELDS:
             partial = dict(complete)
@@ -3373,15 +3417,9 @@ class StageContracts(unittest.TestCase):
     # Guarantees: only finite numbers from a positive sample count are
     # accepted as measurements.
     def test_only_finite_measurements_from_samples_are_accepted(self):
-        base = {
-            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
-            "stage": "encode",
-            "mode": "isolated",
-            "sample_count": 30,
-            "repetition": 2,
-            "fingerprint": {"timing": "a"},
-            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
-        }
+        base = self.complete_stage_result(
+            stage="encode", repetition=2, output_representation="parquet_bytes"
+        )
         for value in ("1.0", float("inf"), float("nan"), True, None):
             broken = dict(base, metrics=dict(base["metrics"]))
             broken["metrics"]["cpu_ns_per_record"] = value
@@ -3396,15 +3434,9 @@ class StageContracts(unittest.TestCase):
     # Guarantees: a composite identifies exactly which profile supplied
     # every metric, so a heap number can never be read as a timing one.
     def test_composite_names_the_child_of_every_metric(self):
-        base = {
-            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
-            "stage": "merge",
-            "mode": "isolated",
-            "sample_count": 30,
-            "repetition": 1,
-            "fingerprint": {"timing": "a"},
-            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
-        }
+        base = self.complete_stage_result(
+            stage="merge", output_representation="merged_chunks"
+        )
         del base["metric_sources"]["peak_workspace_bytes"]
         with self.assertRaisesRegex(AssertionError, "peak_workspace_bytes"):
             performance.validate_stage_result(base)
@@ -3423,6 +3455,27 @@ class StageContracts(unittest.TestCase):
         del timing["metrics"]["cpu_ns_per_record"]
         with self.assertRaisesRegex(AssertionError, "cpu_ns_per_record"):
             performance.validate_child_result(timing, "timing")
+
+    # Scenario: a Criterion group takes its thirty samples but accumulates
+    # only 0.57 s of measured work, because its batched preparation costs
+    # more than the operation it times.
+    # Guarantees: every timing process, Criterion's included, must
+    # accumulate one second of measured work; a shorter group fails its
+    # sample gate instead of being excused by another child.
+    def test_a_short_criterion_group_fails(self):
+        short = {
+            "sample_count": 30,
+            "iterations_per_sample": [82.0] * 30,
+            "measured_wall_s": 0.572362956,
+        }
+        passed, detail = performance.criterion_samples_ok(short)
+        self.assertFalse(passed)
+        self.assertIn("0.572s measured", detail)
+        self.assertIn(f"{performance.MINIMUM_MEASURED_S}s required", detail)
+        long_enough = dict(short, measured_wall_s=1.0)
+        self.assertTrue(performance.criterion_samples_ok(long_enough)[0])
+        too_few = dict(long_enough, sample_count=29)
+        self.assertFalse(performance.criterion_samples_ok(too_few)[0])
 
     # Scenario: the exported stage names and Criterion layers are read back.
     # Guarantees: the names later tasks join on are exactly the registered

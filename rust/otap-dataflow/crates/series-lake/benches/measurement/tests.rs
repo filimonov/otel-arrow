@@ -399,6 +399,95 @@ fn input_file_round_trips(root: &Path) -> Result<()> {
     Ok(())
 }
 
+// Scenario: every stage is asked for one iteration's input, and the input
+// is inspected for the setup that stage needs -- the warmed series cache a
+// cumulative layer admits into, the destination paths a local layer writes
+// to, the sink a store layer flushes through and the pre-encoded objects an
+// upload sends.
+// Guarantees: no stage builds its own setup while it is timed; everything
+// but the stage's own work is handed to `run` already built.
+fn every_stage_is_handed_its_setup(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("store"))?;
+    let expected = [
+        (StageName::OtlpNoop, "wire"),
+        (StageName::OtlpConvert, "wire"),
+        (StageName::OtlpExtractHash, "wire"),
+        (StageName::OtlpSort, "wire+cache"),
+        (StageName::OtlpParquetLocal, "wire+cache+paths"),
+        (StageName::OtlpParquetZstd, "wire+cache+paths"),
+        (StageName::OtlpMinio, "wire+cache+sink"),
+        (StageName::Convert, "wire"),
+        (StageName::Extract, "records"),
+        (StageName::SortSeal, "extracted+cache"),
+        (StageName::Merge, "fixture"),
+        (StageName::Encode, "buffers"),
+        (StageName::LocalWrite, "objects+paths"),
+        (StageName::Upload, "objects+paths"),
+        (StageName::Sink, "sink"),
+    ];
+    let input = fixture_inputs(root)?.remove(0);
+    for (name, carries) in expected {
+        let stage = Stage::new(
+            name,
+            bench_config(root),
+            input.clone(),
+            stages::zstd(),
+            true,
+        )?;
+        let prepared = stage.prepare()?;
+        ensure(
+            prepared.carries() == carries,
+            format!(
+                "{} is handed {:?}, expected {carries:?}",
+                name.as_str(),
+                prepared.carries()
+            ),
+        )?;
+        // Two preparations never name the same destination, so nothing an
+        // iteration writes can be an overwrite of an earlier one.
+        let again = stage.prepare()?;
+        ensure(again.carries() == carries, "the second preparation differs")?;
+    }
+    Ok(())
+}
+
+// Scenario: the same trivial operation is sampled twice, once with a
+// preparation that costs two milliseconds and once with one that costs ten
+// times as much.
+// Guarantees: a stage's measured time does not move when its fixture grows,
+// because the fixture is built outside the timer.
+fn fixture_cost_does_not_move_the_measurement() -> Result<()> {
+    let busy = |length: Duration| {
+        let started = Instant::now();
+        let mut work = 0u64;
+        while started.elapsed() < length {
+            work = std::hint::black_box(work.wrapping_add(1));
+        }
+        work
+    };
+    let sample = |cost: Duration| -> Result<u128> {
+        let samples = super::sample_loop(
+            Clock::Thread,
+            50,
+            Duration::ZERO,
+            || Ok(busy(cost)),
+            |value| Ok(std::hint::black_box(value.wrapping_mul(3))),
+            |_| Ok(Vec::new()),
+        )?;
+        let mut walls: Vec<u128> = samples.samples.iter().map(|s| s.wall_ns).collect();
+        walls.sort_unstable();
+        Ok(walls[walls.len() / 2])
+    };
+    let small = sample(Duration::from_millis(2))?;
+    let large = sample(Duration::from_millis(20))?;
+    let bound = Duration::from_millis(1).as_nanos();
+    ensure(
+        small < bound && large < bound,
+        format!("samples of {small} and {large} ns carry their preparation"),
+    )?;
+    Ok(())
+}
+
 // Scenario: the exported stage names are read back from the bench.
 // Guarantees: the registered names are exactly the contract's names in
 // order, and the Criterion layers are its first six.
@@ -442,7 +531,9 @@ pub fn run() -> Result<()> {
     stage_names_are_the_contract()?;
     input_file_round_trips(root)?;
     input_generation_is_excluded_from_timing()?;
+    fixture_cost_does_not_move_the_measurement()?;
     diagnostic_encoding_matches_sink(root)?;
     stage_row_counts_are_exact(root)?;
+    every_stage_is_handed_its_setup(root)?;
     Ok(())
 }

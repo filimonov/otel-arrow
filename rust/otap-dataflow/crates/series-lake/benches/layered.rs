@@ -27,8 +27,84 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, SamplingMode, Throughput};
+use stages::Timing;
 
 use stages::{BenchConfig, Result, Stage, StageName};
+
+/// The group measurement time the brief configures. `SERIES_CRITERION_S`
+/// overrides the floor, which is how the retry path is exercised.
+const MEASUREMENT_TIME: Duration = Duration::from_secs(5);
+
+/// The configured measurement-time floor, or the environment's override.
+fn configured_measurement_time() -> Duration {
+    std::env::var("SERIES_CRITERION_S")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|seconds| *seconds > 0.0)
+        .map_or(MEASUREMENT_TIME, Duration::from_secs_f64)
+}
+
+/// The measured work every timing process must accumulate.
+const MINIMUM_MEASURED: Duration = Duration::from_secs(1);
+
+/// The longest a group may run to reach that second of measured work.
+const MEASUREMENT_TIME_CAP: Duration = Duration::from_secs(60);
+
+/// How many times a group is run to reach that second of measured work.
+const GROUP_ATTEMPTS: usize = 3;
+
+/// Where Criterion keeps its artifacts.
+fn criterion_home() -> PathBuf {
+    std::env::var_os("CRITERION_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/criterion"))
+}
+
+/// The measured seconds of the group Criterion has just written.
+///
+/// Criterion reports its own samples, so the process reads back what it
+/// actually timed rather than trusting the estimate it started from.
+fn measured_seconds(home: &std::path::Path, group: &str, function: &str) -> Result<f64> {
+    let path = home
+        .join(group)
+        .join(function)
+        .join("new")
+        .join("sample.json");
+    let sample: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let times = sample
+        .get("times")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Criterion wrote no sample times")?;
+    Ok(times
+        .iter()
+        .filter_map(serde_json::Value::as_f64)
+        .sum::<f64>()
+        / 1e9)
+}
+
+/// How long a group must run to time `minimum` of the stage's own work.
+///
+/// Criterion measures only the routine, but schedules from a warm-up that
+/// also pays for the batched preparation, so a group spends
+/// `(prepare + run) / run` of its time for every unit it measures. The
+/// configured time is the floor: a layer whose preparation is negligible
+/// keeps exactly the brief's five seconds.
+fn measurement_time(
+    prepare: Timing,
+    run: Timing,
+    configured: Duration,
+    minimum: Duration,
+) -> Duration {
+    let run_ns = run.wall_ns.max(1);
+    let overhead = (prepare.wall_ns + run_ns) as f64 / run_ns as f64;
+    // Half again what the ratio demands: the warm-up estimate, Criterion's
+    // own per-iteration bookkeeping and the batch's drop all sit between
+    // the plan and the measured total, and a group that lands just under
+    // the required second would fail its sample gate.
+    let needed = minimum.as_secs_f64() * overhead * 1.5;
+    let seconds = needed.max(configured.as_secs_f64());
+    Duration::from_secs_f64(seconds.min(MEASUREMENT_TIME_CAP.as_secs_f64()))
+}
 
 fn required(name: &str) -> Result<PathBuf> {
     std::env::var_os(name)
@@ -78,9 +154,12 @@ fn main() -> Result<()> {
         let stage = Stage::new(layer, cfg.clone(), input.clone(), stages::zstd(), false)?;
         // One untimed run proves the layer's output before anything is
         // timed; Criterion never times an operation that fails.
-        let prepared = stage.prepare()?;
+        let (prepared, prepare) = stages::timed(|| stage.prepare())?;
         let prepared_input_bytes = stage.input_bytes(&prepared);
-        let output = stage.run(prepared)?;
+        // What the layer was handed, so the recorded result says that its
+        // setup existed before the timer started.
+        let prepared_carries = prepared.carries();
+        let (output, run) = stages::timed(|| stage.run(prepared))?;
         let observation = stage.observe(&output)?;
         drop(output);
         let failed: Vec<String> = observation
@@ -92,12 +171,22 @@ fn main() -> Result<()> {
         if !failed.is_empty() {
             return Err(format!("{} failed verification: {failed:?}", layer.as_str()).into());
         }
+        let mut group_measurement_time = measurement_time(
+            prepare,
+            run,
+            configured_measurement_time(),
+            MINIMUM_MEASURED,
+        );
         summaries.push(serde_json::json!({
             "stage": stage.name().as_str(),
+            "prepared_input": prepared_carries,
             "clock": layer.clock(),
             "records": stage.records(),
             "fixture_retained_bytes": stage.fixture_retained_bytes(),
             "prepared_input_bytes": prepared_input_bytes,
+            "verification_prepare_ns": prepare.wall_ns,
+            "verification_run_ns": run.wall_ns,
+            "measurement_time_s": group_measurement_time.as_secs_f64(),
             "observation": observation,
         }));
         if handshake {
@@ -107,30 +196,74 @@ fn main() -> Result<()> {
             let mut line = String::new();
             let _ = std::io::stdin().lock().read_line(&mut line)?;
         }
+        // Criterion sizes its iterations from a warm-up that includes the
+        // batched preparation, so a layer whose measured operation is much
+        // cheaper than its preparation would spend its measurement time
+        // preparing and time less than the required second of work. The
+        // group's measurement time is therefore scaled by the ratio this
+        // process just measured, with the configured five seconds as the
+        // floor and a minute as the cap.
+
         // A failure inside a timed routine is kept here and returned once
         // the group has finished, never timed as a success.
         let failure: RefCell<Option<Box<dyn std::error::Error>>> = RefCell::new(None);
-        let mut group = criterion.benchmark_group(layer.as_str());
-        let _ = group
-            .sample_size(30)
-            .warm_up_time(Duration::from_secs(1))
-            .measurement_time(Duration::from_secs(5))
-            .sampling_mode(SamplingMode::Flat)
-            .throughput(Throughput::Elements(stage.records() as u64));
-        let _ = group.bench_function(cfg.workload_config_id.as_str(), |bencher| {
-            bencher.iter_batched(
-                || stage.prepare(),
-                |prepared| match prepared.and_then(|input| stage.run(input)) {
-                    Ok(output) => Some(output),
-                    Err(error) => {
-                        let _ = failure.borrow_mut().get_or_insert(error);
-                        None
-                    }
-                },
-                BatchSize::PerIteration,
-            );
-        });
-        group.finish();
+        // Criterion estimates its iteration count from a warm-up that also
+        // pays for the batched preparation, and that estimate is only
+        // approximate, so the group is run again with a longer measurement
+        // time until it has actually timed the required second of the
+        // stage's own work.
+        let mut attempts = Vec::new();
+        let mut function_id = cfg.workload_config_id.clone();
+        for attempt in 0..GROUP_ATTEMPTS {
+            // Each attempt gets an id of its own. Reusing one id would
+            // make Criterion disambiguate it by appending " #N" and then
+            // sanitize that into a different directory name, so the
+            // artifacts of an attempt could not be read back by the name
+            // the attempt knows itself by.
+            function_id = if attempt == 0 {
+                cfg.workload_config_id.clone()
+            } else {
+                format!("{}-attempt{}", cfg.workload_config_id, attempt + 1)
+            };
+            let mut group = criterion.benchmark_group(layer.as_str());
+            let _ = group
+                .sample_size(30)
+                .warm_up_time(Duration::from_secs(1))
+                .measurement_time(group_measurement_time)
+                .sampling_mode(SamplingMode::Flat)
+                .throughput(Throughput::Elements(stage.records() as u64));
+            let _ = group.bench_function(function_id.as_str(), |bencher| {
+                bencher.iter_batched(
+                    || stage.prepare(),
+                    |prepared| match prepared.and_then(|input| stage.run(input)) {
+                        Ok(output) => Some(output),
+                        Err(error) => {
+                            let _ = failure.borrow_mut().get_or_insert(error);
+                            None
+                        }
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+            group.finish();
+            let measured =
+                measured_seconds(&criterion_home(), layer.as_str(), &cfg.workload_config_id)?;
+            attempts.push(serde_json::json!({
+                "measurement_time_s": group_measurement_time.as_secs_f64(),
+                "measured_wall_s": measured,
+            }));
+            if failure.borrow().is_some() || measured >= MINIMUM_MEASURED.as_secs_f64() {
+                break;
+            }
+            let factor = (MINIMUM_MEASURED.as_secs_f64() / measured.max(1e-9)) * 1.2;
+            let next = group_measurement_time.as_secs_f64() * factor;
+            group_measurement_time =
+                Duration::from_secs_f64(next.min(MEASUREMENT_TIME_CAP.as_secs_f64()));
+        }
+        if let Some(entry) = summaries.last_mut() {
+            entry["group_attempts"] = serde_json::Value::Array(attempts);
+            entry["criterion_function_id"] = serde_json::Value::String(function_id);
+        }
         if let Some(error) = failure.into_inner() {
             return Err(error);
         }
