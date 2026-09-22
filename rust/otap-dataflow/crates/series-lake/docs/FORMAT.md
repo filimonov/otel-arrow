@@ -212,13 +212,24 @@ is nullable:
   stored as received and never inferred.
 - A histogram point fills `count` and, when present, `sum`, `min` and `max`,
   and leaves `value_int` and `value_double` null. A histogram without a
-  distribution stores two empty lists, not two null lists, so an empty list
-  and a null list distinguish "histogram without buckets" from "not a
-  histogram row".
+  distribution stores two empty lists, not two null lists.
 
 The point kind is not stored in the values row. It is `metric_type` in the
-`series` descriptor and readers obtain it through the join they already
-perform (section 6). The two kinds share one dataset because a mixed metrics
+`series` descriptor, and that descriptor is the only authoritative source of
+it: a reader classifies a values row by joining to the descriptor
+(section 6), never by which columns are null and never by `count`. Null-ness
+is a consequence of the point kind, not a definition of it, and a future
+additive column could make any given column null for a kind that fills it
+today.
+
+Null-ness is also not portable. DuckDB preserves the difference between a
+null list and an empty list, so `bucket_counts IS NULL` and
+`bucket_counts = []` are distinguishable there. ClickHouse has no nullable
+`Array`, so its Parquet reader renders a null list as `[]` and the two cases
+become indistinguishable. A query that tried to separate "not a histogram
+row" from "histogram without buckets" by list null-ness would therefore give
+different answers in the two engines. The descriptor join gives the same
+answer in both. The two kinds share one dataset because a mixed metrics
 stream would otherwise cost two PUT requests per window even when every
 descriptor is already cached; an all-null column inside a row group costs
 only definition levels plus the column-chunk metadata, far less than a
@@ -413,9 +424,11 @@ FROM read_parquet('<base>/v=1/signal=metrics/dataset=values/**/*.parquet',
 JOIN series AS s USING (series_id)
 ```
 
-Filter on `s.metric_type` to read one point kind, or on `v.count IS NOT NULL`
-to select histogram rows without the join. The Spark recipe uses the same
-paths with `mergeSchema` and the same canonical descriptor selection.
+Filter on `s.metric_type` to read one point kind. That join is the only
+supported way to classify a values row; `v.count IS NOT NULL` and the
+null-ness of any other per-kind column are not substitutes for it, for the
+reasons in section 2. The Spark recipe uses the same paths with
+`mergeSchema` and the same canonical descriptor selection.
 
 The README documents this view for DuckDB and Spark. Descriptor coverage
 guarantee: for every values row in partition `P` written by worker `W`, at

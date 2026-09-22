@@ -80,13 +80,20 @@ def log_request(request_id):
     return req
 
 
-# One metric request carries one gauge point and one histogram point, and both
-# land in the single `signal=metrics/dataset=values` dataset.
-POINTS_PER_METRIC = 2
+# One metric request carries one gauge point and two histogram points, and all
+# three land in the single `signal=metrics/dataset=values` dataset.
+POINTS_PER_METRIC = 3
 
 
 def metric_request(request_id, unsupported=False):
-    """Build an OTLP metrics request with one gauge and one histogram point.
+    """Build an OTLP metrics request with one gauge and two histogram points.
+
+    The second histogram carries no distribution at all, which is what makes
+    the null-list case observable: its `bucket_counts` and `explicit_bounds`
+    are genuinely empty lists, while the gauge row's are Parquet null. A
+    request holding both shapes is the only way to tell the two encodings
+    apart in a file, because the OTAP transport drops a column whose every
+    entry in a request is the type default.
 
     `unsupported` appends a summary metric, which the lake has no dataset for;
     it is what the `unsupported` policy decides.
@@ -106,6 +113,14 @@ def metric_request(request_id, unsupported=False):
     )
     point.bucket_counts.extend([1, 2])
     point.explicit_bounds.append(1.0)
+    point.attributes.add(key="request.id").value.string_value = request_id
+    # A histogram with a count but no buckets and no bounds: both lists are
+    # stored as empty lists, never as null lists.
+    flat = scope.metrics.add(name="histogram_no_buckets", unit="s")
+    flat.histogram.aggregation_temporality = 2
+    point = flat.histogram.data_points.add(
+        time_unix_nano=1789960500000000000, count=7, sum=9.0
+    )
     point.attributes.add(key="request.id").value.string_value = request_id
     if unsupported:
         scope.metrics.add(name="summary").summary.data_points.add(count=1, sum=2.0)
@@ -352,14 +367,16 @@ class LocalSlice(unittest.TestCase):
 class MetricsSlice(unittest.TestCase):
     """Metrics admission, unsupported policy and content refusals."""
 
-    # Scenario: a gauge INT64_MAX and histogram arrive in one real OTLP request
-    # and land in the single merged metrics values dataset.
+    # Scenario: a gauge INT64_MAX, a histogram with buckets and a histogram
+    # without a distribution arrive in one real OTLP request and land in the
+    # single merged metrics values dataset.
     # Guarantees: integer precision, histogram shape and wrapped timestamp
-    # nullability survive Parquet; the two point kinds share one file with the
-    # other kind's columns null; and each point row joins on series_id to
-    # exactly one descriptor carrying the metric name, unit, kind,
-    # temporality, scope and point attributes, so the point kind is readable
-    # back through the latest-descriptor join the README documents.
+    # nullability survive Parquet; the point kind is read from the series
+    # descriptor and never from which columns are null; the three kinds share
+    # one file with the other kinds' columns null; and a distribution-less
+    # histogram stores empty lists while a number row stores null lists, which
+    # is the difference the ClickHouse reader cannot see and no query is
+    # allowed to depend on.
     def test_number_and_histogram(self):
         with tempfile.TemporaryDirectory() as directory, Engine(directory) as engine:
             try:
@@ -370,7 +387,7 @@ class MetricsSlice(unittest.TestCase):
                     values = str(
                         engine.data / "v=1/signal=metrics/dataset=values/**/*.parquet"
                     )
-                    # Both kinds share one file: exactly one values file exists.
+                    # Every kind shares one file: exactly one values file.
                     self.assertEqual(
                         len(
                             list(
@@ -381,24 +398,6 @@ class MetricsSlice(unittest.TestCase):
                         ),
                         1,
                     )
-                    rows = db.execute(
-                        "SELECT value_int, time_unix_nano, count, sum, min, max, "
-                        "bucket_counts, explicit_bounds FROM read_parquet(?) "
-                        "WHERE value_int IS NOT NULL",
-                        [values],
-                    ).fetchall()
-                    # The number row leaves every histogram column null.
-                    self.assertEqual(
-                        rows, [(2**63 - 1, None, None, None, None, None, None, None)]
-                    )
-                    rows = db.execute(
-                        "SELECT count, bucket_counts, explicit_bounds, "
-                        "value_int, value_double "
-                        "FROM read_parquet(?) WHERE count IS NOT NULL",
-                        [values],
-                    ).fetchall()
-                    # The histogram row leaves both value columns null.
-                    self.assertEqual(rows, [(3, [1, 2], [1.0], None, None)])
                     # One descriptor per series: the newest wins, ties broken
                     # by filename, exactly as the crate README prescribes.
                     series = str(
@@ -413,7 +412,9 @@ class MetricsSlice(unittest.TestCase):
                         f"AS rn FROM read_parquet('{series}', "
                         "union_by_name = true, filename = true)) WHERE rn = 1"
                     )
-                    # The point kind comes from the descriptor, not the row.
+                    # The point kind comes from the descriptor, so every row
+                    # below is selected by metric_name and metric_type rather
+                    # than by any column being null.
                     joined = db.execute(
                         "SELECT s.metric_name, s.unit, s.metric_type, "
                         "s.temporality, s.scope_name, s.attrs['request.id'], "
@@ -422,29 +423,92 @@ class MetricsSlice(unittest.TestCase):
                         "ORDER BY 1",
                         [values],
                     ).fetchall()
-                self.assertEqual(
-                    joined,
-                    [
-                        (
-                            "histogram",
-                            "s",
-                            "histogram",
-                            "cumulative",
-                            "series-e2e",
-                            "metric-0",
-                            "producer-1",
-                        ),
-                        (
-                            "integer",
-                            "1",
-                            "gauge",
-                            "",
-                            "series-e2e",
-                            "metric-0",
-                            "producer-1",
-                        ),
-                    ],
-                )
+                    self.assertEqual(
+                        joined,
+                        [
+                            (
+                                "histogram",
+                                "s",
+                                "histogram",
+                                "cumulative",
+                                "series-e2e",
+                                "metric-0",
+                                "producer-1",
+                            ),
+                            (
+                                "histogram_no_buckets",
+                                "s",
+                                "histogram",
+                                "cumulative",
+                                "series-e2e",
+                                "metric-0",
+                                "producer-1",
+                            ),
+                            (
+                                "integer",
+                                "1",
+                                "gauge",
+                                "",
+                                "series-e2e",
+                                "metric-0",
+                                "producer-1",
+                            ),
+                        ],
+                    )
+                    # The gauge row: INT64_MAX survives, the wrapped timestamp
+                    # is null, and every histogram column is null.
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT v.value_int, v.time_unix_nano, v.count, "
+                            "v.sum, v.min, v.max, v.bucket_counts, "
+                            "v.explicit_bounds FROM read_parquet(?) v "
+                            "JOIN latest s USING (series_id) "
+                            "WHERE s.metric_type = 'gauge'",
+                            [values],
+                        ).fetchall(),
+                        [(2**63 - 1, None, None, None, None, None, None, None)],
+                    )
+                    # The histogram rows: both value columns null, the shape
+                    # preserved, and the distribution-less one carrying a
+                    # count with no buckets.
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT s.metric_name, v.count, v.sum, "
+                            "v.bucket_counts, v.explicit_bounds, v.value_int, "
+                            "v.value_double FROM read_parquet(?) v "
+                            "JOIN latest s USING (series_id) "
+                            "WHERE s.metric_type = 'histogram' "
+                            "ORDER BY s.metric_name",
+                            [values],
+                        ).fetchall(),
+                        [
+                            ("histogram", 3, 4.0, [1, 2], [1.0], None, None),
+                            ("histogram_no_buckets", 7, 9.0, [], [], None, None),
+                        ],
+                    )
+                    # The encoding the readers disagree about, asserted
+                    # against the file itself: a histogram without a
+                    # distribution stores an empty list, a number row stores a
+                    # Parquet null. DuckDB can see the difference; ClickHouse
+                    # renders both as [], which is why classification goes
+                    # through the descriptor above and never through this.
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT s.metric_name, "
+                            "v.bucket_counts IS NULL, "
+                            "v.explicit_bounds IS NULL, "
+                            "len(v.bucket_counts), len(v.explicit_bounds) "
+                            "FROM read_parquet(?) v "
+                            "JOIN latest s USING (series_id) "
+                            "ORDER BY s.metric_name",
+                            [values],
+                        ).fetchall(),
+                        [
+                            ("histogram", False, False, 2, 1),
+                            ("histogram_no_buckets", False, False, 0, 0),
+                            ("integer", True, True, None, None),
+                        ],
+                    )
                 engine.shutdown()
             except Exception:
                 print(engine.engine_log())
@@ -559,7 +623,11 @@ class MetricsSlice(unittest.TestCase):
             try:
                 request = metric_request("unsupported-only", unsupported=True)
                 metrics = request.resource_metrics[0].scope_metrics[0].metrics
-                del metrics[:2]
+                # `unsupported=True` appends the summary last, so dropping
+                # everything before it leaves a request with no supported
+                # points however many the fixture grows to carry.
+                del metrics[:-1]
+                self.assertEqual(len(metrics), 1)
                 metrics_rpc.MetricsServiceStub(engine.channel).Export(
                     request, timeout=20
                 )
@@ -1593,10 +1661,11 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                     test.assertEqual(
                         mixed, 0, "a values row carries both point kinds"
                     )
-                    # A null list means "not a histogram row"; a histogram
-                    # without a distribution stores an empty list instead.
-                    # The two readers cannot tell these apart, so the
-                    # invariant is checked here, against the file itself.
+                    # A file-level encoding invariant, not a classification
+                    # rule: the writer leaves both lists null on a number row
+                    # and stores empty lists on a distribution-less histogram.
+                    # Readers classify by the descriptor, because ClickHouse
+                    # renders a null Parquet list as [] and cannot see this.
                     inconsistent = db.execute(
                         "SELECT count(*) FROM read_parquet(?) WHERE "
                         "(bucket_counts IS NULL) <> (count IS NULL) OR "

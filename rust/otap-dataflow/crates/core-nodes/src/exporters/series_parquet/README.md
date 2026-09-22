@@ -767,8 +767,11 @@ JOIN metrics_series s USING(series_id)
 WHERE s.metric_type = 'histogram';
 ```
 
-Filter on `s.metric_type` to read one point kind, or on `v.count IS NOT NULL`
-to select histogram rows without consulting the descriptor.
+Filter on `s.metric_type` to read one point kind. The descriptor is the
+authoritative source of the point kind; a values row is never classified by
+which of its columns are null. That would also not be portable: DuckDB keeps
+a null list and an empty list apart, while ClickHouse has no nullable `Array`
+and reads a null Parquet list as `[]`.
 
 ## Request cost
 

@@ -153,8 +153,10 @@ FROM metrics_values v JOIN metrics_series_latest s USING (series_id)
 WHERE s.metric_type = 'histogram';
 ```
 
-The per-kind columns are nullable, so `v.count IS NOT NULL` selects histogram
-rows without consulting the descriptor at all.
+The descriptor's `metric_type` is the only supported way to tell the two point
+kinds apart. Do not classify a row by which columns are null: a null list and
+an empty list are distinguishable in DuckDB but not in ClickHouse, which has
+no nullable `Array` and reads a null Parquet list as `[]`.
 
 Both recipes need `union_by_name` / `mergeSchema` because denormalized columns
 may be added over time. To detect an incompatible mix, compare the
