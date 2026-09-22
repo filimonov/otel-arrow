@@ -69,8 +69,14 @@ each of them once.
   notification, and in the buffered topology with nothing queued or in
   flight. A nonempty observation resets that worker's streak.
 - **Gauges.** A required gauge that is absent, non-numeric or published by
-  more than one entity of a worker is an error, never a zero. A genuine zero
-  is an observation of an empty worker.
+  more than one entity of a worker is an error, never a zero.
+- **Liveness.** Presence is not enough. A snapshot the exporter did not
+  answer carries its metric names with every value zero, which looks exactly
+  like a drained worker. `memory.budget_bytes` is computed from
+  configuration constants and is never zero while the worker is alive, so it
+  is the marker: a worker whose budget reads zero is not an observation, its
+  epoch counts towards neither an empty nor a nonempty streak, and the drain
+  report records how many such epochs it saw.
 - **Environment.** Every run records a start and an end snapshot with the CPU
   model, logical and physical core counts, total RAM, kernel, load averages
   and the observed per-thread affinity from `/proc/PID/task/*/status`. A

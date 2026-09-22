@@ -354,6 +354,10 @@ def telemetry(uptime, *, gauges=None, drop=(), workers=1, generation=0):
     entity, identifying attributes as tagged values, and zeroes retained.
     """
     values = {name: 0 for name in measurement.REQUIRED_EXPORTER_GAUGES}
+    # A worker that answered the collection reports its configuration-derived
+    # budget, which is never zero; tests that model a worker which did not
+    # answer override it back to zero.
+    values[measurement.LIVENESS_GAUGE] = 1637851136
     values.update(gauges or {})
     sets = []
     for core in range(workers):
@@ -555,6 +559,23 @@ class DrainContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "drain deadline"):
             _ = measurement.observe_drain(
                 self.responses(documents),
+                expected_workers=1,
+                buffered=False,
+                deadline_ns=measurement.time.monotonic_ns() + int(0.4 * 10**9),
+            )
+
+    # Scenario: the uptime advances three times, but the exporter did not
+    # answer any of those collections and reports every gauge as zero.
+    # Guarantees: a worker that did not report cannot prove its own
+    # drainage, even though every emptiness gauge reads zero.
+    def test_a_worker_that_did_not_report_cannot_drain(self):
+        quiet = [
+            telemetry(float(index), gauges={measurement.LIVENESS_GAUGE: 0})
+            for index in range(1, 6)
+        ]
+        with self.assertRaisesRegex(AssertionError, "unanswered"):
+            _ = measurement.observe_drain(
+                self.responses(quiet),
                 expected_workers=1,
                 buffered=False,
                 deadline_ns=measurement.time.monotonic_ns() + int(0.4 * 10**9),
@@ -1273,6 +1294,112 @@ class CommandContracts(unittest.TestCase):
         )
         self.assertTrue(document["environment"]["match"]["matched"])
         self.assertEqual(document["metrics"]["throughput_records_per_s"], 10.0)
+
+
+def exporter_snapshot(metrics):
+    """A JSON snapshot carrying one exporter metric set with `metrics`."""
+    return {
+        "timestamp": "2026-09-22T00:00:00Z",
+        "metric_sets": [
+            {
+                "name": "exporter.series_parquet",
+                "attributes": {"node.id": {"String": "exporter"}},
+                "metrics": [
+                    {"name": name, "value": value}
+                    for name, value in metrics.items()
+                ],
+            }
+        ],
+    }
+
+
+class SnapshotReadingContracts(unittest.TestCase):
+    """An absent metric is not a zero-valued one.
+
+    These guard `test_e2e.metric_max`, which the end-to-end suite asserts
+    through. The old helper returned `max(values, default=0)`, so a snapshot
+    that did not carry a metric was indistinguishable from one reporting
+    zero: an upper-bound assertion passed vacuously and a lower-bound
+    assertion failed with a message that named the wrong cause.
+    """
+
+    # Scenario: one snapshot omits the exporter metric set entirely and
+    # another carries the same metric present at zero.
+    # Guarantees: the two are distinguishable, which the old helper's
+    # `default=0` made impossible.
+    def test_absent_and_zero_are_distinguishable(self):
+        absent = exporter_snapshot({"acks": 3})
+        zero = exporter_snapshot({"memory.budget_bytes": 0})
+        self.assertFalse(
+            measurement.test_e2e.metric_present(absent, "memory.budget_bytes")
+        )
+        self.assertTrue(
+            measurement.test_e2e.metric_present(zero, "memory.budget_bytes")
+        )
+        self.assertEqual(
+            measurement.test_e2e.metric_values(absent, "memory.budget_bytes"), []
+        )
+        self.assertEqual(
+            measurement.test_e2e.metric_values(zero, "memory.budget_bytes"), [0]
+        )
+
+    # Scenario: a caller that asserts on a value reads a metric the snapshot
+    # does not carry.
+    # Guarantees: it fails with the metric set and metric named, rather than
+    # silently receiving a zero.
+    def test_a_required_metric_must_be_present(self):
+        absent = exporter_snapshot({"acks": 3})
+        with self.assertRaisesRegex(AssertionError, "memory.budget_bytes"):
+            _ = measurement.test_e2e.metric_max(absent, "memory.budget_bytes")
+        self.assertEqual(
+            measurement.test_e2e.metric_max(
+                exporter_snapshot({"memory.budget_bytes": 0}),
+                "memory.budget_bytes",
+            ),
+            0,
+        )
+
+    # Scenario: a poll is waiting for a metric to appear.
+    # Guarantees: tolerating absence is explicit and yields the caller's own
+    # default, so only callers that mean it get one.
+    def test_tolerating_absence_is_explicit(self):
+        absent = exporter_snapshot({"acks": 3})
+        self.assertEqual(
+            measurement.test_e2e.metric_max(
+                absent, "block.requests_pending", default=0
+            ),
+            0,
+        )
+
+    # Scenario: an upper-bound assertion runs against a snapshot that does
+    # not carry the metric.
+    # Guarantees: it fails instead of passing vacuously, which is how the old
+    # helper let a bound check succeed while measuring nothing.
+    def test_an_upper_bound_cannot_pass_vacuously(self):
+        absent = exporter_snapshot({"acks": 3})
+        with self.assertRaises(AssertionError):
+            self.assertLessEqual(
+                measurement.test_e2e.metric_max(absent, "block.active_bytes"),
+                8 << 20,
+            )
+
+    # Scenario: the exporter did not report in this collection, so its
+    # configuration-derived budget reads zero.
+    # Guarantees: a zero budget marks a snapshot the exporter did not answer,
+    # because the budget is computed from configuration constants and is
+    # never zero while the worker is alive.
+    def test_zero_budget_marks_a_snapshot_the_exporter_did_not_answer(self):
+        quiet = exporter_snapshot(
+            {"memory.budget_bytes": 0, "memory.accounted_bytes": 0}
+        )
+        live = exporter_snapshot(
+            {"memory.budget_bytes": 1637851136, "memory.accounted_bytes": 983168}
+        )
+        self.assertFalse(measurement.test_e2e.exporter_reported(quiet))
+        self.assertTrue(measurement.test_e2e.exporter_reported(live))
+        self.assertFalse(
+            measurement.test_e2e.exporter_reported(exporter_snapshot({"acks": 3}))
+        )
 
 
 class HelperContracts(unittest.TestCase):

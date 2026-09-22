@@ -149,6 +149,13 @@ BUFFER_EMPTY_GAUGES = (
 # proof requires, each with empty state.
 DRAIN_EMPTY_EPOCHS = 3
 
+# The gauge that says whether a worker answered the collection a snapshot was
+# built from. `worker.rs::sample_metrics` computes it from configuration
+# constants, so it is strictly positive whenever the worker sampled itself;
+# a worker that did not answer reports every gauge as zero, which is
+# indistinguishable from a drained worker unless this marker is checked.
+LIVENESS_GAUGE = "memory.budget_bytes"
+
 # A run file name is a plain file name in the report directory. Nothing else
 # may be staged or published by name.
 SAFE_JSON_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
@@ -1500,6 +1507,10 @@ def sample_engine(engine, *, expected_workers: int, buffered=False) -> dict:
             "uptime_s": uptime,
             "gauges": gauges,
             "labelled": worker["labelled"],
+            # A snapshot the worker did not answer carries its metric names
+            # with every value zero, so presence alone does not make it an
+            # observation.
+            "reported": gauges[LIVENESS_GAUGE] > 0,
         }
         if buffered:
             entry["buffer"] = {
@@ -1628,8 +1639,24 @@ class EpochTracker:
         }
 
 
+def worker_reported(worker) -> bool:
+    """Whether the worker answered the collection this sample was built from.
+
+    Derived from the sample's own gauges rather than from a flag a caller
+    might forget to set, so every consumer of a sample gets the check.
+    """
+    return worker["gauges"].get(LIVENESS_GAUGE, 0) > 0
+
+
 def worker_is_empty(worker, *, buffered) -> bool:
-    """Whether one worker holds no requests, no block and no notifications."""
+    """Whether one worker holds no requests, no block and no notifications.
+
+    A worker that did not answer this collection is never empty: its gauges
+    all read zero whatever it is actually holding, so reading them as an
+    empty state would let a stalled exporter prove its own drainage.
+    """
+    if not worker_reported(worker):
+        return False
     for name in EXPORTER_EMPTY_GAUGES:
         if worker["gauges"][name] != 0:
             return False
@@ -1651,6 +1678,7 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
     tracker = EpochTracker()
     wake = threading.Event()
     streak = collections.Counter()
+    unanswered = collections.Counter()
     samples = []
     last = None
     while time.monotonic_ns() < deadline_ns:
@@ -1658,7 +1686,14 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
         samples.append(sample)
         advanced = tracker.observe(sample)
         for key in advanced:
-            if worker_is_empty(sample["workers"][key], buffered=buffered):
+            worker = sample["workers"][key]
+            if not worker_reported(worker):
+                # The uptime advanced but this worker did not answer the
+                # collection, so the epoch says nothing about it: it is
+                # neither an empty observation nor a nonempty one.
+                unanswered[key] += 1
+                continue
+            if worker_is_empty(worker, buffered=buffered):
                 streak[key] += 1
             else:
                 streak[key] = 0
@@ -1671,6 +1706,7 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
             return {
                 "drained": True,
                 "empty_epochs_by_worker": dict(last),
+                "unanswered_epochs_by_worker": dict(unanswered),
                 "epochs": tracker.as_json(),
                 "sample_count": len(samples),
                 "samples": samples,
@@ -1683,7 +1719,7 @@ def observe_drain(sample_once, *, expected_workers, buffered, deadline_ns):
     raise AssertionError(
         f"drain deadline: workers reached empty epochs {last!r}, needed "
         f"{DRAIN_EMPTY_EPOCHS} for each of {expected_workers} workers; "
-        f"epochs={tracker.as_json()}"
+        f"unanswered={dict(unanswered)}; epochs={tracker.as_json()}"
     )
 
 

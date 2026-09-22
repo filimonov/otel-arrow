@@ -1783,7 +1783,9 @@ def wait_for_metrics(engine, names, target, timeout, seed=None):
     while True:
         document = engine_metrics(engine)
         for name in names:
-            best[name] = max(best[name], metric_max(document, name))
+            # Waiting for a value to appear: a snapshot that does not
+            # carry the metric yet contributes nothing to the maximum.
+            best[name] = max(best[name], metric_max(document, name, default=0))
         if all(value >= target for value in best.values()):
             return best
         if time.monotonic() >= deadline:
@@ -1990,7 +1992,9 @@ class DockerSlice(unittest.TestCase):
                     deadline = time.monotonic() + 60
                     while time.monotonic() < deadline:
                         pending = metric_max(
-                            engine_metrics(engine), "block.requests_pending"
+                            engine_metrics(engine),
+                            "block.requests_pending",
+                            default=0,
                         )
                         if pending >= 2:
                             break
@@ -2244,7 +2248,9 @@ class RestartSlice(unittest.TestCase):
                     deadline = time.monotonic() + 4
                     while time.monotonic() < deadline:
                         metrics = engine_metrics(engine)
-                        if metric_max(metrics, "block.requests_pending") >= 1:
+                        if metric_max(
+                            metrics, "block.requests_pending", default=0
+                        ) >= 1:
                             break
                         time.sleep(0.05)
                     else:
@@ -2267,16 +2273,88 @@ def engine_metrics(engine):
         return json.load(response)
 
 
-def metric_max(document, name):
-    """The largest reported value of one exporter metric in a snapshot."""
-    values = [
+EXPORTER_METRIC_SET = "exporter.series_parquet"
+
+
+class _Required:
+    """Sentinel asking `metric_max` to insist the metric is present."""
+
+    def __repr__(self):
+        """Name the sentinel in an assertion message."""
+        return "<required>"
+
+
+REQUIRED = _Required()
+
+
+def metric_values(document, name, metric_set=EXPORTER_METRIC_SET):
+    """Every numeric value one snapshot reports for one metric.
+
+    An empty list means the snapshot does not carry the metric at all, which
+    is a different fact from the metric being present and zero.
+    """
+    return [
         item["value"]
         for group in document["metric_sets"]
-        if group["name"] == "exporter.series_parquet"
+        if group["name"] == metric_set
         for item in group["metrics"]
         if item["name"] == name and isinstance(item["value"], (int, float))
     ]
-    return max(values, default=0)
+
+
+def metric_present(document, name, metric_set=EXPORTER_METRIC_SET):
+    """Whether one snapshot carries one metric at all."""
+    return bool(metric_values(document, name, metric_set))
+
+
+def metric_max(document, name, *, default=REQUIRED, metric_set=EXPORTER_METRIC_SET):
+    """The largest reported value of one exporter metric in a snapshot.
+
+    A snapshot that does not carry the metric is not a snapshot that reports
+    zero. Reading absence as zero makes an upper-bound assertion pass
+    vacuously and gives a lower-bound assertion a message that names the
+    wrong cause, because the number it failed on was never measured.
+
+    Presence is therefore required unless the caller names a `default`. A
+    poll that is waiting for a metric to appear passes `default=0` and says
+    so; a caller that is asserting on a value passes nothing and fails with
+    the metric named if the snapshot cannot answer.
+
+    Presence alone is not enough to make a snapshot an observation of the
+    exporter: see `exporter_reported`.
+    """
+    values = metric_values(document, name, metric_set)
+    if values:
+        return max(values)
+    if default is REQUIRED:
+        raise AssertionError(
+            f"the snapshot carries no {metric_set} metric {name!r}; an absent "
+            f"metric set is not a zero-valued sample"
+        )
+    return default
+
+
+def exporter_reported(document):
+    """Whether the exporter's own sample is in this snapshot.
+
+    `memory.budget_bytes` is computed in `worker.rs::sample_metrics` from
+    configuration constants -- the sort, merge, writer, upload and conversion
+    reservations -- so it is strictly positive whenever the worker samples
+    itself. A snapshot in which it is absent, or present and zero, therefore
+    does not carry that worker's sample.
+
+    Both shapes have been observed. Under outage load one snapshot in a run
+    carried the exporter metric set, with `memory.budget_bytes` among its
+    metric names, reporting zero; the worker had not answered the collection
+    that snapshot was built from. Which engine path produces that is not
+    settled here, and this check does not depend on it.
+
+    The budget is the only reliable marker. Every value gauge reads zero in
+    such a snapshot too, but zero is a legitimate value for each of them, so
+    none can distinguish "the exporter is empty" from "the exporter did not
+    report".
+    """
+    return metric_max(document, "memory.budget_bytes", default=0) > 0
 
 
 def rss_bytes(pid):
@@ -2589,7 +2667,15 @@ class OutageSlice(unittest.TestCase):
                     outage_end = time.monotonic() + 8
                     while time.monotonic() < outage_end:
                         document = engine_metrics(engine)
-                        samples.append((document, rss_bytes(engine.process.pid)))
+                        # A snapshot the exporter did not answer reports
+                        # every one of its gauges as zero. That is not an
+                        # observation of an empty exporter, so it is not a
+                        # memory sample; asserting on it would compare this
+                        # process's resident size against a budget of zero.
+                        if exporter_reported(document):
+                            samples.append(
+                                (document, rss_bytes(engine.process.pid))
+                            )
                         time.sleep(0.2)
                     # Every known first RPC, of both signals, began while
                     # storage was stopped, and none of them may have been
@@ -2618,8 +2704,9 @@ class OutageSlice(unittest.TestCase):
                         seed={
                             name: max(
                                 (
-                                    metric_max(document, name)
+                                    value
                                     for document, _ in samples
+                                    for value in metric_values(document, name)
                                 ),
                                 default=0,
                             )
@@ -2677,9 +2764,11 @@ class OutageSlice(unittest.TestCase):
                     store.recover()
                     while not all(job.done() for job in jobs):
                         self.assertLess(time.monotonic(), end, "recovery deadline")
-                        samples.append(
-                            (engine_metrics(engine), rss_bytes(engine.process.pid))
-                        )
+                        document = engine_metrics(engine)
+                        if exporter_reported(document):
+                            samples.append(
+                                (document, rss_bytes(engine.process.pid))
+                            )
                         time.sleep(0.2)
                     for job in jobs:
                         job.result()
@@ -2728,6 +2817,12 @@ class OutageSlice(unittest.TestCase):
                     expected_requests,
                 )
                 self.assertEqual(len(acknowledged), len(expected_requests))
+                # Skipping snapshots that carry no exporter sample must not
+                # be able to empty the evidence: a recovery that produced no
+                # usable memory sample at all is a failed measurement.
+                self.assertTrue(
+                    samples, "no exporter memory sample was taken during the outage"
+                )
                 for document, rss in samples:
                     self.assertLessEqual(
                         metric_max(document, "block.active_bytes"), 8 << 20
@@ -2753,8 +2848,13 @@ class OutageSlice(unittest.TestCase):
                     limit = time.monotonic() + seconds
                     while time.monotonic() < limit:
                         document = engine_metrics(engine)
+                        # A snapshot the exporter did not answer reports an
+                        # empty backlog and a zero age whatever the real
+                        # state is, so it is not a settled observation and
+                        # the poll continues rather than returning.
                         if (
-                            metric_max(document, "oldest_unacked_seconds") <= 1
+                            exporter_reported(document)
+                            and metric_max(document, "oldest_unacked_seconds") <= 1
                             and metric_max(document, "block.requests_pending") == 0
                         ):
                             return
