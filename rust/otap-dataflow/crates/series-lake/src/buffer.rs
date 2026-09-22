@@ -327,8 +327,13 @@ impl<T> Block<T> {
     /// Compute what admitting `extracted` would add (spec section 6.2 step 5).
     ///
     /// Refuses before touching anything:
-    /// * `RequestTooLarge` when the reservation alone exceeds `max_block_bytes`,
-    ///   even for an empty block -- a permanent nack;
+    /// * `RequestTooLarge` when the request's worst case -- every descriptor
+    ///   it carries written by this block, as with a cold cache or reemit on --
+    ///   exceeds `max_block_bytes`. It is a permanent nack, so it is decided
+    ///   on the worst case rather than on what this block and this cache would
+    ///   actually charge: the identical request must be refused again however
+    ///   warm the cache is, and never refused permanently in one block and
+    ///   admitted in the next;
     /// * `TooManyRequests` when the block already holds `max_requests_per_block`;
     /// * `BlockFull` when the request does not fit the remaining budget.
     ///
@@ -375,7 +380,16 @@ impl<T> Block<T> {
         reemit: bool,
     ) -> Result<Reservation> {
         let limits = &cfg.ingress;
-        let mut bytes = extracted.pinned_bytes + token_bytes;
+        let fixed = extracted.pinned_bytes.saturating_add(token_bytes);
+        let worst = extracted
+            .descriptors
+            .iter()
+            .map(|d| d.series_row_bytes() + limits.pending_series_entry_bytes)
+            .fold(fixed, usize::saturating_add);
+        if worst > limits.max_block_bytes {
+            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        }
+        let mut bytes = fixed;
         let mut new_series = Vec::new();
         for (i, d) in extracted.descriptors.iter().enumerate() {
             let committed_here = cache.is_committed(&d.series_id, self.partition);
@@ -383,9 +397,6 @@ impl<T> Block<T> {
                 new_series.push(i);
                 bytes += d.series_row_bytes() + limits.pending_series_entry_bytes;
             }
-        }
-        if bytes > limits.max_block_bytes {
-            return Err(Error::Refused(RefuseReason::RequestTooLarge));
         }
         if self.requests.len() >= limits.max_requests_per_block {
             return Err(Error::Refused(RefuseReason::TooManyRequests));
@@ -994,6 +1005,55 @@ mod tests {
         assert_eq!(block.request_count(), 0);
         assert!(block.pending_series.is_empty());
         assert_eq!(block.tables().count(), 0);
+    }
+
+    /// Scenario: the same request is reserved against an empty block twice,
+    /// once with a cold cache and once with every one of its descriptors
+    /// already committed in the block's partition, with and without reemit,
+    /// under a block budget one byte short of the request's worst case and
+    /// under one exactly at it.
+    /// Guarantees: the outcome never depends on the cache or on reemit: one
+    /// byte short, every combination is refused as `RequestTooLarge`; exactly
+    /// at the worst case, every combination is admitted. Identical bytes are
+    /// therefore refused again, or never refused permanently, whatever the
+    /// writer happens to have cached.
+    #[test]
+    fn a_request_is_decided_alike_cold_and_warm() {
+        let cfg = LakeConfig::default();
+        let e = extracted(&cfg, "h", 4);
+        let token = 16;
+        let worst = e.pinned_bytes
+            + token
+            + e.descriptors
+                .iter()
+                .map(|d| d.series_row_bytes() + cfg.ingress.pending_series_entry_bytes)
+                .sum::<usize>();
+        for (limit, admitted) in [(worst - 1, false), (worst, true)] {
+            let mut tight = cfg.clone();
+            tight.ingress.max_block_bytes = limit;
+            let block: Block<u32> = Block::new(0, 1, &tight);
+            for reemit in [false, true] {
+                let mut cold = SeriesCache::new(100);
+                let mut warm = SeriesCache::new(100);
+                for d in &e.descriptors {
+                    warm.mark_committed(d.series_id, block.partition);
+                }
+                for cache in [&mut cold, &mut warm] {
+                    let outcome = block.reserve_with_reemit(&e, cache, token, &tight, reemit);
+                    if admitted {
+                        assert!(
+                            outcome.is_ok(),
+                            "limit {limit}, reemit {reemit}: {outcome:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(outcome, Err(Error::Refused(RefuseReason::RequestTooLarge))),
+                            "limit {limit}, reemit {reemit}: {outcome:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Scenario: a block already holding `max_requests_per_block` tokens.

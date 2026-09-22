@@ -114,6 +114,13 @@ the limit`. Any error detail it quotes is cut to 256 bytes and kept on one
 line. The short machine form of the outcome is the `reason` label of the
 `nacks` metric.
 
+A request refused for `window.max_block_bytes` is judged on its worst case,
+as if every series it carries were new to the block, whatever the descriptor
+cache already holds. The same bytes are therefore refused again after a
+restart or a cache eviction, and never admitted to one block after being
+permanently refused by another. A request that fits the worst case but not
+the space left in the ACTIVE block waits for the next block instead.
+
 ### Give a producer attempt more than one window
 
 A timeout below `window.interval` does not make a request fail. It makes
@@ -258,7 +265,8 @@ silently writing zstd.
 
 Cross-field rules enforced at startup: `ingress.max_row_bytes` must be at most
 a quarter of `sorting.run_target_bytes`; `window.max_block_bytes` must be at
-least `ingress.max_extracted_bytes`; `upload.part_bytes` must be at least 5MiB
+least twice `ingress.max_extracted_bytes`, because a block charges a request's
+series rows at up to twice their extracted estimate; `upload.part_bytes` must be at least 5MiB
 for the S3 multipart minimum; request counts, byte and depth budgets, cache
 capacity, upload concurrency, `notify_batch` and the abort and retry durations
 must all be positive. A logical input size that cannot be measured is refused

@@ -371,7 +371,7 @@ impl LakeConfig {
     /// boot id is generated internally from a UUIDv4 and is not
     /// user-configurable, so it needs no such rule); `max_row_bytes <=
     /// run_target_bytes / 4`; `max_requests_per_block >= 1`; `max_block_bytes
-    /// >= max_extracted_bytes`; `upload.part_bytes >= 5 MiB` (the S3
+    /// >= 2 * max_extracted_bytes` (series-row inflation); `upload.part_bytes >= 5 MiB` (the S3
     /// multipart minimum part size, below which every upload would fail at
     /// flush time); `upload.concurrency >= 1` (otherwise no part could ever
     /// be sent); `window_interval` is a whole number of seconds and at least
@@ -404,9 +404,16 @@ impl LakeConfig {
         if self.ingress.max_requests_per_block == 0 {
             return Err(Error::invalid("max_requests_per_block must be >= 1"));
         }
-        if self.ingress.max_block_bytes < self.ingress.max_extracted_bytes {
+        // A block charges a request's series rows at up to twice the estimate
+        // extraction charged them (`DescriptorRow::series_row_bytes`), so a
+        // block of exactly `max_extracted_bytes` could refuse permanently a
+        // request extraction accepted. Twice the extraction budget covers that
+        // inflation; the fixed per-series overhead on top of it is decided by
+        // `Block::reserve` against the request's worst case.
+        if self.ingress.max_block_bytes / 2 < self.ingress.max_extracted_bytes {
             return Err(Error::invalid(
-                "max_block_bytes must be at least max_extracted_bytes",
+                "max_block_bytes must be at least twice max_extracted_bytes, because a \
+                 request's series rows may take up to twice their extracted size in a block",
             ));
         }
         // The window boundary arithmetic and the `window_secs` file metadata
@@ -563,16 +570,25 @@ mod tests {
         }
     }
 
-    /// Scenario: `max_block_bytes` is smaller than `max_extracted_bytes`.
-    /// Guarantees: `validate` refuses, since a block could never hold one request's output.
+    /// Scenario: `max_block_bytes` is below twice `max_extracted_bytes`, by one
+    /// byte, and exactly twice it.
+    /// Guarantees: `validate` refuses the first and accepts the second: a
+    /// block must hold one request's output including the series-row
+    /// inflation, or a request extraction accepted could be refused by every
+    /// block.
     #[test]
-    fn max_block_bytes_below_extracted_is_rejected() {
+    fn max_block_bytes_below_twice_extracted_is_rejected() {
         let mut cfg = LakeConfig::default();
-        cfg.ingress.max_block_bytes = cfg.ingress.max_extracted_bytes - 1;
+        cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes - 1;
         let err = cfg
             .validate()
-            .expect_err("max_block_bytes < max_extracted_bytes");
-        assert!(err.to_string().contains("max_block_bytes"));
+            .expect_err("max_block_bytes < 2 * max_extracted_bytes");
+        assert!(
+            err.to_string()
+                .contains("at least twice max_extracted_bytes")
+        );
+        cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes;
+        cfg.validate().expect("exactly twice is enough");
     }
 
     /// Scenario: `upload.part_bytes` is below the S3 multipart minimum part size.
