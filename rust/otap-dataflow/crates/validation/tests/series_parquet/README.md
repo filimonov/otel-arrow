@@ -32,6 +32,13 @@ python3 -m crates.validation.tests.series_parquet.measure run \
 python3 -m crates.validation.tests.series_parquet.measure run \
   --case launcher-ci --output-dir /tmp/series-launcher
 
+# Every registered stage and cumulative layer, three repetitions each, with
+# Criterion wall times, CPU and resident memory, DHAT allocation and the
+# real engine's OTLP-to-noop baseline. Build the benches and both engines
+# first (below); the run itself starts no build.
+SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure \
+  stages --output-dir /tmp/series-stages
+
 # Stage one published evidence tree by exact file name, before a commit.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
   --index ../../docs/superpowers/reports/series-parquet-measurement/harness-contracts.json
@@ -54,7 +61,30 @@ before it starts: a debug engine's memory and speed describe the debug
 build, not the exporter. The fixture suite `test_e2e.py` keeps using the
 debug build.
 
-The remaining subcommands (`stages`, `attribution`,
+`stages` measures one process per stage, repetition and profile, each under
+the same host controls as an engine run. It needs four prebuilt binaries and
+starts no build of its own, because a compiler running beside a measurement
+invalidates it:
+
+```bash
+cargo bench -p otel-arrow-dfe-series-lake --bench measurement --bench layered --no-run
+cargo bench -p otel-arrow-dfe-series-lake --bench measurement --no-run --features bench-heap
+cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series_parquet,aws,durable-buffer
+cargo build --profile profiling --no-default-features -p otel-arrow-dfe \
+  --bin df_engine --features core-nodes,crypto-ring,dhat-heap
+```
+
+The `bench-heap` feature installs DHAT's global allocator in the
+`measurement` bench executable only, so a timed sample is never measured
+through an allocation tracker; the two builds carry different fingerprints
+and are never compared with each other. The `dhat-heap` engine is the
+paired allocation profile of the pipeline baseline, and its run directory
+keeps the `dhat-heap.json` it writes. `stages` takes
+`--option configs='["logs-1k-stable"]'`, `--option stages='["extract"]'` and
+`--option repetitions=3`.
+
+The remaining subcommands (`attribution`,
 `capacity`, `memory`, `soak`, `fault-preflight`, `failures`, `buffered`,
 `remediate`, `report`) are named here so the command line is one contract;
 each is implemented by its own task.

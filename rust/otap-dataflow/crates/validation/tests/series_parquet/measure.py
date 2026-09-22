@@ -29,12 +29,11 @@ except ImportError:  # Imported by path, e.g. from an ad hoc script.
 
 
 # Subcommands whose measurement is long enough that it must be asked for.
-LONG_COMMANDS = ("capacity", "memory", "soak", "failures", "buffered")
+LONG_COMMANDS = ("stages", "capacity", "memory", "soak", "failures", "buffered")
 
 # Subcommands later tasks own. They are named here so that the command line
 # is one contract rather than a set that grows behind the plan.
 PLANNED_COMMANDS = (
-    "stages",
     "attribution",
     "capacity",
     "memory",
@@ -1281,6 +1280,11 @@ def build_parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--case", required=True)
     _ = run.add_argument("--output-dir", required=True, type=Path)
     _ = run.add_argument("--option", action="append", default=[])
+    stages = sub.add_parser(
+        "stages", help="measure every registered stage and layer"
+    )
+    _ = stages.add_argument("--output-dir", required=True, type=Path)
+    _ = stages.add_argument("--option", action="append", default=[])
     stage = sub.add_parser(
         "stage-results", help="git add one published evidence tree"
     )
@@ -1309,6 +1313,21 @@ def main(argv=None) -> int:
     if arguments.command == "stage-results":
         measurement.stage_run_files(arguments.index)
         return 0
+    if arguments.command == "stages":
+        try:
+            from . import performance
+        except ImportError:
+            import performance
+        options = parse_options(arguments.option)
+        output_dir = arguments.output_dir or Path("/tmp/series-stages")
+        result = performance.run_stages(
+            performance.stages_spec(**options), output_dir, **options
+        )
+        sys.stderr.write(
+            f"{result['run_id']}: {result['status']} "
+            f"{json.dumps(result['metrics'], sort_keys=True)}\n"
+        )
+        return 0 if result["status"] == measurement.STATUS_PASSED else 1
     if arguments.command == "run":
         result = run_named(
             arguments.case,

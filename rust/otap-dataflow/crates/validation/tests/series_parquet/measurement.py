@@ -93,6 +93,10 @@ ID_FIXED_WIDTH = 8 + 1 + 12 + 1 + 6 + 1
 # number whose meaning depends on the reader's memory of the code.
 UNIT_SUFFIXES = (
     "_bytes",
+    "_bytes_per_record",
+    "_bytes_per_input_record",
+    "_ns_per_record",
+    "_per_s_per_core",
     "_bytes_per_s",
     "_s",
     "_ns",
@@ -237,6 +241,13 @@ class Workload:
         return dataclasses.asdict(self)
 
 
+# The topologies a run may declare. `strict` and `buffered` are the two
+# measured exporter pipelines; `noop` is the receiver-to-noop-exporter
+# pipeline baseline of the layered benchmarks, and `stage` is an
+# engine-less run of a prebuilt benchmark executable.
+TOPOLOGIES = ("strict", "buffered", "noop", "stage")
+
+
 @dataclasses.dataclass(frozen=True)
 class RunSpec:
     """The immutable inputs of exactly one experiment."""
@@ -254,8 +265,10 @@ class RunSpec:
     overrides: dict = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
-        if self.topology not in ("strict", "buffered"):
-            raise ValueError(f"topology must be strict or buffered: {self.topology}")
+        if self.topology not in TOPOLOGIES:
+            raise ValueError(
+                f"topology must be one of {TOPOLOGIES}: {self.topology}"
+            )
         if self.store not in ("local", "minio", "rustfs"):
             raise ValueError(f"store must be local, minio or rustfs: {self.store}")
         if not self.cores:
@@ -1075,7 +1088,8 @@ def select_worker_threads(threads, workers):
     return selected, ambiguous
 
 
-def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None) -> dict:
+def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None,
+                        pinned=()) -> dict:
     """A start or end environment snapshot.
 
     `roles` maps a role name to a process id, or to `(pid, cores)`, or to
@@ -1085,6 +1099,12 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
     telemetry reported and `requested_cores` the core set the run asked for;
     each worker is compared with its own core, never with the process-wide
     list.
+
+    `pinned` names roles that are not an engine and whose every thread must
+    be confined to that role's cores -- a prebuilt benchmark executable, for
+    instance. Each such thread is compared with the role's cores by exactly
+    the same rule as a worker thread, so an engine-less run's affinity is
+    asserted rather than merely recorded.
     """
     if hasattr(roles, "pid") and hasattr(roles, "launcher"):
         # An engine stands for its own role, on its requested cores.
@@ -1125,6 +1145,30 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
         "thread_affinity": threads,
         "absent_roles": missing,
     }
+    pinned_threads = []
+    for role in sorted(set(pinned)):
+        expected = sorted({int(core) for core in (roles.get(role) or (None, ()))[1]})
+        if not expected:
+            raise AssertionError(
+                f"pinned role {role} names no cores; a confinement that was "
+                f"never requested cannot be asserted"
+            )
+        for thread in threads:
+            if thread["role"] != role:
+                continue
+            pinned_threads.append(
+                {
+                    "key": f"{role}/tid{thread['tid']}",
+                    "tid": thread["tid"],
+                    "name": thread["name"],
+                    "cpus_allowed_list": thread["cpus_allowed_list"],
+                    "last_cpu": thread.get("last_cpu"),
+                    "expected_cores": expected,
+                }
+            )
+    if pinned_threads:
+        snapshot["pinned_roles"] = sorted(set(pinned))
+        snapshot["worker_threads"] = sorted(pinned_threads, key=lambda item: item["key"])
     if workers:
         selected, ambiguous = select_worker_threads(threads, workers)
         snapshot["worker_threads"] = sorted(
@@ -3454,7 +3498,7 @@ class RunControls:
             self.result, "core_allocation", json.dumps(allocation, sort_keys=True)
         )
 
-    def _observe(self, edge, roles, workers, requested_cores):
+    def _observe(self, edge, roles, workers, requested_cores, pinned=()):
         """One environment snapshot over every registered and named role."""
         merged = dict(self.roles)
         merged.update(roles or {})
@@ -3463,11 +3507,18 @@ class RunControls:
                 f"the {edge} snapshot names no workers; a measured run must "
                 f"attribute every worker thread"
             )
+        if not workers and not pinned and "engine" not in merged:
+            raise AssertionError(
+                f"the {edge} snapshot asserts no affinity; an engine-less run "
+                f"must name the pinned role it measured"
+            )
         return environment_snapshot(
-            merged, workers=workers or (), requested_cores=requested_cores
+            merged, workers=workers or (), requested_cores=requested_cores,
+            pinned=pinned,
         )
 
-    def snapshot(self, edge, roles=None, *, workers=(), requested_cores=None):
+    def snapshot(self, edge, roles=None, *, workers=(), requested_cores=None,
+                 pinned=()):
         """Record one edge's environment and assert worker affinity on it.
 
         `roles` maps each role to `(pid, cores)`. The start edge also fixes
@@ -3478,7 +3529,7 @@ class RunControls:
             raise ValueError(f"an environment snapshot edge is start or end: {edge}")
         if not self.opened:
             raise AssertionError("snapshot before the host controls were opened")
-        snapshot = self._observe(edge, roles, workers, requested_cores)
+        snapshot = self._observe(edge, roles, workers, requested_cores, pinned)
         self.result["environment"][edge] = snapshot
         if edge == "start" and "core_allocation" not in self.result["environment"]:
             merged = dict(self.roles)
@@ -3497,11 +3548,12 @@ class RunControls:
         self.taken[edge] = snapshot
         return snapshot
 
-    def checkpoint(self, label, roles=None, *, workers=(), requested_cores=None):
+    def checkpoint(self, label, roles=None, *, workers=(), requested_cores=None,
+                   pinned=()):
         """Re-verify worker affinity at a phase boundary, such as a restart."""
         if not self.opened:
             raise AssertionError("checkpoint before the host controls were opened")
-        snapshot = self._observe(label, roles, workers, requested_cores)
+        snapshot = self._observe(label, roles, workers, requested_cores, pinned)
         self.result["environment"].setdefault("checkpoints", {})[label] = snapshot
         try:
             assert_affinity(snapshot)
@@ -3525,6 +3577,17 @@ class RunControls:
                 if thread.get("name")
             ],
         )
+
+    def watch_pinned(self, pid, cores):
+        """Have every monitor tick re-check one pinned process's main thread.
+
+        Only the main thread is watched: a runtime's blocking-pool threads
+        come and go while the process runs, and they inherit the process's
+        confinement, so requiring a fixed set of thread ids would fail on a
+        thread that merely exited. Both snapshots still compare every thread
+        the process had at that edge.
+        """
+        self.monitor.watch(int(pid), {int(pid): set(int(core) for core in cores)})
 
     def unwatch_workers(self):
         """Stop re-checking workers, before the engine is deliberately stopped."""

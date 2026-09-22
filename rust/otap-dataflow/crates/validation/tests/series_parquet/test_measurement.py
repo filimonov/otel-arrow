@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import select
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -23,9 +24,11 @@ from unittest import mock
 try:  # Imported as a package module by `python3 -m crates...`.
     from . import measurement
     from . import measure
+    from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
     import measurement
     import measure
+    import performance
 
 Ledger = measurement.Ledger
 RunSpec = measurement.RunSpec
@@ -3229,6 +3232,441 @@ class HelperContracts(unittest.TestCase):
         self.assertEqual(
             len(one), measurement.ID_FIXED_WIDTH + len(measurement.LOG_KIND)
         )
+
+
+# The fields every environment snapshot must carry, with placeholder
+# values: a synthetic child is read by the same validator as a real one.
+SNAPSHOT_FIELDS = {
+    "cpu_model": "cpu",
+    "logical_core_count": 32,
+    "physical_core_count": 16,
+    "sibling_groups": [[0, 16]],
+    "available_cores": [0, 1],
+    "available_physical_core_count": 16,
+    "ram_bytes": 1,
+    "kernel": "linux",
+    "load_average_1_5_15": [0.0, 0.0, 0.0],
+    "thread_affinity": [],
+}
+
+
+def stage_child(stage="extract", profile="timing", repetition=1, **overrides):
+    """One synthetic child measurement of the stage family."""
+    metrics = {
+        "timing": {
+            "records_per_s_per_core": 1000000.0,
+            "cpu_ns_per_record": 1000.0,
+            "wall_ns_per_record": 1100.0,
+            "peak_rss_bytes": 200 * 1024 * 1024,
+            "output_bytes_per_input_record": 512.0,
+        },
+        "heap": {
+            "allocated_bytes_per_record": 2048.0,
+            "peak_live_heap_bytes": 90 * 1024 * 1024,
+            "peak_workspace_bytes": 40 * 1024 * 1024,
+        },
+        "criterion": {"wall_ns_per_record": 1050.0},
+        "pipeline": {
+            "records_per_s_per_core": 500000.0,
+            "cpu_ns_per_record": 2000.0,
+            "wall_ns_per_record": 5000.0,
+            "peak_rss_bytes": 300 * 1024 * 1024,
+            "output_bytes_per_input_record": 0.0,
+        },
+        "pipeline_heap": {
+            "allocated_bytes_per_record": 4096.0,
+            "peak_live_heap_bytes": 120 * 1024 * 1024,
+            "peak_workspace_bytes": 50 * 1024 * 1024,
+        },
+    }[profile]
+    mode = "pipeline" if profile.startswith("pipeline") else performance.stage_mode(stage)
+    child = {
+        "run_id": f"stages-{stage}-{mode}-w-zstd-{profile}-r{repetition:03d}",
+        "case": f"stages-{stage}-{profile}",
+        "status": measurement.STATUS_PASSED,
+        "stage": stage,
+        "mode": mode,
+        "profile": profile,
+        "compression": "zstd",
+        "workload_config_id": "w",
+        "repetition": repetition,
+        "family_ordinal": 1,
+        "metrics": dict(metrics),
+        "metric_directions": {
+            name: performance.METRIC_DIRECTIONS[name] for name in metrics
+        },
+        "checks": [
+            measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+            for name in measurement.REQUIRED_HARD_CHECKS
+        ],
+        "samples": [{"index": 0}],
+        "observations": {
+            "bench_report": {
+                "sample_count": 30,
+                "resident": {
+                    "start_bytes": 100 * 1024 * 1024,
+                    "peak_bytes": 200 * 1024 * 1024,
+                    "growth_bytes": 40 * 1024 * 1024,
+                },
+                "resident_steady": {
+                    "start_bytes": 100 * 1024 * 1024,
+                    "peak_bytes": 141 * 1024 * 1024,
+                    "growth_bytes": 41 * 1024 * 1024,
+                },
+                "observation": {"representation": "extracted_rows"},
+            },
+            "engine_rss_growth_bytes": 50 * 1024 * 1024,
+            "engine_peak_rss_bytes": 300 * 1024 * 1024,
+        },
+        "config": {"requested": {"cores": [1]}, "effective": {"lake": {}}},
+        "workload": measurement.Workload().as_json(),
+        "workload_schedule": {
+            "duration_s": 1, "rate_requests_per_s": "closed_loop", "max_in_flight": 1,
+        },
+        "environment": {
+            "start": dict(SNAPSHOT_FIELDS),
+            "end": dict(SNAPSHOT_FIELDS),
+            "build": {"profile": "bench"},
+            "git": {"revision": "abc"},
+            "core_allocation": {"bench": [1]},
+        },
+        "baseline_files": [],
+    }
+    child.update(overrides)
+    return child
+
+
+class StageContracts(unittest.TestCase):
+    """The registered stage results every later attribution reads."""
+
+    # Scenario: the registered OTLP-to-noop stage omits allocation data.
+    # Guarantees: every stage, including the pipeline baseline, has the full
+    # metric schema.
+    def test_otlp_noop_requires_all_metrics(self):
+        with self.assertRaisesRegex(AssertionError, "allocated_bytes_per_record"):
+            performance.validate_stage_result({"stage": "otlp_noop", "metrics": {}})
+
+    # Scenario: a stage result carries every metric but not the fields that
+    # say which stage, mode, repetition and build it describes.
+    # Guarantees: an unidentifiable measurement is refused, so a result can
+    # never be compared against one of another profile or repetition.
+    def test_identifying_fields_are_required(self):
+        complete = {
+            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
+            "stage": "extract",
+            "mode": "isolated",
+            "sample_count": 30,
+            "repetition": 1,
+            "fingerprint": {"timing": "a"},
+            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
+        }
+        performance.validate_stage_result(dict(complete))
+        for field in performance.STAGE_FIELDS:
+            partial = dict(complete)
+            del partial[field]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(AssertionError, field):
+                    performance.validate_stage_result(partial)
+
+    # Scenario: a stage result reports a metric as a string, as infinity or
+    # with a sample count of zero.
+    # Guarantees: only finite numbers from a positive sample count are
+    # accepted as measurements.
+    def test_only_finite_measurements_from_samples_are_accepted(self):
+        base = {
+            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
+            "stage": "encode",
+            "mode": "isolated",
+            "sample_count": 30,
+            "repetition": 2,
+            "fingerprint": {"timing": "a"},
+            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
+        }
+        for value in ("1.0", float("inf"), float("nan"), True, None):
+            broken = dict(base, metrics=dict(base["metrics"]))
+            broken["metrics"]["cpu_ns_per_record"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(AssertionError, "cpu_ns_per_record"):
+                    performance.validate_stage_result(broken)
+        with self.assertRaisesRegex(AssertionError, "samples"):
+            performance.validate_stage_result(dict(base, sample_count=0))
+
+    # Scenario: a stage result does not name the child that measured each of
+    # its fields.
+    # Guarantees: a composite identifies exactly which profile supplied
+    # every metric, so a heap number can never be read as a timing one.
+    def test_composite_names_the_child_of_every_metric(self):
+        base = {
+            "metrics": {name: 1.0 for name in performance.STAGE_METRICS},
+            "stage": "merge",
+            "mode": "isolated",
+            "sample_count": 30,
+            "repetition": 1,
+            "fingerprint": {"timing": "a"},
+            "metric_sources": {name: "child" for name in performance.STAGE_METRICS},
+        }
+        del base["metric_sources"]["peak_workspace_bytes"]
+        with self.assertRaisesRegex(AssertionError, "peak_workspace_bytes"):
+            performance.validate_stage_result(base)
+
+    # Scenario: a heap child reports a throughput, and a timing child
+    # reports an allocation.
+    # Guarantees: each profile measures its own fields only; a heap child
+    # never supplies throughput, and a missing profile field is incomplete
+    # acceptance.
+    def test_profiles_measure_their_own_fields(self):
+        heap = stage_child(profile="heap")
+        heap["metrics"]["records_per_s_per_core"] = 10.0
+        with self.assertRaisesRegex(AssertionError, "records_per_s_per_core"):
+            performance.validate_child_result(heap, "heap")
+        timing = stage_child(profile="timing")
+        del timing["metrics"]["cpu_ns_per_record"]
+        with self.assertRaisesRegex(AssertionError, "cpu_ns_per_record"):
+            performance.validate_child_result(timing, "timing")
+
+    # Scenario: the exported stage names and Criterion layers are read back.
+    # Guarantees: the names later tasks join on are exactly the registered
+    # ones, in order, and the layers are the first six.
+    def test_registered_stage_names(self):
+        self.assertEqual(
+            performance.STAGES,
+            (
+                "otlp_noop", "otlp_convert", "otlp_extract_hash", "otlp_sort",
+                "otlp_parquet_local", "otlp_parquet_zstd", "otlp_minio",
+                "convert", "extract", "sort_seal", "merge", "encode",
+                "local_write", "upload", "sink",
+            ),
+        )
+        self.assertEqual(performance.CRITERION_LAYERS, performance.STAGES[:6])
+        self.assertEqual(performance.stage_mode("otlp_noop"), "criterion")
+        self.assertEqual(performance.stage_mode("upload"), "async")
+        self.assertEqual(performance.stage_mode("extract"), "isolated")
+
+    # Scenario: every stage metric name is written into a result file.
+    # Guarantees: the schema's names state their unit, so a later reader
+    # never has to remember what a number meant.
+    def test_stage_metrics_state_their_units(self):
+        for name in performance.STAGE_METRICS:
+            with self.subTest(name=name):
+                self.assertTrue(name.endswith(measurement.UNIT_SUFFIXES), name)
+
+    # Scenario: three repetitions of one profile are aggregated, one of them
+    # three times slower than the others.
+    # Guarantees: the dispersion of the repetitions is a hard stability
+    # gate, and the aggregate publishes medians and ranges.
+    def test_unstable_repetitions_fail_the_stage(self):
+        directory = temporary_directory(self)
+        children = [stage_child(repetition=index) for index in (1, 2, 3)]
+        children[2]["metrics"]["cpu_ns_per_record"] = 3000.0
+        for child in children:
+            _ = measurement.write_json_atomic(
+                directory / f"{child['run_id']}.json", child
+            )
+        reconciliation = performance.rss_reconciliation(
+            children, [stage_child(profile="heap", repetition=index) for index in (1, 2, 3)]
+        )
+        aggregate = performance.aggregate_profile(
+            children, plan={}, output_dir=directory, reconciliation=reconciliation
+        )
+        self.assertEqual(aggregate["status"], measurement.STATUS_FAILED)
+        stability = [
+            entry for entry in aggregate["checks"]
+            if entry["name"] == "repetition_stability"
+        ][0]
+        self.assertEqual(stability["status"], measurement.STATUS_FAILED)
+        self.assertIn("cpu_ns_per_record", stability["detail"])
+        self.assertEqual(
+            aggregate["observations"]["dispersion"]["cpu_ns_per_record"]["max"], 3000.0
+        )
+
+    # Scenario: the resident growth one steady-state iteration of a timing
+    # child saw is far larger than the heap workspace its paired allocation
+    # profile measured, and in another pair it is smaller.
+    # Guarantees: unexplained resident growth is a hard failure of both
+    # profiles, resident memory the fixtures already made resident is not,
+    # and the pairing is by repetition.
+    def test_unexplained_residual_fails_the_pair(self):
+        timing = stage_child()
+        timing["observations"]["bench_report"]["resident_steady"]["growth_bytes"] = (
+            700 * 1024 * 1024
+        )
+        outcome = performance.rss_reconciliation([timing], [stage_child(profile="heap")])
+        self.assertEqual(outcome["check"]["status"], measurement.STATUS_FAILED)
+        self.assertFalse(outcome["residuals"][0]["within_tolerance"])
+        within = performance.rss_reconciliation(
+            [stage_child()], [stage_child(profile="heap")]
+        )
+        self.assertEqual(within["check"]["status"], measurement.STATUS_PASSED)
+        reused = stage_child()
+        reused["observations"]["bench_report"]["resident_steady"]["growth_bytes"] = 0
+        explained = performance.rss_reconciliation(
+            [reused], [stage_child(profile="heap")]
+        )
+        self.assertEqual(explained["check"]["status"], measurement.STATUS_PASSED)
+        self.assertTrue(explained["residuals"][0]["explained_negative"])
+        unpaired = performance.rss_reconciliation([stage_child(repetition=2)], [])
+        self.assertEqual(unpaired["check"]["status"], measurement.STATUS_FAILED)
+
+    # Scenario: a child of one profile never recorded a hard gate the
+    # policy requires.
+    # Guarantees: an absent gate is not a passed gate; the family's own gate
+    # fails and names the child.
+    def test_an_absent_child_gate_fails_the_family(self):
+        child = stage_child()
+        child["checks"] = [
+            entry for entry in child["checks"] if entry["name"] != "affinity_matched"
+        ]
+        derived = {
+            entry["name"]: entry for entry in performance.derived_checks([child])
+        }
+        self.assertEqual(
+            derived["affinity_matched"]["status"], measurement.STATUS_FAILED
+        )
+        self.assertIn(child["run_id"], derived["affinity_matched"]["detail"])
+
+    # Scenario: the timing and the heap children of one stage are built
+    # differently, one with the system allocator and one with DHAT.
+    # Guarantees: the two carry different baseline fingerprints, so a heap
+    # profile is never compared against a timing baseline.
+    def test_profiles_do_not_share_a_fingerprint(self):
+        directory = temporary_directory(self)
+        base = {
+            "case": "stages-extract",
+            "run_dir": str(directory),
+            "environment": {
+                "machine_identity_sha256": "m",
+                "start": {
+                    "cpu_model": "cpu", "logical_core_count": 32,
+                    "physical_core_count": 16, "sibling_groups": [[0, 16]],
+                    "ram_bytes": 1, "kernel": "linux",
+                    "available_cores": [0, 1],
+                },
+                "core_allocation": {"bench": [1]},
+                "build": {
+                    "profile": "bench", "features": "default",
+                    "allocator": "system", "toolchain": "rustc 1.88",
+                },
+            },
+            "config": {"effective": {"lake": {}}},
+            "workload": measurement.Workload().as_json(),
+            "workload_schedule": {
+                "duration_s": 1, "rate_requests_per_s": "closed_loop",
+                "max_in_flight": 1,
+            },
+        }
+        timing = measurement.baseline_fingerprint(base)
+        heap = json.loads(json.dumps(base))
+        heap["environment"]["build"].update(
+            {"features": "bench-heap", "allocator": "dhat"}
+        )
+        self.assertNotEqual(timing, measurement.baseline_fingerprint(heap))
+
+    # Scenario: a workload's requests are written as the bench input file.
+    # Guarantees: the file is length-prefixed, its sidecar states the
+    # records and series a stage must produce, and its hash covers it.
+    def test_stage_input_is_length_prefixed_with_a_sidecar(self):
+        directory = temporary_directory(self)
+        workload = Workload(
+            requests=6, records_per_request=3, body_bytes=64, series=2,
+            metrics_every=3,
+        )
+        path = directory / "logs.otlp"
+        sidecar = performance.write_stage_input(workload, "logs", path)
+        self.assertEqual(sidecar["format"], performance.INPUT_FORMAT)
+        self.assertEqual(sidecar["requests"], 4)
+        self.assertEqual(sidecar["records"], 12)
+        self.assertEqual(sidecar["expected_series"], 2)
+        self.assertEqual(sidecar["sha256"], measurement.file_digest(path))
+        data = path.read_bytes()
+        at = 0
+        seen = 0
+        while at < len(data):
+            (length,) = struct.unpack("<I", data[at:at + 4])
+            at += 4
+            _signal, wire, _rows = measurement.build_request(
+                workload, sidecar["request_indexes"][seen]
+            )
+            self.assertEqual(data[at:at + length], wire)
+            at += length
+            seen += 1
+        self.assertEqual(seen, sidecar["requests"])
+
+    # Scenario: a fixture would build a row larger than the configured row
+    # limit.
+    # Guarantees: an illegal fixture is refused before it is measured, so it
+    # can never claim supported throughput.
+    def test_illegal_fixtures_are_refused(self):
+        for config_id in performance.WORKLOAD_CONFIGS:
+            with self.subTest(config_id=config_id):
+                performance.check_fixture(config_id)
+        with mock.patch.dict(
+            performance.WORKLOAD_CONFIGS,
+            {
+                "too-wide": {
+                    "signal": "logs",
+                    "workload": Workload(body_bytes=4 * 1024 * 1024),
+                    "lake": performance.lake_config(),
+                    "committed_fraction": 0.0,
+                    "stages": ("extract",),
+                    "description": "an illegal fixture",
+                }
+            },
+        ):
+            with self.assertRaisesRegex(AssertionError, "row limit"):
+                performance.check_fixture("too-wide")
+
+    # Scenario: cargo reports a bench executable built without optimization.
+    # Guarantees: a debug bench is refused before it measures anything.
+    def test_a_debug_bench_is_refused(self):
+        message = json.dumps(
+            {
+                "reason": "compiler-artifact",
+                "executable": "/tmp/measurement",
+                "target": {"name": "measurement"},
+                "profile": {"opt_level": "0", "test": True, "debug_assertions": True},
+            }
+        )
+        with mock.patch.object(
+            performance.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, message, ""),
+        ):
+            with self.assertRaisesRegex(AssertionError, "opt-level"):
+                _ = performance.locate_benches()
+
+    # Scenario: the noop pipeline stores nothing, and its stage result says
+    # so with a measured zero.
+    # Guarantees: the zero is declared as a representation and an oracle
+    # that does not apply, never as an unmeasured field.
+    def test_noop_output_is_a_measured_zero(self):
+        pipeline = [stage_child(stage="otlp_noop", profile="pipeline", repetition=r)
+                    for r in (1, 2, 3)]
+        heap = [stage_child(stage="otlp_noop", profile="pipeline_heap", repetition=r)
+                for r in (1, 2, 3)]
+        composites = performance.composite_stage_results([], pipeline + heap)
+        self.assertEqual(len(composites), 3)
+        for composite in composites:
+            performance.validate_stage_result(composite)
+            self.assertEqual(composite["metrics"]["output_bytes_per_input_record"], 0.0)
+            self.assertEqual(composite["output_representation"], "none")
+            self.assertIn("not_applicable", composite["descriptor_oracle"])
+            self.assertEqual(
+                composite["metric_sources"]["allocated_bytes_per_record"],
+                heap[0]["run_id"].replace("r001", f"r{composite['repetition']:03d}"),
+            )
+
+    # Scenario: a composite is built from a timing child whose paired heap
+    # child never ran.
+    # Guarantees: completeness rejects it rather than filling the missing
+    # allocation with a zero, and the rejection is carried into the index.
+    def test_a_composite_without_its_heap_child_is_rejected(self):
+        composites = performance.composite_stage_results([], [stage_child()])
+        self.assertEqual(len(composites), 1)
+        self.assertIn("allocated_bytes_per_record", composites[0]["incomplete"])
+        self.assertNotIn("allocated_bytes_per_record", composites[0]["metrics"])
+        with self.assertRaisesRegex(AssertionError, "allocated_bytes_per_record"):
+            performance.validate_stage_result(composites[0])
+
 
 
 if __name__ == "__main__":

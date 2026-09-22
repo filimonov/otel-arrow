@@ -1,0 +1,2946 @@
+{
+  "artifact_kind": "run",
+  "artifacts": [
+    {
+      "kind": "bench_report",
+      "name": "bench-report.json",
+      "retention": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+      "sha256": "38a89c06c8ffb35ceb9f4c692d381b49b84e022d1b89694e6c73eb41963a4b0c",
+      "size_bytes": 27045
+    },
+    {
+      "kind": "bench_config",
+      "name": "bench-config.json",
+      "retention": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+      "sha256": "27a14f12a81e13de60efbe136f5088e17a654c2f8318a7427f5066a7ad59a558",
+      "size_bytes": 1833
+    },
+    {
+      "kind": "bench_log",
+      "name": "bench.log",
+      "retention": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+      "sha256": "b21d2fb96c015e19086cb9cd2657cbbe1d36a3ccb03d1f4c24cc2f5175de0969",
+      "size_bytes": 37
+    }
+  ],
+  "baseline_files": [],
+  "case": "stages-sort_seal-timing",
+  "checks": [
+    {
+      "detail": "stage verification: every check passed",
+      "kind": "hard",
+      "name": "delivery",
+      "status": "passed"
+    },
+    {
+      "detail": "110 samples (every 1 kept), 1.005s measured; complete",
+      "kind": "hard",
+      "name": "minimum_samples",
+      "status": "passed"
+    },
+    {
+      "detail": "0 build processes seen in 93 scans; builder container starts 0",
+      "kind": "hard",
+      "name": "no_concurrent_build",
+      "status": "passed"
+    },
+    {
+      "detail": "93 ticks, largest gap 0.063597596s",
+      "kind": "hard",
+      "name": "build_monitor_coverage",
+      "status": "passed"
+    },
+    {
+      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "kind": "hard",
+      "name": "host_lease_held",
+      "status": "passed"
+    },
+    {
+      "detail": "taken: ['end', 'start']",
+      "kind": "hard",
+      "name": "environment_snapshots_complete",
+      "status": "passed"
+    },
+    {
+      "detail": "{}",
+      "kind": "hard",
+      "name": "environment_matched",
+      "status": "passed"
+    },
+    {
+      "detail": "every worker on its own core",
+      "kind": "hard",
+      "name": "affinity_matched",
+      "status": "passed"
+    },
+    {
+      "detail": "16 physical cores available to the run, 8 required; the machine has 16",
+      "kind": "hard",
+      "name": "physical_cores_sufficient",
+      "status": "passed"
+    }
+  ],
+  "child_indexes": [],
+  "compression": "zstd",
+  "config": {
+    "effective": {
+      "bench": {
+        "compression": "zstd",
+        "criterion": {
+          "measurement_time_s": 5,
+          "sample_size": 30,
+          "sampling_mode": "flat",
+          "warm_up_time_s": 1
+        },
+        "iterations": 30,
+        "minimum_measured_s": 1.0,
+        "minimum_samples": 30,
+        "mode": "isolated",
+        "profile": "timing",
+        "repetition": 2,
+        "stage": "sort_seal"
+      },
+      "input": {
+        "bytes": 21638200,
+        "expected_series": 100,
+        "format": "u32le-length-prefixed-otlp",
+        "records": 20000,
+        "requests": 200,
+        "sha256": "2b76158bac5a7094ea09cb1af87b78430e019f1cb568698bb3f477b4ec2bce31",
+        "signal": "logs"
+      },
+      "lake": {
+        "cache_entries": 200000,
+        "committed_fraction": 0.5,
+        "lake": {
+          "ingress": {
+            "max_block_bytes": 524288000,
+            "max_extracted_bytes": 33554432,
+            "max_nesting_depth": 32,
+            "max_request_bytes": 16777216,
+            "max_requests_per_block": 4096,
+            "max_row_bytes": 1048576,
+            "pending_series_entry_bytes": 64
+          },
+          "logs": {
+            "denormalize": [
+              "resource.service.name"
+            ],
+            "series_attributes": [
+              "logger.name"
+            ],
+            "values_sort": [
+              {
+                "column": "series_id",
+                "order": "asc"
+              },
+              {
+                "column": "time_unix_nano",
+                "nulls": "last",
+                "order": "asc"
+              }
+            ]
+          },
+          "metrics": {
+            "denormalize": [
+              "resource.service.name"
+            ],
+            "series_attributes": [],
+            "values_sort": [
+              {
+                "column": "series_id",
+                "order": "asc"
+              },
+              {
+                "column": "time_unix_nano",
+                "order": "asc"
+              }
+            ]
+          },
+          "parquet": {
+            "row_group_bytes": 67108864,
+            "writer_limit_bytes": 100663296
+          },
+          "producer_id_attribute": "host.id",
+          "sorting": {
+            "enabled": true,
+            "merge_chunk_bytes": 16777216,
+            "run_target_bytes": 8388608
+          },
+          "unsupported": "reject",
+          "upload": {
+            "abort_timeout": "5s",
+            "concurrency": 2,
+            "part_bytes": 8388608
+          },
+          "window_interval": "15s",
+          "writer_id": "local-1"
+        },
+        "scratch_dir": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002/scratch",
+        "seal_at_us": 1789960500000000,
+        "storage": {
+          "file": {
+            "base_uri": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002/store"
+          }
+        },
+        "window_start_secs": 1789960500,
+        "workload_config_id": "logs-1k-stable"
+      }
+    },
+    "requested": {
+      "case": "stages-sort_seal-timing",
+      "cores": [
+        1
+      ],
+      "duration_s": 1,
+      "interval_s": 15,
+      "max_in_flight": 1,
+      "overrides": {
+        "compression": "zstd",
+        "mode": "isolated",
+        "profile": "timing",
+        "repetition": 2,
+        "stage": "sort_seal",
+        "workload_config_id": "logs-1k-stable"
+      },
+      "producer_timeout_s": 180.0,
+      "run_id": "stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+      "store": "local",
+      "topology": "stage"
+    }
+  },
+  "elapsed_s": 4.633646955,
+  "environment": {
+    "build": {
+      "allocator": "system",
+      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/deps/measurement-8bac121a1ae33e80",
+      "binary_sha256": "38f5e6d666c8a130cc752fb703f7215561f4a7970d9c9b813c0517ff812516ab",
+      "binary_size_bytes": 23532560,
+      "features": "default",
+      "profile": "bench",
+      "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
+    },
+    "build_monitor": {
+      "affinity_failure_count": 0,
+      "affinity_failures": [],
+      "coverage": {
+        "gaps_over_limit": [],
+        "gaps_over_limit_count": 0,
+        "interval_s": 0.05,
+        "limit_s": 0.1,
+        "max_gap_s": 0.063597596,
+        "ticks": 93
+      },
+      "detected": false,
+      "docker": {
+        "end": {
+          "available": true,
+          "builders": [
+            {
+              "id": "23367b01804b",
+              "image": "moby/buildkit:buildx-stable-1",
+              "name": "buildx_buildkit_clickhouse-regression-builder"
+            }
+          ],
+          "observable": true
+        },
+        "events": {
+          "builder_starts": [],
+          "container_start_count": 0,
+          "observable": true
+        },
+        "start": {
+          "available": true,
+          "builders": [
+            {
+              "id": "23367b01804b",
+              "image": "moby/buildkit:buildx-stable-1",
+              "name": "buildx_buildkit_clickhouse-regression-builder"
+            }
+          ],
+          "observable": true
+        }
+      },
+      "observation_count": 0,
+      "observations": [],
+      "scans": 93,
+      "visibility": {
+        "complete": true,
+        "hidepid": null,
+        "other_processes_visible": true,
+        "proc_root": "/proc"
+      }
+    },
+    "core_allocation": {
+      "bench": [
+        1
+      ],
+      "bench_reserved": [
+        2,
+        3,
+        4
+      ],
+      "engine_observability": [
+        0
+      ],
+      "producer": [
+        5,
+        6
+      ],
+      "reader": [
+        8
+      ],
+      "store": [
+        7
+      ]
+    },
+    "end": {
+      "absent_roles": {},
+      "available_cores": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "available_physical_core_count": 16,
+      "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+      "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+      "load_average_1_5_15": [
+        2.17,
+        1.61,
+        1.7
+      ],
+      "logical_core_count": 32,
+      "monotonic_ns": 170017538277207,
+      "observed_utc": "2026-09-22T18:28:11Z",
+      "physical_core_count": 16,
+      "pinned_roles": [
+        "bench"
+      ],
+      "ram_bytes": 98401574912,
+      "sibling_groups": [
+        [
+          0,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          2,
+          18
+        ],
+        [
+          3,
+          19
+        ],
+        [
+          4,
+          20
+        ],
+        [
+          5,
+          21
+        ],
+        [
+          6,
+          22
+        ],
+        [
+          7,
+          23
+        ],
+        [
+          8,
+          24
+        ],
+        [
+          9,
+          25
+        ],
+        [
+          10,
+          26
+        ],
+        [
+          11,
+          27
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          30
+        ],
+        [
+          15,
+          31
+        ]
+      ],
+      "thread_affinity": [
+        {
+          "cpus_allowed_list": "1",
+          "expected_cores": [
+            1
+          ],
+          "last_cpu": 1,
+          "name": "measurement-8ba",
+          "nspid": "3709239",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3709239,
+          "role": "bench",
+          "tid": 3709239
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "python3",
+          "nspid": "3704491",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704491
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3704495",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704495
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704496",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704496
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3704497",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704497
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3704498",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704498
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3704499",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704499
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3704500",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704500
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704501",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704501
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3704502",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704502
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3704503",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704503
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704504",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704504
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704505",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704505
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704506",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704506
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704507",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704507
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3704508",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704508
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3704509",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704509
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3704510",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704510
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3704511",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704511
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3704512",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704512
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3704513",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704513
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 31,
+          "name": "python3",
+          "nspid": "3704514",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704514
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3704515",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704515
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3704516",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704516
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3704517",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704517
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704518",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704518
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704519",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704519
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704520",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704520
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3704521",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704521
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704522",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704522
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704523",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704523
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3704524",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704524
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704525",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704525
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "python3",
+          "nspid": "3709238",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3709238
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "3709240",
+          "observed_utc": "2026-09-22T18:28:11Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3709240
+        }
+      ],
+      "worker_threads": [
+        {
+          "cpus_allowed_list": "1",
+          "expected_cores": [
+            1
+          ],
+          "key": "bench/tid3709239",
+          "last_cpu": 1,
+          "name": "measurement-8ba",
+          "tid": 3709239
+        }
+      ]
+    },
+    "git": {
+      "dirty": true,
+      "revision": "bde9fb1e0ab0cd61327327826c7e1a114f2b07e2"
+    },
+    "lease": {
+      "acquired_utc": "2026-09-22T18:28:06Z",
+      "owner": "3704491-fd14d5a852d241648f30f71ac732509f",
+      "path": "/tmp/series-parquet-host-measurement.lock",
+      "pid": 3704491,
+      "released_utc": "2026-09-22T18:28:11Z",
+      "run_id": "stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002"
+    },
+    "machine_identity_sha256": "5f95bfd263ecc79d6a58b132a0e4c62b8ad24560a98752b900cf7d285d8e2e5a",
+    "match": {
+      "differences": {},
+      "matched": true
+    },
+    "start": {
+      "absent_roles": {},
+      "available_cores": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "available_physical_core_count": 16,
+      "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+      "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+      "load_average_1_5_15": [
+        1.49,
+        1.46,
+        1.66
+      ],
+      "logical_core_count": 32,
+      "monotonic_ns": 170013037521177,
+      "observed_utc": "2026-09-22T18:28:06Z",
+      "physical_core_count": 16,
+      "pinned_roles": [
+        "bench"
+      ],
+      "ram_bytes": 98401574912,
+      "sibling_groups": [
+        [
+          0,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          2,
+          18
+        ],
+        [
+          3,
+          19
+        ],
+        [
+          4,
+          20
+        ],
+        [
+          5,
+          21
+        ],
+        [
+          6,
+          22
+        ],
+        [
+          7,
+          23
+        ],
+        [
+          8,
+          24
+        ],
+        [
+          9,
+          25
+        ],
+        [
+          10,
+          26
+        ],
+        [
+          11,
+          27
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          30
+        ],
+        [
+          15,
+          31
+        ]
+      ],
+      "thread_affinity": [
+        {
+          "cpus_allowed_list": "1",
+          "expected_cores": [
+            1
+          ],
+          "last_cpu": 1,
+          "name": "measurement-8ba",
+          "nspid": "3709239",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3709239,
+          "role": "bench",
+          "tid": 3709239
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "3704491",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704491
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3704495",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704495
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704496",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704496
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3704497",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704497
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3704498",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704498
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3704499",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704499
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3704500",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704500
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704501",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704501
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3704502",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704502
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3704503",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704503
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704504",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704504
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3704505",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704505
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704506",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704506
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704507",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704507
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3704508",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704508
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3704509",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704509
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3704510",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704510
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3704511",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704511
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3704512",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704512
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3704513",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704513
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 31,
+          "name": "python3",
+          "nspid": "3704514",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704514
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3704515",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704515
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 28,
+          "name": "python3",
+          "nspid": "3704516",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704516
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3704517",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704517
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704518",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704518
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3704519",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704519
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704520",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704520
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 25,
+          "name": "python3",
+          "nspid": "3704521",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704521
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 26,
+          "name": "python3",
+          "nspid": "3704522",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704522
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704523",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704523
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 11,
+          "name": "python3",
+          "nspid": "3704524",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704524
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3704525",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3704525
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 3,
+          "name": "python3",
+          "nspid": "3709238",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3709238
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "3709240",
+          "observed_utc": "2026-09-22T18:28:06Z",
+          "pid": 3704491,
+          "role": "harness",
+          "tid": 3709240
+        }
+      ],
+      "worker_threads": [
+        {
+          "cpus_allowed_list": "1",
+          "expected_cores": [
+            1
+          ],
+          "key": "bench/tid3709239",
+          "last_cpu": 1,
+          "name": "measurement-8ba",
+          "tid": 3709239
+        }
+      ]
+    }
+  },
+  "ephemeral_values": {
+    "<store_endpoint>": "http://127.0.0.1:37655"
+  },
+  "events": [
+    {
+      "detail": "3704491-fd14d5a852d241648f30f71ac732509f",
+      "kind": "host_controls_opened",
+      "monotonic_ns": 170012980981765,
+      "observed_utc": "2026-09-22T18:28:06Z"
+    },
+    {
+      "detail": "{\"bench\": [1], \"bench_reserved\": [2, 3, 4], \"engine_observability\": [0], \"producer\": [5, 6], \"reader\": [8], \"store\": [7]}",
+      "kind": "core_allocation",
+      "monotonic_ns": 170012981582626,
+      "observed_utc": "2026-09-22T18:28:06Z"
+    },
+    {
+      "detail": "3709239",
+      "kind": "bench_started",
+      "monotonic_ns": 170013045606642,
+      "observed_utc": "2026-09-22T18:28:06Z"
+    },
+    {
+      "detail": "",
+      "kind": "host_controls_closed",
+      "monotonic_ns": 170017582949012,
+      "observed_utc": "2026-09-22T18:28:11Z"
+    }
+  ],
+  "mandatory_metrics": [
+    "cpu_ns_per_record",
+    "output_bytes_per_input_record",
+    "peak_rss_bytes",
+    "records_per_s_per_core",
+    "wall_ns_per_record"
+  ],
+  "metric_directions": {
+    "cpu_ns_per_record": "lower_is_better",
+    "output_bytes_per_input_record": "lower_is_better",
+    "peak_rss_bytes": "lower_is_better",
+    "records_per_s_per_core": "higher_is_better",
+    "wall_ns_per_record": "lower_is_better"
+  },
+  "metrics": {
+    "cpu_ns_per_record": 449.36275,
+    "output_bytes_per_input_record": 1159.0978,
+    "peak_rss_bytes": 111005696,
+    "records_per_s_per_core": 2225373.5985014336,
+    "wall_ns_per_record": 449.38375
+  },
+  "metrics_unavailable": {},
+  "mode": "isolated",
+  "observations": {
+    "bench_report": {
+      "clock": "thread",
+      "compression": "zstd",
+      "failed_checks": [],
+      "fixture_retained_bytes": 21637400,
+      "heap": null,
+      "input_bytes": 21637400,
+      "iterations": 30,
+      "observation": {
+        "checks": [
+          {
+            "detail": "50 series rows, 50 expected after 50 committed",
+            "name": "series_rows",
+            "passed": true
+          },
+          {
+            "detail": "the block committed its seal",
+            "name": "sealed",
+            "passed": true
+          },
+          {
+            "detail": "20000 values rows, 20000 input records",
+            "name": "values_rows",
+            "passed": true
+          }
+        ],
+        "extra": {
+          "cache_hits_count": 100,
+          "cache_misses_count": 100,
+          "part_admission": {
+            "cpu_ns": 9303730,
+            "wall_ns": 9302415
+          },
+          "part_seal": {
+            "cpu_ns": 1898150,
+            "wall_ns": 1897481
+          }
+        },
+        "output_bytes": 23181956,
+        "representation": "sealed_block",
+        "series_rows": 50,
+        "values_rows": 20000
+      },
+      "prepared_input_bytes": 50104800,
+      "profile": "timing",
+      "records": 20000,
+      "requests": 200,
+      "resident": {
+        "growth_bytes": 27815936,
+        "peak_bytes": 111951872,
+        "start_bytes": 84135936
+      },
+      "resident_steady": {
+        "growth_bytes": 25427968,
+        "peak_bytes": 111005696,
+        "start_bytes": 85577728
+      },
+      "sample_count": 110,
+      "schema": "series-stage-bench/1",
+      "stage": "sort_seal",
+      "warmup": {
+        "cpu_ns": 11270460,
+        "wall_ns": 11271586
+      }
+    },
+    "loop_peak_rss_bytes": 111951872,
+    "timing": {
+      "complete": true,
+      "incomplete_reason": null,
+      "measured_wall_ns_total": 1004755125,
+      "parts": {
+        "admission": [
+          {
+            "cpu_ns": 7810130,
+            "wall_ns": 7809055
+          },
+          {
+            "cpu_ns": 7842400,
+            "wall_ns": 7841495
+          },
+          {
+            "cpu_ns": 7957320,
+            "wall_ns": 7956645
+          },
+          {
+            "cpu_ns": 7716470,
+            "wall_ns": 7724794
+          },
+          {
+            "cpu_ns": 7877740,
+            "wall_ns": 7877015
+          },
+          {
+            "cpu_ns": 7870150,
+            "wall_ns": 7868955
+          },
+          {
+            "cpu_ns": 9104600,
+            "wall_ns": 9103966
+          },
+          {
+            "cpu_ns": 11164230,
+            "wall_ns": 11163387
+          },
+          {
+            "cpu_ns": 10994770,
+            "wall_ns": 10994256
+          },
+          {
+            "cpu_ns": 8886060,
+            "wall_ns": 8885215
+          },
+          {
+            "cpu_ns": 7569830,
+            "wall_ns": 7569074
+          },
+          {
+            "cpu_ns": 7558180,
+            "wall_ns": 7557674
+          },
+          {
+            "cpu_ns": 7744960,
+            "wall_ns": 7744424
+          },
+          {
+            "cpu_ns": 7680070,
+            "wall_ns": 7688174
+          },
+          {
+            "cpu_ns": 7927210,
+            "wall_ns": 7926225
+          },
+          {
+            "cpu_ns": 7902650,
+            "wall_ns": 7901255
+          },
+          {
+            "cpu_ns": 7207360,
+            "wall_ns": 7206634
+          },
+          {
+            "cpu_ns": 7676140,
+            "wall_ns": 7675795
+          },
+          {
+            "cpu_ns": 7594320,
+            "wall_ns": 7593945
+          },
+          {
+            "cpu_ns": 7670620,
+            "wall_ns": 7670224
+          },
+          {
+            "cpu_ns": 8080060,
+            "wall_ns": 8079525
+          },
+          {
+            "cpu_ns": 8420070,
+            "wall_ns": 8419644
+          },
+          {
+            "cpu_ns": 7565940,
+            "wall_ns": 7565284
+          },
+          {
+            "cpu_ns": 7582040,
+            "wall_ns": 7581654
+          },
+          {
+            "cpu_ns": 7754570,
+            "wall_ns": 7754354
+          },
+          {
+            "cpu_ns": 8540470,
+            "wall_ns": 8539465
+          },
+          {
+            "cpu_ns": 7933580,
+            "wall_ns": 7933044
+          },
+          {
+            "cpu_ns": 7556470,
+            "wall_ns": 7556214
+          },
+          {
+            "cpu_ns": 8238670,
+            "wall_ns": 8238155
+          },
+          {
+            "cpu_ns": 7875830,
+            "wall_ns": 7875484
+          },
+          {
+            "cpu_ns": 8408850,
+            "wall_ns": 8408484
+          },
+          {
+            "cpu_ns": 8070400,
+            "wall_ns": 8069965
+          },
+          {
+            "cpu_ns": 7543160,
+            "wall_ns": 7542845
+          },
+          {
+            "cpu_ns": 7702910,
+            "wall_ns": 7702574
+          },
+          {
+            "cpu_ns": 7845390,
+            "wall_ns": 7844794
+          },
+          {
+            "cpu_ns": 8302220,
+            "wall_ns": 8301475
+          },
+          {
+            "cpu_ns": 7699200,
+            "wall_ns": 7698764
+          },
+          {
+            "cpu_ns": 7937260,
+            "wall_ns": 7936315
+          },
+          {
+            "cpu_ns": 7848020,
+            "wall_ns": 7847475
+          },
+          {
+            "cpu_ns": 7929280,
+            "wall_ns": 7928545
+          },
+          {
+            "cpu_ns": 7791140,
+            "wall_ns": 7790685
+          },
+          {
+            "cpu_ns": 7789250,
+            "wall_ns": 7788784
+          },
+          {
+            "cpu_ns": 7651770,
+            "wall_ns": 7659194
+          },
+          {
+            "cpu_ns": 7810390,
+            "wall_ns": 7810064
+          },
+          {
+            "cpu_ns": 8064180,
+            "wall_ns": 8063745
+          },
+          {
+            "cpu_ns": 8125490,
+            "wall_ns": 8125145
+          },
+          {
+            "cpu_ns": 7620970,
+            "wall_ns": 7620614
+          },
+          {
+            "cpu_ns": 7621750,
+            "wall_ns": 7621195
+          },
+          {
+            "cpu_ns": 7741040,
+            "wall_ns": 7740645
+          },
+          {
+            "cpu_ns": 7714820,
+            "wall_ns": 7714195
+          },
+          {
+            "cpu_ns": 7691980,
+            "wall_ns": 7691574
+          },
+          {
+            "cpu_ns": 7751010,
+            "wall_ns": 7750614
+          },
+          {
+            "cpu_ns": 8045260,
+            "wall_ns": 8052864
+          },
+          {
+            "cpu_ns": 8159710,
+            "wall_ns": 8159255
+          },
+          {
+            "cpu_ns": 7643170,
+            "wall_ns": 7642884
+          },
+          {
+            "cpu_ns": 7853240,
+            "wall_ns": 7852765
+          },
+          {
+            "cpu_ns": 7767370,
+            "wall_ns": 7766985
+          },
+          {
+            "cpu_ns": 7638970,
+            "wall_ns": 7638485
+          },
+          {
+            "cpu_ns": 7716960,
+            "wall_ns": 7716515
+          },
+          {
+            "cpu_ns": 7747080,
+            "wall_ns": 7746344
+          },
+          {
+            "cpu_ns": 7640220,
+            "wall_ns": 7639584
+          },
+          {
+            "cpu_ns": 7645450,
+            "wall_ns": 7644704
+          },
+          {
+            "cpu_ns": 7990170,
+            "wall_ns": 7989475
+          },
+          {
+            "cpu_ns": 7725110,
+            "wall_ns": 7724404
+          },
+          {
+            "cpu_ns": 7558050,
+            "wall_ns": 7557664
+          },
+          {
+            "cpu_ns": 7978240,
+            "wall_ns": 7985774
+          },
+          {
+            "cpu_ns": 8852210,
+            "wall_ns": 8851145
+          },
+          {
+            "cpu_ns": 7786880,
+            "wall_ns": 7786464
+          },
+          {
+            "cpu_ns": 7707680,
+            "wall_ns": 7707104
+          },
+          {
+            "cpu_ns": 7654400,
+            "wall_ns": 7653804
+          },
+          {
+            "cpu_ns": 8303330,
+            "wall_ns": 8302574
+          },
+          {
+            "cpu_ns": 7977580,
+            "wall_ns": 7977015
+          },
+          {
+            "cpu_ns": 7718970,
+            "wall_ns": 7718495
+          },
+          {
+            "cpu_ns": 7607510,
+            "wall_ns": 7606975
+          },
+          {
+            "cpu_ns": 7734430,
+            "wall_ns": 7733955
+          },
+          {
+            "cpu_ns": 7973130,
+            "wall_ns": 7972735
+          },
+          {
+            "cpu_ns": 7906530,
+            "wall_ns": 7906145
+          },
+          {
+            "cpu_ns": 8039860,
+            "wall_ns": 8039465
+          },
+          {
+            "cpu_ns": 7711580,
+            "wall_ns": 7710634
+          },
+          {
+            "cpu_ns": 7660850,
+            "wall_ns": 7664494
+          },
+          {
+            "cpu_ns": 7934190,
+            "wall_ns": 7933984
+          },
+          {
+            "cpu_ns": 7744500,
+            "wall_ns": 7744214
+          },
+          {
+            "cpu_ns": 7570030,
+            "wall_ns": 7569694
+          },
+          {
+            "cpu_ns": 7629830,
+            "wall_ns": 7629414
+          },
+          {
+            "cpu_ns": 7836280,
+            "wall_ns": 7835875
+          },
+          {
+            "cpu_ns": 7990850,
+            "wall_ns": 7990615
+          },
+          {
+            "cpu_ns": 7650880,
+            "wall_ns": 7650644
+          },
+          {
+            "cpu_ns": 10182820,
+            "wall_ns": 10182145
+          },
+          {
+            "cpu_ns": 7967650,
+            "wall_ns": 7967245
+          },
+          {
+            "cpu_ns": 7713570,
+            "wall_ns": 7713305
+          },
+          {
+            "cpu_ns": 7887990,
+            "wall_ns": 7887725
+          },
+          {
+            "cpu_ns": 7792180,
+            "wall_ns": 7791855
+          },
+          {
+            "cpu_ns": 7781580,
+            "wall_ns": 7781124
+          },
+          {
+            "cpu_ns": 8225750,
+            "wall_ns": 8225204
+          },
+          {
+            "cpu_ns": 8099680,
+            "wall_ns": 8099254
+          },
+          {
+            "cpu_ns": 7835630,
+            "wall_ns": 7835144
+          },
+          {
+            "cpu_ns": 7834670,
+            "wall_ns": 7834004
+          },
+          {
+            "cpu_ns": 8064060,
+            "wall_ns": 8063575
+          },
+          {
+            "cpu_ns": 7925630,
+            "wall_ns": 7925265
+          },
+          {
+            "cpu_ns": 8018730,
+            "wall_ns": 8018455
+          },
+          {
+            "cpu_ns": 7781320,
+            "wall_ns": 7780745
+          },
+          {
+            "cpu_ns": 7540370,
+            "wall_ns": 7539864
+          },
+          {
+            "cpu_ns": 7666910,
+            "wall_ns": 7666425
+          },
+          {
+            "cpu_ns": 7978270,
+            "wall_ns": 7977875
+          },
+          {
+            "cpu_ns": 7658800,
+            "wall_ns": 7658134
+          },
+          {
+            "cpu_ns": 7517800,
+            "wall_ns": 7517485
+          },
+          {
+            "cpu_ns": 7603310,
+            "wall_ns": 7613254
+          },
+          {
+            "cpu_ns": 7617800,
+            "wall_ns": 7617604
+          },
+          {
+            "cpu_ns": 7820730,
+            "wall_ns": 7820404
+          },
+          {
+            "cpu_ns": 7548920,
+            "wall_ns": 7548654
+          }
+        ],
+        "seal": [
+          {
+            "cpu_ns": 1185210,
+            "wall_ns": 1185240
+          },
+          {
+            "cpu_ns": 1254390,
+            "wall_ns": 1254150
+          },
+          {
+            "cpu_ns": 1209680,
+            "wall_ns": 1209271
+          },
+          {
+            "cpu_ns": 1195080,
+            "wall_ns": 1194851
+          },
+          {
+            "cpu_ns": 1193800,
+            "wall_ns": 1193441
+          },
+          {
+            "cpu_ns": 1174610,
+            "wall_ns": 1174130
+          },
+          {
+            "cpu_ns": 1159060,
+            "wall_ns": 1158890
+          },
+          {
+            "cpu_ns": 1526060,
+            "wall_ns": 1525651
+          },
+          {
+            "cpu_ns": 1704070,
+            "wall_ns": 1703861
+          },
+          {
+            "cpu_ns": 1759110,
+            "wall_ns": 1758741
+          },
+          {
+            "cpu_ns": 1146120,
+            "wall_ns": 1145811
+          },
+          {
+            "cpu_ns": 1171190,
+            "wall_ns": 1170811
+          },
+          {
+            "cpu_ns": 1143570,
+            "wall_ns": 1143071
+          },
+          {
+            "cpu_ns": 1174660,
+            "wall_ns": 1174191
+          },
+          {
+            "cpu_ns": 1179690,
+            "wall_ns": 1179391
+          },
+          {
+            "cpu_ns": 1171750,
+            "wall_ns": 1171320
+          },
+          {
+            "cpu_ns": 1183900,
+            "wall_ns": 1183950
+          },
+          {
+            "cpu_ns": 1215310,
+            "wall_ns": 1215070
+          },
+          {
+            "cpu_ns": 1131620,
+            "wall_ns": 1131400
+          },
+          {
+            "cpu_ns": 1156660,
+            "wall_ns": 1156431
+          },
+          {
+            "cpu_ns": 1221490,
+            "wall_ns": 1221110
+          },
+          {
+            "cpu_ns": 1209720,
+            "wall_ns": 1209511
+          },
+          {
+            "cpu_ns": 1167810,
+            "wall_ns": 1167641
+          },
+          {
+            "cpu_ns": 1154900,
+            "wall_ns": 1154711
+          },
+          {
+            "cpu_ns": 1172400,
+            "wall_ns": 1172251
+          },
+          {
+            "cpu_ns": 1212140,
+            "wall_ns": 1211850
+          },
+          {
+            "cpu_ns": 1203240,
+            "wall_ns": 1202811
+          },
+          {
+            "cpu_ns": 1149910,
+            "wall_ns": 1149741
+          },
+          {
+            "cpu_ns": 1180370,
+            "wall_ns": 1180101
+          },
+          {
+            "cpu_ns": 1176470,
+            "wall_ns": 1176301
+          },
+          {
+            "cpu_ns": 1206770,
+            "wall_ns": 1206561
+          },
+          {
+            "cpu_ns": 1194780,
+            "wall_ns": 1194310
+          },
+          {
+            "cpu_ns": 1404870,
+            "wall_ns": 1404271
+          },
+          {
+            "cpu_ns": 1166130,
+            "wall_ns": 1165941
+          },
+          {
+            "cpu_ns": 1158230,
+            "wall_ns": 1157871
+          },
+          {
+            "cpu_ns": 1214980,
+            "wall_ns": 1214690
+          },
+          {
+            "cpu_ns": 1175710,
+            "wall_ns": 1175311
+          },
+          {
+            "cpu_ns": 1163420,
+            "wall_ns": 1163500
+          },
+          {
+            "cpu_ns": 1143850,
+            "wall_ns": 1143510
+          },
+          {
+            "cpu_ns": 1156450,
+            "wall_ns": 1156640
+          },
+          {
+            "cpu_ns": 1184670,
+            "wall_ns": 1184320
+          },
+          {
+            "cpu_ns": 1149160,
+            "wall_ns": 1148771
+          },
+          {
+            "cpu_ns": 1166640,
+            "wall_ns": 1166181
+          },
+          {
+            "cpu_ns": 1174580,
+            "wall_ns": 1174391
+          },
+          {
+            "cpu_ns": 1216020,
+            "wall_ns": 1215750
+          },
+          {
+            "cpu_ns": 1207720,
+            "wall_ns": 1207541
+          },
+          {
+            "cpu_ns": 1183100,
+            "wall_ns": 1182811
+          },
+          {
+            "cpu_ns": 1168850,
+            "wall_ns": 1168491
+          },
+          {
+            "cpu_ns": 1162940,
+            "wall_ns": 1162860
+          },
+          {
+            "cpu_ns": 1180110,
+            "wall_ns": 1179680
+          },
+          {
+            "cpu_ns": 1136470,
+            "wall_ns": 1136241
+          },
+          {
+            "cpu_ns": 1161520,
+            "wall_ns": 1160911
+          },
+          {
+            "cpu_ns": 1187010,
+            "wall_ns": 1187101
+          },
+          {
+            "cpu_ns": 1161880,
+            "wall_ns": 1161731
+          },
+          {
+            "cpu_ns": 1174050,
+            "wall_ns": 1174281
+          },
+          {
+            "cpu_ns": 1155180,
+            "wall_ns": 1154890
+          },
+          {
+            "cpu_ns": 1158340,
+            "wall_ns": 1158050
+          },
+          {
+            "cpu_ns": 1289240,
+            "wall_ns": 1288980
+          },
+          {
+            "cpu_ns": 1235190,
+            "wall_ns": 1234960
+          },
+          {
+            "cpu_ns": 1143020,
+            "wall_ns": 1150701
+          },
+          {
+            "cpu_ns": 1145870,
+            "wall_ns": 1145671
+          },
+          {
+            "cpu_ns": 1159160,
+            "wall_ns": 1158501
+          },
+          {
+            "cpu_ns": 1234610,
+            "wall_ns": 1234291
+          },
+          {
+            "cpu_ns": 1158090,
+            "wall_ns": 1157841
+          },
+          {
+            "cpu_ns": 1145910,
+            "wall_ns": 1145571
+          },
+          {
+            "cpu_ns": 1187080,
+            "wall_ns": 1186881
+          },
+          {
+            "cpu_ns": 1171440,
+            "wall_ns": 1171161
+          },
+          {
+            "cpu_ns": 1186220,
+            "wall_ns": 1186061
+          },
+          {
+            "cpu_ns": 1156020,
+            "wall_ns": 1155571
+          },
+          {
+            "cpu_ns": 1121610,
+            "wall_ns": 1121351
+          },
+          {
+            "cpu_ns": 1206610,
+            "wall_ns": 1206221
+          },
+          {
+            "cpu_ns": 1167860,
+            "wall_ns": 1167640
+          },
+          {
+            "cpu_ns": 1178920,
+            "wall_ns": 1178570
+          },
+          {
+            "cpu_ns": 1327800,
+            "wall_ns": 1327440
+          },
+          {
+            "cpu_ns": 1140260,
+            "wall_ns": 1140030
+          },
+          {
+            "cpu_ns": 1153140,
+            "wall_ns": 1152800
+          },
+          {
+            "cpu_ns": 1164870,
+            "wall_ns": 1164690
+          },
+          {
+            "cpu_ns": 1178390,
+            "wall_ns": 1177781
+          },
+          {
+            "cpu_ns": 1139180,
+            "wall_ns": 1138861
+          },
+          {
+            "cpu_ns": 1160380,
+            "wall_ns": 1160211
+          },
+          {
+            "cpu_ns": 1159040,
+            "wall_ns": 1158631
+          },
+          {
+            "cpu_ns": 1152320,
+            "wall_ns": 1152531
+          },
+          {
+            "cpu_ns": 1127650,
+            "wall_ns": 1127770
+          },
+          {
+            "cpu_ns": 1155730,
+            "wall_ns": 1155431
+          },
+          {
+            "cpu_ns": 1155730,
+            "wall_ns": 1155561
+          },
+          {
+            "cpu_ns": 1176800,
+            "wall_ns": 1176881
+          },
+          {
+            "cpu_ns": 1134170,
+            "wall_ns": 1133971
+          },
+          {
+            "cpu_ns": 1262040,
+            "wall_ns": 1261991
+          },
+          {
+            "cpu_ns": 1150500,
+            "wall_ns": 1150321
+          },
+          {
+            "cpu_ns": 1153550,
+            "wall_ns": 1153360
+          },
+          {
+            "cpu_ns": 1166910,
+            "wall_ns": 1166701
+          },
+          {
+            "cpu_ns": 1168150,
+            "wall_ns": 1167941
+          },
+          {
+            "cpu_ns": 1154950,
+            "wall_ns": 1154771
+          },
+          {
+            "cpu_ns": 1152520,
+            "wall_ns": 1152251
+          },
+          {
+            "cpu_ns": 1151430,
+            "wall_ns": 1150771
+          },
+          {
+            "cpu_ns": 1168590,
+            "wall_ns": 1168081
+          },
+          {
+            "cpu_ns": 1148990,
+            "wall_ns": 1148751
+          },
+          {
+            "cpu_ns": 1135170,
+            "wall_ns": 1134840
+          },
+          {
+            "cpu_ns": 1153660,
+            "wall_ns": 1153380
+          },
+          {
+            "cpu_ns": 1172160,
+            "wall_ns": 1172031
+          },
+          {
+            "cpu_ns": 1191980,
+            "wall_ns": 1191800
+          },
+          {
+            "cpu_ns": 1256480,
+            "wall_ns": 1256231
+          },
+          {
+            "cpu_ns": 1143800,
+            "wall_ns": 1143520
+          },
+          {
+            "cpu_ns": 1197920,
+            "wall_ns": 1197731
+          },
+          {
+            "cpu_ns": 1177900,
+            "wall_ns": 1178011
+          },
+          {
+            "cpu_ns": 1162450,
+            "wall_ns": 1162340
+          },
+          {
+            "cpu_ns": 1149450,
+            "wall_ns": 1149301
+          },
+          {
+            "cpu_ns": 1153140,
+            "wall_ns": 1153011
+          },
+          {
+            "cpu_ns": 1150910,
+            "wall_ns": 1150931
+          },
+          {
+            "cpu_ns": 1170170,
+            "wall_ns": 1170011
+          }
+        ]
+      },
+      "prepare_ns_total": 3297358267,
+      "sample_count": 110,
+      "sample_stride": 1
+    }
+  },
+  "profile": "timing",
+  "repetition": 2,
+  "report_dir": "docs/superpowers/reports/series-parquet-measurement",
+  "run_dir": "/tmp/series-stages/stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+  "run_files": [],
+  "run_id": "stages-sort_seal-isolated-logs-1k-stable-zstd-timing-r002",
+  "samples": [
+    {
+      "cpu_ns": 9012670,
+      "index": 0,
+      "wall_ns": 9013905
+    },
+    {
+      "cpu_ns": 9113370,
+      "index": 1,
+      "wall_ns": 9114165
+    },
+    {
+      "cpu_ns": 9180390,
+      "index": 2,
+      "wall_ns": 9181416
+    },
+    {
+      "cpu_ns": 8925900,
+      "index": 3,
+      "wall_ns": 8936045
+    },
+    {
+      "cpu_ns": 9086150,
+      "index": 4,
+      "wall_ns": 9086596
+    },
+    {
+      "cpu_ns": 9058950,
+      "index": 5,
+      "wall_ns": 9059815
+    },
+    {
+      "cpu_ns": 10277670,
+      "index": 6,
+      "wall_ns": 10278546
+    },
+    {
+      "cpu_ns": 12706700,
+      "index": 7,
+      "wall_ns": 12707498
+    },
+    {
+      "cpu_ns": 12719750,
+      "index": 8,
+      "wall_ns": 12720447
+    },
+    {
+      "cpu_ns": 10669450,
+      "index": 9,
+      "wall_ns": 10670036
+    },
+    {
+      "cpu_ns": 8729040,
+      "index": 10,
+      "wall_ns": 8729705
+    },
+    {
+      "cpu_ns": 8743340,
+      "index": 11,
+      "wall_ns": 8744015
+    },
+    {
+      "cpu_ns": 8901740,
+      "index": 12,
+      "wall_ns": 8902575
+    },
+    {
+      "cpu_ns": 8868450,
+      "index": 13,
+      "wall_ns": 8878515
+    },
+    {
+      "cpu_ns": 9122100,
+      "index": 14,
+      "wall_ns": 9123296
+    },
+    {
+      "cpu_ns": 9089890,
+      "index": 15,
+      "wall_ns": 9090235
+    },
+    {
+      "cpu_ns": 8405480,
+      "index": 16,
+      "wall_ns": 8406444
+    },
+    {
+      "cpu_ns": 8906470,
+      "index": 17,
+      "wall_ns": 8907025
+    },
+    {
+      "cpu_ns": 8738250,
+      "index": 18,
+      "wall_ns": 8738665
+    },
+    {
+      "cpu_ns": 8841120,
+      "index": 19,
+      "wall_ns": 8841685
+    },
+    {
+      "cpu_ns": 9316280,
+      "index": 20,
+      "wall_ns": 9316715
+    },
+    {
+      "cpu_ns": 9645780,
+      "index": 21,
+      "wall_ns": 9646395
+    },
+    {
+      "cpu_ns": 8747110,
+      "index": 22,
+      "wall_ns": 8747875
+    },
+    {
+      "cpu_ns": 8750650,
+      "index": 23,
+      "wall_ns": 8751135
+    },
+    {
+      "cpu_ns": 8940510,
+      "index": 24,
+      "wall_ns": 8941255
+    },
+    {
+      "cpu_ns": 9766770,
+      "index": 25,
+      "wall_ns": 9767735
+    },
+    {
+      "cpu_ns": 9151680,
+      "index": 26,
+      "wall_ns": 9152815
+    },
+    {
+      "cpu_ns": 8719380,
+      "index": 27,
+      "wall_ns": 8720005
+    },
+    {
+      "cpu_ns": 9433530,
+      "index": 28,
+      "wall_ns": 9434056
+    },
+    {
+      "cpu_ns": 9067530,
+      "index": 29,
+      "wall_ns": 9067995
+    },
+    {
+      "cpu_ns": 9629390,
+      "index": 30,
+      "wall_ns": 9630355
+    },
+    {
+      "cpu_ns": 9279760,
+      "index": 31,
+      "wall_ns": 9280865
+    },
+    {
+      "cpu_ns": 8965780,
+      "index": 32,
+      "wall_ns": 8966166
+    },
+    {
+      "cpu_ns": 8882650,
+      "index": 33,
+      "wall_ns": 8883295
+    },
+    {
+      "cpu_ns": 9017460,
+      "index": 34,
+      "wall_ns": 9018515
+    },
+    {
+      "cpu_ns": 9530590,
+      "index": 35,
+      "wall_ns": 9531575
+    },
+    {
+      "cpu_ns": 8888130,
+      "index": 36,
+      "wall_ns": 8889175
+    },
+    {
+      "cpu_ns": 9114700,
+      "index": 37,
+      "wall_ns": 9115755
+    },
+    {
+      "cpu_ns": 9005560,
+      "index": 38,
+      "wall_ns": 9006485
+    },
+    {
+      "cpu_ns": 9099540,
+      "index": 39,
+      "wall_ns": 9100045
+    },
+    {
+      "cpu_ns": 8991300,
+      "index": 40,
+      "wall_ns": 8991945
+    },
+    {
+      "cpu_ns": 8952270,
+      "index": 41,
+      "wall_ns": 8952955
+    },
+    {
+      "cpu_ns": 8832130,
+      "index": 42,
+      "wall_ns": 8840775
+    },
+    {
+      "cpu_ns": 8999350,
+      "index": 43,
+      "wall_ns": 8999815
+    },
+    {
+      "cpu_ns": 9295870,
+      "index": 44,
+      "wall_ns": 9296365
+    },
+    {
+      "cpu_ns": 9348560,
+      "index": 45,
+      "wall_ns": 9349216
+    },
+    {
+      "cpu_ns": 8817970,
+      "index": 46,
+      "wall_ns": 8818485
+    },
+    {
+      "cpu_ns": 8804140,
+      "index": 47,
+      "wall_ns": 8804706
+    },
+    {
+      "cpu_ns": 8916850,
+      "index": 48,
+      "wall_ns": 8917375
+    },
+    {
+      "cpu_ns": 8907960,
+      "index": 49,
+      "wall_ns": 8908675
+    },
+    {
+      "cpu_ns": 8841030,
+      "index": 50,
+      "wall_ns": 8841405
+    },
+    {
+      "cpu_ns": 8927610,
+      "index": 51,
+      "wall_ns": 8927985
+    },
+    {
+      "cpu_ns": 9247270,
+      "index": 52,
+      "wall_ns": 9256455
+    },
+    {
+      "cpu_ns": 9335300,
+      "index": 53,
+      "wall_ns": 9335866
+    },
+    {
+      "cpu_ns": 8831200,
+      "index": 54,
+      "wall_ns": 8831505
+    },
+    {
+      "cpu_ns": 9021740,
+      "index": 55,
+      "wall_ns": 9022325
+    },
+    {
+      "cpu_ns": 8939960,
+      "index": 56,
+      "wall_ns": 8940516
+    },
+    {
+      "cpu_ns": 8943130,
+      "index": 57,
+      "wall_ns": 8943635
+    },
+    {
+      "cpu_ns": 8968700,
+      "index": 58,
+      "wall_ns": 8969235
+    },
+    {
+      "cpu_ns": 8903710,
+      "index": 59,
+      "wall_ns": 8912215
+    },
+    {
+      "cpu_ns": 8799620,
+      "index": 60,
+      "wall_ns": 8800665
+    },
+    {
+      "cpu_ns": 8818940,
+      "index": 61,
+      "wall_ns": 8819675
+    },
+    {
+      "cpu_ns": 9243270,
+      "index": 62,
+      "wall_ns": 9243866
+    },
+    {
+      "cpu_ns": 8898660,
+      "index": 63,
+      "wall_ns": 8899055
+    },
+    {
+      "cpu_ns": 8717410,
+      "index": 64,
+      "wall_ns": 8717935
+    },
+    {
+      "cpu_ns": 9178830,
+      "index": 65,
+      "wall_ns": 9187465
+    },
+    {
+      "cpu_ns": 10037950,
+      "index": 66,
+      "wall_ns": 10038766
+    },
+    {
+      "cpu_ns": 8987580,
+      "index": 67,
+      "wall_ns": 8988005
+    },
+    {
+      "cpu_ns": 8878730,
+      "index": 68,
+      "wall_ns": 8880525
+    },
+    {
+      "cpu_ns": 8790060,
+      "index": 69,
+      "wall_ns": 8790905
+    },
+    {
+      "cpu_ns": 9528130,
+      "index": 70,
+      "wall_ns": 9529285
+    },
+    {
+      "cpu_ns": 9158860,
+      "index": 71,
+      "wall_ns": 9159485
+    },
+    {
+      "cpu_ns": 8912030,
+      "index": 72,
+      "wall_ns": 8913075
+    },
+    {
+      "cpu_ns": 8950630,
+      "index": 73,
+      "wall_ns": 8951405
+    },
+    {
+      "cpu_ns": 8889560,
+      "index": 74,
+      "wall_ns": 8890325
+    },
+    {
+      "cpu_ns": 9139970,
+      "index": 75,
+      "wall_ns": 9141105
+    },
+    {
+      "cpu_ns": 9085610,
+      "index": 76,
+      "wall_ns": 9086355
+    },
+    {
+      "cpu_ns": 9232050,
+      "index": 77,
+      "wall_ns": 9232606
+    },
+    {
+      "cpu_ns": 8865000,
+      "index": 78,
+      "wall_ns": 8865825
+    },
+    {
+      "cpu_ns": 8833410,
+      "index": 79,
+      "wall_ns": 8837605
+    },
+    {
+      "cpu_ns": 9107140,
+      "index": 80,
+      "wall_ns": 9107545
+    },
+    {
+      "cpu_ns": 8911740,
+      "index": 81,
+      "wall_ns": 8912075
+    },
+    {
+      "cpu_ns": 8713620,
+      "index": 82,
+      "wall_ns": 8714074
+    },
+    {
+      "cpu_ns": 8799140,
+      "index": 83,
+      "wall_ns": 8799565
+    },
+    {
+      "cpu_ns": 9005530,
+      "index": 84,
+      "wall_ns": 9006376
+    },
+    {
+      "cpu_ns": 9180430,
+      "index": 85,
+      "wall_ns": 9180886
+    },
+    {
+      "cpu_ns": 8798270,
+      "index": 86,
+      "wall_ns": 8799055
+    },
+    {
+      "cpu_ns": 11460560,
+      "index": 87,
+      "wall_ns": 11461526
+    },
+    {
+      "cpu_ns": 9132590,
+      "index": 88,
+      "wall_ns": 9133856
+    },
+    {
+      "cpu_ns": 8880690,
+      "index": 89,
+      "wall_ns": 8881185
+    },
+    {
+      "cpu_ns": 9068200,
+      "index": 90,
+      "wall_ns": 9068636
+    },
+    {
+      "cpu_ns": 8974070,
+      "index": 91,
+      "wall_ns": 8974686
+    },
+    {
+      "cpu_ns": 8950570,
+      "index": 92,
+      "wall_ns": 8951545
+    },
+    {
+      "cpu_ns": 9392450,
+      "index": 93,
+      "wall_ns": 9392955
+    },
+    {
+      "cpu_ns": 9264630,
+      "index": 94,
+      "wall_ns": 9265335
+    },
+    {
+      "cpu_ns": 9018030,
+      "index": 95,
+      "wall_ns": 9018505
+    },
+    {
+      "cpu_ns": 8997090,
+      "index": 96,
+      "wall_ns": 8997535
+    },
+    {
+      "cpu_ns": 9212650,
+      "index": 97,
+      "wall_ns": 9213675
+    },
+    {
+      "cpu_ns": 9093490,
+      "index": 98,
+      "wall_ns": 9093925
+    },
+    {
+      "cpu_ns": 9204490,
+      "index": 99,
+      "wall_ns": 9204866
+    },
+    {
+      "cpu_ns": 8987330,
+      "index": 100,
+      "wall_ns": 8987855
+    },
+    {
+      "cpu_ns": 8810730,
+      "index": 101,
+      "wall_ns": 8810995
+    },
+    {
+      "cpu_ns": 8824430,
+      "index": 102,
+      "wall_ns": 8825055
+    },
+    {
+      "cpu_ns": 9190320,
+      "index": 103,
+      "wall_ns": 9191336
+    },
+    {
+      "cpu_ns": 8851730,
+      "index": 104,
+      "wall_ns": 8852525
+    },
+    {
+      "cpu_ns": 8693430,
+      "index": 105,
+      "wall_ns": 8693815
+    },
+    {
+      "cpu_ns": 8766140,
+      "index": 106,
+      "wall_ns": 8776745
+    },
+    {
+      "cpu_ns": 8783900,
+      "index": 107,
+      "wall_ns": 8784325
+    },
+    {
+      "cpu_ns": 8987180,
+      "index": 108,
+      "wall_ns": 8987495
+    },
+    {
+      "cpu_ns": 8732600,
+      "index": 109,
+      "wall_ns": 8732945
+    }
+  ],
+  "schema_version": 1,
+  "stage": "sort_seal",
+  "started_utc": "2026-09-22T18:28:06Z",
+  "status": "passed",
+  "workload": {
+    "body_bytes": 1024,
+    "metrics_every": 1000,
+    "records_per_request": 100,
+    "requests": 201,
+    "seed": 20260922,
+    "series": 100
+  },
+  "workload_config_id": "logs-1k-stable",
+  "workload_schedule": {
+    "duration_s": 1,
+    "max_in_flight": 1,
+    "rate_requests_per_s": "closed_loop"
+  }
+}

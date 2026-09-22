@@ -12,6 +12,9 @@ description = "Series/values normalization and Parquet sink for OTAP telemetry"
 
 [features]
 default = []
+# Installs DHAT's global allocator in the `measurement` bench executable,
+# for its heap profile only. No library code uses it.
+bench-heap = []
 
 [dependencies]
 otel-arrow-dfe-pdata.workspace = true
@@ -38,6 +41,22 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+cpu-time.workspace = true
+criterion.workspace = true
+dhat.workspace = true
+object_store = { workspace = true, features = ["aws", "fs"] }
+otel-arrow-dfe-otap = { workspace = true, features = ["aws", "crypto-ring"] }
+prost.workspace = true
+sha2.workspace = true
+
+[[bench]]
+name = "measurement"
+harness = false
+
+[[bench]]
+name = "layered"
+harness = false
 
 [lints]
 workspace = true

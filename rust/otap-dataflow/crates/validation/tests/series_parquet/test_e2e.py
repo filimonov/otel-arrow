@@ -148,7 +148,12 @@ class LocalLauncher:
         return process.pid
 
 
-TOPOLOGIES = ("strict", "buffered")
+# `noop` replaces the exporter with the always-enabled noop exporter, which
+# acknowledges every request without storing anything. It is the pipeline
+# baseline of the layered benchmarks: the receiver and the engine are the
+# real ones, so it calibrates producer and engine cost, and it is never a
+# durable-storage measurement.
+TOPOLOGIES = ("strict", "buffered", "noop")
 
 # The node the buffered topology inserts between the receiver and the
 # exporter, and the settings every buffered measurement runs with: a bounded
@@ -206,12 +211,19 @@ def engine_config(
     nodes["receiver"]["config"]["protocols"]["grpc"]["listening_addr"] = (
         f"127.0.0.1:{grpc_port}"
     )
-    export = nodes["exporter"]["config"]
-    export["storage"] = storage or {"file": {"base_uri": str(data)}}
-    export["window"]["interval"] = interval
-    if overrides:
-        for key, value in overrides.items():
-            export[key] = value
+    if topology == "noop":
+        # The noop exporter has no node configuration at all, so the
+        # exporter section is replaced rather than merged into.
+        nodes["exporter"] = {"type": "exporter:noop", "config": {}}
+        if overrides:
+            raise ValueError("the noop topology has no exporter settings")
+    else:
+        export = nodes["exporter"]["config"]
+        export["storage"] = storage or {"file": {"base_uri": str(data)}}
+        export["window"]["interval"] = interval
+        if overrides:
+            for key, value in overrides.items():
+                export[key] = value
     if log_level:
         # Set explicitly rather than through RUST_LOG, which the engine
         # only consults when the configuration omits a level: a test that
@@ -298,6 +310,7 @@ def graph_edges(config):
 
 EXPECTED_EDGES = {
     "strict": [("receiver", "exporter")],
+    "noop": [("receiver", "exporter")],
     "buffered": [("receiver", BUFFER_NODE), (BUFFER_NODE, "exporter")],
 }
 
