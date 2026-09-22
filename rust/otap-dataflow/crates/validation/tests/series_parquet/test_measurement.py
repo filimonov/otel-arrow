@@ -3615,24 +3615,80 @@ class StageContracts(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "row limit"):
                 performance.check_fixture("too-wide")
 
-    # Scenario: cargo reports a bench executable built without optimization.
-    # Guarantees: a debug bench is refused before it measures anything.
+    # Scenario: the only prebuilt executable that answers is a debug build
+    # of the bench.
+    # Guarantees: a debug bench is refused before it measures anything, and
+    # the refusal names the command that builds a measured one.
     def test_a_debug_bench_is_refused(self):
-        message = json.dumps(
-            {
-                "reason": "compiler-artifact",
-                "executable": "/tmp/measurement",
-                "target": {"name": "measurement"},
-                "profile": {"opt_level": "0", "test": True, "debug_assertions": True},
-            }
-        )
-        with mock.patch.object(
-            performance.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0, message, ""),
+        directory = temporary_directory(self)
+        executable = directory / "measurement-deadbeef"
+        _ = executable.write_text("")
+        executable.chmod(0o755)
+        description = {
+            "bench": "measurement",
+            "bench_heap": False,
+            "allocator": "system",
+            "debug_assertions": True,
+        }
+        with mock.patch.dict(
+            os.environ, {"SERIES_STAGE_BENCH": str(executable)}, clear=False
         ):
-            with self.assertRaisesRegex(AssertionError, "opt-level"):
-                _ = performance.locate_benches()
+            with mock.patch.object(
+                performance, "describe_bench", return_value=description
+            ):
+                with self.assertRaisesRegex(AssertionError, "debug assertions"):
+                    _ = performance.locate_benches()
+
+    # Scenario: the bench executables have not been built.
+    # Guarantees: the family refuses to start, names the cargo command that
+    # builds what is missing, and runs no compiler of its own -- a build
+    # beside a measurement is what invalidates it.
+    def test_missing_benches_are_refused_without_building(self):
+        directory = temporary_directory(self)
+        calls = []
+
+        def refuse(argv, *args, **kwargs):
+            """Record any subprocess the discovery would have started."""
+            calls.append(list(argv))
+            raise AssertionError(f"discovery started {argv!r}")
+
+        with mock.patch.object(performance.test_e2e, "WORKSPACE", directory):
+            with mock.patch.object(performance.subprocess, "run", refuse):
+                with self.assertRaisesRegex(
+                    AssertionError, "cargo bench -p otel-arrow-dfe-series-lake"
+                ):
+                    _ = performance.locate_benches()
+        self.assertEqual(calls, [])
+
+    # Scenario: two prebuilt executables of the same bench exist, one with
+    # DHAT's allocator and one without.
+    # Guarantees: each profile is given the executable that identifies
+    # itself as its build, never the one that merely sorts first.
+    def test_each_profile_gets_its_own_build(self):
+        directory = temporary_directory(self)
+        deps = directory / "target/release/deps"
+        deps.mkdir(parents=True)
+        described = {}
+        for name, heap in (("measurement-aaa", False), ("measurement-bbb", True),
+                           ("layered-ccc", False)):
+            path = deps / name
+            _ = path.write_text("")
+            path.chmod(0o755)
+            described[str(path)] = {
+                "bench": name.split("-")[0],
+                "bench_heap": heap,
+                "allocator": "dhat" if heap else "system",
+                "debug_assertions": False,
+            }
+        with mock.patch.object(performance.test_e2e, "WORKSPACE", directory):
+            with mock.patch.object(
+                performance, "describe_bench", lambda path, **_: described[str(path)]
+            ):
+                timing = performance.locate_benches()
+                heap = performance.locate_benches(features=("bench-heap",))
+        self.assertTrue(timing["measurement"]["executable"].endswith("measurement-aaa"))
+        self.assertTrue(timing["layered"]["executable"].endswith("layered-ccc"))
+        self.assertTrue(heap["measurement"]["executable"].endswith("measurement-bbb"))
 
     # Scenario: the noop pipeline stores nothing, and its stage result says
     # so with a measured zero.

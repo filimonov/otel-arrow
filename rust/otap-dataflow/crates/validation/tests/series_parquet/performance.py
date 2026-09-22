@@ -453,66 +453,127 @@ def check_fixture(config_id) -> None:
 # Locating the prebuilt benches
 # --------------------------------------------------------------------------
 
-# The build profiles a measured bench may have been built with. A debug
-# bench measures the debug build, never the exporter.
-MEASURED_OPT_LEVEL = "3"
 
 
-def locate_benches(*, features=(), timeout_s=1800) -> dict:
-    """Locate the prebuilt bench executables, before any lease is taken.
 
-    Cargo is asked where each bench target's executable is and with what
-    profile. This is setup verification, never a measured interval: it runs
-    before the host controls open, and a build monitored later would
-    invalidate the run that saw it.
+# Where prebuilt bench executables live, and what names them.
+BENCH_DEPS = "target/release/deps"
+
+# The environment variables that name an executable outright.
+BENCH_ENV = {
+    ("measurement", False): "SERIES_STAGE_BENCH",
+    ("measurement", True): "SERIES_STAGE_BENCH_HEAP",
+    ("layered", False): "SERIES_LAYERED_BENCH",
+}
+
+# How each executable is built, named in the error a missing one raises.
+BENCH_BUILD_COMMANDS = {
+    ("measurement", False): (
+        "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "
+        "--bench layered --no-run"
+    ),
+    ("layered", False): (
+        "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "
+        "--bench layered --no-run"
+    ),
+    ("measurement", True): (
+        "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "
+        "--no-run --features bench-heap"
+    ),
+}
+
+
+def describe_bench(executable, timeout_s=60) -> dict:
+    """Ask one prebuilt executable what it is.
+
+    The executable answers `--describe` with its target name, whether DHAT's
+    allocator is installed and whether it carries debug assertions. Asking
+    cargo instead would build the target it was asked about, and a compiler
+    running beside a measurement is exactly what invalidates one.
     """
-    argv = [
-        "cargo", "bench", "-p", "otel-arrow-dfe-series-lake",
-        "--bench", "measurement", "--bench", "layered", "--no-run",
-        "--message-format=json",
-    ]
-    if features:
-        argv += ["--features", ",".join(features)]
     done = subprocess.run(
-        argv, cwd=str(test_e2e.WORKSPACE), capture_output=True, text=True,
+        [str(executable), "--describe"], capture_output=True, text=True,
         timeout=timeout_s,
     )
     if done.returncode != 0:
-        raise AssertionError(f"cargo could not produce the benches: {done.stderr[-4000:]}")
+        raise AssertionError(
+            f"{executable} did not answer --describe: {done.stderr[-500:]}"
+        )
+    return json.loads(done.stdout)
+
+
+def candidate_executables(name) -> list:
+    """Every prebuilt file in the release deps directory named for `name`.
+
+    Cargo names a bench executable `<target>-<hash>`, writes a `.d` file
+    beside it and keeps older hashes, so the candidates are filtered to
+    executable files with no suffix and ordered newest first.
+    """
+    directory = Path(test_e2e.WORKSPACE) / BENCH_DEPS
+    if not directory.is_dir():
+        return []
+    found = [
+        path
+        for path in directory.glob(f"{name}-*")
+        if path.is_file() and not path.suffix and os.access(path, os.X_OK)
+    ]
+    return sorted(found, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def locate_benches(*, features=()) -> dict:
+    """Locate prebuilt bench executables without building anything.
+
+    No cargo runs here or anywhere else in a measured family: the run
+    launches executables that already exist and refuses to start when one is
+    missing, naming the command that builds it. Each candidate identifies
+    itself, so the DHAT build and the timing build are told apart by what
+    they are rather than by their file name, and a debug build is refused.
+    """
+    heap = "bench-heap" in features
+    wanted = [("measurement", heap)] + ([] if heap else [("layered", False)])
     found = {}
-    for line in done.stdout.splitlines():
-        try:
-            message = json.loads(line)
-        except ValueError:
-            continue
-        if message.get("reason") != "compiler-artifact" or not message.get("executable"):
-            continue
-        name = message["target"]["name"]
-        if name not in ("measurement", "layered"):
-            continue
-        profile = message.get("profile", {})
-        # Cargo marks every bench target `test: true`, because it builds
-        # them through the test harness machinery; what a measurement
-        # cannot have is a debug build, so the optimization level and the
-        # debug assertions are what is refused here.
-        if profile.get("opt_level") != MEASURED_OPT_LEVEL or profile.get(
-            "debug_assertions"
-        ):
+    for name, needs_heap in wanted:
+        override = os.environ.get(BENCH_ENV[(name, needs_heap)])
+        candidates = [Path(override)] if override else candidate_executables(name)
+        problems = []
+        for path in candidates:
+            if not path.is_file():
+                problems.append(f"{path}: not a file")
+                continue
+            if Path("target/debug") in Path(path).parents or "/target/debug/" in str(path):
+                problems.append(f"{path}: a debug build is not a measurement")
+                continue
+            try:
+                description = describe_bench(path)
+            except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as error:
+                problems.append(f"{path}: {error}")
+                continue
+            if description.get("bench") != name:
+                problems.append(f"{path}: is the {description.get('bench')!r} bench")
+                continue
+            if description.get("debug_assertions"):
+                problems.append(
+                    f"{path}: carries debug assertions; a measured bench uses "
+                    f"the bench profile"
+                )
+                continue
+            if bool(description.get("bench_heap")) != needs_heap:
+                continue
+            found[name] = {
+                "executable": str(path),
+                "description": description,
+                "features": sorted(features),
+                "mtime": path.stat().st_mtime,
+            }
+            break
+        if name not in found:
             raise AssertionError(
-                f"the {name} bench was built at opt-level "
-                f"{profile.get('opt_level')!r} with debug assertions "
-                f"{profile.get('debug_assertions')!r}; a measured bench uses "
-                f"the bench profile"
+                f"no prebuilt {name} bench"
+                + (" with the bench-heap feature" if needs_heap else "")
+                + f" was found in {BENCH_DEPS}; build it before measuring with: "
+                + BENCH_BUILD_COMMANDS[(name, needs_heap)]
+                + (f"; rejected candidates: {problems[:3]}" if problems else "")
             )
-        found[name] = {
-            "executable": message["executable"],
-            "opt_level": profile.get("opt_level"),
-            "debug_assertions": profile.get("debug_assertions"),
-            "features": sorted(features),
-        }
-    missing = sorted({"measurement", "layered"} - set(found))
-    if missing:
-        raise AssertionError(f"cargo produced no executable for {missing}")
     return found
 
 
@@ -2230,9 +2291,13 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     stages_filter = options.get("stages")
     for config_id in configs:
         check_fixture(config_id)
-    # Everything below the lease is prebuilt: cargo runs here, before any
-    # measured interval, and a build seen later invalidates the run.
+    # Everything below is prebuilt. This family never invokes cargo: it
+    # locates executables that already exist and refuses to start when one
+    # is missing, because a compiler running beside a measurement is
+    # exactly what the build monitor exists to catch.
     git = measurement.git_provenance()
+    # Discovery, not a build: both calls only ask already built executables
+    # what they are, so no compiler ever runs inside this family.
     timing = locate_benches()
     heap = locate_benches(features=("bench-heap",))
     plan = {

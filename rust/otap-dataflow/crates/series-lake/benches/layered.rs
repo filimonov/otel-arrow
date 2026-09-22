@@ -36,7 +36,26 @@ fn required(name: &str) -> Result<PathBuf> {
         .ok_or_else(|| format!("{name} must name a file").into())
 }
 
+/// Answer `--describe` before Criterion sees the command line, so that a
+/// harness can identify a prebuilt executable without building anything.
+fn describe() -> serde_json::Value {
+    serde_json::json!({
+        "bench": "layered",
+        "bench_heap": cfg!(feature = "bench-heap"),
+        "allocator": "system",
+        "debug_assertions": cfg!(debug_assertions),
+        "handshake": true,
+        "stages": StageName::LAYERS.iter().map(|stage| stage.as_str()).collect::<Vec<_>>(),
+    })
+}
+
 fn main() -> Result<()> {
+    if std::env::args().any(|argument| argument == "--describe") {
+        let mut stdout = std::io::stdout();
+        serde_json::to_writer(&mut stdout, &describe())?;
+        stdout.write_all(b"\n")?;
+        return Ok(());
+    }
     let cfg = BenchConfig::read(&required("SERIES_STAGE_CONFIG")?)?;
     let input = stages::read_input(&required("SERIES_STAGE_INPUT")?)?;
     let handshake = std::env::var("SERIES_STAGE_HANDSHAKE").is_ok_and(|value| value == "1");

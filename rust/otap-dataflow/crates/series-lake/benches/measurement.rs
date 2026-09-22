@@ -9,6 +9,7 @@
 //!             --iterations N --profile timing|heap --compression zstd|none
 //!             [--handshake]
 //! measurement --self-test
+//! measurement --describe
 //! ```
 //!
 //! The input is deterministic length-prefixed OTLP requests of one signal
@@ -91,7 +92,39 @@ struct Args {
 /// What the command line asked for.
 enum Command {
     SelfTest,
+    Describe,
     Measure(Box<Args>),
+}
+
+/// What this executable is, for a harness that must not build anything.
+///
+/// The harness locates prebuilt executables and asks each one what it is,
+/// instead of asking cargo -- which would build the target it was asked
+/// about. `bench_heap` says whether DHAT's allocator is installed, and
+/// `debug_assertions` is how a debug build gives itself away.
+#[derive(Debug, Serialize)]
+struct Description {
+    bench: &'static str,
+    bench_heap: bool,
+    allocator: &'static str,
+    debug_assertions: bool,
+    handshake: bool,
+    stages: Vec<&'static str>,
+}
+
+fn describe() -> Description {
+    Description {
+        bench: "measurement",
+        bench_heap: cfg!(feature = "bench-heap"),
+        allocator: if cfg!(feature = "bench-heap") {
+            "dhat"
+        } else {
+            "system"
+        },
+        debug_assertions: cfg!(debug_assertions),
+        handshake: true,
+        stages: StageName::ALL.iter().map(|stage| stage.as_str()).collect(),
+    }
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
@@ -101,6 +134,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
             "--self-test" => return Ok(Command::SelfTest),
+            "--describe" => return Ok(Command::Describe),
             // `cargo bench` passes `--bench` to every harness-less target.
             "--bench" => {}
             "--handshake" => handshake = true,
@@ -474,6 +508,12 @@ fn measure_heap(_stage: &Stage, _args: &Args, _report: &mut Report) -> Result<()
 fn main() -> Result<()> {
     let args = match parse_args(std::env::args().skip(1))? {
         Command::SelfTest => return tests::run(),
+        Command::Describe => {
+            let mut stdout = std::io::stdout();
+            serde_json::to_writer(&mut stdout, &describe())?;
+            stdout.write_all(b"\n")?;
+            return Ok(());
+        }
         Command::Measure(args) => args,
     };
     if cfg!(feature = "bench-heap") != (args.profile == Profile::Heap) {
