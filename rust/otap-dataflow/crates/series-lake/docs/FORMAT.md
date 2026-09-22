@@ -214,26 +214,31 @@ is nullable:
   and leaves `value_int` and `value_double` null. A histogram without a
   distribution stores two empty lists, not two null lists.
 
-The point kind is not stored in the values row. It is `metric_type` in the
-`series` descriptor, and that descriptor is the only authoritative source of
-it: a reader classifies a values row by joining to the descriptor
-(section 6), never by which columns are null and never by `count`. Null-ness
-is a consequence of the point kind, not a definition of it, and a future
-additive column could make any given column null for a kind that fills it
-today.
+Classification rule: the point kind is not stored in the values row. It is
+`metric_type` in the `series` descriptor, and that descriptor is the only
+authoritative source of it. A reader classifies a values row by joining to
+the descriptor (section 6), never by which columns are null and never by
+`count`. Null-ness is a consequence of the point kind, not a definition of
+it, and a future additive column could make any given column null for a kind
+that fills it today.
 
-Null-ness is also not portable. DuckDB preserves the difference between a
-null list and an empty list, so `bucket_counts IS NULL` and
+File-level fact, which is not a reader rule: at the Parquet level a number
+row's `bucket_counts` and `explicit_bounds` are null, while a bucket-less
+histogram's are empty lists. The two encodings are genuinely different bytes
+and a writer must produce them as stated here. They are not equally visible
+to readers. DuckDB preserves the difference, so `bucket_counts IS NULL` and
 `bucket_counts = []` are distinguishable there. ClickHouse has no nullable
-`Array`, so its Parquet reader renders a null list as `[]` and the two cases
-become indistinguishable. A query that tried to separate "not a histogram
-row" from "histogram without buckets" by list null-ness would therefore give
-different answers in the two engines. The descriptor join gives the same
-answer in both. The two kinds share one dataset because a mixed metrics
-stream would otherwise cost two PUT requests per window even when every
-descriptor is already cached; an all-null column inside a row group costs
-only definition levels plus the column-chunk metadata, far less than a
-second file's footer, metadata and request. The tradeoff is that min/max
+`Array`, so its Parquet reader renders a null list as `[]` and collapses the
+two cases. A query that tried to separate "not a histogram row" from
+"histogram without buckets" by list null-ness would therefore answer
+differently in the two engines. That is why classification uses the
+descriptor, which answers the same in both.
+
+The two kinds share one dataset because a mixed metrics stream would
+otherwise cost two PUT requests per window even when every descriptor is
+already cached; an all-null column inside a row group costs only definition
+levels plus the column-chunk metadata, far less than a second file's footer,
+metadata and request. The tradeoff is that min/max
 statistics on `value_double` become less selective when the histogram rows
 of the same file leave it null.
 
