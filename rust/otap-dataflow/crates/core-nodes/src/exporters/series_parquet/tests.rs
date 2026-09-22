@@ -39,6 +39,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::trace::v1::{ResourceSpans, Scope
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_series_lake as lake;
+use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -422,13 +423,15 @@ async fn shutdown_decides_every_force_drained_request() {
                     .expect("a buffered request enqueues");
             }
 
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let config = worker_config();
             let node = tokio::task::spawn_local(super::run(
-                worker_config(),
+                config.clone(),
                 Arc::new(object_store::memory::InMemory::new()),
                 Arc::new(lake::clock::TestWallClock::new(0)),
                 inbox,
                 handler,
-                None,
+                Some(super::metrics::Metrics::register(&context, &config.lake)),
             ));
 
             for _ in 0..2 {
@@ -452,9 +455,24 @@ async fn shutdown_decides_every_force_drained_request() {
                 .await
                 .expect("the node returns once the upstream channel closes")
                 .expect("the node task joins");
-            if let Err(error) = terminal {
-                panic!("unexpected node failure: {error}");
-            }
+            let terminal = match terminal {
+                Ok(terminal) => terminal,
+                Err(error) => panic!("unexpected node failure: {error}"),
+            };
+            // The counters of the interval the node ends must reach the
+            // collector with it: nothing else will ever report them.
+            let snapshots = terminal.metrics();
+            assert_eq!(
+                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                3,
+                "every force-drained request is counted as a shutdown refusal"
+            );
+            assert_eq!(
+                terminal_value(snapshots, "notify.failures", &[]),
+                0,
+                "the completion channel took all three immediately"
+            );
+            assert_eq!(terminal_value(snapshots, "acks", &[]), 0);
             drop(control_tx);
         })
         .await;
@@ -1954,4 +1972,237 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
             }
         })
         .await;
+}
+
+/// Read one metric value out of a terminal handoff by name and labels.
+///
+/// Panics rather than returning an option: a test asking for a metric the
+/// handoff does not carry has found the regression it was written for.
+fn terminal_value(snapshots: &[MetricSetSnapshot], name: &str, labels: &[(&str, &str)]) -> u64 {
+    for snapshot in snapshots {
+        let Some(index) = snapshot
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|metric| metric.name == name)
+        else {
+            continue;
+        };
+        let actual: Vec<_> = snapshot.measurement_attributes().collect();
+        if actual.as_slice() != labels {
+            continue;
+        }
+        return snapshot.get_metrics()[index].to_u64_lossy();
+    }
+    panic!("no terminal snapshot carries {name} with {labels:?}")
+}
+
+/// Scenario: a node takes several requests, one telemetry collection and a
+/// shutdown, driving many turns of its select loop.
+/// Guarantees: the worker scans itself exactly once per collection and once
+/// more for the terminal handoff. The scan walks both token vectors and the
+/// notification queue, so sampling it per loop turn would make a block cost
+/// quadratic time in its request count.
+#[tokio::test(flavor = "current_thread")]
+async fn telemetry_is_scanned_only_when_it_is_collected() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(8);
+            let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(8);
+            let inbox = ExporterInbox::new(
+                Receiver::Local(LocalReceiver::mpsc(control_rx)),
+                Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+                0,
+                Interests::empty(),
+            );
+            let (handler, _rx) = effects(64);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (_reporter_rx, metrics_reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(16);
+
+            for _ in 0..3 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request enqueues");
+            }
+            control_tx
+                .send_async(NodeControlMsg::CollectTelemetry { metrics_reporter })
+                .await
+                .expect("the collection enqueues");
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            // Closing the upstream channel is what releases the latched
+            // shutdown once the backlog has been drained.
+            drop(pdata_tx);
+
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                handler,
+            );
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+            let terminal =
+                tokio::time::timeout(Duration::from_secs(5), super::drive(&mut worker, inbox))
+                    .await
+                    .expect("the node returns")
+                    .expect("the node does not fail");
+            assert!(
+                !terminal.metrics().is_empty(),
+                "the handoff carries metrics"
+            );
+            assert_eq!(
+                worker.samples, 2,
+                "one scan for the collection and one for the terminal handoff"
+            );
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: a block asks for a rotation because it filled its request budget,
+/// and the window boundary fires before that rotation has been served.
+/// Guarantees: the flush is reported as time-triggered, because that is what
+/// sealed it. A threshold that never got to rotate must not leave its reason
+/// behind for every boundary flush that follows.
+#[tokio::test(flavor = "current_thread")]
+async fn a_boundary_rotation_is_not_reported_under_a_stale_threshold_reason() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use super::metrics::{FlushAttrs, FlushReason, Metrics};
+
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config_with_requests(1),
+                Arc::new(object_store::memory::InMemory::new()),
+                wall.clone(),
+                handler,
+            );
+            worker.metrics = Some(Metrics::register(&context, &worker.cfg.lake));
+
+            worker.admit(logs_pdata());
+            assert_eq!(worker.reason, FlushReason::Requests);
+            assert!(worker.rotation_requested);
+
+            // The one-second window ends before the requested rotation has
+            // been served, so the boundary is what actually seals the block.
+            wall.set(2_000_000_000);
+            worker.wake_window();
+            assert_eq!(worker.reason, FlushReason::Time);
+
+            worker.rotate();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(
+                metrics
+                    .flush
+                    .get(FlushAttrs {
+                        reason: FlushReason::Time
+                    })
+                    .count
+                    .get(),
+                1
+            );
+            assert_eq!(
+                metrics
+                    .flush
+                    .get(FlushAttrs {
+                        reason: FlushReason::Requests
+                    })
+                    .count
+                    .get(),
+                0
+            );
+        })
+        .await;
+}
+
+/// Scenario: the shutdown deadline elapses while a write is outstanding, so
+/// the node cancels it instead of waiting for it.
+/// Guarantees: the abandoned flush is counted exactly as a write that returned
+/// `Cancelled` would be -- one failure, one cancellation and one duration --
+/// so a node that always runs out of time does not silently report zero
+/// flush failures.
+#[tokio::test(flavor = "current_thread")]
+async fn an_abandoned_flush_is_counted_as_cancelled() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                wall,
+                handler,
+            );
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            assert!(worker.flushing.is_some(), "a write is outstanding");
+
+            worker.abandon();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_failures.get(), 1);
+            assert_eq!(metrics.worker.flush_cancelled.get(), 1);
+            assert_eq!(metrics.worker.flush_duration.count, 1);
+        })
+        .await;
+}
+
+/// Scenario: one request fills a block, a second is parked behind it, and the
+/// first block's completions are released into the notifier.
+/// Guarantees: the parked extraction and the undelivered completions are each
+/// reported as their own `By` gauge and are both included in the accounted
+/// total, so the memory a saturated worker holds is visible per component
+/// rather than only in aggregate.
+#[tokio::test(flavor = "current_thread")]
+async fn pending_and_notification_bytes_are_reported() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config_with_requests(1),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.metrics = Some(super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    ));
+
+    worker.admit(logs_pdata());
+    worker.admit(logs_pdata());
+    assert!(worker.pending.is_some(), "the second request is parked");
+    // Releases the first block's completion into the notifier without needing
+    // a write to resolve.
+    worker.fail_active(Outcome::Storage);
+    assert_eq!(worker.notify.len(), 1);
+
+    worker.sample_metrics();
+    let metrics = worker.metrics.as_ref().expect("metrics");
+    let pending = metrics.worker.pending_bytes.get();
+    let tokens = metrics.worker.notify_token_bytes.get();
+    assert!(pending > 0, "the parked request retains rows and a token");
+    assert!(
+        tokens > 0,
+        "an undelivered completion retains its queue cell"
+    );
+    assert!(metrics.worker.memory_accounted_bytes.get() >= pending + tokens);
+    assert_eq!(metrics.worker.pending_slot.get(), 1);
 }

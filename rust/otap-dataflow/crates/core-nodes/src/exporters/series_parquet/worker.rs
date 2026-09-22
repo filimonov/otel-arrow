@@ -207,6 +207,14 @@ pub(super) struct Worker {
     pub(super) reason: FlushReason,
     /// Largest completion token the worker has held, for capacity reporting.
     pub(super) token_high_water: usize,
+    /// How many times the worker has scanned its state for telemetry.
+    ///
+    /// The scan walks both token vectors and the notification queue, so it is
+    /// linear in the number of live requests; a node that sampled it once per
+    /// loop turn would spend quadratic time per block. This counter exists so
+    /// a regression test can assert the scan happens only when telemetry is
+    /// actually collected.
+    pub(super) samples: u64,
     /// Registered instruments, once the node has a pipeline context.
     ///
     /// `None` for a worker driven directly by a test, which keeps every call
@@ -254,6 +262,7 @@ impl Worker {
             seq: 1,
             reason: FlushReason::Time,
             token_high_water: size_of::<AckToken>(),
+            samples: 0,
             metrics: None,
         }
     }
@@ -777,6 +786,7 @@ impl Worker {
         if self.metrics.is_none() {
             return;
         }
+        self.samples += 1;
         let flushing = self.flushing.as_ref().map_or(0, |job| job.bytes);
         let pending = self.pending.as_ref().map_or(0, |parked| {
             parked.extracted.pinned_bytes
@@ -835,6 +845,7 @@ impl Worker {
         let stats = self.cache.stats();
         let active_bytes = self.active.data.bytes as u64;
         let queued = self.notify.len() as u64;
+        let notify_bytes = self.notify.bytes() as u64;
         let failures = self.notify.failures();
         let outcomes = *self.notify.outcomes();
         let parked = self.pending.is_some();
@@ -846,9 +857,11 @@ impl Worker {
             metrics.worker.cache_evictions.observe(stats.evictions);
             metrics.worker.active_bytes.set(active_bytes);
             metrics.worker.flushing_bytes.set(flushing as u64);
+            metrics.worker.pending_bytes.set(pending as u64);
             metrics.worker.requests_pending.set(requests);
             metrics.worker.pending_slot.set(u64::from(parked));
             metrics.worker.notify_queued.set(queued);
+            metrics.worker.notify_token_bytes.set(notify_bytes);
             metrics.worker.notify_failures.observe(failures);
             metrics.worker.acks.observe(outcomes[Outcome::Ack as usize]);
             for (outcome, reason) in [
@@ -869,6 +882,19 @@ impl Worker {
             }));
             metrics.worker.memory_accounted_bytes.set(accounted);
             metrics.worker.memory_budget_bytes.set(budget);
+        }
+    }
+
+    /// Serve a window boundary that has fired.
+    ///
+    /// The boundary is the trigger of whatever rotation follows it, whatever a
+    /// byte or request threshold asked for earlier: a block sealed because its
+    /// window ended must not be reported under a reason left behind by a
+    /// threshold that never got to rotate.
+    pub(super) fn wake_window(&mut self) {
+        if self.window.wake() {
+            self.reason = FlushReason::Time;
+            self.rotation_requested = true;
         }
     }
 
@@ -909,6 +935,20 @@ impl Worker {
         }
         if let Some(mut job) = self.flushing.take() {
             job.cancel.cancel();
+            // Reported exactly as the `Error::Cancelled` completion branch
+            // reports it: the write did not put its block in object storage,
+            // and the reason it did not is that it was cancelled. Dropping the
+            // job here instead of awaiting it must not make that flush vanish
+            // from the counters.
+            if let Some(metrics) = &mut self.metrics {
+                metrics.worker.flush_duration.record(
+                    clock::now()
+                        .saturating_duration_since(job.started)
+                        .as_secs_f64(),
+                );
+                metrics.worker.flush_failures.add(1);
+                metrics.worker.flush_cancelled.add(1);
+            }
             for token in std::mem::take(&mut job.tokens) {
                 self.notify.push(token, Outcome::Shutdown);
             }

@@ -48,6 +48,10 @@ pub(super) struct WorkerMetrics {
     /// Bytes the FLUSHING block charged when it was sealed.
     #[metric(name = "block.flushing_bytes", unit = "By")]
     pub flushing_bytes: Gauge<u64>,
+    /// Bytes the one parked request retains: its extracted rows, its
+    /// descriptors and its completion token.
+    #[metric(name = "block.pending_bytes", unit = "By")]
+    pub pending_bytes: Gauge<u64>,
     /// Requests the worker still owes a decision, wherever they sit.
     #[metric(name = "block.requests_pending", unit = "{request}")]
     pub requests_pending: Gauge<u64>,
@@ -72,6 +76,10 @@ pub(super) struct WorkerMetrics {
     /// Decided completions still waiting to be delivered.
     #[metric(name = "notify.queued", unit = "{request}")]
     pub notify_queued: Gauge<u64>,
+    /// Bytes the undelivered completions retain: queue storage, each token's
+    /// external routing buffers, and the one in-flight send's future.
+    #[metric(name = "notify.token_bytes", unit = "By")]
+    pub notify_token_bytes: Gauge<u64>,
     /// Completions the engine would not accept.
     #[metric(name = "notify.failures", unit = "{request}")]
     pub notify_failures: ObserveCounter<u64>,
@@ -440,6 +448,7 @@ mod tests {
                 ("series_cache.evictions", "{entry}"),
                 ("block.active_bytes", "By"),
                 ("block.flushing_bytes", "By"),
+                ("block.pending_bytes", "By"),
                 ("block.requests_pending", "{request}"),
                 ("block.pending_slot_occupied", "{slot}"),
                 ("flush.duration", "s"),
@@ -448,6 +457,7 @@ mod tests {
                 ("flush.cancelled", "{flush}"),
                 ("acks", "{request}"),
                 ("notify.queued", "{request}"),
+                ("notify.token_bytes", "By"),
                 ("notify.failures", "{request}"),
                 ("oldest_unacked_seconds", "s"),
                 ("timestamp.out_of_range", "{timestamp}"),

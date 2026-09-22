@@ -38,9 +38,14 @@ coalesce into one rotation.
 
 The node registers the `exporter.series_parquet` metric set and reports it on
 every `CollectTelemetry` message and once more at its terminal state, so the
-last interval is not lost. State gauges (block bytes, live requests, the
-parking slot, queued completions, the oldest undecided request and the
-accounted-against-budget memory) are sampled on every loop turn. A series row
+last interval is not lost. State gauges (block bytes for the active, flushing
+and parked request, live requests, the parking slot, queued completions and
+their bytes, the oldest undecided request and the accounted-against-budget
+memory) are sampled on collection and once more before the terminal handoff,
+not on every loop turn: the sample walks both token vectors and the
+notification queue, so sampling per turn would cost a block quadratic time in
+its request count. Everything that must not be missed between two collections
+is a counter recorded at the lifecycle transition itself. A series row
 is counted as emitted only once `write_block` has returned success, so an
 abandoned or failed block credits nothing. Every label comes from a closed
 enumeration -- the rotation trigger, the refusal class, the dataset, the

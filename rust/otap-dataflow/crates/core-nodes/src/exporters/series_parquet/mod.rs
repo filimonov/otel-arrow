@@ -184,12 +184,24 @@ async fn run(
     cfg: config::Config,
     store: Arc<dyn object_store::ObjectStore>,
     wall: Arc<dyn lake::clock::WallClock>,
-    mut inbox: ExporterInbox<OtapPdata>,
+    inbox: ExporterInbox<OtapPdata>,
     effects: EffectHandler<OtapPdata>,
     metrics: Option<metrics::Metrics>,
 ) -> Result<TerminalState, Error> {
     let mut worker = worker::Worker::new(cfg, store, wall, effects);
     worker.metrics = metrics;
+    drive(&mut worker, inbox).await
+}
+
+/// The select loop itself, over a worker the caller owns.
+///
+/// Split from [`run`] so a test can inspect the worker the loop drove -- what
+/// it still holds, and how often it was asked to scan itself for telemetry --
+/// after the loop has returned.
+async fn drive(
+    worker: &mut worker::Worker,
+    mut inbox: ExporterInbox<OtapPdata>,
+) -> Result<TerminalState, Error> {
     // The Shutdown control message is the end of the inbox, not the start of
     // the drain: the engine latches it, force-drains the pdata backlog past a
     // closed admission gate, and releases it only once the upstream channel is
@@ -202,14 +214,15 @@ async fn run(
     let mut closed: Option<Instant> = None;
     let mut notify_turns = 0_usize;
     loop {
-        // Sampled before anything is decided, so the gauges describe the state
-        // the node is in on this turn rather than the state it was last
-        // changed into, and so a terminal return still carries the counters of
-        // the interval it ends.
-        worker.sample_metrics();
         if let Some(deadline) = closed
             && worker.is_idle()
         {
+            // Sampled here rather than on every turn: the scan is linear in
+            // the number of live requests, so a per-turn sample would cost a
+            // block quadratic time. Telemetry is a collection-time and
+            // terminal-time concern, and the counters that must not be missed
+            // are recorded at the lifecycle transitions themselves.
+            worker.sample_metrics();
             return Ok(TerminalState::new(
                 deadline,
                 worker
@@ -248,9 +261,7 @@ async fn run(
             // sealed. `wake` re-arms the sleep whether or not it rotated, so a
             // rotation the flush slot cannot take yet still keeps its timer.
             () = worker.window.sleep.as_mut(), if deadline.is_none() => {
-                if worker.window.wake() {
-                    worker.rotation_requested = true;
-                }
+                worker.wake_window();
                 notify_turns = 0;
             }
 
