@@ -8,10 +8,10 @@ change_type: new_component
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Add the experimental series_parquet exporter, which writes logs as joined series/values Parquet datasets and acknowledges only durable requests.
+note: Add the experimental series_parquet exporter, which writes logs and metric points as series and values Parquet datasets and acknowledges only durable requests.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
-# PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
+# Temporary SERIES_TRACKING_ISSUE=4128; replace with the real PR number when opened.
 issues: [4128]
 
 # (Optional) One or more lines of additional information to render under the primary note.
@@ -20,6 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Build with `--features series_parquet` and see `configs/series-parquet-local.yaml`.
-  Only logs are accepted; metrics and traces are refused. This first version writes
-  one file set per request, so an OK OTLP response means the rows are already durable.
+  Build with `--features series_parquet` (add `aws` for S3) and see
+  `configs/series-parquet-local.yaml`. Connect an OTLP receiver directly with
+  `wait_for_result` enabled. Delivery is at-least-once: producers must retry
+  timeouts and transient failures, so duplicates are possible.

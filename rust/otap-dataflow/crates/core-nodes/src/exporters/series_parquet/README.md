@@ -1,115 +1,818 @@
-# Series Parquet exporter
+# Series Parquet Exporter
 
-Build with `--features series_parquet`; add `aws` for S3. The local example
-is `configs/series-parquet-local.yaml`. Connect an OTLP receiver directly
-with `wait_for_result: true`. An OK response means the request is durable;
-retry timeouts and transient failures, allowing duplicates.
+## Metadata
 
-Create `/tmp/series-parquet` before starting. Use the existing admin shutdown
-endpoint with `timeout_secs=180`; signal shutdown currently grants only 60s.
+- Type: `exporter:series_parquet` (`urn:otel:exporter:series_parquet`)
+- Feature gate: `series_parquet`; add `aws` for S3-compatible storage
+- Metric scope: `exporter.series_parquet`
+- Stability: Experimental
 
-## Status
+## Overview
 
-The node owns one ACTIVE block and at most one FLUSHING block. Requests are
-admitted to the ACTIVE block and acknowledged only once the whole block has
-been written and its descriptors marked committed; a failed write nacks every
-request of the block as retryable. A storage failure is retried against the
-identical sealed block -- same file names, same bytes, so a retry overwrites
-what a failed attempt left rather than duplicating rows -- until an absolute
-deadline taken when the block was sealed (`window.flush_retry_deadline`).
-At that deadline the block's requests are nacked immediately, while the
-abandoned write is cancelled and given at most `upload.abort_timeout` to
-unwind; the flush slot stays occupied until that cleanup has finished, so no
-next block writes the same names while an abandoned attempt might still be in
-flight. Only a fully successful write marks the descriptor cache, against the
-partition of the block that was written, so the cache never claims durability
-for rows that were not stored. At the shutdown deadline every request is
-decided and delivered first, and only then are both slot holders cancelled and
-released within one `upload.abort_timeout`, ended by aborting the task itself:
-a multipart upload the node started is given its abort rather than left to the
-bucket's lifecycle rule, without a wedged destination holding the node open.
+`exporter:series_parquet` writes logs and metric number/histogram points as
+series descriptors plus narrow values datasets, on a local filesystem or on
+S3-compatible object storage. Files land under
+`v=1/signal=<signal>/dataset=<dataset>/date=<date>/hour=<hour>/`. The `series`
+dataset holds one descriptor row per identity; the values datasets
+(`values` for logs, `number` and `histogram` for metrics) hold the records and
+join back on `series_id`. The normative on-disk format is
+[`crates/series-lake/docs/FORMAT.md`](../../../../series-lake/docs/FORMAT.md).
+
+The worker owns exactly one ACTIVE block and at most one FLUSHING block, plus
+at most one extracted request parked in a pending slot. A request is admitted
+to the ACTIVE block and is acknowledged only once the whole block has been
+written and its descriptors marked committed. Admission closes once the ACTIVE
+block is waiting to be rotated, so a third block is never needed and a slow
+destination becomes backpressure rather than unbounded memory. A request the
+ACTIVE block cannot reserve room for is not refused: its extracted rows are
+parked, input closes until the next block opens, and the parked request enters
+that block before anything newer.
+
+Rotation follows aligned wall-clock windows. A block covers one
+`window.interval` window and is sealed when that window ends, so the
+boundary-driven case writes one file set per window rather than one per
+request, and two writers of the same lake agree on where a window starts.
+Intervals are positive whole seconds of at least one second. A block that
+reaches `window.max_block_bytes` or `window.max_requests_per_block` is sealed
+before its window ends, which writes more than one file set for that window
+and re-emits that block's descriptors. The waiting is done on the engine's
+monotonic clock, so a wall clock that steps backwards cannot reopen a window
+that was already written, and boundaries missed while the worker was busy
+coalesce into one rotation.
+
+A storage failure is retried against the identical sealed block, with the same
+file names and the same bytes, until an absolute deadline taken when the block
+was sealed (`window.flush_retry_deadline`). At that deadline every request of
+the block is nacked as retryable, and the abandoned write is cancelled and
+given at most `upload.abort_timeout` to unwind; the flush slot stays occupied
+until that cleanup finishes. An encoding failure is not retried at all: only
+an object-store or I/O error is, so a bug in encoding fails the block on its
+first attempt instead of repeating it until the deadline. Its requests are
+still nacked as retryable, because the producer holds the only copy of rows
+that are not durable. Only a fully successful write marks the descriptor
+cache, so the cache never claims durability for rows that were not stored.
+
+Delivery is at-least-once. Producers must retain and retry a request on a
+retryable failure or a timeout, and a retry can duplicate rows an earlier
+attempt already committed.
+
+## Getting Started
+
+Use `configs/series-parquet-local.yaml` for a local destination and
+`configs/series-parquet-s3.yaml` for S3-compatible storage. From the
+`rust/otap-dataflow` workspace:
+
+```bash
+cargo build -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
+mkdir -p /tmp/series-parquet
+./target/debug/df_engine --config configs/series-parquet-local.yaml --validate-and-exit
+./target/debug/df_engine --config configs/series-parquet-local.yaml --http-admin-bind 127.0.0.1:8080
+```
+
+Both examples explicitly set `core_allocation` to one core. Each pipeline
+instance is a separate worker with a separate budget and a separate descriptor
+cache. Increase the core count only after multiplying the memory estimate
+below by the worker count.
+
+## Delivery and shutdown
+
+Connect `receiver:otlp` directly to this exporter with
+`protocols.grpc.wait_for_result: true` and `timeout: 180s`. An OK response
+means every file for that request's block completed in the object store.
+
+| Outcome | gRPC status | Producer action |
+| --- | --- | --- |
+| Durable | OK | none |
+| Content, schema or budget refusal | INVALID_ARGUMENT | fix the request |
+| Storage failure, flush deadline, shutdown | UNAVAILABLE | retry |
+| Receiver admission exhausted | RESOURCE_EXHAUSTED | retry later |
+| Producer-side timeout | DEADLINE_EXCEEDED | retry; may duplicate |
+
+Content, schema and budget rejections are permanent. Storage and shutdown
+failures are retryable, and so is a request refused while the destination is
+unavailable. Producer disconnect does not remove rows that were already
+admitted.
+
+### Give a producer attempt more than one window
+
+The receiver timeout must cover channel residence, one preceding flush, one
+window interval, the request's own flush and the delivery of its completion.
+The same bound applies on the producer side, and it is the one that is easy to
+get wrong: a producer attempt timeout must exceed `window.interval` plus the
+flush that follows it.
+
+A producer whose timeout is below the window gives up before its rows can
+possibly be durable, because the response is held until the whole block is
+written. Under at-least-once delivery nothing is lost, and this is safe: the
+producer retries and the rows arrive. What it costs is traffic and storage. A
+6s attempt timeout against a 15s window never sees an acknowledgement on the
+first try, so every request is sent at least twice, and a copy that was
+committed just after the client gave up is stored again by the retry. The
+symptom is a steady stream of client-side deadlines with acks and
+`rows_written` that keep rising, rather than an error.
+
+`configs/series-parquet.alloy` therefore ships a 180s attempt timeout, and the
+shipped receiver configuration uses `timeout: 180s`. With 15s windows and a
+60s flush deadline, 180s allows margin but cannot eliminate all timeouts under
+sustained backpressure. A full bounded channel makes producers wait; exhausted
+receiver admission slots return RESOURCE_EXHAUSTED.
+
+No block-atomic snapshot is provided. Series files complete before their
+values files, but readers can observe a subset of a block, including rows from
+a request that was later nacked. Read the values dataset first, then the
+descriptors. The exporter has no write-ahead log and no spill. A local
+filesystem path is a final storage backend, not recovery state. A restart
+creates a new boot UUID, so a restarted engine writes distinct file names for
+the same window.
+
+### Keep `window.interval` well below the shutdown deadline
+
+This is the most important sizing rule in this document.
+
+The engine shuts down receiver-first: it sends `DrainIngress` to the
+receivers, and the exporter is handed `Shutdown` only once every receiver has
+reported that it drained, or at the shared deadline. An OTLP receiver
+configured with `wait_for_result: true` holds each response until the exporter
+decides that request, and the exporter decides a request when its block is
+sealed, which normally happens at the next window boundary. So a shutdown
+costs up to one whole `window.interval` before it can even begin, plus the
+flush of the two blocks that are then in flight.
+
+If `window.interval` is comparable to the shutdown deadline, the receiver and
+the exporter wait for each other until that deadline expires: the admin call
+returns HTTP 504, outstanding requests are nacked as retryable, and their
+producers have to resend. The end-to-end suite exercises exactly this with a
+600s window against a 20s deadline.
+
+Size it so that `window.interval` plus `window.flush_retry_deadline` plus an
+upload margin fits inside the deadline the supervisor grants, and keep
+`window.interval` to a small fraction of it. The defaults (15s window, 60s
+flush deadline) fit the admin API's 180s timeout below. They do not fit the
+60s that a SIGINT or SIGTERM grants if a flush has to use its whole retry
+deadline.
+
+### Granting a deadline
+
+Engine signal shutdown (SIGINT, SIGTERM) currently grants 60s and is not
+configurable. The admin shutdown operation takes its own timeout, and its
+default is also 60s, so ask for more explicitly:
+
+```bash
+curl -X POST 'http://127.0.0.1:8080/api/v1/groups/shutdown?wait=true&timeout_secs=180'
+```
+
+There is no pipeline YAML shutdown-deadline key. Supervisors must allow the
+drain plus `upload.abort_timeout` of cleanup.
+
 An orderly shutdown runs in a fixed order: the parked request is nacked the
 moment the deadline is latched, because nothing will open a block for it; the
 outstanding FLUSHING block is finished, so a block that still reaches storage
 is acknowledged rather than refused; and only then is the ACTIVE block rotated
 and flushed. A request force-drained after the latch is refused immediately
-with a retryable `NodeShutdown` nack instead of being parked, so a full
-completion channel cannot stall the drain. A flush that has already
-published a successful result when the deadline arrives is acknowledged from
-that result rather than refused, because the deadline branch outranks the one
-that awaits it and can win the same turn; the block's files exist, so refusing
-it would ask the producer to resend durable rows. At the deadline each
-remaining decision is attempted once and whatever the completion channel will
-not take is counted as a delivery failure and released: the producer sees its own
-timeout and retries, and committed data is never re-exported. The cleanup that
-follows is bounded by `upload.abort_timeout` and admits no new data; it
-releases the write tasks only, and neither extends the producer notification
-deadline nor the engine's drain deadline. Admission closes once the ACTIVE block is
-waiting to be rotated, so no third block is ever needed and a slow destination
-becomes backpressure. A request the ACTIVE block cannot reserve room for is
-not refused: its extracted rows are parked, input closes until the next block
-opens, and the parked request enters that block before anything newer. Only
-one request is ever parked, so the memory a worker holds is the two blocks
-plus one request. Preparation runs entirely before the block is reserved
-against, so a refused request leaves the block unchanged, and the request's
-payload and conversion batches are released as soon as its rows are
-extracted. An OTLP body's top-level protobuf framing is validated before it is
-converted, because the shared byte views decode lazily: without that check a
-truncated request would be acknowledged as stored. Corruption inside a nested
-message is not validated and still surfaces as missing fields. Rotation
-follows aligned wall-clock windows: a block covers one `window.interval`
-window and is sealed when that window ends, so the boundary-driven case writes
-one file set per window rather than one per request, and two writers of the
-same lake agree on where a window starts. A block that reaches
-`window.max_block_bytes` or `window.max_requests_per_block` is sealed before
-its window ends, which writes more than one file set for that window. The waiting is done on the
-engine's monotonic clock, so a wall clock that steps backwards cannot reopen a
-window that was already written and boundaries missed while the node was busy
-coalesce into one rotation.
-
-The node registers the `exporter.series_parquet` metric set and reports it on
-every `CollectTelemetry` message and once more at its terminal state, so the
-last interval is not lost. State gauges (block bytes for the active, flushing
-and parked request, live requests, the parking slot, queued completions and
-their bytes, the oldest undecided request and the accounted-against-budget
-memory) are sampled on collection and once more before the terminal handoff,
-not on every loop turn: the sample walks both token vectors and the
-notification queue, so sampling per turn would cost a block quadratic time in
-its request count. Everything that must not be missed between two collections
-is a counter recorded at the lifecycle transition itself. A series row
-is counted as emitted only once `write_block` has returned success, so an
-abandoned or failed block credits nothing. Every label comes from a closed
-enumeration -- the rotation trigger, the refusal class, the dataset, the
-re-emission cause and the unsupported point kind -- or from a physical column
-name fixed by configuration at startup. Error strings, object store paths,
-request ids, series ids and producer ids are never used as labels, so no
-workload can grow this node's metric cardinality.
-
-Logs and metrics share one admission path and one extraction call per request.
-Traces have no dataset in the lake and are permanently refused on the signal
-alone, before any conversion. A metrics request may carry points the lake has
-no dataset for, namely exponential histograms and summaries; the `unsupported`
-setting decides them for the whole request atomically. Under `reject` the
-request is refused and nothing is written; under `drop` the unsupported points
-are discarded, counted, and the supported rows are acknowledged once they are
-durable. A request that extracts no rows at all is acknowledged without
-opening a file. Metadata and exemplar attribute tables are neither read nor
-validated, under either policy.
+with a retryable `NodeShutdown` nack rather than being parked, so a full
+completion channel cannot stall the drain. At the deadline each remaining
+decision is attempted once, and whatever the completion channel will not take
+is counted as a delivery failure and released: the producer sees its own
+timeout and retries. Committed blocks are never re-exported merely because a
+notification could not be delivered.
 
 ## Configuration
 
-`storage` and `retry` follow the Parquet exporter's object-store settings.
-`window` holds the rotation interval and the budgets of one block.
-`ingress` holds the four per-request budgets; the two block-level budgets
-belong under `window`, and naming one of them under `ingress` is refused
-rather than ignored. `unsupported` is `reject` or `drop`, and `logs` and
-`metrics` carry the per-signal series attributes, denormalized columns and
-sort order. Byte-valued settings accept human units such as `64MiB`.
-`parquet.compression` may only be `zstd`, which is what the sink writes.
+Byte sizes accept integers or IEC strings such as `16MiB`. Durations use
+humantime strings. Unknown fields are errors, including a block-level budget
+written under `ingress`, which belongs under `window`. ZSTD is the only
+supported compression, and naming another codec is refused rather than
+silently writing zstd.
 
-## Layout
+| Setting | Default |
+| --- | --- |
+| `window.interval` | 15s |
+| `window.max_block_bytes` | 500MiB |
+| `window.max_requests_per_block` | 4096 |
+| `window.flush_retry_deadline` | 60s |
+| `ingress.max_request_bytes` | 16MiB |
+| `ingress.max_extracted_bytes` | 32MiB |
+| `ingress.max_row_bytes` | 1MiB |
+| `ingress.max_nesting_depth` | 32 |
+| `series_cache.max_entries` | 200000 |
+| `sorting.enabled` | true |
+| `sorting.run_target_bytes` | 8MiB |
+| `sorting.merge_chunk_bytes` | 16MiB |
+| `upload.part_bytes` | 8MiB |
+| `upload.concurrency` | 2 |
+| `upload.abort_timeout` | 5s |
+| `parquet.row_group_bytes` | 64MiB |
+| `parquet.writer_limit_bytes` | 96MiB |
+| `notify_batch` | 64 |
+| `unsupported` | reject |
+| `writer_id` | `writer` |
+| `producer_id_attribute` | `host.id` |
 
-Files land under
-`v=1/signal=<signal>/dataset=<dataset>/date=<date>/hour=<hour>/`. The
-`series` dataset holds one descriptor row per identity; the `values` dataset
-holds the records, joined back on `series_id`.
+Cross-field rules enforced at startup: `ingress.max_row_bytes` must be at most
+a quarter of `sorting.run_target_bytes`; `window.max_block_bytes` must be at
+least `ingress.max_extracted_bytes`; `upload.part_bytes` must be at least 5MiB
+for the S3 multipart minimum; request counts, byte and depth budgets, cache
+capacity, upload concurrency, `notify_batch` and the abort and retry durations
+must all be positive. A logical input size that cannot be measured is refused
+before conversion. `retry` settings apply to individual storage operations;
+`window.flush_retry_deadline` is the absolute authority for retrying a whole
+sealed block.
+
+`writer_id` must be nonempty and must not contain a slash. It names the writer
+process in file names and file metadata and is never part of the series
+identity. `producer_id_attribute` defaults to `host.id`, projects that
+resource attribute into the `producer_id` column of every values row, and does
+not alter identity membership: all resource attributes remain in the series
+hash. Transport-header producer IDs are not supported.
+
+Logs use `logs.series_attributes` to put named record attributes into the
+identity; metric identity includes point attributes and the metric type and
+temporality. `denormalize` accepts a path shorthand or an object with `path`,
+`column` and `type` (`string`, `int64`, `double`, `bool`). Paths are prefixed
+`resource.`, `scope.` or `attrs.`, and any other prefix is refused. Physical
+names must not collide case-insensitively with an intrinsic column or with
+another configured column. A value of the wrong non-string type is stored as
+null and increments `denormalize.type_mismatch{column}`.
+
+`series_id, time_unix_nano` is the default values sort, which gives per-series
+locality and good compression. For queries that filter on service or
+environment, place that denormalized physical column first, for example
+`service_name, series_id, time_unix_nano`; this improves row-group pruning at
+some cost in per-series locality. A sort key must exist in every values
+dataset of that signal, so `value_int` is refused for metrics because the
+histogram dataset has no such column. Null placement defaults to last. Series
+files always sort by `series_id` and this is not configurable. Disabling
+values sorting preserves schemas and delivery guarantees.
+
+## Examples
+
+### Reference deployment: Alloy + df_engine + MinIO
+
+The reference topology is a file producer in Docker Alloy, the host's
+`df_engine` with its OTLP gRPC receiver, and a Docker MinIO destination:
+
+```text
+/input/events.log -> Alloy -> OTLP gRPC -> df_engine -> MinIO Parquet
+                                                       |
+                                             downloaded object snapshot
+                                                       |
+                                               DuckDB + ClickHouse
+```
+
+Run this example on Linux. Alloy uses host networking to reach the engine's
+loopback listener, and MinIO publishes an ephemeral loopback-only S3 port. The
+engine YAML is generated from `configs/series-parquet-local.yaml` with S3
+storage settings equivalent to `configs/series-parquet-s3.yaml`, an explicit
+one-core allocation and `wait_for_result: true`. The test helpers write the
+exact launched YAML into `SERIES_REFERENCE_DIR/pipeline.yaml` and remove only
+their own containers afterwards. This example keeps the downloaded Parquet
+files for the two-reader check below.
+
+The complete River configuration is `configs/series-parquet.alloy`, shared
+with the normal and the outage end-to-end tests. `/input` is the mounted
+producer directory and `OTLP_ENDPOINT` is the engine's `127.0.0.1:<grpc_port>`
+passed in by the launcher. The transform stage supplies the resource
+attributes the Loki bridge does not: `host.id`, which is the attribute named
+by `producer_id_attribute`, and `service.name`, which feeds the denormalized
+service column. The inserted `e2e.source` attribute is verified alongside each
+log body:
+
+```river
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+loki.source.file "series" {
+  targets = [{ __path__ = "/input/events.log", job = "series-e2e" }]
+  forward_to = [otelcol.receiver.loki.series.receiver]
+  tail_from_end = false
+}
+
+otelcol.receiver.loki "series" {
+  output {
+    logs = [otelcol.processor.transform.series.input]
+  }
+}
+
+// The lake takes its producer_id column from a resource attribute, which the
+// Loki bridge does not supply: without this the rows would carry an empty
+// producer. `host.id` is the attribute named by `producer_id_attribute` in the
+// series Parquet exporter config, and `service.name` feeds the denormalized
+// service column.
+otelcol.processor.transform "series" {
+  error_mode = "ignore"
+  log_statements {
+    context = "resource"
+    statements = [
+      `set(attributes["host.id"], "alloy-producer")`,
+      `set(attributes["service.name"], "series-e2e-service")`,
+    ]
+  }
+  output {
+    logs = [otelcol.processor.attributes.series.input]
+  }
+}
+
+otelcol.processor.attributes "series" {
+  action {
+    key = "e2e.source"
+    value = "alloy-file"
+    action = "insert"
+  }
+  output {
+    logs = [otelcol.exporter.otlp.series.input]
+  }
+}
+
+otelcol.exporter.otlp "series" {
+  // A producer attempt must outlive one exporter window plus the flush that
+  // follows it: the engine holds the OTLP response until the whole block is
+  // durable, so a timeout below `window.interval` makes the client give up
+  // and resend rows that were about to be acknowledged. That is safe under
+  // at-least-once delivery, but it multiplies both traffic and stored rows.
+  // 180s covers the documented 15s window and 60s flush deadline.
+  // `SERIES_ALLOY_TIMEOUT` lets a test choose a deliberately short value.
+  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
+  client {
+    endpoint = sys.env("OTLP_ENDPOINT")
+    compression = "none"
+    tls {
+      insecure = true
+    }
+  }
+  sending_queue {
+    enabled = true
+    num_consumers = 1
+    queue_size = 128
+  }
+  retry_on_failure {
+    enabled = true
+    initial_interval = "200ms"
+    max_interval = "1s"
+    max_elapsed_time = "0s"
+  }
+}
+```
+
+The shipped attempt timeout is 180s, which is the rule above applied to the
+production defaults of a 15s window and a 60s flush deadline. For this example
+the engine window is one second. `SERIES_ALLOY_TIMEOUT` overrides the timeout,
+and the outage fixture sets it to a deliberately short value so that producer
+retry is exercised on purpose rather than by accident. The sending queue and
+the file positions are producer state; the exporter retains no write-ahead log
+and no spill state. The fixture's 12 lines fit the 128-request Alloy queue.
+
+MinIO defaults to `minio/minio:RELEASE.2025-04-22T22-12-26Z`, RustFS to
+`rustfs/rustfs:1.0.0-rc.3`, and the ClickHouse reader fallback to
+`clickhouse/clickhouse-server:26.7.4`. Set `SERIES_MINIO_IMAGE`,
+`SERIES_RUSTFS_IMAGE` or `SERIES_CLICKHOUSE_IMAGE` to another locally present
+tag. Alloy defaults to `grafana/alloy:v1.19.2`, `SERIES_ALLOY_IMAGE` can
+override it, and Alloy is the only image the test runner may pull. A missing
+Docker daemon or a missing image skips locally unless `SERIES_REQUIRE_DOCKER`
+is `1`; a startup or reader failure always fails. The mandatory
+`series-parquet-e2e` workflow provisions the selected images and runs both
+stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
+
+From `rust/otap-dataflow`, after the feature-enabled build above:
+
+```bash
+python3 -m venv /tmp/series-parquet-venv
+/tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+export SERIES_REFERENCE_DIR="$(mktemp -d /tmp/series-reference.XXXXXX)"
+PYTHONPATH=crates/validation/tests/series_parquet /tmp/series-parquet-venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+from test_e2e import AlloyProducer, DockerStore, Engine, require_clickhouse, wait_for_alloy
+
+require_clickhouse()
+root = Path(os.environ["SERIES_REFERENCE_DIR"])
+ids = [f"reference-alloy-{i}" for i in range(12)]
+with DockerStore("minio") as store, Engine(root, storage=store.storage) as engine:
+    with AlloyProducer(root, engine) as alloy:
+        alloy.write(ids)
+        wait_for_alloy(store, root, ids)
+    engine.shutdown(seconds=180)
+    store.download(root / "downloaded")
+print(root / "pipeline.yaml")
+print(root / "downloaded")
+PY
+```
+
+Save the verification below as `/tmp/series-reference-readers.py` and run it
+with `/tmp/series-parquet-venv/bin/python /tmp/series-reference-readers.py -v`
+in the same terminal. It independently runs DuckDB and native
+`clickhouse-local`, or `docker exec` in the selected local ClickHouse image,
+checks all 12 bodies and their `e2e.source` attributes, and proves that the
+latest-descriptor join preserves the row count. Native ClickHouse is preferred
+at `/usr/bin/clickhouse-local`; `SERIES_CLICKHOUSE_LOCAL` selects another
+executable. Missing both reader routes skips locally; a reader that is present
+but cannot execute the query fails.
+
+```python
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+import contextlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import unittest
+import uuid
+import duckdb
+
+
+def reader_unavailable(reason):
+    if os.environ.get("SERIES_REQUIRE_DOCKER") == "1":
+        raise AssertionError(reason)
+    raise unittest.SkipTest(reason)
+
+
+@contextlib.contextmanager
+def reference_clickhouse(root):
+    binary = os.environ.get("SERIES_CLICKHOUSE_LOCAL", "/usr/bin/clickhouse-local")
+    if not (Path(binary).is_file() and os.access(binary, os.X_OK)):
+        binary = (
+            shutil.which("clickhouse-local")
+            if "SERIES_CLICKHOUSE_LOCAL" not in os.environ
+            else None
+        )
+    container = None
+    try:
+        if binary:
+            command = [binary]
+        else:
+            if not shutil.which("docker"):
+                reader_unavailable("Neither clickhouse-local nor Docker is available")
+            try:
+                probe = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+            except subprocess.TimeoutExpired:
+                reader_unavailable("ClickHouse fallback Docker daemon did not respond")
+            if probe.returncode:
+                reader_unavailable("ClickHouse fallback Docker daemon is unavailable")
+            image = os.environ.get(
+                "SERIES_CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server:26.7.4"
+            )
+            if subprocess.run(
+                ["docker", "image", "inspect", image], capture_output=True, timeout=10
+            ).returncode:
+                reader_unavailable(f"Local ClickHouse image is absent: {image}")
+            container = subprocess.check_output(
+                [
+                    "docker", "run", "--pull=never", "--detach", "--network", "none",
+                    "--name", "series-reference-reader-" + uuid.uuid4().hex,
+                    "--user", f"{os.getuid()}:{os.getgid()}",
+                    "--mount", f"type=bind,src={root},dst=/data,readonly",
+                    "--entrypoint", "/bin/sleep", image, "infinity",
+                ],
+                text=True,
+                timeout=30,
+            ).strip()
+            command = [
+                "docker", "exec", "--workdir", "/data", container, "clickhouse", "local",
+            ]
+
+        def query(sql):
+            result = subprocess.run(
+                command
+                + [
+                    "--query",
+                    sql + " FORMAT JSONCompactEachRow",
+                    "--output_format_json_quote_64bit_integers=0",
+                ],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+            return [tuple(json.loads(line)) for line in result.stdout.splitlines() if line.strip()]
+
+        yield query
+    finally:
+        if container:
+            subprocess.run(
+                ["docker", "rm", "--force", "--volumes", container],
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+
+
+class ReferenceReaders(unittest.TestCase):
+    # Scenario: Docker Alloy delivers 12 known file lines through df_engine
+    # into MinIO Parquet.
+    # Guarantees: both readers preserve latest-descriptor join counts and
+    # return every expected body and attribute.
+    def test_latest_descriptor_join_and_bodies(self):
+        root = (Path(os.environ["SERIES_REFERENCE_DIR"]) / "downloaded").resolve()
+        values = "v=1/signal=logs/dataset=values/**/*.parquet"
+        series = "v=1/signal=logs/dataset=series/**/*.parquet"
+        expected = sorted((f"reference-alloy-{i}", "alloy-file") for i in range(12))
+        with duckdb.connect() as db, reference_clickhouse(root) as clickhouse:
+            duck_rows = sorted(
+                db.execute(
+                    """
+                WITH canonical AS (
+                    SELECT * FROM read_parquet(?, union_by_name=true, filename=true)
+                    QUALIFY row_number() OVER (
+                        PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) = 1
+                )
+                SELECT v.body, coalesce(v.attrs['e2e.source'], '')
+                FROM read_parquet(?, union_by_name=true) v
+                INNER JOIN canonical s ON v.series_id = s.series_id
+            """,
+                    [str(root / series), str(root / values)],
+                ).fetchall()
+            )
+            ch_rows = sorted(
+                clickhouse(
+                    f"""
+                WITH canonical AS (
+                    SELECT * FROM (
+                        SELECT *, row_number() OVER (
+                            PARTITION BY series_id ORDER BY emitted_at DESC, _path DESC) AS rank
+                        FROM file('{series}', 'Parquet')
+                    ) WHERE rank = 1
+                )
+                SELECT v.body, coalesce(v.attrs['e2e.source'], '')
+                FROM file('{values}', 'Parquet') AS v
+                INNER JOIN canonical AS s ON v.series_id = s.series_id
+            """
+                )
+            )
+            duck_count = db.execute(
+                "SELECT count(*) FROM read_parquet(?)", [str(root / values)]
+            ).fetchone()[0]
+            ch_count = int(clickhouse(f"SELECT count(*) FROM file('{values}', 'Parquet')")[0][0])
+            self.assertEqual(duck_count, 12)
+            self.assertEqual(ch_count, duck_count)
+            self.assertEqual(len(ch_rows), ch_count)
+            self.assertEqual(len(duck_rows), duck_count)
+            self.assertEqual(ch_rows, duck_rows)
+            self.assertEqual(duck_rows, expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+## Reading and schema changes
+
+Use DuckDB 1.1 or newer. Values rows reference repeated series descriptors, so
+join through a canonical view that keeps the latest descriptor per
+`series_id`, breaking ties on the file name:
+
+```sql
+CREATE VIEW series AS
+SELECT * FROM read_parquet(
+  '/tmp/series-parquet/v=1/signal=logs/dataset=series/**/*.parquet',
+  hive_partitioning=true, union_by_name=true, filename=true)
+QUALIFY row_number() OVER
+  (PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC)=1;
+SELECT v.*, s.resource_attrs FROM read_parquet(
+  '/tmp/series-parquet/v=1/signal=logs/dataset=values/**/*.parquet',
+  hive_partitioning=true, union_by_name=true) v
+JOIN series s USING(series_id);
+```
+
+`clickhouse-local` reads the same files with the same join. It has no
+`QUALIFY`, and its tie-breaker is the virtual `_path` column rather than
+`filename`:
+
+```sql
+WITH canonical AS (
+    SELECT * FROM (
+        SELECT *, row_number() OVER (
+            PARTITION BY series_id ORDER BY emitted_at DESC, _path DESC) AS rank
+        FROM file('v=1/signal=logs/dataset=series/**/*.parquet', 'Parquet')
+    ) WHERE rank = 1
+)
+SELECT v.*, s.resource_attrs
+FROM file('v=1/signal=logs/dataset=values/**/*.parquet', 'Parquet') AS v
+INNER JOIN canonical AS s ON v.series_id = s.series_id;
+```
+
+ClickHouse's `file()` does not synthesize the `date` and `hour` columns from
+the path, so a query that compares the two readers column by column should
+read DuckDB with `hive_partitioning=false`, which is what the end-to-end suite
+does.
+
+For Spark 3.5 or newer, use `mergeSchema` and the same canonical view:
+
+```python
+from pyspark.sql import Window
+from pyspark.sql import functions as F
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+series_path = "/tmp/series-parquet/v=1/signal=logs/dataset=series"
+values_path = "/tmp/series-parquet/v=1/signal=logs/dataset=values"
+series = spark.read.option("mergeSchema", "true").parquet(series_path)
+series = series.withColumn("filename", F.input_file_name())
+order = Window.partitionBy("series_id").orderBy(F.desc("emitted_at"), F.desc("filename"))
+series = series.withColumn("rank", F.row_number().over(order)).where("rank = 1").drop("rank")
+values = spark.read.option("mergeSchema", "true").parquet(values_path)
+joined = values.join(series, "series_id")
+```
+
+Here `series_path` and `values_path` are the complete Hive dataset paths under
+one base URI. Adding nullable or denormalized columns is supported with
+`union_by_name` or `mergeSchema`. Changing an existing column's type, path or
+meaning requires a new base URI. Inspect `schema_fingerprint` alongside the
+physical column schema to find incompatible mixtures:
+
+```sql
+SELECT file_name, decode(value) AS schema_fingerprint
+FROM parquet_kv_metadata('/tmp/series-parquet/**/*.parquet')
+WHERE decode(key) = 'schema_fingerprint';
+SELECT file_name, name, type, logical_type
+FROM parquet_schema('/tmp/series-parquet/**/*.parquet');
+```
+
+Different fingerprints can still mean a supported additive change; compare the
+physical columns before concluding that two files are incompatible.
+
+## Telemetry
+
+Every metric set is registered under the descriptor name
+`exporter.series_parquet` and is reported on every `CollectTelemetry` message
+and once more at the node's terminal state, so the last interval is not lost.
+State gauges are sampled on collection and once before the terminal handoff,
+not on every loop turn; everything that must not be missed between two
+collections is a counter recorded at the lifecycle transition itself.
+
+Unlabelled worker state and totals:
+
+| Metric | Unit | Description |
+| --- | --- | --- |
+| `series_cache.entries` | `{entry}` | Series ids the bounded descriptor cache holds. |
+| `series_cache.hits` | `{lookup}` | Lookups that found a committed descriptor. |
+| `series_cache.misses` | `{lookup}` | Lookups that did not. |
+| `series_cache.evictions` | `{entry}` | Entries dropped because the bound was reached. |
+| `block.active_bytes` | `By` | Bytes the ACTIVE block has charged. |
+| `block.flushing_bytes` | `By` | Bytes the FLUSHING block charged when it was sealed. |
+| `block.pending_bytes` | `By` | Bytes the one parked request retains. |
+| `block.requests_pending` | `{request}` | Requests the worker still owes a decision. |
+| `block.pending_slot_occupied` | `{slot}` | Whether the single parking slot is occupied. |
+| `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
+| `flush.failures` | `{flush}` | Flushes that did not reach object storage. |
+| `flush.retries` | `{attempt}` | Write attempts beyond the first, per completed flush. |
+| `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
+| `acks` | `{request}` | Requests acknowledged as durable. |
+| `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
+| `notify.token_bytes` | `By` | Bytes the undelivered completions retain. |
+| `notify.failures` | `{request}` | Completions the engine would not accept. |
+| `oldest_unacked_seconds` | `s` | Age of the oldest completion the worker still owes. |
+| `timestamp.out_of_range` | `{timestamp}` | Point timestamps outside the representable range. |
+| `memory.budget_bytes` | `By` | Bytes the configuration allows this worker to hold. |
+| `memory.accounted_bytes` | `By` | Bytes the worker is accounted as holding now. |
+
+Labelled sets, each with one closed enumeration:
+
+| Metric | Unit | Label | Values |
+| --- | --- | --- | --- |
+| `flush.count` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
+| `nacks` | `{request}` | `reason` | `storage`, `too_large`, `invalid`, `unsupported`, `shutdown` |
+| `rows_written`, `files_written` | `{row}`, `{file}` | `dataset` | `logs_series`, `logs_values`, `metrics_series`, `metrics_number`, `metrics_histogram` |
+| `series_emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
+| `dropped_unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |
+| `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |
+
+`denormalize.type_mismatch` is the only label that is not an enumeration, and
+its values come from the `denormalize` configuration at startup: one metric
+set is registered per configured column and no request can add another. Error
+strings, object store paths, request ids, series ids and producer ids are
+never used as labels, so no workload can grow this node's cardinality.
+
+A series row is counted in `series_emitted` only once the block write returned
+success, so an abandoned or failed block credits nothing. `series_emitted`
+with `reason=rotation` rising means byte or request rotations inside single
+windows are re-emitting descriptors, which is the signal to raise
+`window.max_block_bytes` or `window.max_requests_per_block`.
+`flush.retries` stays at zero until the sink performs a retry the job can
+observe.
+
+### Reading the process residual
+
+`memory.accounted_bytes` reports the retained exporter data and the measured
+token allocations, including the cache-entry estimate. `memory.budget_bytes`
+reports the configured retained and workspace allowance.
+
+The engine additionally publishes one process-scoped gauge under the same
+descriptor name, `memory.unaccounted_rss_bytes`, which is
+`max(0, RSS - sum of every worker's accounted bytes)`. Normal conversion and
+encoding scratch and allocator overhead appear in this residual, so a non-zero
+value is expected. It is published once per process, only while at least one
+registered exporter worker exists, and it reuses the engine monitor's single
+RSS sample. Watch its trend as well as its absolute value: a residual that
+grows while `memory.accounted_bytes` is flat points at allocator retention or
+at workspace, not at retained block data.
+
+### Memory model
+
+Per worker, let B be `window.max_block_bytes`, E
+`ingress.max_extracted_bytes`, C the configured
+`series_cache.max_entries`, N `window.max_requests_per_block` and T the
+measured retained completion-token size. The retained-data bound is
+`2B + E + 128C + 2NT`. Only ACTIVE and FLUSHING exist, and one extracted
+request may wait in the pending slot. Normal
+admission also reserves notification credit, capped at `2N - 1` live tokens,
+with one immediate token held back for a force-drained request during
+shutdown.
+
+The construction workspace allowance on top of that is
+`4 * ingress.max_request_bytes` for conversion,
+`2 * sorting.run_target_bytes` for sorting,
+`2 * sorting.merge_chunk_bytes` for merge and encoding,
+`3 * parquet.writer_limit_bytes` for the writer plus its encoder transient,
+and `upload.part_bytes * (upload.concurrency + 1) + sorting.merge_chunk_bytes`
+for upload, plus a fixed 64MiB for container and allocator overhead.
+Descriptors become bounded sorted series runs during admission, and sealing
+swaps only the `emitted_at` buffers while sharing every other column, so the
+eight additional timestamp bytes per series row are reserved inside B and
+there is no extra block-sized sealing allowance.
+
+These construction factors are engineering reservations, not measured
+ceilings. The process planning bound is the sum of the worker bounds plus
+receiver and channel memory, the engine baseline and allocator retention.
+Input bytes before admission belong to the receiver and channel limits and are
+outside exporter-owned accounting.
+
+## Limits
+
+### Unsupported signals and points
+
+Traces have no dataset in the lake and are permanently refused on the signal
+alone, before any conversion. Points of an unsupported kind, namely
+exponential histograms and summaries, are rejected by default;
+`unsupported: drop` drops those points instead and counts them in
+`dropped_unsupported`. The policy decides the whole request atomically.
+Exemplars are always dropped and counted. A request that extracts no rows at
+all is acknowledged immediately without opening a file; a request that mixes
+supported and dropped rows waits for its block to commit.
+
+Unspecified sum or histogram temporality, duplicate attribute keys, excessive
+nesting, invalid histogram list lengths and counts above `INT64_MAX` are
+refused atomically. Integer values remain INT64. Zero or absent timestamps
+become null; a negative converted timestamp becomes null and increments
+`timestamp.out_of_range`.
+
+### Validation not performed in v1
+
+- Metric metadata attributes and exemplar attribute payloads are never read,
+  so a duplicate key inside either goes undetected. Duplicate-key validation
+  covers only the lists this writer decodes: resource, scope, the log
+  record's own attributes and a supported data point's attributes.
+- Only an OTLP body's top-level protobuf framing is validated before
+  conversion, because the shared byte views decode lazily. Corruption inside
+  a nested message is not validated and surfaces as missing fields rather
+  than as a refusal.
+
+### Format and storage limits in v1
+
+- `attrs` maps are lossy for readers: values are rendered to strings, so a
+  string `"42"` and an integer `42` look the same in the map, although they
+  remain different series. Bytes values render as a quoted JSON string of
+  lowercase hex; a dedicated `body_bytes` binary column for the log body is
+  deferred to a later format version.
+- A histogram `sum` of exactly zero cannot be told apart from an absent sum
+  after an OTAP round trip, because the transport omits a column whose every
+  entry in a request is the type default. The same holds for any optional
+  metrics column.
+- A cancellation that lands after a file's Parquet finalization has begun
+  cannot abort that file's in-flight multipart upload, because the buffered
+  writer's abort is only safe before finalization starts. Configure a bucket
+  lifecycle rule that removes incomplete multipart uploads; the exporter does
+  not reclaim those parts. Multipart uploads begun before finalization are
+  aborted within `upload.abort_timeout`.
+- One Parquet row group can start several multipart upload parts at once
+  whatever `upload.concurrency` says. The burst is bounded by
+  `parquet.row_group_bytes`.
+- Every merge key of a table being merged is resident for the whole merge, so
+  sorting by a wide column such as `body` can hold close to a second copy of
+  the table's payload.
+- `merge_chunk_bytes` is an average-based approximation from the mean row
+  width, so a chunk whose rows are much wider than the average overshoots it.
+  With sorting disabled it is ignored altogether and the buffered runs go to
+  the writer as they are, each at most `run_target_bytes`.
+- Finalizing a values dataset flushes whatever is still buffered into one
+  further run bounded by `run_target_bytes`, so the transient at seal time can
+  reach `(V + 1) * run_target_bytes` for V buffered runs.
+
+### Operational limits
+
+- Empirical memory-bound validation, expansion-factor measurement, soak runs
+  and benchmarks are not part of this version.
+- There is no compaction, no discovery index, no manifest and no producer
+  replay id.
+- There is no live buffer, tail or series introspection endpoint beyond the
+  metrics above.
+
+## Related Docs
+
+- [Lake format](../../../../series-lake/docs/FORMAT.md): the normative on-disk
+  format, identity encoding and compatibility rules.
+- [series-lake crate](../../../../series-lake/README.md): the
+  engine-independent writer this exporter embeds.
+- [Core nodes catalog](../../../README.md): every built-in node and its
+  feature gate.
+- [Configuration guide](../../../../../docs/configuration.md): writing runtime
+  YAML.

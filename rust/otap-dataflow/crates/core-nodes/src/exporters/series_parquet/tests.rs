@@ -3801,3 +3801,81 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
         })
         .await;
 }
+
+/// Scenario: configuration contains misspelled settings or cross-field
+/// violations.
+/// Guarantees: the factory's typed validation rejects every one of them before
+/// any network listener starts, so a pipeline never runs with a budget the
+/// operator believes they set.
+#[test]
+fn startup_rejects_invalid_configuration() {
+    let base = serde_json::json!({"storage": {"file": {"base_uri": "/tmp/series-config"}}});
+    let cases = [
+        ("window", serde_json::json!({"interval": "0s"})),
+        ("window", serde_json::json!({"interval": "500ms"})),
+        ("window", serde_json::json!({"max_requests_per_block": 0})),
+        ("window", serde_json::json!({"max_block_bytes": "1MiB"})),
+        ("ingress", serde_json::json!({"max_row_bytes": "3MiB"})),
+        ("ingress", serde_json::json!({"max_requset_bytes": "1MiB"})),
+        ("upload", serde_json::json!({"concurrency": 0})),
+        ("upload", serde_json::json!({"part_bytes": "1MiB"})),
+        ("parquet", serde_json::json!({"compression": "snappy"})),
+        ("metrics", serde_json::json!({"values_sort": ["value_int"]})),
+        (
+            "logs",
+            serde_json::json!({"denormalize": [{"path": "resource.x", "column": "SERIES_ID"}]}),
+        ),
+        ("logs", serde_json::json!({"denormalize": ["unknown.x"]})),
+        ("series_cache", serde_json::json!({"max_entries": 0})),
+        ("notify_batch", serde_json::json!(0)),
+    ];
+    for (section, value) in cases {
+        let mut candidate = base.clone();
+        candidate[section] = value;
+        assert!(
+            serde_json::from_value::<Config>(candidate).is_err(),
+            "section={section}"
+        );
+    }
+}
+
+/// Scenario: operators read the component README before configuring durable
+/// ingest.
+/// Guarantees: the documentation states the retry, shutdown, memory and
+/// unsupported-signal contracts, and reproduces the exact River configuration
+/// the end-to-end tests run, so the documented deployment cannot drift away
+/// from the tested one.
+#[test]
+fn readme_states_operating_contract() {
+    let readme = include_str!("README.md");
+    for phrase in [
+        "at-least-once",
+        "wait_for_result",
+        "timeout_secs=180",
+        "core_allocation",
+        "memory.unaccounted_rss_bytes",
+        "exponential histograms",
+        "union_by_name",
+        "mergeSchema",
+        "schema_fingerprint",
+        "notify_batch",
+        "No block-atomic snapshot",
+        "Alloy",
+        "MinIO",
+        "ClickHouse",
+        "loki.source.file",
+        "e2e.source",
+        "row_number()",
+        "SERIES_REQUIRE_DOCKER",
+    ] {
+        assert!(
+            readme.contains(phrase),
+            "missing documented contract: {phrase}"
+        );
+    }
+    let alloy = include_str!("../../../../../configs/series-parquet.alloy");
+    assert!(
+        readme.contains(alloy),
+        "README must reproduce the exact tested River config"
+    );
+}

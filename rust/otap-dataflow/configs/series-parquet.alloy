@@ -43,7 +43,14 @@ otelcol.processor.attributes "series" {
 }
 
 otelcol.exporter.otlp "series" {
-  timeout = "6s"
+  // A producer attempt must outlive one exporter window plus the flush that
+  // follows it: the engine holds the OTLP response until the whole block is
+  // durable, so a timeout below `window.interval` makes the client give up
+  // and resend rows that were about to be acknowledged. That is safe under
+  // at-least-once delivery, but it multiplies both traffic and stored rows.
+  // 180s covers the documented 15s window and 60s flush deadline.
+  // `SERIES_ALLOY_TIMEOUT` lets a test choose a deliberately short value.
+  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
   client {
     endpoint = sys.env("OTLP_ENDPOINT")
     compression = "none"

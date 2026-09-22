@@ -1,0 +1,53 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+name: Series Parquet E2E
+on:
+  pull_request:
+    paths:
+      - "rust/otap-dataflow/**"
+      - ".github/workflows/series-parquet-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust/otap-dataflow/**"
+      - ".github/workflows/series-parquet-e2e.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  writer-reader-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust/otap-dataflow
+    env:
+      SERIES_REQUIRE_DOCKER: "1"
+      SERIES_MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
+      SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
+      SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
+      SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev clang cmake
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+      - name: Provision local object-store and reader images
+        run: |
+          docker info
+          docker pull "$SERIES_MINIO_IMAGE"
+          docker pull "$SERIES_RUSTFS_IMAGE"
+          docker pull "$SERIES_CLICKHOUSE_IMAGE"
+      - name: Install producer and DuckDB dependencies
+        run: |
+          python3 -m venv /tmp/series-parquet-venv
+          /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+      - name: Build the real engine
+        run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
+      - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          SERIES_REQUIRE_DOCKER=1 python3 -m unittest crates.validation.tests.series_parquet.test_e2e -v
