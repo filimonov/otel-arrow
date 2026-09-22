@@ -64,8 +64,28 @@ otelcol.exporter.otlp "series" {
   }
   sending_queue {
     enabled = true
-    num_consumers = 1
-    queue_size = 128
+
+    // The Loki bridge emits one log record per request, so the queue must be
+    // measured in records, not requests. With "requests" the batch can never
+    // grow past queue_size and concurrency collapses to one.
+    sizer = "items"
+    queue_size = 120000
+
+    // Parallel exports. Each one is held for a full window, so this is the
+    // only multiplier on the ceiling besides batch size.
+    num_consumers = 4
+
+    // The source is a file. Backpressure parks the tailer and leaves unread
+    // data on disk, which is durable and free. Dropping is neither.
+    block_on_overflow = true
+
+    // Without this block every log line is its own OTLP export.
+    batch {
+      sizer = "items"
+      min_size = 20000
+      max_size = 50000
+      flush_timeout = "5s"
+    }
   }
   retry_on_failure {
     enabled = true

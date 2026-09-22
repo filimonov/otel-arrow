@@ -377,8 +377,28 @@ otelcol.exporter.otlp "series" {
   }
   sending_queue {
     enabled = true
-    num_consumers = 1
-    queue_size = 128
+
+    // The Loki bridge emits one log record per request, so the queue must be
+    // measured in records, not requests. With "requests" the batch can never
+    // grow past queue_size and concurrency collapses to one.
+    sizer = "items"
+    queue_size = 120000
+
+    // Parallel exports. Each one is held for a full window, so this is the
+    // only multiplier on the ceiling besides batch size.
+    num_consumers = 4
+
+    // The source is a file. Backpressure parks the tailer and leaves unread
+    // data on disk, which is durable and free. Dropping is neither.
+    block_on_overflow = true
+
+    // Without this block every log line is its own OTLP export.
+    batch {
+      sizer = "items"
+      min_size = 20000
+      max_size = 50000
+      flush_timeout = "5s"
+    }
   }
   retry_on_failure {
     enabled = true
@@ -395,7 +415,70 @@ the engine window is one second. `SERIES_ALLOY_TIMEOUT` overrides the timeout,
 and the outage fixture sets it to a deliberately short value so that producer
 retry is exercised on purpose rather than by accident. The sending queue and
 the file positions are producer state; the exporter retains no write-ahead log
-and no spill state. The fixture's 12 lines fit the 128-request Alloy queue.
+and no spill state. The fixture writes 12 lines, far below `min_size`, so the
+batcher releases them on its 5s `flush_timeout` rather than on size.
+
+### Sizing the producer
+
+These figures were measured against `grafana/alloy:v1.19.2` with a server that
+holds each export for a fixed time, which is what this exporter does.
+
+The ceiling of any producer that holds one export per window is
+
+```text
+records/second = num_consumers * records_per_export / hold_time
+```
+
+The hold time is a whole window plus the flush that follows it. At a 15s hold
+the recommended block above sustains about 5000 records per second; at a 60s
+hold the same block sustains about 1050. Raising `num_consumers` or `min_size`
+raises the ceiling proportionally.
+
+Three producer settings decide whether that ceiling is reachable at all.
+
+- **Exporter batching must be switched on explicitly.** `otelcol.receiver.loki`
+  turns one log line into one OTLP request holding one record, and the sending
+  queue's batcher is off unless a `batch {}` block is present. Without it
+  `records_per_export` is 1 and the ceiling is `num_consumers / hold_time`,
+  which is under one record per second for any ordinary configuration.
+- **The queue must be sized in items.** With the default `sizer = "requests"`
+  the queue holds single-record requests and the accumulating batch keeps
+  those slots until its export finishes, so a batch can never exceed
+  `queue_size` and concurrency collapses to one.
+- **Alloy's default `timeout` of 5s is below any usable window.** An attempt
+  that expires is retried with a fresh deadline, so a producer left on the
+  default completes nothing at all against a 15s window while logging a
+  deadline error every five seconds.
+
+Queue overflow is silent loss, and it happens before this exporter sees the
+data. Watch `otelcol_exporter_enqueue_failed_log_records_total`, which is the
+only loss signal available: `otelcol_exporter_send_failed_log_records_total`
+stays permanently zero under `max_elapsed_time = "0s"`, because the timeout
+sits inside the retry loop and retry never gives up.
+
+`queue_size` is a memory decision. A queued 60-byte log line costs about 2 KB
+of resident memory, and roughly 4 KB once the queue is pinned at capacity and
+the garbage collector is under pressure, so budget about 4 KB per `queue_size`
+item. An in-flight export still occupies its queue space until the export
+completes, retries included.
+
+Finally, this engine's receiver `max_concurrent_requests` must be at least the
+producer's `num_consumers`. If it is lower, the extra exports queue at the
+receiver, their hold time grows past one window, and the ceiling falls with no
+signal at the producer. The shipped pipeline configurations set
+`max_concurrent_requests: 128`, which covers the recommended
+`num_consumers = 4` with a wide margin.
+
+### Where at-least-once begins
+
+This exporter's at-least-once guarantee begins when a request reaches it.
+Anything the producer drops before that point is lost, and this exporter
+cannot see it or report it. Queue overflow is exactly such a drop: by default
+the sending queue returns a retryable error that the Loki bridge logs and
+discards, and the file tailer is never told, so it reads on and the data is
+gone. That is why `block_on_overflow = true` is the recommended setting for a
+file source. Backpressure parks the tailer and leaves the unread data on disk,
+which is already durable storage, instead of discarding it.
 
 MinIO defaults to `minio/minio:RELEASE.2025-04-22T22-12-26Z`, RustFS to
 `rustfs/rustfs:1.0.0-rc.3`, and the ClickHouse reader fallback to
