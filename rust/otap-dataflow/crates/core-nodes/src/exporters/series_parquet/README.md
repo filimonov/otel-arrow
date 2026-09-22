@@ -274,10 +274,10 @@ least twice `ingress.max_extracted_bytes`, because a block charges a request's
 series rows at up to twice their extracted estimate; `upload.part_bytes` must
 be at least 5MiB for the S3 multipart minimum; request counts, byte and depth
 budgets, cache capacity, upload concurrency, `notify_batch` and the abort and
-retry durations must all be positive. A logical input size that cannot be measured is refused
-before conversion. `retry` settings apply to individual storage operations;
-`window.flush_retry_deadline` is the absolute authority for retrying a whole
-sealed block. For cloud storage, `retry.retry_timeout` must be strictly less
+retry durations must all be positive. A logical input size that cannot be
+measured is refused before conversion. `retry` settings apply to individual
+storage operations; `window.flush_retry_deadline` is the absolute authority
+for retrying a whole sealed block. For cloud storage, `retry.retry_timeout` must be strictly less
 than `window.flush_retry_deadline`, and the rule applies to the object store
 default of 3m when the `retry` section is omitted, so the default 60s deadline
 needs an explicit `retry` section. Otherwise one write attempt keeps retrying
