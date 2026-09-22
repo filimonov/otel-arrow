@@ -1617,22 +1617,36 @@ def flush_attempts(engine):
     ]
 
 
-def wait_for_metric(engine, name, target, timeout):
-    """Wait for an exporter metric to reach `target`, returning the best seen.
+def wait_for_metrics(engine, names, target, timeout, seed=None):
+    """Wait for every named exporter metric to reach `target`, in one loop.
 
-    The largest value seen across polls is kept rather than the last one: a
-    counter that the engine drains into its reporting interval is only visible
-    in the snapshot that carries it, and this has to observe the event, not
-    catch it still standing there.
+    The largest value seen across polls is kept for each name rather than the
+    last one: these are counters the engine drains into its reporting
+    interval, so one is only visible in the snapshot that carries it. One
+    snapshot feeds every name, because waiting for the names one after another
+    would miss any that peaked and vanished while another was being waited
+    for. `seed` carries in maxima a caller already observed, so snapshots it
+    took earlier are not thrown away.
+
+    Returns the best value seen for each name, whether or not it reached the
+    target, so the caller can assert on it and report it.
     """
-    best = 0
+    best = {name: max(0, (seed or {}).get(name, 0)) for name in names}
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        best = max(best, metric_max(engine_metrics(engine), name))
-        if best >= target:
+    while True:
+        document = engine_metrics(engine)
+        for name in names:
+            best[name] = max(best[name], metric_max(document, name))
+        if all(value >= target for value in best.values()):
+            return best
+        if time.monotonic() >= deadline:
             return best
         time.sleep(0.05)
-    return best
+
+
+def wait_for_metric(engine, name, target, timeout):
+    """Wait for one exporter metric to reach `target`, returning the best seen."""
+    return wait_for_metrics(engine, (name,), target, timeout)[name]
 
 
 def export_with_retry(engine, body, attempts=5, timeout=120):
@@ -2142,11 +2156,14 @@ RETRYABLE_CODES = {
     grpc.StatusCode.RESOURCE_EXHAUSTED,
     grpc.StatusCode.CANCELLED,
 }
-# How close to its own deadline a call must have run for the test to credit a
-# DEADLINE_EXCEEDED to the deadline the test itself set rather than to the
-# server. A call that reports the code earlier than this counts as a status
-# the server returned and has to satisfy the refusal assertion.
-LOCAL_DEADLINE_SLACK = 0.5
+# How long the outage test waits out one ordinary RPC, and one of the cohort
+# RPCs that has to stay outstanding across the whole observation window. The
+# calls themselves carry no gRPC deadline, so these are waits the test
+# performs rather than deadlines the server is told about: a wait that expires
+# raises grpc.FutureTimeoutError on a path of its own, which is what makes
+# every reported status server-originated by construction.
+CALL_WAIT = 6
+COHORT_WAIT = 60
 
 
 class OutageSlice(unittest.TestCase):
@@ -2245,23 +2262,6 @@ class OutageSlice(unittest.TestCase):
                 lock = threading.Lock()
                 end = time.monotonic() + 120
 
-                def classify(signal, error, started, timeout):
-                    """Record one failure as the server's or as our deadline.
-
-                    The signal is kept with the status so the test can show
-                    that both logs and metrics were refused by the stopped
-                    store, rather than one signal waiting on the other.
-                    """
-                    elapsed = time.monotonic() - started
-                    with lock:
-                        if (
-                            error.code() == grpc.StatusCode.DEADLINE_EXCEEDED
-                            and elapsed >= timeout - LOCAL_DEADLINE_SLACK
-                        ):
-                            local_waits.append((signal, elapsed))
-                        else:
-                            server_codes.append((signal, error.code()))
-
                 def producer(signal, index):
                     """Send 12 requests of one signal, retrying every refusal.
 
@@ -2279,7 +2279,10 @@ class OutageSlice(unittest.TestCase):
                         build = metric_request
                     cohort_start.wait()
                     first_started = time.monotonic()
-                    first = stub.Export.future(build(f"p{index}-0"), timeout=30)
+                    # No call in this loop carries a gRPC deadline, so the
+                    # only deadline is the one this thread waits with and any
+                    # status that comes back is one the server sent.
+                    first = stub.Export.future(build(f"p{index}-0"))
 
                     def first_done(call):
                         with lock:
@@ -2297,26 +2300,29 @@ class OutageSlice(unittest.TestCase):
                         request = build(request_id)
                         pending = first if item == 0 else None
                         while time.monotonic() < end:
-                            timeout = 30 if pending is not None else 6
-                            started = (
-                                first_started
-                                if pending is not None
-                                else time.monotonic()
-                            )
+                            if pending is not None:
+                                call, wait = pending, COHORT_WAIT
+                                pending = None
+                            else:
+                                call, wait = stub.Export.future(request), CALL_WAIT
                             try:
-                                if pending is not None:
-                                    pending.result(timeout=timeout + 5)
-                                    pending = None
-                                else:
-                                    stub.Export(request, timeout=timeout)
+                                call.result(timeout=wait)
                                 with lock:
                                     acknowledged.append(
                                         (signal, request_id, time.monotonic())
                                     )
                                 break
+                            except grpc.FutureTimeoutError:
+                                # This thread stopped waiting; the call was
+                                # never refused. Cancel it explicitly and
+                                # record it on its own path, so it can never
+                                # be mistaken for a status the server sent.
+                                call.cancel()
+                                with lock:
+                                    local_waits.append((signal, wait))
                             except grpc.RpcError as error:
-                                pending = None
-                                classify(signal, error, started, timeout)
+                                with lock:
+                                    server_codes.append((signal, error.code()))
                                 if error.code() not in RETRYABLE_CODES:
                                     raise
                                 time.sleep(0.1)
@@ -2361,13 +2367,34 @@ class OutageSlice(unittest.TestCase):
                     # The engine must have given up on at least one block and
                     # must have retried at least one write before doing so: a
                     # single-attempt flush would prove nothing about retries.
+                    # Both are reset counters, so one loop carries the maxima
+                    # of both, seeded with the snapshots taken above: waiting
+                    # for one and then the other would miss a value that
+                    # appeared and was drained while the first was pending.
+                    flushes = ("flush.failures", "flush.retries")
+                    counters = wait_for_metrics(
+                        engine,
+                        flushes,
+                        1,
+                        30,
+                        seed={
+                            name: max(
+                                (
+                                    metric_max(document, name)
+                                    for document, _ in samples
+                                ),
+                                default=0,
+                            )
+                            for name in flushes
+                        },
+                    )
                     self.assertGreaterEqual(
-                        wait_for_metric(engine, "flush.failures", 1, 30),
+                        counters["flush.failures"],
                         1,
                         "no block failed while the store was stopped",
                     )
                     self.assertGreaterEqual(
-                        wait_for_metric(engine, "flush.retries", 1, 30),
+                        counters["flush.retries"],
                         1,
                         "no write was retried while the store was stopped",
                     )
@@ -2557,7 +2584,9 @@ class OutageSlice(unittest.TestCase):
         )
         print(
             f"{kind} outage: {len(server_codes)} server refusals {dict(codes)}, "
-            f"{len(local_waits)} client deadlines, "
+            f"{len(local_waits)} client waits expired, "
+            f"flush failures/retries {counters['flush.failures']:.0f}"
+            f"/{counters['flush.retries']:.0f}, "
             f"Alloy {len(alloy_refusals)} refused exports and "
             f"{len(alloy_deadlines)} own deadlines, "
             f"duplicate rows {duplicates}"
