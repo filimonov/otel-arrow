@@ -34,9 +34,13 @@ outstanding FLUSHING block is finished, so a block that still reaches storage
 is acknowledged rather than refused; and only then is the ACTIVE block rotated
 and flushed. A request force-drained after the latch is refused immediately
 with a retryable `NodeShutdown` nack instead of being parked, so a full
-completion channel cannot stall the drain. At the deadline each remaining
-decision is attempted once and whatever the completion channel will not take
-is counted as a delivery failure and released: the producer sees its own
+completion channel cannot stall the drain. A flush that has already
+published a successful result when the deadline arrives is acknowledged from
+that result rather than refused, because the deadline branch outranks the one
+that awaits it and can win the same turn; the block's files exist, so refusing
+it would ask the producer to resend durable rows. At the deadline each
+remaining decision is attempted once and whatever the completion channel will
+not take is counted as a delivery failure and released: the producer sees its own
 timeout and retries, and committed data is never re-exported. The cleanup that
 follows is bounded by `upload.abort_timeout` and admits no new data; it
 releases the write tasks only, and neither extends the producer notification

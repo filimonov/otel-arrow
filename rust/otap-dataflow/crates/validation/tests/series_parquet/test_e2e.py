@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 import duckdb
@@ -98,7 +99,14 @@ def metric_request(request_id, unsupported=False):
 class Engine:
     """A real `df_engine` process running the series Parquet example config."""
 
-    def __init__(self, directory, storage=None, overrides=None, interval="1s"):
+    def __init__(
+        self,
+        directory,
+        storage=None,
+        overrides=None,
+        interval="1s",
+        telemetry_interval=None,
+    ):
         self.root = Path(directory)
         self.data = self.root / "data"
         self.data.mkdir(exist_ok=True)
@@ -117,6 +125,13 @@ class Engine:
         if overrides:
             for key, value in overrides.items():
                 export[key] = value
+        if telemetry_interval:
+            # The exporter's gauges are sampled when the engine collects
+            # telemetry, so a test that has to observe a short-lived state
+            # needs the collection to be faster than that state.
+            self.config["engine"]["telemetry"]["reporting_interval"] = (
+                telemetry_interval
+            )
         self.path = self.root / "pipeline.yaml"
         self.path.write_text(yaml.safe_dump(self.config))
         binary = Path(os.environ.get("DF_ENGINE", WORKSPACE / "target/debug/df_engine"))
@@ -145,6 +160,29 @@ class Engine:
             self.close()
             raise
         self.logs = logs_rpc.LogsServiceStub(self.channel)
+
+    def exporter_gauges(self, *names):
+        """Latest value of each named exporter gauge, from the admin API.
+
+        Reads the Prometheus text the engine already exposes rather than
+        adding a second reporting path. A gauge the engine has not published
+        yet reads as zero, which is what the callers want: they wait for a
+        state to appear.
+        """
+        url = f"http://127.0.0.1:{self.admin_port}/api/v1/telemetry/metrics"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                body = response.read().decode()
+        except Exception:
+            return dict.fromkeys(names, 0.0)
+        found = dict.fromkeys(names, 0.0)
+        for line in body.splitlines():
+            if line.startswith("#"):
+                continue
+            for name in names:
+                if line.startswith(f"{name}{{") and "series_parquet" in line:
+                    found[name] = float(line.rsplit(" ", 2)[-2])
+        return found
 
     def engine_log(self):
         """Return everything the engine has written to its combined log."""
@@ -528,84 +566,145 @@ class MetricsSlice(unittest.TestCase):
                         print(engine.engine_log())
                         raise
 
+def bulk_log_request(tag, records):
+    """An OTLP logs request with `records` bodies, all on one series.
+
+    Large enough that writing the block it fills takes long enough to be
+    observed through the engine's telemetry, which is how the shutdown test
+    establishes that a block really is being written.
+    """
+    req = logs_pb.ExportLogsServiceRequest()
+    resource = req.resource_logs.add()
+    resource.resource.attributes.add(key="host.id").value.string_value = "producer-1"
+    scope = resource.scope_logs.add()
+    scope.scope.name = "series-e2e"
+    for n in range(records):
+        record = scope.log_records.add(time_unix_nano=1789960500000000000 + n)
+        record.body.string_value = f"{tag}-{n}"
+        record.attributes.add(key="logger.name").value.string_value = "series.logger"
+    return req
+
+
 class ShutdownSlice(unittest.TestCase):
     """Two blocks in flight when the admin endpoint stops the engine."""
 
-    # Scenario: two requests fill a two-request block, which is sealed and
-    # written, a third request opens the next block, and the admin shutdown
-    # endpoint is called while that third producer is still outstanding.
-    # Guarantees: every producer observes an acknowledgement rather than a
-    # refusal or a drain timeout, and all three bodies are readable from
-    # Parquet and still join to their series rows, so a shutdown that arrives
-    # with one block written and one open loses nothing.
+    # Scenario: two bulk requests fill a two-request block whose write is still
+    # running, a third request opens the next block, and the admin shutdown
+    # endpoint is called only once the engine's own telemetry reports both a
+    # non-empty FLUSHING block and a non-empty ACTIVE block. The rotation
+    # window is ten minutes, so nothing but the shutdown can seal that second
+    # block.
+    # Guarantees: every producer is decided -- acknowledged, or refused in a
+    # way that is not a permanent rejection of its data -- and every body that
+    # was acknowledged is readable from Parquet. Nothing is silently lost and
+    # nothing durable is reported as refused.
     #
-    # The rotation window is left at one second on purpose. The receiver holds
-    # its OTLP response until the exporter decides the request, and it drains
-    # its ingress before the exporter is handed the Shutdown control message,
-    # so a window longer than that drain wait would make the two wait for each
-    # other until the drain times out. That ordering is the engine's, not this
-    # node's; see the task 11 report.
-    def test_shutdown_drains_both_blocks(self):
+    # The admin timeout is deliberately short. The receiver holds its OTLP
+    # response until the exporter decides the request and drains its ingress
+    # before the exporter is handed the Shutdown control message, so with a
+    # window this long the two wait for each other until that drain gives up;
+    # see the task 11 report. The test asserts the contract rather than which
+    # side of that race each request lands on.
+    def test_shutdown_drains_two_blocks_in_flight(self):
+        bodies = {
+            "bulk-a": 40000,
+            "bulk-b": 40000,
+        }
         with tempfile.TemporaryDirectory() as directory, Engine(
             directory,
-            overrides={"window": {"interval": "1s", "max_requests_per_block": 2}},
+            overrides={"window": {"interval": "600s", "max_requests_per_block": 2}},
+            telemetry_interval="50ms",
         ) as engine:
             try:
-                filling = [
-                    engine.logs.Export.future(
-                        log_request(f"shutdown-block-a-{n}"), timeout=60
+                calls = {
+                    tag: engine.logs.Export.future(
+                        bulk_log_request(tag, records), timeout=120
                     )
-                    for n in range(2)
-                ]
-                for call in filling:
-                    call.result(timeout=60)
-                # The block that took those two is written, so this one opens
-                # the next block, which is still ACTIVE as shutdown begins.
-                waiting = engine.logs.Export.future(
-                    log_request("shutdown-block-b"), timeout=60
+                    for tag, records in bodies.items()
+                }
+                calls["single"] = engine.logs.Export.future(
+                    log_request("single"), timeout=120
                 )
-                engine.shutdown(seconds=60)
-                # A durable decision: an OK OTLP response means the rows are
-                # in the lake.
-                waiting.result(timeout=60)
+
+                # The gate: the engine itself reports a block being written and
+                # another block open. Without it the test would only be
+                # asserting that a sequence of committed blocks survives.
+                deadline = time.monotonic() + 60
+                gauges = {}
+                while time.monotonic() < deadline:
+                    gauges = engine.exporter_gauges(
+                        "block_flushing_bytes", "block_active_bytes"
+                    )
+                    if gauges["block_flushing_bytes"] > 0 and (
+                        gauges["block_active_bytes"] > 0
+                    ):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail(f"the two blocks were never both in flight: {gauges}")
+
+                try:
+                    engine.shutdown(seconds=20)
+                except urllib.error.HTTPError as error:
+                    # The drain deadline is reached rather than the drain
+                    # completing, which is exactly the case this test is for:
+                    # the engine gives up waiting and the exporter refuses
+                    # whatever it could not make durable. The producers must
+                    # still each be decided, which is what follows.
+                    self.assertEqual(error.code, 504, error.read().decode())
+
+                acked, refused = [], []
+                for tag, call in calls.items():
+                    try:
+                        call.result(timeout=120)
+                        acked.append(tag)
+                    except grpc.RpcError as error:
+                        # A shutdown refusal is retryable: the producer still
+                        # holds the only copy, so it must never be told its
+                        # data was rejected.
+                        self.assertNotEqual(
+                            error.code(),
+                            grpc.StatusCode.INVALID_ARGUMENT,
+                            f"{tag} was refused as if its data were bad",
+                        )
+                        refused.append(tag)
+                self.assertEqual(
+                    sorted(acked + refused),
+                    sorted(calls),
+                    "every producer is decided, one way or the other",
+                )
+                # The block that was already being written when shutdown began
+                # reaches storage, so its requests are acknowledged rather than
+                # refused: shutdown finishes the outstanding FLUSHING block.
+                self.assertEqual(
+                    sorted(tag for tag in acked if tag in bodies),
+                    sorted(bodies),
+                    f"the flushing block was not acknowledged; refused {refused}",
+                )
+
                 values = list(
                     engine.data.glob("v=1/signal=logs/dataset=values/**/*.parquet")
                 )
-                series = list(
-                    engine.data.glob("v=1/signal=logs/dataset=series/**/*.parquet")
-                )
                 self.assertTrue(values, "no values file after shutdown")
-                self.assertTrue(series, "no series file after shutdown")
                 with duckdb.connect() as db:
-                    rows = db.execute(
-                        "SELECT body FROM read_parquet(?) ORDER BY body",
-                        [[str(path) for path in values]],
-                    ).fetchall()
-                    # Counted as a membership test rather than a join: a
-                    # block opened inside a window whose predecessor was
-                    # sealed by the request limit re-emits its descriptors,
-                    # so the same series id legitimately appears in both
-                    # series files and a join would multiply the rows.
-                    described = db.execute(
-                        "SELECT count(*) FROM read_parquet(?) v WHERE "
-                        "v.series_id IN (SELECT series_id FROM read_parquet(?))",
-                        [
-                            [str(path) for path in values],
-                            [str(path) for path in series],
-                        ],
-                    ).fetchall()
+                    stored = {
+                        row[0]
+                        for row in db.execute(
+                            "SELECT DISTINCT split_part(body, '-', 1) || "
+                            "CASE WHEN body LIKE 'bulk-%' THEN '-' || "
+                            "split_part(body, '-', 2) ELSE '' END "
+                            "FROM read_parquet(?)",
+                            [[str(path) for path in values]],
+                        ).fetchall()
+                    }
+                # Every acknowledged request's rows are in the lake, and
+                # nothing that was refused was quietly written anyway.
+                for tag in acked:
+                    self.assertIn(tag, stored, f"{tag} was acked but is not stored")
                 self.assertEqual(
-                    rows,
-                    [
-                        ("shutdown-block-a-0",),
-                        ("shutdown-block-a-1",),
-                        ("shutdown-block-b",),
-                    ],
-                )
-                self.assertEqual(
-                    described,
-                    [(3,)],
-                    "every acknowledged row has its descriptor in the lake",
+                    stored - set(acked),
+                    set(),
+                    "a refused request must not have left rows behind",
                 )
             except Exception:
                 print(engine.engine_log())

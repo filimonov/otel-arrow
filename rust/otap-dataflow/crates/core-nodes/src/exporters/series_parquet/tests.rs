@@ -3712,3 +3712,62 @@ async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
         })
         .await;
 }
+
+/// Scenario: the flush task has already published a successful result when the
+/// shutdown deadline elapses, so the loop's biased deadline branch reaches the
+/// worker in the same turn as a ready, durable result.
+/// Guarantees: the block whose files exist is acknowledged and its descriptors
+/// are committed, rather than refused as uncommitted work, so shutdown never
+/// asks a producer to resend rows that are already in object storage.
+#[tokio::test(flavor = "current_thread")]
+async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
+
+            worker.admit(logs_pdata());
+            let id = *worker
+                .active
+                .data
+                .pending_series
+                .iter()
+                .next()
+                .expect("the request carries a descriptor");
+            let partition = worker.active.data.partition;
+            worker.rotate();
+
+            // The supervising task publishes its decision immediately before
+            // it returns, so this is the state the deadline branch can win:
+            // the result is ready and nothing has taken it yet.
+            until("the flush publishes its result", || {
+                worker
+                    .flushing
+                    .as_ref()
+                    .is_some_and(|job| job.task_finished())
+            })
+            .await;
+            assert!(
+                worker.flushing.is_some(),
+                "the result is still sitting in the flush job"
+            );
+
+            worker.shutdown(clock::now());
+            worker.abandon().await;
+
+            assert!(
+                worker.cache.is_committed(&id, partition),
+                "a block decided by its own successful result still commits"
+            );
+            match rx.recv().await.expect("a completion") {
+                PipelineCompletionMsg::DeliverAck { .. } => {}
+                other => panic!("expected an ack for a durable block, got {other:?}"),
+            }
+            assert!(worker.is_idle(), "nothing is left holding a slot");
+        })
+        .await;
+}

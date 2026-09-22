@@ -967,6 +967,12 @@ impl Worker {
 
     /// Decide everything still owned, once the shutdown deadline has elapsed.
     ///
+    /// A flush that has already published its decision is decided by that
+    /// decision first: the deadline branch outranks the branch that awaits the
+    /// flush result, so it can win the same poll in which a successful write
+    /// finished, and a block whose files exist must be acknowledged rather than
+    /// refused.
+    ///
     /// The whole decision is taken and delivered before anything is cancelled,
     /// and it is taken without a single await: the parked write cannot run
     /// between the two halves, so no completion can be waiting behind the
@@ -984,6 +990,19 @@ impl Worker {
     /// hold the node open: this costs at most one abort timeout beyond the
     /// shutdown deadline, and it buys the abort actually being attempted.
     pub(super) async fn abandon(&mut self) {
+        // Phase zero: a flush that has already published its decision is
+        // decided by that decision, not by the deadline. The loop's deadline
+        // branch is biased above the branch that awaits the flush result, so
+        // the deadline can win the very poll in which a successful write
+        // finished; nacking that block would tell the producer to resend rows
+        // whose files already exist. Taking the result here also commits the
+        // descriptors it carried, and moves the job into the cleaning slot
+        // that phase two releases.
+        if let Some(job) = &mut self.flushing
+            && let Some(done) = job.try_finish()
+        {
+            self.complete(Ok(done));
+        }
         // Phase one: decide and deliver. Nothing here awaits, and nothing here
         // cancels.
         if let Some(pending) = self.pending.take() {

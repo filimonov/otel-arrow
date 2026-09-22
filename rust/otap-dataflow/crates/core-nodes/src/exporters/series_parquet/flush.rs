@@ -291,6 +291,31 @@ impl FlushJob {
         (&mut self.result_rx).await
     }
 
+    /// Take the flush's decision if it has already been published.
+    ///
+    /// Non-blocking, and never waits for the supervising task. The node's
+    /// shutdown-deadline branch is biased above the branch that awaits this
+    /// result, so the deadline can win the very poll in which a successful
+    /// write has already published its report. A block whose files exist has
+    /// to be acknowledged rather than nacked, or the producer is told to
+    /// resend rows that are already durable.
+    ///
+    /// `None` also covers a supervising task that died without sending, which
+    /// the caller then decides exactly as it decides an unresolved flush.
+    pub(super) fn try_finish(&mut self) -> Option<FlushDone> {
+        self.result_rx.try_recv().ok()
+    }
+
+    /// Whether the supervising task has already returned.
+    ///
+    /// A test observation only: the task publishes its decision immediately
+    /// before it returns, so this is how a test waits for a result to be ready
+    /// without consuming it.
+    #[cfg(test)]
+    pub(super) fn task_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
     /// Wait for the supervising task to release everything it owns.
     ///
     /// Cancellation safe, and bounded by the sink's `upload.abort_timeout`
