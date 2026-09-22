@@ -1,7 +1,7 @@
 # Series Parquet Exporter: Design
 
 Date: 2026-09-21
-Status: approved for planning (revision 5, after three rounds of external
+Status: approved for planning (revision 6, after three rounds of external
 review)
 Scope: phases 1 and 2 of the series lake work (core crate and Dataflow
 exporter). Introspection HTTP API and traces are separate specs; section 10
@@ -11,6 +11,13 @@ What changed in revision 5: merged metrics values (5.1), request cost model
 (5.6), workers, sources and threading (6.8), network distribution and
 producer timeouts (7.6), and the deferred shared writer with parallel
 preparation (10.4).
+
+What changed in revision 6: recommended durable-buffer deployment and the
+exporter's acknowledgement invariant (1, 1.1), three deployment topologies
+(7.7), strict-mode producer sizing from measured Alloy memory (7.6), a
+buffered pipeline with a longer window (7.4), required plan-3 latency,
+restart, replay and duplicate measurements (9), and consistent retry,
+shutdown and deferred shared-writer wording throughout.
 
 ## 1. Problem
 
@@ -28,9 +35,9 @@ store as Parquet, with these properties:
   streams that reference it by `series_id`.
 - Every values partition that contains rows for a series also contains at
   least one descriptor row for that series, written by the same worker.
-- Stateless: no WAL, no local disk. Producers wait for their OTLP request to
-  be acknowledged; the ACK is sent only after the data is committed to the
-  object store. Delivery is at-least-once.
+- This exporter is stateless: no WAL, no local disk. The system guarantees
+  at-least-once delivery into object storage; where the producer's
+  acknowledgement happens is a deployment choice (section 7.7).
 - Values files are sorted by configurable physical columns; series files are
   sorted by `series_id`.
 - Layout is Hive-style and readable by Spark and DuckDB without extra tooling.
@@ -41,13 +48,17 @@ store as Parquet, with these properties:
 
 Every change to this component is checked against these four properties:
 
-1. No persistent local state. A restart starts from an empty process.
+1. No persistent local state in this node. Its state is empty after restart.
 2. Never more than ACTIVE plus FLUSHING. There is no third block and no
    spill.
 3. The series cache is an optimization, never correctness state. Losing it
    (restart, eviction, or deleting it outright) can only increase the volume
    of the `series` dataset, never lose or corrupt data.
-4. No producer ACK before its block is durable in object storage.
+4. This node acknowledges a request to its upstream only after every row of
+   its block is durable in object storage.
+
+The recommended deployment puts a durable buffer upstream so producers are
+acknowledged from its write-ahead log on the collector node (section 7.7).
 
 Sorting of values tables is likewise an optimization: with
 `sorting.enabled: false` every guarantee above and every schema stays the
@@ -89,6 +100,13 @@ Verified on `main` at commit `5588c3e0d`:
   optional transport headers and optional authorization claims
   (`otap/src/pdata.rs:143-171`); `take_transport_headers` strips the headers
   (`pdata.rs:512`).
+- `processor:durable_buffer`, behind feature gate `durable-buffer`, is
+  experimental. It acks upstream immediately after the durable local write
+  (`durable_buffer_processor/mod.rs:1106`), then forwards finalized bundles
+  on timer ticks. Retryable downstream nacks defer the bundle with
+  exponential backoff; permanent nacks reject it without retry. Each core
+  has isolated WAL and segment storage; `retention_size_cap` is divided
+  across the assigned pipeline cores (see the processor's README).
 - `ExporterInbox::recv_when(accept_pdata)` (`engine/src/message.rs:874`) lets
   an exporter keep receiving control messages while refusing pdata. On
   shutdown the inbox latches `Shutdown`, force-drains buffered pdata to the
@@ -497,9 +515,10 @@ both recipes and how to detect incompatible mixes.
 - Visibility guarantees, stated narrowly: readers may observe a block
   partially (some files present) while it is being written or after a
   permanent failure; rows of a nacked request may therefore exist in storage
-  and appear again after the producer retries; there is no snapshot
-  consistency across files. Referential coverage (section 5.5) holds for
-  every visible values file because its descriptors were completed earlier.
+  and appear again after the upstream retries (buffer replay or producer
+  retry, depending on topology); there is no snapshot consistency across
+  files. Referential coverage (section 5.5) holds for every visible values
+  file because its descriptors were completed earlier.
 - No files are written for a dataset with zero rows; an empty window writes
   nothing.
 - Interrupted multipart uploads are aborted on a best-effort basis; leftovers
@@ -811,10 +830,11 @@ bounded by construction (documented expansion factors):
 ```
 
 Not counted, and documented as such: the incoming `OtapPdata` before step 2
-(bounded by the receiver's request limit and the pdata channel capacity),
-struct and allocator overhead, and the same formula again for every other
-worker. `memory.unaccounted_rss_bytes` (section 7.5) exposes the residual.
-The README shows the aggregate.
+(bounded by upstream request limits and the pdata channel capacity),
+struct and allocator overhead, the upstream durable buffer's own memory,
+and the same formula again for every other worker.
+`memory.unaccounted_rss_bytes` (section 7.5) exposes the residual. The README
+shows the aggregate and accounts for other nodes separately.
 
 ### 6.7 Responsiveness bound
 
@@ -837,7 +857,7 @@ cardinality and bytes per window.
 
 Workers are shared-nothing: each runs on its own `LocalSet` with `!Send`
 nodes and `Rc` state, its own writer id and boot id, its own series cache
-and its own budgets. Total retained request memory is workers times
+and its own budgets. Exporter-owned retained request memory is workers times
 (ACTIVE + FLUSHING + one pending request + completion tokens); the cache
 and workspace terms in section 6.6 also apply per worker.
 
@@ -897,7 +917,7 @@ observable is handled normally and flushed by the shutdown path.
 Control messages:
 
 - `Shutdown { deadline }`: set `shutting_down`; if `pending` is occupied,
-  nack it with `nacks{reason=shutdown}` (its producer is still waiting);
+  nack it with `nacks{reason=shutdown}` (its upstream awaits the result);
   if `flushing` is busy, wait for it within the deadline while still
   delivering notifications; then rotate and flush `active` within the
   remaining deadline; at the deadline cancel the flush task (6.5 step 2);
@@ -907,20 +927,35 @@ Control messages:
   token.
 - `CollectTelemetry`: report metrics.
 - Others: ignored. `DrainIngress` is never delivered to exporters, so the
-  exporter cannot flush early when draining begins; the README therefore
-  requires `shutdown deadline > window.interval + flush_retry_deadline +
-  upload time`, otherwise receivers give up on outstanding requests before
-  the exporter can commit them.
+  exporter cannot flush early when draining begins. For the strict topology,
+  the README requires `shutdown deadline > window.interval +
+  flush_retry_deadline + upload time`, otherwise receivers give up on
+  outstanding requests before the exporter can commit them. With a durable
+  buffer upstream, producer requests finish at the WAL write; bundles not
+  committed by shutdown remain on disk for replay after restart.
 
 ### 7.2 Acknowledgement contract
 
-With `receiver:otlp` configured with `wait_for_result: true` and the
-exporter directly downstream, the producer's request stays open until commit
-or nack. An admitted request may later commit or fail; producers must retain
-and retry on timeout or nack. Content rejections use `NackCause::Refused`
-so the receiver reports a non-retryable status; storage and shutdown nacks
-are retryable. The receiver `timeout` bounds the producer's wait and should
-cover, in the worst case:
+This node's contract is the same in every topology: ack its upstream only
+after the whole block is durable, nack retryably on storage or shutdown
+failure, and refuse content permanently with `NackCause::Refused`. The
+zero-output-row case remains as specified in section 6.2. This contract
+makes the durable buffer's retry loop correct: it retains a bundle until
+this node acks, retries retryable nacks with backoff, and stops retrying
+permanent refusals.
+
+In the recommended topology, `receiver:otlp` uses `wait_for_result: true`
+with `processor:durable_buffer` immediately downstream. The producer's
+request ends after the durable local write; the exporter later acknowledges
+the buffer after commit. A later content refusal is recorded by the buffer
+as a permanent rejection; it cannot change the producer's earlier OK.
+
+In the strict topology, the exporter is directly downstream of the receiver
+with `wait_for_result: true`, so the producer's request stays open until
+commit or nack. Producers must retain and retry on timeout or retryable
+nack; a content refusal reaches the producer as a non-retryable status.
+The receiver `timeout` bounds the producer's wait and should cover, in the
+worst case:
 
 ```text
 channel residence
@@ -930,7 +965,7 @@ channel residence
 + notification delivery
 ```
 
-The example uses `timeout: 180s` with `flush_retry_deadline: 60s` and
+The strict example uses `timeout: 180s` with `flush_retry_deadline: 60s` and
 `interval: 15s`. This reduces but does not eliminate timeouts after
 admission; a request that times out on the receiver is still committed or
 nacked by the exporter, and the producer's retry then creates duplicates.
@@ -938,12 +973,17 @@ This is the documented at-least-once behavior.
 
 ### 7.3 Backpressure
 
-While the worker refuses pdata, the bounded pdata channel fills, the receiver
-blocks on the channel send until its timeout, and beyond the configured
-admission concurrency it answers `RESOURCE_EXHAUSTED`. No new engine mechanism
-is needed.
+While the worker refuses pdata, its bounded pdata channel fills. In the
+recommended topology the durable buffer keeps bundles on disk and retries
+forwarding; producers are backpressured when the buffer reaches its disk
+cap under `size_cap_policy: backpressure`. In the strict topology this
+pressure reaches the receiver directly: it blocks on the channel send until
+its timeout, and beyond the configured admission concurrency it answers
+`RESOURCE_EXHAUSTED`. No new engine mechanism is needed.
 
 ### 7.4 Configuration
+
+Exporter options, shown with the strict topology's 15 s window:
 
 ```yaml
 type: exporter:series_parquet
@@ -1012,11 +1052,62 @@ README also notes that byte-triggered rotation inside a window re-emits the
 block's descriptors, so under sustained high throughput the `series` volume
 grows with the number of blocks per hour.
 
-Example pipeline in `configs/series-parquet-s3.yaml`: `receiver:otlp`
+Strict example pipeline in `configs/series-parquet-s3.yaml`: `receiver:otlp`
 (`wait_for_result: true`, `timeout: 180s`) connected directly to
 `exporter:series_parquet`, with an explicit `core_allocation`; the shutdown
 deadline of section 7.1 is passed through the admin shutdown API timeout in
 v1 (see section 6.5).
+
+Recommended pipeline, with the other exporter options as above and feature
+gate `durable-buffer` enabled alongside `series_parquet` and the storage
+backend feature:
+
+```yaml
+version: otel_dataflow/v1
+policies:
+  resources:
+    core_allocation: { type: core_count, count: 1 }
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          receiver:
+            type: receiver:otlp
+            config:
+              protocols:
+                grpc:
+                  listening_addr: "127.0.0.1:4317"
+                  wait_for_result: true
+          durable_buffer:
+            type: processor:durable_buffer
+            config:
+              path: /var/lib/otap/series-parquet-buffer
+              retention_size_cap: 10 GiB
+              size_cap_policy: backpressure
+          exporter:
+            type: exporter:series_parquet
+            config:
+              storage:
+                s3:
+                  base_uri: s3://bucket/otel
+                  region: eu-central-1
+              writer_id: collector-17
+              producer_id_attribute: host.id
+              window:
+                interval: 120s
+                max_block_bytes: 500MiB
+                max_requests_per_block: 4096
+                flush_retry_deadline: 60s
+        connections:
+          - { from: receiver, to: durable_buffer }
+          - { from: durable_buffer, to: exporter }
+```
+
+With buffer capacity available, the longer window is free of producer
+latency cost: the producer waits only for the WAL write. It gives fewer,
+larger files and lower request cost; byte and request limits still rotate
+blocks early. The buffer path must survive process restarts.
 
 ### 7.5 Telemetry
 
@@ -1039,12 +1130,19 @@ memory.budget_bytes, memory.accounted_bytes
 
 Process-scoped, reported once per process: `memory.unaccounted_rss_bytes` =
 process RSS (sampled the same way the memory limiter samples it) minus the
-sum of `memory.accounted_bytes` over all workers. A growing unaccounted
-value is the signal that the bound is being bypassed by Arrow, the allocator
-or `object_store`. The README states the memory bound as part of the public
-contract, with the process-level formula.
+sum of `memory.accounted_bytes` over all exporter workers. The residual also
+includes the durable buffer and other nodes in the same process; their
+memory must be accounted for separately before attributing growth to Arrow,
+the allocator or `object_store`. The README states the exporter memory bound
+as part of the public contract, with the process-level formula.
 
-### 7.6 Network distribution and producer timeouts
+### 7.6 Strict topology: network distribution and producer sizing
+
+The producer-timeout and memory requirements below apply when the producer's
+call is held until object-storage commit: the strict topology. The
+recommended durable-buffer topology removes that window-length hold and
+these producer requirements. The connection distribution facts still apply
+to both topologies.
 
 The engine creates a `SO_REUSEPORT` listener per worker on the same port
 (`engine/src/effect_handler.rs`). The kernel distributes TCP connections
@@ -1068,10 +1166,11 @@ Per-connection stream concurrency follows `max_concurrent_streams`, which
 tracks `max_concurrent_requests` by default
 (`otap/src/otap_grpc/common.rs`).
 
-The binding operational constraint is the producer timeout. With
-`wait_for_result: true`, the response is held until the request's rows are
-durable. A request arriving just after a rotation waits nearly a whole
-window plus the flush. The producer's timeout must exceed
+The binding operational constraint in strict mode is the producer timeout.
+With the exporter directly downstream and `wait_for_result: true`, the
+response is held until the request's rows are durable in object storage.
+A request arriving just after a rotation waits nearly a whole window plus
+the flush. The producer's timeout must exceed
 `window.interval` plus the flush time by a clear margin; the reference
 configuration uses 180 s (section 7.2 gives the full receiver-side bound).
 A shorter timeout makes the producer give up and resend, safe under
@@ -1079,12 +1178,83 @@ at-least-once delivery but multiplying traffic and rows. This was observed
 with a six-second exporter timeout in the outage test, which produced
 deadline errors and duplicate rows.
 
+The [Alloy measurements][alloy-research] show why timeout tuning alone is
+not enough. The producer must buffer at least `input_rate * hold` records;
+queue slots stay occupied until the export completes, including retries.
+Use `queue_size = input_rate * hold * 1.5` for headroom. For the measured
+Alloy v1.19.2 file-tail/Loki pipeline, the queue stores one wrapper per log
+record and merges only after dequeue. Batching reduces wire requests but
+does not reduce the per-record backlog cost: about 2.0 KB of resident memory
+per queued record, even for a roughly 60-byte log line.
+
+The measured sizing model is `RSS ~= 236 MB + queue_size * 2.0 KB`, with a
+catch-up peak about `1.6 * RSS` after an outage. Using the measured 2.03 KB
+slope and the 1.5 headroom factor gives these estimates, not universal
+producer memory bounds:
+
+| Input rate | Hold | Queue with headroom (records) | Steady RSS | Catch-up peak |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000/s | 15 s | 22,500 | 280 MB | 450 MB |
+| 1,000/s | 60 s | 90,000 | 420 MB | 670 MB |
+| 5,000/s | 15 s | 112,500 | 465 MB | 745 MB |
+| 5,000/s | 60 s | 450,000 | 1.15 GB | 1.85 GB |
+
+The 60 s rows represent a storage outage holding a request for the flush
+retry deadline, not a 60 s normal window or the full worst-case bound in
+section 7.2. A gigabyte of producer memory is not a reasonable ask. At those
+rates the strict topology depends on the producer parking its source when
+the queue fills. For a file source, `block_on_overflow = true` is safe because
+the file is the buffer. Blocking also parks the Loki receiver's single
+goroutine, so it stalls every Loki-sourced pipeline in a shared producer.
+
+Batching still matters for throughput: the ceiling is
+`num_consumers * records_per_export / hold`. Without batching the measured
+Loki bridge sends one record per export. Use an item-sized queue and explicit
+batching; a request-sized queue of single-record wrappers can cap the batch
+itself. Receiver `max_concurrent_requests` must cover producer export
+concurrency. Alloy's default per-attempt timeout of 5 s repeatedly expired
+against a 15 s hold and delivered zero records in the measurement.
+
 Mitigations for skew: fewer and larger workers (also cheaper by section
 5.6), a client configured with several endpoints and a round-robin policy
 instead of a single connection, or an L7 proxy balancing per request.
 Periodic reconnection would reshuffle the hash, but the gRPC server
 currently exposes keepalive settings (TCP and HTTP/2), not a maximum
 connection age.
+
+[alloy-research]: ../../../.superpowers/sdd/2026-09-21-series-parquet-exporter-node/alloy-research.md
+
+### 7.7 Deployment topologies
+
+Producer acknowledgement is a deployment choice. Both series-parquet
+topologies use `wait_for_result: true` on the receiver; this node's own
+contract in section 7.2 does not change. For supported content, with
+unacknowledged input retained and retried, the choices are:
+
+| Topology | What the producer's acknowledgement means | Trade-offs |
+| --- | --- | --- |
+| `receiver -> durable_buffer -> series_parquet` (RECOMMENDED) | Durable on this node's disk. | The producer uses default timeouts and needs no window-sized buffering. The buffer retries this node's retryable nacks with exponential backoff. With lossless retention, data is lost only if the node's disk is lost before it reaches object storage. `retention_size_cap` defaults to 10 GiB, divided across cores; `size_cap_policy: backpressure` loses nothing, while `drop_oldest` is controlled loss. |
+| `receiver -> series_parquet`, `wait_for_result: true` (strict) | In object storage. | No loss in any supported failure: acknowledged input is already in object storage; the producer retains and retries unacknowledged input. Its call is held for up to a window plus the flush in the uncontended case (full bound in 7.2), requiring at least `input_rate * hold` records in producer memory or source backpressure (7.6). |
+| `receiver -> exporter:parquet` (upstream exporter, contrast only) | Accepted into memory. | That exporter sends no acknowledgement at all. With receiver `wait_for_result: false`, the producer's OK means only memory acceptance; any restart loses buffered data. With `wait_for_result: true`, the receiver waits until timeout rather than receiving a durability ack. |
+
+The durable buffer is `processor:durable_buffer`, feature gate
+`durable-buffer`, and is experimental. It persists to its WAL before acking
+the receiver, then forwards finalized bundles on a timer. Storage nacks
+from this exporter remain retryable; content refusals remain permanent and
+are recorded as rejected bundles, not retried. The table's lossless case
+uses `backpressure` without age-based expiry; `drop_oldest` or `max_age`
+deliberately permits loss. A full disk budget propagates backpressure to
+the producer, so default timeouts do not promise unlimited outage buffering.
+
+With the durable buffer, the window interval stops trading against producer
+latency and can be chosen purely for storage economics: longer windows,
+fewer and larger files, lower request cost (section 5.6). This is a
+significant simplification. The exporter still obeys its byte and request
+caps; the buffer absorbs the delay on disk.
+
+Validation of this combined topology belongs to the plan-3 measurement
+plan (section 9.5); it is not yet covered by the shipped tests. The
+recommendation is the design default, with that validation still required.
 
 ## 8. Error handling
 
@@ -1142,7 +1312,8 @@ connection age.
 
 ### 9.2 Exporter tests (engine harness, injected clocks, failing store)
 
-- Ack arrives only after all files of the block exist.
+- This node's ack to its upstream arrives only after all files of the block
+  exist.
 - Descriptor flush fails, then the next block containing the same series
   re-emits the descriptor.
 - Flush completes across an hour boundary: committed partition is the
@@ -1158,7 +1329,8 @@ connection age.
 - Series upload succeeds, values upload fails, retry reuses names and
   overwrites.
 - Restart within the same window produces distinct file names.
-- Producer disconnect before ack does not remove data.
+- Upstream disconnect before this node's ack does not remove admitted data;
+  in the strict topology this includes a producer disconnect.
 - Original payload and conversion workspace released after extraction
   (retained bytes measured); stored tokens carry no headers or claims.
 - Notification delivery with a full completion channel does not stall the
@@ -1167,8 +1339,8 @@ connection age.
   shutdown; shutdown with FLUSHING and ACTIVE both non-empty, with and
   without meeting the deadline; cancellation stops the flush task within
   `abort_timeout`; dropping the `start` future cancels the task.
-- End-to-end receiver-to-exporter shutdown with an outstanding request and
-  a deadline satisfying section 7.1 completes with an ack, not a drain
+- Strict receiver-to-exporter shutdown with an outstanding producer request
+  and a deadline satisfying section 7.1 completes with an ack, not a drain
   timeout.
 - Mixed request (supported and dropped rows) acked only at commit; reject
   policy nacks atomically with `Refused`; traces request refused.
@@ -1189,31 +1361,65 @@ produce the same `series_id`.
 ### 9.4 End-to-end
 
 Definition: a real OTLP producer over the network, a real `df_engine`
-process with `receiver:otlp` (`wait_for_result: true`) and
-`exporter:series_parquet`, a real S3 protocol endpoint (MinIO or LocalStack,
-as in `configs/trafficgen-parquet-local-s3.yaml`), and DuckDB as the reader.
-A mock object store does not count as end-to-end.
+process with `receiver:otlp` (`wait_for_result: true`), optionally
+`processor:durable_buffer`, and `exporter:series_parquet`, a real S3 protocol
+endpoint (MinIO or LocalStack, as in
+`configs/trafficgen-parquet-local-s3.yaml`), and DuckDB as the reader. A mock
+object store does not count as end-to-end. The strict topology remains a
+required case; plan 3 adds the recommended topology as specified in 9.5.
 
 The producer knows exactly what it sent (for example 100 producers, 10k
-requests, 1M log records, 50k metric points, N known series). Assertions:
-acked requests equal expected; values row counts equal expected; descriptor
-coverage holds per partition; every file is sorted as configured; every
-`series_id` recomputes from `identity_bytes`; the canonical series view join
-does not change the values row count; mixed-schema fixtures (an added
+requests, 1M log records, 50k metric points, N known series). After the
+pipeline drains, assertions for a healthy run without retries:
+producer-acked requests equal expected; values row counts equal expected;
+descriptor coverage holds per partition; every file is sorted as configured;
+every `series_id` recomputes from `identity_bytes`; the canonical series view
+join does not change the values row count; mixed-schema fixtures (an added
 denormalized column) read with union-by-name. First implemented for logs
 against `LocalFileSystem`, then MinIO, then metrics. Runs in CI.
 
 ### 9.5 Failure test in v1
 
-One storage-outage-and-recovery scenario on the end-to-end topology: the
-store becomes unreachable for longer than `flush_retry_deadline` while
+One storage-outage-and-recovery scenario on the strict end-to-end topology:
+the store becomes unreachable for longer than `flush_retry_deadline` while
 producers keep sending, then recovers. Assertions: `block.active_bytes` and
-`block.flushing_bytes` never exceed their limits, RSS stays within the
-documented bound, producers receive retryable nacks or timeouts, and after
-recovery `oldest_unacked_seconds` returns to baseline with no acknowledged
-data missing. This scenario also runs as a short PR-tier soak (a few
-minutes, forced rotations, one outage). The full chaos and soak program is
-deferred (section 10.3).
+`block.flushing_bytes` never exceed their limits, exporter RSS stays within
+the documented bound, producers receive retryable nacks or timeouts, and
+after recovery `oldest_unacked_seconds` returns to baseline with no
+acknowledged data missing. This scenario also runs as a short PR-tier soak
+(a few minutes, forced rotations, one outage).
+
+Plan 3 must also prove the recommended topology with a real
+`receiver -> durable_buffer -> series_parquet` pipeline, persistent buffer
+path, `size_cap_policy: backpressure`, no age expiry, and a real object
+store. This is required measurement and integration scope, not a claim
+about shipped test coverage:
+
+- Measure producer-visible acknowledgement latency with buffer capacity
+  available and default producer timeouts. Compare 15 s and 120 s windows
+  at the same input rate below early-rotation limits; report p50, p95 and
+  p99 latency. ACKs must follow the durable local write without waiting for
+  window rotation or object completion, and increasing the window must not
+  add a window-sized producer hold.
+- After known supported records are producer-acked but before their window
+  is flushed, kill the whole process mid-window. Restart with the same
+  buffer path and core allocation, without producer resends. Require the
+  buffer to replay every acknowledged record into object storage and
+  eventually drain; verify descriptor coverage and values by stable input
+  record ids. Repeat a storage outage beyond `flush_retry_deadline` and
+  observe this node's retryable nacks causing buffer retries with backoff.
+- Exercise replay after an ambiguous completion too: kill after objects
+  complete but before the buffer records this node's ack, then restart.
+  Count duplicates by input record id and report their multiplicity; every
+  acknowledged record must have at least one stored copy after recovery.
+  Replay can create new files under a new boot id, so duplicates are allowed
+  and must retain valid descriptor coverage. Do not assert exactly-once
+  delivery or confuse frozen-name retries of one block with replay into a
+  new block.
+
+The buffer's memory and disk usage are reported separately from exporter
+memory. The full chaos and soak program remains deferred (section 10.3);
+this focused topology proof belongs to plan 3.
 
 ### 9.6 Benchmarks
 
@@ -1229,8 +1435,10 @@ encoder transient) and fails when they are exceeded.
 
 - Core ready: 9.1 and 9.3 pass; streaming output equals the reference
   oracle; declared memory counters never exceeded.
-- Integration ready: 9.2, 9.4 and 9.5 pass for logs and metrics; ack only
-  after object completion; restart and outage tests pass.
+- Integration ready: 9.2, 9.4 and 9.5 pass for logs and metrics; this node
+  acks its upstream only after object completion; producer acknowledgements
+  follow the selected topology. Plan-3 buffered latency, restart, replay and
+  duplicate checks pass alongside the strict restart and outage tests.
 - Canary ready (after the deferred chaos and soak program of 10.3): nightly
   soak with storage latency, errors and restarts shows no RSS trend and no
   lost acknowledged records.
@@ -1251,9 +1459,11 @@ Goal: real-time inspection of data that the exporter has accepted but not yet
 committed, the equivalent of `tail -f | grep ...` for telemetry, plus a look
 into the pending buffer and the series cache. Agreed direction:
 
-- Three distinct states exposed by the API: `accepted` (admitted into a
-  block), `committed` (files complete, ack possibly still queued in
-  `notify`), and `acked`. `tail` shows accepted rows as they are admitted;
+- Three distinct states of this exporter exposed by the API: `accepted`
+  (admitted into a block), `committed` (files complete, ack possibly still
+  queued in `notify`), and `acked` (this node has acknowledged its upstream).
+  These do not describe the producer's earlier WAL acknowledgement in the
+  recommended topology. `tail` shows accepted rows as they are admitted;
   `buffer` shows ACTIVE plus FLUSHING; both exclude requests that were
   rejected at admission and the request in the pending slot.
 - Endpoints, subject to the next spec: `GET /v1/state` (block sizes, ages,
@@ -1316,16 +1526,18 @@ queue, which is the buffer-removal point.
 
 ### 10.3 Chaos and soak program (deferred, must not be forgotten)
 
-Deferred from v1 by decision, to run right after metrics land, on the
-end-to-end topology of section 9.4:
+Deferred from v1 by decision, to run right after metrics land, on both
+end-to-end topologies of section 9.4, extending the focused plan-3 proof in
+section 9.5:
 
 - A TCP proxy (toxiproxy or equivalent) between the exporter and the store
   injecting latency, bandwidth limits, resets, timeouts and outages while
   producers keep sending, with the assertions of section 9.5.
 - Failpoints in test builds (`after_series_upload`, `mid_values_upload`,
   `after_values_upload`, `before_ack`) combined with SIGKILL, restart and
-  producer retry. Invariant: no acknowledged request is missing from
-  storage; duplicates are allowed.
+  buffer replay (disk retained) or strict-mode producer retry. Invariant:
+  after recovery and drain, no acknowledged supported request is missing
+  from storage; duplicates are allowed.
 - Soak modes: nightly (hours, realistic cardinality, periodic slowdowns and
   failures, producer reconnects, exporter restarts) and qualification (24 to
   72 hours, sustained load, cardinality churn, random failures).
@@ -1337,7 +1549,9 @@ end-to-end topology of section 9.4:
 - Acceptance criterion: under any supported storage latency or failure the
   exporter's memory stays within its configured bound, and after storage
   recovers the backlog drains and producers resume without loss of
-  acknowledged data.
+  acknowledged supported data. The buffered case retains its disk and uses
+  lossless retention; disk loss and deliberate retention drops have the
+  different guarantees stated in section 7.7.
 
 The "canary ready" gate of section 9.7 depends on this program.
 
@@ -1355,6 +1569,13 @@ readers and compaction, better compression because dictionaries and RLE
 see more rows, sharper row-group statistics, and no duplicate descriptors
 between writers.
 
+In the recommended topology the durable buffer already removes the producer
+hold, so longer windows can reduce file count without increasing producer
+acknowledgement latency. The case for a shared writer is therefore storage
+economics and per-core throughput, not relief from a producer waiting on
+each flush. Strict deployments still have the window and producer-memory
+tradeoff in section 7.6.
+
 Obstacles:
 
 - `Block`, `Extracted` and the sink live in the engine's `!Send` LocalSet
@@ -1365,7 +1586,9 @@ Obstacles:
   data copy is required, but the ownership change is pervasive.
 - Effect handlers are per worker and `!Send`. The writer cannot
   acknowledge another worker's tokens and must signal durable completion
-  back to each worker, which complicates shutdown ordering.
+  back to each worker, which complicates shutdown ordering. With a durable
+  buffer upstream, that completion lets the buffer release retained data;
+  in the strict topology it releases the producer's call.
 - The ACTIVE plus FLUSHING invariant becomes process-wide and needs a
   global reservation.
 - The blast radius of a failed write grows from one worker to every
@@ -1399,11 +1622,13 @@ implementation plan.
 1. `series-lake` alone: canonical encoding with golden vectors, extract,
    cache, `SortedTableBuffer`, sink to `LocalFileSystem`, reference oracle
    property test, fuzz targets. No engine, no network, no S3.
-2. Vertical slice for logs: `receiver:otlp` to `exporter:series_parquet` to
-   `LocalFileSystem`, read with DuckDB, real gRPC producer, real ack. Then
-   the same against MinIO, plus the v1 outage test (9.5).
+2. Strict vertical slice for logs: `receiver:otlp` to
+   `exporter:series_parquet` to `LocalFileSystem`, read with DuckDB, real
+   gRPC producer, real ack. Then the same against MinIO, plus the strict
+   v1 outage test (9.5).
 3. Metrics (number and histogram points in `metrics/values`) reusing the
    same machinery.
-4. Benchmark suite and expansion-factor measurements; quality gates through
-   "integration ready".
+4. Plan 3: benchmark suite and expansion-factor measurements, plus the
+   required buffered-topology latency, restart, replay and duplicate proof
+   (9.5); quality gates through "integration ready".
 5. Chaos and soak program (10.3), then the "canary ready" gate.
