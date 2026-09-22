@@ -136,7 +136,7 @@ async fn write_until(
     // destination actually said rather than the fact that time ran out.
     let mut last: Option<lake::Error> = None;
     loop {
-        if cancel.is_cancelled() || clock::now() >= deadline {
+        if cancel.is_cancelled() {
             let error = last
                 .take()
                 .unwrap_or(lake::Error::Cancelled { abort_error: None });
@@ -144,6 +144,14 @@ async fn write_until(
                 data: Rc::clone(&data),
                 attempts,
                 result: Err(error),
+            });
+            return;
+        }
+        if clock::now() >= deadline {
+            let _ = result_tx.send(FlushDone {
+                data: Rc::clone(&data),
+                attempts,
+                result: Err(expired(attempts, last.take())),
             });
             return;
         }
@@ -189,32 +197,35 @@ async fn write_until(
         tokio::pin!(write);
         let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => None,
-            () = clock::sleep_until(deadline) => None,
-            result = &mut write => Some(result),
+            () = cancel.cancelled() => Err(last
+                .take()
+                .unwrap_or(lake::Error::Cancelled { abort_error: None })),
+            () = clock::sleep_until(deadline) => Err(expired(attempts, last.take())),
+            result = &mut write => Ok(result),
         };
-        let Some(result) = result else {
-            // Publish the producer decision before awaiting any cleanup. This
-            // task independently owns the block, the sink handle and the
-            // pinned write future, so the owner is free to release the block's
-            // completions while the attempt is still unwinding.
-            let _ = result_tx.send(FlushDone {
-                data: Rc::clone(&data),
-                attempts,
-                result: Err(last
-                    .take()
-                    .unwrap_or(lake::Error::Cancelled { abort_error: None })),
-            });
-            attempt_cancel.cancel();
-            let cleanup_deadline = deadline_at(clock::now(), abort_timeout);
-            tokio::select! {
-                biased;
-                _ = &mut write => {}
-                () = clock::sleep_until(cleanup_deadline) => {}
+        let result = match result {
+            Ok(result) => result,
+            Err(decided) => {
+                // Publish the producer decision before awaiting any cleanup. This
+                // task independently owns the block, the sink handle and the
+                // pinned write future, so the owner is free to release the block's
+                // completions while the attempt is still unwinding.
+                let _ = result_tx.send(FlushDone {
+                    data: Rc::clone(&data),
+                    attempts,
+                    result: Err(decided),
+                });
+                attempt_cancel.cancel();
+                let cleanup_deadline = deadline_at(clock::now(), abort_timeout);
+                tokio::select! {
+                    biased;
+                    _ = &mut write => {}
+                    () = clock::sleep_until(cleanup_deadline) => {}
+                }
+                // Dropping the write after the bound releases the last task-owned
+                // resources even if the object store future never cooperates.
+                return;
             }
-            // Dropping the write after the bound releases the last task-owned
-            // resources even if the object store future never cooperates.
-            return;
         };
         match result {
             Ok(report) => {
@@ -228,6 +239,16 @@ async fn write_until(
             Err(error)
                 if retryable(&error) && clock::now() < deadline && !cancel.is_cancelled() =>
             {
+                // Every failed attempt is reported with what the destination
+                // said, not only the one the flush finally ends with: an
+                // outage that the next attempt survives would otherwise leave
+                // no trace at all.
+                otel_warn!(
+                    "series_parquet.flush_attempt_failed",
+                    attempt = attempts,
+                    file = file,
+                    error = %error
+                );
                 last = Some(error);
                 // Never past the deadline: the wait itself must not outlive
                 // the bound the block was given.
@@ -248,6 +269,19 @@ async fn write_until(
                 return;
             }
         }
+    }
+}
+
+/// The outcome of a flush whose retry deadline expired.
+///
+/// Carries the failure of the last attempt that returned, so the producer
+/// and the log are told what the destination said rather than only that time
+/// ran out, and it is a distinct error rather than a cancellation, so a
+/// storage hang is never counted as a shutdown.
+fn expired(attempts: u64, last: Option<lake::Error>) -> lake::Error {
+    lake::Error::DeadlineExceeded {
+        attempts,
+        last: last.map(Box::new),
     }
 }
 

@@ -148,7 +148,8 @@ impl Failure {
             Failure::Retryable(
                 lake::Error::ObjectStore(_)
                 | lake::Error::Cancelled { .. }
-                | lake::Error::AbortFailed { .. },
+                | lake::Error::AbortFailed { .. }
+                | lake::Error::DeadlineExceeded { .. },
             ) => Outcome::Storage,
             Failure::Retryable(_) => Outcome::Internal,
         }
@@ -823,6 +824,9 @@ impl Worker {
                     .as_secs_f64(),
             );
         }
+        // The sentence every request of a failed block is told, shared: the
+        // block failed once, for one reason.
+        let mut reason: Option<Rc<str>> = None;
         let outcome = match &done {
             Ok(finished) => {
                 if let Some(metrics) = &mut self.metrics {
@@ -880,8 +884,14 @@ impl Worker {
                         otel_error!(
                             "series_parquet.flush_failed",
                             error = %error,
+                            attempts = finished.attempts,
                             message = "Block failed before durable completion"
                         );
+                        reason = Some(Rc::from(format!(
+                            "writing the block holding this request to object storage failed: \
+                             {}; retry the request",
+                            sanitized(&error.to_string())
+                        )));
                         self.failed_outcome()
                     }
                 }
@@ -894,8 +904,13 @@ impl Worker {
                 self.failed_outcome()
             }
         };
+        // A block decided at the shutdown deadline is told so, whatever the
+        // write was doing at the time.
+        if outcome != Outcome::Storage {
+            reason = None;
+        }
         for token in std::mem::take(&mut job.tokens) {
-            self.notify.push(token, outcome);
+            self.notify.push_with(token, outcome, reason.clone());
         }
         // The job keeps the FLUSHING slot until its task has released the
         // block, the sink handle and the write future it owns. It owes no

@@ -49,6 +49,20 @@ pub enum Error {
         /// Why the cleanup abort did not succeed, if it did not.
         abort_error: Option<String>,
     },
+    /// A caller that retries the sink ran out of its retry deadline.
+    ///
+    /// Distinct from [`Error::Cancelled`], which is a decision taken by the
+    /// caller, so a destination that keeps failing or never answers is not
+    /// reported as a cancellation. `last` is the failure of the last attempt
+    /// that returned, and `None` when the attempt in flight at the deadline
+    /// was the first and had not returned.
+    #[error("flush retry deadline exceeded after {attempts} attempt(s); {}", match last { Some(e) => format!("last error: {e}"), None => "no attempt returned before the deadline".to_owned() })]
+    DeadlineExceeded {
+        /// Attempts started before the deadline, the unfinished one included.
+        attempts: u64,
+        /// The failure of the last attempt that returned, if any did.
+        last: Option<Box<Error>>,
+    },
     /// A write failed and the best-effort multipart abort failed as well.
     #[error("{source}; multipart abort failed: {abort_error}")]
     AbortFailed {

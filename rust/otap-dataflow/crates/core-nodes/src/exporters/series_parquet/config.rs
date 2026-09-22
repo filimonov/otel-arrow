@@ -137,6 +137,42 @@ fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(normalized(value)?).map_err(|e| e.to_string())
 }
 
+/// Refuse a store retry budget that one write attempt could spend past the
+/// block's own flush deadline.
+///
+/// A cloud store retries each request internally for up to
+/// `retry.retry_timeout`, three minutes when the section is omitted. If that
+/// is not strictly shorter than `window.flush_retry_deadline`, a single
+/// attempt against a destination that keeps failing is still retrying inside
+/// the store when the block's deadline expires: the flush then ends with no
+/// underlying error to report and no retry of its own ever made, which is the
+/// most common storage incident made invisible. Local file storage applies no
+/// store retry at all, so `retried` is false for it and nothing is checked.
+pub(super) fn check_retry_deadline(
+    retried: bool,
+    retry: Option<&RetryOptions>,
+    flush_retry_deadline: Duration,
+) -> Result<(), String> {
+    if !retried {
+        return Ok(());
+    }
+    let timeout = RetryOptions::effective_retry_timeout(retry);
+    if timeout < flush_retry_deadline {
+        return Ok(());
+    }
+    let setting = if retry.is_some() {
+        "retry.retry_timeout"
+    } else {
+        "retry.retry_timeout (the object store default; no retry section is set)"
+    };
+    Err(format!(
+        "{setting} ({timeout:?}) must be strictly less than window.flush_retry_deadline \
+         ({flush_retry_deadline:?}), or one write attempt keeps retrying inside the store \
+         past the block deadline; set retry.retry_timeout below the deadline or raise \
+         window.flush_retry_deadline"
+    ))
+}
+
 /// Validated exporter configuration. Storage and scheduling stay outside
 /// series-lake, which knows only about the lake format itself.
 #[derive(Clone, Debug, Deserialize)]
@@ -240,6 +276,11 @@ impl TryFrom<RawConfig> for Config {
         if let Some(retry) = &raw.retry {
             retry.validate().map_err(|e| e.to_string())?;
         }
+        check_retry_deadline(
+            !matches!(raw.storage, StorageType::File { .. }),
+            raw.retry.as_ref(),
+            raw.window.flush_retry_deadline,
+        )?;
         Ok(Self {
             storage: raw.storage,
             retry: raw.retry,

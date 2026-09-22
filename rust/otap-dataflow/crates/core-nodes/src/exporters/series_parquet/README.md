@@ -46,8 +46,12 @@ coalesce into one rotation.
 
 A storage failure is retried against the identical sealed block, with the same
 file names and the same bytes, until an absolute deadline taken when the block
-was sealed (`window.flush_retry_deadline`). At that deadline every request of
-the block is nacked as retryable, and the abandoned write is cancelled and
+was sealed (`window.flush_retry_deadline`). Every failed attempt is logged at
+WARN as `series_parquet.flush_attempt_failed` with the error the destination
+returned. At that deadline every request of the block is nacked as retryable
+with a reason that carries the last attempt's error, the flush is reported as
+a deadline expiry rather than as a cancellation, and the abandoned write is
+cancelled and
 given at most `upload.abort_timeout` to unwind; the flush slot stays occupied
 until that cleanup finishes. An encoding failure is not retried at all: only
 an object-store or I/O error is, so a bug in encoding fails the block on its
@@ -256,7 +260,12 @@ capacity, upload concurrency, `notify_batch` and the abort and retry durations
 must all be positive. A logical input size that cannot be measured is refused
 before conversion. `retry` settings apply to individual storage operations;
 `window.flush_retry_deadline` is the absolute authority for retrying a whole
-sealed block.
+sealed block. For cloud storage, `retry.retry_timeout` must be strictly less
+than `window.flush_retry_deadline`, and the rule applies to the object store
+default of 3m when the `retry` section is omitted, so the default 60s deadline
+needs an explicit `retry` section. Otherwise one write attempt keeps retrying
+inside the store past the block's deadline and the flush ends with no error to
+report. Local file storage applies no store retry and is not checked.
 
 `writer_id` must be nonempty and must not contain a slash. It names the writer
 process in file names and file metadata and is never part of the series

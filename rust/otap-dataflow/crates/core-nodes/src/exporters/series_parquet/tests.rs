@@ -2361,6 +2361,12 @@ const FAULT_PARK: u8 = 3;
 /// its parts never land and its abort never returns -- while everything else
 /// passes through.
 const FAULT_MULTIPART_WEDGE: u8 = 5;
+/// Injection mode: every write spends [`SLOW_FAILURE`] of engine-clock time
+/// and then fails, the way a cloud store's own retry loop answers a request
+/// once its `retry_timeout` is spent.
+const FAULT_SLOW_FAIL: u8 = 6;
+/// How long one write takes to fail under [`FAULT_SLOW_FAIL`].
+const SLOW_FAILURE: Duration = Duration::from_secs(20);
 
 /// An object store that injects failures at the two entry points a Parquet
 /// write actually uses: a small single-shot PUT and the initiation of a
@@ -2485,8 +2491,12 @@ impl FaultStore {
             self.release.notified().await;
             guard.released = true;
         }
+        if mode == FAULT_SLOW_FAIL {
+            clock::sleep(SLOW_FAILURE).await;
+        }
         let path = path.as_ref();
         let fail = mode == 4
+            || mode == FAULT_SLOW_FAIL
             || (mode == FAULT_SERIES && path.contains("dataset=series/"))
             || (mode == FAULT_VALUES_ONCE
                 && path.contains("dataset=values/")
@@ -3008,6 +3018,195 @@ async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
                 worker.flushing.is_some(),
                 "the released slot takes the next block"
             );
+        })
+        .await;
+}
+
+/// Scenario: a cloud store's retry budget -- the three-minute default when no
+/// retry section is set, or an explicit one -- is checked against the block's
+/// flush deadline, and local file storage is checked with the same values.
+/// Guarantees: a store retry budget that is not strictly shorter than
+/// `window.flush_retry_deadline` is refused with both values in the message,
+/// so one write attempt can never retry inside the store past the deadline;
+/// local file storage, which applies no store retry, is never refused for it.
+#[test]
+fn a_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
+    let deadline = Duration::from_secs(60);
+    let err = super::config::check_retry_deadline(true, None, deadline)
+        .expect_err("the three-minute default outlives the deadline");
+    assert!(err.contains("(180s)"), "{err}");
+    assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
+    assert!(err.contains("object store default"), "{err}");
+    let retry = |timeout: &str| -> otel_arrow_dfe_otap::object_store::RetryOptions {
+        serde_json::from_value(serde_json::json!({ "retry_timeout": timeout }))
+            .expect("retry options")
+    };
+    let equal = super::config::check_retry_deadline(true, Some(&retry("60s")), deadline)
+        .expect_err("equal is not strictly less");
+    assert!(equal.starts_with("retry.retry_timeout (60s)"), "{equal}");
+    assert!(super::config::check_retry_deadline(true, Some(&retry("30s")), deadline).is_ok());
+    assert!(super::config::check_retry_deadline(false, None, deadline).is_ok());
+    // The shipped local example keeps loading with no retry section at all.
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-test"}}
+    }))
+    .expect("file storage applies no store retry");
+    assert!(cfg.retry.is_none());
+}
+
+/// Scenario: the one write of a flush never returns, so the block's retry
+/// deadline expires while that first attempt is still in flight.
+/// Guarantees: the flush ends as a distinct deadline outcome rather than as a
+/// cancellation -- the cancellation counter stays at zero -- and every request
+/// of the block is nacked retryably with a reason that says the deadline
+/// expired with no attempt returned, so a storage hang is never reported as a
+/// shutdown or as an unexplained failure.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            store.entered.notified().await;
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let finished = done.as_ref().expect("the flush resolves");
+            assert_eq!(finished.attempts, 1);
+            assert!(
+                matches!(
+                    finished.result,
+                    Err(lake::Error::DeadlineExceeded {
+                        attempts: 1,
+                        last: None
+                    })
+                ),
+                "a hung write is a deadline, not a cancellation: {:?}",
+                finished.result.as_ref().err()
+            );
+            worker.complete(done);
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_failures.get(), 1);
+            assert_eq!(metrics.worker.flush_cancelled.get(), 0);
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a nack") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert!(
+                        nack.reason.contains(
+                            "flush retry deadline exceeded after 1 attempt(s); no attempt \
+                             returned before the deadline"
+                        ),
+                        "reason: {}",
+                        nack.reason
+                    );
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            sim.advance(Duration::from_secs(10));
+            job.cleanup().await.expect("the task is released");
+        })
+        .await;
+}
+
+/// Scenario: every write fails, but only after twenty seconds -- the shape of
+/// a cloud store retrying one request internally until its own
+/// `retry_timeout` -- under a sixty-second flush deadline.
+/// Guarantees: the flush retries the block until the deadline, counts every
+/// attempt in `flush.retries`, and nacks the block retryably with the
+/// destination's last error in the reason, so an outage is visible to the
+/// producer and to the operator with its cause rather than as a bare
+/// "cancelled" with zero retries.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_SLOW_FAIL, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_secs(60);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let ticker = ticking(&sim, Duration::from_millis(100));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            drop(ticker);
+            let finished = done.as_ref().expect("the flush resolves");
+            // Attempts start at 0 s, 20.2 s and 40.6 s; the third is still
+            // failing when the deadline expires at 60 s.
+            assert_eq!(finished.attempts, 3);
+            match &finished.result {
+                Err(lake::Error::DeadlineExceeded {
+                    attempts: 3,
+                    last: Some(last),
+                }) => assert!(
+                    last.to_string().contains("injected store failure"),
+                    "{last}"
+                ),
+                other => panic!("expected the deadline with the last error, got {other:?}"),
+            }
+            worker.complete(done);
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_retries.get(), 2);
+            assert_eq!(metrics.worker.flush_cancelled.get(), 0);
+
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a nack") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert!(
+                        nack.reason.contains("after 3 attempt(s); last error:")
+                            && nack.reason.contains("injected store failure"),
+                        "reason: {}",
+                        nack.reason
+                    );
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            let ticker = ticking(&sim, Duration::from_secs(1));
+            job.cleanup().await.expect("the task is released");
+            drop(ticker);
         })
         .await;
 }
