@@ -362,14 +362,30 @@ impl Default for LakeConfig {
     }
 }
 
+/// Largest `ingress.max_nesting_depth` accepted.
+///
+/// The depth becomes the CBOR parser's recursion limit, and the parser
+/// recurses on the stack once per level, so an unbounded value would let one
+/// request exhaust the stack. 256 is the parser's own default.
+pub const MAX_NESTING_DEPTH: usize = 256;
+
+/// Hive partition keys of the lake layout, which no file column may be named
+/// like: a reader that resolves partition keys by name would read the file
+/// column and the path key as one.
+pub const PARTITION_KEYS: [&str; 5] = ["v", "signal", "dataset", "date", "hour"];
+
 impl LakeConfig {
     /// Validate cross-field constraints (spec sections 5.2, 6.2, 7.4).
     ///
-    /// Rules enforced: `writer_id` is non-empty and contains no `/` (it is
-    /// interpolated into the file-name segment of [`crate::sink::object_path`],
-    /// and a delimiter there must not be read as extra path segments; the
-    /// boot id is generated internally from a UUIDv4 and is not
-    /// user-configurable, so it needs no such rule); `max_row_bytes <=
+    /// Rules enforced: `writer_id` is non-empty and made of `[A-Za-z0-9_.]`
+    /// only (it is interpolated into the file-name segment of
+    /// [`crate::sink::object_path`] between `-` separators, so neither a
+    /// path delimiter nor a `-` may appear in it; the boot id is generated
+    /// internally from a UUIDv4 and is not user-configurable, so it needs no
+    /// such rule); `ingress.max_nesting_depth <= 256`;
+    /// `metrics.series_attributes` is empty (a metric's identity already
+    /// includes every point attribute); no denormalized column is named like
+    /// a partition key of [`PARTITION_KEYS`]; `max_row_bytes <=
     /// run_target_bytes / 4`; `max_requests_per_block >= 1`; `max_block_bytes
     /// >= 2 * max_extracted_bytes` (series-row inflation); `upload.part_bytes >= 5 MiB` (the S3
     /// multipart minimum part size, below which every upload would fail at
@@ -385,8 +401,27 @@ impl LakeConfig {
         if self.writer_id.is_empty() {
             return Err(Error::invalid("writer_id must not be empty"));
         }
-        if self.writer_id.contains('/') {
-            return Err(Error::invalid("writer_id must not contain '/'"));
+        if !self
+            .writer_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        {
+            return Err(Error::invalid(format!(
+                "writer_id {:?} must use only [A-Za-z0-9_.]: it sits between '-' separators \
+                 in every file name",
+                self.writer_id
+            )));
+        }
+        if self.ingress.max_nesting_depth > MAX_NESTING_DEPTH {
+            return Err(Error::invalid(format!(
+                "ingress.max_nesting_depth must be at most {MAX_NESTING_DEPTH}"
+            )));
+        }
+        if !self.metrics.series_attributes.is_empty() {
+            return Err(Error::invalid(
+                "metrics.series_attributes is not supported: a metric's identity already \
+                 includes every point attribute",
+            ));
         }
         if self.ingress.max_row_bytes > self.sorting.run_target_bytes / 4 {
             return Err(Error::invalid(
@@ -434,6 +469,15 @@ impl LakeConfig {
             if d.column.contains(':') || d.column.contains(';') {
                 return Err(Error::invalid(format!(
                     "denormalized column name must not contain ':' or ';': {}",
+                    d.column
+                )));
+            }
+            if PARTITION_KEYS
+                .iter()
+                .any(|key| d.column.eq_ignore_ascii_case(key))
+            {
+                return Err(Error::invalid(format!(
+                    "denormalized column {} is named like a partition key of the layout",
                     d.column
                 )));
             }
@@ -643,6 +687,76 @@ mod tests {
         };
         let err = cfg.validate().expect_err("writer_id contains '/'");
         assert!(err.to_string().contains("writer_id"));
+    }
+
+    /// Scenario: `writer_id` holds a hyphen -- the separator of the file-name
+    /// fields it is written between -- a space, a non-ASCII letter, or a
+    /// slash, and then only characters of the allowed class.
+    /// Guarantees: everything outside `[A-Za-z0-9_.]` is refused, so a file
+    /// name always splits back into its documented fields, and the allowed
+    /// class is accepted.
+    #[test]
+    fn writer_id_outside_its_character_class_is_rejected() {
+        for bad in ["local-1", "a b", "w\u{e9}", "team/writer"] {
+            let cfg = LakeConfig {
+                writer_id: bad.into(),
+                ..LakeConfig::default()
+            };
+            let err = cfg.validate().expect_err(bad);
+            assert!(err.to_string().contains("[A-Za-z0-9_.]"), "{bad}: {err}");
+        }
+        let cfg = LakeConfig {
+            writer_id: "Local_1.eu".into(),
+            ..LakeConfig::default()
+        };
+        cfg.validate().expect("the allowed class");
+    }
+
+    /// Scenario: `max_nesting_depth` is set just above and exactly at 256.
+    /// Guarantees: the first is refused and the second accepted, so the depth
+    /// handed to the CBOR parser's own recursion limit is bounded.
+    #[test]
+    fn max_nesting_depth_is_capped() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_nesting_depth = 257;
+        let err = cfg.validate().expect_err("above the cap");
+        assert!(err.to_string().contains("max_nesting_depth"), "{err}");
+        cfg.ingress.max_nesting_depth = 256;
+        cfg.validate().expect("at the cap");
+    }
+
+    /// Scenario: a denormalized column is named like one of the Hive
+    /// partition keys of the layout, in any case.
+    /// Guarantees: it is refused, because a reader that resolves partition
+    /// keys by name would otherwise read the file column and the path key as
+    /// one.
+    #[test]
+    fn a_denormalized_column_named_like_a_partition_key_is_rejected() {
+        for column in ["v", "signal", "dataset", "date", "Hour"] {
+            let mut cfg = LakeConfig::default();
+            cfg.metrics.denormalize = vec![Denormalize {
+                path: "resource.x".into(),
+                column: column.into(),
+                ty: DenormType::String,
+            }];
+            let err = cfg.validate().expect_err(column);
+            assert!(err.to_string().contains("partition key"), "{column}: {err}");
+        }
+    }
+
+    /// Scenario: `metrics.series_attributes` is set.
+    /// Guarantees: it is refused rather than accepted and ignored, because a
+    /// metric's identity already includes every point attribute and the
+    /// setting has no effect there.
+    #[test]
+    fn metrics_series_attributes_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.metrics.series_attributes = vec!["k8s.pod.name".into()];
+        let err = cfg.validate().expect_err("not a metrics setting");
+        assert!(
+            err.to_string().contains("metrics.series_attributes"),
+            "{err}"
+        );
     }
 
     /// Scenario: a denormalized column given as a bare string.

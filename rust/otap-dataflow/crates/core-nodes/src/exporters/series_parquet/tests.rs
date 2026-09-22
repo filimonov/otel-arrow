@@ -158,7 +158,7 @@ fn the_shipped_example_configuration_is_valid() {
         .pointer("/groups/default/pipelines/main/nodes/exporter/config")
         .expect("example config has an exporter node");
     let cfg: Config = serde_json::from_value(exporter.clone()).expect("example config is valid");
-    assert_eq!(cfg.lake.writer_id, "local-1");
+    assert_eq!(cfg.lake.writer_id, "local_1");
 }
 
 fn encoded<M: prost::Message>(message: &M) -> Vec<u8> {
@@ -4319,44 +4319,112 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
 }
 
 /// Scenario: configuration contains misspelled settings or cross-field
-/// violations.
-/// Guarantees: the factory's typed validation rejects every one of them before
-/// any network listener starts, so a pipeline never runs with a budget the
+/// violations, each applied alone to a base configuration that is itself
+/// valid, and each checked through the factory's own `validate_config`.
+/// Guarantees: the factory rejects every one of them before any network
+/// listener starts, and each rejection names the rule it broke, so a case can
+/// only pass by failing for the reason it was written for, never because the
+/// base itself was broken, and a pipeline never runs with a budget the
 /// operator believes they set.
 #[test]
 fn startup_rejects_invalid_configuration() {
+    let validate = super::SERIES_PARQUET.validate_config;
     let base = serde_json::json!({"storage": {"file": {"base_uri": "/tmp/series-config"}}});
+    validate(&base).expect("the base configuration is valid");
     let cases = [
-        ("window", serde_json::json!({"interval": "0s"})),
-        ("window", serde_json::json!({"interval": "500ms"})),
-        ("window", serde_json::json!({"max_requests_per_block": 0})),
-        ("window", serde_json::json!({"max_block_bytes": "1MiB"})),
-        ("ingress", serde_json::json!({"max_row_bytes": "3MiB"})),
-        ("ingress", serde_json::json!({"max_requset_bytes": "1MiB"})),
-        ("upload", serde_json::json!({"concurrency": 0})),
-        ("upload", serde_json::json!({"part_bytes": "1MiB"})),
-        ("parquet", serde_json::json!({"compression": "snappy"})),
+        (
+            "window",
+            serde_json::json!({"interval": "0s"}),
+            "window.interval",
+        ),
+        (
+            "window",
+            serde_json::json!({"interval": "500ms"}),
+            "whole seconds",
+        ),
+        (
+            "window",
+            serde_json::json!({"max_requests_per_block": 0}),
+            "max_requests_per_block",
+        ),
+        (
+            "window",
+            serde_json::json!({"max_block_bytes": "1MiB"}),
+            "at least twice max_extracted_bytes",
+        ),
+        (
+            "ingress",
+            serde_json::json!({"max_row_bytes": "3MiB"}),
+            "run_target_bytes / 4",
+        ),
+        (
+            "ingress",
+            serde_json::json!({"max_requset_bytes": "1MiB"}),
+            "unknown ingress setting max_requset_bytes",
+        ),
+        (
+            "ingress",
+            serde_json::json!({"max_nesting_depth": 257}),
+            "max_nesting_depth must be at most 256",
+        ),
+        (
+            "upload",
+            serde_json::json!({"concurrency": 0}),
+            "concurrency",
+        ),
+        ("upload", serde_json::json!({"part_bytes": "1MiB"}), "5MiB"),
+        (
+            "parquet",
+            serde_json::json!({"compression": "snappy"}),
+            "must be zstd",
+        ),
         (
             "metrics",
             serde_json::json!({"values_sort": ["no_such_column"]}),
+            "sort key no_such_column",
         ),
         // `attrs` is a Map column of logs/values: present, but not a type the
         // Arrow row format can sort by.
-        ("logs", serde_json::json!({"values_sort": ["attrs"]})),
+        (
+            "logs",
+            serde_json::json!({"values_sort": ["attrs"]}),
+            "row converter cannot sort",
+        ),
         (
             "logs",
             serde_json::json!({"denormalize": [{"path": "resource.x", "column": "SERIES_ID"}]}),
+            "collision",
         ),
-        ("logs", serde_json::json!({"denormalize": ["unknown.x"]})),
-        ("series_cache", serde_json::json!({"max_entries": 0})),
-        ("notify_batch", serde_json::json!(0)),
+        (
+            "logs",
+            serde_json::json!({"denormalize": [{"path": "resource.x", "column": "date"}]}),
+            "partition key",
+        ),
+        (
+            "logs",
+            serde_json::json!({"denormalize": ["unknown.x"]}),
+            "denormalize path",
+        ),
+        (
+            "metrics",
+            serde_json::json!({"series_attributes": ["k8s.pod.name"]}),
+            "metrics.series_attributes",
+        ),
+        ("writer_id", serde_json::json!("local-1"), "[A-Za-z0-9_.]"),
+        (
+            "series_cache",
+            serde_json::json!({"max_entries": 0}),
+            "cache entries",
+        ),
+        ("notify_batch", serde_json::json!(0), "notify_batch"),
     ];
-    for (section, value) in cases {
+    for (section, value, expected) in cases {
         let mut candidate = base.clone();
         candidate[section] = value;
+        let err = validate(&candidate).expect_err(section).to_string();
         assert!(
-            serde_json::from_value::<Config>(candidate).is_err(),
-            "section={section}"
+            err.contains(expected),
+            "section={section}: expected {expected:?} in {err}"
         );
     }
 }

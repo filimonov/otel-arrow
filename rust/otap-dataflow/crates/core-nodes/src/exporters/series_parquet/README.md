@@ -282,9 +282,14 @@ needs an explicit `retry` section. Otherwise one write attempt keeps retrying
 inside the store past the block's deadline and the flush ends with no error to
 report. Local file storage applies no store retry and is not checked.
 
-`writer_id` must be nonempty and must not contain a slash. It names the writer
-process in file names and file metadata and is never part of the series
-identity. `producer_id_attribute` defaults to `host.id`, projects that
+`writer_id` must be nonempty and use only letters, digits, `_` and `.`: it
+sits between the `-` separators of every file name, so a hyphen or a slash is
+refused. It names the writer process in file names and file metadata and is
+never part of the series identity. `ingress.max_nesting_depth` is capped at
+256. `metrics.series_attributes` is refused, because a metric's identity
+already includes every point attribute. A denormalized column may not be
+named like a partition key of the layout: `v`, `signal`, `dataset`, `date` or
+`hour`, in any case. `producer_id_attribute` defaults to `host.id`, projects that
 resource attribute into the `producer_id` column of every values row, and does
 not alter identity membership: all resource attributes remain in the series
 hash. Transport-header producer IDs are not supported.
