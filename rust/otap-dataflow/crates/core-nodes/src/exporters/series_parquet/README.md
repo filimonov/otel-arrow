@@ -95,27 +95,41 @@ admitted.
 
 ### Give a producer attempt more than one window
 
-The receiver timeout must cover channel residence, one preceding flush, one
-window interval, the request's own flush and the delivery of its completion.
-The same bound applies on the producer side, and it is the one that is easy to
-get wrong: a producer attempt timeout must exceed `window.interval` plus the
-flush that follows it.
+A timeout below `window.interval` does not make a request fail. It makes
+first-attempt completion impossible to guarantee, and how often it actually
+expires depends on where in the window the request arrives. Windows are
+aligned to the wall clock, so a request admitted just before a boundary waits
+almost no time before its block is sealed, and a request that fills the byte
+or request budget triggers an immediate rotation whenever it arrives. A
+request admitted early in a window waits out the rest of it first.
 
-A producer whose timeout is below the window gives up before its rows can
-possibly be durable, because the response is held until the whole block is
-written. Under at-least-once delivery nothing is lost, and this is safe: the
-producer retries and the rows arrive. What it costs is traffic and storage. A
-6s attempt timeout against a 15s window never sees an acknowledgement on the
-first try, so every request is sent at least twice, and a copy that was
-committed just after the client gave up is stored again by the retry. The
+The arithmetic is worth doing once. Absent an early byte or request rotation,
+a request admitted at offset `t` into a window waits `window.interval - t`
+before its block is sealed, plus the flush. So with a 6s timeout against a 15s
+window, a request admitted in the first nine seconds of a window cannot be
+acknowledged on its first attempt, while one admitted in the last six seconds
+may well be. The result is a partial, position-dependent retry rate rather
+than a failure: every expired attempt is resent, and a copy committed just
+after the client gave up is stored again by the retry. Under at-least-once
+delivery nothing is lost. What it costs is traffic and stored rows, and the
 symptom is a steady stream of client-side deadlines with acks and
-`rows_written` that keep rising, rather than an error.
+`rows_written` still rising, rather than an error.
 
-`configs/series-parquet.alloy` therefore ships a 180s attempt timeout, and the
-shipped receiver configuration uses `timeout: 180s`. With 15s windows and a
-60s flush deadline, 180s allows margin but cannot eliminate all timeouts under
-sustained backpressure. A full bounded channel makes producers wait; exhausted
-receiver admission slots return RESOURCE_EXHAUSTED.
+Size an attempt timeout as the sum of the parts one request can wait through:
+
+- channel residence before the worker admits it,
+- any flush already in progress plus its `upload.abort_timeout` cleanup,
+  because admission closes while the ACTIVE block waits for the flush slot,
+- the remainder of the current window, at most `window.interval`,
+- its own flush, up to `window.flush_retry_deadline`,
+- the delivery of its completion.
+
+The receiver timeout must cover the same sum, which is why the shipped
+receiver configuration uses `timeout: 180s` and
+`configs/series-parquet.alloy` ships a 180s attempt timeout. With 15s windows
+and a 60s flush deadline that leaves margin, but it cannot eliminate all
+timeouts under sustained backpressure. A full bounded channel makes producers
+wait; exhausted receiver admission slots return RESOURCE_EXHAUSTED.
 
 No block-atomic snapshot is provided. Series files complete before their
 values files, but readers can observe a subset of a block, including rows from
@@ -144,12 +158,25 @@ returns HTTP 504, outstanding requests are nacked as retryable, and their
 producers have to resend. The end-to-end suite exercises exactly this with a
 600s window against a 20s deadline.
 
-Size it so that `window.interval` plus `window.flush_retry_deadline` plus an
-upload margin fits inside the deadline the supervisor grants, and keep
-`window.interval` to a small fraction of it. The defaults (15s window, 60s
-flush deadline) fit the admin API's 180s timeout below. They do not fit the
-60s that a SIGINT or SIGTERM grants if a flush has to use its whole retry
-deadline.
+Size the deadline for the two blocks that can be in flight, not for one. The
+FLUSHING block must finish and release the slot before the ACTIVE block can be
+sealed, the slot stays held through the abandoned write's
+`upload.abort_timeout` cleanup, and the ACTIVE block's own retry deadline is
+taken when it is sealed, which is after all of that. The two retry windows are
+therefore sequential rather than overlapping, and one
+`window.flush_retry_deadline` is not a safe ceiling. The conservative bound is:
+
+```text
+window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) + notification margin
+```
+
+With the defaults that is 15s + 2 * (60s + 5s) = 145s plus the notification
+margin, which fits the admin API's 180s timeout below and does not fit the 60s
+that a SIGINT or SIGTERM grants. Note which term dominates: twice the flush
+retry deadline is 130s of that 145s, so lowering `flush_retry_deadline` buys
+far more shutdown headroom than lowering `window.interval` does. Keep
+`window.interval` a small fraction of the deadline anyway, for the reason
+above.
 
 ### Granting a deadline
 
@@ -323,13 +350,17 @@ otelcol.processor.attributes "series" {
 }
 
 otelcol.exporter.otlp "series" {
-  // A producer attempt must outlive one exporter window plus the flush that
-  // follows it: the engine holds the OTLP response until the whole block is
-  // durable, so a timeout below `window.interval` makes the client give up
-  // and resend rows that were about to be acknowledged. That is safe under
-  // at-least-once delivery, but it multiplies both traffic and stored rows.
-  // 180s covers the documented 15s window and 60s flush deadline.
-  // `SERIES_ALLOY_TIMEOUT` lets a test choose a deliberately short value.
+  // The engine holds the OTLP response until the whole block is durable, and
+  // blocks are sealed on aligned window boundaries. A timeout below
+  // `window.interval` therefore cannot guarantee that an attempt completes:
+  // requests arriving early in a window commonly expire, while ones arriving
+  // near a boundary, or ones that trigger a byte or request rotation, do not.
+  // Each expired attempt is resent, which is safe under at-least-once
+  // delivery but multiplies both traffic and stored rows. An attempt timeout
+  // should cover channel residence, any flush already running plus its
+  // cleanup, the rest of the current window, its own flush and the
+  // notification; 180s covers the documented 15s window and 60s flush
+  // deadline. `SERIES_ALLOY_TIMEOUT` lets a test choose a short value.
   timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
   client {
     endpoint = sys.env("OTLP_ENDPOINT")

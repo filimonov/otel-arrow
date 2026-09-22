@@ -43,13 +43,17 @@ otelcol.processor.attributes "series" {
 }
 
 otelcol.exporter.otlp "series" {
-  // A producer attempt must outlive one exporter window plus the flush that
-  // follows it: the engine holds the OTLP response until the whole block is
-  // durable, so a timeout below `window.interval` makes the client give up
-  // and resend rows that were about to be acknowledged. That is safe under
-  // at-least-once delivery, but it multiplies both traffic and stored rows.
-  // 180s covers the documented 15s window and 60s flush deadline.
-  // `SERIES_ALLOY_TIMEOUT` lets a test choose a deliberately short value.
+  // The engine holds the OTLP response until the whole block is durable, and
+  // blocks are sealed on aligned window boundaries. A timeout below
+  // `window.interval` therefore cannot guarantee that an attempt completes:
+  // requests arriving early in a window commonly expire, while ones arriving
+  // near a boundary, or ones that trigger a byte or request rotation, do not.
+  // Each expired attempt is resent, which is safe under at-least-once
+  // delivery but multiplies both traffic and stored rows. An attempt timeout
+  // should cover channel residence, any flush already running plus its
+  // cleanup, the rest of the current window, its own flush and the
+  // notification; 180s covers the documented 15s window and 60s flush
+  // deadline. `SERIES_ALLOY_TIMEOUT` lets a test choose a short value.
   timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
   client {
     endpoint = sys.env("OTLP_ENDPOINT")
