@@ -2664,7 +2664,9 @@ class PlacementContracts(unittest.TestCase):
     # cores and every other role each own a whole physical core, and no
     # role is given an SMT sibling of another role's core.
     def test_roles_own_whole_physical_cores(self):
-        allocation = measurement.role_allocation(self.groups, range(32), [1])
+        allocation = measurement.role_allocation(
+            self.groups, range(32), [1], roles=measurement.CASE_ROLES["engine"]
+        )
         self.assertEqual(
             allocation,
             {
@@ -2685,14 +2687,88 @@ class PlacementContracts(unittest.TestCase):
     # that cannot fit raises instead of doubling roles up.
     def test_shared_or_insufficient_cores_are_refused(self):
         with self.assertRaisesRegex(AssertionError, "shares physical core"):
-            _ = measurement.role_allocation(self.groups, range(32), [16])
+            _ = measurement.role_allocation(
+                self.groups, range(32), [16], roles=measurement.CASE_ROLES["engine"]
+            )
         with self.assertRaisesRegex(AssertionError, "no physical core is left"):
-            _ = measurement.role_allocation(self.groups[:4], range(4), [1])
+            _ = measurement.role_allocation(
+                self.groups[:4], range(4), [1], roles=measurement.CASE_ROLES["engine"]
+            )
         loose = measurement.role_allocation(
-            self.groups[:4], range(4), [1], strict=False
+            self.groups[:4], range(4), [1], roles=measurement.CASE_ROLES["engine"],
+            strict=False,
         )
         self.assertEqual(loose["engine"], [1])
         self.assertEqual(loose["reader"], [])
+
+
+    # Scenario: the campaign's affinity, cores 0-7 with their SMT siblings
+    # 16-23, is offered to a stages family and to a case that declares the
+    # engine case's roles, reader included, with the full four-core engine
+    # reservation.
+    # Guarantees: a case claims cores only for the roles it declares, so
+    # the stages set -- observability, the engine reservation, the producer
+    # pair and the store -- fits in the eight physical cores exactly and
+    # claims no reader; the reader-declaring case still does not fit and is
+    # refused, never squeezed onto a shared core.
+    def test_each_case_claims_only_its_own_roles(self):
+        pinned = list(range(8)) + list(range(16, 24))
+        stages = measurement.role_allocation(
+            self.groups, pinned, [1], roles=measurement.CASE_ROLES["stages"]
+        )
+        self.assertEqual(
+            stages,
+            {
+                "engine_observability": [0],
+                "engine": [1],
+                "engine_reserved": [2, 3, 4],
+                "producer": [5, 6],
+                "store": [7],
+            },
+        )
+        self.assertNotIn("reader", stages)
+        physical = {core % 16 for cores in stages.values() for core in cores}
+        self.assertLessEqual(len(physical), measurement.MINIMUM_PHYSICAL_CORES)
+        self.assertEqual(measurement.MINIMUM_PHYSICAL_CORES, 8)
+        with self.assertRaisesRegex(AssertionError, "no physical core is left for reader"):
+            _ = measurement.role_allocation(
+                self.groups, pinned, [1], roles=measurement.CASE_ROLES["engine"]
+            )
+
+
+class HostNeighbourContracts(unittest.TestCase):
+    """What else the host ran, and on which cores."""
+
+    # Scenario: a fake process table holds a heavy neighbour pinned to the
+    # upper cores, a light one, the family's own process and an entry with
+    # nothing readable in it.
+    # Guarantees: the record keeps the load average and the family's own
+    # affinity, lists neighbours heaviest first with the cores each may
+    # run on, and leaves out the family itself and unreadable entries.
+    def test_neighbours_are_recorded_with_their_cores(self):
+        proc = temporary_directory(self)
+        _ = (proc / "loadavg").write_text("9.98 9.96 9.57 9/3854 3930739\n")
+        def process(pid, comm, ticks, cores):
+            """One fake /proc entry."""
+            directory = proc / str(pid)
+            directory.mkdir()
+            fields = ["S"] + ["0"] * 10 + [str(ticks), "0"] + ["0"] * 30
+            _ = (directory / "stat").write_text(f"{pid} ({comm}) " + " ".join(fields))
+            _ = (directory / "status").write_text(
+                f"Name:\t{comm}\nCpus_allowed_list:\t{cores}\n"
+            )
+        process(10, "java", 800_000, "8-15,24-31")
+        process(11, "htop", 100, "0-31")
+        process(12, "python3", 5_000_000, "0-7,16-23")
+        (proc / "13").mkdir()
+        record = performance.host_neighbours(proc, exclude=(12,), limit=5)
+        self.assertEqual(record["load_average_1_5_15"], [9.98, 9.96, 9.57])
+        self.assertEqual(record["family_affinity"], sorted(os.sched_getaffinity(0)))
+        self.assertEqual(
+            [(item["comm"], item["cpus_allowed"])
+             for item in record["heaviest_other_processes"]],
+            [("java", "8-15,24-31"), ("htop", "0-31")],
+        )
 
 
 class ReconciliationContracts(unittest.TestCase):

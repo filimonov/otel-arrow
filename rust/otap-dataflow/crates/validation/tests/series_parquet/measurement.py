@@ -1254,15 +1254,29 @@ observed_affinity = host_monitor.observed_affinity
 ENGINE_RESERVED_CORES = 4
 ROLE_CORES = (("producer", 2), ("store", 1), ("reader", 1))
 
+# The roles each case actually runs, beside the engine and its
+# observability core. A case claims cores only for these: an engine case
+# produces, stores and reads its output back, while a stages family sends
+# through the producer for its pipeline baseline and uploads to the store,
+# but runs no reader. The engine reservation is kept whole for both,
+# because both launch the engine binary.
+CASE_ROLES = {
+    "engine": ROLE_CORES,
+    "stages": (("producer", 2), ("store", 1)),
+}
 
-def role_allocation(sibling_groups, available, engine_cores, *, strict=True) -> dict:
+
+def role_allocation(sibling_groups, available, engine_cores, *, roles,
+                    strict=True) -> dict:
     """Place every role on its own physical cores, SMT siblings excluded.
 
     The controller runs its own observability pipeline on the first core
     the engine may use, so that physical core is never a worker's. The
     engine's workers take `engine_cores`, the rest of its four-core
-    reservation follows, and then the producer, store and reader each take
-    whole physical cores of their own. A role is given the lowest logical
+    reservation follows, and then each role the case declares in `roles`
+    -- a `CASE_ROLES` entry, as (role, physical cores) pairs -- takes whole
+    physical cores of its own. Only the declared roles are claimed, and a
+    declared set that does not fit still raises. A role is given the lowest logical
     core of each physical core it owns; the siblings of every owned core are
     given to nobody. Anything that cannot be placed this way is an error, so
     a run never silently shares a core between roles.
@@ -1321,7 +1335,7 @@ def role_allocation(sibling_groups, available, engine_cores, *, strict=True) -> 
     reserved = ENGINE_RESERVED_CORES - len(engine_cores)
     if reserved:
         claim(reserved, "engine_reserved")
-    for role, count in ROLE_CORES:
+    for role, count in roles:
         claim(count, role)
     return allocation
 

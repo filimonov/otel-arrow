@@ -2574,6 +2574,8 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     heap = locate_benches(features=("bench-heap",))
     plan = {
         "git": git,
+        # The host as the family found it, before its first child.
+        "host_at_start": host_neighbours(exclude=(os.getpid(),)),
         "benches": {
             "measurement": {
                 "executable": timing["measurement"]["executable"],
@@ -2603,8 +2605,11 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     plan["repetitions"] = repetitions
     plan["family_ordinal"] = family_ordinal(report_dir)
     topology = measurement.core_topology()
+    # A stages family runs the engine (its pipeline baseline), the producer
+    # and the store, but no reader, so it claims no reader core.
     allocation = measurement.role_allocation(
         topology["sibling_groups"], sorted(os.sched_getaffinity(0)), spec.cores,
+        roles=measurement.CASE_ROLES["stages"],
     )
     # The benchmark process takes the core the engine's worker would have.
     allocation["bench"] = allocation.pop("engine")
@@ -2649,6 +2654,49 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     )
 
 
+def host_neighbours(proc_root="/proc", exclude=(), limit=5) -> dict:
+    """The host's load and its heaviest other processes, with their cores.
+
+    A family shares its host with whatever else runs there. This records
+    the load average, the family's own affinity, and the `limit` processes
+    outside `exclude` with the most accumulated CPU time, each with the
+    cores it may run on -- so a result says where a neighbour ran, not only
+    that the load was high.
+    """
+    root = Path(proc_root)
+    ticks = os.sysconf("SC_CLK_TCK")
+    processes = []
+    for entry in root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) in exclude:
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="ascii", errors="replace")
+            status = (entry / "status").read_text(encoding="ascii", errors="replace")
+        except OSError:
+            continue
+        name, _, rest = stat.rpartition(")")
+        fields = rest.split()
+        cpu_s = (int(fields[11]) + int(fields[12])) / ticks
+        allowed = next(
+            (line.split(":", 1)[1].strip() for line in status.splitlines()
+             if line.startswith("Cpus_allowed_list:")),
+            "unknown",
+        )
+        processes.append({
+            "pid": int(entry.name),
+            "comm": name.partition("(")[2],
+            "cpu_s": round(cpu_s, 2),
+            "cpus_allowed": allowed,
+        })
+    processes.sort(key=lambda process: process["cpu_s"], reverse=True)
+    load = (root / "loadavg").read_text(encoding="ascii").split()[:3]
+    return {
+        "load_average_1_5_15": [float(value) for value in load],
+        "family_affinity": sorted(os.sched_getaffinity(0)),
+        "heaviest_other_processes": processes[:limit],
+    }
+
+
 def publish_stages(spec, children, plan, output_dir, report_dir, started, configs,
                    repetitions) -> dict:
     """Aggregate every child, build the stage results and write the index."""
@@ -2691,6 +2739,8 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
     result["environment"]["engines"] = plan["engines"]
     result["environment"]["core_allocation"] = plan["allocation"]
     result["environment"]["git"] = plan["git"]
+    result["environment"]["host_at_start"] = plan["host_at_start"]
+    result["environment"]["host_at_end"] = host_neighbours(exclude=(os.getpid(),))
     # What the family's own setup phase starts, and what the compiler-free
     # claim every child records does and does not cover.
     result["environment"]["setup_subprocesses"] = SETUP_SUBPROCESSES

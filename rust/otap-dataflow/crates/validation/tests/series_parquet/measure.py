@@ -456,7 +456,7 @@ def local_experiment(spec, result, output_dir, controls, *, restart=False,
     topology = measurement.core_topology()
     allocation = measurement.role_allocation(
         topology["sibling_groups"], sorted(os.sched_getaffinity(0)), spec.cores,
-        strict=publishable,
+        roles=measurement.CASE_ROLES["engine"], strict=publishable,
     )
     controls.allocate(allocation)
     # The harness is the producer and the reader; both snapshots record its
