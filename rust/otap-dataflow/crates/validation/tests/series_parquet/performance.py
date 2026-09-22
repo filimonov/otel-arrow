@@ -129,6 +129,18 @@ PRE_ENCODED_INPUT_STAGES = ("local_write", "upload")
 # means, so that no reader takes it for a durability claim.
 STORE_STAGES = ("local_write", "upload", "sink", "otlp_minio")
 
+# The only completion semantics a storing stage may record: the bench's
+# `COMPLETION_SEMANTICS` constant, character for character. The meaning is
+# fixed by the constant, not searched for in free text, so a reversed
+# claim such as "this provides host power-loss durability" is refused
+# however it is worded.
+COMPLETION_SEMANTICS = (
+    "the store reported the object written and the bytes were read back and "
+    "verified; object_store does not fsync its local backend, so this is "
+    "object-store visibility, not host power-loss durability"
+)
+ALLOWED_COMPLETION_SEMANTICS = (COMPLETION_SEMANTICS,)
+
 # The rates a pre-encoded-input stage must report beside its per-record
 # metrics.
 RATE_FIELDS = ("objects_per_s", "input_bytes_per_s", "output_bytes_per_s")
@@ -137,15 +149,18 @@ RATE_FIELDS = ("objects_per_s", "input_bytes_per_s", "output_bytes_per_s")
 # What a stages family starts before any child takes the host lease, and
 # what runs inside each measured window. The setup phase runs no build:
 # `rustc --version` starts the compiler executable only to print its
-# version, and `--describe` asks an already built bench what it is. The
+# version -- once per `engine_build` call, which a stages family makes for
+# its three bench builds and its two engines -- and `--describe` asks an
+# already built bench what it is. The
 # compiler-free claim each child records covers its own measured window,
 # between the start and end snapshots the out-of-process build monitor
 # brackets, and not this setup phase.
 SETUP_SUBPROCESSES = {
     "before_any_lease": [
         "git status and git rev-parse HEAD, for the source provenance",
-        "rustc --version, for the toolchain of every build fingerprint; it "
-        "compiles nothing",
+        "rustc --version, once per build probed: five times in a stages "
+        "family, for the three bench builds and the two engines; it compiles "
+        "nothing",
         "each prebuilt bench executable with --describe, to identify it "
         "without building anything",
         "docker info and docker image inspect, to confirm the daemon and the "
@@ -161,8 +176,8 @@ SETUP_SUBPROCESSES = {
     "compiler_free_claim": (
         "covers measured windows only: no cargo, rustc, cc1 or ld process "
         "was seen by the build monitor inside any child's measured window. "
-        "The setup phase above starts rustc once, for --version, and never "
-        "invokes cargo or builds anything"
+        "The setup phase above starts rustc five times, each only for "
+        "--version, and never invokes cargo or builds anything"
     ),
 }
 
@@ -308,12 +323,12 @@ def validate_stage_result(result: dict) -> None:
         )
     if result["stage"] in STORE_STAGES:
         semantics = result.get("completion_semantics")
-        if not semantics or "power-loss" not in semantics:
+        if semantics not in ALLOWED_COMPLETION_SEMANTICS:
             raise AssertionError(
                 f"stage result {result['stage']!r} stores an object and must "
-                f"record what a completed write means, including that it is "
-                f"not host power-loss durability; it records "
-                f"{semantics!r}"
+                f"record what a completed write means as the bench's fixed "
+                f"completion semantics, which deny host power-loss "
+                f"durability; it records {semantics!r}"
             )
     if result["stage"] in PRE_ENCODED_INPUT_STAGES:
         rates = result.get("rates") or {}

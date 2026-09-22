@@ -62,7 +62,7 @@ const SEQ: u64 = 1;
 /// claim about host power-loss durability: `object_store` does not fsync
 /// its local backend, and no backend used here promises the bytes survive
 /// a power cut.
-const COMPLETION_SEMANTICS: &str = "the store reported the object written and \
+pub const COMPLETION_SEMANTICS: &str = "the store reported the object written and \
     the bytes were read back and verified; object_store does not fsync its \
     local backend, so this is object-store visibility, not host power-loss \
     durability";
@@ -772,7 +772,7 @@ fn uuid_like() -> String {
 }
 
 /// The wire form of each request, as the receiver hands it on.
-fn wire(input: &Input) -> Vec<OtlpProtoBytes> {
+fn wire_of(input: &Input) -> Vec<OtlpProtoBytes> {
     input
         .requests
         .iter()
@@ -999,6 +999,25 @@ pub struct Output {
     pub retained: Retained,
     /// Nested, non-overlapping parts of the timed run.
     pub parts: Vec<(&'static str, Timing)>,
+    /// State that outlives one block in production, handed back so that
+    /// it is dropped with the output, after the timer has stopped. Nothing
+    /// reads it; `a_heavier_fixture_does_not_move_the_measurement` fails if
+    /// the cache is dropped inside the timer instead.
+    pub _kept: Kept,
+}
+
+/// What a run hands back only so that its teardown is not timed.
+///
+/// The exporter keeps one series cache and one sink across every block it
+/// writes, so tearing either down is never part of the per-block cost. A
+/// run that dropped them would time a destructor the production path
+/// never runs -- for a large cache, far more than the admission itself.
+#[derive(Default)]
+pub struct Kept {
+    /// The series cache the run admitted into.
+    _cache: Option<SeriesCache>,
+    /// The sink the run wrote through.
+    _sink: Option<Box<Sink>>,
 }
 
 /// One verification a stage made of its output.
@@ -1063,7 +1082,8 @@ pub struct Stage {
     /// Whether timed buffers are pre-reserved (timing mode only).
     reserve_output: bool,
     /// How many pieces of per-iteration setup this stage has built: one
-    /// count per warmed cache, sink and destination path set. A timed run
+    /// count per wire clone, prepared conversion, warmed cache, sink,
+    /// destination path set, object set and output buffer set. A timed run
     /// must never advance it, which is what the self-test asserts.
     setup_built: AtomicU64,
     /// Fixture checks made while preparing, reported with every output.
@@ -1208,13 +1228,19 @@ impl Stage {
             return Ok(synthetic);
         }
         let mut all = BTreeSet::new();
-        for request in convert_extract(wire(&self.input), &self.cfg.lake)? {
+        for request in convert_extract(self.wire(), &self.cfg.lake)? {
             for row in &request.descriptors {
                 let _ = all.insert(row.series_id);
             }
         }
         let keep = (all.len() as f64 * self.cfg.committed_fraction).round() as usize;
-        Ok(all.into_iter().take(keep).chain(synthetic).collect())
+        // The synthetic ids go in first, so the real ones are the most
+        // recently used entries and a cache large enough for all of them
+        // keeps every real id resident.
+        Ok(synthetic
+            .into_iter()
+            .chain(all.into_iter().take(keep))
+            .collect())
     }
 
     /// How many pieces of per-iteration setup this stage has built.
@@ -1223,9 +1249,24 @@ impl Stage {
         self.setup_built.load(Ordering::Relaxed)
     }
 
+    /// Count one piece of setup built outside the timer.
+    fn count_setup(&self) {
+        let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A fresh clone of the input's wire requests, counted as setup.
+    ///
+    /// `run` never clones the input: every stage is handed its wire form
+    /// already built, so a clone reintroduced inside `run` advances the
+    /// counter the self-test requires to stay still.
+    fn wire(&self) -> Vec<OtlpProtoBytes> {
+        self.count_setup();
+        wire_of(&self.input)
+    }
+
     /// A series cache warmed to the configured hit distribution.
     fn warm_cache(&self) -> SeriesCache {
-        let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
+        self.count_setup();
         let mut cache = SeriesCache::new(self.cfg.cache_entries);
         let partition = otel_arrow_dfe_series_lake::clock::PartitionId::from_unix_secs(
             self.cfg.window_start_secs,
@@ -1239,7 +1280,7 @@ impl Stage {
     /// A sink with a file identity no earlier iteration used, so every
     /// iteration writes new objects instead of overwriting one.
     fn new_sink(&self) -> Result<Sink> {
-        let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
+        self.count_setup();
         let store = self.store.clone().ok_or("this stage has no store")?;
         let naming = FileNaming {
             writer_id: self.cfg.lake.writer_id.clone(),
@@ -1250,7 +1291,7 @@ impl Stage {
 
     /// A freshly sealed block of the whole input.
     fn sealed_block(&self) -> Result<Block<()>> {
-        let extracted = convert_extract(wire(&self.input), &self.cfg.lake)?;
+        let extracted = convert_extract(self.wire(), &self.cfg.lake)?;
         let mut cache = self.warm_cache();
         let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
         block.seal(self.cfg.seal_at_us)?;
@@ -1348,13 +1389,19 @@ impl Stage {
             StageName::OtlpNoop
             | StageName::OtlpConvert
             | StageName::OtlpExtractHash
-            | StageName::Convert => Prepared::Wire(wire(&self.input)),
+            | StageName::Convert => Prepared::Wire(self.wire()),
+            // Every cache-carrying stage warms its cache first and builds
+            // the input it admits last, as the exporter extracts a request
+            // right before admitting it into a cache that persists. A heavy
+            // warm-up therefore cannot push the admitted input out of the
+            // CPU caches before the timer starts.
             StageName::OtlpSort => {
-                Prepared::Cumulative(wire(&self.input), self.warm_cache(), Destination::None)
+                let cache = self.warm_cache();
+                Prepared::Cumulative(self.wire(), cache, Destination::None)
             }
             StageName::OtlpParquetLocal | StageName::OtlpParquetZstd => {
                 let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-                let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
+                self.count_setup();
                 let paths = self
                     .table_names
                     .iter()
@@ -1364,31 +1411,35 @@ impl Stage {
                             .join(format!("{name}-{}-{serial:08}.parquet", std::process::id()))
                     })
                     .collect();
-                Prepared::Cumulative(
-                    wire(&self.input),
-                    self.warm_cache(),
-                    Destination::Files(paths),
+                let cache = self.warm_cache();
+                Prepared::Cumulative(self.wire(), cache, Destination::Files(paths))
+            }
+            StageName::OtlpMinio => {
+                let cache = self.warm_cache();
+                let sink = Box::new(self.new_sink()?);
+                Prepared::Cumulative(self.wire(), cache, Destination::Sink(sink))
+            }
+            StageName::Extract => {
+                // The conversion `extract` consumes is setup of its own.
+                self.count_setup();
+                Prepared::Records(
+                    self.wire()
+                        .into_iter()
+                        .map(convert_one)
+                        .collect::<Result<Vec<_>>>()?,
                 )
             }
-            StageName::OtlpMinio => Prepared::Cumulative(
-                wire(&self.input),
-                self.warm_cache(),
-                Destination::Sink(Box::new(self.new_sink()?)),
-            ),
-            StageName::Extract => Prepared::Records(
-                wire(&self.input)
-                    .into_iter()
-                    .map(convert_one)
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-            StageName::SortSeal => Prepared::Extracted(
-                convert_extract(wire(&self.input), &self.cfg.lake)?,
-                self.warm_cache(),
-            ),
+            StageName::SortSeal => {
+                let cache = self.warm_cache();
+                // The conversion and extraction admission consumes is setup
+                // of its own.
+                self.count_setup();
+                Prepared::Extracted(convert_extract(self.wire(), &self.cfg.lake)?, cache)
+            }
             StageName::Merge => Prepared::Fixture,
             StageName::LocalWrite | StageName::Upload => {
                 let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-                let _ = self.setup_built.fetch_add(1, Ordering::Relaxed);
+                self.count_setup();
                 Prepared::Objects(
                     self.encoded
                         .iter()
@@ -1406,7 +1457,8 @@ impl Stage {
                         .collect(),
                 )
             }
-            StageName::Encode => Prepared::Buffers(
+            StageName::Encode => Prepared::Buffers({
+                self.count_setup();
                 self.capacity
                     .iter()
                     .map(|&estimate| {
@@ -1416,8 +1468,8 @@ impl Stage {
                             Vec::new()
                         }
                     })
-                    .collect(),
-            ),
+                    .collect()
+            }),
             StageName::Sink => Prepared::Sink(Box::new(self.new_sink()?)),
         })
     }
@@ -1430,6 +1482,7 @@ impl Stage {
     pub fn run(&self, input: Prepared) -> Result<Output> {
         let lake = &self.cfg.lake;
         let mut parts = Vec::new();
+        let mut kept = Kept::default();
         let retained = match (self.name, input) {
             (StageName::OtlpNoop, Prepared::Wire(wire)) => Retained::Payloads(
                 wire.into_iter()
@@ -1458,12 +1511,15 @@ impl Stage {
                 let ((), seal) = timed(|| block.seal(self.cfg.seal_at_us))?;
                 parts.push(("admission", admission));
                 parts.push(("seal", seal));
-                Retained::Block(Box::new(block), cache.stats())
+                let stats = cache.stats();
+                kept._cache = Some(cache);
+                Retained::Block(Box::new(block), stats)
             }
             (StageName::OtlpSort, Prepared::Cumulative(wire, mut cache, Destination::None)) => {
                 let extracted = convert_extract(wire, lake)?;
                 let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
                 block.seal(self.cfg.seal_at_us)?;
+                kept._cache = Some(cache);
                 let (values, series) = merge_consume(&block, lake)?;
                 Retained::Merged(values, series)
             }
@@ -1484,6 +1540,7 @@ impl Stage {
                 let extracted = convert_extract(wire, lake)?;
                 let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
                 block.seal(self.cfg.seal_at_us)?;
+                kept._cache = Some(cache);
                 let mut files = Vec::new();
                 for ((dataset, encoded), path) in encode_block(&block, lake, compression)?
                     .into_iter()
@@ -1527,10 +1584,11 @@ impl Stage {
             }
             (StageName::Sink, Prepared::Sink(sink)) => {
                 let block = self.block.as_ref().ok_or("sink has no block")?;
-                Retained::Flushed(
-                    self.runtime
-                        .block_on(sink.write_block(block, &CancellationToken::new()))?,
-                )
+                let report = self
+                    .runtime
+                    .block_on(sink.write_block(block, &CancellationToken::new()))?;
+                kept._sink = Some(sink);
+                Retained::Flushed(report)
             }
             (
                 StageName::OtlpMinio,
@@ -1548,13 +1606,19 @@ impl Stage {
                 })?;
                 parts.push(("convert_extract_admit_seal", prepare));
                 parts.push(("sink_write_block", write));
+                kept._cache = Some(cache);
+                kept._sink = Some(sink);
                 Retained::Flushed(report)
             }
             (name, _) => {
                 return Err(format!("{} was given another stage's input", name.as_str()).into());
             }
         };
-        Ok(Output { retained, parts })
+        Ok(Output {
+            retained,
+            parts,
+            _kept: kept,
+        })
     }
 
     /// Account for and verify one output, then remove what it stored.

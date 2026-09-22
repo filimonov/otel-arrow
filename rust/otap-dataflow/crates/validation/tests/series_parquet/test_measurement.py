@@ -3361,11 +3361,7 @@ class StageContracts(unittest.TestCase):
             "output_representation": "extracted_rows",
             "denominator": performance.DENOMINATOR,
             "rates": {name: 1.0 for name in performance.RATE_FIELDS},
-            "completion_semantics": (
-                "the store reported the object written and the bytes were read "
-                "back and verified; this is object-store visibility, not host "
-                "power-loss durability"
-            ),
+            "completion_semantics": performance.COMPLETION_SEMANTICS,
         }
         result.update(overrides)
         return result
@@ -3508,8 +3504,10 @@ class StageContracts(unittest.TestCase):
     # each one runs.
     # Guarantees: every setup command the harness actually runs -- the git
     # provenance, the rustc version probe, the --describe probe and the
-    # Docker store setup -- is named in the recorded list, and the
-    # compiler-free claim says it covers measured windows only.
+    # Docker store setup -- is named in the recorded list; the number of
+    # rustc --version probes it states matches the builds the family
+    # actually probes; and the compiler-free claim says it covers measured
+    # windows only.
     def test_setup_subprocesses_are_recorded(self):
         recorded = " ".join(performance.SETUP_SUBPROCESSES["before_any_lease"])
         for function, token in (
@@ -3525,7 +3523,17 @@ class StageContracts(unittest.TestCase):
                 self.assertIn(token, recorded)
         claim = performance.SETUP_SUBPROCESSES["compiler_free_claim"]
         self.assertIn("measured windows only", claim)
-        self.assertIn("rustc once, for --version", claim)
+        # One rustc --version per engine_build call: the three bench builds
+        # run_stages probes and the two engines engine_binaries probes.
+        self.assertEqual(inspect.getsource(performance.bench_build).count(
+            "measurement.engine_build("), 1)
+        benches = inspect.getsource(performance.run_stages).count("bench_build(")
+        engines = inspect.getsource(performance.engine_binaries).count(
+            "measurement.engine_build(")
+        self.assertEqual((benches, engines), (3, 2))
+        self.assertIn("rustc five times, each only for --version", claim)
+        self.assertIn("five times in a stages family", recorded)
+        self.assertNotIn("once,", claim)
 
     # Scenario: a layer's group ran three attempts, and its record is read
     # against the artifacts each attempt wrote -- once as the fixed bench
@@ -3584,34 +3592,62 @@ class StageContracts(unittest.TestCase):
             )
 
     # Scenario: a stage that stores an object reports its metrics without
-    # saying what a completed write means.
-    # Guarantees: every storing stage records that completion is
-    # object-store visibility with verified bytes and not host power-loss
-    # durability, so a reader cannot take it for a durability claim.
+    # saying what a completed write means, with a vague claim, with the
+    # reversed claim that it provides host power-loss durability, and with
+    # a paraphrase of the correct meaning.
+    # Guarantees: only the bench's fixed completion semantics are accepted,
+    # character for character, so no wording -- least of all the reversed
+    # claim -- can pass for a durability statement it is not.
     def test_store_stages_record_completion_semantics(self):
+        refused = (
+            None,
+            "",
+            "the object was written",
+            "this provides host power-loss durability",
+            "the store reported the object written; this is host power-loss "
+            "durability",
+            "the store reported the object written and the bytes were read back "
+            "and verified; this is object-store visibility, not host power-loss "
+            "durability",
+        )
         for stage in performance.STORE_STAGES:
             result = self.complete_stage_result(
                 stage=stage,
                 input_representation=performance.INPUT_REPRESENTATIONS[stage],
                 output_representation="stored_objects",
-                completion_semantics=None,
             )
-            with self.subTest(stage=stage):
-                with self.assertRaisesRegex(AssertionError, "completed write"):
-                    performance.validate_stage_result(result)
-                weak = dict(result, completion_semantics="the object was written")
-                with self.assertRaisesRegex(AssertionError, "completed write"):
-                    performance.validate_stage_result(weak)
+            for semantics in refused:
+                with self.subTest(stage=stage, semantics=semantics):
+                    with self.assertRaisesRegex(AssertionError, "completed write"):
+                        performance.validate_stage_result(
+                            dict(result, completion_semantics=semantics)
+                        )
+            with self.subTest(stage=stage, semantics="the bench constant"):
                 performance.validate_stage_result(
-                    dict(
-                        result,
-                        completion_semantics=(
-                            "the store reported the object written and the bytes "
-                            "were read back and verified; this is object-store "
-                            "visibility, not host power-loss durability"
-                        ),
-                    )
+                    dict(result, completion_semantics=performance.COMPLETION_SEMANTICS)
                 )
+
+    # Scenario: the harness's accepted completion semantics are compared
+    # with the constant the bench writes into every storing stage result.
+    # Guarantees: the two cannot drift apart; a change to the bench's text
+    # fails here instead of failing every measured result.
+    def test_completion_semantics_match_the_bench(self):
+        source = (
+            Path(performance.__file__).resolve().parents[3]
+            / "series-lake/benches/measurement/stages.rs"
+        ).read_text(encoding="ascii")
+        start = source.index("pub const COMPLETION_SEMANTICS: &str = ")
+        literal = source[start:source.index(";\n", start)]
+        literal = literal[literal.index('"') + 1:literal.rindex('"')]
+        # A Rust string continuation drops the newline and the next line's
+        # leading whitespace.
+        text = "".join(
+            part.lstrip() if index else part
+            for index, part in enumerate(literal.split("\\\n"))
+        )
+        self.assertEqual(text, performance.COMPLETION_SEMANTICS)
+        self.assertEqual(performance.ALLOWED_COMPLETION_SEMANTICS,
+                         (performance.COMPLETION_SEMANTICS,))
 
     # Scenario: a Criterion group takes its thirty samples but accumulates
     # only 0.57 s of measured work, because its batched preparation costs

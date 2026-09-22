@@ -410,23 +410,38 @@ fn input_file_round_trips(root: &Path) -> Result<()> {
 }
 
 // Scenario: every stage prepares one iteration's input and then runs it,
-// with the pieces of per-iteration setup it builds counted.
-// Guarantees: `run` builds none of its own setup -- the counter never
-// advances across a timed call -- while `prepare` builds it, and two
-// preparations of a stage that writes name different destinations, so no
-// iteration can overwrite what an earlier one wrote.
+// with each piece of per-iteration setup counted: every wire clone,
+// prepared conversion, warmed cache, sink, destination path set, object
+// set and output buffer set.
+// Guarantees: `prepare` builds exactly the setup each stage is specified
+// to be handed -- so setup moved into `run` lowers the count and fails --
+// and `run` builds none, so a clone, conversion or allocation reintroduced
+// inside the timed call advances the counter and fails. Two preparations
+// of a stage that writes name different destinations, so no iteration can
+// overwrite what an earlier one wrote.
 fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
-    let needs_setup = [
-        StageName::OtlpSort,
-        StageName::OtlpParquetLocal,
-        StageName::OtlpParquetZstd,
-        StageName::OtlpMinio,
-        StageName::SortSeal,
-        StageName::LocalWrite,
-        StageName::Upload,
-        StageName::Sink,
+    let expected: [(StageName, u64); 15] = [
+        (StageName::OtlpNoop, 1),         // wire
+        (StageName::OtlpConvert, 1),      // wire
+        (StageName::OtlpExtractHash, 1),  // wire
+        (StageName::OtlpSort, 2),         // wire, cache
+        (StageName::OtlpParquetLocal, 3), // paths, wire, cache
+        (StageName::OtlpParquetZstd, 3),  // paths, wire, cache
+        (StageName::OtlpMinio, 3),        // wire, cache, sink
+        (StageName::Convert, 1),          // wire
+        (StageName::Extract, 2),          // wire, conversion
+        (StageName::SortSeal, 3),         // wire, conversion, cache
+        (StageName::Merge, 0),            // the fixture block is shared
+        (StageName::Encode, 1),           // output buffers
+        (StageName::LocalWrite, 1),       // object paths and bytes
+        (StageName::Upload, 1),           // object paths and bytes
+        (StageName::Sink, 1),             // sink
     ];
+    ensure(
+        expected.iter().map(|(name, _)| *name).collect::<Vec<_>>() == StageName::ALL.to_vec(),
+        "the expected setup table does not list every stage in order",
+    )?;
     let needs_cache = [
         StageName::OtlpSort,
         StageName::OtlpParquetLocal,
@@ -443,7 +458,7 @@ fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
         StageName::Sink,
     ];
     let input = fixture_inputs(root)?.remove(0);
-    for name in StageName::ALL {
+    for (name, pieces) in expected {
         let stage = Stage::new(
             name,
             bench_config(root),
@@ -464,12 +479,14 @@ fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
             format!("{} reports carrying {carries:?}", name.as_str()),
         )?;
         let prepared_count = stage.setup_built();
-        if needs_setup.contains(&name) {
-            ensure(
-                prepared_count > before,
-                format!("{} built no setup while preparing", name.as_str()),
-            )?;
-        }
+        ensure(
+            prepared_count - before == pieces,
+            format!(
+                "{} built {} pieces of setup while preparing, expected {pieces}",
+                name.as_str(),
+                prepared_count - before
+            ),
+        )?;
         let output = stage.run(prepared)?;
         ensure(
             stage.setup_built() == prepared_count,
@@ -499,25 +516,43 @@ fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// Scenario: the cumulative sort layer is sampled twice through the real
-// sampling loop, once with its ordinary fixture and once with a cache
-// warm-up two hundred thousand entries heavier, which is more than an
-// order of magnitude more per-iteration setup for exactly the same
-// admitted work.
-// Guarantees: the preparation really did get heavier, the loop prepares
-// once per sample, and the measured per-iteration time stays within a
-// quarter of the light fixture's -- the fixture is built outside the timer.
+/// Cache entries of the fixture-weight comparison: room for every real
+/// and synthetic committed id, so warming evicts nothing in either run.
+const WEIGHT_CACHE_ENTRIES: usize = 300_000;
+/// Synthetic committed ids the heavy fixture adds.
+const WEIGHT_EXTRA_SERIES: usize = 200_000;
+
+// Scenario: the sort-and-seal stage is sampled twice through the real
+// sampling loop with its own `prepare` and `run`, once with its ordinary
+// fixture and once with a cache warm-up two hundred thousand entries
+// heavier. The cache has room for every id in both runs, and the
+// synthetic ids are inserted before the real ones, so the timed admission
+// sees exactly the same resident committed ids.
+// Guarantees: the timed work is identical -- every sample of both runs
+// records the same cache hits and misses and no eviction -- the
+// preparation really did get more than three times heavier, the loop
+// prepares once per sample, and the measured per-iteration time stays
+// below 1.25 times the light fixture's: the fixture is built outside the
+// timer.
 fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     let input = fixture_inputs(root)?.remove(0);
-    let sample = |extra: usize| -> Result<(u128, u128, u64)> {
+    let sample = |extra: usize| -> Result<(u128, u128, u64, (u64, u64, u64))> {
+        let mut cfg = bench_config_with(root, extra);
+        cfg.cache_entries = WEIGHT_CACHE_ENTRIES;
         let stage = Stage::new(
-            StageName::OtlpSort,
-            bench_config_with(root, extra),
+            StageName::SortSeal,
+            cfg,
             input.clone(),
             stages::zstd(),
             true,
         )?;
+        let per_prepare = {
+            let before = stage.setup_built();
+            drop(stage.prepare()?);
+            stage.setup_built() - before
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
         let before = stage.setup_built();
         let samples = super::sample_loop(
             Clock::Thread,
@@ -525,15 +560,35 @@ fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
             Duration::ZERO,
             || stage.prepare(),
             |prepared| stage.run(prepared),
-            |_| Ok(Vec::new()),
+            |output| {
+                if let stages::Retained::Block(_, stats) = &output.retained {
+                    seen.borrow_mut()
+                        .push((stats.hits, stats.misses, stats.evictions));
+                }
+                Ok(Vec::new())
+            },
         )?;
+        let built = stage.setup_built() - before;
         ensure(
-            stage.setup_built() - before == samples.sample_count as u64,
+            built == per_prepare * samples.sample_count as u64,
             format!(
-                "{} caches for {} samples: preparation is not once per sample",
-                stage.setup_built() - before,
+                "{built} pieces of setup for {} samples of {per_prepare} each: \
+                 preparation is not once per sample",
                 samples.sample_count
             ),
+        )?;
+        let seen = seen.into_inner();
+        ensure(
+            seen.len() == samples.sample_count && seen.windows(2).all(|pair| pair[0] == pair[1]),
+            format!("the samples saw different cache work: {seen:?}"),
+        )?;
+        let counts = seen
+            .first()
+            .copied()
+            .ok_or("no sample recorded its cache")?;
+        ensure(
+            counts.2 == 0,
+            format!("warming evicted {} entries", counts.2),
         )?;
         let mut walls: Vec<u128> = samples.samples.iter().map(|s| s.wall_ns).collect();
         walls.sort_unstable();
@@ -541,11 +596,19 @@ fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
             walls[walls.len() / 2],
             samples.prepare_ns_total / samples.sample_count.max(1) as u128,
             samples.sample_count as u64,
+            counts,
         ))
     };
-    let (light_run, light_prepare, count) = sample(0)?;
-    let (heavy_run, heavy_prepare, _) = sample(200_000)?;
+    let (light_run, light_prepare, count, light_cache) = sample(0)?;
+    let (heavy_run, heavy_prepare, _, heavy_cache) = sample(WEIGHT_EXTRA_SERIES)?;
     ensure(count >= SAMPLES as u64, "too few samples to compare")?;
+    ensure(
+        light_cache == heavy_cache && light_cache.0 > 0 && light_cache.1 > 0,
+        format!(
+            "the light run saw (hits, misses, evictions) {light_cache:?} and the heavy \
+             run {heavy_cache:?}: the timed work is not identical"
+        ),
+    )?;
     ensure(
         heavy_prepare > light_prepare * 3,
         format!(
@@ -635,7 +698,7 @@ fn store_stages_record_completion_semantics(root: &Path) -> Result<()> {
             .unwrap_or_default()
             .to_string();
         ensure(
-            recorded.contains("read back") && recorded.contains("not host power-loss"),
+            recorded == stages::COMPLETION_SEMANTICS,
             format!("{} records completion as {recorded:?}", name.as_str()),
         )?;
         ensure(
