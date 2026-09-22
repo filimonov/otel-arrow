@@ -229,8 +229,12 @@ pub struct EngineMetricsMonitor {
     series_entity: EntityKey,
     /// The accounting this monitor reads the worker count and accounted bytes from.
     accounting: Arc<SeriesAccounting>,
-    /// Test hook run under the accounting guard, just before the residual
-    /// snapshot is materialized, with the state the monitor is deciding on.
+    /// Test hook run at the one instant that matters: after the worker count
+    /// has been checked and before the residual snapshot is materialized.
+    ///
+    /// In the fixed code that instant is inside the accounting guard, so a
+    /// test can drive a worker drop from here and observe that it cannot
+    /// interleave. It receives the state the monitor is deciding on.
     #[cfg(test)]
     on_materialize: Option<Box<dyn FnMut(usize, u64)>>,
 }
@@ -476,6 +480,7 @@ mod tests {
     use crate::context::ControllerContext;
     use otel_arrow_dfe_telemetry::metrics::MetricValue;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A monitor over accounting nothing else in this binary can see.
     ///
@@ -771,6 +776,91 @@ mod tests {
         assert!(
             residuals(&harness.receiver).is_empty(),
             "no residual survives the last worker"
+        );
+    }
+
+    /// Scenario: the last series worker is dropped from another thread at the
+    /// exact instant the monitor has checked the worker count and is about to
+    /// materialize the residual snapshot.
+    /// Guarantees: that whole decision is one critical section, so the drop
+    /// cannot land inside it; the residual that is emitted was decided with
+    /// the worker still counted, the drop completes once the monitor releases
+    /// the guard, and the next report emits nothing.
+    #[test]
+    fn a_worker_drop_cannot_interleave_with_the_residual_decision() {
+        let mut harness = harness();
+        let mut worker = SeriesMemoryAccounting::register_with(Arc::clone(&harness.accounting));
+        worker.set(128);
+        harness.monitor.update();
+        let rss = harness.monitor.metrics.memory_rss.get();
+
+        // What the monitor saw when it decided, and whether a drop could have
+        // proceeded at that instant.
+        let counted = Arc::new(AtomicUsize::new(usize::MAX));
+        let drop_could_proceed = Arc::new(AtomicBool::new(true));
+        // The dropper thread, parked until the monitor lets go of the guard.
+        let dropper = Arc::new(Mutex::new(None));
+
+        let accounting = Arc::clone(&harness.accounting);
+        let observed = Arc::clone(&counted);
+        let probed = Arc::clone(&drop_could_proceed);
+        let handle = Arc::clone(&dropper);
+        let mut slot = Some(worker);
+        harness.monitor.on_materialize = Some(Box::new(move |workers, _accounted| {
+            observed.store(workers, Ordering::SeqCst);
+            let Some(worker) = slot.take() else {
+                return;
+            };
+            let accounting = Arc::clone(&accounting);
+            let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                // Report whether a worker could take the accounting state right
+                // now, then actually drop, which parks on the guard until the
+                // monitor is done deciding.
+                probe_tx
+                    .send(accounting.state.try_lock().is_ok())
+                    .expect("probe result");
+                drop(worker);
+            });
+            // Blocking receive, so the probe is known to have run while the
+            // monitor is mid-decision. No sleeping and no timing assumption.
+            probed.store(probe_rx.recv().expect("probe result"), Ordering::SeqCst);
+            *handle.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
+        }));
+
+        harness.monitor.report().expect("report");
+
+        assert_eq!(
+            counted.load(Ordering::SeqCst),
+            1,
+            "the decision counted the still-registered worker"
+        );
+        assert!(
+            !drop_could_proceed.load(Ordering::SeqCst),
+            "a worker drop must not be able to land between the worker count \
+             being checked and the snapshot being materialized"
+        );
+        assert_eq!(
+            residuals(&harness.receiver),
+            vec![rss.saturating_sub(128)],
+            "the emitted residual is the one decided with the worker counted"
+        );
+
+        // The guard is released now, so the parked drop completes.
+        dropper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .expect("dropper thread")
+            .join()
+            .expect("dropper thread");
+        assert_eq!(harness.accounting.lock().workers, 0);
+
+        harness.monitor.report().expect("report");
+        assert!(harness.monitor.series.is_none());
+        assert!(
+            residuals(&harness.receiver).is_empty(),
+            "no residual is emitted once the drop has landed"
         );
     }
 
