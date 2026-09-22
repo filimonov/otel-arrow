@@ -15,6 +15,7 @@ use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UI
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::AggregationTemporality;
 use otel_arrow_dfe_pdata::schema::consts::{
     AGGREGATION_TEMPORALITY, DESCRIPTION, DOUBLE_VALUE, FLAGS, HISTOGRAM_BUCKET_COUNTS,
     HISTOGRAM_COUNT, HISTOGRAM_EXPLICIT_BOUNDS, HISTOGRAM_MAX, HISTOGRAM_MIN, HISTOGRAM_SUM, ID,
@@ -106,13 +107,21 @@ fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u
                 return Err(Error::invalid(format!("metric_type {kind_u8}")));
             }
         };
-        let temporality = match temporality.as_ref().and_then(|a| {
-            a.is_valid(row)
-                .then(|| a.as_primitive::<Int32Type>().value(row))
-        }) {
-            Some(1) => Temporality::Delta,
-            Some(2) => Temporality::Cumulative,
-            _ => Temporality::Unspecified,
+        // Decoded through the proto enum, so an unknown value is unspecified
+        // by the enum's own definition rather than by a local literal.
+        let temporality = match temporality
+            .as_ref()
+            .and_then(|a| {
+                a.is_valid(row)
+                    .then(|| a.as_primitive::<Int32Type>().value(row))
+            })
+            .map(AggregationTemporality::try_from)
+        {
+            Some(Ok(AggregationTemporality::Delta)) => Temporality::Delta,
+            Some(Ok(AggregationTemporality::Cumulative)) => Temporality::Cumulative,
+            Some(Ok(AggregationTemporality::Unspecified) | Err(_)) | None => {
+                Temporality::Unspecified
+            }
         };
         // Order matters: an unsupported kind is settled by the policy first, and
         // its temporality is never validated. pdata only supplies temporality for
