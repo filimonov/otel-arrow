@@ -37,25 +37,74 @@
 use crate::memory_limiter::MemoryPressureState;
 use cpu_time::ProcessTime;
 use otel_arrow_dfe_telemetry::instrument::{Gauge, ObserveUpDownCounter};
-use otel_arrow_dfe_telemetry::metrics::MetricSet;
+use otel_arrow_dfe_telemetry::metrics::{MetricSet, MetricSetHandler, MetricSetSnapshot};
 use otel_arrow_dfe_telemetry::registry::{EntityKey, TelemetryRegistryHandle};
-use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
+use otel_arrow_dfe_telemetry::reporter::{MetricsReporter, ReportOutcome};
 use otel_arrow_dfe_telemetry_macros::metric_set;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-/// Number of series exporter workers currently registered in this process.
-static SERIES_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// The state a monitor and the workers it accounts for share.
+#[derive(Debug, Default)]
+struct AccountingState {
+    /// Registered workers, including workers currently retaining zero bytes.
+    workers: usize,
+    /// Sum of what those workers most recently accounted for.
+    accounted: u64,
+    /// Whether some monitor already owns registering and reporting the residual.
+    ///
+    /// A process may run more than one engine monitor; only one of them reports
+    /// the residual, because the residual describes the process, not the engine.
+    reporter_owned: bool,
+}
 
-/// Sum of the bytes those workers have most recently accounted for.
-static SERIES_ACCOUNTED_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// Whether some engine monitor already owns the process residual metric.
+/// Series exporter memory accounting shared by the workers and the monitor.
 ///
-/// A process may run more than one engine monitor; only one of them registers
-/// and reports the residual, because the residual describes the process, not
-/// the engine.
-static SERIES_REPORTER_OWNED: AtomicBool = AtomicBool::new(false);
+/// Worker registration, a worker's accounted bytes, and the monitor's decision
+/// to register, materialize or drop the residual all move through one guard.
+/// That is what makes "a residual is reported only while a worker is
+/// registered" a fact rather than a race: a worker cannot appear or vanish
+/// between the monitor reading the worker count and it taking the snapshot.
+///
+/// The guard is held across the registry calls the decision implies, so the
+/// lock order is always accounting then registry; nothing takes the registry
+/// lock first and then this one.
+#[derive(Debug, Default)]
+pub struct SeriesAccounting {
+    /// The shared state; see the type comment for why one guard covers it all.
+    state: Mutex<AccountingState>,
+}
+
+/// The single instance production workers and monitors share.
+static PROCESS_ACCOUNTING: LazyLock<Arc<SeriesAccounting>> =
+    LazyLock::new(|| Arc::new(SeriesAccounting::default()));
+
+impl SeriesAccounting {
+    /// The process-wide accounting every engine monitor and exporter worker uses.
+    #[must_use]
+    pub fn process() -> Arc<Self> {
+        Arc::clone(&PROCESS_ACCOUNTING)
+    }
+
+    /// An accounting instance of its own, isolated from the process-wide one.
+    ///
+    /// Tests use this so that one test's workers and reporter ownership are
+    /// invisible to every other test, instead of contending for global state.
+    #[must_use]
+    pub fn isolated() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Takes the guard, tolerating poisoning from a panic elsewhere.
+    ///
+    /// Every writer restores a consistent state before it can unwind -- the
+    /// counters are plain numbers updated in one critical section -- so a
+    /// poisoned guard carries no torn value and refusing to hand it out would
+    /// only turn one failure into a cascade of unrelated ones.
+    fn lock(&self) -> MutexGuard<'_, AccountingState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// One worker's contribution to process-wide series exporter memory accounting.
 ///
@@ -64,6 +113,8 @@ static SERIES_REPORTER_OWNED: AtomicBool = AtomicBool::new(false);
 /// withdraws exactly this worker's bytes and its registration, once.
 #[derive(Debug)]
 pub struct SeriesMemoryAccounting {
+    /// The accounting this worker is registered with.
+    accounting: Arc<SeriesAccounting>,
     /// What this worker last published, so a later value can be applied as a delta.
     bytes: u64,
 }
@@ -72,8 +123,17 @@ impl SeriesMemoryAccounting {
     /// Register one active exporter worker, including workers currently retaining zero bytes.
     #[must_use]
     pub fn register() -> Self {
-        let _ = SERIES_WORKERS.fetch_add(1, Ordering::AcqRel);
-        Self { bytes: 0 }
+        Self::register_with(SeriesAccounting::process())
+    }
+
+    /// Register one active exporter worker against a specific accounting instance.
+    #[must_use]
+    pub fn register_with(accounting: Arc<SeriesAccounting>) -> Self {
+        accounting.lock().workers += 1;
+        Self {
+            accounting,
+            bytes: 0,
+        }
     }
 
     /// What this worker last published.
@@ -84,19 +144,21 @@ impl SeriesMemoryAccounting {
 
     /// Replace this worker's accounted bytes without disturbing other workers.
     pub fn set(&mut self, bytes: u64) {
-        if bytes >= self.bytes {
-            let _ = SERIES_ACCOUNTED_BYTES.fetch_add(bytes - self.bytes, Ordering::Relaxed);
-        } else {
-            let _ = SERIES_ACCOUNTED_BYTES.fetch_sub(self.bytes - bytes, Ordering::Relaxed);
-        }
+        let mut state = self.accounting.lock();
+        state.accounted = state
+            .accounted
+            .saturating_sub(self.bytes)
+            .saturating_add(bytes);
+        drop(state);
         self.bytes = bytes;
     }
 }
 
 impl Drop for SeriesMemoryAccounting {
     fn drop(&mut self) {
-        self.set(0);
-        let _ = SERIES_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self.accounting.lock();
+        state.accounted = state.accounted.saturating_sub(self.bytes);
+        state.workers = state.workers.saturating_sub(1);
     }
 }
 
@@ -165,6 +227,12 @@ pub struct EngineMetricsMonitor {
     series: Option<MetricSet<SeriesProcessMetrics>>,
     /// The engine entity the residual is reported on; there is no worker entity here.
     series_entity: EntityKey,
+    /// The accounting this monitor reads the worker count and accounted bytes from.
+    accounting: Arc<SeriesAccounting>,
+    /// Test hook run under the accounting guard, just before the residual
+    /// snapshot is materialized, with the state the monitor is deciding on.
+    #[cfg(test)]
+    on_materialize: Option<Box<dyn FnMut(usize, u64)>>,
 }
 
 impl EngineMetricsMonitor {
@@ -178,6 +246,29 @@ impl EngineMetricsMonitor {
         entity_key: EntityKey,
         reporter: MetricsReporter,
         memory_pressure_state: MemoryPressureState,
+    ) -> Self {
+        Self::with_accounting(
+            registry,
+            entity_key,
+            reporter,
+            memory_pressure_state,
+            SeriesAccounting::process(),
+        )
+    }
+
+    /// Creates a monitor reading a specific series accounting instance.
+    ///
+    /// Production passes [`SeriesAccounting::process`], which is what
+    /// [`new`](Self::new) does. Tests pass [`SeriesAccounting::isolated`] so
+    /// that their workers and reporter ownership cannot be seen by, or steal
+    /// ownership from, any other test in the same binary.
+    #[must_use]
+    pub fn with_accounting(
+        registry: TelemetryRegistryHandle,
+        entity_key: EntityKey,
+        reporter: MetricsReporter,
+        memory_pressure_state: MemoryPressureState,
+        accounting: Arc<SeriesAccounting>,
     ) -> Self {
         let metrics = registry.register_metric_set_for_entity::<EngineMetrics>(entity_key);
         let num_cores = std::thread::available_parallelism()
@@ -193,31 +284,89 @@ impl EngineMetricsMonitor {
             memory_pressure_state,
             series: None,
             series_entity: entity_key,
+            accounting,
+            #[cfg(test)]
+            on_materialize: None,
         }
     }
 
-    /// Registers or unregisters the process residual to match the live worker count.
+    /// Brings the residual registration in line with the live worker count.
+    ///
+    /// Takes the fields rather than `&mut self` so a caller can hold the
+    /// accounting guard, which borrows `self.accounting`, across the call.
     ///
     /// The residual is meaningless without a worker to be a residual of, so no
-    /// metric set exists at zero workers. At least one worker, the first
-    /// monitor to win `SERIES_REPORTER_OWNED` reports it; a second monitor
-    /// leaves it alone, and can pick it up on a later update if the first
-    /// monitor is dropped.
-    fn sync_series_registration(&mut self) {
-        if SERIES_WORKERS.load(Ordering::Acquire) == 0 {
-            if let Some(series) = self.series.take() {
-                let _ = self.registry.unregister_metric_set(series.metric_set_key());
-                SERIES_REPORTER_OWNED.store(false, Ordering::Release);
+    /// metric set exists at zero workers. With at least one worker, the first
+    /// monitor to claim `reporter_owned` registers and reports it; a second
+    /// monitor leaves it alone, and picks it up on a later update if the owner
+    /// is dropped.
+    fn sync_locked(
+        series: &mut Option<MetricSet<SeriesProcessMetrics>>,
+        registry: &TelemetryRegistryHandle,
+        entity: EntityKey,
+        state: &mut AccountingState,
+    ) {
+        if state.workers == 0 {
+            if let Some(set) = series.take() {
+                let _ = registry.unregister_metric_set(set.metric_set_key());
+                state.reporter_owned = false;
             }
-        } else if self.series.is_none()
-            && SERIES_REPORTER_OWNED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        } else if series.is_none() && !state.reporter_owned {
+            state.reporter_owned = true;
+            *series = Some(registry.register_metric_set_for_entity::<SeriesProcessMetrics>(entity));
+        }
+    }
+
+    /// Records the residual for `rss` against the current accounted total.
+    ///
+    /// The worker count and the accounted sum are read under the same guard
+    /// that a registering or dropping worker takes, so the value recorded here
+    /// always belongs to a worker state that really existed.
+    fn observe_series_residual(&mut self, rss: u64) {
+        let mut state = self.accounting.lock();
+        Self::sync_locked(
+            &mut self.series,
+            &self.registry,
+            self.series_entity,
+            &mut state,
+        );
+        if let Some(series) = &mut self.series {
+            series.residual.set(rss.saturating_sub(state.accounted));
+        }
+    }
+
+    /// Materializes the residual snapshot, if one is due, under the guard.
+    ///
+    /// The registration check and the snapshot happen in one critical section,
+    /// so the last worker cannot drop between them and leave a residual to be
+    /// emitted for a process that no longer has a series exporter. The
+    /// returned snapshot is sent by the caller after the guard is released,
+    /// which is what keeps the caller free to await.
+    fn take_series_snapshot(&mut self) -> Option<MetricSetSnapshot> {
+        let mut state = self.accounting.lock();
+        Self::sync_locked(
+            &mut self.series,
+            &self.registry,
+            self.series_entity,
+            &mut state,
+        );
+        #[cfg(test)]
+        if let Some(hook) = &mut self.on_materialize {
+            hook(state.workers, state.accounted);
+        }
+        let series = self.series.as_ref()?;
+        series.needs_flush().then(|| series.snapshot())
+    }
+
+    /// Clears the residual after its snapshot was accepted.
+    ///
+    /// A deferred snapshot leaves the values in place so the next report
+    /// retries it, matching how the reporter treats every other metric set.
+    fn clear_series_after(&mut self, outcome: ReportOutcome) {
+        if matches!(outcome, ReportOutcome::Sent)
+            && let Some(series) = &mut self.series
         {
-            self.series = Some(
-                self.registry
-                    .register_metric_set_for_entity::<SeriesProcessMetrics>(self.series_entity),
-            );
+            series.clear_values();
         }
     }
 
@@ -228,12 +377,7 @@ impl EngineMetricsMonitor {
         // `/proc` sample.
         let rss = get_rss_bytes();
         self.metrics.memory_rss.observe(rss);
-        self.sync_series_registration();
-        if let Some(series) = &mut self.series {
-            series
-                .residual
-                .set(rss.saturating_sub(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed)));
-        }
+        self.observe_series_residual(rss);
 
         // Compute process-wide CPU utilization normalized across all cores.
         let now_wall = Instant::now();
@@ -269,11 +413,12 @@ impl EngineMetricsMonitor {
     /// Returns an error only if the metrics channel is permanently closed.
     /// A full channel is silently tolerated (non-blocking, try-send semantics).
     pub fn report(&mut self) -> Result<(), otel_arrow_dfe_telemetry::error::Error> {
-        // Rechecked here, not just in `update`, so the last worker leaving
-        // between the two never has its residual reported after it is gone.
-        self.sync_series_registration();
-        if let Some(series) = &mut self.series {
-            self.reporter.report(series)?;
+        // Rechecked here, not just in `update`: the worker state is re-read and
+        // the snapshot materialized in one critical section, so the last worker
+        // leaving never has its residual reported after it is gone.
+        if let Some(snapshot) = self.take_series_snapshot() {
+            let outcome = self.reporter.try_report_snapshot_with_outcome(snapshot)?;
+            self.clear_series_after(outcome);
         }
         self.reporter.report(&mut self.metrics)
     }
@@ -288,11 +433,15 @@ impl EngineMetricsMonitor {
         deadline: Instant,
     ) -> Result<(), otel_arrow_dfe_telemetry::error::Error> {
         self.update();
-        if let Some(series) = &mut self.series {
-            let _ = self
+        // Materialized under the accounting guard and sent after it is
+        // released, because this send waits on downstream capacity and a guard
+        // must never be held across an await.
+        if let Some(snapshot) = self.take_series_snapshot() {
+            let outcome = self
                 .reporter
-                .report_reliably_until(series, deadline)
+                .report_snapshot_reliably_until(snapshot, deadline)
                 .await?;
+            self.clear_series_after(outcome);
         }
         let _ = self
             .reporter
@@ -313,7 +462,7 @@ impl Drop for EngineMetricsMonitor {
     fn drop(&mut self) {
         if let Some(series) = self.series.take() {
             let _ = self.registry.unregister_metric_set(series.metric_set_key());
-            SERIES_REPORTER_OWNED.store(false, Ordering::Release);
+            self.accounting.lock().reporter_owned = false;
         }
         let _ = self
             .registry
@@ -325,29 +474,70 @@ impl Drop for EngineMetricsMonitor {
 mod tests {
     use super::*;
     use crate::context::ControllerContext;
+    use otel_arrow_dfe_telemetry::metrics::MetricValue;
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
 
-    #[test]
-    fn engine_metrics_reports_nonzero_rss() {
+    /// A monitor over accounting nothing else in this binary can see.
+    ///
+    /// Every monitor test uses this. The residual registration and its
+    /// ownership flag are process state in production, so a test that reached
+    /// for the process instance could steal ownership from, or have it stolen
+    /// by, any other test the harness happens to run beside it.
+    struct Harness {
+        monitor: EngineMetricsMonitor,
+        receiver: flume::Receiver<MetricSetSnapshot>,
+        accounting: Arc<SeriesAccounting>,
+    }
+
+    fn harness() -> Harness {
+        harness_on(SeriesAccounting::isolated())
+    }
+
+    fn harness_on(accounting: Arc<SeriesAccounting>) -> Harness {
         let registry = TelemetryRegistryHandle::new();
         let controller = ControllerContext::new(registry.clone());
         let entity_key = controller.register_engine_entity();
-        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-
-        let mut monitor = EngineMetricsMonitor::new(
+        let (receiver, reporter) = MetricsReporter::create_new_and_receiver(16);
+        let monitor = EngineMetricsMonitor::with_accounting(
             registry,
             entity_key,
             reporter,
             controller.memory_pressure_state(),
+            Arc::clone(&accounting),
         );
+        Harness {
+            monitor,
+            receiver,
+            accounting,
+        }
+    }
+
+    /// The residual values in everything the receiver holds, oldest first.
+    fn residuals(receiver: &flume::Receiver<MetricSetSnapshot>) -> Vec<u64> {
+        receiver
+            .drain()
+            .filter(|snapshot| snapshot.descriptor().name == "exporter.series_parquet")
+            .map(|snapshot| match snapshot.get_metrics() {
+                [MetricValue::U64(value)] => *value,
+                other => panic!("residual snapshot should hold one u64, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Scenario: the engine monitor samples the process once.
+    /// Guarantees: `memory_rss` carries the real process RSS rather than zero.
+    #[test]
+    fn engine_metrics_reports_nonzero_rss() {
+        let mut harness = harness();
+
         // `memory_stats` reads /proc, which can fail transiently under a loaded
         // machine and then reports zero. Retrying a few times keeps the
         // guarantee -- the monitor does report real RSS -- without failing the
         // suite on one unlucky read.
         let mut rss = 0;
         for _ in 0..5 {
-            monitor.update();
-            rss = monitor.metrics.memory_rss.get();
+            harness.monitor.update();
+            rss = harness.monitor.metrics.memory_rss.get();
             if rss > 0 {
                 break;
             }
@@ -356,36 +546,20 @@ mod tests {
         assert!(rss > 0, "memory_rss should report non-zero process RSS");
     }
 
+    /// Scenario: a sampled monitor flushes to an open reporting channel.
+    /// Guarantees: reporting succeeds and does not error on the engine set.
     #[test]
     fn engine_metrics_report_succeeds() {
-        let registry = TelemetryRegistryHandle::new();
-        let controller = ControllerContext::new(registry.clone());
-        let entity_key = controller.register_engine_entity();
-        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-
-        let mut monitor = EngineMetricsMonitor::new(
-            registry,
-            entity_key,
-            reporter,
-            controller.memory_pressure_state(),
-        );
-        monitor.update();
-        assert!(monitor.report().is_ok());
+        let mut harness = harness();
+        harness.monitor.update();
+        assert!(harness.monitor.report().is_ok());
     }
 
+    /// Scenario: the process burns CPU briefly and the monitor samples it.
+    /// Guarantees: `cpu_utilization` stays a ratio inside [0, 1].
     #[test]
     fn engine_metrics_cpu_utilization_in_range() {
-        let registry = TelemetryRegistryHandle::new();
-        let controller = ControllerContext::new(registry.clone());
-        let entity_key = controller.register_engine_entity();
-        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-
-        let mut monitor = EngineMetricsMonitor::new(
-            registry,
-            entity_key,
-            reporter,
-            controller.memory_pressure_state(),
-        );
+        let mut harness = harness();
 
         // Do a small busy-spin so there is measurable CPU time.
         let start = Instant::now();
@@ -393,14 +567,16 @@ mod tests {
             let _ = std::hint::black_box(0u64.wrapping_add(1));
         }
 
-        monitor.update();
-        let util = monitor.metrics.cpu_utilization.get();
+        harness.monitor.update();
+        let util = harness.monitor.metrics.cpu_utilization.get();
         assert!(
             (0.0..=1.0).contains(&util),
             "cpu_utilization should be in [0, 1], got {util}"
         );
     }
 
+    /// Scenario: the memory limiter holds a configured sample and limits.
+    /// Guarantees: the monitor republishes that sample and both limits verbatim.
     #[test]
     fn engine_metrics_expose_process_memory_limiter_usage_and_limits() {
         let registry = TelemetryRegistryHandle::new();
@@ -420,7 +596,13 @@ mod tests {
 
         let entity_key = controller.register_engine_entity();
         let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-        let mut monitor = EngineMetricsMonitor::new(registry, entity_key, reporter, state);
+        let mut monitor = EngineMetricsMonitor::with_accounting(
+            registry,
+            entity_key,
+            reporter,
+            state,
+            SeriesAccounting::isolated(),
+        );
 
         monitor.update();
 
@@ -430,84 +612,202 @@ mod tests {
         assert_eq!(monitor.metrics.process_memory_hard_limit_bytes.get(), 100);
     }
 
-    /// Serializes the process-global accounting tests.
-    ///
-    /// Both of them assert on process-wide counters, so the workspace suite
-    /// running them on two threads at once would make each one observe the
-    /// other's registrations.
-    static SERIES_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Takes the shared lock, tolerating poisoning from an earlier failure.
-    ///
-    /// A failing assertion unwinds through the registration guards, which
-    /// restore the counters on the way out, so the next test still starts from
-    /// a consistent process state and should report its own failure rather
-    /// than a poisoned lock.
-    fn series_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        SERIES_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Scenario: two exporter workers account memory and one exits.
     /// Guarantees: the process total removes the exited worker and never subtracts another worker twice.
     #[test]
     fn series_accounting_releases_each_worker_once() {
-        let _guard = series_test_lock();
-        let baseline = SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed);
-        let mut a = SeriesMemoryAccounting::register();
-        let mut b = SeriesMemoryAccounting::register();
+        let accounting = SeriesAccounting::isolated();
+        let accounted = || accounting.lock().accounted;
+        let mut a = SeriesMemoryAccounting::register_with(Arc::clone(&accounting));
+        let mut b = SeriesMemoryAccounting::register_with(Arc::clone(&accounting));
         a.set(128);
         b.set(256);
         a.set(192);
-        assert_eq!(
-            SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed),
-            baseline + 448
-        );
+        assert_eq!(accounted(), 448);
         drop(a);
-        assert_eq!(
-            SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed),
-            baseline + 256
-        );
+        assert_eq!(accounted(), 256);
         b.set(0);
-        assert_eq!(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed), baseline);
+        assert_eq!(accounted(), 0);
         drop(b);
-        assert_eq!(SERIES_ACCOUNTED_BYTES.load(Ordering::Relaxed), baseline);
+        assert_eq!(accounted(), 0);
+        assert_eq!(accounting.lock().workers, 0);
     }
 
     /// Scenario: a process has no series workers, then two, then no workers again.
     /// Guarantees: only active workers expose residual telemetry and residual reuses the engine RSS sample.
     #[test]
     fn series_accounting_controls_process_metric_presence() {
-        let _guard = series_test_lock();
-        let registry = TelemetryRegistryHandle::new();
-        let controller = ControllerContext::new(registry.clone());
-        let entity = controller.register_engine_entity();
-        let (_rx, reporter) = MetricsReporter::create_new_and_receiver(16);
-        let mut monitor = EngineMetricsMonitor::new(
-            registry,
-            entity,
-            reporter,
-            controller.memory_pressure_state(),
-        );
-        monitor.update();
-        assert!(monitor.series.is_none());
-        let mut a = SeriesMemoryAccounting::register();
-        let b = SeriesMemoryAccounting::register();
+        let mut harness = harness();
+        harness.monitor.update();
+        assert!(harness.monitor.series.is_none());
+        let mut a = SeriesMemoryAccounting::register_with(Arc::clone(&harness.accounting));
+        let b = SeriesMemoryAccounting::register_with(Arc::clone(&harness.accounting));
         a.set(128);
-        monitor.update();
+        harness.monitor.update();
         assert_eq!(
-            monitor.series.as_ref().expect("registered").residual.get(),
-            monitor.metrics.memory_rss.get().saturating_sub(128)
+            harness
+                .monitor
+                .series
+                .as_ref()
+                .expect("registered")
+                .residual
+                .get(),
+            harness.monitor.metrics.memory_rss.get().saturating_sub(128)
         );
         drop(a);
-        monitor.update();
+        harness.monitor.update();
         assert!(
-            monitor.series.is_some(),
+            harness.monitor.series.is_some(),
             "zero-byte worker is still registered"
         );
         drop(b);
-        monitor.update();
-        assert!(monitor.series.is_none());
+        harness.monitor.update();
+        assert!(harness.monitor.series.is_none());
+    }
+
+    /// Scenario: the monitor materializes a residual snapshot with one worker
+    /// registered, and that worker drops before the next report.
+    /// Guarantees: the worker state the snapshot is built from is read under
+    /// the accounting guard, and once the last worker is gone no further
+    /// residual is emitted.
+    #[test]
+    fn series_residual_is_materialized_under_the_accounting_guard() {
+        let mut harness = harness();
+        let mut worker = SeriesMemoryAccounting::register_with(Arc::clone(&harness.accounting));
+        worker.set(128);
+
+        // Record what the monitor sees at the instant it decides to snapshot.
+        // Nothing can register or drop between this observation and the
+        // snapshot, because both happen inside one critical section.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&observed);
+        harness.monitor.on_materialize = Some(Box::new(move |workers, accounted| {
+            recorder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((workers, accounted));
+        }));
+
+        harness.monitor.update();
+        let rss = harness.monitor.metrics.memory_rss.get();
+        harness.monitor.report().expect("report");
+
+        assert_eq!(
+            *observed.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(1, 128)],
+            "the snapshot decision reads the guarded worker state"
+        );
+        assert_eq!(residuals(&harness.receiver), vec![rss.saturating_sub(128)]);
+
+        // The last worker leaves, so nothing further may be emitted.
+        drop(worker);
+        harness.monitor.update();
+        harness.monitor.report().expect("report");
+        assert!(harness.monitor.series.is_none());
+        assert_eq!(
+            *observed.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(1, 128), (0, 0)],
+            "the second decision sees no workers"
+        );
+        assert!(
+            residuals(&harness.receiver).is_empty(),
+            "no residual is emitted once the last worker has dropped"
+        );
+    }
+
+    /// Scenario: the last worker drops between a monitor's update and its report.
+    /// Guarantees: the report emits no residual, because the registration is
+    /// rechecked in the same critical section that materializes the snapshot.
+    #[test]
+    fn series_residual_is_not_reported_after_a_drop_between_update_and_report() {
+        let mut harness = harness();
+        let mut worker = SeriesMemoryAccounting::register_with(Arc::clone(&harness.accounting));
+        worker.set(128);
+        harness.monitor.update();
+        assert!(harness.monitor.series.is_some());
+
+        drop(worker);
+        harness.monitor.report().expect("report");
+
+        assert!(harness.monitor.series.is_none());
+        assert!(
+            residuals(&harness.receiver).is_empty(),
+            "a residual sampled before the drop must not be emitted after it"
+        );
+    }
+
+    /// Scenario: workers register and drop on another thread while a monitor
+    /// updates and reports in a loop.
+    /// Guarantees: the accounting never underflows, and once every worker has
+    /// gone the residual is unregistered and nothing more is emitted.
+    #[test]
+    fn series_accounting_survives_concurrent_registration_and_reporting() {
+        let mut harness = harness();
+        let accounting = Arc::clone(&harness.accounting);
+        let churn = std::thread::spawn(move || {
+            for round in 0..200u64 {
+                let mut worker = SeriesMemoryAccounting::register_with(Arc::clone(&accounting));
+                worker.set(round * 8);
+                let mut second = SeriesMemoryAccounting::register_with(Arc::clone(&accounting));
+                second.set(16);
+                drop(worker);
+            }
+        });
+        for _ in 0..200 {
+            harness.monitor.update();
+            harness.monitor.report().expect("report");
+        }
+        churn.join().expect("churn thread");
+
+        let state = harness.accounting.lock();
+        assert_eq!(state.workers, 0);
+        assert_eq!(state.accounted, 0);
+        drop(state);
+
+        let _ = residuals(&harness.receiver);
+        harness.monitor.update();
+        harness.monitor.report().expect("report");
+        assert!(harness.monitor.series.is_none());
+        assert!(
+            residuals(&harness.receiver).is_empty(),
+            "no residual survives the last worker"
+        );
+    }
+
+    /// Scenario: two monitors share one accounting instance while a worker is registered.
+    /// Guarantees: exactly one of them reports the residual, and the other takes
+    /// it over once the owner is dropped.
+    #[test]
+    fn series_residual_has_one_reporter_and_is_taken_over_on_drop() {
+        let accounting = SeriesAccounting::isolated();
+        let mut first = harness_on(Arc::clone(&accounting));
+        let mut second = harness_on(Arc::clone(&accounting));
+        let worker = SeriesMemoryAccounting::register_with(Arc::clone(&accounting));
+
+        first.monitor.update();
+        second.monitor.update();
+        assert!(first.monitor.series.is_some(), "the first monitor owns it");
+        assert!(
+            second.monitor.series.is_none(),
+            "a second monitor does not report the same process residual"
+        );
+
+        first.monitor.report().expect("report");
+        second.monitor.report().expect("report");
+        assert_eq!(residuals(&first.receiver).len(), 1);
+        assert!(residuals(&second.receiver).is_empty());
+
+        // The owner goes away; the survivor picks the residual up.
+        drop(first);
+        assert!(!accounting.lock().reporter_owned);
+        second.monitor.update();
+        assert!(second.monitor.series.is_some(), "ownership was taken over");
+        second.monitor.report().expect("report");
+        assert_eq!(residuals(&second.receiver).len(), 1);
+
+        drop(worker);
+        second.monitor.update();
+        assert!(second.monitor.series.is_none());
+        assert!(!accounting.lock().reporter_owned);
     }
 }
