@@ -148,6 +148,21 @@ async fn write_until(
             return;
         }
         attempts += 1;
+        // The names this attempt will write, announced before it writes them,
+        // so an operator can see that a retry rewrites objects rather than
+        // adding any. Every object of a block shares one file name and differs
+        // only in its dataset directory, so the name and the count are the
+        // whole set; both are bounded by the schema, not by the data.
+        let planned = sink.planned_paths(&data);
+        otel_info!(
+            "series_parquet.flush_attempt",
+            attempt = attempts,
+            file = planned
+                .first()
+                .and_then(object_store::path::Path::filename)
+                .unwrap_or(""),
+            objects = planned.len()
+        );
         // A child token so the attempt can be cancelled on the deadline
         // without cancelling the job itself, whose token also serves the
         // owner's drop.

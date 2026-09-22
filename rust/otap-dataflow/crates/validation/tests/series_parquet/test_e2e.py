@@ -1045,10 +1045,11 @@ def canonical_column(kind, column):
     """DuckDB and ClickHouse expressions that render one column identically.
 
     Every rendering is a string and never NULL, so the per-row strings the two
-    readers build can be compared directly. Doubles are rendered as their value
-    scaled to microseconds-of-a-unit and rounded, which is the one place the
-    comparison is not bit exact: the two engines print floating point
-    differently, and no test value needs finer resolution than 1e-6.
+    readers build can be compared directly. Doubles are rendered as their
+    IEEE-754 bit pattern, most significant bit first, rather than as formatted
+    decimals: the two engines print floating point differently, and both read
+    the same Parquet bytes, so the comparison is exact down to the sign of a
+    zero.
     """
     if kind == "VARCHAR":
         return f"coalesce({column}, 'null')", f"ifNull({column}, 'null')"
@@ -1063,11 +1064,11 @@ def canonical_column(kind, column):
             f"WHEN {column} THEN 'true' ELSE 'false' END"
         )
         return case, case
-    if kind == "DOUBLE" or kind == "FLOAT":
+    if kind == "DOUBLE":
         return (
-            f"coalesce(CAST(CAST(round({column} * 1000000) AS BIGINT) AS VARCHAR), "
-            "'null')",
-            f"ifNull(toString(toInt64(round({column} * 1000000))), 'null')",
+            f"coalesce(CAST(CAST({column} AS BIT) AS VARCHAR), 'null')",
+            f"if({column} IS NULL, 'null', "
+            f"bin(reverse(reinterpretAsFixedString(assumeNotNull({column})))))",
         )
     if kind == "BLOB":
         return f"coalesce(hex({column}), 'null')", f"ifNull(hex({column}), 'null')"
@@ -1092,13 +1093,13 @@ def canonical_column(kind, column):
             f"ifNull(arrayStringConcat(arrayMap(x -> ifNull(toString(x), 'null'), "
             f"{column}), ','), 'null')",
         )
-    if kind in ("DOUBLE[]", "FLOAT[]"):
+    if kind == "DOUBLE[]":
         return (
             f"coalesce(array_to_string(list_transform({column}, "
-            "x -> coalesce(CAST(CAST(round(x * 1000000) AS BIGINT) AS VARCHAR), "
-            "'null')), ','), 'null')",
-            f"ifNull(arrayStringConcat(arrayMap(x -> ifNull(toString(toInt64("
-            f"round(x * 1000000))), 'null'), {column}), ','), 'null')",
+            "x -> coalesce(CAST(CAST(x AS BIT) AS VARCHAR), 'null')), ','), 'null')",
+            "ifNull(arrayStringConcat(arrayMap(x -> if(isNull(x), 'null', "
+            f"bin(reverse(reinterpretAsFixedString(assumeNotNull(x))))), {column}), "
+            "','), 'null')",
         )
     raise AssertionError(f"no canonical rendering for {kind} column {column}")
 
@@ -1420,7 +1421,7 @@ PART_NAME = re.compile(
     r"/dataset=(?P<dataset>series|values|number|histogram)"
     r"/date=(?P<date>\d{4}-\d{2}-\d{2})/hour=(?P<hour>\d{2})"
     r"/part-(?P<stamp>\d{8}T\d{6}Z)-(?P<writer>.+)"
-    r"-(?P<boot>[0-9a-f]{32})-(?P<seq>\d{8})\.parquet$"
+    r"-(?P<boot>[0-9a-f]{32})-(?P<seq>\d{8,})\.parquet$"
 )
 
 
@@ -1569,6 +1570,26 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
                     test.assertEqual(
                         before, after, "canonical join must preserve values cardinality"
                     )
+
+
+def flush_attempts(engine):
+    """The object names the exporter announced for each write attempt.
+
+    The exporter emits `series_parquet.flush_attempt` before every attempt.
+    Every object of one block carries the same file name and differs only in
+    its dataset directory, so the announced name and count are the whole set
+    of names that attempt was about to write. Reading them back is what lets a
+    test compare the names a failed attempt was going to use with the names
+    the retry actually wrote.
+    """
+    return [
+        (int(attempt), file, int(count))
+        for attempt, file, count in re.findall(
+            r"series_parquet\.flush_attempt.*?"
+            r"\[attempt=(\d+), file=(\S+), objects=(\d+)\]",
+            engine.engine_log(),
+        )
+    ]
 
 
 def wait_for_metric(engine, name, target, timeout):
@@ -1861,21 +1882,21 @@ class DockerSlice(unittest.TestCase):
                     call = engine.logs.Export.future(
                         log_request("frozen-0"), timeout=180
                     )
-                    flushing = 0
+                    # The first attempt starts against a stopped store and
+                    # announces the names it is about to write; those names are
+                    # what the retry has to reuse.
+                    attempts = []
                     deadline = time.monotonic() + 60
                     while time.monotonic() < deadline:
-                        flushing = max(
-                            flushing,
-                            engine.exporter_gauges("block_flushing_bytes")[
-                                "block_flushing_bytes"
-                            ],
-                        )
-                        if flushing > 0:
+                        attempts = flush_attempts(engine)
+                        if attempts:
                             break
                         time.sleep(0.05)
-                    self.assertGreater(
-                        flushing, 0, "the block was never handed to a flush"
-                    )
+                    self.assertTrue(attempts, "no write attempt was announced")
+                    first = attempts[0]
+                    self.assertEqual(first[0], 1)
+                    announced, objects = first[1], first[2]
+                    self.assertEqual(objects, 2, first)
                     self.assertFalse(
                         call.done(), "the request was decided while the store was down"
                     )
@@ -1885,10 +1906,36 @@ class DockerSlice(unittest.TestCase):
                     self.assertGreaterEqual(
                         retries, 1, "the flush reached the store on its first attempt"
                     )
+                    # Every later attempt of that flush named the same objects.
+                    later = [
+                        (name, count)
+                        for attempt, name, count in flush_attempts(engine)
+                        if attempt > 1
+                    ]
+                    self.assertTrue(later, "the retry announced no attempt")
+                    for name, count in later:
+                        self.assertEqual(
+                            (name, count),
+                            (announced, objects),
+                            "a retry changed the object names",
+                        )
                     engine.shutdown()
                 except Exception:
                     print(engine.engine_log())
                     raise
+            # The bucket holds exactly the objects the first attempt named:
+            # the retry rewrote them and added nothing.
+            keys = []
+            for page in store.client.get_paginator("list_objects_v2").paginate(
+                Bucket=store.bucket, Prefix="otel/"
+            ):
+                keys += [item["Key"] for item in page.get("Contents", [])]
+            self.assertEqual(len(keys), objects, f"the bucket holds {keys}")
+            self.assertEqual(
+                [key.rsplit("/", 1)[1] for key in keys],
+                [announced] * objects,
+                f"the retry wrote names the first attempt never announced: {keys}",
+            )
             target, bodies = stored_bodies(store, directory, "downloaded")
             self.assertEqual(bodies, ["frozen-0"])
             files = sorted(Path(target).rglob("*.parquet"))
@@ -1922,14 +1969,6 @@ class DockerSlice(unittest.TestCase):
                     path.name,
                 )
             self.assertEqual(len(blocks), 1, f"two blocks were written: {blocks}")
-            # Nothing else reached the bucket either, so no attempt left a
-            # stray object behind under a name of its own.
-            keys = []
-            for page in store.client.get_paginator("list_objects_v2").paginate(
-                Bucket=store.bucket, Prefix="otel/"
-            ):
-                keys += [item["Key"] for item in page.get("Contents", [])]
-            self.assertEqual(len(keys), 2, f"the bucket holds extra objects: {keys}")
 
 
 class RestartSlice(unittest.TestCase):

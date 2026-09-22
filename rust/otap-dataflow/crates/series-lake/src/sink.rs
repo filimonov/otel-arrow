@@ -321,6 +321,30 @@ impl Sink {
         Ok(rows)
     }
 
+    /// Object paths this sink will write for `block`, in write order.
+    ///
+    /// The names follow from the block's own identity -- its partition, its
+    /// window, its sequence and this sink's writer and boot ids -- and never
+    /// from the attempt that writes them. That is what makes a retry rewrite
+    /// the same objects instead of adding a second copy, and it lets a caller
+    /// name the objects an attempt is about to touch before it touches them.
+    #[must_use]
+    pub fn planned_paths<T>(&self, block: &Block<T>) -> Vec<Path> {
+        block
+            .tables()
+            .filter(|table| !table.is_empty())
+            .map(|table| {
+                object_path(
+                    table.dataset(),
+                    block.partition,
+                    block.window_start_secs,
+                    &self.naming,
+                    block.seq,
+                )
+            })
+            .collect()
+    }
+
     /// Write every non-empty table of a sealed block, series datasets first.
     ///
     /// # Errors
@@ -344,17 +368,11 @@ impl Sink {
             return Err(Error::Cancelled { abort_error: None });
         }
         let mut report = FlushReport::default();
-        for table in block.tables() {
-            if table.is_empty() {
-                continue;
-            }
-            let path = object_path(
-                table.dataset(),
-                block.partition,
-                block.window_start_secs,
-                &self.naming,
-                block.seq,
-            );
+        for (table, path) in block
+            .tables()
+            .filter(|table| !table.is_empty())
+            .zip(self.planned_paths(block))
+        {
             let rows = self
                 .write_table(table, &path, block.seq, block.window_start_secs, cancel)
                 .await?;
@@ -859,6 +877,16 @@ mod tests {
         assert_eq!(report.files.len(), 2);
         assert_eq!(report.files[0].0, Dataset::LogsSeries);
         assert_eq!(report.files[1].0, Dataset::LogsValues);
+        // What the sink announces before writing is what it writes, so an
+        // observer can record the names an attempt will touch.
+        assert_eq!(
+            sink.planned_paths(&b),
+            report
+                .files
+                .iter()
+                .map(|(_, path, _)| path.clone())
+                .collect::<Vec<_>>()
+        );
 
         let (_, values_path, values_rows) = &report.files[1];
         let kv = file_kv(dir.path(), values_path);
