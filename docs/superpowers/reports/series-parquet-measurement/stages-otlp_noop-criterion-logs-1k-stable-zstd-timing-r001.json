@@ -5,15 +5,15 @@
       "kind": "bench_report",
       "name": "bench-report.json",
       "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-timing-r001",
-      "sha256": "0b5ffa667d141a065ad15131a9bd9e573de2f3e945443c547faa72da7eb6620c",
-      "size_bytes": 77596
+      "sha256": "f8fe5b782167e4d7b6b31ef4f7e34cbe9b8c1ef4a1452614b37c915c9c48ef55",
+      "size_bytes": 77342
     },
     {
       "kind": "bench_config",
       "name": "bench-config.json",
       "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-timing-r001",
-      "sha256": "8690ef5110a9acbf3824a755e331b4382406d5652a17a3a42eec253f42e4386b",
-      "size_bytes": 1835
+      "sha256": "1f35f1ed1b00cdb2f350625a38f00e3201fb4ed7f5ad602301dd5f6f0208a99a",
+      "size_bytes": 1866
     },
     {
       "kind": "bench_log",
@@ -33,19 +33,19 @@
       "status": "passed"
     },
     {
-      "detail": "2477016 samples (every 2048 kept), 1.000s measured; complete",
+      "detail": "2467975 samples (every 2048 kept), 1.000s measured; complete",
       "kind": "hard",
       "name": "minimum_samples",
       "status": "passed"
     },
     {
-      "detail": "0 build processes seen in 144 scans; builder container starts 0",
+      "detail": "0 build processes seen in 146 scans; builder container starts 0",
       "kind": "hard",
       "name": "no_concurrent_build",
       "status": "passed"
     },
     {
-      "detail": "144 ticks, largest gap 0.063144589s",
+      "detail": "146 ticks, largest gap 0.063332778s",
       "kind": "hard",
       "name": "build_monitor_coverage",
       "status": "passed"
@@ -113,6 +113,7 @@
       "lake": {
         "cache_entries": 200000,
         "committed_fraction": 0.5,
+        "extra_committed_series": 0,
         "lake": {
           "ingress": {
             "max_block_bytes": 524288000,
@@ -210,13 +211,13 @@
       "topology": "stage"
     }
   },
-  "elapsed_s": 7.208398879,
+  "elapsed_s": 7.322777271,
   "environment": {
     "build": {
       "allocator": "system",
       "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/deps/measurement-8bac121a1ae33e80",
-      "binary_sha256": "da0e7a155a47f264da35187e4abc4bc9730d496e16f34e14eee0744a1d7bd2f2",
-      "binary_size_bytes": 23560968,
+      "binary_sha256": "19fe0a0060fbaf59416fb9c521aee62c5711807dcb763ede761f1726f11f78f6",
+      "binary_size_bytes": 23606360,
       "features": "default",
       "profile": "bench",
       "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
@@ -229,8 +230,8 @@
         "gaps_over_limit_count": 0,
         "interval_s": 0.05,
         "limit_s": 0.1,
-        "max_gap_s": 0.063144589,
-        "ticks": 144
+        "max_gap_s": 0.063332778,
+        "ticks": 146
       },
       "detected": false,
       "docker": {
@@ -264,7 +265,7 @@
       },
       "observation_count": 0,
       "observations": [],
-      "scans": 144,
+      "scans": 146,
       "visibility": {
         "complete": true,
         "hidepid": null,
@@ -335,13 +336,13 @@
       "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
-        1.19,
-        1.29,
-        1.37
+        7.75,
+        11.16,
+        9.54
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 174891377658658,
-      "observed_utc": "2026-09-22T19:49:25Z",
+      "monotonic_ns": 178683925558530,
+      "observed_utc": "2026-09-22T20:52:37Z",
       "physical_core_count": 16,
       "pinned_roles": [
         "bench"
@@ -421,385 +422,385 @@
           ],
           "last_cpu": 1,
           "name": "measurement-8ba",
-          "nspid": "3782155",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3782155,
+          "nspid": "3845813",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3845813,
           "role": "bench",
-          "tid": 3782155
+          "tid": 3845813
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 0,
+          "last_cpu": 17,
           "name": "python3",
-          "nspid": "3781051",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844530",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781051
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "python3",
-          "nspid": "3781056",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781056
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3781057",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781057
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781058",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781058
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781059",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781059
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 27,
-          "name": "python3",
-          "nspid": "3781060",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781060
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 25,
-          "name": "python3",
-          "nspid": "3781061",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781061
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3781062",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781062
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 24,
-          "name": "python3",
-          "nspid": "3781063",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781063
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 31,
-          "name": "python3",
-          "nspid": "3781064",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781064
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 30,
-          "name": "python3",
-          "nspid": "3781065",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781065
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 10,
-          "name": "python3",
-          "nspid": "3781066",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781066
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "python3",
-          "nspid": "3781067",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781067
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 9,
-          "name": "python3",
-          "nspid": "3781068",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781068
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 7,
-          "name": "python3",
-          "nspid": "3781069",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781069
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 30,
-          "name": "python3",
-          "nspid": "3781070",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781070
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3781071",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781071
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 31,
-          "name": "python3",
-          "nspid": "3781072",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781072
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 26,
-          "name": "python3",
-          "nspid": "3781073",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781073
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3781074",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781074
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3781075",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781075
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781076",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781076
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "3781077",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781077
+          "tid": 3844530
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 29,
           "name": "python3",
-          "nspid": "3781078",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844567",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781078
+          "tid": 3844567
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 26,
+          "last_cpu": 9,
           "name": "python3",
-          "nspid": "3781079",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844568",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781079
+          "tid": 3844568
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 12,
+          "last_cpu": 14,
           "name": "python3",
-          "nspid": "3781080",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844569",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781080
+          "tid": 3844569
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 12,
+          "last_cpu": 10,
           "name": "python3",
-          "nspid": "3781081",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844570",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781081
+          "tid": 3844570
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844571",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844571
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3844572",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844572
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3844573",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844573
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3844574",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844574
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3844575",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844575
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3844576",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844576
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844577",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844577
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 25,
           "name": "python3",
-          "nspid": "3781082",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844578",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781082
+          "tid": 3844578
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 9,
           "name": "python3",
-          "nspid": "3781083",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844579",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781083
+          "tid": 3844579
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 2,
+          "last_cpu": 28,
           "name": "python3",
-          "nspid": "3781084",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844580",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781084
+          "tid": 3844580
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844581",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844581
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 31,
+          "name": "python3",
+          "nspid": "3844582",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844582
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 12,
           "name": "python3",
-          "nspid": "3781085",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844583",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781085
+          "tid": 3844583
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3844584",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844584
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844585",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844585
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3844586",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844586
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3844587",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844587
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3844588",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844588
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844589",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844589
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3844590",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844590
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844591",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844591
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844592",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844592
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 25,
           "name": "python3",
-          "nspid": "3781086",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3844593",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781086
+          "tid": 3844593
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3844594",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844594
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3844595",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844595
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3844596",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844596
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3844597",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844597
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "3782154",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3845812",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3782154
+          "tid": 3845812
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 3,
+          "last_cpu": 2,
           "name": "python3",
-          "nspid": "3782156",
-          "observed_utc": "2026-09-22T19:49:25Z",
-          "pid": 3781051,
+          "nspid": "3845814",
+          "observed_utc": "2026-09-22T20:52:37Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3782156
+          "tid": 3845814
         }
       ],
       "worker_threads": [
@@ -808,23 +809,23 @@
           "expected_cores": [
             1
           ],
-          "key": "bench/tid3782155",
+          "key": "bench/tid3845813",
           "last_cpu": 1,
           "name": "measurement-8ba",
-          "tid": 3782155
+          "tid": 3845813
         }
       ]
     },
     "git": {
       "dirty": true,
-      "revision": "df08c9e0401167d008a52b36b68f6a8ec2d09263"
+      "revision": "d6454dbb80a5df9b8d4dc05869f60cdd2d18b6ba"
     },
     "lease": {
-      "acquired_utc": "2026-09-22T19:49:17Z",
-      "owner": "3781051-03af467f5bac41b3998599c20d7cf1ca",
+      "acquired_utc": "2026-09-22T20:52:30Z",
+      "owner": "3844530-7f573c493ac4458f9b7d14cf65d8973b",
       "path": "/tmp/series-parquet-host-measurement.lock",
-      "pid": 3781051,
-      "released_utc": "2026-09-22T19:49:25Z",
+      "pid": 3844530,
+      "released_utc": "2026-09-22T20:52:37Z",
       "run_id": "stages-otlp_noop-criterion-logs-1k-stable-zstd-timing-r001"
     },
     "machine_identity_sha256": "5f95bfd263ecc79d6a58b132a0e4c62b8ad24560a98752b900cf7d285d8e2e5a",
@@ -872,13 +873,13 @@
       "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
-        1.23,
-        1.3,
-        1.37
+        8.34,
+        11.33,
+        9.58
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 174884291641058,
-      "observed_utc": "2026-09-22T19:49:18Z",
+      "monotonic_ns": 178676746020156,
+      "observed_utc": "2026-09-22T20:52:30Z",
       "physical_core_count": 16,
       "pinned_roles": [
         "bench"
@@ -958,385 +959,385 @@
           ],
           "last_cpu": 1,
           "name": "measurement-8ba",
-          "nspid": "3782155",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3782155,
+          "nspid": "3845813",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3845813,
           "role": "bench",
-          "tid": 3782155
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3781051",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781051
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "python3",
-          "nspid": "3781056",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781056
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 12,
-          "name": "python3",
-          "nspid": "3781057",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781057
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781058",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781058
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781059",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781059
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 27,
-          "name": "python3",
-          "nspid": "3781060",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781060
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 25,
-          "name": "python3",
-          "nspid": "3781061",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781061
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "3781062",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781062
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 24,
-          "name": "python3",
-          "nspid": "3781063",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781063
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 31,
-          "name": "python3",
-          "nspid": "3781064",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781064
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 30,
-          "name": "python3",
-          "nspid": "3781065",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781065
+          "tid": 3845813
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 10,
           "name": "python3",
-          "nspid": "3781066",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844530",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781066
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 28,
-          "name": "python3",
-          "nspid": "3781067",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781067
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 9,
-          "name": "python3",
-          "nspid": "3781068",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781068
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 7,
-          "name": "python3",
-          "nspid": "3781069",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781069
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 30,
-          "name": "python3",
-          "nspid": "3781070",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781070
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 14,
-          "name": "python3",
-          "nspid": "3781071",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781071
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 31,
-          "name": "python3",
-          "nspid": "3781072",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781072
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 26,
-          "name": "python3",
-          "nspid": "3781073",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781073
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3781074",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781074
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 8,
-          "name": "python3",
-          "nspid": "3781075",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781075
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 13,
-          "name": "python3",
-          "nspid": "3781076",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781076
-        },
-        {
-          "cpus_allowed_list": "0-31",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "3781077",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
-          "role": "harness",
-          "tid": 3781077
+          "tid": 3844530
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 29,
           "name": "python3",
-          "nspid": "3781078",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844567",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781078
+          "tid": 3844567
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 26,
+          "last_cpu": 9,
           "name": "python3",
-          "nspid": "3781079",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844568",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781079
+          "tid": 3844568
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 12,
+          "last_cpu": 14,
           "name": "python3",
-          "nspid": "3781080",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844569",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781080
+          "tid": 3844569
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 12,
+          "last_cpu": 10,
           "name": "python3",
-          "nspid": "3781081",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844570",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781081
+          "tid": 3844570
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844571",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844571
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3844572",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844572
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3844573",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844573
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 29,
+          "name": "python3",
+          "nspid": "3844574",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844574
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3844575",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844575
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 30,
+          "name": "python3",
+          "nspid": "3844576",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844576
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844577",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844577
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 25,
           "name": "python3",
-          "nspid": "3781082",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844578",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781082
+          "tid": 3844578
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 9,
           "name": "python3",
-          "nspid": "3781083",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844579",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781083
+          "tid": 3844579
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 2,
+          "last_cpu": 28,
           "name": "python3",
-          "nspid": "3781084",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844580",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781084
+          "tid": 3844580
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844581",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844581
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 31,
+          "name": "python3",
+          "nspid": "3844582",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844582
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 12,
           "name": "python3",
-          "nspid": "3781085",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844583",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781085
+          "tid": 3844583
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3844584",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844584
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844585",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844585
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3844586",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844586
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 24,
+          "name": "python3",
+          "nspid": "3844587",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844587
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 10,
+          "name": "python3",
+          "nspid": "3844588",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844588
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 15,
+          "name": "python3",
+          "nspid": "3844589",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844589
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 13,
+          "name": "python3",
+          "nspid": "3844590",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844590
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844591",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844591
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 12,
+          "name": "python3",
+          "nspid": "3844592",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844592
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 25,
           "name": "python3",
-          "nspid": "3781086",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3844593",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3781086
+          "tid": 3844593
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 27,
+          "name": "python3",
+          "nspid": "3844594",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844594
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 9,
+          "name": "python3",
+          "nspid": "3844595",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844595
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 14,
+          "name": "python3",
+          "nspid": "3844596",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844596
+        },
+        {
+          "cpus_allowed_list": "0-31",
+          "expected_cores": [],
+          "last_cpu": 8,
+          "name": "python3",
+          "nspid": "3844597",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
+          "role": "harness",
+          "tid": 3844597
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "3782154",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3845812",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3782154
+          "tid": 3845812
         },
         {
           "cpus_allowed_list": "0-31",
           "expected_cores": [],
-          "last_cpu": 3,
+          "last_cpu": 2,
           "name": "python3",
-          "nspid": "3782156",
-          "observed_utc": "2026-09-22T19:49:18Z",
-          "pid": 3781051,
+          "nspid": "3845814",
+          "observed_utc": "2026-09-22T20:52:30Z",
+          "pid": 3844530,
           "role": "harness",
-          "tid": 3782156
+          "tid": 3845814
         }
       ],
       "worker_threads": [
@@ -1345,41 +1346,41 @@
           "expected_cores": [
             1
           ],
-          "key": "bench/tid3782155",
+          "key": "bench/tid3845813",
           "last_cpu": 1,
           "name": "measurement-8ba",
-          "tid": 3782155
+          "tid": 3845813
         }
       ]
     }
   },
   "ephemeral_values": {
-    "<store_endpoint>": "http://127.0.0.1:37671"
+    "<store_endpoint>": "http://127.0.0.1:48621"
   },
   "events": [
     {
-      "detail": "3781051-03af467f5bac41b3998599c20d7cf1ca",
+      "detail": "3844530-7f573c493ac4458f9b7d14cf65d8973b",
       "kind": "host_controls_opened",
-      "monotonic_ns": 174884234450679,
-      "observed_utc": "2026-09-22T19:49:17Z"
+      "monotonic_ns": 178676689494198,
+      "observed_utc": "2026-09-22T20:52:30Z"
     },
     {
       "detail": "{\"bench\": [1], \"bench_reserved\": [2, 3, 4], \"engine_observability\": [0], \"producer\": [5, 6], \"reader\": [8], \"store\": [7]}",
       "kind": "core_allocation",
-      "monotonic_ns": 174884235145162,
-      "observed_utc": "2026-09-22T19:49:17Z"
+      "monotonic_ns": 178676690091862,
+      "observed_utc": "2026-09-22T20:52:30Z"
     },
     {
-      "detail": "3782155",
+      "detail": "3845813",
       "kind": "bench_started",
-      "monotonic_ns": 174884298071673,
-      "observed_utc": "2026-09-22T19:49:18Z"
+      "monotonic_ns": 178676753281454,
+      "observed_utc": "2026-09-22T20:52:30Z"
     },
     {
       "detail": "",
       "kind": "host_controls_closed",
-      "monotonic_ns": 174891411910548,
-      "observed_utc": "2026-09-22T19:49:25Z"
+      "monotonic_ns": 178683981006045,
+      "observed_utc": "2026-09-22T20:52:37Z"
     }
   ],
   "mandatory_metrics": [
@@ -1399,7 +1400,7 @@
   "metrics": {
     "cpu_ns_per_record": 0.02,
     "output_bytes_per_input_record": 0.0,
-    "peak_rss_bytes": 77811712,
+    "peak_rss_bytes": 78249984,
     "records_per_s_per_core": 50000000000.0,
     "wall_ns_per_record": 0.02
   },
@@ -1438,31 +1439,31 @@
       "records": 20000,
       "requests": 200,
       "resident": {
-        "growth_bytes": 16384,
-        "peak_bytes": 77811712,
-        "start_bytes": 77795328
+        "growth_bytes": 28672,
+        "peak_bytes": 78249984,
+        "start_bytes": 78221312
       },
       "resident_steady": {
         "growth_bytes": 0,
-        "peak_bytes": 77811712,
-        "start_bytes": 77811712
+        "peak_bytes": 78249984,
+        "start_bytes": 78249984
       },
-      "sample_count": 2477016,
+      "sample_count": 2467975,
       "schema": "series-stage-bench/1",
       "stage": "otlp_noop",
       "warmup": {
-        "cpu_ns": 2170,
-        "wall_ns": 3190
+        "cpu_ns": 2860,
+        "wall_ns": 4140
       }
     },
-    "loop_peak_rss_bytes": 77811712,
+    "loop_peak_rss_bytes": 78249984,
     "timing": {
       "complete": true,
       "incomplete_reason": null,
-      "measured_wall_ns_total": 1000000127,
+      "measured_wall_ns_total": 1000000230,
       "parts": {},
-      "prepare_ns_total": 3389095807,
-      "sample_count": 2477016,
+      "prepare_ns_total": 3440411517,
+      "sample_count": 2467975,
       "sample_stride": 2048
     }
   },
@@ -1474,57 +1475,57 @@
   "run_id": "stages-otlp_noop-criterion-logs-1k-stable-zstd-timing-r001",
   "samples": [
     {
-      "cpu_ns": 520,
+      "cpu_ns": 540,
       "index": 0,
-      "wall_ns": 530
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 2,
-      "wall_ns": 400
+      "wall_ns": 550
     },
     {
       "cpu_ns": 390,
-      "index": 3,
+      "index": 1,
       "wall_ns": 390
     },
     {
       "cpu_ns": 390,
+      "index": 2,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 3,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
       "index": 4,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 5,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 390,
-      "index": 6,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 7,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 8,
       "wall_ns": 410
     },
     {
       "cpu_ns": 400,
+      "index": 6,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 7,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
+      "index": 8,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 410,
       "index": 9,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 10,
       "wall_ns": 400
     },
@@ -1544,9 +1545,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 14,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1554,14 +1555,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 16,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 17,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -1571,7 +1572,7 @@
     {
       "cpu_ns": 400,
       "index": 19,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -1589,24 +1590,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 23,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 24,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 25,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 26,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -1614,9 +1615,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 28,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1624,54 +1625,54 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 30,
-      "wall_ns": 400
-    },
-    {
       "cpu_ns": 390,
-      "index": 31,
+      "index": 30,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 32,
+      "index": 31,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
-      "index": 33,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 430,
-      "index": 34,
-      "wall_ns": 430
+      "cpu_ns": 390,
+      "index": 32,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 33,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 34,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 35,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 36,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 37,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
+      "index": 38,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 38,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 39,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
@@ -1689,9 +1690,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 43,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -1699,59 +1700,59 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 520,
       "index": 45,
-      "wall_ns": 400
+      "wall_ns": 520
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 550,
       "index": 46,
-      "wall_ns": 400
+      "wall_ns": 550
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 560,
       "index": 47,
-      "wall_ns": 390
+      "wall_ns": 570
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 560,
       "index": 48,
-      "wall_ns": 399
+      "wall_ns": 560
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 590,
       "index": 49,
-      "wall_ns": 400
+      "wall_ns": 590
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 580,
       "index": 50,
-      "wall_ns": 410
+      "wall_ns": 580
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 530,
       "index": 51,
-      "wall_ns": 400
+      "wall_ns": 540
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 520,
       "index": 52,
-      "wall_ns": 410
+      "wall_ns": 530
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 550,
       "index": 53,
-      "wall_ns": 410
+      "wall_ns": 550
     },
     {
       "cpu_ns": 400,
       "index": 54,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 55,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1759,9 +1760,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 57,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1774,34 +1775,34 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 60,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 61,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 62,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 63,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 64,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 390,
-      "index": 65,
+      "index": 64,
       "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 65,
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1814,9 +1815,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 68,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -1824,17 +1825,17 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 70,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 71,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 72,
       "wall_ns": 390
     },
@@ -1844,32 +1845,32 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 74,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 75,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 76,
-      "wall_ns": 400
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 77,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 78,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 77,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 78,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
       "index": 79,
       "wall_ns": 400
     },
@@ -1879,17 +1880,17 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 81,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 82,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 83,
       "wall_ns": 400
     },
@@ -1899,34 +1900,34 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 85,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 86,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 87,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 88,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 89,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 90,
-      "wall_ns": 389
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -1936,147 +1937,147 @@
     {
       "cpu_ns": 400,
       "index": 92,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 420,
-      "index": 93,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 94,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
+      "index": 93,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 94,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 95,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 96,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 97,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 98,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 97,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 98,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
       "index": 99,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 100,
-      "wall_ns": 409
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 101,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 2350,
+      "cpu_ns": 400,
       "index": 102,
-      "wall_ns": 2340
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 103,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 104,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 105,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 106,
-      "wall_ns": 399
-    },
-    {
-      "cpu_ns": 400,
-      "index": 107,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 108,
-      "wall_ns": 399
+      "index": 107,
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
+      "index": 108,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
       "index": 109,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 480,
+      "cpu_ns": 410,
       "index": 110,
-      "wall_ns": 470
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 111,
-      "wall_ns": 410
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 112,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 112,
+      "index": 113,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
+      "index": 114,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 113,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 114,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
       "index": 115,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 116,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 117,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 118,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 119,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 120,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2089,19 +2090,19 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 123,
-      "wall_ns": 410
-    },
-    {
       "cpu_ns": 400,
-      "index": 124,
+      "index": 123,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
+      "index": 124,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
       "index": 125,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2114,24 +2115,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 430,
+      "cpu_ns": 400,
       "index": 128,
-      "wall_ns": 430
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 129,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 130,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 131,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2141,27 +2142,27 @@
     {
       "cpu_ns": 410,
       "index": 133,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 134,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 135,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 136,
-      "wall_ns": 420
+      "wall_ns": 399
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 137,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -2169,22 +2170,22 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 139,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 140,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 141,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 141,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 142,
       "wall_ns": 400
     },
@@ -2196,42 +2197,42 @@
     {
       "cpu_ns": 400,
       "index": 144,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 145,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 146,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 147,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 430,
       "index": 148,
-      "wall_ns": 390
+      "wall_ns": 420
     },
     {
       "cpu_ns": 400,
       "index": 149,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 150,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 151,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -2239,32 +2240,32 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 153,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 154,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 155,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 156,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 157,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
+      "index": 156,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 157,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
       "index": 158,
       "wall_ns": 400
     },
@@ -2274,54 +2275,54 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 160,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 161,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 162,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 163,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 164,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 165,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 166,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 167,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 168,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 169,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
@@ -2329,19 +2330,19 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 171,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 172,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 173,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2351,30 +2352,30 @@
     {
       "cpu_ns": 400,
       "index": 175,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 176,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 177,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 178,
-      "wall_ns": 410
+      "cpu_ns": 390,
+      "index": 176,
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
+      "index": 177,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 178,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 179,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 180,
       "wall_ns": 400
     },
@@ -2384,9 +2385,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 182,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2394,9 +2395,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 184,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2419,87 +2420,87 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 189,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 190,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 191,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 192,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 193,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 194,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 195,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 196,
+      "wall_ns": 399
+    },
+    {
+      "cpu_ns": 400,
+      "index": 197,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 195,
-      "wall_ns": 409
+      "cpu_ns": 390,
+      "index": 198,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 196,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 197,
+      "index": 199,
       "wall_ns": 410
     },
     {
       "cpu_ns": 400,
-      "index": 198,
+      "index": 200,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
-      "index": 199,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 200,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 201,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 430,
       "index": 202,
-      "wall_ns": 400
+      "wall_ns": 440
     },
     {
       "cpu_ns": 400,
       "index": 203,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 204,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 205,
       "wall_ns": 400
     },
@@ -2509,29 +2510,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 207,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 208,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 209,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 210,
-      "wall_ns": 399
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 211,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2539,14 +2540,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 213,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 214,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2554,67 +2555,67 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 216,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 217,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 218,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 219,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 220,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 221,
       "wall_ns": 410
     },
     {
       "cpu_ns": 390,
-      "index": 222,
+      "index": 221,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 223,
+      "index": 222,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 224,
-      "wall_ns": 410
+      "cpu_ns": 390,
+      "index": 223,
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
+      "index": 224,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
       "index": 225,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 226,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 227,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 228,
       "wall_ns": 400
     },
@@ -2629,9 +2630,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 231,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2641,37 +2642,37 @@
     {
       "cpu_ns": 400,
       "index": 233,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 234,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 235,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 236,
       "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 237,
+      "index": 234,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 235,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 410,
+      "index": 236,
       "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
+      "index": 237,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 238,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 239,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2679,59 +2680,59 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 241,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 242,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 243,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 244,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 245,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 246,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 247,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 248,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 249,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 250,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 248,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 249,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 410,
+      "index": 250,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
       "index": 251,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2744,29 +2745,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 254,
-      "wall_ns": 410
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 255,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 255,
+      "index": 256,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
-      "index": 256,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
       "index": 257,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 258,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2774,34 +2775,34 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 260,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 261,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 262,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 263,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 263,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 264,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 265,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2809,54 +2810,54 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 267,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 268,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 269,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 270,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 271,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 269,
+      "index": 272,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 270,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 271,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 272,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 273,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 274,
-      "wall_ns": 390
+      "wall_ns": 399
     },
     {
       "cpu_ns": 400,
       "index": 275,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 276,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -2864,9 +2865,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 278,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -2879,39 +2880,39 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 281,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 282,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 283,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 284,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 390,
-      "index": 285,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 390,
-      "index": 286,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 287,
+      "index": 284,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 285,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 286,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 287,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2919,14 +2920,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 289,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 290,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -2934,9 +2935,9 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 292,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -2946,52 +2947,52 @@
     {
       "cpu_ns": 400,
       "index": 294,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 295,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 296,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 297,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 298,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 400,
-      "index": 299,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 300,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 301,
-      "wall_ns": 400
-    },
-    {
       "cpu_ns": 400,
-      "index": 302,
+      "index": 298,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
-      "index": 303,
+      "index": 299,
       "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 300,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 301,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
+      "index": 302,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
+      "index": 303,
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -2999,74 +3000,74 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 305,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 306,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 307,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 570,
       "index": 308,
-      "wall_ns": 410
+      "wall_ns": 560
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 590,
       "index": 309,
-      "wall_ns": 410
+      "wall_ns": 590
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 580,
       "index": 310,
-      "wall_ns": 400
+      "wall_ns": 580
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 590,
       "index": 311,
-      "wall_ns": 400
+      "wall_ns": 600
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 530,
       "index": 312,
-      "wall_ns": 400
+      "wall_ns": 520
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 590,
       "index": 313,
-      "wall_ns": 400
+      "wall_ns": 590
+    },
+    {
+      "cpu_ns": 630,
+      "index": 314,
+      "wall_ns": 630
+    },
+    {
+      "cpu_ns": 560,
+      "index": 315,
+      "wall_ns": 560
     },
     {
       "cpu_ns": 400,
-      "index": 314,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 315,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
       "index": 316,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 317,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 318,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3079,12 +3080,12 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 321,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 322,
       "wall_ns": 400
     },
@@ -3094,44 +3095,44 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 324,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 325,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 326,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 327,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 328,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 329,
       "wall_ns": 410
     },
     {
       "cpu_ns": 400,
-      "index": 330,
-      "wall_ns": 400
+      "index": 327,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 328,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 329,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 330,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 331,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3139,9 +3140,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 333,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3149,7 +3150,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 335,
       "wall_ns": 400
     },
@@ -3161,12 +3162,12 @@
     {
       "cpu_ns": 400,
       "index": 337,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 338,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -3176,32 +3177,32 @@
     {
       "cpu_ns": 400,
       "index": 340,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 341,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 341,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 342,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 343,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 344,
-      "wall_ns": 400
+      "wall_ns": 399
     },
     {
       "cpu_ns": 400,
       "index": 345,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3209,24 +3210,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 430,
+      "cpu_ns": 390,
       "index": 347,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 348,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 349,
+      "index": 348,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
+      "index": 349,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 350,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3234,9 +3235,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 352,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3244,29 +3245,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 354,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 355,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 356,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 357,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 358,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3274,24 +3275,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
-      "index": 360,
-      "wall_ns": 390
-    },
-    {
       "cpu_ns": 410,
-      "index": 361,
+      "index": 360,
       "wall_ns": 410
     },
     {
       "cpu_ns": 400,
-      "index": 362,
+      "index": 361,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
-      "index": 363,
+      "cpu_ns": 400,
+      "index": 362,
       "wall_ns": 410
+    },
+    {
+      "cpu_ns": 400,
+      "index": 363,
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3304,7 +3305,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 366,
       "wall_ns": 400
     },
@@ -3316,7 +3317,7 @@
     {
       "cpu_ns": 410,
       "index": 368,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3329,39 +3330,39 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 371,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 372,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 373,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 374,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 375,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 376,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 375,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 376,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 377,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -3369,17 +3370,17 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 379,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 380,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 381,
       "wall_ns": 400
     },
@@ -3394,14 +3395,14 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 384,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 385,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
@@ -3409,24 +3410,24 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 387,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 388,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 389,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 390,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3434,19 +3435,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 392,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 393,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 394,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3454,19 +3455,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 396,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 397,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 397,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 398,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3476,25 +3477,25 @@
     {
       "cpu_ns": 390,
       "index": 400,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 401,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 390,
-      "index": 402,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 400,
-      "index": 403,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 401,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 402,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 403,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 404,
       "wall_ns": 390
     },
@@ -3504,14 +3505,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 406,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 407,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
@@ -3519,39 +3520,39 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 409,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 410,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 411,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 412,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 413,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 414,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 412,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 413,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 414,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 430,
       "index": 415,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3559,89 +3560,89 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 417,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 418,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 418,
+      "cpu_ns": 400,
+      "index": 419,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 420,
-      "index": 419,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 420,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 421,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 422,
-      "wall_ns": 380
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 423,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 424,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 425,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 426,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 427,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 428,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 429,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 430,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 431,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 432,
-      "wall_ns": 410
+      "cpu_ns": 390,
+      "index": 431,
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
+      "index": 432,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 433,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3649,32 +3650,32 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 435,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 436,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 437,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 438,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 439,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 440,
       "wall_ns": 400
     },
@@ -3684,19 +3685,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 442,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 443,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
-      "index": 443,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 444,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3704,14 +3705,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 540,
       "index": 446,
-      "wall_ns": 410
+      "wall_ns": 550
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 520,
       "index": 447,
-      "wall_ns": 400
+      "wall_ns": 530
     },
     {
       "cpu_ns": 400,
@@ -3719,32 +3720,32 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 530,
       "index": 449,
-      "wall_ns": 390
+      "wall_ns": 520
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 450,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 451,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 452,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 453,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 454,
       "wall_ns": 400
     },
@@ -3754,19 +3755,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 456,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 457,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 458,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3774,69 +3775,69 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 460,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 461,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 461,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 462,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 463,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 464,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 465,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 466,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 467,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 468,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 469,
+      "index": 468,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
+      "index": 469,
+      "wall_ns": 420
+    },
+    {
+      "cpu_ns": 390,
       "index": 470,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 471,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 440,
+      "cpu_ns": 400,
       "index": 472,
-      "wall_ns": 430
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -3854,29 +3855,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 476,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 420,
       "index": 477,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 410,
       "index": 478,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 479,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 480,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3884,19 +3885,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 482,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 483,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 484,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3904,12 +3905,12 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 486,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 487,
       "wall_ns": 400
     },
@@ -3921,12 +3922,12 @@
     {
       "cpu_ns": 390,
       "index": 489,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 490,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -3936,27 +3937,27 @@
     {
       "cpu_ns": 400,
       "index": 492,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 493,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 494,
       "wall_ns": 400
     },
     {
       "cpu_ns": 420,
-      "index": 493,
+      "index": 495,
       "wall_ns": 420
     },
     {
-      "cpu_ns": 420,
-      "index": 494,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 495,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 496,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -3964,29 +3965,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 498,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 499,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 500,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 501,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 502,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -3994,19 +3995,19 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 504,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 505,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 506,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4014,59 +4015,59 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 508,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 509,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 510,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 511,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 512,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 513,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 514,
+      "wall_ns": 399
+    },
+    {
+      "cpu_ns": 400,
+      "index": 515,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 516,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 517,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 515,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 516,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 517,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 518,
-      "wall_ns": 409
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4074,14 +4075,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 520,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 521,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4094,54 +4095,54 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 524,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 525,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 526,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 430,
-      "index": 527,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 528,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 529,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 530,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 531,
+      "index": 525,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 526,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
-      "index": 532,
+      "index": 527,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 528,
       "wall_ns": 410
     },
     {
       "cpu_ns": 410,
+      "index": 529,
+      "wall_ns": 420
+    },
+    {
+      "cpu_ns": 400,
+      "index": 530,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 531,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 532,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 533,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4149,24 +4150,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 535,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 536,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 537,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 538,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4179,104 +4180,104 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 541,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 542,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 390,
-      "index": 543,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
-      "index": 544,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 390,
-      "index": 545,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 546,
+      "cpu_ns": 400,
+      "index": 543,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
+      "index": 544,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 545,
       "wall_ns": 410
+    },
+    {
+      "cpu_ns": 640,
+      "index": 546,
+      "wall_ns": 640
     },
     {
       "cpu_ns": 410,
       "index": 547,
-      "wall_ns": 400
+      "wall_ns": 420
     },
     {
       "cpu_ns": 400,
       "index": 548,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 549,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 550,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 551,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 552,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 553,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 554,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 555,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 556,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 557,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 558,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 559,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 559,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 560,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4284,79 +4285,79 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 562,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 563,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 564,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 565,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 566,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 567,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 568,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 569,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 570,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
-      "index": 571,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 572,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 573,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 574,
+      "index": 563,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 564,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 565,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 566,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 567,
       "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 575,
+      "index": 568,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 570,
+      "index": 569,
+      "wall_ns": 580
+    },
+    {
+      "cpu_ns": 540,
+      "index": 570,
+      "wall_ns": 540
+    },
+    {
+      "cpu_ns": 610,
+      "index": 571,
+      "wall_ns": 620
+    },
+    {
+      "cpu_ns": 600,
+      "index": 572,
+      "wall_ns": 610
+    },
+    {
+      "cpu_ns": 610,
+      "index": 573,
+      "wall_ns": 620
+    },
+    {
+      "cpu_ns": 580,
+      "index": 574,
+      "wall_ns": 580
+    },
+    {
+      "cpu_ns": 620,
+      "index": 575,
+      "wall_ns": 630
+    },
+    {
+      "cpu_ns": 410,
       "index": 576,
-      "wall_ns": 400
+      "wall_ns": 409
     },
     {
       "cpu_ns": 400,
@@ -4364,14 +4365,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 578,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 579,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4379,19 +4380,19 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 581,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 582,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 583,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4401,87 +4402,87 @@
     {
       "cpu_ns": 400,
       "index": 585,
-      "wall_ns": 409
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 470,
       "index": 586,
-      "wall_ns": 400
+      "wall_ns": 470
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 587,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 588,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 589,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 590,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 591,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
+      "index": 591,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
       "index": 592,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 593,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 594,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 520,
-      "index": 594,
-      "wall_ns": 550
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 595,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 596,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 597,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 598,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 599,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 600,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 601,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4491,27 +4492,27 @@
     {
       "cpu_ns": 400,
       "index": 603,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 604,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 605,
-      "wall_ns": 410
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
-      "index": 606,
+      "index": 605,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 380,
+      "index": 606,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 607,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4519,69 +4520,69 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 609,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 610,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 611,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 612,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 613,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 614,
-      "wall_ns": 410
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 615,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 615,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
       "index": 616,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 617,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 618,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 619,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 620,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 621,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4589,69 +4590,69 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 623,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 400,
-      "index": 624,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 625,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 626,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 627,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 628,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 629,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 630,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 631,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 632,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 633,
       "wall_ns": 410
     },
     {
       "cpu_ns": 390,
-      "index": 634,
+      "index": 624,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 635,
+      "cpu_ns": 400,
+      "index": 625,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 626,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 627,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
+      "index": 628,
       "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 629,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 630,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 631,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 632,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 633,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 410,
+      "index": 634,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 635,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4661,42 +4662,42 @@
     {
       "cpu_ns": 400,
       "index": 637,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 638,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 638,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 400,
+      "cpu_ns": 470,
       "index": 639,
-      "wall_ns": 400
+      "wall_ns": 470
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 640,
-      "wall_ns": 400
+      "wall_ns": 380
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 550,
       "index": 641,
-      "wall_ns": 410
+      "wall_ns": 550
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 642,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 643,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 644,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -4704,9 +4705,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 646,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4714,102 +4715,102 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 648,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 649,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 650,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 651,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 652,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 653,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 654,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 655,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 656,
       "wall_ns": 390
     },
     {
       "cpu_ns": 410,
+      "index": 654,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 655,
+      "wall_ns": 380
+    },
+    {
+      "cpu_ns": 390,
+      "index": 656,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 657,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 658,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 659,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 660,
-      "wall_ns": 400
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 661,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 661,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
       "index": 662,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 663,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 664,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 665,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 666,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 665,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 666,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 667,
       "wall_ns": 400
     },
@@ -4819,9 +4820,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 669,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4829,54 +4830,54 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 671,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 672,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 673,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 674,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 675,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 676,
+      "index": 673,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 674,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 675,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 676,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 677,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 678,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 679,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 680,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -4884,14 +4885,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 682,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 683,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -4901,27 +4902,27 @@
     {
       "cpu_ns": 400,
       "index": 685,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 686,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 687,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 688,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 689,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
@@ -4934,57 +4935,57 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 692,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 693,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 694,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 695,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 550,
-      "index": 696,
-      "wall_ns": 560
-    },
-    {
       "cpu_ns": 400,
-      "index": 697,
-      "wall_ns": 410
+      "index": 694,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
-      "index": 698,
+      "index": 695,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 699,
+      "index": 696,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 697,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
+      "index": 698,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 560,
+      "index": 699,
+      "wall_ns": 560
+    },
+    {
+      "cpu_ns": 400,
       "index": 700,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 701,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 702,
       "wall_ns": 400
     },
@@ -5004,7 +5005,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 706,
       "wall_ns": 400
     },
@@ -5014,24 +5015,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 450,
       "index": 708,
+      "wall_ns": 450
+    },
+    {
+      "cpu_ns": 390,
+      "index": 709,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 709,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 710,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 711,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -5039,99 +5040,99 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 713,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 714,
-      "wall_ns": 399
-    },
-    {
-      "cpu_ns": 390,
-      "index": 715,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 716,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 717,
-      "wall_ns": 409
-    },
-    {
-      "cpu_ns": 400,
-      "index": 718,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 719,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 720,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 420,
-      "index": 721,
-      "wall_ns": 420
-    },
-    {
       "cpu_ns": 390,
-      "index": 722,
+      "index": 714,
       "wall_ns": 390
     },
     {
+      "cpu_ns": 400,
+      "index": 715,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 716,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 717,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 718,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 719,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 720,
+      "wall_ns": 380
+    },
+    {
       "cpu_ns": 410,
-      "index": 723,
+      "index": 721,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 724,
+      "index": 722,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
+      "index": 723,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 724,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 725,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 726,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 727,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 728,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 729,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 730,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 731,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5139,29 +5140,29 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 733,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 734,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 735,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 736,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 737,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5174,34 +5175,34 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 740,
-      "wall_ns": 400
+      "wall_ns": 380
+    },
+    {
+      "cpu_ns": 390,
+      "index": 741,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 741,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
       "index": 742,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 743,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 744,
-      "wall_ns": 400
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
       "index": 745,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5214,24 +5215,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 748,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 749,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 750,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
+      "index": 750,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 751,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5239,9 +5240,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 753,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -5249,7 +5250,7 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 755,
       "wall_ns": 400
     },
@@ -5259,34 +5260,34 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 757,
-      "wall_ns": 410
+      "wall_ns": 380
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 758,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 759,
-      "wall_ns": 400
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 760,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 760,
+      "index": 761,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
-      "index": 761,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 762,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5294,34 +5295,34 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 480,
       "index": 764,
-      "wall_ns": 399
+      "wall_ns": 470
     },
     {
-      "cpu_ns": 440,
+      "cpu_ns": 390,
       "index": 765,
-      "wall_ns": 440
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 766,
-      "wall_ns": 400
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 767,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 767,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
       "index": 768,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 769,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5329,19 +5330,19 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 771,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 772,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 773,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5351,37 +5352,37 @@
     {
       "cpu_ns": 400,
       "index": 775,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 776,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
       "index": 777,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 778,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
-      "index": 779,
+      "index": 778,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
-      "index": 780,
+      "cpu_ns": 410,
+      "index": 779,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 420,
+      "index": 780,
+      "wall_ns": 420
+    },
+    {
+      "cpu_ns": 420,
       "index": 781,
-      "wall_ns": 400
+      "wall_ns": 420
     },
     {
       "cpu_ns": 410,
@@ -5389,9 +5390,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 783,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
@@ -5399,34 +5400,34 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 785,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 410,
+      "index": 786,
       "wall_ns": 410
     },
     {
       "cpu_ns": 420,
-      "index": 786,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
       "index": 787,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 788,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 390,
-      "index": 789,
-      "wall_ns": 400
+      "index": 788,
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 420,
+      "index": 789,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 410,
       "index": 790,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -5444,22 +5445,22 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 794,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 795,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 796,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 410,
       "index": 797,
       "wall_ns": 410
     },
@@ -5469,7 +5470,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 799,
       "wall_ns": 400
     },
@@ -5479,22 +5480,22 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 801,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 802,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 803,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 804,
       "wall_ns": 400
     },
@@ -5504,14 +5505,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 806,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 420,
       "index": 807,
-      "wall_ns": 400
+      "wall_ns": 420
     },
     {
       "cpu_ns": 410,
@@ -5524,14 +5525,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 420,
       "index": 810,
-      "wall_ns": 410
+      "wall_ns": 420
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 811,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5539,14 +5540,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 813,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 814,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
@@ -5554,19 +5555,19 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 816,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 817,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 818,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -5576,32 +5577,32 @@
     {
       "cpu_ns": 400,
       "index": 820,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 821,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 822,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 420,
       "index": 823,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
       "index": 824,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
       "index": 825,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
@@ -5609,79 +5610,79 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 827,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 828,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 829,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 480,
       "index": 830,
-      "wall_ns": 400
+      "wall_ns": 500
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 610,
       "index": 831,
-      "wall_ns": 410
+      "wall_ns": 600
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 590,
       "index": 832,
-      "wall_ns": 400
+      "wall_ns": 590
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 570,
       "index": 833,
-      "wall_ns": 410
+      "wall_ns": 580
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 610,
       "index": 834,
-      "wall_ns": 400
+      "wall_ns": 620
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 600,
       "index": 835,
-      "wall_ns": 400
+      "wall_ns": 600
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 600,
       "index": 836,
-      "wall_ns": 400
+      "wall_ns": 600
     },
     {
       "cpu_ns": 410,
       "index": 837,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 480,
       "index": 838,
-      "wall_ns": 400
+      "wall_ns": 470
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 430,
       "index": 839,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 840,
-      "wall_ns": 400
+      "wall_ns": 430
     },
     {
       "cpu_ns": 400,
+      "index": 840,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 841,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
@@ -5691,32 +5692,32 @@
     {
       "cpu_ns": 400,
       "index": 843,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 844,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 845,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 846,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 847,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 848,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5724,114 +5725,114 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 850,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 851,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 852,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 851,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 852,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 853,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 854,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 855,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 856,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 857,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 858,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 859,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 860,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 861,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 862,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 863,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 864,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 865,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 864,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 865,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
       "index": 866,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 867,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 868,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 869,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 870,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 871,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
@@ -5839,39 +5840,39 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 873,
-      "wall_ns": 410
+      "wall_ns": 420
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 874,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 875,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
       "index": 876,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 877,
       "wall_ns": 410
     },
     {
       "cpu_ns": 400,
-      "index": 878,
+      "index": 877,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
+      "index": 878,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 410,
       "index": 879,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 410,
@@ -5879,9 +5880,9 @@
       "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 881,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -5899,47 +5900,47 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 885,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 560,
       "index": 886,
-      "wall_ns": 400
+      "wall_ns": 550
     },
     {
       "cpu_ns": 390,
       "index": 887,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 888,
-      "wall_ns": 409
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 889,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 890,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 891,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 892,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 893,
       "wall_ns": 400
     },
@@ -5951,37 +5952,37 @@
     {
       "cpu_ns": 400,
       "index": 895,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 896,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 896,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 430,
+      "cpu_ns": 400,
       "index": 897,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 898,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
+      "index": 898,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
       "index": 899,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 900,
-      "wall_ns": 399
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 901,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -5994,34 +5995,34 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
-      "index": 904,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 905,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 906,
-      "wall_ns": 410
-    },
-    {
       "cpu_ns": 390,
-      "index": 907,
+      "index": 904,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 908,
+      "index": 905,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 430,
+      "index": 906,
+      "wall_ns": 420
+    },
+    {
+      "cpu_ns": 410,
+      "index": 907,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 908,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 909,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6029,37 +6030,37 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 911,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 912,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
-      "index": 912,
-      "wall_ns": 410
+      "cpu_ns": 390,
+      "index": 913,
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
-      "index": 913,
+      "index": 914,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 915,
       "wall_ns": 390
     },
     {
       "cpu_ns": 390,
-      "index": 914,
+      "index": 916,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 915,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 916,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 917,
       "wall_ns": 390
     },
@@ -6069,9 +6070,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 919,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6079,14 +6080,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 921,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 922,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6094,44 +6095,44 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 924,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 925,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 926,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 927,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 928,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 929,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 930,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
       "index": 931,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6139,69 +6140,69 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 933,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 934,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 935,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 936,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 937,
-      "wall_ns": 420
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 938,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 938,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
       "index": 939,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 940,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 941,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 942,
-      "wall_ns": 400
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
       "index": 943,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 944,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 945,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6209,9 +6210,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 947,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6219,14 +6220,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 949,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 950,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6234,122 +6235,122 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 952,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 953,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 954,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 955,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 956,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 957,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 430,
       "index": 958,
-      "wall_ns": 400
+      "wall_ns": 440
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 959,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 960,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 550,
       "index": 961,
-      "wall_ns": 400
+      "wall_ns": 550
     },
     {
       "cpu_ns": 390,
       "index": 962,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 963,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 964,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 963,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 964,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 965,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 966,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 967,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 968,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 969,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 970,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 410,
-      "index": 971,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 971,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 972,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 973,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
-      "index": 974,
-      "wall_ns": 410
-    },
-    {
       "cpu_ns": 400,
+      "index": 973,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 974,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
       "index": 975,
       "wall_ns": 400
     },
@@ -6359,7 +6360,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 977,
       "wall_ns": 390
     },
@@ -6369,7 +6370,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 979,
       "wall_ns": 390
     },
@@ -6379,29 +6380,29 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 981,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 982,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 983,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 984,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 985,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6409,24 +6410,24 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 987,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 988,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 989,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 990,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6434,64 +6435,64 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 992,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 993,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 994,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 995,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 995,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 996,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 997,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 998,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 999,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1000,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 999,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1000,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 1001,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1002,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1003,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6499,39 +6500,39 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1005,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1006,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1007,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1008,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
-      "index": 1009,
-      "wall_ns": 420
+      "cpu_ns": 400,
+      "index": 1006,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1007,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 1010,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1011,
+      "index": 1008,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1009,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1010,
+      "wall_ns": 380
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1011,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6539,14 +6540,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 1013,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 1014,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6559,14 +6560,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1017,
-      "wall_ns": 410
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
       "index": 1018,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6574,22 +6575,22 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1020,
       "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 1021,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 380,
+      "cpu_ns": 390,
       "index": 1022,
-      "wall_ns": 380
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1023,
       "wall_ns": 390
     },
@@ -6599,9 +6600,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 1025,
-      "wall_ns": 400
+      "wall_ns": 410
     },
     {
       "cpu_ns": 400,
@@ -6609,29 +6610,29 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 410,
       "index": 1027,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1028,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 1028,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
       "index": 1029,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1030,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
-      "index": 1031,
+      "index": 1030,
       "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
+      "index": 1031,
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6639,14 +6640,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1033,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1034,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -6654,12 +6655,12 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1036,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1037,
       "wall_ns": 390
     },
@@ -6679,29 +6680,29 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1041,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1042,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1043,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1044,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 1045,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6709,14 +6710,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 380,
       "index": 1047,
-      "wall_ns": 390
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
       "index": 1048,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6724,54 +6725,54 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1050,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1051,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1052,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1053,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 380,
+      "cpu_ns": 400,
       "index": 1054,
-      "wall_ns": 380
-    },
-    {
-      "cpu_ns": 380,
-      "index": 1055,
-      "wall_ns": 380
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
-      "index": 1056,
-      "wall_ns": 400
+      "index": 1055,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 1056,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 380,
       "index": 1057,
-      "wall_ns": 400
+      "wall_ns": 380
     },
     {
       "cpu_ns": 400,
       "index": 1058,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1059,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6781,32 +6782,32 @@
     {
       "cpu_ns": 400,
       "index": 1061,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 390,
-      "index": 1062,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 1063,
+      "index": 1062,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
+      "index": 1063,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
       "index": 1064,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1065,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1066,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6816,17 +6817,17 @@
     {
       "cpu_ns": 400,
       "index": 1068,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 1069,
-      "wall_ns": 380
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 1070,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6839,14 +6840,14 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 380,
+      "cpu_ns": 400,
       "index": 1073,
-      "wall_ns": 380
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 1074,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
@@ -6854,14 +6855,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 380,
       "index": 1076,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1077,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6871,37 +6872,37 @@
     {
       "cpu_ns": 400,
       "index": 1079,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 1080,
       "wall_ns": 390
     },
     {
       "cpu_ns": 390,
       "index": 1081,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
       "index": 1082,
-      "wall_ns": 389
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1083,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1084,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1085,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 390,
@@ -6909,12 +6910,12 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1087,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1088,
       "wall_ns": 400
     },
@@ -6929,74 +6930,74 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 570,
       "index": 1091,
-      "wall_ns": 390
+      "wall_ns": 580
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 590,
       "index": 1092,
-      "wall_ns": 390
+      "wall_ns": 600
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 570,
       "index": 1093,
+      "wall_ns": 570
+    },
+    {
+      "cpu_ns": 580,
+      "index": 1094,
+      "wall_ns": 590
+    },
+    {
+      "cpu_ns": 610,
+      "index": 1095,
+      "wall_ns": 610
+    },
+    {
+      "cpu_ns": 570,
+      "index": 1096,
+      "wall_ns": 570
+    },
+    {
+      "cpu_ns": 570,
+      "index": 1097,
+      "wall_ns": 570
+    },
+    {
+      "cpu_ns": 410,
+      "index": 1098,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 410,
+      "index": 1099,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
-      "index": 1094,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1095,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1096,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 390,
-      "index": 1097,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 390,
-      "index": 1098,
-      "wall_ns": 380
-    },
-    {
-      "cpu_ns": 390,
-      "index": 1099,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 1100,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1101,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1102,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 1103,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 390,
+      "cpu_ns": 400,
       "index": 1104,
-      "wall_ns": 390
+      "wall_ns": 410
     },
     {
       "cpu_ns": 390,
@@ -7004,44 +7005,44 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1106,
-      "wall_ns": 390
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 1107,
-      "wall_ns": 409
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 1108,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1109,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1110,
       "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1109,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1110,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
       "index": 1111,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1112,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 1113,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -7051,17 +7052,17 @@
     {
       "cpu_ns": 400,
       "index": 1115,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 1116,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1117,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 410,
@@ -7069,14 +7070,14 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1119,
-      "wall_ns": 420
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1120,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 390,
@@ -7084,129 +7085,129 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1122,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1123,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1124,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1125,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 1125,
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
       "index": 1126,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 1127,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1128,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1129,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 1130,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1131,
-      "wall_ns": 410
-    },
-    {
       "cpu_ns": 400,
-      "index": 1132,
+      "index": 1130,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 1131,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1132,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 410,
       "index": 1133,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1134,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1135,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 1136,
-      "wall_ns": 420
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1137,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1138,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1139,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1140,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1141,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1142,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 1143,
+      "index": 1141,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1142,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
+      "index": 1143,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
       "index": 1144,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1145,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1146,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -7214,7 +7215,7 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1148,
       "wall_ns": 400
     },
@@ -7224,44 +7225,44 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 1150,
-      "wall_ns": 400
+      "wall_ns": 410
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1151,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 410,
-      "index": 1151,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
       "index": 1152,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 1153,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 390,
       "index": 1154,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1155,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1156,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 1156,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 1157,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -7269,39 +7270,39 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 1159,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1160,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1161,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1162,
-      "wall_ns": 420
-    },
-    {
       "cpu_ns": 400,
-      "index": 1163,
+      "index": 1159,
       "wall_ns": 390
     },
     {
       "cpu_ns": 400,
-      "index": 1164,
+      "index": 1160,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1161,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1162,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
-      "index": 1165,
+      "cpu_ns": 400,
+      "index": 1163,
       "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1164,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1165,
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -7309,9 +7310,9 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 410,
       "index": 1167,
-      "wall_ns": 400
+      "wall_ns": 409
     },
     {
       "cpu_ns": 400,
@@ -7319,79 +7320,79 @@
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1169,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 430,
-      "index": 1170,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1171,
       "wall_ns": 400
     },
     {
       "cpu_ns": 390,
-      "index": 1172,
-      "wall_ns": 390
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1173,
+      "index": 1170,
       "wall_ns": 400
     },
     {
       "cpu_ns": 400,
+      "index": 1171,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1172,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1173,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
       "index": 1174,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1175,
       "wall_ns": 410
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1176,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 1177,
-      "wall_ns": 420
+      "wall_ns": 410
     },
     {
-      "cpu_ns": 400,
+      "cpu_ns": 390,
       "index": 1178,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 430,
+      "cpu_ns": 390,
       "index": 1179,
-      "wall_ns": 430
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1180,
-      "wall_ns": 410
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
+      "index": 1180,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
       "index": 1181,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
       "index": 1182,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1183,
-      "wall_ns": 400
+      "wall_ns": 390
     },
     {
       "cpu_ns": 400,
@@ -7404,87 +7405,87 @@
       "wall_ns": 390
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 390,
       "index": 1186,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 430,
-      "index": 1187,
-      "wall_ns": 420
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1188,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1189,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1190,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1191,
       "wall_ns": 390
     },
     {
-      "cpu_ns": 420,
-      "index": 1192,
-      "wall_ns": 420
+      "cpu_ns": 400,
+      "index": 1187,
+      "wall_ns": 400
     },
     {
-      "cpu_ns": 410,
+      "cpu_ns": 400,
+      "index": 1188,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1189,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1190,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1191,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1192,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
       "index": 1193,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1194,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1195,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1196,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1197,
+      "wall_ns": 390
+    },
+    {
+      "cpu_ns": 400,
+      "index": 1198,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1199,
+      "wall_ns": 400
+    },
+    {
+      "cpu_ns": 390,
+      "index": 1200,
       "wall_ns": 400
     },
     {
       "cpu_ns": 410,
-      "index": 1195,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1196,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1197,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1198,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1199,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 420,
-      "index": 1200,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 400,
       "index": 1201,
       "wall_ns": 400
     },
     {
-      "cpu_ns": 420,
+      "cpu_ns": 400,
       "index": 1202,
       "wall_ns": 400
     },
@@ -7496,37 +7497,17 @@
     {
       "cpu_ns": 400,
       "index": 1204,
-      "wall_ns": 410
+      "wall_ns": 400
     },
     {
       "cpu_ns": 400,
       "index": 1205,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1206,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1207,
-      "wall_ns": 410
-    },
-    {
-      "cpu_ns": 410,
-      "index": 1208,
-      "wall_ns": 400
-    },
-    {
-      "cpu_ns": 400,
-      "index": 1209,
-      "wall_ns": 400
+      "wall_ns": 390
     }
   ],
   "schema_version": 1,
   "stage": "otlp_noop",
-  "started_utc": "2026-09-22T19:49:17Z",
+  "started_utc": "2026-09-22T20:52:30Z",
   "status": "passed",
   "workload": {
     "body_bytes": 1024,
