@@ -34,8 +34,20 @@ same lake agree on where a window starts. A block that reaches
 its window ends, which writes more than one file set for that window. The waiting is done on the
 engine's monotonic clock, so a wall clock that steps backwards cannot reopen a
 window that was already written and boundaries missed while the node was busy
-coalesce into one rotation. Later tasks add telemetry and a drain-aware
-shutdown.
+coalesce into one rotation.
+
+The node registers the `exporter.series_parquet` metric set and reports it on
+every `CollectTelemetry` message and once more at its terminal state, so the
+last interval is not lost. State gauges (block bytes, live requests, the
+parking slot, queued completions, the oldest undecided request and the
+accounted-against-budget memory) are sampled on every loop turn. A series row
+is counted as emitted only once `write_block` has returned success, so an
+abandoned or failed block credits nothing. Every label comes from a closed
+enumeration -- the rotation trigger, the refusal class, the dataset, the
+re-emission cause and the unsupported point kind -- or from a physical column
+name fixed by configuration at startup. Error strings, object store paths,
+request ids, series ids and producer ids are never used as labels, so no
+workload can grow this node's metric cardinality.
 
 Logs and metrics share one admission path and one extraction call per request.
 Traces have no dataset in the lake and are permanently refused on the signal

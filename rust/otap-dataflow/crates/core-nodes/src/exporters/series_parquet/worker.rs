@@ -45,6 +45,9 @@
 
 use super::config::Config;
 use super::flush::{FlushDone, FlushJob};
+use super::metrics::{
+    DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs, NackReason,
+};
 use super::token::{AckToken, Notifier, Outcome};
 use super::window::Window;
 use lake::buffer::Block;
@@ -63,6 +66,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinError;
+
+/// Bytes charged per bounded descriptor cache entry.
+///
+/// The cache stores a sixteen-byte series id and an optional partition id per
+/// entry inside an LRU whose nodes carry their own links; this is the flat
+/// per-entry charge the memory budget is written against.
+const CACHE_ENTRY_BYTES: u64 = 128;
+
+/// Allocator, runtime and library overhead a worker is allowed beyond the
+/// buffers it accounts for itself.
+const FIXED_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How a failed request must be reported back to its sender.
 ///
@@ -121,6 +135,18 @@ pub(super) struct OwnedBlock {
     pub(super) data: Block<()>,
     /// One completion per admitted request, in admission order.
     pub(super) tokens: Vec<AckToken>,
+    /// Whether this block must repeat descriptors the cache already reports
+    /// committed in its partition.
+    ///
+    /// True only for the block that replaces one sealed by a byte or request
+    /// threshold inside the same aligned window: that block's descriptors are
+    /// not durable yet, so this one cannot assume them (spec 7.4).
+    pub(super) reemit: bool,
+    /// Descriptor rows admitted to this block, per [`EmitReason`] position.
+    ///
+    /// Carried with the block and reported only after a successful write, so
+    /// an abandoned block credits nothing.
+    pub(super) emitted: [u64; 3],
 }
 
 /// One extracted request waiting for a block that can take it.
@@ -177,6 +203,15 @@ pub(super) struct Worker {
     sink: Rc<lake::sink::Sink>,
     /// Per-worker block sequence, used in file names.
     seq: u64,
+    /// What will have asked for the next rotation.
+    pub(super) reason: FlushReason,
+    /// Largest completion token the worker has held, for capacity reporting.
+    pub(super) token_high_water: usize,
+    /// Registered instruments, once the node has a pipeline context.
+    ///
+    /// `None` for a worker driven directly by a test, which keeps every call
+    /// site a no-op rather than requiring a registry.
+    pub(super) metrics: Option<Metrics>,
 }
 
 impl Worker {
@@ -192,6 +227,8 @@ impl Worker {
         let active = OwnedBlock {
             data: Block::new(window.clock.last_boundary(), 0, &cfg.lake),
             tokens: Vec::new(),
+            reemit: false,
+            emitted: [0; 3],
         };
         let sink = Rc::new(lake::sink::Sink::new(
             store,
@@ -215,6 +252,9 @@ impl Worker {
             wall,
             sink,
             seq: 1,
+            reason: FlushReason::Time,
+            token_high_water: size_of::<AckToken>(),
+            metrics: None,
         }
     }
 
@@ -363,8 +403,21 @@ impl Worker {
     /// owner.
     pub(super) fn admit(&mut self, data: OtapPdata) {
         match self.prepare(data) {
-            Prepared::Ready(pending) => self.offer(pending),
-            Prepared::Failed(token, failure) => self.refuse(token, &failure),
+            Prepared::Ready(pending) => {
+                self.token_high_water = self.token_high_water.max(pending.token.bytes());
+                // Extraction outcomes are recorded exactly once, here: a
+                // request that is parked and later resumed goes through
+                // `offer` again but never through `prepare`, so nothing it
+                // reported can be counted twice.
+                if let Some(metrics) = &mut self.metrics {
+                    metrics.extracted(&pending.extracted.stats);
+                }
+                self.offer(pending);
+            }
+            Prepared::Failed(token, failure) => {
+                self.token_high_water = self.token_high_water.max(token.bytes());
+                self.refuse(token, &failure);
+            }
         }
     }
 
@@ -386,15 +439,17 @@ impl Worker {
         if self.window.admission_boundary(pending.admission_secs)
             > self.active.data.window_start_secs
         {
+            self.reason = FlushReason::Time;
             self.park(pending);
             return;
         }
         let token_bytes = pending.token.bytes();
-        let reservation = match self.active.data.reserve(
+        let reservation = match self.active.data.reserve_with_reemit(
             &pending.extracted,
             &mut self.cache,
             token_bytes,
             &self.cfg.lake,
+            self.active.reemit,
         ) {
             Ok(reservation) => reservation,
             // The block-scoped refusals judge whichever block happened to
@@ -404,8 +459,12 @@ impl Worker {
             // endless rotation; the guard makes that a checked fact rather
             // than an inference about `reserve`.
             Err(lake::Error::Refused(
-                lake::RefuseReason::BlockFull | lake::RefuseReason::TooManyRequests,
+                reason @ (lake::RefuseReason::BlockFull | lake::RefuseReason::TooManyRequests),
             )) if !self.active.data.is_empty() => {
+                self.reason = match reason {
+                    lake::RefuseReason::BlockFull => FlushReason::Bytes,
+                    _ => FlushReason::Requests,
+                };
                 self.park(pending);
                 return;
             }
@@ -416,17 +475,40 @@ impl Worker {
                 return;
             }
         };
+        // Classified before the descriptors are consumed by `admit`. The
+        // reservation has already touched every series id, so an id absent
+        // from the cache before this request now reads as present but
+        // uncommitted, which is exactly `New`.
+        let mut emitted = [0_u64; 3];
+        for &index in &reservation.new_series {
+            let id = pending.extracted.descriptors[index].series_id;
+            let position = if self.active.reemit {
+                EmitReason::Rotation as usize
+            } else if self.cache.last_committed(&id).is_some() {
+                EmitReason::Partition as usize
+            } else {
+                EmitReason::New as usize
+            };
+            emitted[position] += 1;
+        }
         match self.active.data.admit(pending.extracted, reservation, ()) {
             Ok(()) => {
                 self.active.tokens.push(pending.token);
+                for (total, count) in self.active.emitted.iter_mut().zip(emitted) {
+                    *total += count;
+                }
                 // The window boundary is the normal rotation trigger; these
                 // two only bring it forward, so a burst is written as soon as
                 // it has filled a block rather than held until the boundary.
                 // A rotation that was already owed stays owed: an admission
                 // cannot cancel a boundary that has been consumed.
-                self.rotation_requested |= self.active.data.bytes
-                    >= self.cfg.window.max_block_bytes
-                    || self.active.tokens.len() >= self.cfg.window.max_requests_per_block;
+                if self.active.data.bytes >= self.cfg.window.max_block_bytes {
+                    self.reason = FlushReason::Bytes;
+                    self.rotation_requested = true;
+                } else if self.active.tokens.len() >= self.cfg.window.max_requests_per_block {
+                    self.reason = FlushReason::Requests;
+                    self.rotation_requested = true;
+                }
             }
             Err(error) => {
                 // A failed admission leaves the block partially updated by
@@ -502,9 +584,16 @@ impl Worker {
         // A worker would have to seal one block per nanosecond for six hundred
         // years to reach this.
         self.seq = self.seq.saturating_add(1);
+        // A block opened for the window the sealed one already covered, at
+        // the request of a byte or request threshold, cannot assume that
+        // block's descriptors are durable: it writes its own copies.
+        let reemit = start == self.active.data.window_start_secs
+            && matches!(self.reason, FlushReason::Bytes | FlushReason::Requests);
         OwnedBlock {
             data: Block::new(start, seq, &self.cfg.lake),
             tokens: Vec::new(),
+            reemit,
+            emitted: [0; 3],
         }
     }
 
@@ -539,13 +628,32 @@ impl Worker {
             .data
             .seal(nanos_to_micros(self.wall.now_unix_nanos()))
         {
+            if let Some(metrics) = &mut self.metrics {
+                metrics.worker.flush_failures.add(1);
+            }
             otel_warn!("series_parquet.seal_failed", error = %error);
             self.fail_active(Outcome::Storage);
             return;
         }
+        // Counted here rather than on every rotation call: an empty block is
+        // replaced without a write, so it is not a flush.
+        if let Some(metrics) = &mut self.metrics {
+            metrics
+                .flush
+                .with(FlushAttrs {
+                    reason: self.reason,
+                })
+                .count
+                .add(1);
+        }
         let next = self.new_active();
         let old = std::mem::replace(&mut self.active, next);
-        self.flushing = Some(FlushJob::new(old.data, old.tokens, self.sink.clone()));
+        self.flushing = Some(FlushJob::new(
+            old.data,
+            old.tokens,
+            self.sink.clone(),
+            old.emitted,
+        ));
     }
 
     /// The outcome a block whose flush did not succeed must be reported as.
@@ -569,33 +677,192 @@ impl Worker {
         let Some(mut job) = self.flushing.take() else {
             return;
         };
+        if let Some(metrics) = &mut self.metrics {
+            metrics.worker.flush_duration.record(
+                clock::now()
+                    .saturating_duration_since(job.started)
+                    .as_secs_f64(),
+            );
+        }
         let outcome = match &done {
-            Ok(finished) => match &finished.result {
-                Ok(report) => {
-                    for id in &finished.data.pending_series {
-                        self.cache.mark_committed(*id, finished.data.partition);
+            Ok(finished) => {
+                if let Some(metrics) = &mut self.metrics {
+                    metrics
+                        .worker
+                        .flush_retries
+                        .add(finished.attempts.saturating_sub(1));
+                }
+                match &finished.result {
+                    Ok(report) => {
+                        for id in &finished.data.pending_series {
+                            self.cache.mark_committed(*id, finished.data.partition);
+                        }
+                        // The only place series rows are credited: the write
+                        // returned success, so the file the descriptors are in
+                        // exists.
+                        if let Some(metrics) = &mut self.metrics {
+                            for (reason, count) in
+                                [EmitReason::New, EmitReason::Partition, EmitReason::Rotation]
+                                    .into_iter()
+                                    .zip(job.emitted)
+                            {
+                                if count != 0 {
+                                    metrics
+                                        .emitted
+                                        .with(EmitAttrs { reason })
+                                        .series_emitted
+                                        .add(count);
+                                }
+                            }
+                            for (dataset, _, rows) in &report.files {
+                                let bucket = metrics.written.with(DatasetAttrs {
+                                    dataset: (*dataset).into(),
+                                });
+                                bucket.rows_written.add(*rows as u64);
+                                bucket.files_written.add(1);
+                            }
+                        }
+                        otel_info!(
+                            "series_parquet.block_committed",
+                            files = report.files.len(),
+                            requests = job.tokens.len(),
+                            bytes = job.bytes,
+                            duration = ?clock::now().saturating_duration_since(job.started)
+                        );
+                        Outcome::Ack
                     }
-                    otel_info!(
-                        "series_parquet.block_committed",
-                        files = report.files.len(),
-                        requests = job.tokens.len(),
-                        bytes = job.bytes,
-                        duration = ?clock::now().saturating_duration_since(job.started)
-                    );
-                    Outcome::Ack
+                    Err(error) => {
+                        if let Some(metrics) = &mut self.metrics {
+                            metrics.worker.flush_failures.add(1);
+                            if matches!(error, lake::Error::Cancelled { .. }) {
+                                metrics.worker.flush_cancelled.add(1);
+                            }
+                        }
+                        otel_warn!("series_parquet.flush_failed", error = %error);
+                        self.failed_outcome()
+                    }
                 }
-                Err(error) => {
-                    otel_warn!("series_parquet.flush_failed", error = %error);
-                    self.failed_outcome()
-                }
-            },
+            }
             Err(error) => {
+                if let Some(metrics) = &mut self.metrics {
+                    metrics.worker.flush_failures.add(1);
+                }
                 otel_warn!("series_parquet.flush_task_failed", error = %error);
                 self.failed_outcome()
             }
         };
         for token in std::mem::take(&mut job.tokens) {
             self.notify.push(token, outcome);
+        }
+    }
+
+    /// Publish everything the worker can be asked about right now.
+    ///
+    /// Called at the top of every loop turn and before every terminal return,
+    /// so the gauges describe the state the node is actually in rather than
+    /// the state it was in when something last happened.
+    ///
+    /// The accounted total is exactly what the worker retains: the ACTIVE
+    /// block, the FLUSHING block, the one parked request, the completions the
+    /// notifier holds, the bounded descriptor cache, and the spare capacity of
+    /// the two token vectors. The budget is the same shape derived from
+    /// configuration, plus the sort, merge, writer, upload and conversion
+    /// workspaces a flush may allocate. Those workspace terms are engineering
+    /// reservations rather than measurements; validating them empirically is
+    /// plan 3's work.
+    pub(super) fn sample_metrics(&mut self) {
+        let flushing = self.flushing.as_ref().map_or(0, |job| job.bytes);
+        let pending = self.pending.as_ref().map_or(0, |parked| {
+            parked.extracted.pinned_bytes
+                + parked
+                    .extracted
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.approx_bytes)
+                    .sum::<usize>()
+                + parked.token.bytes()
+        });
+        let token = self.token_high_water.max(self.notify.token_high_water()) as u64;
+        let cfg = &self.cfg.lake;
+        let cache = self.cache.len() as u64 * CACHE_ENTRY_BYTES;
+        let sort = 2 * cfg.sorting.run_target_bytes as u64;
+        let merge = 2 * cfg.sorting.merge_chunk_bytes as u64;
+        let writer = 3 * cfg.parquet.writer_limit_bytes as u64;
+        let upload = cfg.upload.part_bytes as u64 * (cfg.upload.concurrency as u64 + 1)
+            + cfg.sorting.merge_chunk_bytes as u64;
+        let conversion = 4 * cfg.ingress.max_request_bytes as u64;
+        let workspace = sort + merge + writer + upload + conversion + FIXED_WORKSPACE_BYTES;
+        let spare_tokens = self
+            .active
+            .tokens
+            .capacity()
+            .saturating_sub(self.active.tokens.len())
+            + self.flushing.as_ref().map_or(0, |job| {
+                job.tokens.capacity().saturating_sub(job.tokens.len())
+            });
+        let accounted = self.active.data.bytes as u64
+            + flushing as u64
+            + pending as u64
+            + cache
+            + self.notify.bytes() as u64
+            + (spare_tokens * size_of::<AckToken>()) as u64;
+        let budget = 2 * cfg.ingress.max_block_bytes as u64
+            + cfg.ingress.max_extracted_bytes as u64
+            + self.cfg.cache_entries as u64 * CACHE_ENTRY_BYTES
+            + 2 * cfg.ingress.max_requests_per_block as u64 * token
+            + workspace;
+        let oldest = self
+            .active
+            .tokens
+            .iter()
+            .map(AckToken::received)
+            .chain(
+                self.flushing
+                    .iter()
+                    .flat_map(|job| job.tokens.iter().map(AckToken::received)),
+            )
+            .chain(self.pending.iter().map(|parked| parked.token.received()))
+            .chain(self.notify.oldest())
+            .min();
+        let requests = self.live_tokens() as u64;
+        let entries = self.cache.len() as u64;
+        let stats = self.cache.stats();
+        let active_bytes = self.active.data.bytes as u64;
+        let queued = self.notify.len() as u64;
+        let failures = self.notify.failures();
+        let outcomes = *self.notify.outcomes();
+        let parked = self.pending.is_some();
+        let now = clock::now();
+        if let Some(metrics) = &mut self.metrics {
+            metrics.worker.cache_entries.set(entries);
+            metrics.worker.cache_hits.observe(stats.hits);
+            metrics.worker.cache_misses.observe(stats.misses);
+            metrics.worker.cache_evictions.observe(stats.evictions);
+            metrics.worker.active_bytes.set(active_bytes);
+            metrics.worker.flushing_bytes.set(flushing as u64);
+            metrics.worker.requests_pending.set(requests);
+            metrics.worker.pending_slot.set(u64::from(parked));
+            metrics.worker.notify_queued.set(queued);
+            metrics.worker.notify_failures.observe(failures);
+            metrics.worker.acks.observe(outcomes[Outcome::Ack as usize]);
+            for (outcome, reason) in [
+                (Outcome::Storage, NackReason::Storage),
+                (Outcome::TooLarge, NackReason::TooLarge),
+                (Outcome::Invalid, NackReason::Invalid),
+                (Outcome::Unsupported, NackReason::Unsupported),
+                (Outcome::Shutdown, NackReason::Shutdown),
+            ] {
+                metrics
+                    .nacks
+                    .with(NackAttrs { reason })
+                    .nacks
+                    .observe(outcomes[outcome as usize]);
+            }
+            metrics.worker.oldest.set(oldest.map_or(0.0, |received| {
+                now.saturating_duration_since(received).as_secs_f64()
+            }));
+            metrics.worker.memory_accounted_bytes.set(accounted);
+            metrics.worker.memory_budget_bytes.set(budget);
         }
     }
 
@@ -610,6 +877,7 @@ impl Worker {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
         self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+        self.reason = FlushReason::Shutdown;
         self.rotation_requested = true;
     }
 

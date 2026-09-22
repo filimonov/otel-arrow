@@ -29,6 +29,8 @@ pub(super) struct FlushDone {
     pub(super) data: lake::buffer::Block<()>,
     /// What the sink returned.
     pub(super) result: lake::Result<lake::sink::FlushReport>,
+    /// Write attempts this flush made, including the one that resolved it.
+    pub(super) attempts: u64,
 }
 
 /// One local flush task and the completions its block still owes.
@@ -44,6 +46,11 @@ pub(super) struct FlushJob {
     pub(super) bytes: usize,
     /// When the write started, for the duration reported on completion.
     pub(super) started: Instant,
+    /// Descriptor rows this block carries, per re-emission cause.
+    ///
+    /// Counted at admission but reported only once the write has returned
+    /// success, so a series row is credited exactly when its file exists.
+    pub(super) emitted: [u64; 3],
 }
 
 impl FlushJob {
@@ -56,13 +63,18 @@ impl FlushJob {
         data: lake::buffer::Block<()>,
         tokens: Vec<AckToken>,
         sink: Rc<lake::sink::Sink>,
+        emitted: [u64; 3],
     ) -> Self {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let bytes = data.bytes;
         let handle = tokio::task::spawn_local(async move {
             let result = sink.write_block(&data, &task_cancel).await;
-            FlushDone { data, result }
+            FlushDone {
+                data,
+                result,
+                attempts: 1,
+            }
         });
         Self {
             handle,
@@ -70,6 +82,7 @@ impl FlushJob {
             tokens,
             bytes,
             started: clock::now(),
+            emitted,
         }
     }
 

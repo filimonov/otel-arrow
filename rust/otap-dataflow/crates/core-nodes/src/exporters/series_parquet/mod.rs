@@ -46,7 +46,6 @@ use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_otap::{OTAP_EXPORTER_FACTORIES, object_store::StorageType};
 use otel_arrow_dfe_series_lake as lake;
-use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -60,6 +59,7 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 
 pub mod config;
 mod flush;
+mod metrics;
 #[cfg(test)]
 mod tests;
 mod token;
@@ -76,7 +76,7 @@ mod worker;
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 pub static SERIES_PARQUET: ExporterFactory<OtapPdata> = ExporterFactory {
     name: SERIES_PARQUET_URN,
-    create: |_pipeline: PipelineContext,
+    create: |pipeline: PipelineContext,
              node: NodeId,
              node_config: Arc<NodeUserConfig>,
              exporter_config: &ExporterConfig,
@@ -88,6 +88,7 @@ pub static SERIES_PARQUET: ExporterFactory<OtapPdata> = ExporterFactory {
                 }
             })?;
         let mut exporter = SeriesParquet::new(config);
+        exporter.metrics = Some(metrics::Metrics::register(&pipeline, &exporter.config.lake));
         if exporter.config.storage.requires_bearer_token_provider() {
             exporter.token_provider = Some(
                 capabilities
@@ -115,6 +116,8 @@ pub struct SeriesParquet {
     token_provider: Option<
         Box<dyn otel_arrow_dfe_engine::shared::capability::auth::bearer_token_provider::BearerTokenProvider>,
     >,
+    /// Instruments registered by the factory, moved into the worker at start.
+    metrics: Option<metrics::Metrics>,
 }
 
 impl SeriesParquet {
@@ -124,6 +127,7 @@ impl SeriesParquet {
         Self {
             config,
             token_provider: None,
+            metrics: None,
         }
     }
 }
@@ -159,6 +163,7 @@ impl Exporter<OtapPdata> for SeriesParquet {
             Arc::new(lake::clock::SystemWallClock),
             inbox,
             effects,
+            self.metrics.take(),
         )
         .await
     }
@@ -181,8 +186,10 @@ async fn run(
     wall: Arc<dyn lake::clock::WallClock>,
     mut inbox: ExporterInbox<OtapPdata>,
     effects: EffectHandler<OtapPdata>,
+    metrics: Option<metrics::Metrics>,
 ) -> Result<TerminalState, Error> {
     let mut worker = worker::Worker::new(cfg, store, wall, effects);
+    worker.metrics = metrics;
     // The Shutdown control message is the end of the inbox, not the start of
     // the drain: the engine latches it, force-drains the pdata backlog past a
     // closed admission gate, and releases it only once the upstream channel is
@@ -195,12 +202,20 @@ async fn run(
     let mut closed: Option<Instant> = None;
     let mut notify_turns = 0_usize;
     loop {
+        // Sampled before anything is decided, so the gauges describe the state
+        // the node is in on this turn rather than the state it was last
+        // changed into, and so a terminal return still carries the counters of
+        // the interval it ends.
+        worker.sample_metrics();
         if let Some(deadline) = closed
             && worker.is_idle()
         {
             return Ok(TerminalState::new(
                 deadline,
-                std::iter::empty::<MetricSetSnapshot>(),
+                worker
+                    .metrics
+                    .as_mut()
+                    .map_or_else(Vec::new, metrics::Metrics::snapshots),
             ));
         }
         let accept = worker.accept();
@@ -218,9 +233,13 @@ async fn run(
             } => {
                 otel_warn!("series_parquet.shutdown_deadline_elapsed");
                 worker.abandon();
+                worker.sample_metrics();
                 return Ok(TerminalState::new(
                     deadline.expect("the deadline branch only fires with a deadline"),
-                    std::iter::empty::<MetricSetSnapshot>(),
+                    worker
+                        .metrics
+                        .as_mut()
+                        .map_or_else(Vec::new, metrics::Metrics::snapshots),
                 ));
             }
 
@@ -293,6 +312,14 @@ async fn run(
                         otel_info!("series_parquet.shutdown", reason = reason);
                         closed = Some(deadline);
                         worker.shutdown(deadline);
+                    }
+                    Ok(Message::Control(NodeControlMsg::CollectTelemetry {
+                        mut metrics_reporter,
+                    })) => {
+                        worker.sample_metrics();
+                        if let Some(m) = &mut worker.metrics {
+                            m.report(&mut metrics_reporter);
+                        }
                     }
                     Ok(Message::Control(_)) => {}
                     Err(e) => {

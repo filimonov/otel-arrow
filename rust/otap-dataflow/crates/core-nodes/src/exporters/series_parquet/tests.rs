@@ -428,6 +428,7 @@ async fn shutdown_decides_every_force_drained_request() {
                 Arc::new(lake::clock::TestWallClock::new(0)),
                 inbox,
                 handler,
+                None,
             ));
 
             for _ in 0..2 {
@@ -1135,6 +1136,7 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
                 Arc::clone(&wall) as _,
                 inbox,
                 handler,
+                None,
             ));
 
             // The first two fill the room the block reserves; the third
@@ -1475,6 +1477,7 @@ async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
                 Arc::clone(&wall) as _,
                 inbox,
                 handler,
+                None,
             ));
 
             // The first request fills the window that starts at 0 s.
@@ -1602,6 +1605,7 @@ async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
                 Arc::clone(&wall) as _,
                 inbox,
                 handler,
+                None,
             ));
 
             pdata_tx
@@ -1722,4 +1726,232 @@ async fn the_request_limit_asks_for_a_rotation_within_a_window() {
     assert_eq!(worker.active.tokens.len(), 2);
     assert!(worker.rotation_requested, "a full block is sealed at once");
     assert!(!worker.accept());
+}
+
+/// Scenario: telemetry is collected after admitting a request and while a
+/// notification waits.
+/// Guarantees: gauges include live requests and all required worker
+/// instruments have stable names.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_metrics_cover_live_memory_and_requests() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.metrics = Some(super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    ));
+
+    worker.admit(logs_pdata());
+    worker.sample_metrics();
+
+    let metrics = worker.metrics.as_ref().expect("registered");
+    assert_eq!(metrics.worker.requests_pending.get(), 1);
+    assert!(metrics.worker.memory_accounted_bytes.get() >= worker.active.data.bytes as u64);
+    assert!(
+        metrics.worker.memory_budget_bytes.get() >= metrics.worker.memory_accounted_bytes.get()
+    );
+    assert_eq!(
+        metrics.worker.snapshot().descriptor().name,
+        "exporter.series_parquet"
+    );
+}
+
+/// Scenario: one block is abandoned after admission and a later block commits
+/// successfully.
+/// Guarantees: `series_emitted` excludes admitted/abandoned rows and
+/// increments only on durable completion.
+#[tokio::test(flavor = "current_thread")]
+async fn series_emitted_requires_durable_completion() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                wall,
+                handler,
+            );
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            assert!(
+                worker
+                    .metrics
+                    .as_mut()
+                    .expect("metrics")
+                    .emitted
+                    .terminal_snapshots()
+                    .is_empty(),
+                "admission alone emits nothing"
+            );
+            worker.fail_active(Outcome::Storage);
+            assert!(
+                worker
+                    .metrics
+                    .as_mut()
+                    .expect("metrics")
+                    .emitted
+                    .terminal_snapshots()
+                    .is_empty(),
+                "an abandoned block emits nothing"
+            );
+
+            worker.admit(logs_pdata());
+            let expected = worker.active.data.pending_series.len() as u64;
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(done.as_ref().expect("the flush task joins").result.is_ok());
+            assert!(
+                worker
+                    .metrics
+                    .as_mut()
+                    .expect("metrics")
+                    .emitted
+                    .terminal_snapshots()
+                    .is_empty(),
+                "a resolved write that has not been completed emits nothing"
+            );
+
+            worker.complete(done);
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(
+                metrics
+                    .emitted
+                    .get(super::metrics::EmitAttrs {
+                        reason: super::metrics::EmitReason::New
+                    })
+                    .series_emitted
+                    .get(),
+                expected
+            );
+        })
+        .await;
+}
+
+/// Scenario: a request-limited block rotates twice inside one window and then
+/// a later window opens a block in a different partition, with every flush
+/// completing durably.
+/// Guarantees: the flush trigger, the re-emission cause and the written
+/// dataset are labelled from what the worker actually did. The replacement
+/// block inside one window reports `rotation`, a block in a new partition
+/// reports `partition`, and an empty rotation is not counted as a flush.
+#[tokio::test(flavor = "current_thread")]
+async fn rotation_causes_and_flush_reasons_are_labelled() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            use super::metrics::{DatasetAttrs, DatasetLabel, EmitAttrs, EmitReason, FlushAttrs};
+            use super::metrics::{FlushReason, Metrics};
+
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config_with_requests(1),
+                Arc::new(object_store::memory::InMemory::new()),
+                wall.clone(),
+                handler,
+            );
+            worker.metrics = Some(Metrics::register(&context, &worker.cfg.lake));
+
+            /// Seal the ACTIVE block, wait for its write and decide it.
+            async fn flush(worker: &mut Worker) {
+                worker.rotate();
+                let done = worker
+                    .flushing
+                    .as_mut()
+                    .expect("a rotated block is flushing")
+                    .finish()
+                    .await;
+                assert!(done.as_ref().expect("the flush task joins").result.is_ok());
+                worker.complete(done);
+                // The notifier holds one credit per block here, so the ack is
+                // delivered before the next block is decided.
+                assert!(worker.notify.next().await.is_ok());
+            }
+
+            fn emitted(worker: &Worker, reason: EmitReason) -> u64 {
+                worker
+                    .metrics
+                    .as_ref()
+                    .expect("metrics")
+                    .emitted
+                    .get(EmitAttrs { reason })
+                    .series_emitted
+                    .get()
+            }
+
+            // A full block inside one window: the first copy of the
+            // descriptor is new, and the block that replaces it must repeat it
+            // because the replaced block is not durable when it is opened.
+            worker.admit(logs_pdata());
+            assert_eq!(worker.reason, FlushReason::Requests);
+            let rows = worker.active.data.pending_series.len() as u64;
+            assert!(rows > 0, "the request carries a descriptor");
+            flush(&mut worker).await;
+            assert!(worker.active.reemit, "the window has not moved on");
+            assert_eq!(emitted(&worker, EmitReason::New), rows);
+
+            worker.admit(logs_pdata());
+            flush(&mut worker).await;
+            assert_eq!(emitted(&worker, EmitReason::Rotation), rows);
+
+            // A later window in a later storage partition: partitions are
+            // date/hour, so the clock has to cross an hour for the cached
+            // commit to stop applying.
+            wall.set(4_000_000_000_000);
+            worker.admit(logs_pdata());
+            assert!(worker.pending.is_some(), "a later window parks the request");
+            worker.rotate();
+            assert!(
+                worker.flushing.is_none(),
+                "an empty block is replaced rather than written"
+            );
+            assert!(!worker.active.reemit);
+            worker.resume_pending();
+            flush(&mut worker).await;
+            assert_eq!(emitted(&worker, EmitReason::Partition), rows);
+
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_mut().expect("metrics");
+            assert_eq!(metrics.worker.acks.get(), 3);
+            // Three real writes, each sealed by the one-request limit. The
+            // empty rotation the parked request forced is not one of them,
+            // and the block that took the parked request was still sealed by
+            // the limit rather than by its window.
+            for (reason, expected) in [
+                (FlushReason::Requests, 3),
+                (FlushReason::Time, 0),
+                (FlushReason::Bytes, 0),
+                (FlushReason::Shutdown, 0),
+            ] {
+                assert_eq!(
+                    metrics.flush.get(FlushAttrs { reason }).count.get(),
+                    expected,
+                    "flush count for {reason:?}"
+                );
+            }
+            for dataset in [DatasetLabel::LogsSeries, DatasetLabel::LogsValues] {
+                let written = metrics.written.get(DatasetAttrs { dataset });
+                assert_eq!(written.files_written.get(), 3, "files for {dataset:?}");
+                assert!(written.rows_written.get() >= 3, "rows for {dataset:?}");
+            }
+        })
+        .await;
 }

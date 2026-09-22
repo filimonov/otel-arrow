@@ -64,6 +64,11 @@ impl AckToken {
         size_of::<Self>() + self.external_bytes()
     }
 
+    /// When the exporter took ownership of this completion.
+    pub(super) fn received(&self) -> Instant {
+        self.received
+    }
+
     /// Bytes owned outside the token's own inline storage.
     ///
     /// Charged separately because the inline part is already accounted for by
@@ -126,7 +131,6 @@ impl Outcome {
 type SendFuture = Pin<Box<dyn Future<Output = Result<(), Error>>>>;
 
 /// The single in-flight completion send, kept across polls.
-#[allow(dead_code)]
 struct Sending {
     /// The started send; never recreated while it is pending.
     future: SendFuture,
@@ -179,16 +183,15 @@ impl Notifier {
         self.len() == 0
     }
 
-    // The counters and size reporting below are read by the node's metrics,
-    // which a later task adds; they are built and tested here because the
-    // accounting rules they depend on -- one charge per token, a send future
-    // that survives a cancelled poll -- belong to this module.
+    // The counters and size reporting below are read by the node's metrics.
+    // They are built and tested here because the accounting rules they depend
+    // on -- one charge per token, a send future that survives a cancelled poll
+    // -- belong to this module.
     /// Bytes the notifier keeps resident.
     ///
     /// Each token is charged once: a queued token by the queue cell it sits in
     /// plus its external buffers, and the sending token by the send future's
     /// storage, which owns it inline, plus the same external buffers.
-    #[allow(dead_code)]
     pub(super) fn bytes(&self) -> usize {
         self.queue
             .iter()
@@ -199,7 +202,6 @@ impl Notifier {
     }
 
     /// When the oldest outstanding completion was taken ownership of.
-    #[allow(dead_code)]
     pub(super) fn oldest(&self) -> Option<Instant> {
         self.queue
             .iter()
@@ -209,19 +211,16 @@ impl Notifier {
     }
 
     /// Counters of pushed completions, indexed by [`Outcome`].
-    #[allow(dead_code)]
     pub(super) fn outcomes(&self) -> &[u64; OUTCOMES] {
         &self.outcomes
     }
 
     /// Completions the engine would not accept.
-    #[allow(dead_code)]
     pub(super) fn failures(&self) -> u64 {
         self.failures
     }
 
     /// Largest single token the notifier has held.
-    #[allow(dead_code)]
     pub(super) fn token_high_water(&self) -> usize {
         self.token_high_water
     }
