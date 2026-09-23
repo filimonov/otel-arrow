@@ -1464,6 +1464,14 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 Use a `chore` commit subject when this pass contains only harness fixes, a no-defects inventory or architectural evidence; preserve the exact trailers. Repeat the contingency for later discoveries and commit every new evidence index/child using the same staging contract.
 
+**Amendment (user decision 2026-09-23): coherent size limits, option A.** A request that passes ingress must always fit an EMPTY block, so `window.max_block_bytes` only rotates and bounds memory and never refuses. Today only the `2 * max_extracted_bytes` term is validated, while block admission also reserves a fixed per-series term F = 128 * C + 8 + Q per new series (1352 B logs, 2120 B metrics, +128 B per denormalized series column), so with the defaults a single request above ~215k new metric series or ~338k new log series is permanently refused naming `window.max_block_bytes`. Bounded fix, after Task 6 has measured the real per-series builder row cost:
+- [ ] Replace the unmeasured 128 B-per-column reservation in `LakeConfig::series_row_fixed_bytes` with the measured cost plus a stated margin (never below measured), recording the measurement file and margin in the code doc and FORMAT/README.
+- [ ] Add `ingress.max_series_per_request` (distinct series per request), checked during extraction as soon as the count exceeds it; the nack reason names the limit, the observed count and the remedy ("split the batch upstream or raise the limit"); `error.type` gets its own value. Default derived from the defaults so that `2 * max_extracted_bytes + max_series_per_request * F_max + token_bytes <= max_block_bytes` holds, F_max being the largest F for the configured signals and denormalized columns.
+- [ ] Startup validation checks that full inequality for the configured values and refuses with the numbers; the README sizing section states it.
+- [ ] Block admission keeps its worst-case check as a debug assertion plus a counted `internal` nack if it ever fires, since validation now makes it unreachable; a test proves an ingress-accepted request with max_series_per_request new series fits an empty block for logs, metrics and a denormalized schema.
+- [ ] Task 5's high-cardinality shape is rerun afterwards: at the limit it is accepted, one above it is refused at ingress with the new reason.
+Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as memory cap) and C (split an oversize request across blocks with a multi-block token) are recorded for plan 4 and not implemented here.
+
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
 **Expected wall-clock cost:** 55-80 minutes for both stores, both topologies' latency cohorts and window comparisons; under one second for latency/backoff analysis tests.
