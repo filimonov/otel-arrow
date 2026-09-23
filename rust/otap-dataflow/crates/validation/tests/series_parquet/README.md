@@ -101,49 +101,76 @@ SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
 
 It needs Docker with the MinIO image, a `perf` that may attach to this
 user's processes (`kernel.perf_event_paranoid` of 2 or lower, or
-`CAP_PERFMON`), `c++filt` from binutils for Rust's v0 symbols, and a
-profilable release engine, `target/release/df_engine-perf`
-(`SERIES_ATTRIBUTION_ENGINE` names another). The workspace's default linker,
-lld, places the executable segment 4 KiB above its file offset, and perf's
-libdw unwinder, which derives the module base from the file offset, then
-ends every stack after its first frame. Relinking only the binary crate
-with page-aligned segments changes no generated code:
+`CAP_PERFMON`), `c++filt` from binutils for Rust's v0 symbols, and a clean
+Rust tree. The workspace's default linker, lld, places the executable
+segment 4 KiB above its file offset, and perf's libdw unwinder, which
+derives the module base from the file offset, then ends every stack after
+its first frame. So the family builds its own profiled engine,
+`target/release/df_engine-perf`, before any measured window and holding the
+host lease so no one else's measurement overlaps the compile:
 
 ```bash
+cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer          # the canonical engine
 cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine \
   --features series-parquet,aws,durable-buffer -- \
-  -C link-arg=-Wl,-z,separate-loadable-segments
+  -C link-arg=-Wl,-z,separate-loadable-segments          # relink only
 cp target/release/df_engine target/release/df_engine-perf
 cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
-  --features series-parquet,aws,durable-buffer   # restores df_engine
+  --features series-parquet,aws,durable-buffer          # restores df_engine
 ```
 
-A preflight checks that engine's segment layout and records a busy process
-with the exact command line a measured run uses; when perf cannot attach, no
-repetition runs, `attribution.json` is published with status `skipped`, a
-failed `perf_attached` check and the preflight's evidence, the mandatory
-acceptance stays incomplete, and the command exits 3.
+It then proves the two binaries one engine. Both record their revision,
+profile, features, allocator, `rustc -vV`, hash, segment layout and the
+exact flag difference. Their sorted `(size, demangled name)` function
+symbols from `nm --defined-only --size-sort -C` must be identical, and the
+profiled layout must be one perf can unwind. Any mismatch refuses the family
+with the reason. The perf preflight then records a busy process with the
+exact command line a measured run uses. When the engine is not proven or
+perf cannot attach, no repetition runs, `attribution.json` is published with
+status `skipped`, a failed `perf_attached` check and the preflight's
+evidence, the mandatory acceptance stays incomplete, and the command exits
+3. Every index and repetition records the `perf_event_paranoid` it ran
+under, since the setting does not survive a reboot.
 
 Each of the stage family's two primary workloads is prebuilt once, before
-any lease, lengthened until three repetitions give at least 10,000
-classified samples at 199 Hz. Each repetition runs an unprofiled control
-lifetime and a profiled one on the same cores and store: blocks rotate
-every 128 requests with 256 in flight. The profiled lifetime records
-`perf record -e cpu-clock -F 199 -g --call-graph dwarf -p ENGINE_PID`, with
-the events enabled through control FIFOs across exactly the input phase,
-first request to last durable acknowledgement. Every sample is assigned once
-by its innermost production frame (`performance.classify_cpu`; the rules
-are recorded in the index). The flush wall time that is not flush-task CPU
-is reported as `upload_wait_s`, outside the CPU shares. `--option
-rehearsal=true` runs the control lifetimes alone into the output directory
-and publishes nothing; `--option records=...`, `cpu_ns_per_record=...`,
-`repetitions=...` and `configs=[...]` adjust the family. Each lifetime's
-ledger is written on `/tmp` (`--option ledger_dir=...` or
-`SERIES_ATTRIBUTION_LEDGER_DIR` name another memory file system): on a disk
-its per-request fsyncs throttle the sender to the disk's commit rate. It is
-deleted after the read-back and its hash is kept. `--option
-lease_wait_s=...` lets each repetition wait that long for the host lease
-another measurement holds, instead of being refused.
+any lease, and lengthened from the pinned family's costs until three
+repetitions give at least 10,000 classified samples at 199 Hz. Each
+repetition runs an unprofiled control lifetime and a profiled one on the
+same cores and store: blocks rotate every 128 requests with 256 in flight.
+The profiled lifetime records `perf record -e cpu-clock -F 199 -g
+--call-graph dwarf --sample-cpu -p ENGINE_PID`, with the events enabled
+through control FIFOs across exactly the input phase, first request to last
+durable acknowledgement. Every sample is assigned once by its innermost
+production frame (`performance.classify_cpu`; the rules are recorded in the
+index). The flush wall time that is not flush-task CPU is reported as
+`upload_wait_s`, outside the CPU shares.
+
+The binding reconciliation is the plan's Stage agreement rule, a hard gate
+in every repetition and aggregate. Exclusive category CPU plus the named
+residual is compared with the engine CPU the scheduler measured; an error
+above 10 percent, or unexplained CPU (residual plus uncovered CPU) above 20
+percent, invalidates the attribution. An aggregate also requires the pinned
+stage family to verify by hash. A baseline is written only after every one of
+these gates has passed. The per-stage comparison of attributed costs with
+isolated bench costs is descriptive and gates nothing. Its reference is the
+pinned family, with the spot family beside it as supplementary evidence and
+never substituted. A row outside the 0.5 to 2 band is explained only when the
+published spot family brings it into the band, and is otherwise marked
+unexplained.
+
+`--option rehearsal=true` runs the control lifetimes alone into the output
+directory and publishes nothing; `--option records=...`,
+`cpu_ns_per_record=...`, `repetitions=...` and `configs=[...]` adjust the
+family. Each lifetime's ledger is written on a memory file system, checked
+in `/proc/self/mountinfo` and recorded: `/tmp` by default, `--option
+ledger_dir=...` or `SERIES_ATTRIBUTION_LEDGER_DIR` name another, and a
+directory that is not tmpfs falls back to `/dev/shm`, or the family is
+refused. On a disk the ledger's per-request fsyncs throttle the sender to the
+disk's commit rate. It is deleted after the read-back and its hash is kept.
+`--option lease_wait_s=...` lets the engine build and each repetition wait
+that long for the host lease another measurement holds, instead of being
+refused.
 
 The remaining subcommands (`capacity`, `memory`, `soak`, `fault-preflight`,
 `failures`, `buffered`, `remediate`, `report`) are named here so the command

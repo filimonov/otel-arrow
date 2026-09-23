@@ -4874,7 +4874,10 @@ class AttributionContracts(unittest.TestCase):
         allocation = {"engine_observability": [0], "engine": [1],
                       "engine_reserved": [2, 3, 4], "producer": [5], "store": [6],
                       "profiler": [7]}
+        engines = {"valid": True, "problems": []}
         with mock.patch.object(performance, "perf_preflight", return_value=refusal), \
+                mock.patch.object(performance, "prepare_profiled_engine",
+                                  return_value=engines), \
                 mock.patch.object(measurement, "role_allocation", return_value=allocation), \
                 mock.patch.object(measure, "prepare_build",
                                   side_effect=AssertionError("must not build")), \
@@ -4900,7 +4903,7 @@ class AttributionContracts(unittest.TestCase):
         self.assertEqual(index["classification"]["categories"],
                          list(performance.CPU_CATEGORIES))
 
-    def evidence(self, *, verified=True, spot_extract=800.0):
+    def evidence(self, *, verified=True, spot_extract=800.0, pinned_extract=1400.0):
         """Two stage families as the reconciliation reads them."""
         def summary(cost):
             return {
@@ -4914,7 +4917,7 @@ class AttributionContracts(unittest.TestCase):
             }
 
         config = "metrics-mixed"
-        costs = {"convert": 500.0, "extract": 1400.0, "sort_seal": 350.0,
+        costs = {"convert": 500.0, "extract": pinned_extract, "sort_seal": 350.0,
                  "merge": 100.0, "encode": 220.0, "upload": 15.0,
                  "otlp_noop": 300.0, "otlp_minio": 3000.0}
         modes = {"upload": "async", "otlp_minio": "async", "otlp_noop": "pipeline"}
@@ -4945,50 +4948,67 @@ class AttributionContracts(unittest.TestCase):
                 upload_wait_s=4.0,
                 flush_wall_s=6.0,
             ),
-            "checks": [measurement.check("attribution_exclusive", measurement.CHECK_HARD,
-                                         measurement.STATUS_PASSED)],
-            "observations": {"pooled_profile": {
-                "categories": categories,
-                "allocator_callers_share_ratio": {"extraction": 0.025},
-            }},
+            "checks": [
+                measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+                for name in performance.BINDING_RECONCILIATION_CHECKS
+            ],
+            "observations": {
+                "pooled_profile": {
+                    "categories": categories,
+                    "allocator_callers_share_ratio": {"extraction": 0.025},
+                },
+                "stage_agreement": {"repetitions": [
+                    {"error_ratio": 0.003, "unexplained_ratio": 0.005}
+                ]},
+            },
         }
 
-    # Scenario: a metrics workload's attributed extraction cost is joined
-    # with the pinned family, whose extraction predates Task 3c's memo, and
-    # a spot family re-measured at the attribution's revision.
-    # Guarantees: the spot family is the preferred reference where it
-    # measured the stage, the pinned cost is kept beside it, the allocator
-    # samples extraction caused are added back before comparing, the known
-    # deviation is stated, the whole engine is compared with the noop
-    # pipeline plus the object-store layer, and no byte rate is added
-    # across stages.
+    # Scenario: a metrics workload whose binding checks all passed is joined
+    # with the pinned family, whose extraction cost is far from the engine's,
+    # and with a later spot family that re-measured extraction.
+    # Guarantees: the reconciliation is valid on the binding rule alone; the
+    # stage comparison is labelled descriptive and uses the pinned family as
+    # its reference, never the spot family in its place; the allocator
+    # samples a stage caused are added back before comparing; an
+    # out-of-band row is explained only by the published spot measurement
+    # bringing it into the band, and otherwise says it is unexplained; and
+    # no byte rate is added across stages.
     def test_reconciliation_joins_stage_evidence_by_workload(self):
         reconciliation = performance.reconcile_attribution(
-            [self.aggregate()], self.evidence()
+            [self.aggregate()], self.evidence(pinned_extract=2000.0)
         )
         self.assertTrue(reconciliation["valid"], reconciliation["problems"])
+        self.assertIn("10%", reconciliation["binding_rule"])
+        self.assertFalse(reconciliation["descriptive_stage_comparison"]["gating"])
         self.assertTrue(reconciliation["spot_revision_matches"])
-        rows = {row["row"]: row for row in reconciliation["workloads"]["metrics-mixed"]["rows"]}
+        workload = reconciliation["workloads"]["metrics-mixed"]
+        self.assertTrue(all(workload["binding"]["checks"].values()))
+        rows = {row["row"]: row for row in workload["descriptive_stage_comparison"]}
         extraction = rows["extraction"]
-        self.assertEqual(extraction["stages"][0]["source"], "spot")
-        self.assertEqual(extraction["reference_cpu_ns_per_record"], 800.0)
-        self.assertEqual(extraction["pinned_reference_cpu_ns_per_record"], 1400.0)
+        self.assertEqual(extraction["stages"][0]["reference"], "pinned")
+        self.assertEqual(extraction["reference_cpu_ns_per_record"], 2000.0)
+        self.assertEqual(extraction["supplementary_spot_cpu_ns_per_record"], 800.0)
         self.assertAlmostEqual(
             extraction["attributed_with_allocator_cpu_ns_per_record"], 800.0 + 0.025 * 3200.0
         )
-        self.assertEqual(extraction["verdict"], "agrees")
-        self.assertIn("memo", extraction["known_deviation"])
+        self.assertEqual(extraction["verdict"], "outside_band")
+        self.assertEqual(extraction["explanation"]["status"], "explained")
+        self.assertEqual(extraction["explanation"]["evidence"]["index"], "stages-spot.json")
+        conversion = rows["conversion"]
+        self.assertEqual(conversion["verdict"], "outside_band")
+        self.assertEqual(conversion["explanation"]["status"], "unexplained")
         total = rows["total"]
         self.assertEqual(total["reference_cpu_ns_per_record"], 3300.0)
-        self.assertEqual(total["attributed_with_allocator_cpu_ns_per_record"], 3200.0)
-        self.assertEqual(rows["conversion"]["verdict"], "differs")
+        self.assertEqual(total["verdict"], "within_band")
+        self.assertIsNone(total["explanation"])
         for row in rows.values():
             self.assertFalse([key for key in row if "bytes" in key])
             for stage in row["stages"]:
                 self.assertIn("output_representation", stage)
 
     # Scenario: the pinned family on disk no longer has the recorded hash,
-    # a joined stage is missing from it, or a profile was not exclusive.
+    # a joined stage is missing from it, and the aggregate passed none of
+    # the binding checks.
     # Guarantees: each makes the reconciliation invalid and names why.
     def test_an_unverified_or_incomplete_reconciliation_is_invalid(self):
         evidence = self.evidence(verified=False)
@@ -5000,7 +5020,9 @@ class AttributionContracts(unittest.TestCase):
         problems = " ".join(reconciliation["problems"])
         self.assertIn("hashes to", problems)
         self.assertIn("merge/isolated/metrics-mixed", problems)
-        self.assertIn("not shown to be exclusive", problems)
+        self.assertIn("binding checks not passed", problems)
+        for name in performance.BINDING_RECONCILIATION_CHECKS:
+            self.assertIn(name, problems)
 
     def child(self, repetition, classified, cpu=3000.0):
         """One profiled repetition that passed every gate."""
@@ -5021,8 +5043,8 @@ class AttributionContracts(unittest.TestCase):
         categories["unknown"]["samples_count"] = 0
         checks = passed_hard_checks() + [
             measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
-            for name in ("perf_recorded", "perf_sampling_coverage",
-                         "attribution_exclusive", "unknown_residual_bounded")
+            for name in ("perf_recorded", "stage_agreement_error",
+                         "attribution_exclusive", "stage_agreement_unexplained")
         ]
         return measured_result(
             run_id=f"attribution-metrics-mixed-strict-minio-c1-w15-r{repetition:03d}",
@@ -5049,7 +5071,10 @@ class AttributionContracts(unittest.TestCase):
     # aggregate creates its baseline, and a short one never does.
     def test_the_family_needs_ten_thousand_classified_samples(self):
         plan = {"profile": True, "repetitions": 3, "minimum_samples": 10_000,
-                "cores": [1], "family_ordinal": 1}
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": True, "file": {"sha256": "a"},
+                                        "expected_sha256": "a"}}}
 
         def written(children, directory):
             """The children, each also written where the aggregate hashes it."""
@@ -5080,6 +5105,196 @@ class AttributionContracts(unittest.TestCase):
         self.assertEqual(checks["classified_samples_sufficient"]["status"],
                          measurement.STATUS_FAILED)
         self.assertEqual(short["baseline_files"], [])
+
+    # Scenario: profiles whose categories and named residual hold all of the
+    # measured engine CPU, 85 percent of it, and all of it with a quarter
+    # named residual.
+    # Guarantees: the reconciliation error is the relative difference from
+    # the measured CPU and unexplained CPU is the residual plus what no
+    # sample covered, so the plan's 10 and 20 percent limits catch both.
+    def test_stage_agreement_is_the_plan_rule(self):
+        full = performance.stage_agreement(1000, 10, 1000)
+        self.assertEqual(full, {"error_ratio": 0.0, "unexplained_ratio": 0.01})
+        short = performance.stage_agreement(850, 10, 1000)
+        self.assertAlmostEqual(short["error_ratio"], 0.15)
+        self.assertAlmostEqual(short["unexplained_ratio"], 0.16)
+        self.assertGreater(short["error_ratio"], performance.STAGE_AGREEMENT_ERROR_LIMIT)
+        residual = performance.stage_agreement(1000, 250, 1000)
+        self.assertGreater(residual["unexplained_ratio"], performance.UNEXPLAINED_CPU_LIMIT)
+        self.assertEqual(
+            performance.stage_agreement(10, 0, 0),
+            {"error_ratio": None, "unexplained_ratio": None},
+        )
+
+    # Scenario: three repetitions pass every gate, but the pinned reference
+    # the family is reconciled against does not verify.
+    # Guarantees: the reference is a binding gate of the aggregate itself, so
+    # it fails there and no baseline is written.
+    def test_no_baseline_without_the_verified_reference(self):
+        output = temporary_directory(self)
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 10_000,
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": False}}}
+        children = [self.child(index, 4000) for index in (1, 2, 3)]
+        for child in children:
+            _ = measurement.write_result(output / f"{child['run_id']}.json", child)
+        aggregate = performance.aggregate_attribution(children, plan=plan, output_dir=output)
+        checks = {entry["name"]: entry for entry in aggregate["checks"]}
+        self.assertEqual(checks["reference_family_verified"]["status"],
+                         measurement.STATUS_FAILED)
+        self.assertEqual(aggregate["baseline_files"], [])
+        self.assertEqual(aggregate["status"], measurement.STATUS_FAILED)
+
+    # Scenario: the ledger directory is asked for on an ext4 disk while
+    # /dev/shm is tmpfs, on tmpfs itself, and on a host with no memory file
+    # system at all.
+    # Guarantees: the file system type is read from mountinfo and recorded;
+    # a disk directory falls back to /dev/shm, a tmpfs one is kept, and with
+    # neither the family is refused rather than throttled.
+    def test_ledgers_live_on_a_memory_file_system(self):
+        root = temporary_directory(self)
+        mountinfo = root / "mountinfo"
+        mountinfo.write_text(
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "23 22 0:5 / /dev/shm rw - tmpfs tmpfs rw\n"
+            "24 22 0:6 / /tmp rw - tmpfs tmpfs rw\n",
+            encoding="ascii",
+        )
+        moved = performance.memory_ledger_dir("/var/tmp/ledgers", mountinfo=mountinfo)
+        self.assertEqual((moved["fstype"], moved["fallback"]), ("tmpfs", True))
+        self.assertEqual(moved["directory"], "/dev/shm/ledgers")
+        kept = performance.memory_ledger_dir("/tmp/ledgers", mountinfo=mountinfo)
+        self.assertEqual((kept["mount_point"], kept["fallback"]), ("/tmp", False))
+        disk_only = root / "disk-only"
+        disk_only.write_text("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n", encoding="ascii")
+        with self.assertRaisesRegex(AssertionError, "memory file system"):
+            _ = performance.memory_ledger_dir("/var/tmp/ledgers", mountinfo=disk_only)
+
+    def engine_proof(self, *, clean=True, same_symbols=True):
+        """prepare_profiled_engine with cargo, nm and git replaced."""
+        root = temporary_directory(self)
+        (root / "target" / "release").mkdir(parents=True)
+        canonical = root / "target" / "release" / "df_engine"
+        profiled = root / "target" / "release" / "df_engine-perf"
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            canonical.write_bytes(b"relinked" if argv[1] == "rustc" else b"canonical")
+            return subprocess.CompletedProcess(argv, 0)
+
+        def symbols(path, nm="nm"):
+            digest = "same" if same_symbols or Path(path) == canonical else "other"
+            return {"count": 3, "sha256": digest, "tool": "nm"}
+
+        def build(path):
+            return {"profile": "release", "features": "f", "allocator": "jemalloc",
+                    "toolchain": "rustc 1", "binary": str(path),
+                    "binary_sha256": measurement.file_digest(path)}
+
+        with mock.patch.object(measurement.test_e2e, "WORKSPACE", root), \
+                mock.patch.dict(os.environ, {performance.ATTRIBUTION_ENGINE_ENV: str(profiled)}), \
+                mock.patch.object(performance, "rust_tree_status",
+                                  return_value={"clean": clean, "changes": [] if clean else [" M a.rs"]}), \
+                mock.patch.object(performance.subprocess, "run", side_effect=run), \
+                mock.patch.object(performance, "function_symbols", side_effect=symbols), \
+                mock.patch.object(performance, "rustc_version", return_value="rustc 1 -vV"), \
+                mock.patch.object(performance, "unwind_layout",
+                                  return_value={"compatible": True, "skewed_executable_segments": []}), \
+                mock.patch.object(measurement, "engine_build", side_effect=build), \
+                mock.patch.object(measurement, "git_provenance",
+                                  return_value={"revision": "r", "dirty": not clean}):
+            facts = performance.prepare_profiled_engine(
+                root / "log", lease_path=root / "lease",
+            )
+        return facts, commands
+
+    # Scenario: the attribution builds its two engines from a clean tree with
+    # identical function symbols, from a dirty tree, and into binaries whose
+    # function symbols differ.
+    # Guarantees: the canonical build, the one-flag relink and the restore
+    # run in order under the lease; only a clean tree whose two binaries list
+    # the same functions is valid; the exact flag difference is recorded;
+    # and each refusal says why.
+    def test_the_profiled_engine_is_proven_the_canonical_one(self):
+        facts, commands = self.engine_proof()
+        self.assertTrue(facts["valid"], facts["problems"])
+        self.assertEqual([argv[1] for argv in commands], ["build", "rustc", "build"])
+        self.assertEqual(commands[1][-2:], ["-C", performance.PROFILED_LINK_ARG])
+        self.assertEqual(facts["rustflags_difference"]["profiled"],
+                         ["-C", performance.PROFILED_LINK_ARG])
+        self.assertEqual(facts["canonical"]["function_symbols"],
+                         facts["profiled"]["function_symbols"])
+        dirty, commands = self.engine_proof(clean=False)
+        self.assertFalse(dirty["valid"])
+        self.assertIn("uncommitted", " ".join(dirty["problems"]))
+        self.assertEqual(commands, [])
+        different, _ = self.engine_proof(same_symbols=False)
+        self.assertFalse(different["valid"])
+        self.assertIn("function symbols differ", " ".join(different["problems"]))
+
+    # Scenario: the reader's rows fail part-way through a second load, after
+    # a first load committed.
+    # Guarantees: the failed load is rolled back whole -- the first load's
+    # rows are what the ledger still holds -- and the connection is left
+    # outside any transaction, usable by the comparison that follows.
+    def test_a_failed_read_back_load_is_rolled_back(self):
+        ledger = Ledger(temporary_directory(self) / "ledger.sqlite")
+        self.addCleanup(ledger.close)
+        rows = [(f"id{index}", "logs", "h") for index in range(5)]
+        self.assertEqual(measurement._load_actual(ledger, iter(rows)), 5)
+
+        def failing():
+            for index in range(7):
+                yield (f"new{index}", "logs", "h")
+            raise OSError("reader failed")
+
+        with mock.patch.object(measurement, "ORACLE_BATCH", 3):
+            with self.assertRaisesRegex(OSError, "reader failed"):
+                _ = measurement._load_actual(ledger, failing())
+        self.assertFalse(ledger.connection.in_transaction)
+        kept = ledger.connection.execute("SELECT record_id FROM actual ORDER BY 1").fetchall()
+        self.assertEqual([row[0] for row in kept], [row[0] for row in rows])
+
+    # Scenario: a lifetime fails immediately after its engine started, while
+    # constructing its phase.
+    # Guarantees: the engine is closed anyway, so no failure can leave an
+    # engine behind on a measured core, and the failure propagates.
+    def test_an_early_lifetime_failure_closes_its_engine(self):
+        closed = []
+
+        class FakeEngine:
+            pid = 4242
+            config_sha256 = "c"
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                closed.append(True)
+
+        class FailingCommand:
+            @staticmethod
+            def EnginePhase(*args, **kwargs):
+                raise RuntimeError("phase failed")
+
+        prebuilt = mock.Mock(workload=Workload())
+        plan = {"inputs": {"logs-1k-stable": {"prebuilt": prebuilt}}, "storage": {},
+                "merge": {}, "provenance": {"build": {"binary": "/bin/true"}},
+                "ledger_dir": str(temporary_directory(self))}
+        spec = measure.harness_local_spec()
+        controls = mock.Mock()
+        with mock.patch.object(measurement.test_e2e, "Engine", FakeEngine), \
+                mock.patch.object(performance, "_command", return_value=FailingCommand):
+            with self.assertRaisesRegex(RuntimeError, "phase failed"):
+                _ = performance.attribution_lifetime(
+                    "control", plan, {"config_id": "logs-1k-stable"}, spec,
+                    {"config": {}, "ephemeral_values": {}}, temporary_directory(self),
+                    controls, edge="start", last=True, profile=False,
+                )
+        self.assertEqual(closed, [True])
+        controls.unwatch_workers.assert_called()
 
     # Scenario: a stages family is asked for a filtered set of stages or
     # workloads, or the complete set under another name.

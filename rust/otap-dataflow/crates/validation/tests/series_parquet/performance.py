@@ -22,6 +22,7 @@ import collections
 import concurrent.futures
 import dataclasses
 import functools
+import hashlib
 import json
 import math
 import mmap
@@ -3571,6 +3572,192 @@ def unwind_layout(path) -> dict:
     }
 
 
+# The canonical release engine, the features both engines are built with,
+# and the one flag the profiled engine adds.
+CANONICAL_ENGINE = "target/release/df_engine"
+ENGINE_FEATURES = "series-parquet,aws,durable-buffer"
+PROFILED_LINK_ARG = "link-arg=-Wl,-z,separate-loadable-segments"
+ENGINE_BUILD_LOG = "engine-build.log"
+
+
+def engine_build_commands() -> dict:
+    """The cargo commands that build both engines, in order.
+
+    The canonical engine is built first, so it is the release engine of the
+    current tree; the profiled one is the same crate graph with the single
+    extra linker argument passed to the binary crate only, which relinks it
+    and compiles nothing; the last command restores the canonical binary,
+    which cargo keeps beside the relinked one.
+    """
+    base = [
+        "cargo", "build", "--release", "--locked", "-p", "otel-arrow-dfe",
+        "--bin", "df_engine", "--features", ENGINE_FEATURES,
+    ]
+    profiled = [
+        "cargo", "rustc", "--release", "--locked", "-p", "otel-arrow-dfe",
+        "--bin", "df_engine", "--features", ENGINE_FEATURES, "--", "-C",
+        PROFILED_LINK_ARG,
+    ]
+    return {"canonical": base, "profiled": profiled, "restore": base}
+
+
+def rust_tree_status() -> dict:
+    """Whether the Rust workspace has uncommitted changes to tracked files."""
+    done = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no", "--", "rust/otap-dataflow"],
+        capture_output=True, text=True, timeout=60, cwd=str(measurement.REPO_ROOT),
+    )
+    changes = [line for line in done.stdout.splitlines() if line.strip()]
+    return {
+        "clean": done.returncode == 0 and not changes,
+        "changes": changes[:10],
+        "returncode": done.returncode,
+    }
+
+
+def function_symbols(binary, nm="nm") -> dict:
+    """A digest of every defined function symbol with its size.
+
+    Two binaries linked from the same objects list the same functions with
+    the same sizes whatever their segment layout; any difference in source,
+    features, profile or compiler changes the list. The digest covers the
+    sorted `(size, demangled name)` pairs of text and weak symbols.
+    """
+    done = subprocess.run(
+        [nm, "--defined-only", "--size-sort", "-C", str(binary)],
+        capture_output=True, text=True, errors="replace", timeout=600,
+    )
+    if done.returncode != 0:
+        raise AssertionError(f"{nm} failed on {binary}: {done.stderr[-300:]}")
+    entries = []
+    for line in done.stdout.splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) == 3 and fields[1] in ("t", "T", "w", "W"):
+            entries.append(f"{int(fields[0], 16)} {fields[2]}")
+    entries.sort()
+    return {
+        "count": len(entries),
+        "sha256": hashlib.sha256("\n".join(entries).encode("utf-8", "replace")).hexdigest(),
+        "tool": f"{nm} --defined-only --size-sort -C, types t T w W",
+    }
+
+
+def rustc_version() -> str:
+    """The full `rustc -vV` of the toolchain that builds the engines."""
+    done = subprocess.run(
+        ["rustc", "-vV"], capture_output=True, text=True, timeout=60,
+        cwd=str(test_e2e.WORKSPACE),
+    )
+    return done.stdout.strip()
+
+
+def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
+                            lease_path=None) -> dict:
+    """Build both engines from the current tree and prove them one engine.
+
+    The Rust tree must be clean, so the revision recorded is the source that
+    was compiled. Both engines are built by `engine_build_commands`, holding
+    the host lease so no one's measurement overlaps the compile, before any
+    of this family's measured windows. Each binary's profile, features,
+    allocator, toolchain, `rustc -vV`, hash, segment layout and
+    function-symbol digest are recorded, with the exact flag difference. The
+    engines are one engine only when their function symbols are identical;
+    the profiled one must also have a layout perf can unwind. Any failure
+    is a named problem and the attribution is refused.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    workspace = Path(test_e2e.WORKSPACE)
+    canonical = workspace / CANONICAL_ENGINE
+    profiled = attribution_engine()
+    commands = engine_build_commands()
+    facts = {
+        "commands": {name: " ".join(argv) for name, argv in commands.items()},
+        "environment_rustflags": {
+            name: os.environ.get(name)
+            for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                         "CARGO_BUILD_RUSTFLAGS")
+        },
+        "rustflags_difference": {
+            "canonical": [],
+            "profiled": ["-C", PROFILED_LINK_ARG],
+            "scope": "the df_engine binary crate only, through cargo rustc",
+        },
+        "rust_tree": rust_tree_status(),
+        "git": measurement.git_provenance(),
+        "built": bool(build),
+    }
+    problems = []
+    if not facts["rust_tree"]["clean"]:
+        problems.append(
+            f"the Rust tree has uncommitted changes {facts['rust_tree']['changes']}; "
+            f"a profiled engine must be built from a recorded revision"
+        )
+    if not build:
+        problems.append(
+            "the engines were not built by this family, so neither is proven to "
+            "be the current tree's"
+        )
+    if not problems:
+        lease = measurement.HostLease(lease_path, run_id="attribution-engine-build")
+        lease.acquire(deadline_ns=time.monotonic_ns() + int(lease_wait_s * 10**9))
+        facts["lease"] = lease.as_json()
+        try:
+            with open(log_dir / ENGINE_BUILD_LOG, "w", encoding="ascii",
+                      errors="replace") as log:
+                for name in ("canonical", "profiled", "restore"):
+                    done = subprocess.run(
+                        commands[name], cwd=str(workspace), stdout=log,
+                        stderr=subprocess.STDOUT, timeout=7200,
+                    )
+                    if done.returncode != 0:
+                        problems.append(f"the {name} build failed with {done.returncode}")
+                        break
+                    if name == "canonical":
+                        facts["canonical_sha256_before"] = measurement.file_digest(canonical)
+                    if name == "profiled":
+                        _ = shutil.copyfile(canonical, profiled)
+                        profiled.chmod(0o755)
+        finally:
+            lease.release()
+    for role, path in (("canonical", canonical), ("profiled", profiled)):
+        if not path.is_file():
+            problems.append(f"no {role} engine at {path}")
+            continue
+        described = measurement.engine_build(path)
+        described["rustc_vv"] = rustc_version()
+        described["function_symbols"] = function_symbols(path)
+        described["layout"] = unwind_layout(path)
+        facts[role] = described
+    one, other = facts.get("canonical"), facts.get("profiled")
+    if one and other:
+        if facts.get("canonical_sha256_before") not in (None, one["binary_sha256"]):
+            problems.append(
+                "restoring the canonical engine produced a different binary than "
+                "the canonical build"
+            )
+        for key in ("profile", "features", "allocator", "toolchain", "rustc_vv"):
+            if one[key] != other[key]:
+                problems.append(f"the engines differ in {key}: {one[key]} vs {other[key]}")
+        if one["profile"] != "release":
+            problems.append(f"the canonical engine is a {one['profile']} build")
+        if one["function_symbols"] != other["function_symbols"]:
+            problems.append(
+                f"the engines' function symbols differ: {one['function_symbols']} "
+                f"vs {other['function_symbols']}"
+            )
+        if one["binary_sha256"] == other["binary_sha256"]:
+            problems.append("the profiled engine was not relinked")
+        if not other["layout"]["compatible"]:
+            problems.append(
+                f"the profiled engine's executable segments are skewed: "
+                f"{other['layout']['skewed_executable_segments']}"
+            )
+    facts["problems"] = problems
+    facts["valid"] = not problems
+    return facts
+
+
 def perf_binary() -> str:
     """The perf executable: `SERIES_PERF`, else `perf` on the PATH."""
     return os.environ.get(PERF_BINARY_ENV) or shutil.which("perf") or "perf"
@@ -4297,15 +4484,20 @@ ATTRIBUTION_BLOCK_REQUESTS = 128
 ATTRIBUTION_IN_FLIGHT = 256
 ATTRIBUTION_INTERVAL_S = 15
 
-# The largest share of samples no rule may name, and the band the sampled
-# CPU must fall in relative to what the scheduler says the engine used.
-UNKNOWN_SHARE_LIMIT = 0.20
-SAMPLING_COVERAGE_BOUNDS = (0.7, 1.3)
+# The plan's Stage agreement rule, the binding reconciliation: the sum of
+# the exclusive category CPU and the named residual is compared with the
+# engine CPU the scheduler measured over the same window. A reconciliation
+# error above 10 percent, or unexplained CPU above 20 percent, invalidates
+# the attribution. Unexplained CPU is the named residual (samples no rule
+# matched) plus any measured CPU the samples did not cover.
+STAGE_AGREEMENT_ERROR_LIMIT = 0.10
+UNEXPLAINED_CPU_LIMIT = 0.20
 
-# The band inside which an engine-attributed stage cost is said to agree
-# with its isolated bench cost. The two measure the same code in different
-# contexts -- block sizes, cache state, a shared worker thread -- so this is
-# a reported finding, not a gate.
+# The band of the DESCRIPTIVE per-stage comparison of engine-attributed
+# costs with isolated bench costs. It is not an acceptance model and gates
+# nothing: the two measure the same code in different contexts -- block
+# sizes, cache state, a shared worker thread. A row outside it must carry a
+# measured explanation from published evidence or say it is unexplained.
 AGREEMENT_BOUNDS = (0.5, 2.0)
 
 # The stage family of record every attribution is reconciled against: the
@@ -4342,21 +4534,6 @@ RECONCILIATION_ROWS = (
     ("engine_runtime", ("engine_runtime",), (("otlp_noop", "pipeline"),)),
     ("total", CPU_CATEGORIES, (("otlp_noop", "pipeline"), ("otlp_minio", "async"))),
 )
-
-# Differences a reader should expect before reading a verdict, by row and
-# workload.
-KNOWN_DEVIATIONS = {
-    ("extraction", "metrics-mixed"): (
-        "Task 3c's content-keyed memo made metrics extraction about a third "
-        "cheaper after the pinned family was measured; the spot family at "
-        "the attribution's revision is the comparable reference"
-    ),
-    ("upload", None): (
-        "the upload bench sends pre-encoded bytes in one object, the engine "
-        "streams each file as multipart parts while it encodes, so their "
-        "per-record costs are not expected to match closely"
-    ),
-}
 
 # The metrics every profiled repetition reports, with the direction each
 # gets worse in.
@@ -4500,13 +4677,14 @@ def reference_cpu_ns_per_record(evidence, config_id):
     """The whole engine's expected cost per record, for sizing a profile.
 
     The real engine's noop pipeline plus the cumulative OTLP-to-object-store
-    layer, from the spot family where it measured them, else the pinned one.
+    layer, from the pinned family: the named reference, never a
+    supplementary family in its place.
     """
     total = 0.0
     for stage, mode in (("otlp_noop", "pipeline"), ("otlp_minio", "async")):
         key = f"{stage}/{mode}/{config_id}"
         value = None
-        for family in ("spot", "pinned"):
+        for family in ("pinned",):
             summary = (evidence.get(family) or {}).get("summaries", {}).get(key)
             if summary and _finite(summary["metrics"].get("cpu_ns_per_record")):
                 value = summary["metrics"]["cpu_ns_per_record"]
@@ -4798,6 +4976,52 @@ def oracle_cores(allocation, sibling_groups) -> list:
 LEDGER_DIR_ENV = "SERIES_ATTRIBUTION_LEDGER_DIR"
 
 
+MEMORY_FILESYSTEMS = ("tmpfs", "ramfs")
+MEMORY_FALLBACK = "/dev/shm"
+
+
+def filesystem_of(path, mountinfo="/proc/self/mountinfo") -> dict:
+    """The mount a path lives on and its file system type.
+
+    The longest mount point that contains the path wins, as the kernel
+    resolves it; the path need not exist yet.
+    """
+    target = os.path.realpath(str(path))
+    best = {"mount_point": None, "fstype": None}
+    for line in Path(mountinfo).read_text().splitlines():
+        fields = line.split()
+        if " - " not in line or len(fields) < 5:
+            continue
+        mount_point = fields[4].replace("\\040", " ")
+        fstype = line.split(" - ", 1)[1].split()[0]
+        inside = target == mount_point or target.startswith(mount_point.rstrip("/") + "/")
+        if inside and len(mount_point) >= len(best["mount_point"] or ""):
+            best = {"mount_point": mount_point, "fstype": fstype}
+    return dict(best, path=target)
+
+
+def memory_ledger_dir(requested, *, fallback=MEMORY_FALLBACK,
+                      mountinfo="/proc/self/mountinfo") -> dict:
+    """The ledger directory, proven to be on a memory file system.
+
+    The requested directory is used when it is on tmpfs or ramfs;
+    otherwise `fallback` is, when it is; otherwise the family is refused,
+    because a disk-backed ledger throttles the sender to the disk's fsync
+    rate and the profile then describes an idling engine.
+    """
+    for candidate, used_fallback in ((Path(requested), False),
+                                     (Path(fallback) / Path(requested).name, True)):
+        found = filesystem_of(candidate, mountinfo)
+        if found["fstype"] in MEMORY_FILESYSTEMS:
+            return dict(found, directory=str(candidate), fallback=used_fallback,
+                        requested=str(requested))
+    raise AssertionError(
+        f"neither {requested} ({filesystem_of(requested, mountinfo)['fstype']}) nor "
+        f"{fallback} is on a memory file system; a ledger on disk throttles the "
+        f"sender to its fsync rate. Name a tmpfs with --option ledger_dir=..."
+    )
+
+
 def ledger_path(plan, run_dir, label) -> Path:
     """The ledger of one lifetime, on the ledger directory of the plan."""
     directory = Path(plan.get("ledger_dir") or run_dir) / Path(run_dir).name
@@ -4814,6 +5038,25 @@ def retire_ledger(path) -> dict:
         if candidate.exists():
             candidate.unlink()
     return entry
+
+
+def stage_agreement(attributed_ns, residual_ns, measured_ns) -> dict:
+    """The plan's Stage agreement quantities for one profile.
+
+    `attributed_ns` is the sum of every category's sampled CPU, the named
+    residual included; `residual_ns` is the named residual alone;
+    `measured_ns` is what the scheduler says the engine used in the same
+    window. The error is their relative difference; unexplained CPU is the
+    residual plus whatever measured CPU no sample covered.
+    """
+    if not measured_ns or measured_ns <= 0:
+        return {"error_ratio": None, "unexplained_ratio": None}
+    return {
+        "error_ratio": abs(attributed_ns - measured_ns) / measured_ns,
+        "unexplained_ratio": (
+            residual_ns + max(0, measured_ns - attributed_ns)
+        ) / measured_ns,
+    }
 
 
 def lifetime_indexes(indexes, *, profiled) -> list:
@@ -4903,9 +5146,12 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
         profile = profiled["profile"]
         perf = profiled["perf"]
         coverage = perf["sampling_coverage_ratio"]
-        low, high = SAMPLING_COVERAGE_BOUNDS
-        unknown_share = profile["categories"][UNKNOWN_CATEGORY]["share_ratio"]
         exclusive = sum(entry["weight"] for entry in profile["categories"].values())
+        agreement = stage_agreement(
+            profile["total_weight"],
+            profile["categories"][UNKNOWN_CATEGORY]["weight"],
+            profiled["engine_cpu_ns"],
+        )
         for name, passed, detail in (
             (
                 "perf_recorded",
@@ -4917,11 +5163,13 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
                 f"{perf['parse']['unparsed_lines_count']} unparsed lines",
             ),
             (
-                "perf_sampling_coverage",
-                coverage is not None and low <= coverage <= high,
-                f"sampled {profile['total_weight']} ns of the engine's "
-                f"{perf['sampled_cpu_ns']} ns of {perf['sampled_scope']} CPU in "
-                f"the window: {coverage}",
+                "stage_agreement_error",
+                agreement["error_ratio"] is not None
+                and agreement["error_ratio"] <= STAGE_AGREEMENT_ERROR_LIMIT,
+                f"exclusive categories plus the named residual hold "
+                f"{profile['total_weight']} ns of the {profiled['engine_cpu_ns']} ns "
+                f"the scheduler measured ({perf['sampled_scope']} sampled): error "
+                f"{agreement['error_ratio']}, limit {STAGE_AGREEMENT_ERROR_LIMIT}",
             ),
             (
                 "attribution_exclusive",
@@ -4929,10 +5177,12 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
                 f"categories hold {exclusive} of {profile['total_weight']} ns",
             ),
             (
-                "unknown_residual_bounded",
-                unknown_share <= UNKNOWN_SHARE_LIMIT,
-                f"unknown {unknown_share:.4f} of the profile, limit "
-                f"{UNKNOWN_SHARE_LIMIT}; heaviest "
+                "stage_agreement_unexplained",
+                agreement["unexplained_ratio"] is not None
+                and agreement["unexplained_ratio"] <= UNEXPLAINED_CPU_LIMIT,
+                f"unexplained {agreement['unexplained_ratio']} of the measured CPU "
+                f"(named residual and uncovered CPU), limit {UNEXPLAINED_CPU_LIMIT}; "
+                f"heaviest residual "
                 + json.dumps(profile["named_residual"][:3], sort_keys=True),
             ),
         ):
@@ -4983,6 +5233,7 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
             "worker_schedule": profiled["schedule"]["workers"],
             "admission_closed_s": profiled["admission_closed_s"],
             "sampling_coverage_ratio": coverage,
+            "stage_agreement": agreement,
             "sampled_scope": perf["sampled_scope"],
             "unsampled_kernel_cpu_ns_per_record": (
                 perf["unsampled_kernel_cpu_ns"] / records
@@ -5057,6 +5308,7 @@ def attribution_experiment(plan, job, spec, result, run_dir, controls):
     # The setting is not persistent: a reboot restores the distribution's
     # default, so each repetition records the value it actually ran under.
     result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
+    result["environment"]["ledger_filesystem"] = plan.get("ledger_filesystem")
     result["ephemeral_values"] = dict(plan["ephemeral"])
     result["config"]["input"] = plan["inputs"][job["config_id"]]["prebuilt"].as_json()
     labels = ("control", "profiled") if plan["profile"] else ("control",)
@@ -5269,8 +5521,8 @@ def aggregate_attribution(children, *, plan, output_dir) -> dict:
     )
     checks = derived_checks(children)
     for name in ("rss_reconciliation",) + (
-        ("perf_recorded", "perf_sampling_coverage", "attribution_exclusive",
-         "unknown_residual_bounded") if plan["profile"] else ()
+        ("perf_recorded", "stage_agreement_error", "attribution_exclusive",
+         "stage_agreement_unexplained") if plan["profile"] else ()
     ):
         failed = [
             child["run_id"] for child in children
@@ -5320,6 +5572,22 @@ def aggregate_attribution(children, *, plan, output_dir) -> dict:
                 f"--option records=... if short",
             )
         )
+        # The reference the family is reconciled against must be the one
+        # named by hash before anything this family measured can become a
+        # baseline: every binding gate is decided before the policy runs.
+        pinned = (plan.get("evidence") or {}).get("pinned") or {}
+        checks.append(
+            measurement.check(
+                "reference_family_verified",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED
+                if pinned.get("present") and pinned.get("verified")
+                else measurement.STATUS_FAILED,
+                f"{pinned.get('index')}: present {pinned.get('present')}, sha256 "
+                f"{(pinned.get('file') or {}).get('sha256')}, expected "
+                f"{pinned.get('expected_sha256')}",
+            )
+        )
     result["checks"] = checks
     overheads = [
         (child.get("observations") or {}).get("profile_overhead") or {}
@@ -5345,6 +5613,17 @@ def aggregate_attribution(children, *, plan, output_dir) -> dict:
             for name, values in sorted(by_metric.items())
         },
         "pooled_profile": pooled,
+        "stage_agreement": {
+            "error_limit": STAGE_AGREEMENT_ERROR_LIMIT,
+            "unexplained_limit": UNEXPLAINED_CPU_LIMIT,
+            "repetitions": [
+                (
+                    ((child.get("observations") or {}).get("attribution") or {})
+                    .get("stage_agreement")
+                )
+                for child in children
+            ],
+        },
         "profile_overhead": {
             key: median(values) if values else None
             for key in ("cpu_per_record_ratio", "throughput_ratio", "window_ratio")
@@ -5383,29 +5662,51 @@ def aggregate_attribution(children, *, plan, output_dir) -> dict:
     return result
 
 
-def _stage_source(evidence, key):
-    """The summary of one stage key, from the spot family where it has it."""
-    for family in ("spot", "pinned"):
-        summary = (evidence.get(family) or {}).get("summaries", {}).get(key)
-        if summary is not None:
-            return family, summary
-    return None, None
+def _family_summary(evidence, family, key):
+    """One family's summary of one stage key, or None."""
+    return ((evidence.get(family) or {}).get("summaries") or {}).get(key)
+
+
+def _passed(result, name) -> bool:
+    """Whether a result recorded the named check and every copy passed."""
+    recorded = [entry for entry in result.get("checks", []) if entry["name"] == name]
+    return bool(recorded) and all(
+        entry["status"] == measurement.STATUS_PASSED for entry in recorded
+    )
+
+
+# The checks that make up the plan's binding Stage agreement rule for one
+# workload's aggregate, beside the verified reference and exclusivity.
+BINDING_RECONCILIATION_CHECKS = (
+    "attribution_exclusive",
+    "stage_agreement_error",
+    "stage_agreement_unexplained",
+    "reference_family_verified",
+)
 
 
 def reconcile_attribution(aggregates, evidence) -> dict:
-    """Join each workload's attributed costs with its stage costs.
+    """The binding reconciliation, and the descriptive stage comparison.
 
-    Validity is structural and is a hard gate: the pinned family is the one
-    named by hash, every joined stage summary exists and divides by the
-    same logical-record denominator, and every workload's profile was
-    exclusive. Each row then states the attributed cost, the stage costs
-    of the spot and the pinned family, their ratios and whether they agree
-    within `AGREEMENT_BOUNDS`; that verdict is a finding. Byte rates are
-    listed per stage with their own output representation and never added
-    across stages.
+    Binding, a hard gate: the plan's Stage agreement rule. In every
+    repetition of every workload, exclusive category CPU plus the named
+    residual must be within `STAGE_AGREEMENT_ERROR_LIMIT` of the measured
+    engine CPU, and unexplained CPU within `UNEXPLAINED_CPU_LIMIT`; the
+    profile must be exclusive, and the pinned stage family must be the one
+    named by hash.
+
+    Descriptive, never a gate: each attributed stage cost against its
+    isolated bench cost in the pinned family, the reference, with the spot
+    family reported beside it as supplementary evidence and never
+    substituted. A row outside `AGREEMENT_BOUNDS` is explained only by
+    published measurement -- the supplementary family bringing the same
+    row into the band -- or is marked unexplained. Byte rates are listed per
+    stage with their own output representation and never added across
+    stages.
     """
     problems = []
     pinned = evidence.get("pinned") or {}
+    spot = evidence.get("spot") or {}
     if not pinned.get("present"):
         problems.append(f"the pinned stage family {pinned.get('index')} is not published")
     elif not pinned.get("verified"):
@@ -5413,18 +5714,18 @@ def reconcile_attribution(aggregates, evidence) -> dict:
             f"the pinned stage family {pinned['index']} hashes to "
             f"{pinned['file']['sha256']}, not {pinned.get('expected_sha256')}"
         )
+    low, high = AGREEMENT_BOUNDS
     workloads = {}
     for aggregate in aggregates:
         config_id = aggregate["workload_config_id"]
         metrics = aggregate.get("metrics") or {}
-        exclusive = any(
-            entry["name"] == "attribution_exclusive"
-            and entry["status"] == measurement.STATUS_PASSED
-            for entry in aggregate.get("checks", [])
-        )
-        if not exclusive:
-            problems.append(f"{config_id}: the profile was not shown to be exclusive")
+        failed = [
+            name for name in BINDING_RECONCILIATION_CHECKS if not _passed(aggregate, name)
+        ]
+        if failed:
+            problems.append(f"{config_id}: binding checks not passed: {failed}")
         pooled = (aggregate.get("observations") or {}).get("pooled_profile") or {}
+        agreement = (aggregate.get("observations") or {}).get("stage_agreement") or {}
         engine = metrics.get("engine_cpu_ns_per_record")
         rows = []
         for label, categories, stages in RECONCILIATION_ROWS:
@@ -5442,39 +5743,79 @@ def reconcile_attribution(aggregates, evidence) -> dict:
                 with_allocator = attributed + added * engine if _finite(engine) else None
             joined = []
             reference = 0.0
+            supplementary = 0.0
+            complete = True
+            spot_complete = bool(spot.get("present"))
             for stage, mode in stages:
                 key = f"{stage}/{mode}/{config_id}"
-                source, summary = _stage_source(evidence, key)
-                pinned_summary = (pinned.get("summaries") or {}).get(key)
-                if pinned_summary is None:
-                    problems.append(f"{config_id}: the pinned family has no {key}")
+                summary = _family_summary(evidence, "pinned", key)
+                extra = _family_summary(evidence, "spot", key)
                 if summary is None:
+                    complete = False
+                    problems.append(f"{config_id}: the pinned family has no {key}")
                     continue
                 if summary.get("denominator") != DENOMINATOR:
-                    problems.append(f"{key} ({source}) divides by {summary.get('denominator')!r}")
+                    problems.append(f"{key} divides by {summary.get('denominator')!r}")
                 cost = summary["metrics"].get("cpu_ns_per_record")
                 reference += cost if _finite(cost) else 0.0
+                extra_cost = (extra or {}).get("metrics", {}).get("cpu_ns_per_record")
+                if _finite(extra_cost):
+                    supplementary += extra_cost
+                else:
+                    spot_complete = False
                 joined.append(
                     {
                         "stage": stage,
                         "mode": mode,
-                        "source": source,
+                        "reference": "pinned",
                         "metrics": summary["metrics"],
-                        "pinned_cpu_ns_per_record": (
-                            pinned_summary["metrics"].get("cpu_ns_per_record")
-                            if pinned_summary else None
-                        ),
+                        "supplementary_spot_cpu_ns_per_record": extra_cost,
                         "input_representation": summary.get("input_representation"),
                         "output_representation": summary.get("output_representation"),
                         "denominator": summary.get("denominator"),
                     }
                 )
-            pinned_reference = sum(
-                entry["pinned_cpu_ns_per_record"] or 0.0 for entry in joined
+            ratio = (
+                with_allocator / reference
+                if complete and reference and _finite(with_allocator) else None
             )
-            ratio = with_allocator / reference if reference and _finite(with_allocator) else None
-            low, high = AGREEMENT_BOUNDS
-            note = KNOWN_DEVIATIONS.get((label, config_id)) or KNOWN_DEVIATIONS.get((label, None))
+            spot_ratio = (
+                with_allocator / supplementary
+                if spot_complete and supplementary and _finite(with_allocator) else None
+            )
+            if ratio is None:
+                verdict, explanation = "not_measured", None
+            elif low <= ratio <= high:
+                verdict, explanation = "within_band", None
+            elif spot_ratio is not None and low <= spot_ratio <= high:
+                verdict = "outside_band"
+                explanation = {
+                    "status": "explained",
+                    "evidence": {
+                        "index": spot.get("index"),
+                        "sha256": (spot.get("file") or {}).get("sha256"),
+                        "git": spot.get("git"),
+                    },
+                    "detail": (
+                        f"the supplementary stage family, measured at a later "
+                        f"revision, gives a ratio of {spot_ratio:.3f}, inside the "
+                        f"band: the stage's own cost changed after the pinned "
+                        f"family was measured"
+                    ),
+                }
+            else:
+                verdict = "outside_band"
+                explanation = {
+                    "status": "unexplained",
+                    "detail": (
+                        "no published measurement brings this row into the band"
+                        + (
+                            f"; the supplementary family gives {spot_ratio:.3f}"
+                            if spot_ratio is not None
+                            else "; the supplementary family did not measure it"
+                        )
+                    ),
+                }
             rows.append(
                 {
                     "row": label,
@@ -5486,31 +5827,49 @@ def reconcile_attribution(aggregates, evidence) -> dict:
                         for name in categories
                     ),
                     "stages": joined,
-                    "reference_cpu_ns_per_record": reference,
-                    "pinned_reference_cpu_ns_per_record": pinned_reference,
+                    "reference_cpu_ns_per_record": reference if complete else None,
                     "ratio_to_reference": ratio,
-                    "ratio_to_pinned": (
-                        with_allocator / pinned_reference
-                        if pinned_reference and _finite(with_allocator) else None
+                    "supplementary_spot_cpu_ns_per_record": (
+                        supplementary if spot_complete else None
                     ),
-                    "verdict": (
-                        "not_measured" if ratio is None
-                        else "agrees" if low <= ratio <= high else "differs"
-                    ),
-                    "known_deviation": note,
+                    "ratio_to_supplementary": spot_ratio,
+                    "verdict": verdict,
+                    "explanation": explanation,
                 }
             )
         workloads[config_id] = {
+            "binding": {
+                "checks": {
+                    name: _passed(aggregate, name) for name in BINDING_RECONCILIATION_CHECKS
+                },
+                "repetitions": agreement.get("repetitions"),
+                "error_limit": STAGE_AGREEMENT_ERROR_LIMIT,
+                "unexplained_limit": UNEXPLAINED_CPU_LIMIT,
+            },
             "engine_cpu_ns_per_record": engine,
             "upload_wait_s": metrics.get("upload_wait_s"),
             "flush_wall_s": metrics.get("flush_wall_s"),
-            "rows": rows,
+            "descriptive_stage_comparison": rows,
         }
-    spot = evidence.get("spot") or {}
     return {
-        "valid": not problems,
+        "valid": not problems and bool(aggregates),
         "problems": problems,
-        "agreement_bounds": list(AGREEMENT_BOUNDS),
+        "binding_rule": (
+            "the plan's Stage agreement row: exclusive category CPU plus the "
+            "named residual against the measured engine CPU; an error above "
+            f"{STAGE_AGREEMENT_ERROR_LIMIT:.0%} or unexplained CPU above "
+            f"{UNEXPLAINED_CPU_LIMIT:.0%} invalidates the attribution"
+        ),
+        "descriptive_stage_comparison": {
+            "gating": False,
+            "reference": "pinned",
+            "supplementary": "spot",
+            "agreement_bounds": list(AGREEMENT_BOUNDS),
+            "note": (
+                "engine-attributed stage costs against isolated bench costs; "
+                "descriptive only, not an acceptance model"
+            ),
+        },
         "references": {
             family: {
                 key: value for key, value in (evidence.get(family) or {}).items()
@@ -5554,6 +5913,7 @@ def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir
     result["environment"]["host_at_end"] = host_neighbours(exclude=(os.getpid(),))
     result["family_ordinal"] = plan["family_ordinal"]
     result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
+    result["environment"]["ledger_filesystem"] = plan.get("ledger_filesystem")
     result["preflight"] = preflight
     result["classification"] = classification_rules()
     result["perf"] = {
@@ -5628,7 +5988,7 @@ def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir
                 measurement.STATUS_PASSED if reconciliation["valid"]
                 else measurement.STATUS_FAILED,
                 "; ".join(reconciliation["problems"][:5])
-                or "every joined stage verified and on the same denominator",
+                or reconciliation["binding_rule"] + ": held in every workload",
             )
         )
     result["metrics"] = {
@@ -5757,7 +6117,7 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         "profile": not rehearsal,
         "repetitions": repetitions,
         "lease_wait_s": float(options.get("lease_wait_s", 0.0)),
-        "ledger_dir": str(
+        "ledger_filesystem": memory_ledger_dir(
             options.get("ledger_dir") or os.environ.get(LEDGER_DIR_ENV)
             or Path("/tmp") / f"series-attribution-ledgers-{os.getpid()}"
         ),
@@ -5771,14 +6131,35 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         "host_at_start": host_neighbours(exclude=(os.getpid(),)),
         "inputs": {config_id: {} for config_id in configs},
     }
+    # A directory of this run's own inside the chosen one, so the cleanup
+    # at the end can never remove anything it did not create.
+    plan["ledger_dir"] = str(
+        Path(plan["ledger_filesystem"]["directory"]) / f"attribution-run-{os.getpid()}"
+    )
     if rehearsal:
         preflight = {"attached": False, "rehearsal": True,
                      "reason": "a rehearsal does not profile"}
     else:
-        preflight = perf_preflight(
-            output_dir / "preflight", cores=allocation["profiler"],
-            engine=attribution_engine(),
+        # The engines are built and proven one engine before perf is tried:
+        # a profile of an engine that is not the canonical one describes
+        # nothing this family may claim.
+        engines = prepare_profiled_engine(
+            output_dir / "engines", lease_wait_s=plan["lease_wait_s"],
         )
+        if not engines["valid"]:
+            preflight = {
+                "attached": False,
+                "perf_event_paranoid": perf_event_paranoid(),
+                "engine_provenance": engines,
+                "reason": "the profiled engine is not proven to be the canonical "
+                "release engine: " + "; ".join(engines["problems"]),
+            }
+        else:
+            preflight = perf_preflight(
+                output_dir / "preflight", cores=allocation["profiler"],
+                engine=attribution_engine(),
+            )
+            preflight["engine_provenance"] = engines
         if not preflight["attached"]:
             return publish_attribution(
                 spec, plan, [], [], output_dir, report_dir, started, preflight=preflight
@@ -5786,16 +6167,12 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
     if rehearsal:
         plan["provenance"] = command.prepare_build()
     else:
-        build = measurement.engine_build(attribution_engine())
-        if build["profile"] != command.MEASURED_PROFILE:
-            raise AssertionError(
-                f"an attribution profiles a release engine, not {build['profile']}"
-            )
-        build["link_layout"] = preflight["engine_layout"]
-        build["canonical_release_sha256"] = measurement.engine_build(command.engine_binary())[
-            "binary_sha256"
-        ]
-        plan["provenance"] = {"build": build, "git": measurement.git_provenance()}
+        build = dict(engines["profiled"])
+        build["canonical"] = engines["canonical"]
+        build["rustflags_difference"] = engines["rustflags_difference"]
+        build["build_commands"] = engines["commands"]
+        build["identical_function_symbols"] = True
+        plan["provenance"] = {"build": build, "git": engines["git"]}
     plan["merge"] = command.engine_merge(
         dataclasses.replace(
             spec,
