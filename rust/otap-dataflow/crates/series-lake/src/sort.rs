@@ -310,6 +310,7 @@ pub struct MergeBuild {
     /// so far, which set the chunk's row count.
     heap: BinaryHeap<HeapItem>,
     key_bytes: usize,
+    owned_key_bytes: usize,
     longest_key: usize,
     pinned_bytes: usize,
     pinned_rows: usize,
@@ -366,6 +367,7 @@ impl MergeBuild {
             sorted,
             heap: BinaryHeap::new(),
             key_bytes: 0,
+            owned_key_bytes: 0,
             longest_key: 0,
             pinned_bytes: 0,
             pinned_rows: 0,
@@ -433,8 +435,10 @@ impl MergeBuild {
             rows_done += rows;
             bytes_done += bytes;
             if self.offset == 0 {
+                let first = encoded.row(0);
+                self.owned_key_bytes += first.as_ref().len();
                 self.heap.push(HeapItem {
-                    row: encoded.row(0).owned(),
+                    row: first.owned(),
                     run: self.run,
                     idx: 0,
                     seg: 0,
@@ -451,11 +455,12 @@ impl MergeBuild {
         Ok(self.is_complete())
     }
 
-    /// Heap the keys encoded so far hold beside the runs. Kept as a running
-    /// total, so asking costs nothing.
+    /// Heap the keys encoded so far hold beside the runs: every segment,
+    /// the owned key of every run seeded into the heap, and the heap's own
+    /// allocation. Kept as running totals, so asking costs nothing.
     #[must_use]
     pub fn resident_key_bytes(&self) -> usize {
-        self.key_bytes
+        self.key_bytes + self.owned_key_bytes + self.heap.capacity() * size_of::<HeapItem>()
     }
 
     /// Seed the merge heap and hand over the merge, encoding whatever keys
@@ -1579,8 +1584,9 @@ mod tests {
     /// Guarantees: the build keeps its totals as it goes -- the resident key
     /// bytes, the longest key and the heap, seeded with each run's first row
     /// as soon as that row is encoded -- so neither reporting the keys after
-    /// a slice nor finishing the build scans every key again; the totals
-    /// always equal a full recount.
+    /// a slice nor finishing the build scans every key again; the resident
+    /// figure always equals a full recount of the segments, the owned key of
+    /// every seeded run and the heap's backing allocation.
     #[test]
     fn the_build_keeps_its_totals_as_it_goes() {
         let (runs, spec) = tie_heavy_runs();
@@ -1590,9 +1596,17 @@ mod tests {
         loop {
             let done = build.step().expect("slice");
             let segments: Vec<&Rows> = build.keys.iter().flatten().collect();
+            let owned: usize = build
+                .heap
+                .iter()
+                .map(|item| item.row.as_ref().as_ref().len())
+                .sum();
             assert_eq!(
                 build.resident_key_bytes(),
                 segments.iter().map(|rows| rows.size()).sum::<usize>()
+                    + owned
+                    + build.heap.capacity() * size_of::<HeapItem>(),
+                "segments, the owned key of every seeded run and the heap"
             );
             assert_eq!(
                 build.longest_key,
