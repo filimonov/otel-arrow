@@ -4974,6 +4974,7 @@ def oracle_cores(allocation, sibling_groups) -> list:
 # make it gigabytes, so it is deleted once the read-back has compared it,
 # and the result keeps its hash, size and counts.
 LEDGER_DIR_ENV = "SERIES_ATTRIBUTION_LEDGER_DIR"
+LEDGER_DEFAULT_PREFIX = "series-attribution-ledgers-"
 
 
 MEMORY_FILESYSTEMS = ("tmpfs", "ramfs")
@@ -6205,7 +6206,7 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         "lease_wait_s": float(options.get("lease_wait_s", 0.0)),
         "ledger_filesystem": memory_ledger_dir(
             options.get("ledger_dir") or os.environ.get(LEDGER_DIR_ENV)
-            or Path("/tmp") / f"series-attribution-ledgers-{os.getpid()}"
+            or Path("/tmp") / f"{LEDGER_DEFAULT_PREFIX}{os.getpid()}"
         ),
         "minimum_samples": int(options.get("minimum_samples", ATTRIBUTION_MINIMUM_SAMPLES)),
         "allocation": allocation,
@@ -6328,6 +6329,11 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         store.__exit__(None, None, None)
         # A lifetime that failed before its read-back leaves its ledger.
         shutil.rmtree(plan["ledger_dir"], ignore_errors=True)
+        # The default parent is this run's own too; a directory the caller
+        # named is left as it was found.
+        parent = Path(plan["ledger_dir"]).parent
+        if parent.name == f"{LEDGER_DEFAULT_PREFIX}{os.getpid()}":
+            shutil.rmtree(parent, ignore_errors=True)
         for entry in plan["inputs"].values():
             if entry.get("prebuilt") is not None:
                 entry["prebuilt"].close()
