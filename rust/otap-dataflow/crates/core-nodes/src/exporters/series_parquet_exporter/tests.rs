@@ -1298,6 +1298,85 @@ async fn an_unknown_group_before_known_fields_loses_nothing() {
     }
 }
 
+/// Scenario: an OTLP logs request whose record attribute value sets
+/// `array_value` twice -- `["alpha", "beta"]`, then an empty array -- and whose
+/// body sets `kvlist_value` twice, compared with the same request after prost
+/// decodes and re-encodes it (which merges each repeated member into one).
+/// Guarantees: both are admitted with the same rows, descriptors and values,
+/// and the array elements and every key of both lists are stored: a
+/// message-typed oneof member that follows itself is merged as prost merges
+/// it, so a trailing empty occurrence never silently drops the elements.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repeated_any_value_member_is_merged_end_to_end() {
+    use prost::Message as _;
+
+    let len_field = |field: u32, payload: &[u8]| {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    };
+    let string = |text: &[u8]| len_field(1, text);
+    let key_value = |key: &[u8], value: &[u8]| [len_field(1, key), len_field(2, value)].concat();
+    // AnyValue: array_value ["alpha", "beta"], then array_value [].
+    let array = [
+        len_field(
+            5,
+            &[
+                len_field(1, &string(b"alpha")),
+                len_field(1, &string(b"beta")),
+            ]
+            .concat(),
+        ),
+        len_field(5, &[]),
+    ]
+    .concat();
+    // AnyValue: kvlist_value {k1: "one"}, then kvlist_value {k2: "two"}.
+    let kvlist = [
+        len_field(6, &len_field(1, &key_value(b"k1", &string(b"one")))),
+        len_field(6, &len_field(1, &key_value(b"k2", &string(b"two")))),
+    ]
+    .concat();
+    let mut record = vec![0x09];
+    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    record.extend(len_field(5, &kvlist));
+    record.extend(len_field(6, &key_value(b"tags", &array)));
+    let scope_logs = len_field(2, &record);
+    let raw = len_field(1, &len_field(2, &scope_logs));
+    let canonical = ExportLogsServiceRequest::decode(&raw[..])
+        .expect("prost decodes it")
+        .encode_to_vec();
+    assert_ne!(raw, canonical, "prost merged the repeated members");
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (handler, _rx) = effects(2);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(worker_config(), store, wall, handler);
+    let extract = |body: Vec<u8>| {
+        let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+        assert!(payload.validate_framing().is_ok());
+        let mut context = Context::default();
+        context.set_source_node(7);
+        match worker.prepare(OtapPdata::new(context, payload.into())) {
+            Prepared::Ready(pending) => pending.extracted,
+            Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
+        }
+    };
+    let raw = extract(raw);
+    let canonical = extract(canonical);
+    assert_eq!(raw.stats.rows, 1);
+    assert_eq!(raw.stats, canonical.stats);
+    let raw_all = format!("{:?}{:?}", raw.descriptors, raw.values);
+    assert_eq!(
+        raw_all,
+        format!("{:?}{:?}", canonical.descriptors, canonical.values)
+    );
+    for stored in ["alpha", "beta", "k1", "one", "k2", "two"] {
+        assert!(raw_all.contains(stored), "{stored} is missing");
+    }
+}
+
 /// Scenario: OTLP logs requests whose record body nests arrays exactly at the
 /// framing walk's bound of 256 levels and one level beyond it, under the
 /// default `ingress.max_nesting_depth` of 32.
