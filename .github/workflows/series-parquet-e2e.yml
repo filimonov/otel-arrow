@@ -106,6 +106,24 @@ jobs:
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
           python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
+      # Only the classes that start no container, engine or build; the live
+      # rig slice needs Docker and the host lease and belongs to the earlier
+      # E2E step instead.
+      - name: Fault-tool unit contracts
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          python3 -m unittest \
+            crates.validation.tests.series_parquet.test_failures.ProbeVerdicts \
+            crates.validation.tests.series_parquet.test_failures.Privileges \
+            crates.validation.tests.series_parquet.test_failures.ToolContracts \
+            crates.validation.tests.series_parquet.test_failures.RigRules \
+            crates.validation.tests.series_parquet.test_failures.Teardown \
+            crates.validation.tests.series_parquet.test_failures.Provenance \
+            crates.validation.tests.series_parquet.test_failures.StoreImage \
+            crates.validation.tests.series_parquet.test_failures.AckLossVerdict \
+            crates.validation.tests.series_parquet.test_failures.EvidenceScrub \
+            crates.validation.tests.series_parquet.test_failures.PreflightOutcome \
+            -v
       # The stage bench's own checks, run through the test profile so no
       # optimized build is needed.
       - name: Measurement bench self-test
