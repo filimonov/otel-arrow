@@ -1211,8 +1211,13 @@ impl Worker {
                 .chain(self.cleaning.iter())
                 .map(|job| job.tokens.capacity().saturating_sub(job.tokens.len()))
                 .sum::<usize>();
+        // The flushing block's merge also holds the encoded sort key of
+        // every row of the table it is writing, for as long as that table's
+        // write lasts; the sink reports those bytes and they are charged here.
+        let merge_keys = self.sink.merge_key_bytes();
         let accounted = self.active.data.bytes as u64
             + flushing as u64
+            + merge_keys as u64
             + pending as u64
             + cache
             + self.notify.bytes() as u64

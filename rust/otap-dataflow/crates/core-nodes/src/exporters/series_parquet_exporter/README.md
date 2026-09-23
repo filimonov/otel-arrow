@@ -1019,8 +1019,10 @@ timeout, as described under shutdown above, or lower the flush deadline.
 ### Reading the process residual
 
 `memory.accounted` reports the retained exporter data and the measured
-token allocations, including the cache-entry estimate. `memory.budget`
-reports the configured retained and workspace allowance.
+token allocations, including the cache-entry estimate, and, while a block
+flushes, the encoded sort keys its merge holds for the table being written
+(one key per row of that table, released when the table is written).
+`memory.budget` reports the configured retained and workspace allowance.
 
 The engine additionally publishes one process-scoped gauge under the same
 descriptor name, `memory.unaccounted_rss_bytes`, which is

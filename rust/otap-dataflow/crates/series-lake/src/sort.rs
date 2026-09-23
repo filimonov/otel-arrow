@@ -248,6 +248,25 @@ pub struct MergeIter {
 }
 
 impl MergeIter {
+    /// Heap bytes the merge holds beside its input runs.
+    ///
+    /// Every run's encoded sort keys, allocated when the merge is built and
+    /// released only when the iterator is dropped, plus the merge heap and
+    /// the key row each heap entry owns. The runs themselves are not
+    /// counted: the block they came from already accounts for them. Zero in
+    /// unsorted mode, which encodes no keys.
+    #[must_use]
+    pub fn resident_key_bytes(&self) -> usize {
+        let keys = self.keys.iter().map(Rows::size).sum::<usize>();
+        let heap = self.heap.capacity() * size_of::<HeapItem>()
+            + self
+                .heap
+                .iter()
+                .map(|item| item.row.as_ref().as_ref().len())
+                .sum::<usize>();
+        keys + heap
+    }
+
     fn interleave(&self, pending: &[(usize, usize)]) -> Result<RecordBatch> {
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
         for c in 0..self.schema.fields().len() {
@@ -824,6 +843,42 @@ mod tests {
             all.schema().metadata().is_empty(),
             "the first run's schema metadata is the output's"
         );
+    }
+
+    /// Scenario: two sorted runs of five rows in total, merged by an Int64 and
+    /// a Float64 key, are consumed chunk by chunk.
+    /// Guarantees: the merge reports every row's encoded key -- one null byte
+    /// plus eight value bytes per key column -- and the row offsets as
+    /// resident from the moment it is built until the last chunk, because the
+    /// keys are dropped only with the iterator; unsorted mode encodes no keys
+    /// and reports zero.
+    #[test]
+    fn merge_reports_the_keys_it_keeps_resident() {
+        let r1 = sort_batch(
+            &batch(vec![Some(5), Some(1), Some(9)], vec![0.0; 3], "a"),
+            &spec(),
+        )
+        .expect("s");
+        let r2 = sort_batch(&batch(vec![Some(2), Some(8)], vec![0.0; 2], "b"), &spec()).expect("s");
+        let mut merge = merge_runs(vec![r1.clone(), r2.clone()], &spec(), 1).expect("merge");
+        let encoded_rows = 5 * 2 * (1 + 8);
+        let offsets = (3 + 1 + 2 + 1) * size_of::<usize>();
+        let built = merge.resident_key_bytes();
+        assert!(
+            built >= encoded_rows + offsets,
+            "{built} bytes reported for {encoded_rows} key bytes and {offsets} offset bytes"
+        );
+        let mut rows = 0;
+        while let Some(chunk) = merge.next() {
+            rows += chunk.expect("chunk").num_rows();
+            assert!(
+                merge.resident_key_bytes() >= encoded_rows + offsets,
+                "the keys of every run stay resident until the iterator is dropped"
+            );
+        }
+        assert_eq!(rows, 5);
+        let unsorted = merge_runs(vec![r1, r2], &SortSpec::new(vec![]), 1).expect("merge");
+        assert_eq!(unsorted.resident_key_bytes(), 0);
     }
 
     /// Scenario: an empty spec (sorting disabled).

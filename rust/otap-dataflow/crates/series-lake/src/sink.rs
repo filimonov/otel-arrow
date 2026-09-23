@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
@@ -108,6 +109,37 @@ pub struct Sink {
     cfg: LakeConfig,
     naming: FileNaming,
     clock: SinkClock,
+    merge_keys: MergeKeys,
+}
+
+/// The encoded sort keys the table being written keeps resident.
+///
+/// A sorted table's merge encodes the key of every row of every run up
+/// front and holds them until the merge iterator is dropped, beside the
+/// block the rows come from. That is heap the block's own accounting does
+/// not include, so the sink publishes it for its owner to charge.
+#[derive(Debug, Default)]
+struct MergeKeys {
+    current: AtomicUsize,
+    high_water: AtomicUsize,
+}
+
+impl MergeKeys {
+    /// Record `bytes` as resident until the returned guard is dropped.
+    fn hold(&self, bytes: usize) -> MergeKeysHeld<'_> {
+        self.current.store(bytes, AtomicOrdering::Relaxed);
+        let _ = self.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+        MergeKeysHeld(self)
+    }
+}
+
+/// Clears the resident merge keys when a table write ends, however it ends.
+struct MergeKeysHeld<'a>(&'a MergeKeys);
+
+impl Drop for MergeKeysHeld<'_> {
+    fn drop(&mut self) {
+        self.0.current.store(0, AtomicOrdering::Relaxed);
+    }
 }
 
 /// A sleep future of the sink's clock.
@@ -152,7 +184,7 @@ impl std::fmt::Debug for SinkClock {
 #[derive(Debug)]
 struct CreationWatch {
     inner: Arc<dyn ObjectStore>,
-    creating: std::sync::atomic::AtomicUsize,
+    creating: AtomicUsize,
     settled: tokio::sync::Notify,
 }
 
@@ -173,7 +205,7 @@ impl CreationWatch {
     fn new(inner: Arc<dyn ObjectStore>) -> Self {
         Self {
             inner,
-            creating: std::sync::atomic::AtomicUsize::new(0),
+            creating: AtomicUsize::new(0),
             settled: tokio::sync::Notify::new(),
         }
     }
@@ -365,7 +397,23 @@ impl Sink {
             cfg,
             naming,
             clock: SinkClock::default(),
+            merge_keys: MergeKeys::default(),
         }
+    }
+
+    /// Heap the merge of the table being written holds for its sort keys.
+    ///
+    /// Zero between tables and outside a write. A block's owner adds it to
+    /// what it accounts for while the block flushes.
+    #[must_use]
+    pub fn merge_key_bytes(&self) -> usize {
+        self.merge_keys.current.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The most `merge_key_bytes` any table write of this sink has held.
+    #[must_use]
+    pub fn merge_key_high_water_bytes(&self) -> usize {
+        self.merge_keys.high_water.load(AtomicOrdering::Relaxed)
     }
 
     /// The same sink, bounding its cleanup on `clock` instead of tokio time.
@@ -560,6 +608,9 @@ impl Sink {
         let mut failure: Option<Error> = None;
         let mut cleanup: Option<Instant> = None;
         let mut merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        // Held until this function returns, which is when `merged` and the
+        // keys it encoded are dropped.
+        let _keys = self.merge_keys.hold(merged.resident_key_bytes());
         loop {
             // Yield before every chunk. `AsyncArrowWriter::write` usually
             // completes synchronously, and so does a buffered upload whose store
@@ -1295,6 +1346,46 @@ mod tests {
         assert_eq!(
             native_sorting_columns(&SortSpec::new(Vec::new()), &metrics).expect("convert"),
             None
+        );
+    }
+
+    /// Scenario: a sealed block of 30 log records, whose values table merges
+    /// on `series_id` and `time_unix_nano`, is written.
+    /// Guarantees: while a table is written the sink reports the heap its
+    /// merge holds for the encoded keys -- exactly what the largest table's
+    /// merge iterator reports, at least one null byte plus the value bytes of
+    /// both keys for every row -- and nothing once the write has returned, so
+    /// the exporter can charge the keys for as long as they are resident.
+    #[tokio::test]
+    async fn the_sink_reports_the_merge_keys_it_holds() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cfg = LakeConfig::default();
+        let b = sealed_block(&cfg, 30);
+        let expected = b
+            .tables()
+            .filter(|table| !table.is_empty())
+            .map(|table| {
+                merge_runs(
+                    table.iter_snapshots().cloned().collect(),
+                    table.spec(),
+                    cfg.sorting.merge_chunk_bytes,
+                )
+                .expect("merge")
+                .resident_key_bytes()
+            })
+            .max()
+            .expect("a table");
+        let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "keys"));
+        assert_eq!(sink.merge_key_high_water_bytes(), 0);
+        let _ = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        assert_eq!(sink.merge_key_bytes(), 0, "no table is being written");
+        assert_eq!(sink.merge_key_high_water_bytes(), expected);
+        assert!(
+            expected >= 30 * ((1 + 16) + (1 + 8)),
+            "{expected} key bytes"
         );
     }
 
