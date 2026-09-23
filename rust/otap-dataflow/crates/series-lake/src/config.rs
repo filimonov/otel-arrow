@@ -248,7 +248,8 @@ pub struct IngressLimits {
     /// Logical input size limit.
     #[serde(deserialize_with = "byte_size")]
     pub max_request_bytes: usize,
-    /// Extracted output limit, enforced on the *measured* extracted output.
+    /// Extracted output limit, enforced on the *measured* extracted output
+    /// plus the decoded attribute tables it is built from.
     ///
     /// Values rows are charged as estimates only while their run is being
     /// built; sealing a run replaces that estimate with the measured pinned

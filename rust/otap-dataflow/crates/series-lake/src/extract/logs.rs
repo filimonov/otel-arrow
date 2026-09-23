@@ -49,8 +49,7 @@ pub(crate) fn extract_logs(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)
-        .with_table_bytes(cfg.ingress.max_extracted_bytes);
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
     let mut stats = ExtractStats::default();
     let Some(logs) = records.get(ArrowPayloadType::Logs) else {
         return Ok(Extracted {
@@ -62,9 +61,9 @@ pub(crate) fn extract_logs(
             stats,
         });
     };
-    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits)?;
-    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits)?;
-    let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, limits)?;
+    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits, budget)?;
+    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits, budget)?;
+    let log_attrs = attr_table(records, ArrowPayloadType::LogAttrs, limits, budget)?;
 
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let time = plain(logs, TIME_UNIX_NANO, &ts_ns)?;
@@ -82,7 +81,7 @@ pub(crate) fn extract_logs(
     let scope_name = struct_child(logs, SCOPE, NAME, &DataType::Utf8)?;
     let scope_version = struct_child(logs, SCOPE, VERSION, &DataType::Utf8)?;
     let scope_schema = plain(logs, SCHEMA_URL, &DataType::Utf8)?;
-    let body = any_value_col(logs, BODY)?;
+    let mut body = any_value_col(logs, BODY)?;
 
     let allow: &[String] = &cfg.logs.series_attributes;
     let values_denorm = denorm_columns(Dataset::LogsValues, cfg);
@@ -160,8 +159,8 @@ pub(crate) fn extract_logs(
 
         let (t_ns, t_us) = timestamp_pair(i64_at(&time, row), &mut stats);
         let (o_ns, o_us) = timestamp_pair(i64_at(&observed, row), &mut stats);
-        let body_value = match &body {
-            Some(b) => b.value_at(row, limits)?,
+        let body_value = match &mut body {
+            Some(b) => b.value_at(row, limits, budget)?,
             None => Value::Null,
         };
         let body_str = body_string(&body_value);
@@ -215,6 +214,9 @@ pub(crate) fn extract_logs(
             budget,
         )?;
         stats.rows += 1;
+    }
+    if let Some(body) = body {
+        body.release(budget);
     }
     let (batches, pinned_bytes) = sink.finish(budget)?;
     let values = if batches.is_empty() {
@@ -448,7 +450,7 @@ mod tests {
         let cfg = LakeConfig::default();
         // The premise of the test: the tree fits the limit, the rendering does not.
         let attr = vec![("blob".to_string(), Value::Bytes(vec![0xABu8; RAW]))];
-        assert!(crate::extract::kv_bytes(&attr) < cfg.ingress.max_row_bytes);
+        assert!(crate::value::kv_bytes(&attr) < cfg.ingress.max_row_bytes);
         assert!(crate::extract::rendered_kv_bytes(&attr) > cfg.ingress.max_row_bytes);
 
         let data = LogsData {
@@ -614,16 +616,27 @@ mod tests {
     fn budget_is_enforced_on_the_measured_output() {
         let mut probe = encode_logs(&logs_data());
         let out = extract(&mut probe, &cfg()).expect("extract");
-        // What the budget holds once the run is sealed: the estimated descriptor
-        // rows plus the measured pinned bytes of the values batches. The values
-        // rows' estimates were uncharged when their run was sealed.
+        // What the budget holds once the run is sealed: the decoded attribute
+        // tables, the estimated descriptor rows and the measured pinned bytes of
+        // the values batches. The values rows' estimates were uncharged when
+        // their run was sealed.
+        let tables = crate::extract::tests::table_bytes(
+            &encode_logs(&logs_data()),
+            &cfg(),
+            &[
+                ArrowPayloadType::ResourceAttrs,
+                ArrowPayloadType::ScopeAttrs,
+                ArrowPayloadType::LogAttrs,
+            ],
+        );
         let measured: usize = out
             .descriptors
             .iter()
             .map(|d| d.approx_bytes)
             .sum::<usize>()
             + out.pinned_bytes
-            + out.shared_bytes;
+            + out.shared_bytes
+            + tables;
 
         let mut exact = cfg();
         exact.ingress.max_extracted_bytes = measured;

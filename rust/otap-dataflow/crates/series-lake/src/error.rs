@@ -14,7 +14,7 @@ pub enum SizeBudget {
     Row,
     /// One attribute key or value, or one CBOR cell (`ingress.max_row_bytes`).
     Cell,
-    /// The decoded content of one attribute table
+    /// Decoded attribute values, charged to the extracted budget
     /// (`ingress.max_extracted_bytes`).
     Table,
     /// The request's worst case in one block (`max_block_bytes`).

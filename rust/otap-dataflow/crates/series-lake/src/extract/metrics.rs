@@ -533,10 +533,9 @@ pub(crate) fn extract_metrics(
     cfg: &LakeConfig,
     budget: &mut Budget,
 ) -> Result<Extracted> {
-    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)
-        .with_table_bytes(cfg.ingress.max_extracted_bytes);
-    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits)?;
-    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits)?;
+    let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
+    let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits, budget)?;
+    let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits, budget)?;
     let metrics = metric_rows(records, cfg)?;
     let mut c = Common {
         cfg,
@@ -614,7 +613,7 @@ pub(crate) fn extract_metrics(
     // them, so a request with several malformed columns is refused for the
     // same one.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
-        let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, limits)?;
+        let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, limits, budget)?;
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let attrs_id = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -653,11 +652,12 @@ pub(crate) fn extract_metrics(
                 ))
             },
         )?;
+        attrs.release(budget);
     }
 
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
-        let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, limits)?;
+        let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, limits, budget)?;
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let attrs_id = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -719,6 +719,7 @@ pub(crate) fn extract_metrics(
                 ))
             },
         )?;
+        attrs.release(budget);
     }
 
     // One sink for both point kinds, so a mixed request still produces a single
@@ -911,8 +912,8 @@ mod tests {
 
     /// Scenario: one metric under a resource carrying a 256 KiB attribute,
     /// with `max_extracted_bytes` set just above what the request actually
-    /// retains: its descriptor rows, its values and its one shared resource
-    /// copy.
+    /// retains: its attribute tables, its descriptor rows, its values and its
+    /// one shared resource copy.
     /// Guarantees: the request is accepted. The shared copy is charged once,
     /// when it is made, and the descriptor row that holds it charges only its
     /// own rendering of it, so the two are never counted together and a
@@ -929,13 +930,22 @@ mod tests {
         let cfg = LakeConfig::default();
         let mut budget = Budget::new(&cfg);
         let out = extract_metrics(&encode_metrics(&d), &cfg, &mut budget).expect("measure");
+        let tables = crate::extract::tests::table_bytes(
+            &encode_metrics(&d),
+            &cfg,
+            &[
+                ArrowPayloadType::ResourceAttrs,
+                ArrowPayloadType::ScopeAttrs,
+            ],
+        );
         let retained: usize = out
             .descriptors
             .iter()
             .map(|r| r.approx_bytes)
             .sum::<usize>()
             + out.pinned_bytes
-            + out.shared_bytes;
+            + out.shared_bytes
+            + tables;
         // The premise: the copy alone is a large fraction of the retained size,
         // so counting it twice would take the request past the limit below.
         assert!(retained > ATTR_BYTES);
@@ -1506,6 +1516,7 @@ mod tests {
             &records,
             ArrowPayloadType::NumberDpAttrs,
             DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes),
+            &mut Budget::new(&cfg),
         )
         .expect("attrs");
         assert_eq!(table.get(0).len(), 1);
@@ -1662,7 +1673,7 @@ mod tests {
         assert_eq!(resource.len(), 25);
         assert_eq!(
             out.shared_bytes,
-            super::super::kv_bytes(resource),
+            crate::value::kv_bytes(resource),
             "one shared copy of the resource, no scope attributes"
         );
         assert!(

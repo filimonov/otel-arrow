@@ -27,7 +27,7 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
-use crate::value::{DecodeLimits, Value, map_string, value_bytes};
+use crate::value::{DecodeLimits, Value, kv_bytes, map_string};
 
 /// The single "cast this batch column to a plain type" helper of the crate.
 ///
@@ -204,9 +204,9 @@ pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extra
 
 /// The single byte accountant of one request.
 ///
-/// One `Budget` is created in [`extract`] and threaded through every descriptor
-/// row and every values row, so that a request with many small datasets cannot
-/// spend the whole limit once per dataset.
+/// One `Budget` is created in [`extract`] and threaded through every decoded
+/// attribute table, descriptor row and values row, so that a request with many
+/// small datasets or tables cannot spend the whole limit once per each.
 ///
 /// A values row is charged its approximate size while the run is being built,
 /// because nothing is measurable until the run is sealed. When the run *is*
@@ -249,13 +249,19 @@ impl Budget {
 
     /// Charge bytes that are not one row, such as a sealed batch.
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.add(bytes, crate::error::SizeBudget::Extracted)
+    }
+
+    /// Charge decoded attribute values; past the limit they refuse the request
+    /// as [`crate::error::SizeBudget::Table`].
+    pub(crate) fn charge_decoded(&mut self, bytes: usize) -> Result<()> {
+        self.add(bytes, crate::error::SizeBudget::Table)
+    }
+
+    fn add(&mut self, bytes: usize, budget: crate::error::SizeBudget) -> Result<()> {
         self.used = self.used.saturating_add(bytes);
         if self.used > self.limit {
-            return Err(Error::too_large(
-                crate::error::SizeBudget::Extracted,
-                self.used,
-                self.limit,
-            ));
+            return Err(Error::too_large(budget, self.used, self.limit));
         }
         Ok(())
     }
@@ -267,13 +273,6 @@ impl Budget {
     pub(crate) fn uncharge(&mut self, bytes: usize) {
         self.used = self.used.saturating_sub(bytes);
     }
-}
-
-/// Approximate retained bytes of a sorted attribute list.
-pub(crate) fn kv_bytes(list: &[(String, Value)]) -> usize {
-    list.iter()
-        .map(|(k, v)| k.len() + 24 + value_bytes(v))
-        .sum()
 }
 
 /// Approximate retained bytes of one denormalized cell.
@@ -705,14 +704,16 @@ pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<An
     })?))
 }
 
-/// Attribute table for a payload type, empty when the payload is absent.
+/// Attribute table for a payload type, empty when the payload is absent,
+/// charged to `budget` (see [`AttrTable::from_batch`]).
 pub(crate) fn attr_table(
     records: &OtapArrowRecords,
     pt: ArrowPayloadType,
     limits: DecodeLimits,
+    budget: &mut Budget,
 ) -> Result<AttrTable> {
     match records.get(pt) {
-        Some(b) => AttrTable::from_batch(b, limits),
+        Some(b) => AttrTable::from_batch(b, limits, budget),
         None => Ok(AttrTable::default()),
     }
 }
@@ -967,6 +968,20 @@ mod tests {
     use arrow::buffer::{BooleanBuffer, NullBuffer};
     use arrow::datatypes::{Field, Schema};
 
+    /// Bytes the attribute tables of `payloads` charge to a request budget.
+    pub(in crate::extract) fn table_bytes(
+        records: &OtapArrowRecords,
+        cfg: &LakeConfig,
+        payloads: &[ArrowPayloadType],
+    ) -> usize {
+        let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
+        let mut budget = Budget::new(cfg);
+        for &pt in payloads {
+            let _table = attr_table(records, pt, limits, &mut budget).expect("attribute table");
+        }
+        budget.used
+    }
+
     fn batch_with_utf8(name: &str) -> RecordBatch {
         let schema = Schema::new(vec![Field::new(name, DataType::Utf8, true)]);
         let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["x"]))];
@@ -1029,14 +1044,18 @@ mod tests {
         )]));
         let b = RecordBatch::try_new(Arc::new(Schema::new(vec![body])), vec![struct_col])
             .expect("batch");
-        let any = any_value_col(&b, "body")
+        let mut any = any_value_col(&b, "body")
             .expect("struct body")
             .expect("present");
         // Type 1 is TYPE_STR with no `str` column: the tag names the variant and
         // the missing column means the type's default, so this is `Str("")`.
         assert_eq!(
-            any.value_at(0, DecodeLimits::new(32, usize::MAX))
-                .expect("value"),
+            any.value_at(
+                0,
+                DecodeLimits::new(32, usize::MAX),
+                &mut Budget::new(&LakeConfig::default())
+            )
+            .expect("value"),
             Value::Str(String::new())
         );
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
@@ -1154,15 +1173,23 @@ mod tests {
         assert_eq!(opt_u16_at(&ids, 0), Some(7));
         assert_eq!(opt_u16_at(&ids, 1), None);
 
-        let any = any_value_col(&b, "body").expect("body").expect("present");
+        let mut any = any_value_col(&b, "body").expect("body").expect("present");
         assert_eq!(
-            any.value_at(0, DecodeLimits::new(32, usize::MAX))
-                .expect("row 0"),
+            any.value_at(
+                0,
+                DecodeLimits::new(32, usize::MAX),
+                &mut Budget::new(&LakeConfig::default())
+            )
+            .expect("row 0"),
             Value::Str("kept".into())
         );
         assert_eq!(
-            any.value_at(1, DecodeLimits::new(32, usize::MAX))
-                .expect("row 1"),
+            any.value_at(
+                1,
+                DecodeLimits::new(32, usize::MAX),
+                &mut Budget::new(&LakeConfig::default())
+            )
+            .expect("row 1"),
             Value::Null
         );
     }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array, UInt16Array, UInt32Array};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt8Type};
+use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt8Type, UInt16Type};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::arrays::{
     ByteArrayAccessor, MaybeDictArrayAccessor, NullableArrayAccessor, StringArrayAccessor,
@@ -20,12 +20,15 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use crate::error::{Error, Result};
-use crate::value::{DecodeLimits, Value, decode_cbor, sort_kvlist, value_bytes};
+use crate::extract::Budget;
+use crate::value::{DecodeLimits, Value, decode_cbor, entry_bytes, sort_kvlist, value_bytes};
 
 /// Attributes of one OTAP attribute batch, grouped by parent id.
 #[derive(Debug, Default)]
 pub struct AttrTable {
     groups: HashMap<u32, Vec<(String, Value)>>,
+    /// Decoded bytes the table charged to its request's budget.
+    bytes: usize,
 }
 
 /// Fetch `name` from `batch` as `to`, or `None` when the column is absent.
@@ -125,6 +128,29 @@ fn cell_fits(len: usize, limits: DecodeLimits) -> Result<()> {
     Ok(())
 }
 
+/// The dictionary values of a `u8`- or `u16`-keyed column and its key at
+/// `row` (`None` for a null key), or `None` for a plain column.
+fn dictionary_at(a: &ArrayRef, row: usize) -> Option<(&ArrayRef, Option<usize>)> {
+    if let Some(d) = a.as_dictionary_opt::<UInt8Type>() {
+        return Some((d.values(), d.key(row)));
+    }
+    a.as_dictionary_opt::<UInt16Type>()
+        .map(|d| (d.values(), d.key(row)))
+}
+
+/// Rows referencing each of the `values` entries of a dictionary column.
+fn reference_counts(a: &ArrayRef, values: usize) -> Vec<u32> {
+    let mut refs = vec![0_u32; values];
+    for row in 0..a.len() {
+        if let Some((_, Some(key))) = dictionary_at(a, row)
+            && let Some(count) = refs.get_mut(key)
+        {
+            *count += 1;
+        }
+    }
+    refs
+}
+
 /// The seven `AnyValue` columns (type, str, int, double, bool, bytes, ser) of an
 /// attribute batch or a log body struct, cast to plain types.
 pub(crate) struct AnyValueColumns {
@@ -135,6 +161,13 @@ pub(crate) struct AnyValueColumns {
     bools: Option<ArrayRef>,
     bytes: Option<ArrayRef>,
     sers: Option<ArrayRef>,
+    /// Decoded `ser` dictionary values a later row still references, by
+    /// dictionary index, with the bytes each charged to the request budget.
+    decoded: HashMap<usize, (Value, usize)>,
+    /// Rows left to read per `ser` dictionary index, counted on first use.
+    refs: Option<Vec<u32>>,
+    /// Bytes of `decoded`, charged to the request budget until they leave it.
+    decoded_bytes: usize,
 }
 
 impl AnyValueColumns {
@@ -155,7 +188,15 @@ impl AnyValueColumns {
             bools: cast_opt(ATTRIBUTE_BOOL, &DataType::Boolean)?,
             bytes: cast_opt(ATTRIBUTE_BYTES, &DataType::Binary)?,
             sers: cast_opt(ATTRIBUTE_SER, &DataType::Binary)?,
+            decoded: HashMap::new(),
+            refs: None,
+            decoded_bytes: 0,
         })
+    }
+
+    /// Give back the budget charged for the decoded dictionary values.
+    pub(crate) fn release(self, budget: &mut Budget) {
+        budget.uncharge(self.decoded_bytes);
     }
 
     /// Typed value at a row.
@@ -175,13 +216,20 @@ impl AnyValueColumns {
     /// `ser` cell under those tags is malformed content rather than a default.
     ///
     /// A string, bytes or CBOR cell longer than `limits.max_cell_bytes` is
-    /// refused as too large before it is copied or decoded.
+    /// refused as too large before it is copied or decoded. A dictionary-encoded
+    /// `ser` value is decoded once and kept, charged to `budget`, until the last
+    /// row that references it takes it; the rows before get clones.
     ///
     /// # Errors
     /// Returns [`Error::Refused`] for an unknown type tag, for a map or slice
-    /// whose `ser` payload is missing, for a malformed CBOR payload and for an
-    /// oversized cell.
-    pub(crate) fn value_at(&self, row: usize, limits: DecodeLimits) -> Result<Value> {
+    /// whose `ser` payload is missing, for a malformed CBOR payload, for an
+    /// oversized cell and for a kept copy past the budget.
+    pub(crate) fn value_at(
+        &mut self,
+        row: usize,
+        limits: DecodeLimits,
+        budget: &mut Budget,
+    ) -> Result<Value> {
         if !self.types.is_valid(row) {
             return Ok(Value::Null);
         }
@@ -220,22 +268,55 @@ impl AnyValueColumns {
                 });
                 Value::Bytes(cell.transpose()?.unwrap_or_default())
             }
-            // `decode_cbor` refuses an oversized cell before decoding it.
-            AttributeValueType::Map | AttributeValueType::Slice => {
-                match self
-                    .sers
-                    .as_ref()
-                    .and_then(|a| bytes_cell(a, row, |b| decode_cbor(b, limits)))
-                {
-                    Some(value) => value?,
-                    None => {
-                        return Err(Error::invalid(
-                            "map or slice attribute without a ser payload",
-                        ));
-                    }
-                }
-            }
+            AttributeValueType::Map | AttributeValueType::Slice => self
+                .ser_at(row, limits, budget)?
+                .ok_or_else(|| Error::invalid("map or slice attribute without a ser payload"))?,
         })
+    }
+
+    /// The decoded `ser` cell at `row`, `None` when it is absent or null.
+    fn ser_at(
+        &mut self,
+        row: usize,
+        limits: DecodeLimits,
+        budget: &mut Budget,
+    ) -> Result<Option<Value>> {
+        let Some(sers) = &self.sers else {
+            return Ok(None);
+        };
+        let Some((values, key)) = dictionary_at(sers, row) else {
+            return bytes_cell(sers, row, |b| decode_cbor(b, limits)).transpose();
+        };
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let refs = self
+            .refs
+            .get_or_insert_with(|| reference_counts(sers, values.len()));
+        let left = refs
+            .get_mut(key)
+            .ok_or_else(|| Error::invalid("ser dictionary key out of range"))?;
+        *left = left.saturating_sub(1);
+        let last = *left == 0;
+        if last {
+            if let Some((value, bytes)) = self.decoded.remove(&key) {
+                budget.uncharge(bytes);
+                self.decoded_bytes -= bytes;
+                return Ok(Some(value));
+            }
+        } else if let Some((value, _)) = self.decoded.get(&key) {
+            return Ok(Some(value.clone()));
+        }
+        let Some(value) = bytes_cell(values, key, |b| decode_cbor(b, limits)).transpose()? else {
+            return Ok(None);
+        };
+        if !last {
+            let bytes = value_bytes(&value);
+            budget.charge_decoded(bytes)?;
+            self.decoded_bytes += bytes;
+            let _ = self.decoded.insert(key, (value.clone(), bytes));
+        }
+        Ok(Some(value))
     }
 }
 
@@ -247,48 +328,43 @@ impl AttrTable {
     /// Build the table from an `attributes_16` or `attributes_32` batch.
     ///
     /// Keys and values are read through dictionary encoding rather than
-    /// expanded, and charged as they are read: a key or value longer than
-    /// `limits.max_cell_bytes`, or a table whose keys and values add up to
-    /// more than `limits.max_table_bytes`, is refused as too large before the
-    /// cell that crosses the limit is copied. The table is the decoded form of
-    /// the batch, so without that charge one dictionary value referenced by
-    /// many rows would be copied once per row before any budget applied.
+    /// expanded, and each entry's decoded footprint ([`entry_bytes`]) is
+    /// charged to `budget` as it is read, so the table draws from the same
+    /// `max_extracted_bytes` as the rest of the request.
     ///
     /// # Errors
     /// Refuses the batch when `parent_id` is missing or null, a required
     /// column is absent, an attribute type or CBOR payload is malformed, a
-    /// parent has a duplicate attribute key, or a cell or the table is too
-    /// large.
-    pub fn from_batch(batch: &RecordBatch, limits: DecodeLimits) -> Result<Self> {
+    /// parent has a duplicate attribute key, a cell is longer than
+    /// `limits.max_cell_bytes`, or the budget is exhausted.
+    pub(crate) fn from_batch(
+        batch: &RecordBatch,
+        limits: DecodeLimits,
+        budget: &mut Budget,
+    ) -> Result<Self> {
         let parent_ids = read_parent_ids(batch)?;
         let keys = required(batch, ATTRIBUTE_KEY, &DataType::Utf8)?;
-        let any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;
+        let mut any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;
 
         let mut groups: HashMap<u32, Vec<(String, Value)>> = HashMap::new();
-        let mut total = 0_usize;
+        let mut bytes = 0_usize;
         for (row, &parent_id) in parent_ids.iter().enumerate() {
             let key = str_cell(&keys, row, |k| {
-                cell_fits(k.len(), limits)?;
-                total = total.saturating_add(k.len());
-                Ok::<_, Error>(k.to_owned())
+                cell_fits(k.len(), limits).map(|()| k.to_owned())
             })
             .transpose()?
             .unwrap_or_default();
-            let value = any.value_at(row, limits)?;
-            total = total.saturating_add(payload_bytes(&value));
-            if total > limits.max_table_bytes {
-                return Err(Error::too_large(
-                    crate::error::SizeBudget::Table,
-                    total,
-                    limits.max_table_bytes,
-                ));
-            }
+            let value = any.value_at(row, limits, budget)?;
+            let entry = entry_bytes(&key, &value);
+            budget.charge_decoded(entry)?;
+            bytes += entry;
             groups.entry(parent_id).or_default().push((key, value));
         }
+        any.release(budget);
         for list in groups.values_mut() {
             sort_kvlist(list)?;
         }
-        Ok(Self { groups })
+        Ok(Self { groups, bytes })
     }
 
     /// Attributes of one parent, sorted by key, or an empty slice.
@@ -305,25 +381,10 @@ impl AttrTable {
             .map(|(k, v)| k.len() + 24 + value_bytes(v))
             .sum()
     }
-}
 
-/// The variable-size payload of one decoded value: what a table of them
-/// holds beyond its fixed per-cell overhead.
-///
-/// Only string and byte content counts, nested or not, so the sum is never
-/// more than the rendered cells extraction later charges for the same
-/// values, and a request extraction would accept is never refused by the
-/// table charge.
-fn payload_bytes(value: &Value) -> usize {
-    match value {
-        Value::Str(s) => s.len(),
-        Value::Bytes(b) => b.len(),
-        Value::Array(items) => items.iter().map(payload_bytes).sum(),
-        Value::KvList(entries) => entries
-            .iter()
-            .map(|(k, v)| k.len() + payload_bytes(v))
-            .sum(),
-        Value::Null | Value::Int(_) | Value::Double(_) | Value::Bool(_) => 0,
+    /// Drop the table and give back what it charged to `budget`.
+    pub(crate) fn release(self, budget: &mut Budget) {
+        budget.uncharge(self.bytes);
     }
 }
 
@@ -375,6 +436,73 @@ mod tests {
     /// Depth 32, no cell-size bound: the size limit has its own tests.
     fn limits() -> DecodeLimits {
         DecodeLimits::new(32, usize::MAX)
+    }
+
+    /// A request budget of `limit` bytes.
+    fn budget(limit: usize) -> Budget {
+        let mut cfg = crate::config::LakeConfig::default();
+        cfg.ingress.max_extracted_bytes = limit;
+        Budget::new(&cfg)
+    }
+
+    /// A CBOR array of `n` zeros: one encoded byte and one decoded node each.
+    fn cbor_zeros(n: usize) -> Vec<u8> {
+        let mut ser = Vec::new();
+        ciborium::into_writer(
+            &ciborium::Value::Array(vec![ciborium::Value::Integer(0.into()); n]),
+            &mut ser,
+        )
+        .expect("cbor");
+        ser
+    }
+
+    /// A one-MiB CBOR cell of small ints, about 32 MiB once decoded.
+    fn one_mib_of_ints() -> Vec<u8> {
+        let ser = cbor_zeros((1 << 20) - 5);
+        assert_eq!(ser.len(), 1 << 20);
+        ser
+    }
+
+    /// Slice attributes `k`, one parent per row, whose `ser` column is
+    /// `Dictionary<U16, Binary>` over `values` and row `i` references key
+    /// `keys[i]`: the OTAP schema's encoding of the column.
+    fn ser_dictionary_batch(values: &[&[u8]], keys: &[u16]) -> RecordBatch {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt16Type;
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new(
+                "ser",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Binary)),
+                true,
+            ),
+        ]);
+        let n = u16::try_from(keys.len()).expect("rows fit u16");
+        let ser = DictionaryArray::<UInt16Type>::try_new(
+            UInt16Array::from(keys.to_vec()),
+            Arc::new(BinaryArray::from(values.to_vec())),
+        )
+        .expect("dictionary");
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from_iter_values(0..n)),
+            Arc::new(StringArray::from(vec!["k"; keys.len()])),
+            Arc::new(UInt8Array::from(vec![6u8; keys.len()])),
+            Arc::new(ser),
+        ];
+        RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
+    }
+
+    fn refused_by_table(result: &Result<AttrTable>) -> bool {
+        use crate::error::{Excess, SizeBudget};
+        matches!(
+            result,
+            Err(Error::Refused(RefuseReason::RequestTooLarge(Excess {
+                budget: SizeBudget::Table,
+                ..
+            })))
+        )
     }
 
     fn batch() -> RecordBatch {
@@ -468,9 +596,9 @@ mod tests {
     fn a_large_dictionary_value_is_refused_before_it_is_expanded() {
         let big = "x".repeat(2 << 20);
         let batch = dictionary_batch(256, &big);
-        let limits = DecodeLimits::new(32, 1 << 20).with_table_bytes(32 << 20);
+        let limits = DecodeLimits::new(32, 1 << 20);
         assert!(matches!(
-            AttrTable::from_batch(&batch, limits),
+            AttrTable::from_batch(&batch, limits, &mut budget(32 << 20)),
             Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
@@ -485,11 +613,75 @@ mod tests {
     fn many_references_to_one_dictionary_value_are_bounded() {
         let value = "y".repeat(512 << 10);
         let batch = dictionary_batch(256, &value);
-        let limits = DecodeLimits::new(32, 1 << 20).with_table_bytes(32 << 20);
+        let limits = DecodeLimits::new(32, 1 << 20);
         assert!(matches!(
-            AttrTable::from_batch(&batch, limits),
+            AttrTable::from_batch(&batch, limits, &mut budget(32 << 20)),
             Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
+    }
+
+    /// Scenario: 64 rows reference one dictionary-encoded `ser` value, a
+    /// one-MiB CBOR array of small ints, under the default 1 MiB cell limit and
+    /// 32 MiB request budget.
+    /// Guarantees: the value is decoded once and the table is refused against
+    /// the budget on its first copy, not after 64 decodes of 32 MiB each.
+    #[test]
+    fn a_dictionary_ser_value_is_decoded_once_and_its_copies_are_charged() {
+        let value = one_mib_of_ints();
+        let batch = ser_dictionary_batch(&[&value], &[0; 64]);
+        let before = crate::value::decodes();
+        let result = AttrTable::from_batch(
+            &batch,
+            DecodeLimits::new(32, 1 << 20),
+            &mut budget(32 << 20),
+        );
+        assert!(refused_by_table(&result), "{result:?}");
+        assert_eq!(crate::value::decodes() - before, 1);
+    }
+
+    /// Scenario: rows alternate between two dictionary-encoded `ser` arrays
+    /// under a budget that cannot bind.
+    /// Guarantees: each distinct dictionary key is decoded exactly once and
+    /// every row still reads back its own value.
+    #[test]
+    fn each_distinct_dictionary_ser_value_is_decoded_once() {
+        let (a, b) = (cbor_zeros(1000), cbor_zeros(2000));
+        let batch = ser_dictionary_batch(&[&a, &b], &[0, 1, 0, 1, 0, 1]);
+        let before = crate::value::decodes();
+        let t = AttrTable::from_batch(&batch, limits(), &mut budget(usize::MAX)).expect("table");
+        assert_eq!(crate::value::decodes() - before, 2);
+        for parent in 0..6 {
+            let len = if parent % 2 == 0 { 1000 } else { 2000 };
+            assert!(matches!(&t.get(parent)[0].1, Value::Array(items) if items.len() == len));
+        }
+    }
+
+    /// Scenario: one plain (not dictionary-encoded) `ser` cell holds a one-MiB
+    /// CBOR array of small ints, decoded against a 16 MiB and a 64 MiB budget.
+    /// Guarantees: the table is charged the decoded footprint, about 32 MiB,
+    /// not the encoded length or zero, so it is refused under 16 MiB and
+    /// accepted under 64 MiB.
+    #[test]
+    fn a_plain_ser_cell_is_charged_its_decoded_footprint() {
+        let value = one_mib_of_ints();
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new("ser", DataType::Binary, true),
+        ]);
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(StringArray::from(vec!["k"])),
+            Arc::new(UInt8Array::from(vec![6u8])),
+            Arc::new(BinaryArray::from(vec![value.as_slice()])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
+        let limits = DecodeLimits::new(32, 1 << 20);
+        let refused = AttrTable::from_batch(&batch, limits, &mut budget(16 << 20));
+        assert!(refused_by_table(&refused), "{refused:?}");
+        let t = AttrTable::from_batch(&batch, limits, &mut budget(64 << 20)).expect("fits");
+        assert!(t.bytes > crate::value::VALUE_NODE_BYTES * ((1 << 20) - 5));
     }
 
     /// Scenario: a small dictionary-encoded batch -- parent ids, keys and
@@ -501,7 +693,7 @@ mod tests {
     #[test]
     fn a_dictionary_batch_reads_through_without_expansion() {
         let batch = dictionary_batch(3, "shared");
-        let t = AttrTable::from_batch(&batch, limits()).expect("table");
+        let t = AttrTable::from_batch(&batch, limits(), &mut budget(usize::MAX)).expect("table");
         for parent in 0..3 {
             assert_eq!(
                 t.get(parent),
@@ -519,7 +711,7 @@ mod tests {
     /// Guarantees: each parent gets a sorted, typed attribute list; absent parents are empty.
     #[test]
     fn groups_and_sorts_by_parent() {
-        let t = AttrTable::from_batch(&batch(), limits()).expect("table");
+        let t = AttrTable::from_batch(&batch(), limits(), &mut budget(usize::MAX)).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -555,7 +747,7 @@ mod tests {
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
         assert!(matches!(
-            AttrTable::from_batch(&b, limits()),
+            AttrTable::from_batch(&b, limits(), &mut budget(usize::MAX)),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
     }
@@ -578,7 +770,7 @@ mod tests {
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
         assert!(matches!(
-            AttrTable::from_batch(&b, limits()),
+            AttrTable::from_batch(&b, limits(), &mut budget(usize::MAX)),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
     }
@@ -612,7 +804,7 @@ mod tests {
     fn absent_value_column_decodes_as_the_type_default() {
         // Tags: str, int, double, bool, bytes, empty.
         let b = batch_without_value_columns(&[1, 2, 3, 4, 7, 0]);
-        let t = AttrTable::from_batch(&b, limits()).expect("table");
+        let t = AttrTable::from_batch(&b, limits(), &mut budget(usize::MAX)).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -646,7 +838,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![None::<i64>, None])),
         ];
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
-        let t = AttrTable::from_batch(&b, limits()).expect("table");
+        let t = AttrTable::from_batch(&b, limits(), &mut budget(usize::MAX)).expect("table");
         assert_eq!(
             t.get(0),
             &[
@@ -665,7 +857,7 @@ mod tests {
         for tag in [5u8, 6] {
             let b = batch_without_value_columns(&[tag]);
             assert!(matches!(
-                AttrTable::from_batch(&b, limits()),
+                AttrTable::from_batch(&b, limits(), &mut budget(usize::MAX)),
                 Err(Error::Refused(RefuseReason::Invalid(_)))
             ));
         }

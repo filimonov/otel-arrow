@@ -16,27 +16,15 @@ pub struct DecodeLimits {
     pub max_depth: usize,
     /// Maximum byte length of one string, bytes or encoded `ser` cell.
     pub max_cell_bytes: usize,
-    /// Maximum string and byte content one attribute table may decode.
-    pub max_table_bytes: usize,
 }
 
 impl DecodeLimits {
-    /// Limits from a depth and a cell byte bound, with no table bound.
+    /// Limits from a depth and a cell byte bound.
     #[must_use]
     pub fn new(max_depth: usize, max_cell_bytes: usize) -> Self {
         Self {
             max_depth,
             max_cell_bytes,
-            max_table_bytes: usize::MAX,
-        }
-    }
-
-    /// The same limits with a bound on what one attribute table may decode.
-    #[must_use]
-    pub fn with_table_bytes(self, max_table_bytes: usize) -> Self {
-        Self {
-            max_table_bytes,
-            ..self
         }
     }
 }
@@ -75,10 +63,8 @@ pub enum Value {
 /// configuration, so a deeply nested payload is refused during parsing rather
 /// than after its whole tree has been allocated.
 ///
-/// There is no separate node budget: the decoded tree is bounded by the cell
-/// cap, because every CBOR item costs at least one encoded byte and expands to
-/// at most a small constant of decoded bytes, so a tree from a cell of at most
-/// `max_cell_bytes` is at most that many bytes times that constant.
+/// The decoded tree can be [`VALUE_NODE_BYTES`] per encoded byte, so the caller
+/// charges its [`value_bytes`] to the request budget.
 ///
 /// # Errors
 /// Refuses an oversized cell as `RequestTooLarge`, nesting deeper than
@@ -92,6 +78,8 @@ pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
             limits.max_cell_bytes,
         ));
     }
+    #[cfg(test)]
+    DECODES.with(|n| n.set(n.get() + 1));
     // One recursion level per container, plus one so that a payload exactly at
     // `max_depth` is settled by the conversion below rather than by the parser:
     // `convert` is the definition of this crate's depth rule.
@@ -222,20 +210,48 @@ pub fn body_string(v: &Value) -> Option<String> {
     map_string(v)
 }
 
-/// Approximate retained size of a value, used for row-size budgets.
+/// Inline bytes of one decoded value node.
+pub const VALUE_NODE_BYTES: usize = size_of::<Value>();
+
+/// Inline bytes of one owned string or byte buffer.
+pub const BUFFER_HEADER_BYTES: usize = size_of::<String>();
+
+/// Decoded footprint of a value: [`VALUE_NODE_BYTES`] per node plus string,
+/// byte and key content.
+#[must_use]
 pub fn value_bytes(v: &Value) -> usize {
-    match v {
-        Value::Null | Value::Int(_) | Value::Double(_) | Value::Bool(_) => 8,
-        Value::Str(s) => s.len() + 24,
-        Value::Bytes(b) => b.len() + 24,
-        Value::Array(items) => 24 + items.iter().map(value_bytes).sum::<usize>(),
-        Value::KvList(entries) => {
-            24 + entries
-                .iter()
-                .map(|(k, v)| k.len() + 24 + value_bytes(v))
-                .sum::<usize>()
+    VALUE_NODE_BYTES
+        + match v {
+            Value::Null | Value::Int(_) | Value::Double(_) | Value::Bool(_) => 0,
+            Value::Str(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            Value::Array(items) => items.iter().map(value_bytes).sum(),
+            Value::KvList(entries) => kv_bytes(entries),
         }
-    }
+}
+
+/// Decoded footprint of one key/value entry.
+#[must_use]
+pub fn entry_bytes(key: &str, value: &Value) -> usize {
+    BUFFER_HEADER_BYTES + key.len() + value_bytes(value)
+}
+
+/// Decoded footprint of a key/value list.
+#[must_use]
+pub fn kv_bytes(list: &[(String, Value)]) -> usize {
+    list.iter().map(|(k, v)| entry_bytes(k, v)).sum()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// CBOR cells this thread has decoded.
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// CBOR cells this thread has decoded so far.
+#[cfg(test)]
+pub(crate) fn decodes() -> usize {
+    DECODES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
