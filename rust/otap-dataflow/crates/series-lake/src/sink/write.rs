@@ -23,7 +23,10 @@ use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use crate::hook_store::{HookGuard, HookStore, StoreHooks};
 use tokio_util::sync::CancellationToken;
 
 /// The encoded sort keys the table being written keeps resident.
@@ -323,7 +326,26 @@ pub(super) fn chunk_charge(merge: &MergeIter, chunk: &RecordBatch) -> usize {
 }
 
 /// The store one table is written through: the sink's own store, counting
-/// the multipart uploads it is creating.
+/// the multipart uploads it is creating and entering the table's upload
+/// bytes in its ledger.
+pub(super) type CreationWatch = HookStore<Creations>;
+
+/// `inner`, watched for the multipart uploads it is creating, with its
+/// upload bytes entered in `ledger`.
+pub(super) fn creation_watch(
+    inner: Arc<dyn ObjectStore>,
+    ledger: Arc<UploadLedger>,
+) -> CreationWatch {
+    HookStore::new(
+        inner,
+        Creations {
+            state: Arc::new(CreationState::default()),
+            ledger,
+        },
+    )
+}
+
+/// The hooks of a [`CreationWatch`].
 ///
 /// `BufWriter::abort` can only abort an upload whose creation has finished;
 /// while it is still being created there is nothing to abort, and dropping the
@@ -331,46 +353,39 @@ pub(super) fn chunk_charge(merge: &MergeIter, chunk: &RecordBatch) -> usize {
 /// count is what lets a cancelled write wait for exactly that creation, and
 /// for nothing else it may be blocked on.
 #[derive(Debug)]
-pub(super) struct CreationWatch {
-    pub(super) inner: Arc<dyn ObjectStore>,
-    pub(super) creating: AtomicUsize,
-    pub(super) settled: tokio::sync::Notify,
+pub(super) struct Creations {
+    state: Arc<CreationState>,
     /// Where the table's upload bytes are entered.
-    pub(super) ledger: Arc<UploadLedger>,
+    ledger: Arc<UploadLedger>,
+}
+
+/// Multipart creations in flight, and the wake-up of their end.
+#[derive(Debug, Default)]
+struct CreationState {
+    creating: AtomicUsize,
+    settled: tokio::sync::Notify,
 }
 
 /// Counts one multipart creation for as long as it is in flight.
-pub(super) struct Creating<'a>(&'a CreationWatch);
+struct Creating(Arc<CreationState>);
 
-impl Drop for Creating<'_> {
+impl Drop for Creating {
     fn drop(&mut self) {
-        let _ = self
-            .0
-            .creating
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.0.creating.fetch_sub(1, SeqCst);
         self.0.settled.notify_waiters();
     }
 }
 
-impl CreationWatch {
-    pub(super) fn new(inner: Arc<dyn ObjectStore>, ledger: Arc<UploadLedger>) -> Self {
-        Self {
-            inner,
-            creating: AtomicUsize::new(0),
-            settled: tokio::sync::Notify::new(),
-            ledger,
-        }
-    }
-
+impl Creations {
     /// Whether a multipart upload is being created right now.
     pub(super) fn creating(&self) -> bool {
-        self.creating.load(std::sync::atomic::Ordering::SeqCst) > 0
+        self.state.creating.load(SeqCst) > 0
     }
 
     /// Resolves once no multipart upload is being created.
     pub(super) async fn settled(&self) {
         loop {
-            let notified = self.settled.notified();
+            let notified = self.state.settled.notified();
             tokio::pin!(notified);
             // Registered before the check, so a creation that ends between
             // the check and the wait still wakes it.
@@ -383,76 +398,30 @@ impl CreationWatch {
     }
 }
 
-impl std::fmt::Display for CreationWatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner.fmt(f)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for CreationWatch {
-    async fn put_opts(
+impl StoreHooks for Creations {
+    async fn before_put(
         &self,
-        location: &Path,
-        payload: object_store::PutPayload,
-        options: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        let _landed = PutLanded(Arc::clone(&self.ledger));
-        self.inner.put_opts(location, payload, options).await
+        _location: &Path,
+        _payload: &object_store::PutPayload,
+    ) -> object_store::Result<Option<HookGuard>> {
+        Ok(Some(Box::new(PutLanded(Arc::clone(&self.ledger)))))
     }
 
-    async fn put_multipart_opts(
+    async fn before_multipart(&self, _location: &Path) -> object_store::Result<Option<HookGuard>> {
+        let _ = self.state.creating.fetch_add(1, SeqCst);
+        Ok(Some(Box::new(Creating(Arc::clone(&self.state)))))
+    }
+
+    fn wrap_upload(
         &self,
-        location: &Path,
-        options: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        let _ = self
-            .creating
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _creating = Creating(self);
-        let inner = self.inner.put_multipart_opts(location, options).await?;
-        Ok(Box::new(LedgeredUpload {
-            inner,
+        _location: &Path,
+        upload: Box<dyn object_store::MultipartUpload>,
+    ) -> Box<dyn object_store::MultipartUpload> {
+        Box::new(LedgeredUpload {
+            inner: upload,
             ledger: Arc::clone(&self.ledger),
-        }))
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        })
     }
 }
 
@@ -505,13 +474,13 @@ impl Sink {
             result = &mut op => return result.map_err(Error::from),
         }
         let deadline = cleanup.get_or_insert_with(|| self.start_cleanup());
-        if !watch.creating() {
+        if !watch.hooks().creating() {
             return Err(Error::cancelled(None));
         }
         tokio::select! {
             biased;
             _ = &mut op => Err(Error::cancelled(None)),
-            () = watch.settled() => Err(Error::cancelled(None)),
+            () = watch.hooks().settled() => Err(Error::cancelled(None)),
             () = deadline => Err(Error::cancelled(Some(format!(
                 "the write in flight did not finish within {:?}, so a multipart upload \
                  it was creating may be left to the bucket lifecycle rule",
@@ -687,7 +656,7 @@ impl Sink {
             )))
             .build();
         let ledger = Arc::new(UploadLedger::default());
-        let watch = Arc::new(CreationWatch::new(self.store.clone(), Arc::clone(&ledger)));
+        let watch = Arc::new(creation_watch(self.store.clone(), Arc::clone(&ledger)));
         let buf = BufWriter::with_capacity(
             Arc::clone(&watch) as Arc<dyn ObjectStore>,
             path.clone(),

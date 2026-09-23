@@ -14,6 +14,7 @@ pub mod clock;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod hook_store;
 pub mod schema;
 pub mod sink;
 pub mod sort;

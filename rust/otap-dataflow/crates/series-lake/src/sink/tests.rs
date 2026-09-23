@@ -3,7 +3,7 @@
 
 //! Tests of the Parquet sink.
 
-use super::write::{CreationWatch, UploadLedger, chunk_charge};
+use super::write::{UploadLedger, chunk_charge, creation_watch};
 use super::*;
 use crate::buffer::Block;
 use crate::cache::SeriesCache;
@@ -11,18 +11,15 @@ use crate::clock::PartitionId;
 use crate::config::{LakeConfig, Nulls, SortOrder};
 use crate::error::{Error, TransientError};
 use crate::extract::extract;
+use crate::hook_store::{HookGuard, HookStore, StoreHooks};
 use crate::schema::{Dataset, dataset_schema, schema_fingerprint};
 use crate::sort::SortSpec;
 use crate::sort::merge_runs;
 use arrow::record_batch::RecordBatch;
-use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
-};
+use object_store::{MultipartUpload, PutPayload, PutResult, UploadPart};
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
     AnyValue, KeyValue as OtlpKeyValue, any_value,
@@ -182,15 +179,13 @@ enum AbortBehavior {
     Hang,
 }
 
-/// An `ObjectStore` that starts real multipart uploads and then controls how
+/// Store hooks that let real multipart uploads start and then control how
 /// their parts and aborts behave.
 ///
-/// `put_multipart_opts` delegates immediately, unlike a wrapper that parks
-/// before delegating: the `BufWriter` must actually reach its `Write` state,
-/// because that is the only state in which `BufWriter::abort` does anything.
+/// The creation is not delayed: the `BufWriter` must actually reach its
+/// `Write` state, the only state in which `BufWriter::abort` does anything.
 #[derive(Debug)]
 struct ControlledMultipart {
-    inner: Arc<dyn ObjectStore>,
     /// Notified when a part upload has started.
     entered: Arc<Notify>,
     /// Set once the upload has been aborted.
@@ -242,152 +237,51 @@ impl MultipartUpload for ControlledUpload {
     }
 }
 
-impl std::fmt::Display for ControlledMultipart {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ControlledMultipart({})", self.inner)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for ControlledMultipart {
-    async fn put_opts(
+impl StoreHooks for ControlledMultipart {
+    fn wrap_upload(
         &self,
-        location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        self.inner.put_opts(location, payload, options).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let inner = self.inner.put_multipart_opts(location, options).await?;
-        Ok(Box::new(ControlledUpload {
+        _location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        Box::new(ControlledUpload {
             inner,
             entered: self.entered.clone(),
             aborted: self.aborted.clone(),
             parts: self.parts.clone(),
             part: self.part,
             abort: self.abort,
-        }))
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        })
     }
 }
 
-/// An `ObjectStore` whose multipart creation is slow: it cancels a token as
-/// the values upload is being created and yields before the creation
+/// Store hooks that make a multipart creation slow: they cancel a token as
+/// the values upload is being created and yield before the creation
 /// finishes, so the cancellation lands while `BufWriter` is still
 /// preparing the upload.
 #[derive(Debug)]
 struct CancelDuringCreate {
-    inner: Arc<dyn ObjectStore>,
     token: CancellationToken,
 }
 
-impl std::fmt::Display for CancelDuringCreate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CancelDuringCreate({})", self.inner)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for CancelDuringCreate {
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        self.inner.put_opts(location, payload, options).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+impl StoreHooks for CancelDuringCreate {
+    async fn before_multipart(&self, location: &Path) -> object_store::Result<Option<HookGuard>> {
         if location.as_ref().contains("dataset=values") {
             self.token.cancel();
             for _ in 0..4 {
                 tokio::task::yield_now().await;
             }
         }
-        self.inner.put_multipart_opts(location, options).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        Ok(None)
     }
 }
 
-/// An `ObjectStore` that cancels a token the first time the values dataset
+/// Store hooks that cancel a token the first time the values dataset
 /// object is opened, so a test can land a cancellation inside the chunk loop
 /// without depending on the scheduler.
 #[derive(Debug)]
 struct CancelOnValues {
-    inner: Arc<dyn ObjectStore>,
     token: CancellationToken,
     /// Set when the trip happened on a multipart upload, which only starts
     /// while the writer is still writable.
@@ -407,63 +301,20 @@ impl CancelOnValues {
     }
 }
 
-impl std::fmt::Display for CancelOnValues {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CancelOnValues({})", self.inner)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for CancelOnValues {
-    async fn put_opts(
+impl StoreHooks for CancelOnValues {
+    async fn before_put(
         &self,
         location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+        _payload: &PutPayload,
+    ) -> object_store::Result<Option<HookGuard>> {
         let _ = self.trip(location, false);
-        self.inner.put_opts(location, payload, options).await
+        Ok(None)
     }
 
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn before_multipart(&self, location: &Path) -> object_store::Result<Option<HookGuard>> {
         let _ = self.trip(location, true);
-        self.inner.put_multipart_opts(location, options).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        Ok(None)
     }
 }
 
@@ -1083,11 +934,13 @@ async fn cancellation_at_a_chunk_boundary() {
     let b = sealed_upload_block(&cfg);
     let token = CancellationToken::new();
     let tripped_multipart = Arc::new(AtomicBool::new(false));
-    let store: Arc<dyn ObjectStore> = Arc::new(CancelOnValues {
-        inner: local(&dir),
-        token: token.clone(),
-        tripped_multipart: tripped_multipart.clone(),
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        CancelOnValues {
+            token: token.clone(),
+            tripped_multipart: tripped_multipart.clone(),
+        },
+    ));
     let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let got = sink.write_block(&b, &token).await;
     assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
@@ -1112,14 +965,16 @@ async fn cancellation_inside_an_upload() {
     let entered = Arc::new(Notify::new());
     let aborted = Arc::new(AtomicBool::new(false));
     let parts = Arc::new(AtomicUsize::new(0));
-    let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
-        inner: local(&dir),
-        entered: entered.clone(),
-        aborted: aborted.clone(),
-        parts: parts.clone(),
-        part: PartBehavior::Park,
-        abort: AbortBehavior::Delegate,
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        ControlledMultipart {
+            entered: entered.clone(),
+            aborted: aborted.clone(),
+            parts: parts.clone(),
+            part: PartBehavior::Park,
+            abort: AbortBehavior::Delegate,
+        },
+    ));
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
     let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
@@ -1155,17 +1010,21 @@ async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
     let dir = tempfile::tempdir().expect("tmp");
     let aborted = Arc::new(AtomicBool::new(false));
     let token = CancellationToken::new();
-    let store: Arc<dyn ObjectStore> = Arc::new(CancelDuringCreate {
-        inner: Arc::new(ControlledMultipart {
-            inner: local(&dir),
-            entered: Arc::new(Notify::new()),
-            aborted: aborted.clone(),
-            parts: Arc::new(AtomicUsize::new(0)),
-            part: PartBehavior::Fail,
-            abort: AbortBehavior::Delegate,
-        }),
-        token: token.clone(),
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        Arc::new(HookStore::new(
+            local(&dir),
+            ControlledMultipart {
+                entered: Arc::new(Notify::new()),
+                aborted: aborted.clone(),
+                parts: Arc::new(AtomicUsize::new(0)),
+                part: PartBehavior::Fail,
+                abort: AbortBehavior::Delegate,
+            },
+        )),
+        CancelDuringCreate {
+            token: token.clone(),
+        },
+    ));
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
     let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
@@ -1187,14 +1046,16 @@ async fn write_failure_with_a_failing_abort_reports_both() {
     let dir = tempfile::tempdir().expect("tmp");
     let aborted = Arc::new(AtomicBool::new(false));
     let parts = Arc::new(AtomicUsize::new(0));
-    let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
-        inner: local(&dir),
-        entered: Arc::new(Notify::new()),
-        aborted: aborted.clone(),
-        parts: parts.clone(),
-        part: PartBehavior::Fail,
-        abort: AbortBehavior::Fail,
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        ControlledMultipart {
+            entered: Arc::new(Notify::new()),
+            aborted: aborted.clone(),
+            parts: parts.clone(),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Fail,
+        },
+    ));
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
     let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
@@ -1228,14 +1089,16 @@ async fn write_failure_with_a_failing_abort_reports_both() {
 #[tokio::test]
 async fn the_abort_is_bounded_by_the_callers_timer() {
     let dir = tempfile::tempdir().expect("tmp");
-    let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
-        inner: local(&dir),
-        entered: Arc::new(Notify::new()),
-        aborted: Arc::new(AtomicBool::new(false)),
-        parts: Arc::new(AtomicUsize::new(0)),
-        part: PartBehavior::Fail,
-        abort: AbortBehavior::Hang,
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        ControlledMultipart {
+            entered: Arc::new(Notify::new()),
+            aborted: Arc::new(AtomicBool::new(false)),
+            parts: Arc::new(AtomicUsize::new(0)),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Hang,
+        },
+    ));
     let mut cfg = upload_config();
     cfg.upload.abort_timeout = Duration::from_secs(3600);
     let b = sealed_upload_block(&cfg);
@@ -1261,14 +1124,16 @@ async fn the_abort_is_bounded_by_the_callers_timer() {
 #[tokio::test]
 async fn abort_timeout_is_reported() {
     let dir = tempfile::tempdir().expect("tmp");
-    let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
-        inner: local(&dir),
-        entered: Arc::new(Notify::new()),
-        aborted: Arc::new(AtomicBool::new(false)),
-        parts: Arc::new(AtomicUsize::new(0)),
-        part: PartBehavior::Fail,
-        abort: AbortBehavior::Hang,
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        ControlledMultipart {
+            entered: Arc::new(Notify::new()),
+            aborted: Arc::new(AtomicBool::new(false)),
+            parts: Arc::new(AtomicUsize::new(0)),
+            part: PartBehavior::Fail,
+            abort: AbortBehavior::Hang,
+        },
+    ));
     let mut cfg = upload_config();
     cfg.upload.abort_timeout = Duration::from_millis(1);
     cfg.validate().expect("valid config");
@@ -1468,11 +1333,10 @@ fn only_a_chunk_the_merge_allocated_is_charged() {
     }
 }
 
-/// An `ObjectStore` whose multipart parts wait for a permit before they
+/// Store hooks whose multipart parts wait for a permit before they
 /// are uploaded, announcing each part as it is handed over.
 #[derive(Debug)]
 struct GatedParts {
-    inner: Arc<dyn ObjectStore>,
     gate: Arc<tokio::sync::Semaphore>,
     entered: Arc<Notify>,
 }
@@ -1506,66 +1370,18 @@ impl MultipartUpload for GatedUpload {
     }
 }
 
-impl std::fmt::Display for GatedParts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GatedParts({})", self.inner)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for GatedParts {
-    async fn put_opts(
+impl StoreHooks for GatedParts {
+    fn wrap_upload(
         &self,
-        location: &Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        self.inner.put_opts(location, payload, options).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let inner = self.inner.put_multipart_opts(location, options).await?;
-        Ok(Box::new(GatedUpload {
+        _location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        Box::new(GatedUpload {
             inner,
             gate: Arc::clone(&self.gate),
             entered: Arc::clone(&self.entered),
-        }))
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        })
     }
 }
 
@@ -1581,11 +1397,13 @@ async fn the_sink_publishes_the_upload_bytes_a_part_in_flight_holds() {
     let dir = tempfile::tempdir().expect("tmp");
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let entered = Arc::new(Notify::new());
-    let store: Arc<dyn ObjectStore> = Arc::new(GatedParts {
-        inner: local(&dir),
-        gate: Arc::clone(&gate),
-        entered: Arc::clone(&entered),
-    });
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        GatedParts {
+            gate: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
+        },
+    ));
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
     let sink = Sink::new(store, cfg.clone(), FileNaming::new("w"), tokio_timer);
@@ -1623,7 +1441,7 @@ async fn a_step_whose_token_has_fired_is_not_driven_again() {
         FileNaming::new("w"),
         tokio_timer,
     );
-    let watch = CreationWatch::new(store, Arc::new(UploadLedger::default()));
+    let watch = creation_watch(store, Arc::new(UploadLedger::default()));
     let cancel = CancellationToken::new();
     cancel.cancel();
     let polled = std::cell::Cell::new(0);
