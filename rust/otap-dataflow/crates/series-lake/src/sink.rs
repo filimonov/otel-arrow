@@ -833,6 +833,18 @@ impl Sink {
         }
     }
 
+    /// The cancellation a table write has just observed at one of its step
+    /// boundaries.
+    ///
+    /// The cleanup deadline is taken here, where the token is seen, rather
+    /// than after the write has released its merge, so dropping a large
+    /// merge is spent out of the abort's allowance instead of postponing
+    /// the start of it.
+    fn cancelled_here(&self, cleanup: &mut Option<Instant>) -> Error {
+        let _ = cleanup.get_or_insert_with(|| self.cleanup_deadline());
+        Error::Cancelled { abort_error: None }
+    }
+
     /// The instant the cleanup of a failed or cancelled write must end by.
     fn cleanup_deadline(&self) -> Instant {
         deadline_after((self.clock.now)(), self.cfg.upload.abort_timeout)
@@ -948,7 +960,7 @@ impl Sink {
             }
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
-                failure = Some(Error::Cancelled { abort_error: None });
+                failure = Some(self.cancelled_here(&mut cleanup));
                 break;
             }
         }
@@ -970,7 +982,7 @@ impl Sink {
         while let Some(merge) = merged.as_mut() {
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
-                failure = Some(Error::Cancelled { abort_error: None });
+                failure = Some(self.cancelled_here(&mut cleanup));
                 break;
             }
             let chunk = match merge.step() {
@@ -991,7 +1003,7 @@ impl Sink {
             // the chunk without a return to the runtime in between.
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
-                failure = Some(Error::Cancelled { abort_error: None });
+                failure = Some(self.cancelled_here(&mut cleanup));
                 break;
             }
             let step = self
@@ -1011,7 +1023,7 @@ impl Sink {
                 // `row_group_bytes`, and it too runs in a poll of its own.
                 tokio::task::yield_now().await;
                 if cancel.is_cancelled() {
-                    failure = Some(Error::Cancelled { abort_error: None });
+                    failure = Some(self.cancelled_here(&mut cleanup));
                     break;
                 }
                 let step = self
