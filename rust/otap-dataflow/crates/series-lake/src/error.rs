@@ -67,6 +67,52 @@ pub enum RefuseReason {
     Unsupported(String),
 }
 
+impl std::fmt::Display for SizeBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SizeBudget::Request => "request",
+            SizeBudget::Extracted => "extracted",
+            SizeBudget::Row => "row",
+            SizeBudget::Cell => "cell",
+            SizeBudget::Table => "table",
+            SizeBudget::Block => "block",
+        })
+    }
+}
+
+/// One line for logs and error chains.
+///
+/// The two block-scoped refusals keep their variant names: a caller that
+/// reports one to a sender as an internal failure quotes this text, and
+/// that sentence is pinned.
+impl std::fmt::Display for RefuseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefuseReason::RequestTooLarge(Excess {
+                budget,
+                observed: Some(observed),
+                limit,
+            }) => write!(
+                f,
+                "{budget} budget exceeded: {observed} bytes, limit {limit} bytes"
+            ),
+            RefuseReason::RequestTooLarge(Excess {
+                budget,
+                observed: None,
+                limit,
+            }) => write!(
+                f,
+                "{budget} budget exceeded: size not measured, limit {limit} bytes"
+            ),
+            RefuseReason::BlockFull => f.write_str("BlockFull"),
+            RefuseReason::TooManyRequests => f.write_str("TooManyRequests"),
+            RefuseReason::TooDeep(limit) => write!(f, "nesting deeper than {limit} levels"),
+            RefuseReason::Invalid(detail) => write!(f, "invalid content: {detail}"),
+            RefuseReason::Unsupported(what) => write!(f, "unsupported: {what}"),
+        }
+    }
+}
+
 /// Crate error, in three classes by who can act on the failure.
 ///
 /// Only [`Error::Refused`] judges the request's own content: the identical
@@ -79,7 +125,7 @@ pub enum RefuseReason {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The request must be nacked as non-retryable.
-    #[error("refused: {0:?}")]
+    #[error("refused: {0}")]
     Refused(RefuseReason),
     /// Storage or the write in progress failed.
     #[error(transparent)]
@@ -377,6 +423,52 @@ mod tests {
         ];
         for (error, retryable) in &cases {
             assert_eq!(error.is_retryable(), *retryable, "{error:?}");
+        }
+    }
+
+    /// Scenario: every refusal reason, a size refusal with and without a
+    /// measured size, is rendered through the crate error's `Display`.
+    /// Guarantees: a refusal reads as one sentence rather than as Rust
+    /// `Debug` output, and the two block-scoped refusals keep their variant
+    /// names, which a caller's pinned internal-failure sentence quotes.
+    #[test]
+    fn a_refusal_displays_as_text() {
+        let cases = [
+            (
+                Error::too_large(SizeBudget::Row, 10, 5),
+                "refused: row budget exceeded: 10 bytes, limit 5 bytes",
+            ),
+            (
+                Error::Refused(RefuseReason::RequestTooLarge(Excess {
+                    budget: SizeBudget::Request,
+                    observed: None,
+                    limit: 5,
+                })),
+                "refused: request budget exceeded: size not measured, limit 5 bytes",
+            ),
+            (
+                Error::Refused(RefuseReason::BlockFull),
+                "refused: BlockFull",
+            ),
+            (
+                Error::Refused(RefuseReason::TooManyRequests),
+                "refused: TooManyRequests",
+            ),
+            (
+                Error::Refused(RefuseReason::TooDeep(8)),
+                "refused: nesting deeper than 8 levels",
+            ),
+            (
+                Error::invalid("duplicate attribute key"),
+                "refused: invalid content: duplicate attribute key",
+            ),
+            (
+                Error::Refused(RefuseReason::Unsupported("traces".into())),
+                "refused: unsupported: traces",
+            ),
+        ];
+        for (error, text) in &cases {
+            assert_eq!(error.to_string(), *text);
         }
     }
 }
