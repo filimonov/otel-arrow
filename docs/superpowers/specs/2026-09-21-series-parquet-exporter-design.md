@@ -1309,7 +1309,8 @@ at-least-once delivery but multiplying traffic and rows. This was observed
 with a six-second exporter timeout in the outage test, which produced
 deadline errors and duplicate rows.
 
-The [Alloy measurements][alloy-research] show why timeout tuning alone is
+The Alloy measurements of the design campaign (kept in the campaign notes,
+outside the repository) show why timeout tuning alone is
 not enough. The producer must buffer at least `input_rate * hold` records;
 queue slots stay occupied until the export completes, including retries.
 Use `queue_size = input_rate * hold * 1.5` for headroom. For the measured
@@ -1352,8 +1353,6 @@ instead of a single connection, or an L7 proxy balancing per request.
 Periodic reconnection would reshuffle the hash, but the gRPC server
 currently exposes keepalive settings (TCP and HTTP/2), not a maximum
 connection age.
-
-[alloy-research]: ../../../.superpowers/sdd/2026-09-21-series-parquet-exporter-node/alloy-research.md
 
 ### 7.7 Deployment topologies
 
@@ -1595,7 +1594,7 @@ separate from the design requirements above:
 - Merging the metrics datasets took a mixed metrics window from three files
   to two: one `series` file and one `values` file.
 - The producer memory and throughput figures in section 7.6 come from the
-  [measured Alloy rig][alloy-research], with fixed response holds, queue
+  measured Alloy rig of the design campaign, with fixed response holds, queue
   occupancy, resident memory and delivered records measured. They are
   producer results, not measurements of this exporter's throughput ceiling.
 

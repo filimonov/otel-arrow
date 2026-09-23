@@ -255,7 +255,9 @@ OTLP/gRPC receiver writing a local series/values Parquet lake:
 Requires a binary built with `--features series-parquet`. Create the base
 directory before starting. An OK OTLP response means the request's rows are
 already durable, so clients should retry timeouts and transient failures and
-tolerate duplicates. Only logs are accepted; metrics and traces are refused.
+tolerate duplicates. Logs and metric number and histogram points are stored;
+traces are refused, and exponential histograms and summaries are refused
+unless `unsupported: drop` is set.
 
 ### `series-parquet-s3.yaml`
 
@@ -266,9 +268,11 @@ The same pipeline writing to an S3-compatible object store:
 - Retries object-store operations with an explicit backoff schedule
 
 Requires a binary built with `--features series-parquet,aws` and an existing
-bucket. The static credentials are local test credentials for a MinIO or
-RustFS container; production deployments use the shared AWS auth provider
-configuration.
+bucket. The static credentials come from `SERIES_S3_ACCESS_KEY_ID` and
+`SERIES_S3_SECRET_ACCESS_KEY` in the environment and must name the
+credentials of a local MinIO or RustFS container; production deployments use
+the shared AWS auth provider configuration. Receiver concurrency is sized for
+100k records/s in requests of about 512 records; the file shows the formula.
 
 ### `series-parquet.alloy`
 

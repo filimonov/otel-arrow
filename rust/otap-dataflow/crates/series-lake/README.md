@@ -9,9 +9,10 @@ The storage format is specified in [docs/FORMAT.md](docs/FORMAT.md). The
 design is in `docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md`
 at the repository root.
 
-This crate is engine-independent: it never depends on the Dataflow engine. A
-`core-nodes` exporter node (`exporter:series_parquet`) that adapts it into a
-Dataflow pipeline is planned for a later plan and does not exist yet.
+This crate is engine-independent: it never depends on the Dataflow engine.
+The `core-nodes` exporter `exporter:series_parquet` adapts it into a Dataflow
+pipeline; see its
+[README](../core-nodes/src/exporters/series_parquet_exporter/README.md).
 
 ## Modules
 

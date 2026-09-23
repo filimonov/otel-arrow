@@ -71,9 +71,13 @@ otelcol.exporter.otlp "series" {
     sizer = "items"
     queue_size = 120000
 
-    // Parallel exports. Each one is held for a full window, so this is the
-    // only multiplier on the ceiling besides batch size.
-    num_consumers = 4
+    // Parallel exports. An export is held for half a window plus the flush on
+    // average (a whole window at worst), so the exports in flight are
+    //   in_flight = rate * (interval / 2 + flush) / records_per_export.
+    // Sized for 10000 records/s from one producer at the 20000-record minimum
+    // batch against the 15s window: 10000 * (7.5s + 2s) / 20000 ~= 4.8, and
+    // 8 leaves room for the whole-window worst case.
+    num_consumers = 8
 
     // The source is a file. Backpressure parks the tailer and leaves unread
     // data on disk, which is durable and free. Dropping is neither.

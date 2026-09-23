@@ -3,7 +3,8 @@
 ## Metadata
 
 - Type: `exporter:series_parquet` (`urn:otel:exporter:series_parquet`)
-- Feature gate: `series-parquet` (opt-in, not in `core-exporters`); add `aws` for S3-compatible storage
+- Feature gate: `series-parquet` (opt-in, not in `core-exporters`); add `aws`
+  for S3-compatible storage
 - Metric scope: `exporter.series_parquet`
 - Stability: Experimental
 
@@ -94,6 +95,13 @@ below by the worker count.
 Connect `receiver:otlp` directly to this exporter with
 `protocols.grpc.wait_for_result: true` and `timeout: 180s`. An OK response
 means every file for that request's block completed in the object store.
+
+For `storage: file`, "completed" is weaker than for a cloud store. The
+`object_store` local backend writes to a staging file and renames it into
+place, but never calls `fsync`, so an acknowledged file survives a crash of
+this process and not necessarily a crash of the operating system or a power
+loss. Use a cloud store, or a filesystem mounted for synchronous writes, when
+an ack must survive the host.
 
 | Outcome | gRPC status | Producer action |
 | --- | --- | --- |
@@ -450,9 +458,13 @@ otelcol.exporter.otlp "series" {
     sizer = "items"
     queue_size = 120000
 
-    // Parallel exports. Each one is held for a full window, so this is the
-    // only multiplier on the ceiling besides batch size.
-    num_consumers = 4
+    // Parallel exports. An export is held for half a window plus the flush on
+    // average (a whole window at worst), so the exports in flight are
+    //   in_flight = rate * (interval / 2 + flush) / records_per_export.
+    // Sized for 10000 records/s from one producer at the 20000-record minimum
+    // batch against the 15s window: 10000 * (7.5s + 2s) / 20000 ~= 4.8, and
+    // 8 leaves room for the whole-window worst case.
+    num_consumers = 8
 
     // The source is a file. Backpressure parks the tailer and leaves unread
     // data on disk, which is durable and free. Dropping is neither.
@@ -495,10 +507,30 @@ The ceiling of any producer that holds one export per window is
 records/second = num_consumers * records_per_export / hold_time
 ```
 
-The hold time is a whole window plus the flush that follows it. At a 15s hold
-the recommended block above sustains about 5000 records per second; at a 60s
-hold the same block sustains about 1050. Raising `num_consumers` or `min_size`
-raises the ceiling proportionally.
+The hold time is at worst a whole window plus the flush that follows it. At a
+15s hold the four-consumer block these figures were measured with sustained
+about 5000 records per second; at a 60s hold it sustained about 1050. Raising
+`num_consumers` or `min_size` raises the ceiling proportionally.
+
+The same relation, turned around, sizes both ends of a deployment. A request
+admitted at a uniformly random point of a window waits on average half a
+window, then the flush, so the requests one target rate keeps in flight are
+
+```text
+in_flight = rate * (interval / 2 + flush) / records_per_request
+```
+
+Size every limit that caps concurrent requests from it: the producer's
+`num_consumers` (per producer), and this engine's receiver
+`max_concurrent_requests` (summed over every producer that reaches it), with
+margin for the whole-window worst case. Also keep
+`rate * interval / records_per_request` under `window.max_requests_per_block`,
+or blocks rotate on the request count before their window ends. The shipped
+`configs/series-parquet-s3.yaml` is sized this way for 100k records/s in
+512-record requests: `100000 * (7.5s + 2s) / 512` is about 1860, so it sets
+`max_concurrent_requests: 2048`, and one window takes about 2930 requests. The
+Alloy block above is sized for 10000 records/s per producer at its 20000-record
+minimum batch, which needs about five exports in flight; it runs eight.
 
 Three producer settings decide whether that ceiling is reachable at all.
 
@@ -529,11 +561,12 @@ item. An in-flight export still occupies its queue space until the export
 completes, retries included.
 
 Finally, this engine's receiver `max_concurrent_requests` must be at least the
-producer's `num_consumers`. If it is lower, the extra exports queue at the
-receiver, their hold time grows past one window, and the ceiling falls with no
-signal at the producer. The shipped pipeline configurations set
-`max_concurrent_requests: 128`, which covers the recommended
-`num_consumers = 4` with a wide margin.
+sum of `num_consumers` over the producers it serves, and at least the
+`in_flight` above. If it is lower, the extra exports queue at the receiver,
+their hold time grows past one window, and the ceiling falls with no signal at
+the producer and none from this exporter either: `admission.closed` stays at
+zero, because the limit is the receiver's, not the exporter's. The local
+example sets `max_concurrent_requests: 128`; the S3 example sets 2048.
 
 ### Where at-least-once begins
 
@@ -1104,8 +1137,11 @@ become null; a negative converted timestamp becomes null and increments
 
 ### Operational limits
 
-- Empirical memory-bound validation, expansion-factor measurement, soak runs
-  and benchmarks are not part of this version.
+- Stage benchmarks and a measurement harness exist
+  (`crates/series-lake/benches`, `crates/validation/tests/series_parquet`),
+  but the memory-bound validation, expansion-factor measurement and soak runs
+  they support are still in progress; the workspace factors in the memory
+  model above are reservations, not measured ceilings.
 - There is no compaction, no discovery index, no manifest and no producer
   replay id.
 - There is no live buffer, tail or series introspection endpoint beyond the

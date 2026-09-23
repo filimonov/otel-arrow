@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
 """Independent implementation of canonical encoding v1 (spec section 4).
 
 Generates tests/golden/canonical_v1.json. Requires: pip install xxhash
@@ -147,4 +149,5 @@ for name, d in cases:
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump({"format": "canonical_v1", "vectors": vectors}, fh,
               indent=1, ensure_ascii=False, allow_nan=False)
+    fh.write("\n")
 print(f"wrote {len(vectors)} vectors")
