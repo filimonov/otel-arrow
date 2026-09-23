@@ -169,8 +169,12 @@ fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
     }
 }
 
-fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u32, MetricRow>> {
-    let Some(m) = records.get(ArrowPayloadType::UnivariateMetrics) else {
+/// The metrics of a `UnivariateMetrics` batch by id; none when it is absent.
+fn metric_rows(
+    m: Option<&arrow::record_batch::RecordBatch>,
+    cfg: &LakeConfig,
+) -> Result<HashMap<u32, MetricRow>> {
+    let Some(m) = m else {
         return Ok(HashMap::new());
     };
     let id = plain(m, ID, &DataType::UInt16)?;
@@ -187,10 +191,21 @@ fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u
     let scope_name = struct_child(m, SCOPE, NAME, &DataType::Utf8)?;
     let scope_version = struct_child(m, SCOPE, VERSION, &DataType::Utf8)?;
     let mut out = HashMap::with_capacity(m.num_rows());
+    let mut ids = HashSet::with_capacity(m.num_rows());
     for row in 0..m.num_rows() {
+        // A repeated id would put one metric's points under another's series.
+        let metric_id =
+            opt_u16_at(&id, row).ok_or_else(|| Error::invalid("metric row without id"))?;
+        if !ids.insert(metric_id) {
+            return Err(Error::invalid(format!("duplicate metric id {metric_id}")));
+        }
         let kind_u8 = kind
             .as_ref()
-            .map_or(0, |a| a.as_primitive::<UInt8Type>().value(row));
+            .and_then(|a| {
+                a.is_valid(row)
+                    .then(|| a.as_primitive::<UInt8Type>().value(row))
+            })
+            .ok_or_else(|| Error::invalid("metric row without metric_type"))?;
         // pdata already owns the OTAP metric type tags; reuse its enum rather
         // than a second copy of the same numbering. `Empty` has no kind of its
         // own and is refused exactly like an unknown tag.
@@ -267,8 +282,6 @@ fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u
                 description: str_at(&description, row),
             },
         };
-        let metric_id =
-            opt_u16_at(&id, row).ok_or_else(|| Error::invalid("metric row without id"))?;
         let _ = out.insert(metric_id, row_out);
     }
     Ok(out)
@@ -536,7 +549,7 @@ pub(crate) fn extract_metrics(
     let limits = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes);
     let resource_attrs = attr_table(records, ArrowPayloadType::ResourceAttrs, limits, budget)?;
     let scope_attrs = attr_table(records, ArrowPayloadType::ScopeAttrs, limits, budget)?;
-    let metrics = metric_rows(records, cfg)?;
+    let metrics = metric_rows(records.get(ArrowPayloadType::UnivariateMetrics), cfg)?;
     let mut c = Common {
         cfg,
         metrics: &metrics,
@@ -1596,6 +1609,81 @@ mod tests {
             explicit_bounds_at(&None, 0).expect("absent"),
             Vec::<f64>::new()
         );
+    }
+
+    /// The `UnivariateMetrics` batch of `records` with column `name` replaced
+    /// by `column`.
+    fn patched_metrics(
+        records: &OtapArrowRecords,
+        name: &str,
+        column: ArrayRef,
+    ) -> arrow::record_batch::RecordBatch {
+        use arrow::datatypes::{Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        let batch = records
+            .get(ArrowPayloadType::UnivariateMetrics)
+            .expect("metrics");
+        let mut fields: Vec<Field> = Vec::new();
+        let mut cols: Vec<ArrayRef> = Vec::new();
+        for (i, f) in batch.schema().fields().iter().enumerate() {
+            if f.name() == name {
+                fields.push(Field::new(name, column.data_type().clone(), true));
+                cols.push(std::sync::Arc::clone(&column));
+            } else {
+                fields.push(f.as_ref().clone());
+                cols.push(std::sync::Arc::clone(batch.column(i)));
+            }
+        }
+        RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), cols).expect("batch")
+    }
+
+    /// Scenario: the gauge's `metric_type` cell is null while its value slot
+    /// still holds the gauge tag; pdata's schema check refuses such a batch,
+    /// so `metric_rows` is given it directly.
+    /// Guarantees: the batch is refused as invalid instead of the slot under
+    /// the null being read as the metric's kind.
+    #[test]
+    fn a_null_metric_type_is_refused() {
+        use arrow::array::UInt8Array;
+        use arrow::buffer::NullBuffer;
+        let records = encode_metrics(&gauge_and_hist());
+        let kinds = records
+            .get(ArrowPayloadType::UnivariateMetrics)
+            .expect("metrics")
+            .column_by_name(METRIC_TYPE)
+            .expect("metric_type")
+            .as_primitive::<UInt8Type>()
+            .values()
+            .clone();
+        let valid = (0..kinds.len()).map(|row| row != 0).collect::<Vec<_>>();
+        let nulled = UInt8Array::new(kinds, Some(NullBuffer::from(valid)));
+        let batch = patched_metrics(&records, METRIC_TYPE, std::sync::Arc::new(nulled));
+        assert!(matches!(
+            metric_rows(Some(&batch), &LakeConfig::default()),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+    }
+
+    /// Scenario: the gauge and the histogram carry the same metric id, which
+    /// pdata's schema check accepts.
+    /// Guarantees: the request is refused as invalid instead of one metric's
+    /// row replacing the other's and its points being stored under the wrong
+    /// series.
+    #[test]
+    fn a_duplicate_metric_id_is_refused() {
+        use arrow::array::UInt16Array;
+        let mut records = encode_metrics(&gauge_and_hist());
+        let ids = std::sync::Arc::new(UInt16Array::from(vec![0u16; 2]));
+        let batch = patched_metrics(&records, ID, ids);
+        records
+            .set(ArrowPayloadType::UnivariateMetrics, batch)
+            .expect("pdata accepts a repeated id");
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        assert!(matches!(
+            extract_metrics(&records, &cfg, &mut budget),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
     }
 
     /// A request shaped like a Kubernetes node's metrics: one resource with
