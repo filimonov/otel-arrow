@@ -1059,6 +1059,11 @@ class FaultRig:
             except Exception as error:
                 report["recovered"] = False
                 report["errors"].append(f"recover: {error}")
+        if self.owner_id:
+            # The owner's tools write the artifacts as root; make them
+            # readable to the harness user before the owner goes away.
+            report["artifacts_readable"] = self.exec(
+                ["chmod", "-R", "a+rX", ARTIFACT_MOUNT])["exit_status"] == 0
         for entry in reversed(self.containers):
             done = run_command(["docker", "rm", "--force", "--volumes", entry["name"]])
             report["removed"].append({"name": entry["name"], "exit_status": done["exit_status"]})
@@ -1591,7 +1596,8 @@ class Capture:
         self.file = f"{ARTIFACT_MOUNT}/{name}.pcap"
         self.host_file = rig.artifact_dir / f"{name}.pcap"
         self.argv = ["docker", "exec", rig.owner_id, "timeout", "60", "tcpdump",
-                     "-Z", "root", "-i", "any", "-U", "-n", "-w", self.file, expression]
+                     "-Z", "root", "-i", "any", "--immediate-mode", "-U", "-n",
+                     "-w", self.file, expression]
         self.process = None
         self.stderr = ""
 
@@ -1611,10 +1617,15 @@ class Capture:
             raise AssertionError(f"tcpdump did not start: {self.stderr}")
         return self
 
+    # How long packets already received may take to reach the file before
+    # the capture is stopped.
+    SETTLE_S = 0.5
+
     def stop(self):
         """Stop the capture with SIGINT so tcpdump flushes the file."""
         if self.process is None:
             return
+        time.sleep(self.SETTLE_S)
         _ = self.rig.exec(["pkill", "-INT", "-x", "tcpdump"])
         try:
             _, rest = self.process.communicate(timeout=15)
@@ -1756,6 +1767,8 @@ def probe_capture(rig) -> dict:
         _record(probe, command)
     if not (counts.get("packets") or 0) > 0:
         problems.append(f"tshark read no packets: {counts.get('packets')}")
+    if "0 packets captured" in capture.stderr:
+        problems.append("tcpdump wrote no packet it received")
     if counts.get("retransmissions") is None:
         problems.append("tshark could not evaluate tcp.analysis.retransmission")
     probe["evidence"] = {"capture": capture.as_json(), "packets": counts.get("packets"),
