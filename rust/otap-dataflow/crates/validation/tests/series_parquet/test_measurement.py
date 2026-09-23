@@ -4712,6 +4712,20 @@ class MemoryContracts(unittest.TestCase):
             memory.ledger_check(entries, 100 * mib)["status"], measurement.STATUS_FAILED
         )
 
+    # Scenario: a family asks for jemalloc's background thread explicitly
+    # off, as the engine ran before the thread became its default.
+    # Guarantees: the mode keeps the statistics print, turns the thread off
+    # and names that setting in the pair's allocator label, so a family run
+    # under it is never compared with one that ran the thread.
+    def test_the_background_thread_can_be_turned_off_for_a_family(self):
+        conf = memory.DIAGNOSTIC_CONF["nobgthread"]
+        self.assertTrue(conf.startswith(memory.JEMALLOC_STATS_CONF))
+        self.assertIn("background_thread:false", conf)
+        self.assertEqual(
+            memory.allocator_label("jemalloc", conf, ("jemalloc", "off")),
+            f"jemalloc:{conf}",
+        )
+
     # Scenario: samples of an engine whose worker publishes its live flush
     # workspace as `flush.workspace`, one of them taken during a flush, and
     # samples of an older engine that publishes none.

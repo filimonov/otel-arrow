@@ -173,6 +173,9 @@ DIAGNOSTIC_CONF = {
     # jemalloc's own purging thread: without it, dirty pages decay only when
     # the process allocates, so an idle engine keeps a varying amount.
     "bgthread": JEMALLOC_STATS_CONF + ",background_thread:true",
+    # The thread explicitly off, as every engine ran before it became the
+    # default: what a family measured then is re-run under this.
+    "nobgthread": JEMALLOC_STATS_CONF + ",background_thread:false",
     "prof": JEMALLOC_STATS_CONF + ",prof:true,prof_active:true,lg_prof_sample:17",
 }
 
