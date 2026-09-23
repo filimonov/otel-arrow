@@ -6,8 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray};
-use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use arrow::datatypes::{DataType, Int32Type, TimeUnit, TimestampNanosecondType, UInt16Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use otel_arrow_dfe_pdata::schema::consts::{
@@ -18,9 +17,9 @@ use otel_arrow_dfe_pdata::schema::consts::{
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
     any_value_col, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at,
-    flags_at, i64_at, identity, map_cell, opt_u16_at, plain, producer_id, str_at, struct_child,
-    timestamp_pair,
+    flags_at, identity, map_cell, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
+use crate::attrs::prim_at;
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
@@ -93,9 +92,9 @@ pub(crate) fn extract_logs(
     let mut scopes = SharedLists::default();
 
     for row in 0..logs.num_rows() {
-        let rid = opt_u16_at(&res_id, row);
-        let sid = opt_u16_at(&scope_id, row);
-        let lid = opt_u16_at(&id, row);
+        let rid = prim_at::<UInt16Type>(&res_id, row).map(u32::from);
+        let sid = prim_at::<UInt16Type>(&scope_id, row).map(u32::from);
+        let lid = prim_at::<UInt16Type>(&id, row).map(u32::from);
         let resource = attrs_of(&resource_attrs, rid);
         let scope = attrs_of(&scope_attrs, sid);
         let all_attrs = attrs_of(&log_attrs, lid);
@@ -157,8 +156,10 @@ pub(crate) fn extract_logs(
             }
         };
 
-        let (t_ns, t_us) = timestamp_pair(i64_at(&time, row), &mut stats);
-        let (o_ns, o_us) = timestamp_pair(i64_at(&observed, row), &mut stats);
+        let t_ns = prim_at::<TimestampNanosecondType>(&time, row).unwrap_or(0);
+        let o_ns = prim_at::<TimestampNanosecondType>(&observed, row).unwrap_or(0);
+        let (t_ns, t_us) = timestamp_pair(t_ns, &mut stats);
+        let (o_ns, o_us) = timestamp_pair(o_ns, &mut stats);
         let body_value = match &mut body {
             Some(b) => b.value_at(row, limits, budget)?,
             None => Value::Null,
@@ -178,13 +179,7 @@ pub(crate) fn extract_logs(
         approx += body_str.as_ref().map_or(0, String::len);
         approx += severity_text_str.len() + event_name_str.len() + producer.len();
         approx += residual_bytes;
-        let severity = severity_number
-            .as_ref()
-            .and_then(|a| {
-                a.is_valid(row)
-                    .then(|| a.as_primitive::<Int32Type>().value(row))
-            })
-            .unwrap_or(0);
+        let severity = prim_at::<Int32Type>(&severity_number, row).unwrap_or(0);
         let mut cols = vec![
             Col::Fixed(Some(series_id.to_vec())),
             Col::Str(Some(producer)),

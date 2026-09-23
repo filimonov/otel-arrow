@@ -11,7 +11,10 @@
 use std::collections::{HashMap, HashSet};
 
 use arrow::array::{Array, ArrayRef, AsArray, ListArray};
-use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UInt64Type};
+use arrow::datatypes::{
+    DataType, Float64Type, Int32Type, Int64Type, TimeUnit, TimestampNanosecondType, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
+};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -25,11 +28,10 @@ use otel_arrow_dfe_pdata::schema::consts::{
 
 use super::{
     Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
-    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, identity,
-    list_col, opt_f64, opt_i64, opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child,
-    timestamp_pair,
+    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at, identity, plain,
+    producer_id, str_at, struct_child, timestamp_pair, typed_col,
 };
-use crate::attrs::AttrTable;
+use crate::attrs::{AttrTable, bool_at, prim_at};
 use crate::canonical::{
     Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_double_bits,
 };
@@ -194,17 +196,13 @@ fn metric_rows(
     let mut ids = HashSet::with_capacity(m.num_rows());
     for row in 0..m.num_rows() {
         // A repeated id would put one metric's points under another's series.
-        let metric_id =
-            opt_u16_at(&id, row).ok_or_else(|| Error::invalid("metric row without id"))?;
+        let metric_id = prim_at::<UInt16Type>(&id, row)
+            .map(u32::from)
+            .ok_or_else(|| Error::invalid("metric row without id"))?;
         if !ids.insert(metric_id) {
             return Err(Error::invalid(format!("duplicate metric id {metric_id}")));
         }
-        let kind_u8 = kind
-            .as_ref()
-            .and_then(|a| {
-                a.is_valid(row)
-                    .then(|| a.as_primitive::<UInt8Type>().value(row))
-            })
+        let kind_u8 = prim_at::<UInt8Type>(&kind, row)
             .ok_or_else(|| Error::invalid("metric row without metric_type"))?;
         // pdata already owns the OTAP metric type tags; reuse its enum rather
         // than a second copy of the same numbering. `Empty` has no kind of its
@@ -221,20 +219,14 @@ fn metric_rows(
         };
         // Decoded through the proto enum, so an unknown value is unspecified
         // by the enum's own definition rather than by a local literal.
-        let temporality = match temporality
-            .as_ref()
-            .and_then(|a| {
-                a.is_valid(row)
-                    .then(|| a.as_primitive::<Int32Type>().value(row))
-            })
-            .map(AggregationTemporality::try_from)
-        {
-            Some(Ok(AggregationTemporality::Delta)) => Temporality::Delta,
-            Some(Ok(AggregationTemporality::Cumulative)) => Temporality::Cumulative,
-            Some(Ok(AggregationTemporality::Unspecified) | Err(_)) | None => {
-                Temporality::Unspecified
-            }
-        };
+        let temporality =
+            match prim_at::<Int32Type>(&temporality, row).map(AggregationTemporality::try_from) {
+                Some(Ok(AggregationTemporality::Delta)) => Temporality::Delta,
+                Some(Ok(AggregationTemporality::Cumulative)) => Temporality::Cumulative,
+                Some(Ok(AggregationTemporality::Unspecified) | Err(_)) | None => {
+                    Temporality::Unspecified
+                }
+            };
         // Order matters: an unsupported kind is settled by the policy first, and
         // its temporality is never validated. pdata only supplies temporality for
         // sums and histograms, so a summary would otherwise be refused as invalid
@@ -260,8 +252,8 @@ fn metric_rows(
             MetricKind::Gauge => {}
         }
         let row_out = MetricRow {
-            resource_id: opt_u16_at(&res_id, row),
-            scope_id: opt_u16_at(&scope_id, row),
+            resource_id: prim_at::<UInt16Type>(&res_id, row).map(u32::from),
+            scope_id: prim_at::<UInt16Type>(&scope_id, row).map(u32::from),
             resource_schema_url: str_at(&res_schema, row),
             scope_name: str_at(&scope_name, row),
             scope_version: str_at(&scope_version, row),
@@ -276,9 +268,7 @@ fn metric_rows(
                     temporality
                 },
                 is_monotonic: kind == MetricKind::Sum
-                    && is_monotonic
-                        .as_ref()
-                        .is_some_and(|a| a.is_valid(row) && a.as_boolean().value(row)),
+                    && bool_at(&is_monotonic, row).unwrap_or(false),
                 description: str_at(&description, row),
             },
         };
@@ -396,9 +386,10 @@ impl Common<'_> {
         let (resource_attrs, scope_attrs) = (self.resource_attrs, self.scope_attrs);
         let mut memo = HashMap::new();
         for row in 0..rows {
-            let metric_id =
-                opt_u16_at(&columns.parent, row).ok_or_else(|| Error::invalid(orphan))?;
-            let point_attrs = match opt_u32_at(&columns.attrs_id, row) {
+            let metric_id = prim_at::<UInt16Type>(&columns.parent, row)
+                .map(u32::from)
+                .ok_or_else(|| Error::invalid(orphan))?;
+            let point_attrs = match prim_at::<UInt32Type>(&columns.attrs_id, row) {
                 Some(id) => attrs.get(id),
                 None => &[],
             };
@@ -412,8 +403,8 @@ impl Common<'_> {
                 m,
                 resource,
                 self.cfg,
-                i64_at(&columns.time, row),
-                i64_at(&columns.start, row),
+                prim_at::<TimestampNanosecondType>(&columns.time, row).unwrap_or(0),
+                prim_at::<TimestampNanosecondType>(&columns.start, row).unwrap_or(0),
                 flags_at(&columns.flags, row),
                 &mut self.stats,
             );
@@ -651,8 +642,8 @@ pub(crate) fn extract_metrics(
             |row| {
                 Ok((
                     [
-                        Col::Int(opt_i64(&iv, row)),
-                        Col::Double(opt_f64(&dv, row)),
+                        Col::Int(prim_at::<Int64Type>(&iv, row)),
+                        Col::Double(prim_at::<Float64Type>(&dv, row)),
                         // Histogram columns of a number point: null, not zero.
                         Col::Int(None),
                         Col::Double(None),
@@ -680,8 +671,8 @@ pub(crate) fn extract_metrics(
         let min = plain(b, HISTOGRAM_MIN, &DataType::Float64)?;
         let max = plain(b, HISTOGRAM_MAX, &DataType::Float64)?;
         let flags = plain(b, FLAGS, &DataType::UInt32)?;
-        let bc = list_col(b, HISTOGRAM_BUCKET_COUNTS)?;
-        let eb = list_col(b, HISTOGRAM_EXPLICIT_BOUNDS)?;
+        let bc = typed_col::<ListArray>(b, HISTOGRAM_BUCKET_COUNTS, "a list")?.cloned();
+        let eb = typed_col::<ListArray>(b, HISTOGRAM_EXPLICIT_BOUNDS, "a list")?.cloned();
         let columns = PointColumns {
             parent,
             attrs_id,
@@ -706,13 +697,7 @@ pub(crate) fn extract_metrics(
                         "histogram bucket_counts.len != explicit_bounds.len + 1",
                     ));
                 }
-                let cnt = count
-                    .as_ref()
-                    .and_then(|a| {
-                        a.is_valid(row)
-                            .then(|| a.as_primitive::<UInt64Type>().value(row))
-                    })
-                    .unwrap_or(0);
+                let cnt = prim_at::<UInt64Type>(&count, row).unwrap_or(0);
                 let cnt = i64::try_from(cnt)
                     .map_err(|_| Error::invalid("histogram count above i64::MAX"))?;
                 let bytes = counts.len() * 8 + bounds.len() * 8;
@@ -722,9 +707,9 @@ pub(crate) fn extract_metrics(
                         Col::Int(None),
                         Col::Double(None),
                         Col::Int(Some(cnt)),
-                        Col::Double(opt_f64(&sum, row)),
-                        Col::Double(opt_f64(&min, row)),
-                        Col::Double(opt_f64(&max, row)),
+                        Col::Double(prim_at::<Float64Type>(&sum, row)),
+                        Col::Double(prim_at::<Float64Type>(&min, row)),
+                        Col::Double(prim_at::<Float64Type>(&max, row)),
                         Col::ListI64(Some(counts)),
                         Col::ListF64(Some(bounds)),
                     ],
@@ -1519,7 +1504,7 @@ mod tests {
             .expect("id column")
             .expect("id present");
         let point_ids: Vec<Option<u32>> = (0..points.num_rows())
-            .map(|r| opt_u32_at(&Some(ids.clone()), r))
+            .map(|r| prim_at::<UInt32Type>(&Some(ids.clone()), r))
             .collect();
         assert_eq!(point_ids, vec![Some(0), Some(1)]);
         // Point 1 has its own id but no rows in the attribute batch, so the

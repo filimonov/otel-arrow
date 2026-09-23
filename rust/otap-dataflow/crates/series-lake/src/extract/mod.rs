@@ -10,19 +10,17 @@ pub mod metrics;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder,
-    Float64Builder, Int32Builder, Int64Builder, ListArray, ListBuilder, MapBuilder, StringBuilder,
-    StructArray, TimestampMicrosecondBuilder,
+    Array, ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder,
+    Int32Builder, Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructArray,
+    TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{
-    DataType, Float64Type, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type, UInt32Type,
-};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::attrs::{AnyValueColumns, AttrTable, bytes_cell, int_cell, readable, str_cell};
+use crate::attrs::{AnyValueColumns, AttrTable, bytes_cell, prim_at, readable, str_cell};
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
@@ -645,16 +643,25 @@ fn flat_children(s: &StructArray) -> Vec<(String, ArrayRef)> {
         .collect()
 }
 
-/// One child of a struct column with the parent's validity applied.
+/// Column `name` of `batch` as a `T`, or `None` when it is absent.
 ///
-/// See [`flat_children`] for why the parent's null buffer matters.
-fn flat_child(s: &StructArray, child: &str) -> Option<ArrayRef> {
-    if s.nulls().is_none() {
-        return s.column_by_name(child).map(Arc::clone);
-    }
-    let (fields, columns) = s.flatten();
-    let idx = fields.iter().position(|f| f.name() == child)?;
-    columns.get(idx).map(Arc::clone)
+/// The downcast is checked: a column that is present but is not a `T` refuses
+/// the request as invalid instead of panicking. `OtapArrowRecords` validates
+/// the OTAP schema on the way in, so this can only be reached by a batch built
+/// outside that validation.
+pub(crate) fn typed_col<'a, T: Array + 'static>(
+    batch: &'a RecordBatch,
+    name: &str,
+    what: &str,
+) -> Result<Option<&'a T>> {
+    batch
+        .column_by_name(name)
+        .map(|col| {
+            col.as_any()
+                .downcast_ref::<T>()
+                .ok_or_else(|| Error::invalid(format!("column {name} is not {what}")))
+        })
+        .transpose()
 }
 
 /// Child of a struct column, cast to a plain type, or `None` when absent.
@@ -667,34 +674,25 @@ pub(crate) fn struct_child(
     child: &str,
     to: &DataType,
 ) -> Result<Option<ArrayRef>> {
-    let Some(col) = batch.column_by_name(parent) else {
+    let Some(s) = typed_col::<StructArray>(batch, parent, "a struct")? else {
         return Ok(None);
     };
-    let s = col
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| Error::invalid(format!("column {parent} is not a struct")))?;
-    flat_child(s, child).map(|c| readable(c, to)).transpose()
+    flat_children(s)
+        .into_iter()
+        .find(|(name, _)| name == child)
+        .map(|(_, c)| readable(c, to))
+        .transpose()
 }
 
 /// The `AnyValue` struct column `name` of a batch, or `None` when it is absent.
-///
-/// The downcast is checked: a column that is present but is not a struct
-/// refuses the request instead of panicking. `OtapArrowRecords` validates the
-/// OTAP schema on the way in, so this can only be reached by a batch built
-/// outside that validation.
 ///
 /// The struct's own validity is applied to its children (see
 /// [`flat_children`]), so a null body row reads as a null type tag and becomes
 /// [`Value::Null`] rather than whatever the child buffers happen to hold.
 pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<AnyValueColumns>> {
-    let Some(col) = batch.column_by_name(name) else {
+    let Some(s) = typed_col::<StructArray>(batch, name, "an AnyValue struct")? else {
         return Ok(None);
     };
-    let s = col
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| Error::invalid(format!("column {name} is not an AnyValue struct")))?;
     let children = flat_children(s);
     Ok(Some(AnyValueColumns::new(&|n| {
         children
@@ -718,19 +716,11 @@ pub(crate) fn attr_table(
     }
 }
 
-/// A `UInt16` id column read as `Option<u32>`.
+/// Attributes of an optional parent id: the empty list when the id is `None`.
 ///
 /// `None` means "no parent": pdata writes a null id for a record or point that
 /// carries no attributes. A `None` must never be turned into id 0, which would
 /// make such a record inherit the attributes of parent 0.
-pub(crate) fn opt_u16_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| u32::from(a.as_primitive::<UInt16Type>().value(row)))
-    })
-}
-
-/// Attributes of an optional parent id: the empty list when the id is `None`.
 pub(crate) fn attrs_of(table: &AttrTable, id: Option<u32>) -> &[(String, Value)] {
     match id {
         Some(id) => table.get(id),
@@ -748,39 +738,6 @@ pub(crate) fn str_at(a: &Option<ArrayRef>, row: usize) -> String {
         .unwrap_or_default()
 }
 
-/// A `Timestamp(ns)` column read as `i64`, `0` when null or absent.
-pub(crate) fn i64_at(a: &Option<ArrayRef>, row: usize) -> i64 {
-    a.as_ref()
-        .and_then(|a| {
-            a.is_valid(row)
-                .then(|| a.as_primitive::<TimestampNanosecondType>().value(row))
-        })
-        .unwrap_or(0)
-}
-
-/// An `Int64` column read as `Option<i64>`, `None` when null or absent.
-pub(crate) fn opt_i64(a: &Option<ArrayRef>, row: usize) -> Option<i64> {
-    a.as_ref().and_then(|a| int_cell(a, row))
-}
-
-/// A `Float64` column read as `Option<f64>`, `None` when null or absent.
-pub(crate) fn opt_f64(a: &Option<ArrayRef>, row: usize) -> Option<f64> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<Float64Type>().value(row))
-    })
-}
-
-/// A `UInt32` id column read as `Option<u32>`.
-///
-/// Like [`opt_u16_at`], `None` means "no parent" and must never become id 0.
-pub(crate) fn opt_u32_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
-    a.as_ref().and_then(|a| {
-        a.is_valid(row)
-            .then(|| a.as_primitive::<UInt32Type>().value(row))
-    })
-}
-
 /// A `UInt32` OTLP flags column reinterpreted into the signed storage column.
 ///
 /// The flags are a bit set, stored as received; readers interpret the bits. The
@@ -788,29 +745,7 @@ pub(crate) fn opt_u32_at(a: &Option<ArrayRef>, row: usize) -> Option<u32> {
 /// the sign bit rather than being lost.
 #[allow(clippy::cast_possible_wrap)]
 pub(crate) fn flags_at(a: &Option<ArrayRef>, row: usize) -> i32 {
-    a.as_ref()
-        .and_then(|a| {
-            a.is_valid(row)
-                .then(|| a.as_primitive::<UInt32Type>().value(row))
-        })
-        .unwrap_or(0) as i32
-}
-
-/// A `List` column of a batch, or `None` when it is absent.
-///
-/// The downcast is checked: a column that is present but is not a list refuses
-/// the request instead of panicking, exactly as [`struct_child`] and
-/// [`any_value_col`] do for their own shapes.
-pub(crate) fn list_col(batch: &RecordBatch, name: &str) -> Result<Option<ListArray>> {
-    let Some(col) = batch.column_by_name(name) else {
-        return Ok(None);
-    };
-    Ok(Some(
-        col.as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| Error::invalid(format!("column {name} is not a list")))?
-            .clone(),
-    ))
+    prim_at::<UInt32Type>(a, row).unwrap_or(0) as i32
 }
 
 /// A `FixedSizeBinary` column read as owned bytes, `None` when null or absent.
@@ -964,8 +899,9 @@ mod tests {
     use super::*;
     use crate::config::{DenormType, Denormalize};
     use crate::error::RefuseReason;
-    use arrow::array::{StringArray, UInt8Array, UInt16Array};
+    use arrow::array::{ListArray, StringArray, UInt8Array, UInt16Array};
     use arrow::buffer::{BooleanBuffer, NullBuffer};
+    use arrow::datatypes::UInt16Type;
     use arrow::datatypes::{Field, Schema};
 
     /// Bytes the attribute tables of `payloads` charge to a request budget.
@@ -1007,19 +943,19 @@ mod tests {
         );
     }
 
-    /// Scenario: `list_col` is given a batch whose `bucket_counts` column is a
-    /// string column rather than a list.
+    /// Scenario: `typed_col` is asked for a list where the batch's
+    /// `bucket_counts` column is a string column.
     /// Guarantees: the request is refused as invalid content, not panicked on by
     /// an unchecked downcast; an absent column is simply absent.
     #[test]
-    fn list_col_refuses_a_non_list_column() {
+    fn typed_col_refuses_a_column_of_another_type() {
         let b = batch_with_utf8("bucket_counts");
         assert!(matches!(
-            list_col(&b, "bucket_counts"),
+            typed_col::<ListArray>(&b, "bucket_counts", "a list"),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
         assert!(
-            list_col(&b, "explicit_bounds")
+            typed_col::<ListArray>(&b, "explicit_bounds", "a list")
                 .expect("absent column")
                 .is_none()
         );
@@ -1170,8 +1106,8 @@ mod tests {
         let b = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
 
         let ids = struct_child(&b, "resource", "id", &DataType::UInt16).expect("child");
-        assert_eq!(opt_u16_at(&ids, 0), Some(7));
-        assert_eq!(opt_u16_at(&ids, 1), None);
+        assert_eq!(prim_at::<UInt16Type>(&ids, 0), Some(7));
+        assert_eq!(prim_at::<UInt16Type>(&ids, 1), None);
 
         let mut any = any_value_col(&b, "body").expect("body").expect("present");
         assert_eq!(

@@ -6,7 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Int64Array, UInt16Array, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, PrimitiveArray, UInt8Array, UInt16Array,
+    UInt32Array,
+};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt8Type, UInt16Type};
 use arrow::record_batch::RecordBatch;
@@ -48,7 +51,7 @@ pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Op
 /// A column that already is `to` is returned as it is, and so is a
 /// dictionary with `u8` or `u16` keys -- the only key types OTAP uses -- whose
 /// values are `to`, for the string, binary, fixed-size binary and 64-bit
-/// integer types: [`str_cell`], [`bytes_cell`] and [`int_cell`] read
+/// integer types: [`str_cell`], [`bytes_cell`] and [`prim_at`] read
 /// through the dictionary instead. Anything else is cast.
 ///
 /// Casting a dictionary would expand it before any budget applies: one
@@ -101,15 +104,26 @@ pub(crate) fn bytes_cell<R>(a: &ArrayRef, row: usize, f: impl FnOnce(&[u8]) -> R
     ByteArrayAccessor::try_new(a).ok()?.slice_at(row).map(f)
 }
 
-/// The integer at `row` of a [`readable`] `Int64` column, reading through a
-/// dictionary; `None` when the cell is null.
-pub(crate) fn int_cell(a: &ArrayRef, row: usize) -> Option<i64> {
-    if let Some(ints) = a.as_primitive_opt::<Int64Type>() {
-        return ints.is_valid(row).then(|| ints.value(row));
+/// The value at `row` of a [`readable`] primitive column, reading through a
+/// dictionary; `None` when the column is absent or the cell is null.
+pub(crate) fn prim_at<T: ArrowPrimitiveType>(
+    a: &Option<ArrayRef>,
+    row: usize,
+) -> Option<T::Native> {
+    let a = a.as_ref()?;
+    if let Some(values) = a.as_primitive_opt::<T>() {
+        return values.is_valid(row).then(|| values.value(row));
     }
-    MaybeDictArrayAccessor::<Int64Array>::try_new(a)
+    MaybeDictArrayAccessor::<PrimitiveArray<T>>::try_new(a)
         .ok()?
         .value_at(row)
+}
+
+/// The value at `row` of a [`readable`] `Boolean` column; `None` when the
+/// column is absent or the cell is null.
+pub(crate) fn bool_at(a: &Option<ArrayRef>, row: usize) -> Option<bool> {
+    let a = a.as_ref()?.as_boolean_opt()?;
+    a.is_valid(row).then(|| a.value(row))
 }
 
 /// Refuse one cell whose payload alone is larger than a row may be.
@@ -154,7 +168,7 @@ fn reference_counts(a: &ArrayRef, values: usize) -> Vec<u32> {
 /// The seven `AnyValue` columns (type, str, int, double, bool, bytes, ser) of an
 /// attribute batch or a log body struct, cast to plain types.
 pub(crate) struct AnyValueColumns {
-    types: ArrayRef,
+    types: UInt8Array,
     strs: Option<ArrayRef>,
     ints: Option<ArrayRef>,
     doubles: Option<ArrayRef>,
@@ -181,7 +195,10 @@ impl AnyValueColumns {
         };
         Ok(Self {
             types: cast_opt(ATTRIBUTE_TYPE, &DataType::UInt8)?
-                .ok_or_else(|| Error::invalid("missing type column"))?,
+                .ok_or_else(|| Error::invalid("missing type column"))?
+                .as_primitive_opt::<UInt8Type>()
+                .cloned()
+                .ok_or_else(|| Error::invalid("type column is not u8"))?,
             strs: cast_opt(ATTRIBUTE_STR, &DataType::Utf8)?,
             ints: cast_opt(ATTRIBUTE_INT, &DataType::Int64)?,
             doubles: cast_opt(ATTRIBUTE_DOUBLE, &DataType::Float64)?,
@@ -230,10 +247,9 @@ impl AnyValueColumns {
         limits: DecodeLimits,
         budget: &mut Budget,
     ) -> Result<Value> {
-        if !self.types.is_valid(row) {
+        let Some(ty) = self.types.value_at(row) else {
             return Ok(Value::Null);
-        }
-        let ty = self.types.as_primitive::<UInt8Type>().value(row);
+        };
         let ty = AttributeValueType::try_from(ty)
             .map_err(|_| Error::invalid(format!("attribute type {ty}")))?;
         Ok(match ty {
@@ -246,22 +262,13 @@ impl AnyValueColumns {
                 });
                 Value::Str(cell.transpose()?.unwrap_or_default())
             }
-            AttributeValueType::Int => Value::Int(
-                self.ints
-                    .as_ref()
-                    .and_then(|a| int_cell(a, row))
-                    .unwrap_or(0),
-            ),
-            AttributeValueType::Double => match &self.doubles {
-                Some(a) if a.is_valid(row) => {
-                    Value::Double(a.as_primitive::<Float64Type>().value(row))
-                }
-                _ => Value::Double(0.0),
-            },
-            AttributeValueType::Bool => match &self.bools {
-                Some(a) if a.is_valid(row) => Value::Bool(a.as_boolean().value(row)),
-                _ => Value::Bool(false),
-            },
+            AttributeValueType::Int => {
+                Value::Int(prim_at::<Int64Type>(&self.ints, row).unwrap_or(0))
+            }
+            AttributeValueType::Double => {
+                Value::Double(prim_at::<Float64Type>(&self.doubles, row).unwrap_or(0.0))
+            }
+            AttributeValueType::Bool => Value::Bool(bool_at(&self.bools, row).unwrap_or(false)),
             AttributeValueType::Bytes => {
                 let cell = self.bytes.as_ref().and_then(|a| {
                     bytes_cell(a, row, |b| cell_fits(b.len(), limits).map(|()| b.to_vec()))
