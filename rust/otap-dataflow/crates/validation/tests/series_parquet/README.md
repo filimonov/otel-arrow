@@ -199,21 +199,28 @@ listeners are real and every DNS, firewall and capture rule installed with
 `docker exec` in the owner applies to the engine's own traffic. Nothing uses
 `--privileged`, host networking, host firewall rules or module loading. The
 owner publishes NGINX, the Toxiproxy API and the engine's gRPC and admin
-ports on host loopback only. The engine runs as the invoking user with the
-binary and the repository mounted read-only and its run and buffer
-directories read-write, after `ldd` inside the image proved its shared
-libraries resolve; `docker inspect` gives its host PID. Tool containers and
-the engine inherit the harness's CPU affinity through `--cpuset-cpus`, so a
-harness under `taskset` confines them too. Cleanup removes exactly the
-containers and network the rig recorded, detaches the store and checks by
-label that nothing of the run is left; artifacts (access log, captures,
-dnsmasq log) stay under the rig's root.
+ports on host loopback only. Every container starts from the inspected image
+id, never the mutable tag. The engine must be a release build (the harness's
+own profile rule; anything else is refused before launch) and its hash is
+recorded; it runs as the invoking user with the binary and the repository
+mounted read-only and its run and buffer directories read-write, after `ldd`
+inside the image proved its shared libraries resolve; `docker inspect` gives
+its host PID. Tool containers and the engine inherit the harness's CPU
+affinity through `--cpuset-cpus`, so a harness under `taskset` confines them
+too. A container is recorded only once Docker wrote its id to a cidfile, and
+is removed by that id. Teardown runs independent stages -- retry of any
+fault whose recovery failed, namespace rules, proxies, control file,
+artifacts, containers, store attachment, network, leftover check -- each of
+which runs whatever an earlier one raised, an interrupt included (re-raised
+at the end). Artifacts (access log, captures, dnsmasq log) stay under the
+rig's root.
 
 Registered faults: `slow` adds the upstream `bandwidth` (rate 256 KB/s) and
 downstream `latency` (1500 ms) toxics to both proxies; `http503` creates the
 control file NGINX answers 503 for; `store_outage` stops the store container
 and recovers the same container, repointing both proxies if its address
-changed. Any activation or recovery error after preflight is a failure.
+changed. Any activation or recovery error after preflight is a failure, and
+a fault whose recovery failed stays active so the teardown retries it.
 
 Provision once, outside any measurement lease, from `rust/otap-dataflow`:
 
@@ -235,10 +242,16 @@ exporting through both backends, the capability split read from each
 container's configuration and `/proc/PID/status`, UDP and TCP DNS blocking
 (exact port-53 DROP rule, bounded `dig` timeout, positive counter, exact
 deletion, resolution restored), the `xt_bpf` ACK-only drop (bytecode from
-`tcpdump -ddd -y RAW`, positive counter under capture, exact deletion),
-capture read back with tshark, the three activations, and the restored
-state. Every command's argv, exit status, output and duration is kept in
-`fault-preflight.json`, with the fault-class coverage those probes decide.
+`tcpdump -ddd -y RAW`; a signed PUT through the route stalls under the rule,
+and the probe requires dropped ACKs, a non-empty capture and at least one
+retransmission, then after the exact deletion a signed PUT with a 2xx
+status and its bytes read back), a signed transfer captured and read back
+with tshark, the three activations, and the restored state. Every command's
+argv, exit status, output and duration is kept in `fault-preflight.json`,
+with the fault-class coverage those probes decide. `disconnect_reset` and
+`dropped_completion_response` stay unavailable until Task 11 adds their
+direct probes with negative controls; the coverage names what each must
+show.
 A failed `xt_bpf` probe names the host fix (`sudo modprobe xt_bpf`); the
 harness never runs it.
 

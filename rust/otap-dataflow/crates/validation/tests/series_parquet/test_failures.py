@@ -123,6 +123,22 @@ class ProbeVerdicts(unittest.TestCase):
         required = faults.coverage(probes, required=True)
         self.assertEqual(required["tcp_ack_loss"]["consequence"], "fails the lane")
 
+    # Scenario: every probe the preflight runs passed.
+    # Guarantees: disconnect/reset and the dropped completion response stay
+    # unavailable, because no direct probe with a negative control exists
+    # for them yet; the evidence names the task that owns each one.
+    def test_unprobed_classes_are_not_claimed(self):
+        probes = [{"name": name, "store": "minio", "passed": True}
+                  for name in faults.PREFLIGHT_PROBES]
+        for required in (False, True):
+            classes = faults.coverage(probes, required=required)
+            for name in ("disconnect_reset", "dropped_completion_response"):
+                with self.subTest(name=name, required=required):
+                    self.assertEqual(classes[name]["status"], "unavailable")
+                    self.assertIn("Task 11", classes[name]["consequence"])
+                    self.assertTrue(classes[name]["deferred_probes"])
+            self.assertEqual(classes["tcp_ack_loss"]["status"], "available")
+
     # Scenario: a preflight never ran the DNS probes at all.
     # Guarantees: an absent probe makes its classes unavailable; absence is
     # never read as success.
@@ -143,10 +159,12 @@ class Privileges(unittest.TestCase):
     def argvs(self):
         """The command line of every container a rig or a store starts."""
         owner = faults.owner_argv(
-            name="series-fault-x-tools", network="net", image="tools", run_id="x",
+            name="series-fault-x-tools", cidfile="/s/owner.cid", network="net",
+            image="tools", run_id="x",
             control_dir="/c", artifact_dir="/a", engine_ports=(40001, 40002), cores=(1, 2),
         )
-        toxiproxy = faults.toxiproxy_argv(name="series-fault-x-toxiproxy", owner=self.OWNER,
+        toxiproxy = faults.toxiproxy_argv(name="series-fault-x-toxiproxy",
+                                          cidfile="/s/toxiproxy.cid", owner=self.OWNER,
                                           image="toxiproxy", run_id="x")
         engine = faults.engine_argv(
             name="series-fault-x-engine-1", cidfile="/s/engine-1.cid", owner=self.OWNER,
@@ -430,8 +448,9 @@ class RigRules(unittest.TestCase):
         self.assertEqual(rig.active, [])
 
     # Scenario: two faults are active and one recovery fails.
-    # Guarantees: every fault is still recovered, newest first, and the
-    # failure is raised rather than swallowed.
+    # Guarantees: every other fault is still recovered, newest first, the
+    # failure is raised rather than swallowed, and the failed one stays
+    # active so it can be retried.
     def test_recovery_is_complete_and_loud(self):
         rig = self.rig()
         order = []
@@ -452,7 +471,7 @@ class RigRules(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "b: recovery broke"):
                 rig.recover()
         self.assertEqual(order, ["b", "a"])
-        self.assertEqual(rig.active, [])
+        self.assertEqual([entry["name"] for entry in rig.active], ["b"])
         self.assertEqual(len(rig.activations), 2)
 
     # Scenario: the plan's first fault names are looked up.
@@ -464,20 +483,273 @@ class RigRules(unittest.TestCase):
             self.assertTrue(callable(activate) and callable(recover), name)
 
     # Scenario: the engine container is signalled.
-    # Guarantees: signals reach the container through docker kill, not the
-    # CLI process that merely waits for it.
+    # Guarantees: signals reach the container through docker kill, by the id
+    # Docker returned, not the CLI process that merely waits for it; with no
+    # id there is nothing of this rig's to signal.
     def test_container_process_signals_the_container(self):
         cli = mock.Mock()
         cli.wait.return_value = 0
-        process = faults.ContainerProcess(cli, temporary_directory(self) / "absent.cid",
-                                          "series-fault-x-engine-1")
+        cidfile = temporary_directory(self) / "engine-1.cid"
+        process = faults.ContainerProcess(cli, cidfile, "series-fault-x-engine-1")
+        with self.assertRaisesRegex(AssertionError, "no id"):
+            process.terminate()
+        cidfile.write_text("abc123\n")
         with mock.patch.object(faults, "run_command") as run:
             process.terminate()
             process.kill()
         signals = [call.args[0][3] for call in run.call_args_list]
         self.assertEqual(signals, ["SIGTERM", "SIGKILL"])
         self.assertTrue(all(call.args[0][:2] == ["docker", "kill"] for call in run.call_args_list))
+        self.assertTrue(all(call.args[0][4] == "abc123" for call in run.call_args_list))
         cli.kill.assert_not_called()
+
+
+def ok_command(stdout="", stderr="", status=0):
+    """One run_command result."""
+    return {"argv": [], "exit_status": status, "elapsed_s": 0.0,
+            "stdout": stdout, "stderr": stderr}
+
+
+class TeardownRig(faults.FaultRig):
+    """A rig with its real teardown and Docker replaced by a recorder."""
+
+    def __init__(self, root):
+        super().__init__(store=mock.Mock(kind="minio", name="store"), root=root, probes=())
+        self.state_dir = Path(root)
+        self.network_id = "net-id"
+        self.attached = True
+        self.owner_id = "owner-id"
+        self.baseline_rules = "-P INPUT ACCEPT\n"
+        self.toxiproxy = mock.Mock()
+        self.toxiproxy.toxics.return_value = []
+        for role, ident in (("owner", "owner-id"), ("toxiproxy", "toxi-id")):
+            cidfile = self.state_dir / f"{role}.cid"
+            cidfile.write_text(ident)
+            self.adopt_container(role, f"series-fault-x-{role}", cidfile)
+
+    def exec(self, argv, *, timeout=60):
+        if argv[:2] == ["iptables", "-w"] and argv[2:] == ["-S"]:
+            return ok_command(self.baseline_rules)
+        return ok_command()
+
+
+class Teardown(unittest.TestCase):
+    """The rig's cleanup: ownership by id, retained recovery, interrupts."""
+
+    def setUp(self):
+        self.calls = []
+
+        def run(argv, *, timeout=60):
+            self.calls.append([str(part) for part in argv])
+            return ok_command()
+
+        for patcher in (mock.patch.object(faults, "run_command", side_effect=run),
+                        mock.patch.object(faults, "leftovers", return_value={
+                            "containers": [], "networks": [], "commands_ok": True})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.rig = TeardownRig(temporary_directory(self))
+
+    def removed(self):
+        """The ids `docker rm` was given, in order."""
+        return [argv[-1] for argv in self.calls if argv[:2] == ["docker", "rm"]]
+
+    # Scenario: a container name is reused but Docker wrote no id for it.
+    # Guarantees: only containers whose id Docker returned are recorded, and
+    # they are removed by that id, never by name.
+    def test_containers_are_owned_by_returned_id(self):
+        missing = self.rig.adopt_container("engine", "series-fault-x-engine-1",
+                                           self.rig.state_dir / "never-written.cid")
+        self.assertIsNone(missing)
+        self.rig.__exit__(None, None, None)
+        self.assertEqual(self.removed(), ["toxi-id", "owner-id"])
+        self.assertTrue(self.rig.cleanup_report["clean"], self.rig.cleanup_report)
+
+    # Scenario: a store outage's recovery fails once, inside a case.
+    # Guarantees: the fault stays active instead of being forgotten, and the
+    # rig's teardown retries it; every attempt is recorded.
+    def test_failed_recovery_stays_active_and_is_retried(self):
+        attempts = []
+
+        def recover(_rig, state):
+            attempts.append(state)
+            if len(attempts) == 1:
+                raise RuntimeError("store did not come back")
+            return {"recovered": True}
+
+        with mock.patch.dict(faults.FAULTS, {"flaky": (lambda _rig, p: dict(p), recover)}):
+            self.rig.activate("flaky", {"id": 1})
+            with self.assertRaisesRegex(AssertionError, "store did not come back"):
+                self.rig.recover()
+            self.assertEqual([entry["name"] for entry in self.rig.active], ["flaky"])
+            self.rig.__exit__(None, None, None)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.rig.active, [])
+        entry = self.rig.activations[0]
+        self.assertEqual(len(entry["recovery_attempts"]), 2)
+        self.assertIn("error", entry["recovery_attempts"][0])
+        self.assertTrue(self.rig.cleanup_report["stages"]["faults"]["ok"])
+
+    # Scenario: Ctrl-C arrives while the rig removes its first container.
+    # Guarantees: the remaining container, the store attachment and the
+    # network are still removed, and the interrupt is raised afterwards.
+    def test_interrupt_mid_teardown_still_removes_everything(self):
+        real = self.rig._remove_entry
+
+        def interrupted(entry):
+            if entry["id"] == "toxi-id":
+                raise KeyboardInterrupt
+            return real(entry)
+
+        with mock.patch.object(self.rig, "_remove_entry", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.rig.__exit__(None, None, None)
+        self.assertEqual(self.removed(), ["owner-id"])
+        self.rig.store.detach.assert_called_once_with("net-id")
+        self.assertIn(["docker", "network", "rm", "net-id"], self.calls)
+        report = self.rig.cleanup_report
+        self.assertFalse(report["clean"])
+        self.assertFalse(report["stages"]["containers"]["ok"])
+        for stage in ("store_attachment", "network", "leftovers"):
+            self.assertTrue(report["stages"][stage]["ok"], stage)
+
+    # Scenario: one teardown stage raises an ordinary error.
+    # Guarantees: every later stage still runs and the report is not clean.
+    def test_failing_stage_does_not_stop_later_stages(self):
+        self.rig.toxiproxy.toxics.side_effect = RuntimeError("api gone")
+        self.rig.__exit__(None, None, None)
+        report = self.rig.cleanup_report
+        self.assertFalse(report["stages"]["proxies"]["ok"])
+        self.assertEqual(self.removed(), ["toxi-id", "owner-id"])
+        self.assertFalse(report["clean"])
+
+
+class Provenance(unittest.TestCase):
+    """What a rig runs: images by id, and only a release engine."""
+
+    def rig(self):
+        """A rig with inspected images and no Docker behind it."""
+        rig = faults.FaultRig(store=mock.Mock(kind="minio"), root=temporary_directory(self),
+                              probes=())
+        rig.images = {"fault_tools": {"tag": "series-measure-fault-tools:local",
+                                      "id": "sha256:" + "a" * 64},
+                      "toxiproxy": {"tag": faults.TOXIPROXY_IMAGE, "id": "sha256:" + "b" * 64}}
+        rig.state_dir = rig.root
+        return rig
+
+    # Scenario: the tools tag is moved to another image after inspection.
+    # Guarantees: containers are started from the inspected id, never the tag.
+    def test_containers_run_the_inspected_image_id(self):
+        rig = self.rig()
+        self.assertEqual(rig.image("fault_tools"), "sha256:" + "a" * 64)
+        with self.assertRaisesRegex(AssertionError, "never inspected"):
+            rig.image("absent")
+
+    # Scenario: DF_ENGINE names a debug or custom build.
+    # Guarantees: the rig refuses it before running anything, by the
+    # harness's own profile rule.
+    def test_non_release_engine_is_refused(self):
+        rig = self.rig()
+        root = temporary_directory(self)
+        for profile in ("debug", "profiling"):
+            binary = root / "target" / profile / "df_engine"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"not an engine")
+            with self.subTest(profile=profile), mock.patch.object(faults, "run_command") as run:
+                with self.assertRaisesRegex(AssertionError, "release df_engine only"):
+                    rig.launcher.check_binary(binary)
+                run.assert_not_called()
+        self.assertEqual(measurement.build_profile(root / "target/release/df_engine"), "release")
+
+    # Scenario: a release engine passes ldd.
+    # Guarantees: ldd runs from the image id, its container is removed by
+    # the id Docker returned, and the binary's hash is recorded.
+    def test_release_engine_is_hashed_and_checked_by_image_id(self):
+        rig = self.rig()
+        binary = temporary_directory(self) / "target" / "release" / "df_engine"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"engine bytes")
+        calls = []
+
+        def run(argv, *, timeout=60):
+            calls.append([str(part) for part in argv])
+            if argv[:2] == ["docker", "run"]:
+                Path(argv[argv.index("--cidfile") + 1]).write_text("ldd-id")
+                return ok_command("\tlibc.so.6 => /lib/libc.so.6\n")
+            return ok_command()
+
+        with mock.patch.object(faults, "run_command", side_effect=run):
+            report = rig.launcher.check_binary(binary)
+        self.assertTrue(report["compatible"])
+        self.assertEqual(report["binary_sha256"], measurement.file_digest(binary))
+        self.assertIn("sha256:" + "a" * 64, calls[0])
+        self.assertEqual(calls[1], ["docker", "rm", "--force", "--volumes", "ldd-id"])
+
+
+class AckLossVerdict(unittest.TestCase):
+    """When the xt_bpf ACK-loss probe may pass."""
+
+    RESTORED = {"status": 200, "bytes_verified": True}
+
+    # Scenario: every part of the ACK-loss probe held.
+    # Guarantees: the verdict has no problem to report.
+    def test_complete_evidence_passes(self):
+        self.assertEqual(faults.ack_loss_problems(
+            dropped=4, captured=19, retransmissions=1, restored=self.RESTORED), [])
+
+    # Scenario: the rule counted drops but the capture was empty (the
+    # archived first preflight child).
+    # Guarantees: an empty capture or no retransmission fails the probe.
+    def test_empty_capture_or_no_retransmission_fails(self):
+        for captured, retransmissions in ((0, 0), (19, 0), (None, 1)):
+            with self.subTest(captured=captured, retransmissions=retransmissions):
+                self.assertTrue(faults.ack_loss_problems(
+                    dropped=4, captured=captured, retransmissions=retransmissions,
+                    restored=self.RESTORED))
+
+    # Scenario: after the rule is deleted, the store answers 403 (an
+    # unsigned request) or the bytes cannot be read back.
+    # Guarantees: only a 2xx signed transfer with verified bytes counts as a
+    # restored route.
+    def test_403_or_unverified_restoration_fails(self):
+        for restored in ({"status": 403, "bytes_verified": False},
+                         {"status": 200, "bytes_verified": False},
+                         {"status": None, "bytes_verified": False}, None):
+            with self.subTest(restored=restored):
+                problems = faults.ack_loss_problems(
+                    dropped=4, captured=19, retransmissions=1, restored=restored)
+                self.assertTrue(any("did not succeed" in problem for problem in problems))
+
+    # Scenario: the rule never matched.
+    # Guarantees: zero dropped ACKs fails even with packets and a restored route.
+    def test_no_dropped_ack_fails(self):
+        self.assertTrue(faults.ack_loss_problems(
+            dropped=0, captured=19, retransmissions=1, restored=self.RESTORED))
+
+
+class EvidenceScrub(unittest.TestCase):
+    """Host paths in container command lines, as the evidence records them."""
+
+    # Scenario: the engine's run directory is bind-mounted at its own path.
+    # Guarantees: both sides of `-v SRC:DST[:MODE]` and both `--mount`
+    # paths lose their host prefix; container-only paths are kept.
+    def test_bind_specifications_are_scrubbed_on_both_sides(self):
+        scrub = measurement.scrub_published
+        self.assertEqual(scrub("/tmp/series-fault-preflight/rigs/minio/engine-probe:"
+                               "/tmp/series-fault-preflight/rigs/minio/engine-probe:rw"),
+                         "<host-path>/engine-probe:<host-path>/engine-probe:rw")
+        self.assertEqual(scrub("/tmp/r/fault-control:/control:ro"),
+                         "<host-path>/fault-control:/control:ro")
+        self.assertEqual(scrub("type=bind,source=/tmp/q/r,target=/tmp/q/r"),
+                         "type=bind,source=<host-path>/r,target=<host-path>/r")
+        self.assertEqual(scrub("/etc/a.conf:/etc/nginx/nginx.conf:ro"),
+                         "/etc/a.conf:/etc/nginx/nginx.conf:ro")
+        self.assertEqual(scrub("http://127.0.0.1:9000/tmp/x"), "http://127.0.0.1:9000/tmp/x")
+        # Evidence scrubbed by the earlier, source-only rule is completed.
+        self.assertEqual(scrub("<host-path>/engine-probe:/tmp/r/engine-probe:rw"),
+                         "<host-path>/engine-probe:<host-path>/engine-probe:rw")
+        once = scrub("/tmp/a/b:/tmp/a/b:rw")
+        self.assertEqual(scrub(once), once)
 
 
 class PreflightOutcome(unittest.TestCase):

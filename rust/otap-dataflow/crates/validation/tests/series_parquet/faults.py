@@ -135,6 +135,9 @@ DEFAULT_LEASE_WAIT_S = 4 * 3600
 
 DOCKER_TIMEOUT_S = test_e2e.DOCKER_TIMEOUT_S
 
+# The only engine build a rig launches, as for every measured case.
+RELEASE_PROFILE = "release"
+
 
 # --------------------------------------------------------------------------
 # Required versus optional coverage
@@ -183,11 +186,26 @@ FAULT_CLASS_PROBES = {
     "store_outage": BASE_PROBES + ("store_outage activation",),
     "slow": BASE_PROBES + ("slow activation",),
     "http503": BASE_PROBES + ("http503 activation",),
-    "disconnect_reset": BASE_PROBES,
-    "dropped_completion_response": BASE_PROBES,
+    # No direct probe with a negative control exists for these two yet, so
+    # they stay unavailable until the task that owns them adds one.
+    "disconnect_reset": BASE_PROBES + ("disconnect_reset direct",),
+    "dropped_completion_response": BASE_PROBES + ("dropped_completion_response direct",),
     "dns_nxdomain_timeout": BASE_PROBES + ("UDP DNS", "TCP DNS"),
     "tcp_ack_loss": BASE_PROBES + ("xt_bpf", "capture"),
     "containerized_engine": BASE_PROBES + ("engine launch",),
+}
+
+# Classes whose direct probe a later task owns, and what it must show.
+DEFERRED_PROBES = {
+    "disconnect_reset direct": (
+        "Task 11: a client-observed connection reset and refused connection "
+        "through the route while a bypass request succeeds (negative control)"
+    ),
+    "dropped_completion_response direct": (
+        "Task 11 (reused by Task 13): a values PUT whose completion response is "
+        "withheld while the bypass HEAD/GET shows the complete object, against "
+        "an untoxicated control PUT"
+    ),
 }
 
 
@@ -209,16 +227,25 @@ def coverage(probes, *, required: bool) -> dict:
             }
         )
         missing = sorted(set(needed) - {probe["name"] for probe in probes})
+        deferred = sorted(name for name in missing if name in DEFERRED_PROBES)
         available = not failed and not missing
+        if available:
+            consequence = "runs"
+        elif deferred and not failed and missing == deferred:
+            consequence = "not probed yet: " + "; ".join(
+                DEFERRED_PROBES[name] for name in deferred
+            )
+        elif required:
+            consequence = "fails the lane"
+        else:
+            consequence = "skipped before traffic"
         classes[fault] = {
             "probes": list(needed),
             "status": "available" if available else "unavailable",
             "failed_probes": failed,
             "missing_probes": missing,
-            "consequence": (
-                "runs" if available else "fails the lane" if required
-                else "skipped before traffic"
-            ),
+            "deferred_probes": deferred,
+            "consequence": consequence,
         }
     return classes
 
@@ -442,7 +469,7 @@ def _cpuset(cores):
     return ["--cpuset-cpus", ",".join(str(core) for core in sorted(cores))]
 
 
-def owner_argv(*, name, network, image, run_id, control_dir, artifact_dir,
+def owner_argv(*, name, cidfile, network, image, run_id, control_dir, artifact_dir,
                engine_ports, cores=()) -> list:
     """`docker run` for the namespace owner: the only container with NET_ADMIN.
 
@@ -452,6 +479,7 @@ def owner_argv(*, name, network, image, run_id, control_dir, artifact_dir,
     """
     argv = [
         "docker", "run", "--pull=never", "--detach", "--name", name,
+        "--cidfile", str(cidfile),
         "--label", f"{RUN_LABEL}={run_id}",
         "--network", network,
         "--cap-add", NET_ADMIN,
@@ -466,10 +494,11 @@ def owner_argv(*, name, network, image, run_id, control_dir, artifact_dir,
     return argv + _cpuset(cores) + [image]
 
 
-def toxiproxy_argv(*, name, owner, image, run_id, cores=()) -> list:
+def toxiproxy_argv(*, name, cidfile, owner, image, run_id, cores=()) -> list:
     """`docker run` for Toxiproxy inside the owner's namespace, no added capability."""
     return [
         "docker", "run", "--pull=never", "--detach", "--name", name,
+        "--cidfile", str(cidfile),
         "--label", f"{RUN_LABEL}={run_id}",
         "--network", f"container:{owner}",
     ] + _cpuset(cores) + [image, "-host=0.0.0.0", f"-port={TOXIPROXY_API_PORT}"]
@@ -545,10 +574,12 @@ class ContainerProcess:
         return self.cli.wait(timeout)
 
     def send_signal(self, sig):
-        """Deliver one signal to the engine in its container."""
+        """Deliver one signal to the engine in its container, by its id."""
+        ident = self.container_id
+        if ident is None:
+            raise AssertionError(f"the engine container {self.name} has no id to signal")
         _ = run_command(
-            ["docker", "kill", "--signal", _signal_name(sig),
-             self.container_id or self.name],
+            ["docker", "kill", "--signal", _signal_name(sig), ident],
             timeout=DOCKER_TIMEOUT_S,
         )
 
@@ -594,20 +625,42 @@ class ContainerLauncher:
         self.extra_mounts.append(Path(path).resolve())
 
     def check_binary(self, binary):
-        """Fail unless every shared library of `binary` resolves in the image."""
-        binary = Path(binary).resolve()
+        """Fail unless `binary` is a release engine whose libraries resolve.
+
+        The profile is read by the harness's own rule (the target directory
+        the binary was built into) and anything but release is refused, as
+        every measured case refuses it; the binary's hash is recorded. Then
+        `ldd` runs inside the tools image, by its inspected id.
+        """
+        requested = Path(binary)
+        binary = requested.resolve()
         if binary in self.ldd:
             return self.ldd[binary]
-        name = f"series-fault-{self.rig.run_id}-ldd-{len(self.ldd) + 1}"
-        done = run_command(
-            ["docker", "run", "--rm", "--pull=never", "--name", name,
-             "--label", f"{RUN_LABEL}={self.rig.run_id}", "--network", "none",
-             "--volume", f"{binary}:{binary}:ro", self.rig.images["fault_tools"]["tag"],
-             "ldd", str(binary)],
-            timeout=DOCKER_TIMEOUT_S,
-        )
+        profile = measurement.build_profile(requested)
+        if profile != RELEASE_PROFILE:
+            raise AssertionError(
+                f"the fault rig runs a release df_engine only; {requested} is a "
+                f"{profile} build. Point DF_ENGINE at target/release/df_engine"
+            )
+        ordinal = len(self.ldd) + 1
+        name = f"series-fault-{self.rig.run_id}-ldd-{ordinal}"
+        cidfile = self.rig.state_dir / f"ldd-{ordinal}.cid"
+        try:
+            done = run_command(
+                ["docker", "run", "--pull=never", "--name", name, "--cidfile", str(cidfile),
+                 "--label", f"{RUN_LABEL}={self.rig.run_id}", "--network", "none",
+                 "--volume", f"{binary}:{binary}:ro", self.rig.image("fault_tools"),
+                 "ldd", str(binary)],
+                timeout=DOCKER_TIMEOUT_S,
+            )
+        finally:
+            self.rig.adopt_container("ldd", name, cidfile)
+            self.rig.remove_container(name)
         missing = [line.strip() for line in done["stdout"].splitlines() if "not found" in line]
-        report = {"binary": str(binary), "command": done, "missing": missing,
+        report = {"binary": str(binary), "profile": profile,
+                  "binary_sha256": measurement.file_digest(binary),
+                  "binary_size_bytes": binary.stat().st_size,
+                  "command": done, "missing": missing,
                   "compatible": done["exit_status"] == 0 and not missing}
         self.ldd[binary] = report
         if not report["compatible"]:
@@ -655,14 +708,22 @@ class ContainerLauncher:
         cidfile = self.rig.state_dir / f"engine-{ordinal}.cid"
         command = engine_argv(
             name=name, cidfile=cidfile, owner=self.rig.owner_id,
-            image=self.rig.images["fault_tools"]["tag"], run_id=self.rig.run_id,
+            image=self.rig.image("fault_tools"), run_id=self.rig.run_id,
             argv=argv, mounts=self._mounts(argv),
             user=f"{os.getuid()}:{os.getgid()}", env=env, cores=self.rig.engine_cores,
         )
-        self.rig.record_container("engine", name)
         cli = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         process = ContainerProcess(cli, cidfile, name)
         self.launches.append({"name": name, "argv": command})
+        # Docker writes the id when it creates the container; only then is
+        # the container this rig's to remove.
+        deadline = time.monotonic() + 30
+        while process.container_id is None and cli.poll() is None:
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
+        self.rig.adopt_container("engine", name, cidfile)
+        self.launches[-1]["container_id"] = process.container_id
         return process
 
     def pid(self, process):
@@ -674,12 +735,13 @@ class ContainerLauncher:
                     f"the engine container {process.name} exited with "
                     f"{process.returncode} before it had a PID"
                 )
-            state = _docker_json(["inspect", "--format", "{{json .State}}", process.name])
+            ident = process.container_id
+            state = ident and _docker_json(["inspect", "--format", "{{json .State}}", ident])
             if state and state.get("Running") and state.get("Pid"):
                 pid = int(state["Pid"])
                 self.launches[-1]["host_pid"] = pid
-                self.launches[-1]["container_id"] = process.container_id
-                self.rig.record_container("engine", process.name, pid=pid)
+                self.launches[-1]["container_id"] = ident
+                self.rig.adopt_container("engine", process.name, process.cidfile, pid=pid)
                 return pid
             time.sleep(0.05)
         raise AssertionError(f"the engine container {process.name} never started")
@@ -914,14 +976,64 @@ class FaultRig:
 
     # -- lifecycle --------------------------------------------------------
 
-    def record_container(self, role, name, *, pid=None):
-        """Remember one container this rig created, for evidence and cleanup."""
+    def image(self, role):
+        """The immutable id of one inspected image; containers run by id.
+
+        A tag can be moved between inspection and launch; the id cannot.
+        """
+        ident = (self.images.get(role) or {}).get("id")
+        if not ident:
+            raise AssertionError(f"the {role} image was never inspected")
+        return ident
+
+    def adopt_container(self, role, name, cidfile, *, pid=None):
+        """Record a container once Docker has written its id to `cidfile`.
+
+        Only a container whose id Docker returned to this rig is recorded,
+        and cleanup removes it by that id, so a name collision can never make
+        the rig remove a container it did not create. Returns the id, or
+        None when Docker created nothing.
+        """
+        try:
+            ident = Path(cidfile).read_text().strip() or None
+        except OSError:
+            ident = None
+        if ident is None:
+            return None
         for entry in self.containers:
-            if entry["name"] == name:
+            if entry["id"] == ident:
                 if pid is not None:
                     entry["host_pid"] = pid
-                return
-        self.containers.append({"role": role, "name": name, "host_pid": pid})
+                return ident
+        self.containers.append({"role": role, "name": name, "id": ident, "host_pid": pid,
+                                "removed": False})
+        return ident
+
+    def remove_container(self, name):
+        """Remove the recorded container of this name, by its id."""
+        for entry in self.containers:
+            if entry["name"] == name and not entry["removed"]:
+                return self._remove_entry(entry)
+        return None
+
+    @staticmethod
+    def _remove_entry(entry):
+        """Remove one recorded container by the id Docker returned for it."""
+        done = run_command(["docker", "rm", "--force", "--volumes", entry["id"]])
+        entry["removed"] = (done["exit_status"] == 0
+                            or "No such container" in done["stderr"])
+        return done
+
+    def _run_container(self, role, name, build_argv):
+        """`docker run --detach` one container and adopt it by its cidfile."""
+        cidfile = self.state_dir / f"{name}.cid"
+        try:
+            done = run_command(build_argv(cidfile))
+        finally:
+            ident = self.adopt_container(role, name, cidfile)
+        if done["exit_status"] != 0:
+            return None, done
+        return ident, done
 
     def __enter__(self):
         self.images = require_fault_images()
@@ -959,12 +1071,11 @@ class FaultRig:
             raise AssertionError("the store has no address on the rig network")
         self._start_owner()
         name = f"series-fault-{self.run_id}-toxiproxy"
-        self.record_container("toxiproxy", name)
-        done = run_command(toxiproxy_argv(
-            name=name, owner=self.owner_id, image=self.images["toxiproxy"]["tag"],
+        ident, done = self._run_container("toxiproxy", name, lambda cidfile: toxiproxy_argv(
+            name=name, cidfile=cidfile, owner=self.owner_id, image=self.image("toxiproxy"),
             run_id=self.run_id, cores=self.cores,
         ))
-        if done["exit_status"] != 0:
+        if ident is None:
             raise AssertionError(f"toxiproxy did not start: {done['stderr']}")
         self.toxiproxy_port = self._published(TOXIPROXY_API_PORT)
         self.nginx_port = self._published(NGINX_PORT)
@@ -980,8 +1091,8 @@ class FaultRig:
         self.route_endpoint = f"http://127.0.0.1:{self.nginx_port}"
         self._wait(self._route_answers, "the NGINX route to the store")
         for entry in self.containers:
-            if entry["host_pid"] is None:
-                entry["host_pid"] = container_pid(entry["name"])
+            if entry["host_pid"] is None and not entry["removed"]:
+                entry["host_pid"] = container_pid(entry["id"])
         self.baseline_rules = self.iptables_rules()
         self.storage = {
             "s3": {
@@ -1000,21 +1111,22 @@ class FaultRig:
 
     def _start_owner(self, attempts=3):
         """Start the namespace owner, retrying when a chosen port was taken."""
-        name = f"series-fault-{self.run_id}-tools"
         for attempt in range(attempts):
+            name = f"series-fault-{self.run_id}-tools-{attempt + 1}"
             self.engine_ports = (test_e2e.free_port(), test_e2e.free_port())
-            self.record_container("owner", name)
-            done = run_command(owner_argv(
-                name=name, network=self.network_id,
-                image=self.images["fault_tools"]["tag"], run_id=self.run_id,
+            ident, done = self._run_container("owner", name, lambda cidfile: owner_argv(
+                name=name, cidfile=cidfile, network=self.network_id,
+                image=self.image("fault_tools"), run_id=self.run_id,
                 control_dir=self.control_dir.resolve(),
                 artifact_dir=self.artifact_dir.resolve(),
                 engine_ports=self.engine_ports, cores=self.cores,
             ))
-            if done["exit_status"] == 0:
-                self.owner_id = done["stdout"].strip()
+            if ident is not None:
+                self.owner_id = ident
                 return
-            _ = run_command(["docker", "rm", "--force", name])
+            # A container Docker created but could not start is this rig's,
+            # by its cidfile, and is removed by that id.
+            self.remove_container(name)
             taken = "already allocated" in done["stderr"] or "in use" in done["stderr"]
             if not taken or attempt + 1 == attempts:
                 raise AssertionError(f"the fault-tools owner did not start: {done['stderr']}")
@@ -1049,37 +1161,139 @@ class FaultRig:
         except urllib.error.HTTPError as error:
             return error.code < 500
 
+    # The teardown stages, in order. Each one runs whatever an earlier one
+    # raised, an interrupt included, so a failed recovery or a Ctrl-C in
+    # the middle can never leave a container, a network or an attachment
+    # behind.
+    TEARDOWN_STAGES = ("faults", "namespace_rules", "proxies", "control_file",
+                       "artifacts", "containers", "store_attachment", "network",
+                       "leftovers")
+
     def __exit__(self, *exc):
-        """Recover what is still active, then remove what this rig created."""
-        report = {"recovered": None, "removed": [], "errors": []}
-        if self.active:
+        """Recover what is still active, then remove what this rig created.
+
+        Every stage in `TEARDOWN_STAGES` runs, each catching everything it
+        raises into the report. An interrupt (KeyboardInterrupt, SystemExit)
+        caught in a stage is raised again once every stage has run.
+        """
+        report = {"stages": {}, "errors": [], "removed": []}
+        interrupted = None
+        for stage in self.TEARDOWN_STAGES:
             try:
-                self.recover()
-                report["recovered"] = True
-            except Exception as error:
-                report["recovered"] = False
-                report["errors"].append(f"recover: {error}")
-        if self.owner_id:
-            # The owner's tools write the artifacts as root; make them
-            # readable to the harness user before the owner goes away.
-            report["artifacts_readable"] = self.exec(
-                ["chmod", "-R", "a+rX", ARTIFACT_MOUNT])["exit_status"] == 0
-        for entry in reversed(self.containers):
-            done = run_command(["docker", "rm", "--force", "--volumes", entry["name"]])
-            report["removed"].append({"name": entry["name"], "exit_status": done["exit_status"]})
-        if self.attached:
-            self.store.detach(self.network_id)
-            self.attached = False
-        if self.network_id:
-            done = run_command(["docker", "network", "rm", self.network_id])
-            report["network_removed"] = done["exit_status"] == 0
-            if done["exit_status"] != 0:
-                report["errors"].append(f"network rm: {done['stderr'].strip()}")
-        report["leftovers"] = leftovers(self.run_id)
-        report["clean"] = not report["leftovers"]["containers"] and not report[
-            "leftovers"]["networks"] and not report["errors"]
+                outcome = getattr(self, f"_teardown_{stage}")(report)
+                report["stages"][stage] = {"ok": True, "detail": outcome}
+            except BaseException as error:  # every stage runs, whatever this was
+                report["stages"][stage] = {"ok": False,
+                                           "detail": f"{type(error).__name__}: {error}"}
+                report["errors"].append(f"{stage}: {type(error).__name__}: {error}")
+                if not isinstance(error, Exception) and interrupted is None:
+                    interrupted = error
+        leftover = report.get("leftovers") or {}
+        report["clean"] = (not report["errors"] and not leftover.get("containers")
+                           and not leftover.get("networks"))
         self.cleanup_report = report
+        if interrupted is not None:
+            raise interrupted
         return False
+
+    def _teardown_faults(self, report):
+        """Retry the recovery of every fault still active."""
+        if not self.active:
+            return "no active fault"
+        self.recover()
+        return "recovered"
+
+    def _teardown_namespace_rules(self, report):
+        """Put the owner's filter table back to its baseline."""
+        if not self.owner_id or getattr(self, "baseline_rules", None) is None:
+            return "no namespace"
+        if self.iptables_rules() == self.baseline_rules:
+            return "baseline"
+        if any(line.startswith("-A") for line in self.baseline_rules.splitlines()):
+            raise AssertionError("probe rules remain and the baseline is not empty")
+        flushed = self.exec(["iptables", "-w", "-F"])
+        if flushed["exit_status"] != 0 or self.iptables_rules() != self.baseline_rules:
+            raise AssertionError(f"the filter table could not be restored: {flushed}")
+        return "flushed back to the empty baseline"
+
+    def _teardown_proxies(self, report):
+        """Remove every toxic and re-enable both proxies."""
+        if getattr(self, "toxiproxy", None) is None:
+            return "no proxy"
+        for proxy in PROXY_PORTS:
+            for toxic in self.toxiproxy.toxics(proxy) or []:
+                self.toxiproxy.remove_toxic(proxy, toxic["name"])
+            self.toxiproxy.update(proxy, {"enabled": True})
+        return "no toxics, both enabled"
+
+    def _teardown_control_file(self, report):
+        """Remove the 503 control file if it is still there."""
+        fail503 = getattr(self, "fail503", None)
+        if fail503 is not None and fail503.exists():
+            fail503.unlink()
+            return "removed"
+        return "absent"
+
+    def _teardown_artifacts(self, report):
+        """Make the root-written artifacts readable before the owner goes away."""
+        if not self.owner_id:
+            return "no owner"
+        done = self.exec(["chmod", "-R", "a+rX", ARTIFACT_MOUNT])
+        if done["exit_status"] != 0:
+            raise AssertionError(f"chmod failed: {done['stderr']}")
+        return "readable"
+
+    def _teardown_containers(self, report):
+        """Remove every recorded container, newest first, by its id.
+
+        Each removal is attempted even if an earlier one raised; an
+        interrupt is raised again after the last one.
+        """
+        failures = []
+        interrupted = None
+        for entry in reversed(self.containers):
+            if entry["removed"]:
+                continue
+            try:
+                done = self._remove_entry(entry)
+            except BaseException as error:  # the next container is still removed
+                failures.append(f"{entry['name']}: {type(error).__name__}: {error}")
+                if not isinstance(error, Exception) and interrupted is None:
+                    interrupted = error
+                continue
+            report["removed"].append({"name": entry["name"], "id": entry["id"],
+                                      "exit_status": done and done["exit_status"]})
+            if not entry["removed"]:
+                failures.append(f"{entry['name']}: {done and done['stderr'].strip()}")
+        if interrupted is not None:
+            raise interrupted
+        if failures:
+            raise AssertionError(f"containers not removed: {failures}")
+        return f"{len(report['removed'])} removed"
+
+    def _teardown_store_attachment(self, report):
+        """Detach the store from the rig network."""
+        if not self.attached:
+            return "not attached"
+        self.store.detach(self.network_id)
+        self.attached = False
+        return "detached"
+
+    def _teardown_network(self, report):
+        """Remove the rig network, by the id Docker returned."""
+        if not self.network_id:
+            return "no network"
+        done = run_command(["docker", "network", "rm", self.network_id])
+        if done["exit_status"] != 0 and "not found" not in done["stderr"]:
+            raise AssertionError(f"network rm: {done['stderr'].strip()}")
+        return "removed"
+
+    def _teardown_leftovers(self, report):
+        """Prove by label that nothing of this run is left."""
+        report["leftovers"] = leftovers(self.run_id)
+        if not report["leftovers"]["commands_ok"]:
+            raise AssertionError("the leftover check could not list containers or networks")
+        return "checked"
 
     # -- control ----------------------------------------------------------
 
@@ -1129,18 +1343,26 @@ class FaultRig:
         self.activations.append(entry)
 
     def recover(self) -> None:
-        """Recover every active fault, newest first; any error is a failure."""
+        """Recover every active fault, newest first; any error is a failure.
+
+        A fault leaves `active` only once its recovery succeeded, so a
+        failed recovery stays active and a later `recover` -- the rig's own
+        teardown included -- retries it. Every attempt is recorded.
+        """
         errors = []
-        while self.active:
-            entry = self.active.pop()
+        for entry in list(reversed(self.active)):
             _activate, recover = FAULTS[entry["name"]]
+            attempt = {"started_utc": measurement.utc_now()}
+            entry.setdefault("recovery_attempts", []).append(attempt)
             try:
                 entry["recovery"] = recover(self, entry["state"])
             except Exception as error:
-                entry["recovery"] = {"error": str(error)}
+                attempt["error"] = f"{type(error).__name__}: {error}"
                 errors.append(f"{entry['name']}: {error}")
+                continue
             entry["recovered_utc"] = measurement.utc_now()
             entry["recovered_monotonic_ns"] = time.monotonic_ns()
+            self.active.remove(entry)
         if errors:
             raise AssertionError(f"fault recovery failed: {errors}")
 
@@ -1458,12 +1680,13 @@ def probe_capabilities(rig) -> dict:
     started = time.monotonic()
     problems = []
     observed = {}
-    subjects = [(entry["role"], entry["name"]) for entry in rig.containers
-                if entry["role"] != "engine" or entry.get("host_pid")]
-    subjects.append(("store", rig.store.name))
-    for role, name in subjects:
-        host = _docker_json(["inspect", "--format", "{{json .HostConfig}}", name]) or {}
-        pid = container_pid(name)
+    subjects = [(entry["role"], entry["name"], entry["id"]) for entry in rig.containers
+                if not entry["removed"]
+                and (entry["role"] != "engine" or entry.get("host_pid"))]
+    subjects.append(("store", rig.store.name, rig.store.container))
+    for role, name, ident in subjects:
+        host = _docker_json(["inspect", "--format", "{{json .HostConfig}}", ident]) or {}
+        pid = container_pid(ident)
         caps = effective_capabilities(pid) if pid else {"error": "not running"}
         observed[name] = {
             "role": role, "cap_add": host.get("CapAdd"), "privileged": host.get("Privileged"),
@@ -1658,30 +1881,78 @@ def tshark_counts(rig, capture) -> dict:
 
 
 PROBE_TRANSFER_BYTES = 256 * 1024
+# How long the client waits for the stalled upload under the ACK-only rule.
+ACK_LOSS_READ_TIMEOUT_S = 5
 
 
-def _store_transfer(rig, *, max_time):
-    """One disposable HTTP PUT from the namespace straight to the store."""
-    body = rig.artifact_dir / "probe-transfer.bin"
-    if not body.exists():
-        body.write_bytes(_payload(PROBE_TRANSFER_BYTES, "transfer"))
-    return rig.exec([
-        "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", str(max_time),
-        "-X", "PUT", "--data-binary", f"@{ARTIFACT_MOUNT}/{body.name}",
-        f"http://{rig.store_ip}:{STORE_PORT}/{rig.store.bucket}/fault-preflight-transfer",
-    ], timeout=max_time + 30)
+def signed_transfer(rig, probe, label, *, read_timeout):
+    """One signed PUT through the route, then a GET that verifies its bytes.
+
+    Toxiproxy's connection to the store runs inside the owner's namespace,
+    so this is the path every namespace rule acts on. Returns the PUT's
+    status (None when it did not complete), its duration and whether the
+    stored bytes were read back unchanged.
+    """
+    client = rig.route_client(read_timeout=read_timeout)
+    key = f"fault-preflight/{rig.run_id}/dataset=series/{label}"
+    body = _payload(PROBE_TRANSFER_BYTES, label)
+    put, _ = _s3_op(probe, f"{label}_put", lambda: client.put_object(
+        Bucket=rig.store.bucket, Key=key, Body=body), key=key, bytes=len(body))
+    outcome = {"key": key, "status": probe["operations"][-1].get("status"),
+               "elapsed_s": probe["operations"][-1]["elapsed_s"], "bytes_verified": False}
+    if put:
+        got, response = _s3_op(probe, f"{label}_get", lambda: client.get_object(
+            Bucket=rig.store.bucket, Key=key), key=key)
+        outcome["bytes_verified"] = bool(got) and response["Body"].read() == body
+        _s3_op(probe, f"{label}_delete", lambda: client.delete_object(
+            Bucket=rig.store.bucket, Key=key), key=key)
+    return outcome
+
+
+def succeeded(transfer) -> bool:
+    """Whether a signed transfer got a 2xx status and read its bytes back."""
+    status = (transfer or {}).get("status")
+    return isinstance(status, int) and 200 <= status < 300 and bool(
+        transfer.get("bytes_verified"))
 
 
 BPF_HOST_FIX = "sudo modprobe xt_bpf"
 
 
+def ack_loss_problems(*, dropped, captured, retransmissions, restored) -> list:
+    """Why an ACK-loss probe must fail; empty only when every part held.
+
+    The rule must have dropped at least one pure ACK, the capture must hold
+    packets, the sender must have retransmitted at least once because of the
+    drops, and after the rule is gone a signed transfer must succeed with a
+    2xx status and its bytes read back. Any other HTTP status, a 403
+    included, is not a restored route.
+    """
+    problems = []
+    if not isinstance(dropped, int) or dropped <= 0:
+        problems.append(f"the ACK-only rule dropped no packets: {dropped}")
+    if not isinstance(captured, int) or captured <= 0:
+        problems.append(f"the capture holds no packets: {captured}")
+    if not isinstance(retransmissions, int) or retransmissions < 1:
+        problems.append(f"no retransmission was observed: {retransmissions}")
+    if not succeeded(restored):
+        problems.append(
+            f"the signed transfer after the rule was deleted did not succeed: "
+            f"status {(restored or {}).get('status')}, bytes verified "
+            f"{(restored or {}).get('bytes_verified')}"
+        )
+    return problems
+
+
 def probe_xt_bpf(rig) -> dict:
     """The store's pure ACKs can be dropped by an xt_bpf rule in the namespace.
 
-    Compile the ACK-only filter for the store's address, insert it at the
-    head of INPUT, run a disposable transfer from the namespace to the
-    store under a capture, require a positive rule counter, delete that
-    exact rule and require an unhindered transfer afterwards.
+    Compile the ACK-only filter for the store's address and insert it at the
+    head of INPUT. Under a capture, send a signed PUT through the route:
+    Toxiproxy's upload to the store loses every pure ACK, so it stalls and
+    retransmits until the client gives up. Require dropped ACKs, captured
+    packets and at least one retransmission; delete that exact rule and
+    require a signed PUT to succeed (2xx, bytes read back) afterwards.
     """
     probe = new_probe("xt_bpf", rig)
     started = time.monotonic()
@@ -1697,7 +1968,7 @@ def probe_xt_bpf(rig) -> dict:
         return finish(probe, started, False, str(error))
     probe["evidence"]["bytecode"] = bytecode
     rule = ["INPUT", "-p", "tcp", "-m", "bpf", "--bytecode", bytecode, "-j", "DROP"]
-    counters = transfer = None
+    counters, transfer = {}, None
     capture = Capture(rig, f"xt-bpf-{rig.store.kind}",
                       f"host {rig.store_ip} and tcp port {STORE_PORT}")
     try:
@@ -1711,33 +1982,32 @@ def probe_xt_bpf(rig) -> dict:
                 )
             else:
                 try:
-                    transfer = _record(probe, _store_transfer(rig, max_time=6))
+                    transfer = signed_transfer(rig, probe, "ack-loss",
+                                               read_timeout=ACK_LOSS_READ_TIMEOUT_S)
                     listing = _record(probe, rig.exec(["iptables", "-w", "-v", "-S", "INPUT"]))
                     counters = rule_counters(listing["stdout"], ["-m bpf", "-j DROP"])
                 finally:
                     deleted = _record(probe, rig.exec(["iptables", "-w", "-D", *rule]))
                 if deleted["exit_status"] != 0:
                     problems.append(f"the exact rule could not be deleted: {deleted['stderr']}")
-                if not (counters.get("packets") or 0) > 0:
-                    problems.append(f"the ACK-only rule counted no packets: {counters}")
     except AssertionError as error:
         problems.append(str(error))
     counts = tshark_counts(rig, capture) if capture.host_file.exists() else {}
     for command in counts.get("commands", []):
         _record(probe, command)
-    after = _record(probe, _store_transfer(rig, max_time=15))
-    if after["exit_status"] != 0 or not after["stdout"].strip().isdigit():
-        problems.append(f"a transfer after the rule was deleted failed: {after['stderr']}")
+    restored = signed_transfer(rig, probe, "ack-restored", read_timeout=30)
+    if not problems:
+        problems.extend(ack_loss_problems(
+            dropped=counters.get("packets"), captured=counts.get("packets"),
+            retransmissions=counts.get("retransmissions"), restored=restored))
     rules = rig.iptables_rules()
     probe["restored"] = {"iptables_matches_baseline": rules == rig.baseline_rules,
-                         "iptables_filter": rules}
+                         "iptables_filter": rules, "signed_transfer": restored}
     if not probe["restored"]["iptables_matches_baseline"]:
         problems.append("the filter table differs from its baseline after the probe")
     probe["evidence"].update({
         "rule": rule, "counters": counters,
-        "transfer_under_rule": transfer and {
-            "exit_status": transfer["exit_status"], "http_code": transfer["stdout"],
-            "elapsed_s": transfer["elapsed_s"]},
+        "transfer_under_rule": transfer,
         "capture": capture.as_json(),
         "captured_packets": counts.get("packets"),
         "captured_retransmissions": counts.get("retransmissions"),
@@ -1745,23 +2015,25 @@ def probe_xt_bpf(rig) -> dict:
     })
     return finish(probe, started, not problems, "; ".join(problems) or (
         f"xt_bpf dropped {counters['packets']} pure ACKs from the store; "
-        f"{counts.get('retransmissions')} retransmissions captured"))
+        f"{counts['retransmissions']} retransmissions in {counts['packets']} captured "
+        f"packets; a signed PUT succeeded after the rule was deleted"))
 
 
 def probe_capture(rig) -> dict:
-    """tcpdump captures the namespace's store traffic and tshark reads it."""
+    """tcpdump captures a signed transfer's store traffic and tshark reads it."""
     probe = new_probe("capture", rig)
     started = time.monotonic()
     problems = []
+    transfer = None
     capture = Capture(rig, f"capture-{rig.store.kind}",
                       f"host {rig.store_ip} and tcp port {STORE_PORT}")
     try:
         with capture:
-            transfer = _record(probe, _store_transfer(rig, max_time=15))
-            if transfer["exit_status"] != 0:
-                problems.append(f"the captured transfer failed: {transfer['stderr']}")
+            transfer = signed_transfer(rig, probe, "capture", read_timeout=30)
     except AssertionError as error:
         problems.append(str(error))
+    if not succeeded(transfer):
+        problems.append(f"the captured signed transfer did not succeed: {transfer}")
     counts = tshark_counts(rig, capture) if capture.host_file.exists() else {}
     for command in counts.get("commands", []):
         _record(probe, command)
@@ -1772,9 +2044,10 @@ def probe_capture(rig) -> dict:
     if counts.get("retransmissions") is None:
         problems.append("tshark could not evaluate tcp.analysis.retransmission")
     probe["evidence"] = {"capture": capture.as_json(), "packets": counts.get("packets"),
-                         "retransmissions": counts.get("retransmissions")}
+                         "retransmissions": counts.get("retransmissions"),
+                         "transfer": transfer}
     return finish(probe, started, not problems, "; ".join(problems) or (
-        f"{counts['packets']} packets captured and read back"))
+        f"{counts['packets']} packets of a signed transfer captured and read back"))
 
 
 def _timed_get(rig, probe, label, key):
@@ -2097,7 +2370,7 @@ def preflight_fault_tools(required: bool, *, output_dir=None, report_dir=None,
         probe = new_probe("images")
         probes.append(finish(probe, time.monotonic(), False, str(missing)))
     if images is not None:
-        images["fault_tools"]["packages"] = package_versions(images["fault_tools"]["tag"])
+        images["fault_tools"]["packages"] = package_versions(images["fault_tools"]["id"])
         images["fault_tools"]["dockerfile_sha256"] = measurement.file_digest(DOCKERFILE)
         images["fault_tools"]["nginx_conf_sha256"] = measurement.file_digest(NGINX_CONF)
         result["environment"]["images"] = images
