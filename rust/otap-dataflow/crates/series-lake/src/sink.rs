@@ -308,10 +308,21 @@ fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
 ///
 /// A `SortingColumn` can only describe a leaf column, and the list is
 /// lexicographic, so it holds the longest prefix of `spec` whose columns are
-/// top-level primitive columns and stops at the first key that is not (a list
-/// column, which the row converter can sort as a whole but no leaf order
-/// describes). `None` when that prefix is empty, including when sorting is
-/// disabled.
+/// top-level primitive, non-floating-point columns, and stops at the first key
+/// that is not:
+///
+/// - a list column, which the row converter can sort as a whole but no leaf
+///   order describes;
+/// - a floating-point column, which the merge sorts on a normalized copy where
+///   `-0.0` equals `+0.0` and every NaN equals every other NaN. Parquet's
+///   recommended IEEE 754 total order puts `-0.0` before `+0.0` and gives NaN
+///   payloads distinct positions, so declaring such a column sorted would be
+///   false, and a false declaration is worse than none.
+///
+/// Nothing after the first excluded key is declared, since the keys after it
+/// are only ordered within its ties. `None` when the prefix is empty,
+/// including when sorting is disabled; `sort_key` stays the complete
+/// description either way.
 ///
 /// # Errors
 /// Returns the Parquet error when the schema cannot be converted, which
@@ -323,6 +334,12 @@ pub fn native_sorting_columns(
     let descr = ArrowSchemaConverter::new().convert(schema)?;
     let mut out = Vec::with_capacity(spec.keys().len());
     for key in spec.keys() {
+        let floating = schema
+            .field_with_name(&key.column)
+            .is_ok_and(|f| f.data_type().is_floating());
+        if floating {
+            break;
+        }
         let leaf = descr.columns().iter().position(|c| {
             let parts = c.path().parts();
             parts.len() == 1 && parts[0] == key.column
@@ -1207,12 +1224,13 @@ mod tests {
 
     /// Scenario: sort specifications over the logs and metrics values schemas:
     /// a key after the two-leaf `attrs` map, a descending nulls-first key, a
-    /// list key in the middle of the spec, a list key first, and no keys.
+    /// list key in the middle of the spec, a list key first, a double key in
+    /// the middle and first, and no keys.
     /// Guarantees: `column_idx` is the Parquet leaf index, not the Arrow field
     /// index; order and null placement are carried over; the list stops at the
-    /// first key that is not a top-level primitive column, so the native list
-    /// never claims an order no leaf column has; and an empty prefix emits no
-    /// list at all.
+    /// first list or floating-point key, so the native list never claims an
+    /// order no leaf column has or an IEEE 754 total order the normalized
+    /// double sort does not produce; and an empty prefix emits no list at all.
     #[test]
     fn native_sorting_columns_use_leaf_indexes_and_a_primitive_prefix() {
         use crate::config::{DenormType, Denormalize, SortKey};
@@ -1259,6 +1277,21 @@ mod tests {
             native_sorting_columns(&spec, &metrics).expect("convert"),
             None
         );
+        let spec = SortSpec::new(vec![
+            key("series_id", SortOrder::Asc, Nulls::Last),
+            key("value_double", SortOrder::Asc, Nulls::Last),
+            key("time_unix_nano", SortOrder::Asc, Nulls::Last),
+        ]);
+        let cols = native_sorting_columns(&spec, &metrics)
+            .expect("convert")
+            .expect("one key");
+        assert_eq!(cols.len(), 1, "stops at the double key");
+        assert_eq!(cols[0].column_idx, 0);
+        let spec = SortSpec::new(vec![key("value_double", SortOrder::Asc, Nulls::Last)]);
+        assert_eq!(
+            native_sorting_columns(&spec, &metrics).expect("convert"),
+            None
+        );
         assert_eq!(
             native_sorting_columns(&SortSpec::new(Vec::new()), &metrics).expect("convert"),
             None
@@ -1273,7 +1306,9 @@ mod tests {
     /// (Parquet leaves 0 and 3, ascending, nulls last) beside the `sort_key`
     /// key/value, every row group of the series file carries `series_id`
     /// ascending, and an unsorted values file carries no native list while its
-    /// series file still does.
+    /// series file still does. A values sort whose second key is a
+    /// denormalized double column declares only `series_id` natively, while
+    /// `sort_key` still names all three keys.
     #[tokio::test]
     async fn every_row_group_carries_the_native_sorting_columns() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -1318,6 +1353,33 @@ mod tests {
             assert_eq!(rg, None);
         }
         for rg in row_group_sorting(dir.path(), &report.files[0].1) {
+            assert_eq!(rg.as_deref(), Some(&[(0, false, false)][..]));
+        }
+
+        let key = |column: &str| crate::config::SortKey {
+            column: column.into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        };
+        let mut double = LakeConfig::default();
+        double.logs.denormalize = vec![crate::config::Denormalize {
+            path: "attrs.latency".into(),
+            column: "latency".into(),
+            ty: crate::config::DenormType::Double,
+        }];
+        double.logs.values_sort = vec![key("series_id"), key("latency"), key("time_unix_nano")];
+        double.validate().expect("valid double sort");
+        let b = sealed_block(&double, 30);
+        let sink = Sink::new(local(&dir), double, naming("w", "double"));
+        let report = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        assert_eq!(
+            get(&file_kv(dir.path(), &report.files[1].1), "sort_key"),
+            "series_id:asc:nulls_last,latency:asc:nulls_last,time_unix_nano:asc:nulls_last"
+        );
+        for rg in row_group_sorting(dir.path(), &report.files[1].1) {
             assert_eq!(rg.as_deref(), Some(&[(0, false, false)][..]));
         }
     }

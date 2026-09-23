@@ -568,18 +568,27 @@ Native sort metadata: every row group of a file whose `sort_key` is not
 generic readers (DataFusion, DuckDB, ClickHouse) can use the order without
 knowing this format. It holds one `SortingColumn` per key, with
 `descending` and `nulls_first` taken from the key, for the longest prefix of
-`sort_key` whose columns are top-level primitive columns. A list column ends
-the prefix, because no single leaf order describes a sorted list, and a
-prefix that would be empty writes no field at all. `column_idx` counts
+`sort_key` whose columns are top-level primitive columns other than
+`DOUBLE` (or any floating-point type). The first key that is not ends the
+prefix, and nothing after it is declared, because later keys are only
+ordered within its ties:
+
+- A list column ends it, because no single leaf order describes a sorted
+  list.
+- A floating-point column ends it, because the writer sorts doubles on a
+  normalized copy in which `-0.0` equals `+0.0` and every NaN equals every
+  other NaN (ascending, NaN after `+Infinity`). Parquet's recommended IEEE
+  754 total order puts `-0.0` before `+0.0` and gives NaN payloads distinct
+  positions, so a native declaration would claim an order the file does not
+  have. `sort_key` still describes the double key exactly.
+
+A prefix that would be empty writes no field at all. `column_idx` counts
 Parquet leaf columns, not top-level columns: a `MAP` column has two leaves,
 so every column after one is shifted. Series files always carry
 `series_id` (leaf 0) ascending; values files under the default sort carry
 `series_id` (leaf 0) and `time_unix_nano` (leaf 3), both ascending. The
 `sort_key` key/value stays the complete, authoritative description of the
-order and is what the compaction scope above uses. For a `DOUBLE` key the
-writer orders `-0.0` and `+0.0` as equal and every NaN after `+Infinity`
-ascending; a reader that relies on the native field for a double column
-must accept that order.
+order and is what the compaction scope above uses.
 
 The native field is part of the Parquet footer, not a key/value, so it has
 no name of its own. The key/value keeps the name `sort_key` rather than
@@ -723,7 +732,8 @@ release:
   `Display` text of each type. Revision 1 fingerprints could not be
   reproduced outside the Rust writer and moved with Arrow upgrades.
 - Every row group of a sorted file carries Parquet's native `SortingColumn`
-  list (section 5) beside the `sort_key` key/value.
+  list (section 5) beside the `sort_key` key/value, for the leading keys
+  that are neither lists nor floating-point columns.
 - `render_v1` spells non-finite doubles `"Infinity"`, `"-Infinity"` and
   `"NaN"`, and bytes as padded standard base64, as the workspace OTLP JSON
   encoder does (section 2). Revision 1 wrote `"inf"`, `"-inf"` and lowercase
