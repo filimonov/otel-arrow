@@ -495,7 +495,9 @@ fn open_array(slice: &[u8]) -> AnyValueIter<'_> {
     AnyValueIter { buf: slice, pos: 0 }
 }
 
-/// The key-values of one serialized `KeyValueList`.
+/// The key-values of one serialized `KeyValueList`. Like every
+/// `ProtoBytesParser`, the parser behind it allocates its shared state (one
+/// `Rc`) per occurrence, as the single-occurrence path always has.
 fn open_kvlist(slice: &[u8]) -> KeyValueIter<'_, KeyValuesListFieldOffsets> {
     KeyValueIter::new(RepeatedFieldProtoBytesParser::from_byte_parser(
         &ProtoBytesParser::new(slice),
@@ -512,8 +514,12 @@ fn open_kvlist(slice: &[u8]) -> KeyValueIter<'_, KeyValuesListFieldOffsets> {
 /// in it is either another occurrence of the same member or a field that is
 /// not a member (unknown, or a member under another wire type), because any
 /// other member would have started a new run. Occurrences are found by
-/// scanning `rest` as the iteration reaches them, so nothing is allocated and
-/// each byte is read once.
+/// scanning `rest` as the iteration reaches them, so no list of occurrences is
+/// kept. The keys and length prefixes of the run are read a second time here,
+/// after `value_type` has scanned the whole value once; each kvlist
+/// occurrence costs one `Rc` allocation (see [`open_kvlist`]). A repeated
+/// member is rare, and the common single occurrence costs one extra key
+/// read.
 pub struct MergedMember<'a, I> {
     rest: &'a [u8],
     pos: usize,

@@ -1298,6 +1298,88 @@ async fn an_unknown_group_before_known_fields_loses_nothing() {
     }
 }
 
+/// Scenario: an OTLP logs request whose one `ResourceLogs` carries its
+/// `resource` twice -- valid protobuf, which prost merges into one resource --
+/// and an OTLP metrics request whose metric carries both a gauge and a sum.
+/// Guarantees: each is nacked permanently as `Refused` with a sentence naming
+/// the message and the field, never admitted: the byte views would read one
+/// occurrence where prost merges or overrides, so storing the request would
+/// store data prost would not decode.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repeated_singular_field_is_refused_not_acked() {
+    let len_field = |field: u32, payload: &[u8]| {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    };
+    let attribute = len_field(
+        1,
+        &[len_field(1, b"k"), len_field(2, &len_field(1, b"v"))].concat(),
+    );
+    let mut record = vec![0x09];
+    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    let resource_logs = [
+        len_field(1, &attribute),
+        len_field(1, &attribute),
+        len_field(2, &len_field(2, &record)),
+    ]
+    .concat();
+    let logs = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(
+        len_field(1, &resource_logs).into(),
+    );
+    let mut point = vec![0x19];
+    point.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    point.extend([0x31, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let data = len_field(1, &point);
+    let metric = [
+        len_field(1, b"requests"),
+        len_field(5, &data),
+        len_field(7, &data),
+    ]
+    .concat();
+    let metrics = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
+        len_field(1, &len_field(2, &len_field(2, &metric))).into(),
+    );
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            for (payload, named) in [(logs, "ResourceLogs.resource"), (metrics, "Metric.data")] {
+                let mut context = Context::default();
+                context.set_source_node(7);
+                worker.admit(OtapPdata::new(context, payload.into()));
+                assert!(worker.active.data.is_empty());
+                assert!(worker.pending.is_none());
+                assert!(worker.notify.next().await.is_ok());
+                match rx.recv().await.expect("a refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(nack.permanent);
+                        assert_eq!(nack.cause, NackCause::Refused);
+                        assert!(
+                            nack.reason
+                                .starts_with("invalid request content: malformed OTLP"),
+                            "reason: {}",
+                            nack.reason
+                        );
+                        assert!(nack.reason.contains(named), "reason: {}", nack.reason);
+                        assert!(
+                            nack.reason.contains("occurs more than once"),
+                            "reason: {}",
+                            nack.reason
+                        );
+                    }
+                    other => panic!("expected a refusal, got {other:?}"),
+                }
+            }
+        })
+        .await;
+}
+
 /// Scenario: an OTLP logs request whose record attribute value sets
 /// `array_value` twice -- `["alpha", "beta"]`, then an empty array -- and whose
 /// body sets `kvlist_value` twice, compared with the same request after prost

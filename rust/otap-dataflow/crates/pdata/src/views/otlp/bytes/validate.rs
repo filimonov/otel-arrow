@@ -22,7 +22,12 @@
 //! - a packed `fixed64`/`double` field holds a whole number of elements, and a
 //!   packed varint field holds only well-formed varints;
 //! - `AnyValue` arrays and key-value lists nest at most
-//!   [`MAX_ANY_VALUE_NESTING_DEPTH`] levels.
+//!   [`MAX_ANY_VALUE_NESTING_DEPTH`] levels;
+//! - a singular field, or a oneof, occurs at most once per message, except
+//!   `AnyValue`'s value, whose view reads repeated members as prost does.
+//!   Protobuf allows the repetition (last scalar wins, messages merge), but no
+//!   OTLP encoder emits it and the byte views read it differently, so it is
+//!   refused rather than stored as something prost would not decode.
 //!
 //! A field the schema does not know keeps protobuf skip semantics: its
 //! framing is checked and its content is skipped. An unknown group (wire
@@ -152,6 +157,117 @@ impl Message {
     /// Whether entering this message is one more `AnyValue` nesting level.
     const fn is_value_container(self) -> bool {
         matches!(self, Self::ArrayValue | Self::KeyValueList)
+    }
+
+    /// The singular fields of this message: for field `num`, its slot in a
+    /// per-message bitmask and its name, or `None` for a repeated or unknown
+    /// field. Members of one oneof share a slot. `AnyValue` has none: its
+    /// view reads a repeated oneof member as prost does (the last member
+    /// wins; `array_value` and `kvlist_value` following themselves merge).
+    ///
+    /// Protobuf lets a singular field occur more than once -- the last scalar
+    /// wins, message occurrences are merged -- but no OTLP encoder emits that,
+    /// and the byte views read the first occurrence or one occurrence only.
+    /// A request that repeats one is refused, so none is ever stored as read
+    /// differently from prost.
+    fn singular(self, num: u64) -> Option<(u32, &'static str)> {
+        use Message as M;
+        let name = match (self, num) {
+            (M::ResourceLogs | M::ResourceMetrics | M::ResourceSpans, 1) => "resource",
+            (M::ScopeLogs | M::ScopeMetrics | M::ScopeSpans, 1) => "scope",
+            (
+                M::ResourceLogs
+                | M::ResourceMetrics
+                | M::ResourceSpans
+                | M::ScopeLogs
+                | M::ScopeMetrics
+                | M::ScopeSpans,
+                3,
+            ) => "schema_url",
+            (M::LogRecord, 1) => "time_unix_nano",
+            (M::LogRecord, 2) => "severity_number",
+            (M::LogRecord, 3) => "severity_text",
+            (M::LogRecord, 5) => "body",
+            (M::LogRecord, 7) => "dropped_attributes_count",
+            (M::LogRecord, 8) => "flags",
+            (M::LogRecord, 9) => "trace_id",
+            (M::LogRecord, 10) => "span_id",
+            (M::LogRecord, 11) => "observed_time_unix_nano",
+            (M::LogRecord, 12) => "event_name",
+            (M::Metric, 1) => "name",
+            (M::Metric, 2) => "description",
+            (M::Metric, 3) => "unit",
+            // The `data` oneof: gauge, sum, histogram, exponential_histogram,
+            // summary share slot 5.
+            (M::Metric, 5 | 7 | 9 | 10 | 11) => return Some((5, "data")),
+            (M::Sum | M::Histogram | M::ExponentialHistogram, 2) => "aggregation_temporality",
+            (M::Sum, 3) => "is_monotonic",
+            (
+                M::NumberDataPoint
+                | M::HistogramDataPoint
+                | M::ExponentialHistogramDataPoint
+                | M::SummaryDataPoint,
+                2,
+            ) => "start_time_unix_nano",
+            (
+                M::NumberDataPoint
+                | M::HistogramDataPoint
+                | M::ExponentialHistogramDataPoint
+                | M::SummaryDataPoint,
+                3,
+            ) => "time_unix_nano",
+            // The `value` oneof: as_double, as_int share slot 4.
+            (M::NumberDataPoint, 4 | 6) => return Some((4, "value")),
+            (M::NumberDataPoint | M::SummaryDataPoint, 8) => "flags",
+            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint | M::SummaryDataPoint, 4) => {
+                "count"
+            }
+            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint | M::SummaryDataPoint, 5) => {
+                "sum"
+            }
+            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint, 10) => "flags",
+            (M::HistogramDataPoint, 11) | (M::ExponentialHistogramDataPoint, 12) => "min",
+            (M::HistogramDataPoint, 12) | (M::ExponentialHistogramDataPoint, 13) => "max",
+            (M::ExponentialHistogramDataPoint, 6) => "scale",
+            (M::ExponentialHistogramDataPoint, 7) => "zero_count",
+            (M::ExponentialHistogramDataPoint, 8) => "positive",
+            (M::ExponentialHistogramDataPoint, 9) => "negative",
+            (M::ExponentialHistogramDataPoint, 14) => "zero_threshold",
+            (M::Buckets, 1) => "offset",
+            (M::ValueAtQuantile, 1) => "quantile",
+            (M::ValueAtQuantile, 2) => "value",
+            (M::Exemplar, 2) => "time_unix_nano",
+            // The `value` oneof: as_double, as_int share slot 3.
+            (M::Exemplar, 3 | 6) => return Some((3, "value")),
+            (M::Exemplar, 4) => "span_id",
+            (M::Exemplar, 5) => "trace_id",
+            (M::Span, 1) | (M::Link, 1) => "trace_id",
+            (M::Span, 2) | (M::Link, 2) => "span_id",
+            (M::Span, 3) | (M::Link, 3) => "trace_state",
+            (M::Span, 4) => "parent_span_id",
+            (M::Span, 5) | (M::Event, 2) => "name",
+            (M::Span, 6) => "kind",
+            (M::Span, 7) => "start_time_unix_nano",
+            (M::Span, 8) => "end_time_unix_nano",
+            (M::Span, 10) | (M::Event, 4) | (M::Link, 5) => "dropped_attributes_count",
+            (M::Span, 12) => "dropped_events_count",
+            (M::Span, 14) => "dropped_links_count",
+            (M::Span, 15) => "status",
+            (M::Span, 16) | (M::Link, 6) => "flags",
+            (M::Event, 1) => "time_unix_nano",
+            (M::Status, 2) => "message",
+            (M::Status, 3) => "code",
+            (M::Resource, 2) | (M::InstrumentationScope, 4) => "dropped_attributes_count",
+            (M::EntityRef, 1) => "schema_url",
+            (M::EntityRef, 2) => "type",
+            (M::InstrumentationScope, 1) => "name",
+            (M::InstrumentationScope, 2) => "version",
+            (M::KeyValue, 1) => "key",
+            (M::KeyValue, 2) => "value",
+            _ => return None,
+        };
+        // Every singular field number of OTLP is below 32.
+        Some((u32::try_from(num).ok()?, name))
     }
 
     /// The schema of field `num` of this message.
@@ -433,6 +549,15 @@ pub(crate) fn validate_request(buf: &[u8], root: Message) -> Result<(), Error> {
             limit: MAX_ANY_VALUE_NESTING_DEPTH,
             offset,
         },
+        Damage::Duplicate {
+            message,
+            field,
+            offset,
+        } => Error::DuplicateOtlpField {
+            message: message.name(),
+            field,
+            offset,
+        },
     })
 }
 
@@ -447,6 +572,11 @@ enum Damage {
     TooDeep {
         offset: usize,
     },
+    Duplicate {
+        message: Message,
+        field: &'static str,
+        offset: usize,
+    },
 }
 
 /// Walk one message of type `message`; `base` is the offset of `buf` within
@@ -457,6 +587,8 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
         message,
         offset: base + at,
     };
+    // The singular fields seen so far in this message, one bit per slot.
+    let mut seen: u32 = 0;
     let mut pos = 0;
     while pos < buf.len() {
         let at = pos;
@@ -478,6 +610,17 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
         }
         let (start, end) =
             value_range(buf, wire_type, next).map_err(|problem| fail(problem, at))?;
+        if let Some((slot, name)) = message.singular(field_num) {
+            let bit = 1u32 << slot;
+            if seen & bit != 0 {
+                return Err(Damage::Duplicate {
+                    message,
+                    field: name,
+                    offset: base + at,
+                });
+            }
+            seen |= bit;
+        }
         match field {
             Field::Unknown => {}
             Field::Scalar(expected) => {
@@ -934,6 +1077,144 @@ mod tests {
                 "{root:?}: the unknown content changed what the views read"
             );
         }
+    }
+
+    /// Re-encode `buf`, a message of type `message`, with every occurrence of
+    /// field `target.1` in every `target.0` message written twice.
+    fn duplicate(buf: &[u8], message: Message, target: (Message, u64)) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            let field = match message.field(field_num) {
+                Field::Message(child) => len_field(
+                    field_num as u32,
+                    &duplicate(&buf[start..end], child, target),
+                ),
+                _ => buf[pos..end].to_vec(),
+            };
+            if (message, field_num) == target {
+                out.extend_from_slice(&field);
+            }
+            out.extend(field);
+            pos = end;
+        }
+        out
+    }
+
+    /// Every (message, field) pair of a singular field set in `buf`.
+    fn singular_fields(buf: &[u8], message: Message, found: &mut Vec<(Message, u64)>) {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            if message.singular(field_num).is_some() && !found.contains(&(message, field_num)) {
+                found.push((message, field_num));
+            }
+            if let Field::Message(child) = message.field(field_num) {
+                singular_fields(&buf[start..end], child, found);
+            }
+            pos = end;
+        }
+    }
+
+    /// Scenario: for every singular field -- scalar, string, sub-message or
+    /// oneof member -- that the fully populated logs, metrics and traces
+    /// requests set, the same request with that field written twice in its
+    /// message (118 cases over 26 message types, among them
+    /// `ResourceLogs.resource`, `ScopeSpans.scope`, `LogRecord.body`,
+    /// `Metric.data`, the exponential histogram buckets, `Span.status` and
+    /// `KeyValue.value`), plus a number data point and an exemplar carrying
+    /// both members of their `value` oneof.
+    /// Guarantees: each is refused as `DuplicateOtlpField` naming the message
+    /// and the field, because the byte views read a repeated singular field
+    /// differently from prost (first occurrence instead of the last, one
+    /// occurrence instead of the merge); the requests with each field once
+    /// pass, and `AnyValue`'s own repeated members -- which its view reads as
+    /// prost does -- are still accepted.
+    #[test]
+    fn a_repeated_singular_field_is_refused() {
+        let mut targets = Vec::new();
+        for (root, body) in requests() {
+            assert!(validate_request(&body, root).is_ok(), "{root:?}");
+            let mut found = Vec::new();
+            singular_fields(&body, root, &mut found);
+            for target in found {
+                let doubled = duplicate(&body, root, target);
+                let (_, field) = target.0.singular(target.1).expect("singular");
+                match validate_request(&doubled, root) {
+                    Err(Error::DuplicateOtlpField {
+                        message,
+                        field: refused,
+                        ..
+                    }) => {
+                        assert_eq!(message, target.0.name(), "{target:?}");
+                        assert_eq!(refused, field, "{target:?}");
+                    }
+                    other => panic!("{target:?}: expected a duplicate refusal, got {other:?}"),
+                }
+                targets.push(target);
+            }
+        }
+        let messages: Vec<Message> = targets.iter().fold(Vec::new(), |mut all, (m, _)| {
+            if !all.contains(m) {
+                all.push(*m);
+            }
+            all
+        });
+        assert_eq!((targets.len(), messages.len()), (118, 26), "{messages:?}");
+        for (message, field) in [
+            (Message::ResourceLogs, 1),
+            (Message::ScopeSpans, 1),
+            (Message::LogRecord, 5),
+            (Message::Metric, 5),
+            (Message::ExponentialHistogramDataPoint, 8),
+            (Message::ExponentialHistogramDataPoint, 9),
+            (Message::Span, 15),
+            (Message::KeyValue, 2),
+        ] {
+            assert!(targets.contains(&(message, field)), "{message:?}.{field}");
+        }
+
+        // Both members of a scalar oneof in one message.
+        let point = [
+            vec![0x21, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f], // as_double = 1.0
+            vec![0x31, 7, 0, 0, 0, 0, 0, 0, 0],       // as_int = 7
+        ]
+        .concat();
+        let gauge = len_field(5, &len_field(1, &point));
+        let body = len_field(1, &len_field(2, &len_field(2, &gauge)));
+        assert!(matches!(
+            validate_request(&body, Message::ExportMetricsServiceRequest),
+            Err(Error::DuplicateOtlpField {
+                message: "NumberDataPoint",
+                field: "value",
+                ..
+            })
+        ));
+        let exemplar = [
+            vec![0x19, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f], // as_double
+            vec![0x31, 7, 0, 0, 0, 0, 0, 0, 0],       // as_int
+        ]
+        .concat();
+        let gauge = len_field(5, &len_field(1, &len_field(5, &exemplar)));
+        let body = len_field(1, &len_field(2, &len_field(2, &gauge)));
+        assert!(matches!(
+            validate_request(&body, Message::ExportMetricsServiceRequest),
+            Err(Error::DuplicateOtlpField {
+                message: "Exemplar",
+                field: "value",
+                ..
+            })
+        ));
+
+        // AnyValue members may repeat: string twice, array then string.
+        let any_value = [len_field(1, b"x"), len_field(1, b"y"), len_field(5, &[])].concat();
+        let record = len_field(5, &any_value);
+        assert!(
+            validate_request(&in_log_record(&record), Message::ExportLogsServiceRequest).is_ok()
+        );
     }
 
     /// Scenario: every proper prefix of each fully populated request, and

@@ -124,7 +124,9 @@ impl OtlpProtoBytes {
     /// each nested message's framing as the top level is checked, as prost
     /// would: a varint that overflows `u64`, a known field with the wrong
     /// wire type, a `string` field that is not UTF-8, or a packed field that
-    /// is not a whole number of elements is refused; an unknown field,
+    /// is not a whole number of elements is refused, and so is a singular
+    /// field or oneof that occurs twice in one message (outside `AnyValue`),
+    /// which the byte views would read differently from prost; an unknown field,
     /// including a balanced group, is framed and skipped. See
     /// [`crate::views::otlp::bytes::validate`].
     ///
@@ -136,7 +138,9 @@ impl OtlpProtoBytes {
     /// innermost message holding it and its byte offset, when the framing is
     /// broken; [`crate::error::Error::OtlpNestingTooDeep`] when `AnyValue`
     /// values nest deeper than
-    /// [`crate::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH`].
+    /// [`crate::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH`];
+    /// [`crate::error::Error::DuplicateOtlpField`] naming the message and the
+    /// field that occurs twice.
     pub fn validate_framing(&self) -> Result<()> {
         use crate::views::otlp::bytes::validate::{Message, validate_request};
         let root = match self {

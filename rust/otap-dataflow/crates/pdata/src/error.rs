@@ -165,6 +165,18 @@ pub enum Error {
     #[error("OTLP AnyValue nesting is deeper than {limit} levels at byte {offset}")]
     OtlpNestingTooDeep { limit: usize, offset: usize },
 
+    /// A singular field (or a oneof) of an OTLP message occurs more than once
+    /// in one message; `offset` is the byte offset of the second occurrence.
+    #[error(
+        "OTLP {message}.{field} occurs more than once in one message at byte {offset}; \
+         the OTLP byte views would not read it as protobuf merges it"
+    )]
+    DuplicateOtlpField {
+        message: &'static str,
+        field: &'static str,
+        offset: usize,
+    },
+
     #[error("Log record not found")]
     LogRecordNotFound,
 
