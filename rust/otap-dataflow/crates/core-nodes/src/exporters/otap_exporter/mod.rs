@@ -737,10 +737,9 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                         let export_started_at = Instant::now();
                         let signal_type = pdata.signal_type();
 
-                        let payload = pdata.take_payload();
-
-                        // The conversion never refuses a damaged OTLP body.
-                        if let Err(error) = payload.validate_otlp_framing(
+                        // The conversion never refuses a damaged OTLP body; the
+                        // refusal returns the request with its payload.
+                        if let Err(error) = pdata.payload_ref().validate_otlp_framing(
                             otel_arrow_dfe_pdata::views::otlp::bytes::validate::RepeatedSingular::Accept,
                         ) {
                             self.metrics.record_failure(
@@ -755,6 +754,7 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                             continue;
                         }
 
+                        let payload = pdata.take_payload();
                         let message: OtapArrowRecords = match payload.try_into_with_default() {
                             Ok(m) => m,
                             Err(e) => {
@@ -2954,6 +2954,8 @@ mod tests {
             permanent: bool,
             cause: NackCause,
             reason: String,
+            /// The OTLP bytes the refused request carried back.
+            refused: Vec<u8>,
         },
     }
 
@@ -3054,12 +3056,21 @@ mod tests {
                             Ok(PipelineCompletionMsg::DeliverAck { ack }) => {
                                 Decision::Ack(calldata_id(&ack.accepted))
                             }
-                            Ok(PipelineCompletionMsg::DeliverNack { nack }) => Decision::Nack {
-                                id: calldata_id(&nack.refused),
-                                permanent: nack.permanent,
-                                cause: nack.cause,
-                                reason: nack.reason,
-                            },
+                            Ok(PipelineCompletionMsg::DeliverNack { nack }) => {
+                                let refused = match nack.refused.payload_ref().data() {
+                                    otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) => {
+                                        bytes.as_bytes().to_vec()
+                                    }
+                                    other => panic!("refused a non-OTLP payload: {other:?}"),
+                                };
+                                Decision::Nack {
+                                    id: calldata_id(&nack.refused),
+                                    permanent: nack.permanent,
+                                    cause: nack.cause,
+                                    reason: nack.reason,
+                                    refused,
+                                }
+                            }
                             Err(_) => panic!("pipeline result channel closed"),
                         };
                     decisions.push(decision);
@@ -3111,31 +3122,33 @@ mod tests {
     /// (`0a 01 0a`), and a record whose string body declares five bytes and
     /// holds one.
     /// Guarantees: each is nacked permanently as `Refused`, naming the
-    /// malformed body and the damaged message, before any stream is used, so
-    /// a damaged request is never converted into an empty or partial batch
-    /// and acknowledged as exported.
+    /// malformed body and the damaged message and carrying the request's
+    /// original bytes, before any stream is used, so a damaged request is
+    /// never converted into an empty or partial batch and acknowledged as
+    /// exported.
     #[test]
     fn a_malformed_otlp_body_is_refused() {
         let deep = logs_request(b"INFO", &[0x0a, 0x05, b'a']);
-        let (decisions, _) = export_otlp_logs(
-            vec![(41, vec![0x0a]), (42, vec![0x0a, 0x01, 0x0a]), (43, deep)],
-            false,
-        );
-        let named = [
-            (41, "ExportLogsServiceRequest"),
-            (42, "ResourceLogs"),
-            (43, "AnyValue"),
-        ];
+        let bodies = vec![(41, vec![0x0a]), (42, vec![0x0a, 0x01, 0x0a]), (43, deep)];
+        let (decisions, _) = export_otlp_logs(bodies.clone(), false);
+        let named = ["ExportLogsServiceRequest", "ResourceLogs", "AnyValue"];
         assert_eq!(decisions.len(), named.len());
-        for (decision, (expected_id, message)) in decisions.into_iter().zip(named) {
+        for ((decision, (expected_id, body)), message) in
+            decisions.into_iter().zip(bodies).zip(named)
+        {
             match decision {
                 Decision::Nack {
                     id,
                     permanent,
                     cause,
                     reason,
+                    refused,
                 } => {
                     assert_eq!(id, expected_id);
+                    assert_eq!(
+                        refused, body,
+                        "{id}: the nack must carry the original bytes"
+                    );
                     assert!(permanent, "{id}");
                     assert_eq!(cause, NackCause::Refused, "{id}");
                     assert!(
