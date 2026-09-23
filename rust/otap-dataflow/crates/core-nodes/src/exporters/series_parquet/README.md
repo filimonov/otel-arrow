@@ -129,14 +129,25 @@ restart or a cache eviction, and never admitted to one block after being
 permanently refused by another. A request that fits the worst case but not
 the space left in the ACTIVE block waits for the next block instead.
 
-The worst case of a request is `2 * E + T + S * F`, where E is what extraction
-charged it, T its completion token, S the number of distinct series it carries
-and F the fixed cost of one series row: 1352 bytes for logs and 2120 bytes for
-metrics, plus 128 bytes per denormalized series column. Startup validation
-covers only the `2 * E` term, by requiring `window.max_block_bytes` to be at
-least twice `ingress.max_extracted_bytes`. The `S * F` term grows with the
-number of series, which extraction bounds only through each series' own
-estimate, so no startup factor could cover it without refusing the defaults.
+The worst case of a request, the charge it is judged on, is exactly
+`P + T + sum over its series of (2 * (A - D) + 128 * C + 8 + Q)`:
+
+- P: the measured bytes of the request's values rows.
+- T: the bytes of its completion token.
+- A: one series' extracted estimate, as extraction charged it.
+- D: that series' decoded attribute trees, which admission drops.
+- C: the series columns, 10 for logs and 16 for metrics, plus one per
+  denormalized series column.
+- Q: the pending-series entry, 64 bytes.
+
+The fixed part per series, `F = 128 * C + 8 + Q`, is 1352 bytes for logs and
+2120 bytes for metrics, plus 128 bytes per denormalized series column. With E
+the request's extracted charge and S its number of distinct series, the charge
+never exceeds the upper bound `2 * E + T + S * F`. Startup validation covers
+only the `2 * E` term, by requiring `window.max_block_bytes` to be at least
+twice `ingress.max_extracted_bytes`. The `S * F` term grows with the number of
+series, which extraction bounds only through each series' own estimate, so no
+startup factor could cover it without refusing the defaults.
 A request of many small series can therefore pass `ingress.max_extracted_bytes`
 and still be refused as too large for the block; the refusal names
 `window.max_block_bytes` and is the same on every attempt.

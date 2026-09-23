@@ -1063,58 +1063,121 @@ mod tests {
         }
     }
 
-    /// Scenario: logs requests of one and of many series, extracted with and
-    /// without denormalized series columns, are measured against the
-    /// documented worst-case block cost of a request.
-    /// Guarantees: what `reserve` charges a request in the worst case -- its
-    /// values, its token, and every descriptor as a series row plus its
-    /// pending entry -- never exceeds `2 * extracted + token + descriptors *
-    /// LakeConfig::series_row_fixed_bytes`, where `extracted` is what
-    /// extraction charged the same request, and each series row costs exactly
-    /// twice its estimate net of the decoded attribute trees plus that fixed
-    /// term. The formula documented at the
-    /// `max_block_bytes` rule and in the README is therefore a true bound,
-    /// and it changes only together with this test.
+    /// A gauge request of `n` distinct series under one resource.
+    fn gauge_request(
+        n: usize,
+    ) -> otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::MetricsData {
+        use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
+            Gauge, Metric, MetricsData, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+        let kv = |k: &str, v: String| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v)),
+            }),
+        };
+        MetricsData {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", "h".into())],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "cpu".into(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: (0..n)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: 10 + i as u64,
+                                    value: Some(number_data_point::Value::AsDouble(0.5)),
+                                    attributes: vec![kv("cpu", i.to_string())],
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Scenario: logs requests of one and of many series, with and without a
+    /// denormalized series column, and metrics requests of one and of many
+    /// series, are each reserved against an empty block with a cold cache --
+    /// the worst case, every descriptor written by this block.
+    /// Guarantees: the bytes `reserve` charges equal, exactly,
+    /// `P + T + sum_i (2 * (A_i - D_i) + 128 * C + 8 + Q)`: P the request's
+    /// values bytes, T its token, and per series its extracted estimate A_i,
+    /// its decoded attribute trees D_i, the series columns C (10 for logs, 16
+    /// for metrics, plus one per denormalized series column) and the pending
+    /// entry Q. That makes the fixed per-series term 1352 bytes for logs and
+    /// 2120 for metrics, as `LakeConfig::series_row_fixed_bytes` reports and
+    /// the README documents, and the simple upper bound `2 * E + T + S * F`
+    /// holds. The documented formula changes only together with this test.
     #[test]
-    fn the_documented_worst_case_block_cost_bounds_every_request() {
+    fn the_documented_worst_case_block_cost_is_what_reserve_charges() {
+        use crate::canonical::Signal;
+        use otel_arrow_dfe_pdata::testing::round_trip::encode_metrics;
+
         let mut denormalized = LakeConfig::default();
         denormalized.logs.denormalize = vec![crate::config::Denormalize {
             path: "resource.host.id".into(),
             column: "host".into(),
             ty: crate::config::DenormType::String,
         }];
-        for cfg in [LakeConfig::default(), denormalized] {
-            let fixed = cfg.series_row_fixed_bytes(crate::canonical::Signal::Logs);
-            let columns = 10 + crate::schema::denorm_columns(Dataset::LogsSeries, &cfg).len();
-            assert_eq!(
-                fixed,
-                2 * 64 * columns + 8 + cfg.ingress.pending_series_entry_bytes
-            );
+        let defaults = LakeConfig::default();
+        assert_eq!(defaults.series_row_fixed_bytes(Signal::Logs), 1352);
+        assert_eq!(defaults.series_row_fixed_bytes(Signal::Metrics), 2120);
+        assert_eq!(
+            denormalized.series_row_fixed_bytes(Signal::Logs),
+            1352 + 128
+        );
+
+        let mut cases: Vec<(LakeConfig, usize, Signal, Extracted)> = Vec::new();
+        for cfg in [defaults.clone(), denormalized] {
             for (host, n) in [("one", 1), ("many", 64)] {
                 let e = extracted(&cfg, host, n);
-                let token = 16;
-                let charged: usize =
-                    e.pinned_bytes + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
-                let worst = e.pinned_bytes
-                    + token
-                    + e.descriptors
-                        .iter()
-                        .map(|d| d.series_row_bytes() + cfg.ingress.pending_series_entry_bytes)
-                        .sum::<usize>();
-                let bound = 2 * charged + token + e.descriptors.len() * fixed;
-                assert!(worst <= bound, "{host}: worst {worst} > bound {bound}");
-                // Each row's charge is exactly twice its estimate net of the
-                // decoded trees admission drops, plus the fixed term.
-                for d in &e.descriptors {
-                    let decoded = crate::extract::kv_bytes(&d.descriptor.resource_attrs)
-                        + crate::extract::kv_bytes(&d.descriptor.scope_attrs)
-                        + crate::extract::kv_bytes(&d.descriptor.attrs);
-                    assert_eq!(
-                        d.series_row_bytes() + cfg.ingress.pending_series_entry_bytes,
-                        2 * (d.approx_bytes - decoded) + fixed
-                    );
-                }
+                let columns = 10 + crate::schema::denorm_columns(Dataset::LogsSeries, &cfg).len();
+                cases.push((cfg.clone(), columns, Signal::Logs, e));
             }
+        }
+        for n in [1, 64] {
+            let mut records = encode_metrics(&gauge_request(n));
+            let e = extract(&mut records, &defaults).expect("extract metrics");
+            assert_eq!(e.descriptors.len(), n);
+            cases.push((defaults.clone(), 16, Signal::Metrics, e));
+        }
+
+        for (cfg, columns, signal, e) in cases {
+            let token = 16;
+            let q = cfg.ingress.pending_series_entry_bytes;
+            let exact = e.pinned_bytes
+                + token
+                + e.descriptors
+                    .iter()
+                    .map(|d| {
+                        let decoded = crate::extract::kv_bytes(&d.descriptor.resource_attrs)
+                            + crate::extract::kv_bytes(&d.descriptor.scope_attrs)
+                            + crate::extract::kv_bytes(&d.descriptor.attrs);
+                        2 * (d.approx_bytes - decoded) + 128 * columns + 8 + q
+                    })
+                    .sum::<usize>();
+            let block: Block<u32> = Block::new(0, 1, &cfg);
+            let reservation = block
+                .reserve(&e, &mut SeriesCache::new(1024), token, &cfg)
+                .expect("the default block takes the request");
+            assert_eq!(reservation.new_series.len(), e.descriptors.len());
+            assert_eq!(reservation.bytes, exact, "{signal:?}");
+
+            let charged =
+                e.pinned_bytes + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
+            let fixed = cfg.series_row_fixed_bytes(signal);
+            assert_eq!(fixed, 128 * columns + 8 + q);
+            assert!(exact <= 2 * charged + token + e.descriptors.len() * fixed);
         }
     }
 
