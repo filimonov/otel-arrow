@@ -29,7 +29,7 @@ use crate::clock::PartitionId;
 use crate::config::{LakeConfig, Nulls, SortOrder};
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, dataset_schema, schema_fingerprint};
-use crate::sort::{SortSpec, merge_runs};
+use crate::sort::{MergeBuild, MergeStep, SortSpec};
 
 /// Window length assumed when the configured interval does not fit in `i64`.
 const DEFAULT_WINDOW_SECS: i64 = 15;
@@ -135,6 +135,14 @@ impl MergeKeys {
 
 /// Clears the resident merge keys when a table write ends, however it ends.
 struct MergeKeysHeld<'a>(&'a MergeKeys);
+
+impl MergeKeysHeld<'_> {
+    /// Record `bytes` as what the table's merge now holds.
+    fn set(&self, bytes: usize) {
+        self.0.current.store(bytes, AtomicOrdering::Relaxed);
+        let _ = self.0.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+    }
+}
 
 impl Drop for MergeKeysHeld<'_> {
     fn drop(&mut self) {
@@ -607,32 +615,77 @@ impl Sink {
         let mut rows = 0usize;
         let mut failure: Option<Error> = None;
         let mut cleanup: Option<Instant> = None;
-        let mut merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
-        // Held until this function returns, which is when `merged` and the
-        // keys it encoded are dropped. The value is a bound for the merge's
-        // whole life, so taking it once never under-charges a later chunk.
-        let _keys = self.merge_keys.hold(merged.resident_key_bytes());
+        // The whole write is a sequence of bounded steps with a return to the
+        // runtime and a cancellation check between every two of them. The
+        // table's task shares its thread with the node loop that admits
+        // requests, delivers acks and nacks, answers telemetry and watches the
+        // shutdown deadline, so a step is the longest that loop can be kept
+        // waiting. Nothing about the steps reaches the file: the chunks, their
+        // order and the writer calls are the same as an unsliced write makes.
+        //
+        // `AsyncArrowWriter::write` usually completes synchronously, and so
+        // does a buffered upload whose store is ready, which is why every
+        // step yields explicitly rather than relying on the store to suspend.
+        let mut build = MergeBuild::new(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        // Held until this function returns, which is when the keys are
+        // dropped. Raised as the keys are encoded, then set once to the
+        // merge's bound for its whole life, so no later chunk is
+        // under-charged.
+        let keys = self.merge_keys.hold(0);
+        // Step 1: encode the merge keys, one bounded slice at a time.
         loop {
-            // Yield before every chunk. `AsyncArrowWriter::write` usually
-            // completes synchronously, and so does a buffered upload whose store
-            // is ready, so a highly compressible table could otherwise run from
-            // the first chunk to the last without ever returning to the runtime:
-            // the cancellation token and every other task on the same runtime
-            // would be starved. The yield also precedes producing the next
-            // chunk, whose merge-key work is unbounded CPU time of its own.
+            match build.step() {
+                Ok(true) => break,
+                Ok(false) => keys.set(build.resident_key_bytes()),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
             tokio::task::yield_now().await;
             if cancel.is_cancelled() {
                 failure = Some(Error::Cancelled { abort_error: None });
                 break;
             }
-            let chunk = match merged.next() {
-                None => break,
-                Some(Ok(c)) => c,
-                Some(Err(e)) => {
+        }
+        let mut merged = match failure {
+            Some(_) => None,
+            None => match build.finish() {
+                Ok(merged) => Some(merged),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            },
+        };
+        if let Some(merged) = &merged {
+            keys.set(merged.resident_key_bytes());
+        }
+        // Step 2: produce, encode and flush the chunks, one bounded step at a
+        // time.
+        while let Some(merge) = merged.as_mut() {
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(Error::Cancelled { abort_error: None });
+                break;
+            }
+            let chunk = match merge.step() {
+                Ok(MergeStep::Done) => break,
+                Ok(MergeStep::Progress) => continue,
+                Ok(MergeStep::Chunk(c)) => c,
+                Err(e) => {
                     failure = Some(e);
                     break;
                 }
             };
+            // Encoding one chunk is a stretch of its own, bounded by
+            // `merge_chunk_bytes`; it does not follow the step that produced
+            // the chunk without a return to the runtime in between.
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(Error::Cancelled { abort_error: None });
+                break;
+            }
             let step = self
                 .step(writer.write(&chunk), &watch, cancel, &mut cleanup)
                 .await;
@@ -641,9 +694,17 @@ impl Sink {
                 break;
             }
             rows += chunk.num_rows();
+            drop(chunk);
             if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
                 || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
             {
+                // Closing a row group is the other stretch, bounded by
+                // `row_group_bytes`, and it too runs in a poll of its own.
+                tokio::task::yield_now().await;
+                if cancel.is_cancelled() {
+                    failure = Some(Error::Cancelled { abort_error: None });
+                    break;
+                }
                 let step = self
                     .step(writer.flush(), &watch, cancel, &mut cleanup)
                     .await;
@@ -653,6 +714,7 @@ impl Sink {
                 }
             }
         }
+        drop(merged);
         if let Some(cause) = failure {
             let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
             let abort_error = self.abort_upload(writer, deadline).await;
@@ -745,6 +807,7 @@ mod tests {
     use crate::cache::SeriesCache;
     use crate::config::LakeConfig;
     use crate::extract::extract;
+    use crate::sort::merge_runs;
     use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
     use object_store::{
@@ -2026,5 +2089,117 @@ mod tests {
             "expected a timeout reason, got {abort_error}"
         );
         assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+    }
+
+    /// A sealed block of `n` log rows whose one series is already committed
+    /// in the block's partition, so the block's only table is its values.
+    fn values_only_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+        let mut cache = SeriesCache::new(10);
+        let mut records = encode_logs(&logs(n, 8));
+        let e = extract(&mut records, cfg).expect("extract");
+        let partition = PartitionId::from_unix_secs(WINDOW_START);
+        for descriptor in &e.descriptors {
+            cache.mark_committed(descriptor.series_id, partition);
+        }
+        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, cfg);
+        let r = b.reserve(&e, &mut cache, 8, cfg).expect("reserve");
+        b.admit(e, r, 0).expect("admit");
+        b.seal(SEAL_AT_US).expect("seal");
+        assert_eq!(
+            b.tables().filter(|table| !table.is_empty()).count(),
+            1,
+            "only the values table has rows"
+        );
+        b
+    }
+
+    /// Scenario: a 30,000-row logs block, merged into one chunk, is written
+    /// to an in-memory store that is ready the instant it is asked, while a
+    /// ticker task on the same current-thread runtime counts how often the
+    /// runtime schedules it.
+    /// Guarantees: the write returns to the runtime between bounded slices of
+    /// its work -- merge-key slices, heap-pop slices of at most
+    /// `MERGE_STEP_ROWS` rows, one interleaved column at a time, and between
+    /// producing a chunk, encoding it and flushing its row group -- so the
+    /// ticker runs at least once per pop slice and once per output column.
+    /// A write that yields only between chunks lets it run a handful of times.
+    #[tokio::test]
+    async fn the_write_returns_to_the_runtime_between_bounded_slices() {
+        let cfg = LakeConfig::default();
+        let rows = 30_000;
+        let b = sealed_block(&cfg, rows);
+        let columns = dataset_schema(Dataset::LogsValues, &cfg).fields().len();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let done = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let done = Arc::clone(&done);
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                while !done.load(Ordering::SeqCst) {
+                    let _ = ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let report = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        done.store(true, Ordering::SeqCst);
+        ticker.await.expect("ticker");
+        assert_eq!(report.files.iter().map(|f| f.2).sum::<usize>(), rows + 1);
+        let pop_slices = rows.div_ceil(crate::sort::MERGE_STEP_ROWS);
+        let ticked = ticks.load(Ordering::SeqCst);
+        assert!(
+            ticked > pop_slices + columns,
+            "the runtime scheduled the ticker {ticked} times during the write, fewer than \
+             {pop_slices} pop slices and {columns} columns"
+        );
+    }
+
+    /// Scenario: a values-only block of 100,000 log rows, whose merge keys
+    /// take many slices to encode, is written while a task that the runtime
+    /// schedules at the write's first yield cancels the token.
+    /// Guarantees: the cancellation is observed between merge-key slices:
+    /// the write returns Cancelled having encoded only a fraction of the
+    /// keys, as the sink's merge-key high-water mark shows, instead of
+    /// encoding the key of every row before it first returns to the runtime.
+    #[tokio::test]
+    async fn a_cancellation_during_merge_key_building_stops_the_build() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_request_bytes = 64 << 20;
+        cfg.ingress.max_extracted_bytes = 64 << 20;
+        cfg.validate().expect("valid config");
+        let b = values_only_block(&cfg, 100_000);
+        let full = b
+            .tables()
+            .filter(|table| !table.is_empty())
+            .map(|table| {
+                merge_runs(
+                    table.iter_snapshots().cloned().collect(),
+                    table.spec(),
+                    cfg.sorting.merge_chunk_bytes,
+                )
+                .expect("merge")
+                .resident_key_bytes()
+            })
+            .sum::<usize>();
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let sink = Sink::new(store, cfg, FileNaming::new("w"));
+        let token = CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancel() })
+        };
+        let got = sink.write_block(&b, &token).await;
+        canceller.await.expect("cancelling task");
+        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        let built = sink.merge_key_high_water_bytes();
+        assert!(
+            built < full / 2,
+            "{built} of {full} merge-key bytes were encoded before the cancellation was seen"
+        );
     }
 }

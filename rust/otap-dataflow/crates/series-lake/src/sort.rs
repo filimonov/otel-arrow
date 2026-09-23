@@ -157,10 +157,60 @@ pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), taken)?)
 }
 
+/// Most rows one merge step encodes keys for, or pops from the merge heap,
+/// before it returns.
+///
+/// A step is the unit of work the sink runs between two returns to its
+/// runtime, so this and [`MERGE_STEP_KEY_BYTES`] bound how long a merge holds
+/// the thread it runs on. Neither affects which rows a chunk holds or their
+/// order: the merge produces the same chunks however its work is sliced.
+pub const MERGE_STEP_ROWS: usize = 8192;
+
+/// Most encoded key bytes one merge step builds or copies before it returns.
+///
+/// Encoding and copying keys costs time in proportion to their bytes, so a
+/// wide key, such as a log body, gets proportionally fewer rows per step.
+pub const MERGE_STEP_KEY_BYTES: usize = 1 << 20;
+
+/// Rows the first key slice of a merge encodes, before any key width is
+/// known.
+const FIRST_KEY_SLICE_ROWS: usize = 256;
+
+/// Fewest rows a key slice encodes, whatever the key width.
+const MIN_KEY_SLICE_ROWS: usize = 16;
+
+/// How much work one merge step may do.
+#[derive(Debug, Clone, Copy)]
+struct StepBudget {
+    rows: usize,
+    key_bytes: usize,
+}
+
+impl StepBudget {
+    const DEFAULT: Self = Self {
+        rows: MERGE_STEP_ROWS,
+        key_bytes: MERGE_STEP_KEY_BYTES,
+    };
+
+    /// Rows of the next key slice, given the average encoded key width seen
+    /// so far.
+    fn key_slice_rows(self, average_key_bytes: Option<usize>) -> usize {
+        let rows = match average_key_bytes {
+            None => FIRST_KEY_SLICE_ROWS,
+            Some(width) => self.key_bytes / width.max(1),
+        };
+        rows.clamp(MIN_KEY_SLICE_ROWS.min(self.rows), self.rows)
+    }
+}
+
 struct HeapItem {
     row: OwnedRow,
     run: usize,
+    /// Row index within the run.
     idx: usize,
+    /// Key segment of the run the row's key sits in, and its offset there.
+    seg: usize,
+    off: usize,
 }
 
 impl PartialEq for HeapItem {
@@ -222,6 +272,201 @@ fn avg_row_bytes(runs: &[RecordBatch]) -> usize {
     (bytes / rows).max(1)
 }
 
+/// A merge whose sort keys are still being encoded, one bounded slice per
+/// [`MergeBuild::step`].
+///
+/// The keys of every row of every run must exist before the first row can
+/// leave the merge, and encoding them is linear in the rows and in the key
+/// width. Built in one call, that is one uninterrupted stretch as long as the
+/// table is large; built here, it is a sequence of slices of at most
+/// [`MERGE_STEP_ROWS`] rows and about [`MERGE_STEP_KEY_BYTES`] encoded bytes,
+/// between which a caller on an asynchronous runtime can return to it.
+///
+/// Each run's keys are kept as the segments the slices produced. Every
+/// segment is encoded by the one converter of the merge, so a row's encoded
+/// key, and therefore every comparison and the whole output, is the same as
+/// if the run had been encoded in one call.
+pub struct MergeBuild {
+    runs: Vec<RecordBatch>,
+    schema: SchemaRef,
+    spec: SortSpec,
+    converter: Option<RowConverter>,
+    keys: Vec<Vec<Rows>>,
+    chunk_bytes: usize,
+    /// The run being encoded and the first row of it not yet encoded.
+    run: usize,
+    offset: usize,
+    /// Encoded key bytes and rows so far, for the next slice's width.
+    encoded_bytes: usize,
+    encoded_rows: usize,
+    budget: StepBudget,
+    sorted: bool,
+}
+
+impl MergeBuild {
+    /// Validate the runs and prepare the merge, encoding no key yet.
+    ///
+    /// Runs without rows are dropped. With an empty spec the merge is the
+    /// unsorted pass-through and there is nothing to encode.
+    ///
+    /// # Errors
+    ///
+    /// Refuses runs whose fields differ, and a spec naming a column the
+    /// runs do not have.
+    pub fn new(runs: Vec<RecordBatch>, spec: &SortSpec, chunk_bytes: usize) -> Result<Self> {
+        let runs: Vec<RecordBatch> = runs.into_iter().filter(|r| r.num_rows() > 0).collect();
+        let schema = match runs.first() {
+            Some(first) => first.schema(),
+            None => Arc::new(Schema::empty()),
+        };
+        // Every run must share one set of fields: the merge reads column `c` of every
+        // run for each output column, so a narrower run would be an out-of-bounds
+        // index and a differently typed one would fail `interleave`. Only the fields
+        // matter, so runs that differ solely in schema-level metadata merge fine and
+        // the first run's metadata is carried into the output.
+        if runs.iter().any(|r| r.schema().fields() != schema.fields()) {
+            return Err(Error::internal("merge runs have different schemas"));
+        }
+        let sorted = !runs.is_empty() && !spec.is_empty();
+        let converter = if sorted {
+            Some(key_converter(&schema, spec)?)
+        } else {
+            None
+        };
+        let keys = if sorted {
+            runs.iter().map(|_| Vec::new()).collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            runs,
+            schema,
+            spec: spec.clone(),
+            converter,
+            keys,
+            chunk_bytes,
+            run: 0,
+            offset: 0,
+            encoded_bytes: 0,
+            encoded_rows: 0,
+            budget: StepBudget::DEFAULT,
+            sorted,
+        })
+    }
+
+    /// The same build, sliced by a different budget (tests).
+    #[cfg(test)]
+    fn with_budget(self, rows: usize, key_bytes: usize) -> Self {
+        Self {
+            budget: StepBudget { rows, key_bytes },
+            ..self
+        }
+    }
+
+    /// Whether every key has been encoded.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.sorted || self.run >= self.runs.len()
+    }
+
+    /// Encode the next slice of sort keys. Returns whether every key is now
+    /// encoded; a complete build does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow failure of encoding a slice.
+    pub fn step(&mut self) -> Result<bool> {
+        if self.is_complete() {
+            return Ok(true);
+        }
+        let converter = self
+            .converter
+            .as_ref()
+            .ok_or_else(|| Error::internal("sorted merge without a converter"))?;
+        let run = &self.runs[self.run];
+        let average = (self.encoded_rows > 0).then(|| self.encoded_bytes / self.encoded_rows);
+        let rows = self
+            .budget
+            .key_slice_rows(average)
+            .min(run.num_rows() - self.offset);
+        let slice = run.slice(self.offset, rows);
+        let encoded = key_rows(&slice, &self.spec, converter)?;
+        self.encoded_bytes += encoded.lengths().sum::<usize>();
+        self.encoded_rows += rows;
+        self.keys[self.run].push(encoded);
+        self.offset += rows;
+        if self.offset >= run.num_rows() {
+            self.run += 1;
+            self.offset = 0;
+        }
+        Ok(self.is_complete())
+    }
+
+    /// Heap the keys encoded so far hold beside the runs.
+    #[must_use]
+    pub fn resident_key_bytes(&self) -> usize {
+        self.keys.iter().flatten().map(Rows::size).sum()
+    }
+
+    /// Seed the merge heap and hand over the merge, encoding whatever keys
+    /// are still missing first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow failure of encoding a remaining slice.
+    pub fn finish(mut self) -> Result<MergeIter> {
+        while !self.step()? {}
+        let mut heap = BinaryHeap::new();
+        for (run, segments) in self.keys.iter().enumerate() {
+            if let Some(first) = segments.first() {
+                heap.push(HeapItem {
+                    row: first.row(0).owned(),
+                    run,
+                    idx: 0,
+                    seg: 0,
+                    off: 0,
+                });
+            }
+        }
+        let rows_per_chunk = if self.sorted {
+            (self.chunk_bytes / avg_row_bytes(&self.runs)).max(1)
+        } else {
+            1
+        };
+        let longest_key = self
+            .keys
+            .iter()
+            .flatten()
+            .flat_map(Rows::lengths)
+            .max()
+            .unwrap_or(0);
+        Ok(MergeIter {
+            runs: self.runs,
+            schema: self.schema,
+            keys: self.keys,
+            heap,
+            longest_key,
+            rows_per_chunk,
+            next_run: 0,
+            sorted: self.sorted,
+            budget: self.budget,
+            pending: Vec::new(),
+            columns: Vec::new(),
+        })
+    }
+}
+
+/// What one [`MergeIter::step`] produced.
+#[derive(Debug)]
+pub enum MergeStep {
+    /// Bounded work was done towards the next chunk; step again.
+    Progress,
+    /// The next output chunk.
+    Chunk(RecordBatch),
+    /// The merge is exhausted.
+    Done,
+}
+
 /// Lazy k-way merge: one output chunk is materialized per `next()`.
 ///
 /// Memory: the iterator holds the input runs, the encoded sort keys of every row
@@ -235,11 +480,17 @@ fn avg_row_bytes(runs: &[RecordBatch]) -> usize {
 /// be wider than average exceeds `chunk_bytes`. The overshoot is bounded by
 /// `max_row_bytes` per row, and `max_row_bytes <= run_target_bytes / 4` is
 /// validated at startup. Exact byte-driven chunking is a plan 3 follow-up.
+///
+/// A chunk can be produced in bounded steps through [`MergeIter::step`]:
+/// heap pops in slices of at most [`MERGE_STEP_ROWS`] rows and
+/// [`MERGE_STEP_KEY_BYTES`] copied key bytes, then one output column per
+/// step. `next()` runs the same steps back to back, so both produce exactly
+/// the same chunks.
 pub struct MergeIter {
     runs: Vec<RecordBatch>,
     schema: SchemaRef,
-    /// Sorted mode: encoded keys per run, plus the merge heap.
-    keys: Vec<Rows>,
+    /// Sorted mode: encoded keys per run, as segments, plus the merge heap.
+    keys: Vec<Vec<Rows>>,
     heap: BinaryHeap<HeapItem>,
     /// The longest encoded key of any row of any run: the most one heap
     /// entry's owned key row can ever hold.
@@ -248,6 +499,11 @@ pub struct MergeIter {
     /// Unsorted mode: index of the next run to hand out unchanged.
     next_run: usize,
     sorted: bool,
+    budget: StepBudget,
+    /// Sorted mode: the rows popped for the chunk being produced.
+    pending: Vec<(usize, usize)>,
+    /// Sorted mode: the chunk's columns interleaved so far.
+    columns: Vec<ArrayRef>,
 }
 
 impl MergeIter {
@@ -265,15 +521,27 @@ impl MergeIter {
     /// mode, which encodes no keys.
     #[must_use]
     pub fn resident_key_bytes(&self) -> usize {
-        let keys = self.keys.iter().map(Rows::size).sum::<usize>();
+        let keys = self.keys.iter().flatten().map(Rows::size).sum::<usize>();
         let entries = self.heap.capacity().max(self.keys.len());
         keys + entries * size_of::<HeapItem>() + self.keys.len() * self.longest_key
+    }
+
+    /// Heap the chunk being produced holds right now: the popped row
+    /// indices and the columns interleaved so far.
+    #[must_use]
+    pub fn chunk_workspace_bytes(&self) -> usize {
+        self.pending.capacity() * size_of::<(usize, usize)>()
+            + self
+                .columns
+                .iter()
+                .map(|column| column.get_array_memory_size())
+                .sum::<usize>()
     }
 
     /// What the owned key rows and the merge heap hold right now (tests).
     #[cfg(test)]
     fn resident_key_bytes_now(&self) -> usize {
-        self.keys.iter().map(Rows::size).sum::<usize>()
+        self.keys.iter().flatten().map(Rows::size).sum::<usize>()
             + self.heap.capacity() * size_of::<HeapItem>()
             + self
                 .heap
@@ -282,13 +550,97 @@ impl MergeIter {
                 .sum::<usize>()
     }
 
-    fn interleave(&self, pending: &[(usize, usize)]) -> Result<RecordBatch> {
-        let mut cols: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
-        for c in 0..self.schema.fields().len() {
-            let arrays: Vec<&dyn Array> = self.runs.iter().map(|r| r.column(c).as_ref()).collect();
-            cols.push(interleave(&arrays, pending)?);
+    /// The same merge, stepped by a different budget (tests).
+    #[cfg(test)]
+    fn with_budget(self, rows: usize, key_bytes: usize) -> Self {
+        Self {
+            budget: StepBudget { rows, key_bytes },
+            ..self
         }
-        Ok(RecordBatch::try_new(self.schema.clone(), cols)?)
+    }
+
+    /// Do one bounded step of producing the next chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow failure of interleaving a column or assembling the
+    /// chunk.
+    pub fn step(&mut self) -> Result<MergeStep> {
+        if !self.sorted {
+            // Unsorted mode: hand out the runs in arrival order, unchanged. No
+            // concatenation, so no second copy of the dataset is ever built.
+            let Some(run) = self.runs.get(self.next_run) else {
+                return Ok(MergeStep::Done);
+            };
+            self.next_run += 1;
+            return Ok(MergeStep::Chunk(run.clone()));
+        }
+        if self.columns.is_empty() {
+            if !self.popped_enough() {
+                self.pop_slice();
+                return Ok(if self.pending.is_empty() {
+                    MergeStep::Done
+                } else {
+                    MergeStep::Progress
+                });
+            }
+            if self.pending.is_empty() {
+                return Ok(MergeStep::Done);
+            }
+        }
+        // Interleave one column per step.
+        let c = self.columns.len();
+        let arrays: Vec<&dyn Array> = self.runs.iter().map(|r| r.column(c).as_ref()).collect();
+        self.columns.push(interleave(&arrays, &self.pending)?);
+        if self.columns.len() < self.schema.fields().len() {
+            return Ok(MergeStep::Progress);
+        }
+        let columns = std::mem::take(&mut self.columns);
+        self.pending.clear();
+        Ok(MergeStep::Chunk(RecordBatch::try_new(
+            self.schema.clone(),
+            columns,
+        )?))
+    }
+
+    /// Whether the rows popped so far complete a chunk: the chunk's row
+    /// count is reached or the heap is exhausted.
+    fn popped_enough(&self) -> bool {
+        self.pending.len() >= self.rows_per_chunk || self.heap.is_empty()
+    }
+
+    /// Pop the next slice of rows of the chunk being produced.
+    fn pop_slice(&mut self) {
+        if self.pending.capacity() == 0 {
+            self.pending.reserve_exact(self.rows_per_chunk);
+        }
+        let mut rows = 0usize;
+        let mut copied = 0usize;
+        while rows < self.budget.rows && copied < self.budget.key_bytes {
+            let Some(item) = self.heap.pop() else { break };
+            self.pending.push((item.run, item.idx));
+            rows += 1;
+            let segments = &self.keys[item.run];
+            let (seg, off) = if item.off + 1 < segments[item.seg].num_rows() {
+                (item.seg, item.off + 1)
+            } else {
+                (item.seg + 1, 0)
+            };
+            if let Some(segment) = segments.get(seg) {
+                let row = segment.row(off);
+                copied += row.as_ref().len();
+                self.heap.push(HeapItem {
+                    row: row.owned(),
+                    run: item.run,
+                    idx: item.idx + 1,
+                    seg,
+                    off,
+                });
+            }
+            if self.pending.len() >= self.rows_per_chunk {
+                break;
+            }
+        }
     }
 }
 
@@ -296,32 +648,14 @@ impl Iterator for MergeIter {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.sorted {
-            // Unsorted mode: hand out the runs in arrival order, unchanged. No
-            // concatenation, so no second copy of the dataset is ever built.
-            let run = self.runs.get(self.next_run)?;
-            self.next_run += 1;
-            return Some(Ok(run.clone()));
-        }
-        let mut pending: Vec<(usize, usize)> = Vec::with_capacity(self.rows_per_chunk);
-        while let Some(item) = self.heap.pop() {
-            pending.push((item.run, item.idx));
-            let next = item.idx + 1;
-            if next < self.keys[item.run].num_rows() {
-                self.heap.push(HeapItem {
-                    row: self.keys[item.run].row(next).owned(),
-                    run: item.run,
-                    idx: next,
-                });
-            }
-            if pending.len() >= self.rows_per_chunk {
-                break;
+        loop {
+            match self.step() {
+                Ok(MergeStep::Progress) => {}
+                Ok(MergeStep::Chunk(chunk)) => return Some(Ok(chunk)),
+                Ok(MergeStep::Done) => return None,
+                Err(e) => return Some(Err(e)),
             }
         }
-        if pending.is_empty() {
-            return None;
-        }
-        Some(self.interleave(&pending))
     }
 }
 
@@ -330,70 +664,19 @@ impl Iterator for MergeIter {
 /// The result is an iterator: only one output chunk exists at a time, so the
 /// caller (the sink) can hand each chunk to the Parquet writer and drop it. With
 /// an empty spec the runs are yielded unchanged, in arrival order.
+///
+/// Every key is encoded before this returns; [`MergeBuild`] builds the same
+/// merge in bounded slices.
+///
+/// # Errors
+///
+/// As [`MergeBuild::new`] and [`MergeBuild::finish`].
 pub fn merge_runs(
     runs: Vec<RecordBatch>,
     spec: &SortSpec,
     chunk_bytes: usize,
 ) -> Result<MergeIter> {
-    let runs: Vec<RecordBatch> = runs.into_iter().filter(|r| r.num_rows() > 0).collect();
-    let Some(first) = runs.first() else {
-        return Ok(MergeIter {
-            runs: Vec::new(),
-            schema: Arc::new(Schema::empty()),
-            keys: Vec::new(),
-            heap: BinaryHeap::new(),
-            longest_key: 0,
-            rows_per_chunk: 1,
-            next_run: 0,
-            sorted: false,
-        });
-    };
-    let schema = first.schema();
-    // Every run must share one set of fields: the merge reads column `c` of every
-    // run for each output column, so a narrower run would be an out-of-bounds
-    // index and a differently typed one would fail `interleave`. Only the fields
-    // matter, so runs that differ solely in schema-level metadata merge fine and
-    // the first run's metadata is carried into the output.
-    if runs.iter().any(|r| r.schema().fields() != schema.fields()) {
-        return Err(Error::internal("merge runs have different schemas"));
-    }
-    if spec.is_empty() {
-        return Ok(MergeIter {
-            runs,
-            schema,
-            keys: Vec::new(),
-            heap: BinaryHeap::new(),
-            longest_key: 0,
-            rows_per_chunk: 1,
-            next_run: 0,
-            sorted: false,
-        });
-    }
-    let converter = key_converter(&schema, spec)?;
-    let mut keys = Vec::with_capacity(runs.len());
-    for r in &runs {
-        keys.push(key_rows(r, spec, &converter)?);
-    }
-    let mut heap = BinaryHeap::new();
-    for (run, rows) in keys.iter().enumerate() {
-        heap.push(HeapItem {
-            row: rows.row(0).owned(),
-            run,
-            idx: 0,
-        });
-    }
-    let rows_per_chunk = (chunk_bytes / avg_row_bytes(&runs)).max(1);
-    let longest_key = keys.iter().flat_map(Rows::lengths).max().unwrap_or(0);
-    Ok(MergeIter {
-        runs,
-        schema,
-        keys,
-        heap,
-        longest_key,
-        rows_per_chunk,
-        next_run: 0,
-        sorted: true,
-    })
+    MergeBuild::new(runs, spec, chunk_bytes)?.finish()
 }
 
 /// Whether a batch is sorted by the spec (test helper, also used by the oracle).
@@ -1006,5 +1289,181 @@ mod tests {
             vec![Some(1)]
         );
         assert!(is_sorted(&one, &spec()).expect("one row"));
+    }
+
+    /// Runs keyed by an Int64 `k` with ties and nulls and a Utf8 `s` of
+    /// widths from 1 to about 90 bytes, each carrying a distinct tag, each
+    /// sorted by `k` ascending, nulls last, then `s` descending.
+    fn tie_heavy_runs() -> (Vec<RecordBatch>, SortSpec) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("tag", DataType::Utf8, false),
+        ]));
+        let spec = SortSpec::new(vec![
+            SortKey {
+                column: "k".into(),
+                order: SortOrder::Asc,
+                nulls: Nulls::Last,
+            },
+            SortKey {
+                column: "s".into(),
+                order: SortOrder::Desc,
+                nulls: Nulls::Last,
+            },
+        ]);
+        let runs = (0..4)
+            .map(|run| {
+                let n = 37 + run * 11;
+                let k: Vec<Option<i64>> = (0..n)
+                    .map(|i| (i % 9 != 4).then_some(((i * 7 + run * 3) % 5) as i64))
+                    .collect();
+                let s: Vec<String> = (0..n)
+                    .map(|i| "x".repeat(1 + (i * 13 + run) % 90) + &format!("{}", i % 3))
+                    .collect();
+                let tag: Vec<String> = (0..n).map(|i| format!("r{run}i{i}")).collect();
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k)) as ArrayRef,
+                        Arc::new(StringArray::from(s)) as ArrayRef,
+                        Arc::new(StringArray::from(tag)) as ArrayRef,
+                    ],
+                )
+                .expect("batch");
+                sort_batch(&batch, &spec).expect("sort")
+            })
+            .collect();
+        (runs, spec)
+    }
+
+    /// The tags of every run's rows in the order a stable sort of the runs'
+    /// concatenation, in run order, by the keys of `tie_heavy_runs` gives.
+    fn stable_sort_tags(runs: &[RecordBatch]) -> Vec<String> {
+        let mut rows: Vec<(Option<i64>, String, String)> = Vec::new();
+        for run in runs {
+            let k = run.column(0).as_primitive::<Int64Type>();
+            let s = run.column(1).as_string::<i32>();
+            let t = run.column(2).as_string::<i32>();
+            for i in 0..run.num_rows() {
+                rows.push((
+                    k.is_valid(i).then(|| k.value(i)),
+                    s.value(i).to_string(),
+                    t.value(i).to_string(),
+                ));
+            }
+        }
+        rows.sort_by(|a, b| {
+            let k = match (a.0, b.0) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+            k.then_with(|| b.1.cmp(&a.1))
+        });
+        rows.into_iter().map(|(_, _, tag)| tag).collect()
+    }
+
+    /// Scenario: tie-heavy runs with variable-width string keys are merged
+    /// with the default budget and, through `MergeBuild` and `MergeIter::step`,
+    /// with budgets from one row and one key byte per step upwards, and with
+    /// a chunk budget small enough for several chunks.
+    /// Guarantees: however the key encoding and the heap pops are sliced,
+    /// every chunk holds the same rows in the same order as the unsliced
+    /// merge, which is exactly the stable sort of the runs in run order, and
+    /// a small budget really does slice the work into many steps.
+    #[test]
+    fn sliced_merge_matches_the_unsliced_merge_and_a_stable_sort() {
+        let (runs, spec) = tie_heavy_runs();
+        let chunk_bytes = avg_row_bytes(&runs) * 23;
+        let unsliced = merged(runs.clone(), &spec, chunk_bytes);
+        let expected = stable_sort_tags(&runs);
+        assert_eq!(tags_of(&concat(&unsliced)), expected);
+        assert!(unsliced.len() > 3, "{} chunks", unsliced.len());
+        for (rows, key_bytes) in [(1, 1), (2, 7), (5, 64), (16, 1 << 20), (1 << 20, 1 << 30)] {
+            let mut build = MergeBuild::new(runs.clone(), &spec, chunk_bytes)
+                .expect("build")
+                .with_budget(rows, key_bytes);
+            let mut build_steps = 0usize;
+            let mut resident = 0usize;
+            while !build.step().expect("key slice") {
+                build_steps += 1;
+                assert!(build.resident_key_bytes() >= resident, "keys only grow");
+                resident = build.resident_key_bytes();
+            }
+            let mut merge = build.finish().expect("finish").with_budget(rows, key_bytes);
+            let mut chunks = Vec::new();
+            let mut steps = 0usize;
+            loop {
+                steps += 1;
+                match merge.step().expect("step") {
+                    MergeStep::Progress => {}
+                    MergeStep::Chunk(chunk) => chunks.push(chunk),
+                    MergeStep::Done => break,
+                }
+            }
+            assert_eq!(
+                chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+                unsliced
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .collect::<Vec<_>>(),
+                "chunk boundaries with {rows} rows / {key_bytes} bytes per step"
+            );
+            for (got, want) in chunks.iter().zip(&unsliced) {
+                assert_eq!(
+                    got, want,
+                    "chunk content with {rows} rows / {key_bytes} bytes"
+                );
+            }
+            if rows <= 16 {
+                assert!(build_steps > runs.len(), "{build_steps} key slices");
+                assert!(steps > chunks.len() * 4, "{steps} merge steps");
+            }
+        }
+    }
+
+    /// Scenario: the tie-heavy runs merged with a budget of three rows per
+    /// step.
+    /// Guarantees: one key slice encodes at most three rows, one pop step
+    /// adds at most three rows to the chunk being produced and one
+    /// interleave step adds exactly one column, so no single step does more
+    /// than its budget however large the table.
+    #[test]
+    fn one_merge_step_does_bounded_work() {
+        let (runs, spec) = tie_heavy_runs();
+        let mut build = MergeBuild::new(runs.clone(), &spec, 1 << 20)
+            .expect("build")
+            .with_budget(3, 1 << 20);
+        let mut encoded = 0usize;
+        while !build.step().expect("slice") {
+            let now = build
+                .keys
+                .iter()
+                .flatten()
+                .map(Rows::num_rows)
+                .sum::<usize>();
+            assert!(
+                now - encoded <= 3,
+                "{} rows in one key slice",
+                now - encoded
+            );
+            encoded = now;
+        }
+        let mut merge = build.finish().expect("finish").with_budget(3, 1 << 20);
+        let mut chunks = 0;
+        loop {
+            let (pending, columns) = (merge.pending.len(), merge.columns.len());
+            match merge.step().expect("step") {
+                MergeStep::Progress if merge.columns.is_empty() => {
+                    assert!(merge.pending.len() - pending <= 3);
+                }
+                MergeStep::Progress => assert_eq!(merge.columns.len(), columns + 1),
+                MergeStep::Chunk(_) => chunks += 1,
+                MergeStep::Done => break,
+            }
+        }
+        assert_eq!(chunks, 1);
     }
 }

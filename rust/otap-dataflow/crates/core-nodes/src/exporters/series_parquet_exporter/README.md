@@ -1317,6 +1317,18 @@ or aggregate cumulative metrics and gauges in the SDK.
   replay id.
 - There is no live buffer, tail or series introspection endpoint beyond the
   metrics above.
+- A flush runs on the worker's own core, beside the loop that admits
+  requests, delivers acks and nacks, answers telemetry and watches the
+  shutdown deadline. It works in bounded steps and returns to that loop
+  between every two: merge keys are encoded and merge rows popped in slices
+  of at most 8,192 rows and about 1 MiB of key bytes, the chunk is assembled
+  one column at a time, and producing, encoding and flushing a chunk each get
+  a poll of their own. The two steps that cannot be sliced without changing
+  the file are encoding one chunk, bounded by `sorting.merge_chunk_bytes`,
+  and closing one row group, bounded by `parquet.row_group_bytes`. At the
+  defaults, on the largest block the default budgets admit, the longest step
+  measured 22 to 25 ms, and a cancellation was observed within 16 to 22 ms.
+  Moving the flush off the core is future work.
 
 ## Related Docs
 
