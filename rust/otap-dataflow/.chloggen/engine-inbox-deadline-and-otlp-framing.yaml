@@ -8,7 +8,7 @@ change_type: enhancement
 component: engine
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Exporters can read the latched shutdown deadline while draining, and the parquet and otap exporters refuse OTLP requests whose protobuf framing is broken.
+note: Exporters can read the latched shutdown deadline while draining.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,5 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  A truncated OTLP body was written or sent on as a partial or empty
-  batch. The parquet exporter now drops it as a failed export with a WARN, the
-  otap exporter nacks it permanently. The file-storage retry warning of both
-  object-store exporters is now object_store.retry_ignored_for_file_storage.
+  The file-storage retry warning of both object-store exporters is now
+  object_store.retry_ignored_for_file_storage.
