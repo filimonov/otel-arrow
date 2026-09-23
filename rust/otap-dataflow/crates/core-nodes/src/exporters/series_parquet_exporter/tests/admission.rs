@@ -1122,22 +1122,43 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     drop(events);
 }
 
-/// Scenario: refusals arrive in a burst, then after a pause of the log
-/// interval.
-/// Guarantees: one WARN line is written per interval however many requests
-/// are refused within it, and the next line reports how many were left out,
-/// so a producer resending a refused request cannot flood the log while the
-/// count of refusals is still visible.
-#[test]
-fn refusal_warnings_are_rate_limited() {
-    let mut log = super::super::worker::RefusalLog::default();
-    let start = std::time::Instant::now();
-    assert_eq!(log.admit(start), Some(0));
-    for i in 1..=5 {
-        assert_eq!(log.admit(start + Duration::from_millis(i * 100)), None);
+/// Scenario: six traces requests are refused in a burst on a simulated clock,
+/// then one more a second later.
+/// Guarantees: the worker writes one `series_parquet.request.failed` line for
+/// the burst, and the next line, an interval later, reports the five it left
+/// out, so a producer resending a refused request cannot flood the log while
+/// every refusal is still counted.
+#[tokio::test(flavor = "current_thread")]
+async fn refusal_warnings_are_rate_limited() {
+    let events = capture();
+    let sim = clock::SimClock::new();
+    let _clock_guard = sim.install();
+    let (handler, _rx) = effects(16);
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(lake::clock::TestWallClock::new(0)),
+        handler,
+    );
+    let traces = || {
+        let mut context = Context::default();
+        context.set_source_node(7);
+        OtapPdata::new(context, traces_payload())
+    };
+    for _ in 0..6 {
+        worker.admit(traces());
+        sim.advance(Duration::from_millis(100));
     }
-    assert_eq!(log.admit(start + Duration::from_secs(1)), Some(5));
-    assert_eq!(log.admit(start + Duration::from_millis(1_500)), None);
+    assert_eq!(events.named("series_parquet.request.failed").len(), 1);
+    sim.advance(Duration::from_secs(1));
+    worker.admit(traces());
+    let logged = events.named("series_parquet.request.failed");
+    assert_eq!(logged.len(), 2);
+    assert_eq!(
+        logged[1].fields.get("suppressed"),
+        Some(&FieldValue::U64(5))
+    );
+    assert_eq!(worker.notify.outcomes()[Outcome::Unsupported as usize], 7);
 }
 
 /// Scenario: a metrics request whose gauge point carries an exemplar

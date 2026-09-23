@@ -44,6 +44,7 @@
 //! newer one. Exactly one request is ever parked, so the bound above becomes
 //! two blocks, one request and the completions in flight.
 
+use super::super::log_gate::LogGate;
 use super::config::Config;
 use super::flush::{self, FlushDone, FlushJob};
 use super::metrics::{
@@ -85,39 +86,6 @@ const CACHE_ENTRY_BYTES: u64 = 128;
 /// Allocator, runtime and library overhead a worker is allowed beyond the
 /// buffers it accounts for itself.
 const FIXED_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Shortest interval between two per-request refusal WARN lines.
-const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Rate limit of the per-request refusal WARN.
-///
-/// A producer that keeps sending a request this node refuses would otherwise
-/// write one WARN line per request, at whatever rate it sends. Every refusal
-/// is still counted in the `nacks` metric; the log keeps one line per
-/// interval and says how many it left out.
-#[derive(Debug, Default)]
-pub(super) struct RefusalLog {
-    /// When the last line was written.
-    last: Option<Instant>,
-    /// Refusals left out since then.
-    suppressed: u64,
-}
-
-impl RefusalLog {
-    /// Whether a refusal seen at `now` is logged, and if it is, how many were
-    /// left out since the previous line.
-    pub(super) fn admit(&mut self, now: Instant) -> Option<u64> {
-        if self
-            .last
-            .is_some_and(|last| now.saturating_duration_since(last) < REFUSAL_LOG_INTERVAL)
-        {
-            self.suppressed += 1;
-            return None;
-        }
-        self.last = Some(now);
-        Some(std::mem::take(&mut self.suppressed))
-    }
-}
 
 /// Open and closed history of pdata admission, for telemetry.
 ///
@@ -264,7 +232,7 @@ pub(super) struct Worker {
     #[cfg(test)]
     pub(super) samples: u64,
     /// Rate limit of the per-request refusal WARN.
-    refusals: RefusalLog,
+    refusals: LogGate,
     /// Whether pdata admission is open, and how long it has been closed.
     pub(super) admission: AdmissionGate,
     /// Random id of this worker's incarnation, the file-name segment that
@@ -339,7 +307,7 @@ impl Worker {
             token_high_water: size_of::<AckToken>(),
             #[cfg(test)]
             samples: 0,
-            refusals: RefusalLog::default(),
+            refusals: LogGate::new(),
             admission: AdmissionGate::default(),
             boot_id,
             accepted: 0,
@@ -647,7 +615,7 @@ impl Worker {
     /// the detail still exists; the completion carries the outcome and the
     /// reason sentence. The line names the signal and, for a size refusal,
     /// the setting that refused it, the observed size and the limit; it is
-    /// rate limited (see [`RefusalLog`]).
+    /// rate limited (see [`LogGate`]).
     fn refuse(&mut self, token: AckToken, error: &lake::Error) {
         let outcome = Outcome::of(error);
         let sentence = Outcome::explain(error);
