@@ -1104,7 +1104,9 @@ impl Stage {
             writer_id: self.cfg.lake.writer_id.clone(),
             boot_id: format!("bench{}", uuid_like().replace('-', "x")),
         };
-        Ok(Sink::new(store, self.cfg.lake.clone(), naming))
+        Ok(Sink::new(store, self.cfg.lake.clone(), naming, |timeout| {
+            Box::pin(tokio::time::sleep(timeout))
+        }))
     }
 
     /// A freshly sealed block of the whole input.

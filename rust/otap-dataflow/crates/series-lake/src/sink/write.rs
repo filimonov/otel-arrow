@@ -7,7 +7,7 @@
 use super::properties::{
     compression, native_sorting_columns, row_group_full, time_range, writer_properties,
 };
-use super::{FlushReport, Sink};
+use super::{AbortTimer, FlushReport, Sink};
 
 use crate::buffer::{Block, SortedTableBuffer};
 use crate::error::{Error, Result, TransientError};
@@ -24,7 +24,6 @@ use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// The encoded sort keys the table being written keeps resident.
@@ -457,28 +456,21 @@ impl ObjectStore for CreationWatch {
     }
 }
 
-/// `base + delta`, saturated at a year out rather than panicking on overflow.
-pub(super) fn deadline_after(base: Instant, delta: Duration) -> Instant {
-    base.checked_add(delta)
-        .or_else(|| base.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
-        .unwrap_or(base)
-}
-
 impl Sink {
     /// Best-effort abort of a still-writable upload, by `deadline`.
     ///
-    /// Bounded, on the sink's clock, so a wedged store cannot block the flush
+    /// Bounded by `deadline`, so a wedged store cannot block the flush
     /// task. Returns why the abort did not succeed, or `None` when it did.
     pub(super) async fn abort_upload(
         &self,
         writer: AsyncArrowWriter<LedgeredWriter>,
-        deadline: Instant,
+        deadline: AbortTimer,
     ) -> Option<String> {
         let mut buf: BufWriter = writer.into_inner().into_buf_writer();
         tokio::select! {
             biased;
             aborted = buf.abort() => aborted.err().map(|e| e.to_string()),
-            () = (self.clock.sleep_until)(deadline) => Some(format!(
+            () = deadline => Some(format!(
                 "abort timed out after {:?}",
                 self.cfg.upload.abort_timeout
             )),
@@ -501,7 +493,7 @@ impl Sink {
         op: impl Future<Output = parquet::errors::Result<()>>,
         watch: &CreationWatch,
         cancel: &CancellationToken,
-        cleanup: &mut Option<Instant>,
+        cleanup: &mut Option<AbortTimer>,
     ) -> Result<()> {
         tokio::pin!(op);
         // The token is polled first: once it has fired, the step is not
@@ -512,7 +504,7 @@ impl Sink {
             () = cancel.cancelled() => {}
             result = &mut op => return result.map_err(Error::from),
         }
-        let deadline = *cleanup.get_or_insert_with(|| self.cleanup_deadline());
+        let deadline = cleanup.get_or_insert_with(|| self.start_cleanup());
         if !watch.creating() {
             return Err(Error::cancelled(None));
         }
@@ -520,7 +512,7 @@ impl Sink {
             biased;
             _ = &mut op => Err(Error::cancelled(None)),
             () = watch.settled() => Err(Error::cancelled(None)),
-            () = (self.clock.sleep_until)(deadline) => Err(Error::cancelled(Some(format!(
+            () = deadline => Err(Error::cancelled(Some(format!(
                 "the write in flight did not finish within {:?}, so a multipart upload \
                  it was creating may be left to the bucket lifecycle rule",
                 self.cfg.upload.abort_timeout
@@ -531,18 +523,20 @@ impl Sink {
     /// The cancellation a table write has just observed at one of its step
     /// boundaries.
     ///
-    /// The cleanup deadline is taken here, where the token is seen, rather
+    /// The cleanup timer is started here, where the token is seen, rather
     /// than after the write has released its merge, so dropping a large
     /// merge is spent out of the abort's allowance instead of postponing
     /// the start of it.
-    pub(super) fn cancelled_here(&self, cleanup: &mut Option<Instant>) -> Error {
-        let _ = cleanup.get_or_insert_with(|| self.cleanup_deadline());
+    pub(super) fn cancelled_here(&self, cleanup: &mut Option<AbortTimer>) -> Error {
+        if cleanup.is_none() {
+            *cleanup = Some(self.start_cleanup());
+        }
         Error::cancelled(None)
     }
 
-    /// The instant the cleanup of a failed or cancelled write must end by.
-    pub(super) fn cleanup_deadline(&self) -> Instant {
-        deadline_after((self.clock.now)(), self.cfg.upload.abort_timeout)
+    /// Start the cleanup allowance of a failed or cancelled write.
+    pub(super) fn start_cleanup(&self) -> AbortTimer {
+        (self.abort_timer)(self.cfg.upload.abort_timeout)
     }
 
     /// Attach the outcome of the cleanup abort to the failure that triggered it.
@@ -569,7 +563,7 @@ impl Sink {
     async fn checkpoint(
         &self,
         cancel: &CancellationToken,
-        cleanup: &mut Option<Instant>,
+        cleanup: &mut Option<AbortTimer>,
     ) -> Result<()> {
         tokio::task::yield_now().await;
         if cancel.is_cancelled() {
@@ -598,7 +592,7 @@ impl Sink {
         keys: &MergeKeysHeld<'_>,
         workspace: &FlushWorkspaceHeld<'_>,
         cancel: &CancellationToken,
-        cleanup: &mut Option<Instant>,
+        cleanup: &mut Option<AbortTimer>,
     ) -> Result<usize> {
         // Step 1: encode the merge keys, one bounded slice at a time.
         while !build.step()? {
@@ -717,7 +711,7 @@ impl Sink {
         // merge's bound for its whole life, so no later chunk is
         // under-charged.
         let keys = self.merge_keys.hold(0);
-        let mut cleanup: Option<Instant> = None;
+        let mut cleanup: Option<AbortTimer> = None;
         let written = self
             .write_chunks(
                 build,
@@ -733,13 +727,13 @@ impl Sink {
         let rows = match written {
             Ok(rows) => rows,
             Err(cause) => {
-                let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
+                let deadline = cleanup.unwrap_or_else(|| self.start_cleanup());
                 let abort_error = self.abort_upload(writer, deadline).await;
                 return Err(Self::with_abort(cause, abort_error));
             }
         };
         if cancel.is_cancelled() {
-            let abort_error = self.abort_upload(writer, self.cleanup_deadline()).await;
+            let abort_error = self.abort_upload(writer, self.start_cleanup()).await;
             return Err(Error::cancelled(abort_error));
         }
 

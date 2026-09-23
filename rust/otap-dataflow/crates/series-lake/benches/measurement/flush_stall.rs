@@ -58,7 +58,7 @@ use otel_arrow_dfe_series_lake::cache::SeriesCache;
 use otel_arrow_dfe_series_lake::error::{Error as LakeError, RefuseReason};
 use otel_arrow_dfe_series_lake::extract::extract;
 use otel_arrow_dfe_series_lake::schema::dataset_schema;
-use otel_arrow_dfe_series_lake::sink::{FileNaming, Sink, SinkClock};
+use otel_arrow_dfe_series_lake::sink::{AbortTimer, FileNaming, Sink};
 use otel_arrow_dfe_series_lake::sort::merge_runs;
 use parquet::arrow::ArrowWriter;
 use serde::Serialize;
@@ -302,20 +302,20 @@ struct Observed {
 }
 
 thread_local! {
-    /// The first reading of the sink's clock in the current write.
+    /// When the sink started its first cleanup timer in the current write.
     static SINK_CLOCK_READ: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// The sink's clock in the probe: the real one, recording its first
-/// reading, which is where the sink acts on a cancellation.
-fn recording_now() -> Instant {
+/// The sink's cleanup timer in the probe: tokio's, recording when the
+/// first one starts, which is where the sink acts on a cancellation.
+fn recording_timer(timeout: Duration) -> AbortTimer {
     let now = Instant::now();
     SINK_CLOCK_READ.with(|read| {
         if read.get().is_none() {
             read.set(Some(now));
         }
     });
-    now
+    Box::pin(tokio::time::sleep_until((now + timeout).into()))
 }
 
 /// The sink's live flush workspace: merge chunk, encoder buffers and the
@@ -337,12 +337,7 @@ fn write_once(
         boot_id: "flushstall".into(),
     };
     SINK_CLOCK_READ.with(|read| read.set(None));
-    let sink = Rc::new(
-        Sink::new(store, cfg.lake.clone(), naming).with_clock(SinkClock {
-            now: recording_now,
-            sleep_until: |at| Box::pin(tokio::time::sleep_until(at.into())),
-        }),
-    );
+    let sink = Rc::new(Sink::new(store, cfg.lake.clone(), naming, recording_timer));
     let local = tokio::task::LocalSet::new();
     local.block_on(runtime, async {
         let cancel = CancellationToken::new();

@@ -313,14 +313,12 @@ impl Worker {
         // of this node, so a simulated clock governs it too.
         let naming = lake::sink::FileNaming::new(&cfg.lake.writer_id);
         let boot_id = naming.boot_id.clone();
-        let sink = Rc::new(
-            lake::sink::Sink::new(store, cfg.lake.clone(), naming).with_clock(
-                lake::sink::SinkClock {
-                    now: clock::now,
-                    sleep_until: clock::sleep_until,
-                },
-            ),
-        );
+        let sink = Rc::new(lake::sink::Sink::new(
+            store,
+            cfg.lake.clone(),
+            naming,
+            |timeout| clock::sleep_until(flush::deadline_at(clock::now(), timeout)),
+        ));
         // One credit per in-flight request in each of the two blocks a window
         // pair can hold. Admission stops one short of it, so the last slot is
         // always free for a force-drained refusal once shutdown is latched.

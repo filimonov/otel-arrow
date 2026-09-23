@@ -241,7 +241,9 @@ async fn round_trip(
     block
         .seal(SEAL_AT_US)
         .map_err(|e| TestCaseError::fail(format!("{e}")))?;
-    let sink = Sink::new(store, cfg.clone(), FileNaming::new("oracle"));
+    let sink = Sink::new(store, cfg.clone(), FileNaming::new("oracle"), |timeout| {
+        Box::pin(tokio::time::sleep(timeout))
+    });
     let report = sink
         .write_block(&block, &CancellationToken::new())
         .await

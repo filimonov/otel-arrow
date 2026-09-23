@@ -40,7 +40,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -137,6 +137,11 @@ fn upload_config() -> LakeConfig {
     cfg.sorting.merge_chunk_bytes = 512 << 10;
     cfg.validate().expect("valid config");
     cfg
+}
+
+/// The cleanup allowance on tokio's clock.
+pub(super) fn tokio_timer(timeout: Duration) -> AbortTimer {
+    Box::pin(tokio::time::sleep(timeout))
 }
 
 fn local(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
@@ -629,7 +634,7 @@ async fn the_sink_reports_the_merge_keys_it_holds() {
         })
         .max()
         .expect("a table");
-    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "keys"));
+    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "keys"), tokio_timer);
     assert_eq!(sink.merge_key_high_water_bytes(), 0);
     let _ = sink
         .write_block(&b, &CancellationToken::new())
@@ -661,7 +666,7 @@ async fn every_row_group_carries_the_native_sorting_columns() {
     cfg.parquet.row_group_bytes = 1;
     cfg.sorting.merge_chunk_bytes = 1;
     let b = sealed_block(&cfg, 30);
-    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "sorted"));
+    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "sorted"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -685,7 +690,7 @@ async fn every_row_group_carries_the_native_sorting_columns() {
     let mut unsorted = LakeConfig::default();
     unsorted.logs.values_sort = Vec::new();
     let b = sealed_block(&unsorted, 30);
-    let sink = Sink::new(local(&dir), unsorted, naming("w", "unsorted"));
+    let sink = Sink::new(local(&dir), unsorted, naming("w", "unsorted"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -715,7 +720,7 @@ async fn every_row_group_carries_the_native_sorting_columns() {
     double.logs.values_sort = vec![key("series_id"), key("latency"), key("time_unix_nano")];
     double.validate().expect("valid double sort");
     let b = sealed_block(&double, 30);
-    let sink = Sink::new(local(&dir), double, naming("w", "double"));
+    let sink = Sink::new(local(&dir), double, naming("w", "double"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -782,7 +787,7 @@ async fn writes_series_before_values_and_reads_back() {
     let dir = tempfile::tempdir().expect("tmp");
     let cfg = LakeConfig::default();
     let b = sealed_block(&cfg, 30);
-    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"));
+    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -881,7 +886,7 @@ async fn metrics_block_writes_series_before_the_merged_values_dataset() {
     b.admit(e, r).expect("admit");
     b.seal(SEAL_AT_US).expect("seal");
 
-    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"));
+    let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -960,7 +965,7 @@ async fn empty_block_writes_no_file() {
     let cfg = LakeConfig::default();
     let mut b = Block::new(WINDOW_START, SEQ, cfg.clone());
     b.seal(SEAL_AT_US).expect("seal");
-    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -980,7 +985,7 @@ async fn write_block_rejects_an_unsealed_block() {
     let cfg = LakeConfig::default();
     let b = Block::new(WINDOW_START, SEQ, cfg.clone());
     assert!(!b.is_sealed());
-    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"), tokio_timer);
     let err = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -999,7 +1004,7 @@ async fn writer_limit_closes_row_groups() {
     cfg.sorting.merge_chunk_bytes = 1;
     cfg.validate().expect("valid config");
     let b = sealed_block(&cfg, 40);
-    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"), tokio_timer);
     let report = sink
         .write_block(&b, &CancellationToken::new())
         .await
@@ -1030,7 +1035,7 @@ async fn cancellation_before_writing_aborts() {
     let dir = tempfile::tempdir().expect("tmp");
     let cfg = LakeConfig::default();
     let b = sealed_block(&cfg, 5);
-    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
+    let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"), tokio_timer);
     let token = CancellationToken::new();
     token.cancel();
     assert!(
@@ -1056,7 +1061,7 @@ async fn cancellation_is_observed_with_an_immediately_ready_store() {
     cfg.validate().expect("valid config");
     let b = sealed_block(&cfg, 200);
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let token = CancellationToken::new();
     let canceller = {
         let token = token.clone();
@@ -1083,7 +1088,7 @@ async fn cancellation_at_a_chunk_boundary() {
         token: token.clone(),
         tripped_multipart: tripped_multipart.clone(),
     });
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let got = sink.write_block(&b, &token).await;
     assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
     assert!(
@@ -1117,7 +1122,7 @@ async fn cancellation_inside_an_upload() {
     });
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let token = CancellationToken::new();
     let canceller = token.clone();
     let waiter = entered.clone();
@@ -1163,7 +1168,7 @@ async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
     });
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let got = sink.write_block(&b, &token).await;
     assert!(got.is_err(), "a cancelled write fails: {got:?}");
     assert!(
@@ -1192,7 +1197,7 @@ async fn write_failure_with_a_failing_abort_reports_both() {
     });
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let got = sink.write_block(&b, &CancellationToken::new()).await;
     let Err(Error::Transient(TransientError::AbortFailed {
         source,
@@ -1216,13 +1221,12 @@ async fn write_failure_with_a_failing_abort_reports_both() {
 }
 
 /// Scenario: a part upload fails and the abort then hangs, with an hour of
-/// `upload.abort_timeout`, on a sink whose injected clock reports every
-/// deadline as already reached.
-/// Guarantees: the abort ends on the injected clock -- at once -- rather
-/// than after an hour of tokio time, so a caller running on a simulated
-/// clock governs the sink's cleanup bound as well.
+/// `upload.abort_timeout`, on a sink whose abort timer completes at once.
+/// Guarantees: the abort ends when the caller's timer does, not after an
+/// hour of tokio time, so a caller running on a simulated clock governs the
+/// sink's cleanup bound.
 #[tokio::test]
-async fn the_abort_is_bounded_on_the_injected_clock() {
+async fn the_abort_is_bounded_by_the_callers_timer() {
     let dir = tempfile::tempdir().expect("tmp");
     let store: Arc<dyn ObjectStore> = Arc::new(ControlledMultipart {
         inner: local(&dir),
@@ -1235,16 +1239,15 @@ async fn the_abort_is_bounded_on_the_injected_clock() {
     let mut cfg = upload_config();
     cfg.upload.abort_timeout = Duration::from_secs(3600);
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg, FileNaming::new("w")).with_clock(SinkClock {
-        now: Instant::now,
-        sleep_until: |_| Box::pin(std::future::ready(())),
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), |_| {
+        Box::pin(std::future::ready(()))
     });
     let got = tokio::time::timeout(
         Duration::from_secs(30),
         sink.write_block(&b, &CancellationToken::new()),
     )
     .await
-    .expect("the abort is bounded by the injected clock, not by tokio time");
+    .expect("the abort is bounded by the caller's timer, not by tokio time");
     let Err(Error::Transient(TransientError::AbortFailed { abort_error, .. })) = got else {
         panic!("expected AbortFailed, got {got:?}");
     };
@@ -1270,7 +1273,7 @@ async fn abort_timeout_is_reported() {
     cfg.upload.abort_timeout = Duration::from_millis(1);
     cfg.validate().expect("valid config");
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let got = sink.write_block(&b, &CancellationToken::new()).await;
     let Err(Error::Transient(TransientError::AbortFailed { abort_error, .. })) = got else {
         panic!("expected AbortFailed, got {got:?}");
@@ -1322,7 +1325,7 @@ async fn the_write_returns_to_the_runtime_between_bounded_slices() {
     let b = sealed_block(&cfg, rows);
     let columns = dataset_schema(Dataset::LogsValues, &cfg).fields().len();
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let done = Arc::new(AtomicBool::new(false));
     let ticks = Arc::new(AtomicUsize::new(0));
     let ticker = {
@@ -1379,7 +1382,7 @@ async fn a_cancellation_during_merge_key_building_stops_the_build() {
         })
         .sum::<usize>();
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let sink = Sink::new(store, cfg, FileNaming::new("w"));
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
     let token = CancellationToken::new();
     let canceller = {
         let token = token.clone();
@@ -1585,7 +1588,7 @@ async fn the_sink_publishes_the_upload_bytes_a_part_in_flight_holds() {
     });
     let cfg = upload_config();
     let b = sealed_upload_block(&cfg);
-    let sink = Sink::new(store, cfg.clone(), FileNaming::new("w"));
+    let sink = Sink::new(store, cfg.clone(), FileNaming::new("w"), tokio_timer);
     assert_eq!(sink.flush_workspace_bytes(), 0);
     let token = CancellationToken::new();
     let write = sink.write_block(&b, &token);
@@ -1618,6 +1621,7 @@ async fn a_step_whose_token_has_fired_is_not_driven_again() {
         Arc::clone(&store),
         LakeConfig::default(),
         FileNaming::new("w"),
+        tokio_timer,
     );
     let watch = CreationWatch::new(store, Arc::new(UploadLedger::default()));
     let cancel = CancellationToken::new();

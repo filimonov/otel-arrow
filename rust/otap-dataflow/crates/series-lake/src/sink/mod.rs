@@ -21,7 +21,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
-use std::time::Instant;
+use std::time::Duration;
 
 /// Files written for one block.
 #[derive(Debug, Default)]
@@ -36,51 +36,37 @@ pub struct Sink {
     store: Arc<dyn ObjectStore>,
     cfg: LakeConfig,
     naming: FileNaming,
-    clock: SinkClock,
+    abort_timer: StartAbortTimer,
     merge_keys: MergeKeys,
     workspace: FlushWorkspace,
 }
 
-/// A sleep future of the sink's clock.
-pub type SinkSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+/// The cleanup allowance of one failed or cancelled write: completes once
+/// `upload.abort_timeout` has passed since it was started.
+pub type AbortTimer = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// The monotonic clock the sink bounds its cleanup with.
+/// Starts an [`AbortTimer`] of the given length on the caller's clock.
 ///
-/// Injectable so a caller that runs on a simulated clock -- the engine's, in
-/// the exporter -- bounds the abort on that same clock rather than on
-/// wall-clock tokio time a test cannot advance.
-#[derive(Clone, Copy)]
-pub struct SinkClock {
-    /// The current instant.
-    pub now: fn() -> Instant,
-    /// A future that completes at the given instant.
-    pub sleep_until: fn(Instant) -> SinkSleep,
-}
-
-impl Default for SinkClock {
-    fn default() -> Self {
-        Self {
-            now: Instant::now,
-            sleep_until: |at| Box::pin(tokio::time::sleep_until(at.into())),
-        }
-    }
-}
-
-impl std::fmt::Debug for SinkClock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SinkClock")
-    }
-}
+/// The sink starts one where it first sees a write fail or be cancelled and
+/// bounds the rest of that write's cleanup by it, so the caller's clock, a
+/// simulated one included, is the only clock the sink waits on.
+pub type StartAbortTimer = fn(Duration) -> AbortTimer;
 
 impl Sink {
-    /// New sink.
+    /// New sink, bounding the cleanup of a failed or cancelled write with
+    /// timers from `abort_timer`.
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, cfg: LakeConfig, naming: FileNaming) -> Self {
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        cfg: LakeConfig,
+        naming: FileNaming,
+        abort_timer: StartAbortTimer,
+    ) -> Self {
         Self {
             store,
             cfg,
             naming,
-            clock: SinkClock::default(),
+            abort_timer,
             merge_keys: MergeKeys::default(),
             workspace: FlushWorkspace::default(),
         }
@@ -123,11 +109,5 @@ impl Sink {
     pub fn flush_workspace_high_water_bytes(&self) -> usize {
         let _ = self.workspace.bytes();
         self.workspace.high_water.load(AtomicOrdering::Relaxed)
-    }
-
-    /// The same sink, bounding its cleanup on `clock` instead of tokio time.
-    #[must_use]
-    pub fn with_clock(self, clock: SinkClock) -> Self {
-        Self { clock, ..self }
     }
 }
