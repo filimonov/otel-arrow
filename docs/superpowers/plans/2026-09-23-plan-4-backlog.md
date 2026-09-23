@@ -95,3 +95,14 @@ Source and triage: docs/superpowers/complexity-review-2026-09-24.md.
 - One config form: lake sections equal the user sections, `Error::Config` in lake, delete the exporter mirror structs and the duplicated validation rules (deslop B9).
 - Sink write stack: merge `PutLanded` into `PartLanded`; one gauge type with a drop guard for merge keys and flush workspace; drop the `ParquetObjectWriter` layer if the shared writer keeps this stack.
 - `Outcome` with `derive(AttributeEnum)` and `Outcome::ALL` instead of the hand table.
+
+## Data-model coverage gaps (user note, 2026-09-24)
+
+What the OTAP and OTLP models carry and series_parquet does not keep. The exporter README section "What this exporter does not keep" is the user-facing list; this is the work list. Each item is a format change unless marked otherwise, so it belongs with format batch 2 or a later format revision.
+
+- Signals: traces (OTAP Spans, SpanAttrs, SpanEvents, SpanLinks and their attributes; the plain parquet exporter writes them; today a trace request is refused as a whole). Profiles are not in the OTAP model at all, so they wait for the engine.
+- Metric point kinds: exponential histograms and summaries (the engine carries ExpHistogramDataPoints and SummaryDataPoints with attributes; today dropped and counted, `unsupported: drop` becomes the default in slice S8); exemplars for number and histogram points with their filtered attributes, trace_id and span_id (six OTAP payload types; today dropped and counted by default); multivariate metrics (payload type 25, never read); metric-level attributes (MetricAttrs, never read or validated: at least validate them now, not a format change).
+- Fields not stored: `dropped_attributes_count` on resource, scope, log record and point; arrival order among equal sort keys (by design; say so in FORMAT.md).
+- Typing the format flattens: attribute value types in `attrs`, `resource_attrs`, `scope_attrs` (all rendered to Map<string,string>: 42 and "42" collide, bytes become base64, nested values JSON text; types survive only in identity bytes, series_id and typed denormalize columns); non-string log bodies rendered as JSON text (the `body_bytes` column is already deferred to the next format version); histogram sum/min/max that are zero in every point of a request arrive as absent OTAP columns and are stored as null (a transport limit the format could compensate for with a presence flag); zero or out-of-range timestamps stored as null.
+- Layout: number and histogram points share one values dataset, so half the rows of a mixed stream hold null in value_* and the other half in count/sum/min/max, which weakens Parquet statistics; consider per-kind datasets or row groups with the compactor.
+- To check before deciding: span-like `flags` handling and out-of-range severity numbers in logs (the standard OTAP log columns are all present).
