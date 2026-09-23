@@ -411,6 +411,22 @@ fn write_once(
     })
 }
 
+/// Remove one write's store directory, retrying for a moment.
+///
+/// A cancelled write may leave a part being written on the runtime's
+/// blocking pool, which can create a staging file while the directory is
+/// being removed; the next write uses a directory of its own, so a leftover
+/// is harmless and never fails the probe.
+fn remove_scratch(dir: &std::path::Path) {
+    for _ in 0..50 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
 /// The `q` quantile of sorted durations.
 fn quantile(sorted: &[Duration], q: f64) -> Duration {
     if sorted.is_empty() {
@@ -533,7 +549,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
                 });
             }
         }
-        std::fs::remove_dir_all(&dir)?;
+        remove_scratch(&dir);
         let mut sorted = observed.gaps.clone();
         sorted.sort();
         let gaps_at_least = GAP_THRESHOLDS_MS
@@ -568,7 +584,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
         let signal_after = median_wall.mul_f64(fraction);
         let (store, dir) = fresh_store(format!("cancel-{index}"))?;
         let observed = write_once(&runtime, &block, cfg, store, Some(signal_after));
-        std::fs::remove_dir_all(&dir)?;
+        remove_scratch(&dir);
         let signal = observed.started + signal_after;
         let cancelled = observed.result.is_err();
         if let Err(error) = &observed.result
@@ -599,7 +615,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
             cancelled,
         });
     }
-    let _ = std::fs::remove_dir_all(&scratch);
+    remove_scratch(&scratch);
     let max_gap_ns = writes.iter().map(|w| w.max_gap_ns).max().unwrap_or(0);
     let max_observe_latency_ns = cancels
         .iter()
