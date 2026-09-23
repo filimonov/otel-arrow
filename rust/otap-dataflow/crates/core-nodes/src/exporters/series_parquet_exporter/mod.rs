@@ -117,11 +117,8 @@ pub struct SeriesParquet {
     /// Cores the engine runs this pipeline on: one worker, and one memory
     /// budget, per core.
     num_cores: usize,
-    /// Object store injected in place of the one the configuration names.
-    ///
-    /// The only seam a test uses to drive the real [`Exporter::start`] entry
-    /// point: everything else about the node -- the inbox, the select loop,
-    /// the worker and its flush tasks -- is the production path.
+    /// Object store a test drives [`Exporter::start`] with instead of the
+    /// configured one.
     #[cfg(test)]
     store_override: Option<Arc<dyn object_store::ObjectStore>>,
 }

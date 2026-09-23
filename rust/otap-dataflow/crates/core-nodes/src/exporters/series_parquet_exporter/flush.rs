@@ -472,11 +472,7 @@ impl FlushJob {
         self.result_rx.try_recv().ok()
     }
 
-    /// Whether the supervising task has already returned.
-    ///
-    /// A test observation only: the task publishes its decision immediately
-    /// before it returns, so this is how a test waits for a result to be ready
-    /// without consuming it.
+    /// Whether the supervising task has returned, for a test to wait on.
     #[cfg(test)]
     pub(super) fn task_finished(&self) -> bool {
         self.handle.is_finished()

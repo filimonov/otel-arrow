@@ -260,13 +260,8 @@ pub(super) struct Worker {
     last_attempt: Option<std::time::Duration>,
     /// Largest completion token the worker has held, for capacity reporting.
     pub(super) token_high_water: usize,
-    /// How many times the worker has scanned its state for telemetry.
-    ///
-    /// The scan walks both token vectors and the notification queue, so it is
-    /// linear in the number of live requests; a node that sampled it once per
-    /// loop turn would spend quadratic time per block. This counter exists so
-    /// a regression test can assert the scan happens only when telemetry is
-    /// actually collected.
+    /// Telemetry scans taken, which a test pins to collections.
+    #[cfg(test)]
     pub(super) samples: u64,
     /// Rate limit of the per-request refusal WARN.
     refusals: RefusalLog,
@@ -342,6 +337,7 @@ impl Worker {
             reason: FlushReason::Time,
             last_attempt: None,
             token_high_water: size_of::<AckToken>(),
+            #[cfg(test)]
             samples: 0,
             refusals: RefusalLog::default(),
             admission: AdmissionGate::default(),
@@ -1055,7 +1051,10 @@ impl Worker {
         if self.metrics.is_none() {
             return;
         }
-        self.samples += 1;
+        #[cfg(test)]
+        {
+            self.samples += 1;
+        }
         // Both slot holders are the one FLUSHING block: a decided block is
         // still accounted for until its supervising task has released it.
         let flushing = self
