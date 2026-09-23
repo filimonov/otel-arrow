@@ -520,10 +520,7 @@ pub fn encode_chunks(
 }
 
 /// Every non-empty table of a sealed block, as the sink merges it.
-fn merged_tables<T>(
-    block: &Block<T>,
-    cfg: &LakeConfig,
-) -> Result<Vec<(Dataset, Vec<RecordBatch>)>> {
+fn merged_tables(block: &Block, cfg: &LakeConfig) -> Result<Vec<(Dataset, Vec<RecordBatch>)>> {
     let mut tables = Vec::new();
     for table in block.tables().filter(|table| !table.is_empty()) {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
@@ -580,8 +577,8 @@ fn read_parquet(
 /// # Errors
 /// Propagates sink, store and decoding failures; differences are reported,
 /// not raised.
-pub fn sink_equivalence<T>(
-    block: &Block<T>,
+pub fn sink_equivalence(
+    block: &Block,
     cfg: &LakeConfig,
     runtime: &tokio::runtime::Runtime,
     scratch: &FsPath,
@@ -808,17 +805,17 @@ fn admit_all(
     extracted: Vec<Extracted>,
     cache: &mut SeriesCache,
     cfg: &BenchConfig,
-) -> Result<Block<()>> {
-    let mut block: Block<()> = Block::new(cfg.window_start_secs, SEQ, &cfg.lake);
+) -> Result<Block> {
+    let mut block = Block::new(cfg.window_start_secs, SEQ, cfg.lake.clone());
     for request in extracted {
-        let reservation = block.reserve(&request, cache, TOKEN_BYTES, &cfg.lake)?;
-        block.admit(request, reservation, ())?;
+        let reservation = block.reserve(&request, cache, TOKEN_BYTES)?;
+        block.admit(request, reservation)?;
     }
     Ok(block)
 }
 
 /// Merge every table of a sealed block, keeping at most one chunk alive.
-fn merge_consume<T>(block: &Block<T>, cfg: &LakeConfig) -> Result<(usize, usize)> {
+fn merge_consume(block: &Block, cfg: &LakeConfig) -> Result<(usize, usize)> {
     let mut values_rows = 0usize;
     let mut series_rows = 0usize;
     for table in block.tables().filter(|table| !table.is_empty()) {
@@ -836,8 +833,8 @@ fn merge_consume<T>(block: &Block<T>, cfg: &LakeConfig) -> Result<(usize, usize)
 }
 
 /// Merge and encode every table of a sealed block, streaming the chunks.
-fn encode_block<T>(
-    block: &Block<T>,
+fn encode_block(
+    block: &Block,
     cfg: &LakeConfig,
     compression: Compression,
 ) -> Result<Vec<(Dataset, Vec<u8>)>> {
@@ -859,7 +856,7 @@ fn encode_block<T>(
 }
 
 /// Rows of the values tables and of the series tables of a block.
-fn block_rows<T>(block: &Block<T>) -> (usize, usize) {
+fn block_rows(block: &Block) -> (usize, usize) {
     let mut values = 0usize;
     let mut series = 0usize;
     for table in block.tables() {
@@ -979,10 +976,7 @@ pub enum Retained {
     /// Extracted requests.
     Extracted(Vec<Extracted>),
     /// A sealed block and the cache's hit and miss counts.
-    Block(
-        Box<Block<()>>,
-        otel_arrow_dfe_series_lake::cache::CacheStats,
-    ),
+    Block(Box<Block>, otel_arrow_dfe_series_lake::cache::CacheStats),
     /// A consumed merge: values and series rows.
     Merged(usize, usize),
     /// Encoded Parquet files and what the writer observed.
@@ -1071,7 +1065,7 @@ pub struct Stage {
     /// Series marked committed before each admission.
     committed: Vec<SeriesId>,
     /// The sealed block of the block-level stages.
-    block: Option<Block<()>>,
+    block: Option<Block>,
     /// Merged chunks of the encoder stage.
     chunks: Vec<(Dataset, Vec<RecordBatch>)>,
     /// Pre-encoded bytes of the persistence stages.
@@ -1292,7 +1286,7 @@ impl Stage {
     }
 
     /// A freshly sealed block of the whole input.
-    fn sealed_block(&self) -> Result<Block<()>> {
+    fn sealed_block(&self) -> Result<Block> {
         let extracted = convert_extract(self.wire(), &self.cfg.lake)?;
         let mut cache = self.warm_cache();
         let mut block = admit_all(extracted, &mut cache, &self.cfg)?;
@@ -1876,7 +1870,7 @@ impl Stage {
     /// until its merge iterator is dropped, so the largest table's keys are
     /// the peak this term adds to a flush; the sum is what the whole block
     /// would add if every table were merged at once.
-    fn record_merge_keys(&mut self, block: &Block<()>) -> Result<()> {
+    fn record_merge_keys(&mut self, block: &Block) -> Result<()> {
         let mut tables = Vec::new();
         let mut total_keys = 0usize;
         let mut total_pinned = 0usize;
@@ -1982,7 +1976,7 @@ impl Stage {
         Ok(())
     }
 
-    fn record_merged_bytes(&mut self, block: &Block<()>) -> Result<()> {
+    fn record_merged_bytes(&mut self, block: &Block) -> Result<()> {
         let mut seen = CountedAllocations::default();
         let mut bytes = 0usize;
         let mut largest = 0usize;
@@ -2044,7 +2038,7 @@ fn row_strings(batch: &RecordBatch) -> Result<Vec<String>> {
 /// Verify a full merge of every table once, outside every timer: each
 /// chunk and each chunk boundary is in order, and the output is exactly
 /// the input's row multiset.
-fn verify_merge<T>(block: &Block<T>, cfg: &LakeConfig) -> Result<Vec<Check>> {
+fn verify_merge(block: &Block, cfg: &LakeConfig) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
     for table in block.tables().filter(|table| !table.is_empty()) {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();

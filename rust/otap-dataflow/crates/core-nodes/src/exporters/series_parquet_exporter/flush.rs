@@ -81,7 +81,7 @@ pub(super) struct FlushDone {
     /// Shared rather than moved, because the supervising task may still be
     /// unwinding a cancelled attempt over the same block when the decision is
     /// published.
-    pub(super) data: Rc<lake::buffer::Block<()>>,
+    pub(super) data: Rc<lake::buffer::Block>,
     /// What the sink returned.
     pub(super) result: lake::Result<lake::sink::FlushReport>,
     /// Write attempts this flush made, including the one that resolved it.
@@ -174,7 +174,7 @@ fn contains_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool
 /// dropped whether or not it cooperated.
 async fn write_until(
     sink: Rc<lake::sink::Sink>,
-    data: Rc<lake::buffer::Block<()>>,
+    data: Rc<lake::buffer::Block>,
     cancel: CancellationToken,
     deadline: Instant,
     abort_timeout: Duration,
@@ -386,7 +386,7 @@ impl FlushJob {
     /// retry deadline is absolute from this point, so a destination that fails
     /// slowly cannot extend it.
     pub(super) fn new(
-        data: lake::buffer::Block<()>,
+        data: lake::buffer::Block,
         tokens: Vec<AckToken>,
         sink: Rc<lake::sink::Sink>,
         emitted: [u64; 3],

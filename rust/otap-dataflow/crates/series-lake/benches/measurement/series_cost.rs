@@ -167,14 +167,14 @@ pub fn series_cost(
         .sum();
     let values_extracted = extracted.pinned_bytes;
     let mut cache = SeriesCache::new(series.max(1) * 2);
-    let mut block: Block<()> = Block::new(1_789_960_500, 1, &cfg);
+    let mut block = Block::new(1_789_960_500, 1, cfg.clone());
     let before_reserve = heap();
-    let reservation = block.reserve(&extracted, &mut cache, 0, &cfg)?;
+    let reservation = block.reserve(&extracted, &mut cache, 0)?;
     let reserved = reservation.bytes;
     let after_reserve = heap();
-    block.admit(extracted, reservation, ())?;
+    block.admit(extracted, reservation)?;
     let after_admit = heap();
-    let pinned_of = |block: &Block<()>, want_series: bool| {
+    let pinned_of = |block: &Block, want_series: bool| {
         let mut seen = CountedAllocations::default();
         block
             .tables()

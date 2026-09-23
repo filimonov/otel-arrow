@@ -228,14 +228,14 @@ async fn round_trip(
             .map_err(|e| TestCaseError::fail(e.to_string()))?,
     );
     let mut cache = SeriesCache::new(10_000);
-    let mut block: Block<usize> = Block::new(WINDOW_START, 1, cfg);
-    for (i, mut records) in requests.into_iter().enumerate() {
+    let mut block = Block::new(WINDOW_START, 1, cfg.clone());
+    for mut records in requests {
         let e = extract(&mut records, cfg).map_err(|e| TestCaseError::fail(format!("{e}")))?;
         let r = block
-            .reserve(&e, &mut cache, 8, cfg)
+            .reserve(&e, &mut cache, 8)
             .map_err(|e| TestCaseError::fail(format!("{e}")))?;
         block
-            .admit(e, r, i)
+            .admit(e, r)
             .map_err(|e| TestCaseError::fail(format!("{e}")))?;
     }
     block

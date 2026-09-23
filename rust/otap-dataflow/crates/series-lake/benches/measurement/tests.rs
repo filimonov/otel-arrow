@@ -229,9 +229,9 @@ fn fixture_inputs(root: &Path) -> Result<Vec<Input>> {
 }
 
 /// A sealed block of one fixture, built through the production path.
-fn sealed(input: &Input, cfg: &LakeConfig) -> Result<Block<()>> {
+fn sealed(input: &Input, cfg: &LakeConfig) -> Result<Block> {
     let mut cache = SeriesCache::new(1000);
-    let mut block: Block<()> = Block::new(WINDOW_START, 1, cfg);
+    let mut block = Block::new(WINDOW_START, 1, cfg.clone());
     for bytes in &input.requests {
         let wire = match input.sidecar.signal {
             Signal::Logs => OtlpProtoBytes::ExportLogsRequest(bytes.clone()),
@@ -240,8 +240,8 @@ fn sealed(input: &Input, cfg: &LakeConfig) -> Result<Block<()>> {
         let payload: OtapPayload = wire.into();
         let mut records: OtapArrowRecords = payload.try_into_with_default()?;
         let extracted = extract(&mut records, cfg)?;
-        let reservation = block.reserve(&extracted, &mut cache, 0, cfg)?;
-        block.admit(extracted, reservation, ())?;
+        let reservation = block.reserve(&extracted, &mut cache, 0)?;
+        block.admit(extracted, reservation)?;
     }
     block.seal(SEAL_AT_US)?;
     Ok(block)

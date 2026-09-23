@@ -218,8 +218,8 @@ pub struct Args {
 }
 
 /// Build the largest block the input and the configuration allow.
-fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block<()>, BlockShape)> {
-    let mut block: Block<()> = Block::new(cfg.window_start_secs, 1, &cfg.lake);
+fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block, BlockShape)> {
+    let mut block = Block::new(cfg.window_start_secs, 1, cfg.lake.clone());
     let mut cache = SeriesCache::new(cfg.cache_entries);
     let mut requests = 0usize;
     let mut refused_as_full = false;
@@ -232,9 +232,9 @@ fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block<()>, BlockShap
         let mut records: OtapArrowRecords = payload.try_into_with_default()?;
         let extracted = extract(&mut records, &cfg.lake)?;
         drop(records);
-        match block.reserve(&extracted, &mut cache, TOKEN_BYTES, &cfg.lake) {
+        match block.reserve(&extracted, &mut cache, TOKEN_BYTES) {
             Ok(reservation) => {
-                block.admit(extracted, reservation, ())?;
+                block.admit(extracted, reservation)?;
                 requests += 1;
             }
             Err(LakeError::Refused(RefuseReason::BlockFull)) => {
@@ -326,7 +326,7 @@ fn workspace_of(sink: &Sink) -> Option<usize> {
 /// Write `block` once, with the ticker beside it.
 fn write_once(
     runtime: &tokio::runtime::Runtime,
-    block: &Block<()>,
+    block: &Block,
     cfg: &BenchConfig,
     store: Arc<dyn ObjectStore>,
     signal_after: Option<Duration>,
@@ -455,7 +455,7 @@ fn objects(
 }
 
 /// Time the synchronous steps of writing every table of `block`.
-fn phases(block: &Block<()>, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
+fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
     let mut out = Vec::new();
     for table in block.tables().filter(|table| !table.is_empty()) {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();

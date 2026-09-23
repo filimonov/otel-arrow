@@ -58,6 +58,7 @@ use super::window::Window;
 use lake::buffer::Block;
 use lake::cache::SeriesCache;
 use lake::clock::{WallClock, nanos_to_micros, nanos_to_secs};
+use lake::config::LakeConfig;
 use lake::extract::Extracted;
 use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting;
@@ -169,11 +170,11 @@ impl AdmissionGate {
 
 /// A block together with the completions of every request admitted to it.
 ///
-/// The block itself carries `()` per request: the completions are kept beside
+/// The block itself only counts its requests: the completions are kept beside
 /// it so a flush task can own the data without owning the routing contexts.
 pub(super) struct OwnedBlock {
     /// Rows, descriptors and accounting.
-    pub(super) data: Block<()>,
+    pub(super) data: Block,
     /// One completion per admitted request, in admission order.
     pub(super) tokens: Vec<AckToken>,
     /// Whether this block must repeat descriptors the cache already reports
@@ -223,6 +224,8 @@ pub(super) enum Prepared {
 pub(super) struct Worker {
     /// Validated user configuration.
     pub(super) cfg: Config,
+    /// The lake configuration every block of this worker is opened under.
+    lake_cfg: Arc<LakeConfig>,
     /// The one block open for admission.
     pub(super) active: OwnedBlock,
     /// The one block being written, if any.
@@ -299,8 +302,9 @@ impl Worker {
         effects: EffectHandler<OtapPdata>,
     ) -> Self {
         let window = Window::new(cfg.window.interval, Arc::clone(&wall));
+        let lake_cfg = Arc::new(cfg.lake.clone());
         let active = OwnedBlock {
-            data: Block::new(window.clock.last_boundary(), 0, &cfg.lake),
+            data: Block::new(window.clock.last_boundary(), 0, Arc::clone(&lake_cfg)),
             tokens: Vec::new(),
             reemit: false,
             emitted: [0; 3],
@@ -324,6 +328,7 @@ impl Worker {
         let cache = SeriesCache::new(cfg.cache_entries);
         Self {
             cfg,
+            lake_cfg,
             active,
             flushing: None,
             cleaning: None,
@@ -530,7 +535,6 @@ impl Worker {
             &pending.extracted,
             &mut self.cache,
             token_bytes,
-            &self.cfg.lake,
             self.active.reemit,
         ) {
             Ok(reservation) => reservation,
@@ -576,7 +580,7 @@ impl Worker {
             };
             emitted[position] += 1;
         }
-        match self.active.data.admit(pending.extracted, reservation, ()) {
+        match self.active.data.admit(pending.extracted, reservation) {
             Ok(()) => {
                 self.active.tokens.push(pending.token);
                 for (total, count) in self.active.emitted.iter_mut().zip(emitted) {
@@ -590,7 +594,8 @@ impl Worker {
                 if self.active.data.bytes >= self.cfg.window.max_block_bytes {
                     self.reason = FlushReason::Bytes;
                     self.rotation_requested = true;
-                } else if self.active.tokens.len() >= self.cfg.window.max_requests_per_block {
+                } else if self.active.data.request_count() >= self.cfg.window.max_requests_per_block
+                {
                     self.reason = FlushReason::Requests;
                     self.rotation_requested = true;
                 }
@@ -699,7 +704,7 @@ impl Worker {
             && (matches!(self.reason, FlushReason::Bytes | FlushReason::Requests)
                 || (self.reason == FlushReason::Time && self.window.floored));
         OwnedBlock {
-            data: Block::new(start, seq, &self.cfg.lake),
+            data: Block::new(start, seq, Arc::clone(&self.lake_cfg)),
             tokens: Vec::new(),
             reemit,
             emitted: [0; 3],

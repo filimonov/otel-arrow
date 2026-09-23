@@ -275,7 +275,11 @@ pub struct Reservation {
 }
 
 /// One ACTIVE or FLUSHING block.
-pub struct Block<T> {
+///
+/// The block counts the requests admitted to it and nothing more: the
+/// completions they are owed are held by the caller, beside the block, so a
+/// flush can own the rows without owning the routing contexts.
+pub struct Block {
     /// Window start (Unix seconds).
     pub window_start_secs: i64,
     /// Destination partition.
@@ -287,17 +291,19 @@ pub struct Block<T> {
     pub pending_series: HashSet<SeriesId>,
     /// Accounted bytes: an upper bound while filling, exact after `seal`.
     pub bytes: usize,
-    /// Request tokens.
-    pub requests: Vec<T>,
+    /// Requests admitted.
+    requests: usize,
     token_bytes: usize,
     emitted_at_us: Option<i64>,
-    cfg: LakeConfig,
+    /// The configuration the block was opened under, shared with every other
+    /// block of the same writer; its limits decide every reservation.
+    cfg: Arc<LakeConfig>,
 }
 
-impl<T> Block<T> {
+impl Block {
     /// New empty block for a window.
     #[must_use]
-    pub fn new(window_start_secs: i64, seq: u64, cfg: &LakeConfig) -> Self {
+    pub fn new(window_start_secs: i64, seq: u64, cfg: impl Into<Arc<LakeConfig>>) -> Self {
         Self {
             window_start_secs,
             partition: PartitionId::from_unix_secs(window_start_secs),
@@ -305,10 +311,10 @@ impl<T> Block<T> {
             tables: BTreeMap::new(),
             pending_series: HashSet::new(),
             bytes: 0,
-            requests: Vec::new(),
+            requests: 0,
             token_bytes: 0,
             emitted_at_us: None,
-            cfg: cfg.clone(),
+            cfg: cfg.into(),
         }
     }
 
@@ -349,9 +355,8 @@ impl<T> Block<T> {
         extracted: &Extracted,
         cache: &mut SeriesCache,
         token_bytes: usize,
-        cfg: &LakeConfig,
     ) -> Result<Reservation> {
-        self.reserve_with_reemit(extracted, cache, token_bytes, cfg, false)
+        self.reserve_with_reemit(extracted, cache, token_bytes, false)
     }
 
     /// Compute what admitting `extracted` would add, optionally repeating every
@@ -376,10 +381,9 @@ impl<T> Block<T> {
         extracted: &Extracted,
         cache: &mut SeriesCache,
         token_bytes: usize,
-        cfg: &LakeConfig,
         reemit: bool,
     ) -> Result<Reservation> {
-        let limits = &cfg.ingress;
+        let limits = &self.cfg.ingress;
         let fixed = extracted.pinned_bytes.saturating_add(token_bytes);
         let worst = extracted
             .descriptors
@@ -402,7 +406,7 @@ impl<T> Block<T> {
                 bytes += d.series_row_bytes() + limits.pending_series_entry_bytes;
             }
         }
-        if self.requests.len() >= limits.max_requests_per_block {
+        if self.requests >= limits.max_requests_per_block {
             return Err(Error::Refused(RefuseReason::TooManyRequests));
         }
         if self.bytes + bytes > limits.max_block_bytes {
@@ -439,12 +443,7 @@ impl<T> Block<T> {
     /// # Errors
     /// Refuses a sealed block, and propagates a series-construction or run
     /// sorting failure.
-    pub fn admit(
-        &mut self,
-        extracted: Extracted,
-        reservation: Reservation,
-        token: T,
-    ) -> Result<()> {
+    pub fn admit(&mut self, extracted: Extracted, reservation: Reservation) -> Result<()> {
         if self.is_sealed() {
             return Err(Error::internal("block already sealed"));
         }
@@ -498,7 +497,7 @@ impl<T> Block<T> {
         }
         self.bytes += reservation.bytes;
         self.token_bytes += reservation.token_bytes;
-        self.requests.push(token);
+        self.requests += 1;
         Ok(())
     }
 
@@ -612,28 +611,7 @@ impl<T> Block<T> {
     /// Number of admitted requests.
     #[must_use]
     pub fn request_count(&self) -> usize {
-        self.requests.len()
-    }
-
-    /// Take apart a successfully sealed block after its flush result.
-    ///
-    /// The series rows of an unsealed block still carry their placeholder
-    /// `emitted_at` of zero. The sink always seals before it flushes and only
-    /// takes the block apart once the flush has resolved, so the debug assertion
-    /// below catches a caller that has stepped outside that order.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<T>,
-        HashSet<SeriesId>,
-        BTreeMap<Dataset, SortedTableBuffer>,
-    ) {
-        debug_assert!(
-            self.is_sealed(),
-            "into_parts requires a successfully sealed block"
-        );
-        (self.requests, self.pending_series, self.tables)
+        self.requests
     }
 }
 
@@ -702,11 +680,11 @@ mod tests {
         cfg.sorting.run_target_bytes = 64 * 1024;
         cfg.ingress.max_row_bytes = 16 * 1024;
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         for i in 0..64 {
             let e = extracted(&cfg, &format!("host-{i:03}"), 1);
-            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
-            block.admit(e, r, ()).expect("admit");
+            let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let table = block
             .tables()
@@ -735,11 +713,11 @@ mod tests {
     fn seal_peak_retained_bytes_only_adds_timestamp_values() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         for i in 0..32 {
             let e = extracted(&cfg, &format!("{}-{i}", "x".repeat(4096)), 1);
-            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
-            block.admit(e, r, ()).expect("admit");
+            let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let table = block.tables.get_mut(&Dataset::LogsSeries).expect("series");
         let last = table.runs.pop().expect("last run");
@@ -784,9 +762,12 @@ mod tests {
             }
         }
         assert!(block.is_sealed());
-        let (_, ids, tables) = block.into_parts();
-        assert_eq!(ids.len(), rows);
-        assert_eq!(tables[&Dataset::LogsSeries].rows(), rows);
+        assert_eq!(block.pending_series.len(), rows);
+        let series = block
+            .tables()
+            .find(|t| t.dataset() == Dataset::LogsSeries)
+            .expect("the series table");
+        assert_eq!(series.rows(), rows);
     }
 
     /// Scenario: two requests whose values batches each stay under the run
@@ -800,11 +781,11 @@ mod tests {
     fn values_batches_pack_across_requests_until_the_run_target() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         for host in ["a", "b"] {
             let e = extracted(&cfg, host, 4);
-            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
-            block.admit(e, r, ()).expect("admit");
+            let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let values = &block.tables[&Dataset::LogsValues];
         assert!(
@@ -833,11 +814,11 @@ mod tests {
         let mut tight = LakeConfig::default();
         tight.sorting.run_target_bytes = 1;
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<()> = Block::new(0, 1, &tight);
+        let mut block = Block::new(0, 1, tight.clone());
         for host in ["a", "b"] {
             let e = extracted(&tight, host, 1);
-            let r = block.reserve(&e, &mut cache, 0, &tight).expect("reserve");
-            block.admit(e, r, ()).expect("admit");
+            let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let values = &block.tables[&Dataset::LogsValues];
         assert_eq!(
@@ -865,9 +846,9 @@ mod tests {
         let mut e = extracted(&cfg, "host", 1);
         e.descriptors[0].denorm.clear();
         let mut cache = SeriesCache::new(10);
-        let mut block: Block<()> = Block::new(0, 1, &cfg);
-        let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
-        assert!(block.admit(e, r, ()).is_err());
+        let mut block = Block::new(0, 1, cfg.clone());
+        let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+        assert!(block.admit(e, r).is_err());
         assert!(block.is_empty());
         assert!(!block.is_sealed());
         assert_eq!(block.request_count(), 0);
@@ -879,16 +860,16 @@ mod tests {
     fn reserve_emits_descriptor_once_per_block_and_partition() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         let e1 = extracted(&cfg, "h", 2);
-        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("reserve 1");
+        let r1 = block.reserve(&e1, &mut cache, 16).expect("reserve 1");
         assert_eq!(r1.new_series, vec![0]);
         assert!(r1.bytes > 16);
-        block.admit(e1, r1, 1).expect("admit");
+        block.admit(e1, r1).expect("admit");
         let e2 = extracted(&cfg, "h", 1);
-        let r2 = block.reserve(&e2, &mut cache, 16, &cfg).expect("reserve 2");
+        let r2 = block.reserve(&e2, &mut cache, 16).expect("reserve 2");
         assert!(r2.new_series.is_empty());
-        block.admit(e2, r2, 2).expect("admit");
+        block.admit(e2, r2).expect("admit");
         assert_eq!(block.request_count(), 2);
         assert_eq!(block.pending_series.len(), 1);
         block.seal(SEAL_AT_US).expect("seal");
@@ -901,18 +882,18 @@ mod tests {
         for id in &block.pending_series {
             cache.mark_committed(*id, block.partition);
         }
-        let next: Block<u32> = Block::new(0, 2, &cfg);
+        let next = Block::new(0, 2, cfg.clone());
         let e3 = extracted(&cfg, "h", 1);
         assert!(
-            next.reserve(&e3, &mut cache, 16, &cfg)
+            next.reserve(&e3, &mut cache, 16)
                 .expect("reserve 3")
                 .new_series
                 .is_empty()
         );
-        let other: Block<u32> = Block::new(3600, 3, &cfg); // next hour
+        let other = Block::new(3600, 3, cfg.clone()); // next hour
         assert_eq!(
             other
-                .reserve(&e3, &mut cache, 16, &cfg)
+                .reserve(&e3, &mut cache, 16)
                 .expect("reserve 4")
                 .new_series,
             vec![0]
@@ -927,11 +908,11 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<()> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         for host in ["first", "second"] {
             let e = extracted(&cfg, host, 1);
-            let r = block.reserve(&e, &mut cache, 0, &cfg).expect("reserve");
-            block.admit(e, r, ()).expect("admit");
+            let r = block.reserve(&e, &mut cache, 0).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let table = block.tables.get_mut(&Dataset::LogsSeries).expect("table");
         let good = table.runs[1].clone();
@@ -975,10 +956,10 @@ mod tests {
     fn emitted_at_is_stamped_at_seal_and_frozen() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         let e = extracted(&cfg, "h", 2);
-        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
-        block.admit(e, r, 1).expect("admit");
+        let r = block.reserve(&e, &mut cache, 16).expect("reserve");
+        block.admit(e, r).expect("admit");
         block.seal(SEAL_AT_US).expect("seal");
         block.seal(SEAL_AT_US + 5_000_000).expect("re-seal");
         assert_eq!(block.emitted_at_us(), Some(SEAL_AT_US));
@@ -999,10 +980,10 @@ mod tests {
         let mut cfg = LakeConfig::default();
         cfg.ingress.max_block_bytes = 1;
         let mut cache = SeriesCache::new(100);
-        let block: Block<u32> = Block::new(0, 1, &cfg);
+        let block = Block::new(0, 1, cfg.clone());
         let e = extracted(&LakeConfig::default(), "h", 4);
         assert!(matches!(
-            block.reserve(&e, &mut cache, 16, &cfg),
+            block.reserve(&e, &mut cache, 16),
             Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
         assert_eq!(block.bytes, 0);
@@ -1035,7 +1016,7 @@ mod tests {
         for (limit, admitted) in [(worst - 1, false), (worst, true)] {
             let mut tight = cfg.clone();
             tight.ingress.max_block_bytes = limit;
-            let block: Block<u32> = Block::new(0, 1, &tight);
+            let block = Block::new(0, 1, tight.clone());
             for reemit in [false, true] {
                 let mut cold = SeriesCache::new(100);
                 let mut warm = SeriesCache::new(100);
@@ -1043,7 +1024,7 @@ mod tests {
                     warm.mark_committed(d.series_id, block.partition);
                 }
                 for cache in [&mut cold, &mut warm] {
-                    let outcome = block.reserve_with_reemit(&e, cache, token, &tight, reemit);
+                    let outcome = block.reserve_with_reemit(&e, cache, token, reemit);
                     if admitted {
                         assert!(
                             outcome.is_ok(),
@@ -1161,9 +1142,9 @@ mod tests {
                     .iter()
                     .map(|d| 2 * (d.approx_bytes - d.decoded_bytes) + 128 * columns + 8 + q)
                     .sum::<usize>();
-            let block: Block<u32> = Block::new(0, 1, &cfg);
+            let block = Block::new(0, 1, cfg.clone());
             let reservation = block
-                .reserve(&e, &mut SeriesCache::new(1024), token, &cfg)
+                .reserve(&e, &mut SeriesCache::new(1024), token)
                 .expect("the default block takes the request");
             assert_eq!(reservation.new_series.len(), e.descriptors.len());
             assert_eq!(reservation.bytes, exact, "{signal:?}");
@@ -1183,17 +1164,17 @@ mod tests {
         let mut cfg = LakeConfig::default();
         cfg.ingress.max_requests_per_block = 2;
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
-        for token in 0..2u32 {
+        let mut block = Block::new(0, 1, cfg.clone());
+        for _ in 0..2 {
             let e = extracted(&cfg, "h", 1);
-            let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
-            block.admit(e, r, token).expect("admit");
+            let r = block.reserve(&e, &mut cache, 16).expect("reserve");
+            block.admit(e, r).expect("admit");
         }
         let before_bytes = block.bytes;
         let before_series = block.pending_series.len();
         let e = extracted(&cfg, "h", 1);
         assert!(matches!(
-            block.reserve(&e, &mut cache, 16, &cfg),
+            block.reserve(&e, &mut cache, 16),
             Err(Error::Refused(RefuseReason::TooManyRequests))
         ));
         assert_eq!(block.bytes, before_bytes);
@@ -1206,25 +1187,28 @@ mod tests {
     #[test]
     fn full_block_refuses_with_block_full() {
         let cfg = LakeConfig::default();
-        let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
-        let first = extracted(&cfg, "h", 4);
-        let r = block
-            .reserve(&first, &mut cache, 16, &cfg)
-            .expect("reserve");
-        block.admit(first, r, 1).expect("admit");
+        // A block holding one request, under `cfg`.
+        let filled = |cfg: &LakeConfig| {
+            let mut cache = SeriesCache::new(100);
+            let mut block = Block::new(0, 1, cfg.clone());
+            let first = extracted(cfg, "h", 4);
+            let r = block.reserve(&first, &mut cache, 16).expect("reserve");
+            block.admit(first, r).expect("admit");
+            (block, cache)
+        };
+        let (block, mut cache) = filled(&cfg);
         let before_bytes = block.bytes;
 
         // A second, distinct series whose own reservation fits the limit, so the
         // only reason to refuse it is the bytes the block already holds.
         let e = extracted(&cfg, "h2", 4);
-        let probe = block
-            .reserve(&e, &mut cache, 16, &cfg)
-            .expect("fits on its own");
+        let probe = block.reserve(&e, &mut cache, 16).expect("fits on its own");
         let mut tight = cfg.clone();
         tight.ingress.max_block_bytes = before_bytes + probe.bytes - 1;
+        let (block, mut cache) = filled(&tight);
+        assert_eq!(block.bytes, before_bytes);
         assert!(matches!(
-            block.reserve(&e, &mut cache, 16, &tight),
+            block.reserve(&e, &mut cache, 16),
             Err(Error::Refused(RefuseReason::BlockFull))
         ));
         assert_eq!(block.bytes, before_bytes);
@@ -1243,7 +1227,7 @@ mod tests {
     fn seal_recounts_shared_buffers_once() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         let e1 = extracted(&cfg, "h", 8);
         // The logical payload of the request, free of the builder capacity slack
         // that `pinned_bytes` also counts.
@@ -1257,8 +1241,8 @@ mod tests {
             })
             .sum();
         assert!(one_request_logical > 0);
-        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("r1");
-        block.admit(e1, r1, 1).expect("admit");
+        let r1 = block.reserve(&e1, &mut cache, 16).expect("r1");
+        block.admit(e1, r1).expect("admit");
         let reserved = block.bytes;
         block.seal(SEAL_AT_US).expect("seal");
         assert!(
@@ -1388,7 +1372,7 @@ mod tests {
             nulls: Nulls::Last,
         }];
         assert_ne!(cfg.logs.values_sort, cfg.metrics.values_sort);
-        let block: Block<u32> = Block::new(0, 1, &cfg);
+        let block = Block::new(0, 1, cfg.clone());
 
         assert_eq!(
             block.spec_for(Dataset::LogsSeries),
@@ -1412,7 +1396,7 @@ mod tests {
 
         let mut off = cfg.clone();
         off.sorting.enabled = false;
-        let block: Block<u32> = Block::new(0, 1, &off);
+        let block = Block::new(0, 1, off.clone());
         for ds in [Dataset::LogsValues, Dataset::MetricsValues] {
             assert!(
                 block.spec_for(ds).is_empty(),
@@ -1431,10 +1415,10 @@ mod tests {
     fn block_runs_are_sealed_under_the_spec_spec_for_reports() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         let e = extracted(&cfg, "h", 40);
-        let r = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
-        block.admit(e, r, 1).expect("admit");
+        let r = block.reserve(&e, &mut cache, 16).expect("reserve");
+        block.admit(e, r).expect("admit");
         block.seal(SEAL_AT_US).expect("seal");
         for t in block.tables() {
             assert_eq!(t.spec(), &block.spec_for(t.dataset()));
@@ -1456,17 +1440,17 @@ mod tests {
     fn admit_after_seal_is_rejected() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
-        let mut block: Block<u32> = Block::new(0, 1, &cfg);
+        let mut block = Block::new(0, 1, cfg.clone());
         let e1 = extracted(&cfg, "h", 2);
-        let r1 = block.reserve(&e1, &mut cache, 16, &cfg).expect("reserve 1");
-        block.admit(e1, r1, 1).expect("admit");
+        let r1 = block.reserve(&e1, &mut cache, 16).expect("reserve 1");
+        block.admit(e1, r1).expect("admit");
         block.seal(SEAL_AT_US).expect("seal");
         let sealed_bytes = block.bytes;
 
         let e2 = extracted(&cfg, "h2", 2);
-        let r2 = block.reserve(&e2, &mut cache, 16, &cfg).expect("reserve 2");
+        let r2 = block.reserve(&e2, &mut cache, 16).expect("reserve 2");
         let err = block
-            .admit(e2, r2, 2)
+            .admit(e2, r2)
             .expect_err("a sealed block admits nothing");
         assert!(matches!(err, Error::Internal(_)));
         assert!(err.to_string().contains("already sealed"));
@@ -1483,12 +1467,12 @@ mod tests {
         let mut cache = SeriesCache::new(10);
         let e = extracted(&cfg, "h", 1);
         let id = e.descriptors[0].series_id;
-        let block: Block<()> = Block::new(0, 1, &cfg);
+        let block = Block::new(0, 1, cfg.clone());
         cache.mark_committed(id, block.partition);
-        let normal = block.reserve(&e, &mut cache, 16, &cfg).expect("reserve");
+        let normal = block.reserve(&e, &mut cache, 16).expect("reserve");
         assert!(normal.new_series.is_empty());
         let forced = block
-            .reserve_with_reemit(&e, &mut cache, 16, &cfg, true)
+            .reserve_with_reemit(&e, &mut cache, 16, true)
             .expect("reserve");
         assert_eq!(forced.new_series, vec![0]);
         assert!(forced.bytes > normal.bytes);

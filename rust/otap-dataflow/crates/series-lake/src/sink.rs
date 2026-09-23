@@ -1098,7 +1098,7 @@ impl Sink {
     /// the same objects instead of adding a second copy, and it lets a caller
     /// name the objects an attempt is about to touch before it touches them.
     #[must_use]
-    pub fn planned_paths<T>(&self, block: &Block<T>) -> Vec<Path> {
+    pub fn planned_paths(&self, block: &Block) -> Vec<Path> {
         block
             .tables()
             .filter(|table| !table.is_empty())
@@ -1120,9 +1120,9 @@ impl Sink {
     ///
     /// Returns [`TransientError::Cancelled`] when `cancel` fires, and the underlying
     /// Arrow, Parquet or object store failure otherwise.
-    pub async fn write_block<T>(
+    pub async fn write_block(
         &self,
-        block: &Block<T>,
+        block: &Block,
         cancel: &CancellationToken,
     ) -> Result<FlushReport> {
         // Series rows exist from admission onwards, but they carry a
@@ -1241,26 +1241,26 @@ mod tests {
         s
     }
 
-    fn seal_logs(cfg: &LakeConfig, n: usize, body_len: usize) -> Block<u8> {
+    fn seal_logs(cfg: &LakeConfig, n: usize, body_len: usize) -> Block {
         let mut cache = SeriesCache::new(10);
-        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, cfg);
+        let mut b = Block::new(WINDOW_START, SEQ, cfg.clone());
         let mut records = encode_logs(&logs(n, body_len));
         let e = extract(&mut records, cfg).expect("extract");
-        let r = b.reserve(&e, &mut cache, 8, cfg).expect("reserve");
-        b.admit(e, r, 0).expect("admit");
+        let r = b.reserve(&e, &mut cache, 8).expect("reserve");
+        b.admit(e, r).expect("admit");
         b.seal(SEAL_AT_US).expect("seal");
         b
     }
 
     /// A sealed block of 30 small log rows.
-    fn sealed_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+    fn sealed_block(cfg: &LakeConfig, n: usize) -> Block {
         seal_logs(cfg, n, 8)
     }
 
     /// A sealed block whose values object is comfortably larger than one 5 MiB
     /// multipart part, so that the upload tests reach an in-flight `put_part`
     /// while the writer is still in its writable phase.
-    fn sealed_upload_block(cfg: &LakeConfig) -> Block<u8> {
+    fn sealed_upload_block(cfg: &LakeConfig) -> Block {
         seal_logs(cfg, 24_000, 1_024)
     }
 
@@ -2035,11 +2035,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(10);
-        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
+        let mut b = Block::new(WINDOW_START, SEQ, cfg.clone());
         let mut records = encode_metrics(&gauge_and_histogram());
         let e = extract(&mut records, &cfg).expect("extract");
-        let r = b.reserve(&e, &mut cache, 8, &cfg).expect("reserve");
-        b.admit(e, r, 0).expect("admit");
+        let r = b.reserve(&e, &mut cache, 8).expect("reserve");
+        b.admit(e, r).expect("admit");
         b.seal(SEAL_AT_US).expect("seal");
 
         let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"));
@@ -2119,7 +2119,7 @@ mod tests {
     async fn empty_block_writes_no_file() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
-        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
+        let mut b = Block::new(WINDOW_START, SEQ, cfg.clone());
         b.seal(SEAL_AT_US).expect("seal");
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let report = sink
@@ -2139,7 +2139,7 @@ mod tests {
     async fn write_block_rejects_an_unsealed_block() {
         let dir = tempfile::tempdir().expect("tmp");
         let cfg = LakeConfig::default();
-        let b: Block<u8> = Block::new(WINDOW_START, SEQ, &cfg);
+        let b = Block::new(WINDOW_START, SEQ, cfg.clone());
         assert!(!b.is_sealed());
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let err = sink
@@ -2445,7 +2445,7 @@ mod tests {
 
     /// A sealed block of `n` log rows whose one series is already committed
     /// in the block's partition, so the block's only table is its values.
-    fn values_only_block(cfg: &LakeConfig, n: usize) -> Block<u8> {
+    fn values_only_block(cfg: &LakeConfig, n: usize) -> Block {
         let mut cache = SeriesCache::new(10);
         let mut records = encode_logs(&logs(n, 8));
         let e = extract(&mut records, cfg).expect("extract");
@@ -2453,9 +2453,9 @@ mod tests {
         for descriptor in &e.descriptors {
             cache.mark_committed(descriptor.series_id, partition);
         }
-        let mut b: Block<u8> = Block::new(WINDOW_START, SEQ, cfg);
-        let r = b.reserve(&e, &mut cache, 8, cfg).expect("reserve");
-        b.admit(e, r, 0).expect("admit");
+        let mut b = Block::new(WINDOW_START, SEQ, cfg.clone());
+        let r = b.reserve(&e, &mut cache, 8).expect("reserve");
+        b.admit(e, r).expect("admit");
         b.seal(SEAL_AT_US).expect("seal");
         assert_eq!(
             b.tables().filter(|table| !table.is_empty()).count(),
