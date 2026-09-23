@@ -594,7 +594,7 @@ From `rust/otap-dataflow`, after the feature-enabled build above:
 
 ```bash
 python3 -m venv /tmp/series-parquet-venv
-/tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+/tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
 export SERIES_REFERENCE_DIR="$(mktemp -d /tmp/series-reference.XXXXXX)"
 PYTHONPATH=crates/validation/tests/series_parquet /tmp/series-parquet-venv/bin/python - <<'PY'
 import os

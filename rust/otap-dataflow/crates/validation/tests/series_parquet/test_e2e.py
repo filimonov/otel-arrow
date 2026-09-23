@@ -39,11 +39,43 @@ from opentelemetry.proto.collector.trace.v1 import trace_service_pb2_grpc as tra
 WORKSPACE = Path(__file__).resolve().parents[4]
 
 
-def free_port():
-    """Bind an ephemeral port and return it after closing the socket."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+# Ports this process has handed out. The kernel may give the same ephemeral
+# port to two back-to-back binds once the first socket is closed, so a port is
+# never handed out twice by one harness process.
+_ISSUED_PORTS = set()
+
+
+def free_port(attempts=64):
+    """A loopback port that was free when probed and never issued before.
+
+    Probing is check-then-use: another process can still take the port
+    before the caller binds it. The dedupe removes the race between two
+    callers in this process; a caller that loses the race with another
+    process retries through its own start-up path.
+    """
+    last = None
+    for _ in range(attempts):
+        try:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+        except OSError as error:
+            last = error
+            continue
+        if port not in _ISSUED_PORTS:
+            _ISSUED_PORTS.add(port)
+            return port
+    raise AssertionError(f"no unissued loopback port after {attempts} probes: {last}")
+
+
+def sleep_to_window_offset(interval_s, offset_s):
+    """Sleep until `offset_s` seconds into the next aligned window.
+
+    The exporter aligns windows to multiples of `interval_s` of Unix time, so
+    a test that must act at a known point of a window waits for it here.
+    """
+    now = time.time()
+    time.sleep(interval_s - (now % interval_s) + offset_s)
 
 
 def window_start(path):
@@ -393,6 +425,7 @@ class Engine:
         self.pid = self.launcher.pid(self.process)
         self.channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
         try:
+            self.wait_ready(30)
             grpc.channel_ready_future(self.channel).result(timeout=30)
         except Exception:
             # The caller usually runs inside a TemporaryDirectory that is about
@@ -404,27 +437,46 @@ class Engine:
         self.logs = logs_rpc.LogsServiceStub(self.channel)
 
     def exporter_gauges(self, *names):
-        """Latest value of each named exporter gauge, from the admin API.
+        """Largest value of each named exporter gauge, from the admin API.
 
-        Reads the Prometheus text the engine already exposes rather than
-        adding a second reporting path. A gauge the engine has not published
-        yet reads as zero, which is what the callers want: they wait for a
-        state to appear.
+        Read through the same JSON snapshot and the same `metric_values`
+        every other assertion uses, so there is one telemetry reader. A gauge
+        the snapshot does not carry, or a snapshot that could not be taken,
+        reads as `None`, never as zero: the callers wait for a state to
+        appear and must not mistake an absent sample for an empty exporter.
         """
-        url = f"http://127.0.0.1:{self.admin_port}/api/v1/telemetry/metrics"
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                body = response.read().decode()
+            document = engine_metrics(self)
         except Exception:
-            return dict.fromkeys(names, 0.0)
-        found = dict.fromkeys(names, 0.0)
-        for line in body.splitlines():
-            if line.startswith("#"):
-                continue
-            for name in names:
-                if line.startswith(f"{name}{{") and "series_parquet" in line:
-                    found[name] = float(line.rsplit(" ", 2)[-2])
+            return dict.fromkeys(names)
+        found = {}
+        for name in names:
+            values = metric_values(document, name)
+            found[name] = max(values) if values else None
         return found
+
+    def wait_ready(self, seconds):
+        """Poll the admin API's `/api/v1/readyz` until it answers 200.
+
+        The engine's own readiness, the probe the Rust scenario framework
+        uses, rather than inferring it from one listener accepting a
+        connection.
+        """
+        url = f"http://127.0.0.1:{self.admin_port}/api/v1/readyz"
+        deadline = time.monotonic() + seconds
+        last = None
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise AssertionError("the engine exited before it became ready")
+            try:
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    if response.status == 200:
+                        return
+                    last = f"status {response.status}"
+            except Exception as error:
+                last = error
+            time.sleep(0.05)
+        raise AssertionError(f"the engine never became ready: {last}")
 
     def engine_log(self):
         """Return everything the engine has written to its combined log."""
@@ -938,10 +990,10 @@ class ShutdownSlice(unittest.TestCase):
                 gauges = {}
                 while time.monotonic() < deadline:
                     gauges = engine.exporter_gauges(
-                        "block_flushing_bytes", "block_active_bytes"
+                        "block.flushing_bytes", "block.active_bytes"
                     )
-                    if gauges["block_flushing_bytes"] > 0 and (
-                        gauges["block_active_bytes"] > 0
+                    if all(
+                        value is not None and value > 0 for value in gauges.values()
                     ):
                         break
                     time.sleep(0.01)
@@ -1676,6 +1728,11 @@ def verify_readers(
                 test.assertEqual({row[0] for row in duck_rows}, set(metric_ids))
 
 
+# Upper bound on any single docker CLI call, so a wedged daemon fails the test
+# instead of hanging it.
+DOCKER_TIMEOUT_S = 120
+
+
 class DockerStore:
     """A MinIO or RustFS container serving S3 on a loopback port.
 
@@ -1692,34 +1749,58 @@ class DockerStore:
         self.key = "series-test-access"
         self.secret = "series-test-secret-12345"
 
-    def __enter__(self):
-        image = require_docker_image(self.kind)
-        # The host port is chosen here rather than by Docker: a container that
-        # is stopped and started again keeps an explicit mapping, so the
-        # engine's configured endpoint stays valid across an outage.
-        self.port = free_port()
+    def run_args(self, image):
+        """The `docker run` command line for the current port."""
         args = [
             "docker", "run", "--pull=never", "--detach", "--name", self.name,
             "--publish", f"127.0.0.1:{self.port}:9000",
         ]
         if self.kind == "minio":
-            args += [
+            return args + [
                 "-e", f"MINIO_ROOT_USER={self.key}",
                 "-e", f"MINIO_ROOT_PASSWORD={self.secret}",
                 image, "server", "/data", "--address", ":9000",
             ]
-        else:
-            args += [
-                "-e", f"RUSTFS_ACCESS_KEY={self.key}",
-                "-e", f"RUSTFS_SECRET_KEY={self.secret}",
-                "-e", "RUSTFS_ADDRESS=0.0.0.0:9000",
-                "-e", "RUSTFS_VOLUMES=/data",
-                image,
-            ]
+        return args + [
+            "-e", f"RUSTFS_ACCESS_KEY={self.key}",
+            "-e", f"RUSTFS_SECRET_KEY={self.secret}",
+            "-e", "RUSTFS_ADDRESS=0.0.0.0:9000",
+            "-e", "RUSTFS_VOLUMES=/data",
+            image,
+        ]
+
+    def start_container(self, image, attempts=3):
+        """Run the container, retrying on a port another process took.
+
+        The host port is chosen here rather than by Docker: a container that
+        is stopped and started again keeps an explicit mapping, so the
+        engine's configured endpoint stays valid across an outage. A failed
+        `docker run` can still leave a created container behind under the
+        name, so every failure removes it by name before the next attempt.
+        """
+        for attempt in range(attempts):
+            self.port = free_port()
+            done = subprocess.run(
+                self.run_args(image), capture_output=True, text=True,
+                timeout=DOCKER_TIMEOUT_S,
+            )
+            if done.returncode == 0:
+                self.container = done.stdout.strip()
+                return
+            self.remove()
+            taken = "already allocated" in done.stderr or "in use" in done.stderr
+            if not taken or attempt + 1 == attempts:
+                raise AssertionError(
+                    f"docker run of {self.kind} failed: {done.stderr.strip()}"
+                )
+
+    def __enter__(self):
+        image = require_docker_image(self.kind)
         try:
-            self.container = subprocess.check_output(args, text=True).strip()
+            self.start_container(image)
             mapping = subprocess.check_output(
-                ["docker", "port", self.container, "9000/tcp"], text=True
+                ["docker", "port", self.container, "9000/tcp"], text=True,
+                timeout=DOCKER_TIMEOUT_S,
             ).strip()
             if f":{self.port}" not in mapping:
                 raise AssertionError(
@@ -1772,7 +1853,8 @@ class DockerStore:
                 last_error = error
                 time.sleep(0.2)
         logs = subprocess.check_output(
-            ["docker", "logs", self.container], stderr=subprocess.STDOUT, text=True
+            ["docker", "logs", self.container], stderr=subprocess.STDOUT, text=True,
+            timeout=DOCKER_TIMEOUT_S,
         )
         raise AssertionError(f"{self.kind} never became S3-ready: {last_error}\n{logs}")
 
@@ -1795,23 +1877,36 @@ class DockerStore:
             ["docker", "stop", "--time", "0", self.container],
             check=True,
             capture_output=True,
+            timeout=DOCKER_TIMEOUT_S,
         )
 
     def recover(self):
         """Start the same container again and wait for it to serve S3."""
         subprocess.run(
-            ["docker", "start", self.container], check=True, capture_output=True
+            ["docker", "start", self.container], check=True, capture_output=True,
+            timeout=DOCKER_TIMEOUT_S,
         )
         self.ready()
 
-    def __exit__(self, *exc):
-        if self.container:
+    def remove(self):
+        """Remove the container by name, whether or not it ever started.
+
+        By name rather than by id, so a container `docker run` created but
+        could not start -- which returns no id -- is removed too.
+        """
+        try:
             subprocess.run(
-                ["docker", "rm", "--force", "--volumes", self.container],
+                ["docker", "rm", "--force", "--volumes", self.name],
                 check=False,
                 capture_output=True,
+                timeout=DOCKER_TIMEOUT_S,
             )
-            self.container = None
+        except subprocess.TimeoutExpired:
+            pass
+        self.container = None
+
+    def __exit__(self, *exc):
+        self.remove()
 
 
 # The frozen object layout of spec section 5.3. The writer id is matched
@@ -2536,6 +2631,12 @@ class RestartSlice(unittest.TestCase):
                 directory, overrides=overrides, telemetry_interval="50ms"
             ) as engine:
                 try:
+                    # Windows are aligned to multiples of the interval on the
+                    # wall clock. Sent at an arbitrary offset, a request near
+                    # a boundary is written and acked before the poll below
+                    # can see it pending; sent just after a boundary, it stays
+                    # pending for the whole observation.
+                    sleep_to_window_offset(5.0, 0.2)
                     call = engine.logs.Export.future(
                         log_request("disconnected"), timeout=20
                     )

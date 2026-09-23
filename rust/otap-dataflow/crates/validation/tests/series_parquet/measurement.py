@@ -3337,10 +3337,88 @@ def write_json_atomic(path, document) -> Path:
     return path
 
 
+# Keys whose string value is a credential. A published document keeps the key,
+# so its shape is unchanged, and carries this token instead of the value.
+CREDENTIAL_KEYS = frozenset(
+    {
+        "access_key_id",
+        "secret_access_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "session_token",
+        "password",
+    }
+)
+REDACTED = "<redacted>"
+REPO_TOKEN = "<repo>"
+HOME_TOKEN = "<home>"
+# `NAME=value` arguments whose value is a credential, as a container command
+# line passes them.
+CREDENTIAL_ASSIGNMENT = re.compile(
+    r"\b([A-Z0-9_]*(?:PASSWORD|SECRET|SECRET_KEY|ACCESS_KEY|TOKEN)[A-Z0-9_]*)=[^\s\"']+"
+)
+
+
+def scrub_published(value, *, repo_root=None, home=None):
+    """A copy of one document with host paths and credentials removed.
+
+    Every document the harness writes for publication passes through here:
+    the repository root becomes `<repo>` and the user's home directory
+    `<home>` wherever either appears in a string, a credential-named key
+    keeps its key with a `<redacted>` value, and a `NAME=value` credential
+    assignment keeps its name. The run directory token and the declared
+    ephemeral tokens are applied earlier, for fingerprints; this is the last
+    step before a file is written, so nothing a fingerprint hashed changes.
+    """
+    roots = []
+    for root, token in (
+        (repo_root if repo_root is not None else REPO_ROOT, REPO_TOKEN),
+        (home if home is not None else os.path.expanduser("~"), HOME_TOKEN),
+    ):
+        text = str(root).rstrip(os.sep)
+        if text and text != os.sep:
+            roots.append((text, token))
+            real = os.path.realpath(text)
+            if real != text:
+                roots.append((real, token))
+    # Longest first, so the repository inside the home directory is named as
+    # the repository.
+    roots.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+    def text_of(item):
+        """One string with every host prefix and credential replaced."""
+        for root, token in roots:
+            item = item.replace(root, token)
+        return CREDENTIAL_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={REDACTED}", item)
+
+    def rewrite(item, key=None):
+        """Rewrite one node of the document."""
+        if isinstance(item, dict):
+            return {name: rewrite(child, name) for name, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [rewrite(child) for child in item]
+        if isinstance(item, str):
+            if key is not None and key.lower() in CREDENTIAL_KEYS and item:
+                return REDACTED
+            return text_of(item)
+        return item
+
+    return rewrite(value)
+
+
+def write_published_json(path, document) -> Path:
+    """Write one document meant for publication, scrubbed first."""
+    return write_json_atomic(path, scrub_published(document))
+
+
 def write_result(path, result) -> Path:
-    """Write one result file atomically, after validating it."""
+    """Write one result file atomically, after validating it.
+
+    The written copy is scrubbed of host paths and credentials
+    (`scrub_published`); the in-memory result the caller keeps is not.
+    """
     validate_result(result)
-    return write_json_atomic(path, result)
+    return write_published_json(path, result)
 
 
 def file_digest(path) -> str:
@@ -3457,6 +3535,12 @@ class RunControls:
         self.affinity_failures = []
         self.opened = False
         self.closed = False
+        # Whether a monitor tick gap over the coverage limit fails the
+        # coverage gate. A host that is not a publishable measurement host
+        # (the `publish=false` CI mode) records the gaps as an observation
+        # instead: a loaded shared runner stalls a 50 ms sampler routinely,
+        # and nothing it measures is published.
+        self.coverage_gaps_hard = True
 
     def open(self):
         """Take the lease and start watching for builds, in that order.
@@ -3678,7 +3762,9 @@ class RunControls:
                         f"{len(report['docker']['events'].get('builder_starts', []))}",
                     )
                 )
-                checks.append(coverage_check(report))
+                checks.append(
+                    coverage_check(report, gaps_hard=self.coverage_gaps_hard)
+                )
                 self.affinity_failures.extend(
                     f"tick {entry['observed_utc']}: {entry['detail']}"
                     for entry in report["affinity_failures"]
@@ -3764,32 +3850,40 @@ class RunControls:
         )
 
 
-def coverage_check(report) -> dict:
+def coverage_check(report, *, gaps_hard=True) -> dict:
     """Whether the build monitor could have missed a build.
 
     It could if two ticks were further apart than the coverage limit, if
     procfs hides other processes, or if Docker is installed but could not
-    be asked about builder containers.
+    be asked about builder containers. With `gaps_hard=False` tick gaps are
+    reported in the detail as an observation and do not fail the check; the
+    visibility and Docker conditions still do.
     """
     problems = []
+    observed = []
     coverage = report["coverage"]
     if coverage["gaps_over_limit_count"]:
-        problems.append(
+        gaps = (
             f"{coverage['gaps_over_limit_count']} tick gaps over "
             f"{coverage['limit_s']}s, largest {coverage['max_gap_s']}s"
         )
+        (problems if gaps_hard else observed).append(gaps)
     if not report["visibility"].get("complete"):
         problems.append(f"procfs visibility {report['visibility']}")
     docker = report["docker"]
     for part in ("start", "end", "events"):
         if not docker.get(part, {}).get("observable", False):
             problems.append(f"docker {part} unobservable: {docker.get(part)}")
+    detail = "; ".join(problems) or (
+        f"{coverage['ticks']} ticks, largest gap {coverage['max_gap_s']}s"
+    )
+    if observed:
+        detail += "; observed, not gated on this host: " + "; ".join(observed)
     return check(
         "build_monitor_coverage",
         CHECK_HARD,
         STATUS_FAILED if problems else STATUS_PASSED,
-        "; ".join(problems)
-        or f"{coverage['ticks']} ticks, largest gap {coverage['max_gap_s']}s",
+        detail,
     )
 
 

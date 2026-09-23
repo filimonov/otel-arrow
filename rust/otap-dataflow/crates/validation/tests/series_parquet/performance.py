@@ -2198,7 +2198,7 @@ def aggregate_profile(children, *, plan, output_dir, reconciliation) -> dict:
         decision = measurement.evaluate_baseline(result)
         if decision["action"] == "created":
             candidate = result.pop("baseline_candidate")
-            path = measurement.write_json_atomic(
+            path = measurement.write_published_json(
                 Path(output_dir) / decision["baseline_name"], candidate
             )
             result["baseline_files"].append(measurement.file_entry(path))
@@ -2508,6 +2508,10 @@ def run_child(plan, job, output_dir, report_dir):
             spec, run_dir, experiment=experiment, report_dir=report_dir,
             evaluate=False,
         )
+    except (KeyboardInterrupt, SystemExit):
+        # An operator's interrupt or an exit ends the family, not the child:
+        # recording it as one failed child would run every remaining child.
+        raise
     except BaseException as error:  # noqa: BLE001 - recorded in the result
         sys.stderr.write(f"{spec.run_id}: {type(error).__name__}: {error}\n")
         result = json.loads((run_dir / f"{spec.run_id}.json").read_text(encoding="ascii"))

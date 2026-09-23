@@ -4047,5 +4047,197 @@ class StageContracts(unittest.TestCase):
 
 
 
+class HarnessHygieneContracts(unittest.TestCase):
+    """Task 3c harness minors and publication scrubbing."""
+
+    # Scenario: a document carries the repository root, the home directory,
+    # S3 static credentials, a container credential assignment and an
+    # ordinary path outside both roots.
+    # Guarantees: the written copy names the repository and home as tokens,
+    # redacts every credential value while keeping its key and variable
+    # name, leaves every other string exactly as it was, and never touches
+    # the caller's own document.
+    def test_published_documents_carry_no_host_paths_or_credentials(self):
+        document = {
+            "binary": "/home/alice/src/otel-arrow/rust/otap-dataflow/target/x",
+            "log": "/home/alice/notes.txt",
+            "other": "/srv/data/file",
+            "auth": {
+                "type": "static_credentials",
+                "access_key_id": "series-test-access",
+                "secret_access_key": "series-test-secret-12345",
+            },
+            "argv": ["docker", "run", "-e", "MINIO_ROOT_PASSWORD=hunter2",
+                     "-e", "RUSTFS_SECRET_KEY=abc", "-e", "MINIO_ROOT_USER=u"],
+            "count": 3,
+        }
+        original = json.loads(json.dumps(document))
+        scrubbed = measurement.scrub_published(
+            document, repo_root="/home/alice/src/otel-arrow", home="/home/alice"
+        )
+        self.assertEqual(document, original, "the input is not modified")
+        self.assertEqual(scrubbed["binary"], "<repo>/rust/otap-dataflow/target/x")
+        self.assertEqual(scrubbed["log"], "<home>/notes.txt")
+        self.assertEqual(scrubbed["other"], "/srv/data/file")
+        self.assertEqual(scrubbed["auth"]["type"], "static_credentials")
+        self.assertEqual(scrubbed["auth"]["access_key_id"], "<redacted>")
+        self.assertEqual(scrubbed["auth"]["secret_access_key"], "<redacted>")
+        self.assertIn("MINIO_ROOT_PASSWORD=<redacted>", scrubbed["argv"])
+        self.assertIn("RUSTFS_SECRET_KEY=<redacted>", scrubbed["argv"])
+        self.assertIn("MINIO_ROOT_USER=u", scrubbed["argv"])
+        self.assertEqual(scrubbed["count"], 3)
+        text = json.dumps(scrubbed)
+        for leaked in ("/home/alice", "hunter2", "series-test-secret-12345"):
+            self.assertNotIn(leaked, text)
+
+    # Scenario: a result is written through `write_result` from a document
+    # holding this host's real repository path and a static secret.
+    # Guarantees: the file on disk holds neither, so no published result
+    # can carry them whatever produced it.
+    def test_write_result_scrubs_the_file_it_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = measured_result()
+            result["config"]["effective"] = {
+                "binary": str(measurement.REPO_ROOT / "target/release/df_engine"),
+                "secret_access_key": "series-test-secret-12345",
+            }
+            path = measurement.write_result(Path(directory) / "r.json", result)
+            text = path.read_text(encoding="ascii")
+            self.assertNotIn(str(measurement.REPO_ROOT), text)
+            self.assertNotIn("series-test-secret-12345", text)
+
+    # Scenario: the measured body of a child raises KeyboardInterrupt.
+    # Guarantees: `run_child` re-raises it rather than recording one failed
+    # child and moving on to the next, so an operator's interrupt stops the
+    # whole family.
+    def test_run_child_does_not_swallow_an_interrupt(self):
+        spec = mock.Mock(run_id="interrupted")
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(performance, "child_spec", return_value=spec), \
+                mock.patch.object(measure, "run_case", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                performance.run_child({}, {"profile": "timing"}, directory, directory)
+
+    # Scenario: a build monitor report with a tick gap over the coverage
+    # limit is judged for a publishable host and for a non-publishable one,
+    # and one whose Docker events were unobservable is judged for the
+    # non-publishable host.
+    # Guarantees: the gap fails the gate only on a publishable host; on the
+    # other it is recorded in the detail as an observation; an unobservable
+    # build namespace still fails either way.
+    def test_monitor_tick_gaps_are_an_observation_off_a_publishable_host(self):
+        report = {
+            "coverage": {"gaps_over_limit_count": 2, "limit_s": 0.1,
+                         "max_gap_s": 0.4, "ticks": 100},
+            "visibility": {"complete": True},
+            "docker": {part: {"observable": True} for part in ("start", "end", "events")},
+        }
+        hard = measurement.coverage_check(report)
+        self.assertEqual(hard["status"], measurement.STATUS_FAILED)
+        soft = measurement.coverage_check(report, gaps_hard=False)
+        self.assertEqual(soft["status"], measurement.STATUS_PASSED)
+        self.assertIn("observed, not gated", soft["detail"])
+        self.assertIn("2 tick gaps", soft["detail"])
+        report["docker"]["events"] = {"observable": False}
+        self.assertEqual(
+            measurement.coverage_check(report, gaps_hard=False)["status"],
+            measurement.STATUS_FAILED,
+        )
+
+    # Scenario: the kernel hands the same ephemeral port to two probes in a
+    # row.
+    # Guarantees: `free_port` never returns a port it already issued; it
+    # probes again instead.
+    def test_free_port_never_issues_a_port_twice(self):
+        e2e = measurement.test_e2e
+        issued = set(e2e._ISSUED_PORTS)
+        first = e2e.free_port()
+        self.assertNotIn(first, issued)
+
+        class Fixed:
+            """A socket whose kernel keeps returning `first`, then another."""
+            answers = [first, first, 1]
+
+            def __init__(self, *args):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def bind(self, address):
+                pass
+
+            def getsockname(self):
+                return ("127.0.0.1", Fixed.answers.pop(0))
+
+        e2e._ISSUED_PORTS.discard(1)
+        with mock.patch.object(e2e.socket, "socket", Fixed):
+            self.assertEqual(e2e.free_port(), 1)
+        e2e._ISSUED_PORTS.discard(1)
+
+    # Scenario: the admin API's snapshot does not carry a requested exporter
+    # gauge, and then cannot be read at all.
+    # Guarantees: `exporter_gauges` reports the gauge as None, never as zero,
+    # and reads a present gauge through the same `metric_values` every
+    # other assertion uses.
+    def test_exporter_gauges_never_read_absence_as_zero(self):
+        e2e = measurement.test_e2e
+        engine = object.__new__(e2e.Engine)
+        snapshot = {"metric_sets": [{"name": e2e.EXPORTER_METRIC_SET, "metrics": [
+            {"name": "block.active_bytes", "value": 7},
+        ]}]}
+        with mock.patch.object(e2e, "engine_metrics", return_value=snapshot):
+            self.assertEqual(
+                engine.exporter_gauges("block.active_bytes", "block.flushing_bytes"),
+                {"block.active_bytes": 7, "block.flushing_bytes": None},
+            )
+        with mock.patch.object(e2e, "engine_metrics", side_effect=OSError("down")):
+            self.assertEqual(
+                engine.exporter_gauges("block.active_bytes"),
+                {"block.active_bytes": None},
+            )
+
+    # Scenario: the wall clock reads 3.7 s into a 5 s window.
+    # Guarantees: `sleep_to_window_offset` sleeps to 0.2 s into the next
+    # window, 1.5 s, so a test acts at a known point of an aligned window.
+    def test_sleep_to_window_offset_lands_after_the_boundary(self):
+        e2e = measurement.test_e2e
+        with mock.patch.object(e2e.time, "time", return_value=1003.7), \
+                mock.patch.object(e2e.time, "sleep") as sleep:
+            e2e.sleep_to_window_offset(5.0, 0.2)
+        self.assertAlmostEqual(sleep.call_args.args[0], 1.5)
+
+    # Scenario: `docker run` of a store container fails with a port another
+    # process took, then succeeds on a new port.
+    # Guarantees: the failed attempt's container is removed by name before
+    # the retry, every docker call carries a timeout, and the store ends up
+    # running on the second port.
+    def test_docker_store_removes_a_failed_start_and_retries(self):
+        e2e = measurement.test_e2e
+        store = e2e.DockerStore("minio")
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ["docker", "run"] and len(
+                [c for c in calls if c[0][:2] == ["docker", "run"]]
+            ) == 1:
+                return subprocess.CompletedProcess(
+                    args, 125, "", "Bind for 127.0.0.1:1 failed: port is already allocated"
+                )
+            return subprocess.CompletedProcess(args, 0, "abc123\n", "")
+
+        with mock.patch.object(e2e.subprocess, "run", side_effect=run):
+            store.start_container("image:tag")
+        self.assertEqual(store.container, "abc123")
+        removals = [c for c in calls if c[0][:3] == ["docker", "rm", "--force"]]
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(removals[0][0][-1], store.name)
+        self.assertTrue(all(kwargs.get("timeout") for _, kwargs in calls))
+
+
 if __name__ == "__main__":
     unittest.main()

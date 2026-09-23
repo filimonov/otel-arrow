@@ -103,7 +103,9 @@ each is implemented by its own task.
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
-Python dependencies are in `requirements.txt`.
+Python dependencies are pinned in `requirements.txt` and, with hashes, in
+`requirements.lock.txt`; install with `pip install --require-hashes -r
+requirements.lock.txt`.
 
 ## What a measurement is allowed to claim
 
@@ -158,10 +160,11 @@ each of them once.
   a build daemon; an idle `buildkitd` is not a build. On each tick it also
   enumerates every thread of the engine and requires the threads carrying a
   worker name to be exactly the mapped worker TIDs, each allowed exactly its
-  own core, so an extra or replacing worker fails even for a single tick. A tick gap over 100 ms,
-  a procfs that hides other processes, or a Docker that is installed but
-  cannot be asked about builder containers makes the coverage incomplete and
-  the run invalid. Any build seen after preflight invalidates the run even
+  own core, so an extra or replacing worker fails even for a single tick. A
+  tick gap over 100 ms (recorded as an observation only in `publish=false`
+  mode), a procfs that hides other processes, or a Docker that is installed
+  but cannot be asked about builder containers makes the coverage incomplete
+  and the run invalid. Any build seen after preflight invalidates the run even
   if it has gone by the end; the run stops itself, keeps the evidence and
   never stops anybody else's process.
 - **Topologies and launchers.** `Engine` takes keyword-only `topology`
@@ -226,7 +229,8 @@ directory.
 ## Reproducing a measurement
 
 1. Build the release engine with the features the case needs:
-   `cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer`.
+   `cargo build --release --locked -p otel-arrow-dfe --bin df_engine
+   --features series-parquet,aws,durable-buffer`.
    The fixture suite additionally needs the same command without `--release`.
 2. Read the run's `environment` block. Match the machine, the core
    allocation and the build profile, or expect a new baseline rather than a

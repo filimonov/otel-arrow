@@ -73,7 +73,7 @@ jobs:
       - name: Install producer and DuckDB dependencies
         run: |
           python3 -m venv /tmp/series-parquet-venv
-          /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+          /tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
       - name: Build the real engine
         run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
       - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
@@ -130,7 +130,7 @@ jobs:
       - name: Install producer and DuckDB dependencies
         run: |
           python3 -m venv /tmp/series-parquet-venv
-          /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+          /tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
       # Built before any step takes the host measurement lease, so a measured
       # step never runs beside a compiler.
       - name: Build the release engine for measurement

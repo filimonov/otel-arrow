@@ -452,6 +452,9 @@ def local_experiment(spec, result, output_dir, controls, *, restart=False,
     back through both readers.
     """
     output_dir = Path(output_dir)
+    # A host that cannot publish records monitor tick gaps as an observation
+    # rather than failing the coverage gate on them.
+    controls.coverage_gaps_hard = publishable
     buffered = spec.topology == "buffered"
     topology = measurement.core_topology()
     allocation = measurement.role_allocation(
@@ -1229,7 +1232,7 @@ def run_case(spec: measurement.RunSpec, output_dir, *, experiment=None,
             decision = measurement.evaluate_baseline(result)
             if decision["action"] == "created":
                 candidate = result.pop("baseline_candidate")
-                path = measurement.write_json_atomic(
+                path = measurement.write_published_json(
                     output_dir / decision["baseline_name"], candidate
                 )
                 result["baseline_files"].append(measurement.file_entry(path))
