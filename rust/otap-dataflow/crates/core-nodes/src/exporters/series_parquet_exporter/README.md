@@ -1368,16 +1368,17 @@ or aggregate cumulative metrics and gauges in the SDK.
 - A flush runs on the worker's own core, beside the loop that admits
   requests, delivers acks and nacks, answers telemetry and watches the
   shutdown deadline. It works in bounded steps and returns to that loop
-  between every two: a step encodes merge keys, pops merge rows or
-  assembles the chunk's columns until it has done about 8,192 rows of work
-  or 1 MiB of key bytes, and producing, encoding and flushing a chunk each
-  get a poll of their own. The two steps that cannot be sliced without changing
-  the file are encoding one chunk, bounded by `sorting.merge_chunk_bytes`,
-  and closing one row group, bounded by `parquet.row_group_bytes`. At the
-  defaults, on the largest block the default budgets admit, the longest step
-  measured 20 to 24 ms, and the flush acted on a cancellation within 17 to
-  22 ms of it.
-  Moving the flush off the core is future work.
+  between every two. A step encodes merge keys, pops merge rows or copies
+  rows into the chunk's columns until it has done about 8,192 rows of work
+  or 1 MiB of key bytes. The columns are sized up front and filled in
+  place, so finishing one copies nothing more. Producing, encoding and
+  flushing a chunk each get a poll of their own. The two steps that cannot
+  be sliced without changing the file are encoding one chunk, bounded by
+  `sorting.merge_chunk_bytes`, and closing one row group, bounded by
+  `parquet.row_group_bytes`. At the defaults, on the largest block the
+  default budgets admit, the longest step measured 19 to 24 ms (28 ms once,
+  on a cold first write), and the flush acted on a cancellation within 13
+  to 21 ms of it. Moving the flush off the core is future work.
 
 ## Related Docs
 

@@ -16,7 +16,9 @@ fixtures, each with 3 uncancelled and 20 cancelled writes, under
 - `files-final.sha256`: the same for the library at 75732cafd.
 - `files-head-545c9f038.sha256`: the same for the library at 545c9f038,
   after review fix round 1.
-- All three manifests are identical. They show that the output is the same
+- `files-head-8d5be48eb.sha256`: the same for the library at 8d5be48eb,
+  after review fix round 2 (columns built in place).
+- All four manifests are identical. They show that the output is the same
   before and after the change, on these four inputs. The unit test
   `sliced_merge_matches_the_unsliced_merge_and_a_stable_sort` shows
   something else: that the current merge's output does not depend on its
@@ -32,3 +34,8 @@ reading, where it takes the cleanup deadline, and makes 7 uncancelled and
   545c9f038, its workspace reading disabled (the old sink has none).
 - `*-round1-head.json`: library and probe at 545c9f038.
 - `probe-binaries-round1.sha256`: the two executables.
+
+Review fix round 2 re-ran the changed build only; the before side stays
+round 1's. `*-round2-head.json` is the library and probe at 8d5be48eb,
+with 7 uncancelled and 20 cancelled writes per fixture.
+`probe-binaries-round2.sha256` is its executable.
