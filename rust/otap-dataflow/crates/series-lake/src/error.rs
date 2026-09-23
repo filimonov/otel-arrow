@@ -54,7 +54,14 @@ pub enum RefuseReason {
     BlockFull,
     /// The active block already holds `max_requests_per_block` tokens.
     TooManyRequests,
-    /// Malformed content: duplicate keys, nesting too deep, bad histogram, ...
+    /// A nested value is deeper than `ingress.max_nesting_depth`, the limit
+    /// carried here.
+    ///
+    /// Distinct from [`RefuseReason::Invalid`]: the content is well formed,
+    /// it only exceeds a configured bound, so an operator can tell which
+    /// setting refused it.
+    TooDeep(usize),
+    /// Malformed content: duplicate keys, bad histogram, ...
     Invalid(String),
     /// Unsupported signal or point kind under the reject policy.
     Unsupported(String),

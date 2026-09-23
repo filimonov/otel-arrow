@@ -89,6 +89,7 @@ pub static SERIES_PARQUET: ExporterFactory<OtapPdata> = ExporterFactory {
             })?;
         let mut exporter = SeriesParquet::new(config);
         exporter.metrics = Some(metrics::Metrics::register(&pipeline, &exporter.config.lake));
+        exporter.num_cores = pipeline.num_cores();
         if exporter.config.storage.requires_bearer_token_provider() {
             exporter.token_provider = Some(
                 capabilities
@@ -118,6 +119,9 @@ pub struct SeriesParquet {
     >,
     /// Instruments registered by the factory, moved into the worker at start.
     metrics: Option<metrics::Metrics>,
+    /// Cores the engine runs this pipeline on: one worker, and one memory
+    /// budget, per core.
+    num_cores: usize,
     /// Object store injected in place of the one the configuration names.
     ///
     /// The only seam a test uses to drive the real [`Exporter::start`] entry
@@ -135,6 +139,7 @@ impl SeriesParquet {
             config,
             token_provider: None,
             metrics: None,
+            num_cores: 1,
             #[cfg(test)]
             store_override: None,
         }
@@ -168,15 +173,113 @@ impl Exporter<OtapPdata> for SeriesParquet {
             })?;
         #[cfg(test)]
         let store = self.store_override.take().unwrap_or(store);
-        run(
+        let storage = storage_kind(&self.config.storage);
+        run_announced(
             self.config.clone(),
             store,
             Arc::new(lake::clock::SystemWallClock),
             inbox,
             effects,
             self.metrics.take(),
+            Startup {
+                storage,
+                num_cores: self.num_cores,
+            },
         )
         .await
+    }
+}
+
+/// The name of a storage backend, for the start event.
+///
+/// The cloud variants are compiled in by features of the `otap` crate, which
+/// this crate cannot name in a `cfg`, so they are named by their variant: the
+/// leading identifier of the `Debug` rendering, never the fields after it,
+/// which may hold credentials.
+fn storage_kind(storage: &StorageType) -> String {
+    match storage {
+        StorageType::File { .. } => "file".to_owned(),
+        #[allow(unreachable_patterns)]
+        other => format!("{other:?}")
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    }
+}
+
+/// What the start event reports beyond the worker itself.
+struct Startup {
+    /// Storage backend name.
+    storage: String,
+    /// Workers the engine runs, one per core.
+    num_cores: usize,
+}
+
+/// The grace the engine grants a signal-driven shutdown (SIGINT, SIGTERM).
+///
+/// A worker whose worst-case shutdown -- one window, then a flush and its
+/// abort for each of the two blocks -- does not fit it is cut off before it
+/// can decide what it holds.
+const SIGNAL_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Physical memory of the host, in bytes, where the platform reports it.
+fn physical_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// Emit the start event and the configuration warnings a worker can judge
+/// at start-up.
+///
+/// One event carries everything an operator needs to find this worker's
+/// files -- writer id, boot id, storage -- and the budget it runs under.
+/// The warnings are conditions that do not stop the node but predict a
+/// failure: every core's budget together exceeding physical memory, and a
+/// worst-case shutdown longer than the signal shutdown grace.
+fn announce(worker: &worker::Worker, startup: &Startup) {
+    let budget = worker.budget_bytes();
+    let total = budget.saturating_mul(startup.num_cores as u64);
+    otel_info!(
+        "series_parquet.start",
+        writer_id = worker.cfg.lake.writer_id.as_str(),
+        boot_id = worker.boot_id.as_str(),
+        storage = startup.storage.as_str(),
+        num_cores = startup.num_cores,
+        memory_budget_bytes = budget
+    );
+    if let Some(physical) = physical_memory_bytes()
+        && total > physical
+    {
+        otel_warn!(
+            "series_parquet.memory_budget.oversubscribed",
+            memory_budget_bytes = budget,
+            num_cores = startup.num_cores,
+            total_budget_bytes = total,
+            physical_memory_bytes = physical,
+            message = "every worker's memory budget together exceeds physical memory; lower \
+                       the block and ingress budgets or run on fewer cores"
+        );
+    }
+    let window = &worker.cfg.window;
+    let bound = window.interval.saturating_add(
+        window
+            .flush_retry_deadline
+            .saturating_add(worker.cfg.lake.upload.abort_timeout)
+            .saturating_mul(2),
+    );
+    if bound > SIGNAL_SHUTDOWN_GRACE {
+        otel_warn!(
+            "series_parquet.shutdown.grace_exceeded",
+            shutdown_bound = ?bound,
+            signal_grace = ?SIGNAL_SHUTDOWN_GRACE,
+            message = "window.interval + 2 * (window.flush_retry_deadline + \
+                       upload.abort_timeout) exceeds the signal shutdown grace; a SIGTERM may \
+                       cut off the last flush, so shut down through the admin API with a \
+                       longer timeout"
+        );
     }
 }
 
@@ -194,6 +297,7 @@ impl Exporter<OtapPdata> for SeriesParquet {
 /// queued in the notifier, which the loop keeps serving until the deadline.
 /// Normal completions never take the notifier's last slot, so a saturated
 /// node can still queue at least one such refusal.
+#[cfg(test)]
 async fn run(
     cfg: config::Config,
     store: Arc<dyn object_store::ObjectStore>,
@@ -202,9 +306,54 @@ async fn run(
     effects: EffectHandler<OtapPdata>,
     metrics: Option<metrics::Metrics>,
 ) -> Result<TerminalState, Error> {
+    run_announced(
+        cfg,
+        store,
+        wall,
+        inbox,
+        effects,
+        metrics,
+        Startup {
+            storage: "test".to_owned(),
+            num_cores: 1,
+        },
+    )
+    .await
+}
+
+/// [`run`], with what the start event reports beyond the worker itself.
+async fn run_announced(
+    cfg: config::Config,
+    store: Arc<dyn object_store::ObjectStore>,
+    wall: Arc<dyn lake::clock::WallClock>,
+    inbox: ExporterInbox<OtapPdata>,
+    effects: EffectHandler<OtapPdata>,
+    metrics: Option<metrics::Metrics>,
+    startup: Startup,
+) -> Result<TerminalState, Error> {
     let mut worker = worker::Worker::new(cfg, store, wall, effects);
-    worker.metrics = metrics;
+    worker.set_metrics(metrics);
+    announce(&worker, &startup);
     drive(&mut worker, inbox).await
+}
+
+/// Emit the outcome of one shutdown: what the worker took in over its life,
+/// how it was decided, and how long the drain took.
+fn summarize(worker: &worker::Worker, since: Option<Instant>, deadline_exceeded: bool) {
+    let outcomes = worker.notify.outcomes();
+    let acked = outcomes[token::Outcome::Ack as usize];
+    let nacked = outcomes.iter().sum::<u64>() - acked;
+    let duration =
+        since.map(|since| otel_arrow_dfe_engine::clock::now().saturating_duration_since(since));
+    otel_info!(
+        "series_parquet.shutdown.complete",
+        accepted = worker.accepted,
+        acked = acked,
+        nacked = nacked,
+        abandoned = worker.abandoned,
+        deadline_exceeded = deadline_exceeded,
+        duration = ?duration
+    );
 }
 
 /// The select loop itself, over a worker the caller owns.
@@ -226,6 +375,8 @@ async fn drive(
     // sender is still alive, dropping whatever it sends next without a
     // decision.
     let mut closed: Option<Instant> = None;
+    // When the Shutdown control message arrived, for the drain duration.
+    let mut closed_at: Option<Instant> = None;
     let mut notify_turns = 0_usize;
     loop {
         if let Some(deadline) = closed
@@ -237,15 +388,11 @@ async fn drive(
             // terminal-time concern, and the counters that must not be missed
             // are recorded at the lifecycle transitions themselves.
             worker.sample_metrics();
-            return Ok(TerminalState::new(
-                deadline,
-                worker
-                    .metrics
-                    .as_mut()
-                    .map_or_else(Vec::new, metrics::Metrics::snapshots),
-            ));
+            summarize(worker, closed_at, false);
+            return Ok(TerminalState::new(deadline, worker.metric_snapshots()));
         }
         let accept = worker.accept();
+        worker.observe_admission(accept);
         let deadline = worker.deadline;
         tokio::select! {
             biased;
@@ -258,15 +405,13 @@ async fn drive(
                     None => std::future::pending().await,
                 }
             } => {
-                otel_warn!("series_parquet.shutdown_deadline_elapsed");
+                otel_warn!("series_parquet.shutdown.deadline_exceeded");
                 worker.abandon().await;
                 worker.sample_metrics();
+                summarize(worker, closed_at, true);
                 return Ok(TerminalState::new(
                     deadline.expect("the deadline branch only fires with a deadline"),
-                    worker
-                        .metrics
-                        .as_mut()
-                        .map_or_else(Vec::new, metrics::Metrics::snapshots),
+                    worker.metric_snapshots(),
                 ));
             }
 
@@ -302,7 +447,7 @@ async fn drive(
             result = worker.notify.next(),
                 if !worker.notify.is_empty() && notify_turns < worker.cfg.notify_batch => {
                 if let Err(e) = result {
-                    otel_warn!("series_parquet.notify_failed", error = %e);
+                    otel_warn!("series_parquet.notify.failed", error = %e);
                 }
                 notify_turns += 1;
             }
@@ -318,7 +463,7 @@ async fn drive(
                 }
             } => {
                 if let Err(error) = cleaned {
-                    otel_warn!("series_parquet.cleanup_failed", error = %error);
+                    otel_warn!("series_parquet.flush.cleanup_failed", error = %error);
                 }
                 let _ = worker.cleaning.take();
                 if worker.rotation_requested {
@@ -356,15 +501,14 @@ async fn drive(
                     Ok(Message::Control(NodeControlMsg::Shutdown { deadline, reason })) => {
                         otel_info!("series_parquet.shutdown", reason = reason);
                         closed = Some(deadline);
+                        closed_at = Some(otel_arrow_dfe_engine::clock::now());
                         worker.shutdown(deadline);
                     }
                     Ok(Message::Control(NodeControlMsg::CollectTelemetry {
                         mut metrics_reporter,
                     })) => {
                         worker.sample_metrics();
-                        if let Some(m) = &mut worker.metrics {
-                            m.report(&mut metrics_reporter);
-                        }
+                        worker.report_metrics(&mut metrics_reporter);
                     }
                     Ok(Message::Control(_)) => {}
                     Err(e) => {
@@ -374,7 +518,7 @@ async fn drive(
                         // than the node shutting down. Nothing more can be
                         // received and no deadline was granted, so everything
                         // still held is decided before the error is reported.
-                        otel_warn!("series_parquet.inbox_failed", error = %e);
+                        otel_warn!("series_parquet.inbox.failed", error = %e);
                         worker.abandon().await;
                         return Err(e.into());
                     }

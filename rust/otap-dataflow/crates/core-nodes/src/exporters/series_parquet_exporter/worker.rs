@@ -46,7 +46,7 @@
 use super::config::Config;
 use super::flush::{self, FlushDone, FlushJob};
 use super::metrics::{
-    DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs, NackReason,
+    DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs, NackErrorType,
 };
 use super::token::{AckToken, Notifier, Outcome, sanitized};
 use super::window::Window;
@@ -108,6 +108,52 @@ impl RefusalLog {
         }
         self.last = Some(now);
         Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Open and closed history of pdata admission, for telemetry.
+///
+/// The node loop reports the gate once per turn; only a change of state reads
+/// the clock, so an open gate costs one comparison per turn.
+#[derive(Debug, Default)]
+pub(super) struct AdmissionGate {
+    /// When the current closure began, while admission is closed.
+    closed_since: Option<Instant>,
+    /// Transitions from open to closed.
+    closures: u64,
+    /// Time spent closed in closures that have ended.
+    closed_total: std::time::Duration,
+}
+
+impl AdmissionGate {
+    /// Record whether admission is open on this loop turn.
+    pub(super) fn observe(&mut self, open: bool) {
+        match (open, self.closed_since) {
+            (false, None) => {
+                self.closed_since = Some(clock::now());
+                self.closures += 1;
+            }
+            (true, Some(since)) => {
+                self.closed_total += clock::now().saturating_duration_since(since);
+                self.closed_since = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether admission is closed at `now`, how many closures began, and
+    /// the seconds spent closed, the closure in progress included.
+    pub(super) fn sample(&self, now: Instant) -> (bool, u64, f64) {
+        let current = self
+            .closed_since
+            .map_or(std::time::Duration::ZERO, |since| {
+                now.saturating_duration_since(since)
+            });
+        (
+            self.closed_since.is_some(),
+            self.closures,
+            (self.closed_total + current).as_secs_f64(),
+        )
     }
 }
 
@@ -181,8 +227,16 @@ impl Failure {
     /// neither is a client error.
     pub(super) fn outcome(&self) -> Outcome {
         match self {
-            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(_))) => {
-                Outcome::TooLarge
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(
+                excess,
+            ))) => match excess.budget {
+                lake::SizeBudget::Request => Outcome::RequestTooLarge,
+                lake::SizeBudget::Extracted | lake::SizeBudget::Table => Outcome::ExtractedTooLarge,
+                lake::SizeBudget::Row | lake::SizeBudget::Cell => Outcome::RowTooLarge,
+                lake::SizeBudget::Block => Outcome::BlockTooLarge,
+            },
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(_))) => {
+                Outcome::TooDeep
             }
             Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(_))) => {
                 Outcome::Unsupported
@@ -234,6 +288,12 @@ impl Failure {
                      reject; set unsupported: drop to keep the supported points, or route \
                      them to another exporter",
                     sanitized(what)
+                )
+            }
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(limit))) => {
+                format!(
+                    "a nested value exceeds ingress.max_nesting_depth ({limit}); flatten it in \
+                     the producer or raise the limit"
                 )
             }
             Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Invalid(detail))) => {
@@ -357,6 +417,15 @@ pub(super) struct Worker {
     pub(super) samples: u64,
     /// Rate limit of the per-request refusal WARN.
     refusals: RefusalLog,
+    /// Whether pdata admission is open, and how long it has been closed.
+    pub(super) admission: AdmissionGate,
+    /// Random id of this worker's incarnation, the file-name segment that
+    /// keeps two runs of one `writer_id` apart.
+    pub(super) boot_id: String,
+    /// Requests handed to [`Worker::admit`], whatever became of them.
+    pub(super) accepted: u64,
+    /// Completions decided by [`Worker::abandon`] at the shutdown deadline.
+    pub(super) abandoned: u64,
     /// Registered instruments, once the node has a pipeline context.
     ///
     /// `None` for a worker driven directly by a test, which keeps every call
@@ -388,16 +457,15 @@ impl Worker {
         };
         // The sink bounds its abort on the engine clock like every other wait
         // of this node, so a simulated clock governs it too.
+        let naming = lake::sink::FileNaming::new(&cfg.lake.writer_id);
+        let boot_id = naming.boot_id.clone();
         let sink = Rc::new(
-            lake::sink::Sink::new(
-                store,
-                cfg.lake.clone(),
-                lake::sink::FileNaming::new(&cfg.lake.writer_id),
-            )
-            .with_clock(lake::sink::SinkClock {
-                now: clock::now,
-                sleep_until: clock::sleep_until,
-            }),
+            lake::sink::Sink::new(store, cfg.lake.clone(), naming).with_clock(
+                lake::sink::SinkClock {
+                    now: clock::now,
+                    sleep_until: clock::sleep_until,
+                },
+            ),
         );
         // One credit per in-flight request in each of the two blocks a window
         // pair can hold. Admission stops one short of it, so the last slot is
@@ -422,6 +490,10 @@ impl Worker {
             token_high_water: size_of::<AckToken>(),
             samples: 0,
             refusals: RefusalLog::default(),
+            admission: AdmissionGate::default(),
+            boot_id,
+            accepted: 0,
+            abandoned: 0,
             metrics: None,
             accounting: SeriesMemoryAccounting::register(),
         }
@@ -580,6 +652,7 @@ impl Worker {
     /// ACTIVE block, or the whole extraction parked; none leaves it without an
     /// owner.
     pub(super) fn admit(&mut self, data: OtapPdata) {
+        self.accepted += 1;
         match self.prepare(data) {
             Prepared::Ready(pending) => {
                 self.token_high_water = self.token_high_water.max(pending.token.bytes());
@@ -746,7 +819,7 @@ impl Worker {
                 .map(|n| n as u64);
             let limit = excess.map(|(_, _, limit)| limit as u64);
             otel_warn!(
-                "series_parquet.request_failed",
+                "series_parquet.request.failed",
                 outcome = outcome.reason(),
                 signal = ?token.signal(),
                 limit_setting = setting,
@@ -838,7 +911,7 @@ impl Worker {
             if let Some(metrics) = &mut self.metrics {
                 metrics.worker.flush_failures.add(1);
             }
-            otel_warn!("series_parquet.seal_failed", error = %error);
+            otel_warn!("series_parquet.seal.failed", error = %error);
             self.fail_active(Outcome::Storage);
             return;
         }
@@ -936,18 +1009,27 @@ impl Worker {
                                 }
                             }
                             for (dataset, _, rows) in &report.files {
-                                let bucket = metrics.written.with(DatasetAttrs {
-                                    dataset: (*dataset).into(),
-                                });
+                                let bucket = metrics.written.with(DatasetAttrs::from(*dataset));
                                 bucket.rows_written.add(*rows as u64);
                                 bucket.files_written.add(1);
                             }
                         }
+                        // Every object of a block shares one file name and
+                        // differs only in its dataset directory, so the first
+                        // path and the count name the whole set.
+                        let path = report
+                            .files
+                            .first()
+                            .map_or_else(String::new, |(_, path, _)| path.to_string());
                         otel_info!(
-                            "series_parquet.block_committed",
+                            "series_parquet.block.committed",
+                            window_start = job.window_start_secs,
+                            seq = job.seq,
+                            path = path,
                             files = report.files.len(),
                             requests = job.tokens.len(),
                             bytes = job.bytes,
+                            attempts = finished.attempts,
                             duration = ?clock::now().saturating_duration_since(job.started)
                         );
                         Outcome::Ack
@@ -960,7 +1042,7 @@ impl Worker {
                             }
                         }
                         otel_error!(
-                            "series_parquet.flush_failed",
+                            "series_parquet.flush.failed",
                             error = %error,
                             attempts = finished.attempts,
                             message = "Block failed before durable completion"
@@ -978,7 +1060,7 @@ impl Worker {
                 if let Some(metrics) = &mut self.metrics {
                     metrics.worker.flush_failures.add(1);
                 }
-                otel_warn!("series_parquet.flush_task_failed", error = %error);
+                otel_warn!("series_parquet.flush.task_failed", error = %error);
                 self.failed_outcome()
             }
         };
@@ -995,6 +1077,89 @@ impl Worker {
         // completion from here on, so nothing a producer waits for is held by
         // it; what it holds back is the next write to the same file names.
         self.cleaning = Some(job);
+    }
+
+    /// Bytes this worker's configuration allows it to hold: two blocks, one
+    /// parked extraction, a full descriptor cache, a token per request slot,
+    /// and the sort, merge, writer, upload and conversion workspaces a flush
+    /// may allocate. Those workspace terms are engineering reservations
+    /// rather than measurements.
+    ///
+    /// Every term is derived from unbounded configuration values, so the
+    /// arithmetic saturates rather than overflowing: a budget written to mean
+    /// "no practical limit" reports `u64::MAX`, not a panic.
+    pub(super) fn budget_bytes(&self) -> u64 {
+        let token = self.token_high_water.max(self.notify.token_high_water()) as u64;
+        let cfg = &self.cfg.lake;
+        let bytes = |n: usize| n as u64;
+        let sort = bytes(cfg.sorting.run_target_bytes).saturating_mul(2);
+        let merge = bytes(cfg.sorting.merge_chunk_bytes).saturating_mul(2);
+        let writer = bytes(cfg.parquet.writer_limit_bytes).saturating_mul(3);
+        let upload = bytes(cfg.upload.part_bytes)
+            .saturating_mul(bytes(cfg.upload.concurrency).saturating_add(1))
+            .saturating_add(bytes(cfg.sorting.merge_chunk_bytes));
+        let conversion = bytes(cfg.ingress.max_request_bytes).saturating_mul(4);
+        [
+            bytes(cfg.ingress.max_block_bytes).saturating_mul(2),
+            bytes(cfg.ingress.max_extracted_bytes),
+            bytes(self.cfg.cache_entries).saturating_mul(CACHE_ENTRY_BYTES),
+            bytes(cfg.ingress.max_requests_per_block)
+                .saturating_mul(2)
+                .saturating_mul(token),
+            sort,
+            merge,
+            writer,
+            upload,
+            conversion,
+            FIXED_WORKSPACE_BYTES,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Install the node's registered instruments.
+    ///
+    /// The shared `exporter.exports` set moves into the notifier, which is
+    /// where every request is decided.
+    pub(super) fn set_metrics(&mut self, mut metrics: Option<Metrics>) {
+        self.notify.exports = metrics.as_mut().and_then(Metrics::take_exports);
+        self.metrics = metrics;
+    }
+
+    /// Hand every instrument to the collector on a `CollectTelemetry`.
+    pub(super) fn report_metrics(
+        &mut self,
+        reporter: &mut otel_arrow_dfe_telemetry::reporter::MetricsReporter,
+    ) {
+        if let Some(exports) = &mut self.notify.exports {
+            let _ = reporter.report_measurement(exports);
+        }
+        if let Some(metrics) = &mut self.metrics {
+            metrics.report(reporter);
+        }
+    }
+
+    /// Take every instrument for terminal handoff.
+    pub(super) fn metric_snapshots(
+        &mut self,
+    ) -> Vec<otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot> {
+        let mut out = self
+            .notify
+            .exports
+            .as_mut()
+            .map_or_else(Vec::new, |exports| exports.terminal_snapshots());
+        if let Some(metrics) = &mut self.metrics {
+            out.extend(metrics.snapshots());
+        }
+        out
+    }
+
+    /// Record whether pdata admission is open on this loop turn.
+    ///
+    /// A gate closed by the latched shutdown is not backpressure, so it ends
+    /// any closure in progress rather than starting one.
+    pub(super) fn observe_admission(&mut self, accept: bool) {
+        self.admission.observe(accept || self.deadline.is_some());
     }
 
     /// Publish everything the worker can be asked about right now.
@@ -1037,30 +1202,7 @@ impl Worker {
                     .sum::<usize>()
                 + parked.token.bytes()
         });
-        let token = self.token_high_water.max(self.notify.token_high_water()) as u64;
-        let cfg = &self.cfg.lake;
-        // Every term is derived from unbounded configuration values, so the
-        // arithmetic saturates rather than overflowing: a budget written to
-        // mean "no practical limit" reports `u64::MAX`, not a panic.
-        let bytes = |n: usize| n as u64;
-        let cache = bytes(self.cache.len()).saturating_mul(CACHE_ENTRY_BYTES);
-        let sort = bytes(cfg.sorting.run_target_bytes).saturating_mul(2);
-        let merge = bytes(cfg.sorting.merge_chunk_bytes).saturating_mul(2);
-        let writer = bytes(cfg.parquet.writer_limit_bytes).saturating_mul(3);
-        let upload = bytes(cfg.upload.part_bytes)
-            .saturating_mul(bytes(cfg.upload.concurrency).saturating_add(1))
-            .saturating_add(bytes(cfg.sorting.merge_chunk_bytes));
-        let conversion = bytes(cfg.ingress.max_request_bytes).saturating_mul(4);
-        let workspace = [
-            sort,
-            merge,
-            writer,
-            upload,
-            conversion,
-            FIXED_WORKSPACE_BYTES,
-        ]
-        .into_iter()
-        .fold(0_u64, u64::saturating_add);
+        let cache = (self.cache.len() as u64).saturating_mul(CACHE_ENTRY_BYTES);
         let spare_tokens = self
             .active
             .tokens
@@ -1079,17 +1221,7 @@ impl Worker {
             + self.notify.bytes() as u64
             + (spare_tokens * size_of::<AckToken>()) as u64;
         self.accounting.set(accounted);
-        let budget = [
-            bytes(cfg.ingress.max_block_bytes).saturating_mul(2),
-            bytes(cfg.ingress.max_extracted_bytes),
-            bytes(self.cfg.cache_entries).saturating_mul(CACHE_ENTRY_BYTES),
-            bytes(cfg.ingress.max_requests_per_block)
-                .saturating_mul(2)
-                .saturating_mul(token),
-            workspace,
-        ]
-        .into_iter()
-        .fold(0_u64, u64::saturating_add);
+        let budget = self.budget_bytes();
         let oldest = self
             .active
             .tokens
@@ -1127,20 +1259,31 @@ impl Worker {
             metrics.worker.notify_token_bytes.set(notify_bytes);
             metrics.worker.notify_failures.observe(failures);
             metrics.worker.acks.observe(outcomes[Outcome::Ack as usize]);
-            for (outcome, reason) in [
-                (Outcome::Storage, NackReason::Storage),
-                (Outcome::TooLarge, NackReason::TooLarge),
-                (Outcome::Invalid, NackReason::Invalid),
-                (Outcome::Unsupported, NackReason::Unsupported),
-                (Outcome::Shutdown, NackReason::Shutdown),
-                (Outcome::Internal, NackReason::Internal),
+            for (outcome, error_type) in [
+                (Outcome::Storage, NackErrorType::Storage),
+                (Outcome::RequestTooLarge, NackErrorType::RequestTooLarge),
+                (Outcome::ExtractedTooLarge, NackErrorType::ExtractedTooLarge),
+                (Outcome::RowTooLarge, NackErrorType::RowTooLarge),
+                (Outcome::BlockTooLarge, NackErrorType::BlockTooLarge),
+                (Outcome::TooDeep, NackErrorType::TooDeep),
+                (Outcome::Invalid, NackErrorType::Invalid),
+                (Outcome::Unsupported, NackErrorType::Unsupported),
+                (Outcome::Shutdown, NackErrorType::Shutdown),
+                (Outcome::Internal, NackErrorType::Internal),
             ] {
                 metrics
                     .nacks
-                    .with(NackAttrs { reason })
+                    .with(NackAttrs { error_type })
                     .nacks
                     .observe(outcomes[outcome as usize]);
             }
+            let (closed, closures, closed_secs) = self.admission.sample(now);
+            metrics.worker.admission_closed.set(u64::from(closed));
+            metrics.worker.admission_closures.observe(closures);
+            metrics
+                .worker
+                .admission_closed_duration
+                .observe(closed_secs);
             metrics.worker.oldest.set(oldest.map_or(0.0, |received| {
                 now.saturating_duration_since(received).as_secs_f64()
             }));
@@ -1227,11 +1370,17 @@ impl Worker {
         }
         // Phase one: decide and deliver. Nothing here awaits, and nothing here
         // cancels.
+        // Every completion still held by a block or the parking slot is
+        // decided here by the deadline; the notifier's own queue was already
+        // decided before.
+        let mut abandoned = 0_u64;
         if let Some(pending) = self.pending.take() {
+            abandoned += 1;
             self.notify.push(pending.token, Outcome::Shutdown);
         }
         let mut flushing = self.flushing.take();
         if let Some(job) = &mut flushing {
+            abandoned += job.tokens.len() as u64;
             // Reported exactly as the `Error::Cancelled` completion branch
             // reports it: the write will not put its block in object storage,
             // and the reason it will not is that it is about to be cancelled.
@@ -1245,6 +1394,13 @@ impl Worker {
                 );
                 metrics.worker.flush_failures.add(1);
                 metrics.worker.flush_cancelled.add(1);
+                // The retries this write spent are counted like a completed
+                // flush counts them, or an outage that runs into the deadline
+                // would report none at all.
+                metrics
+                    .worker
+                    .flush_retries
+                    .add(job.attempts.get().saturating_sub(1));
             }
             for token in std::mem::take(&mut job.tokens) {
                 self.notify.push(token, Outcome::Shutdown);
@@ -1253,7 +1409,9 @@ impl Worker {
         // A block whose decision has already been published owes no completion;
         // what it still owns is the write its supervisor is unwinding.
         let mut cleaning = self.cleaning.take();
+        abandoned += self.active.tokens.len() as u64;
         self.fail_active(Outcome::Shutdown);
+        self.abandoned += abandoned;
         self.notify.drain_now();
         // Phase two: cancel and release, with one shared bound so a node
         // holding a write and a cleanup does not wait twice.

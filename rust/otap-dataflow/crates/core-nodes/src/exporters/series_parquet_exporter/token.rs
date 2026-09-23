@@ -21,8 +21,13 @@ use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg};
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, clock};
+use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_pdata::OtapPayload;
+use otel_arrow_dfe_telemetry::common_attributes::{
+    Outcome as ExportOutcome, SignalOutcomeAttributes,
+};
+use otel_arrow_dfe_telemetry::metrics::MeasurementMetricSet;
 use std::collections::VecDeque;
 use std::future::{Future, pending};
 use std::pin::Pin;
@@ -91,7 +96,7 @@ impl AckToken {
 
 /// How a request was decided, in the form the sender is told about it.
 ///
-/// The three refusals are separate variants rather than one, so the counters
+/// Each refusal rule is a separate variant rather than one, so the counters
 /// keep saying which validation rule rejected a request after the error value
 /// itself has been dropped with the payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +104,17 @@ impl AckToken {
 pub(super) enum Outcome {
     /// The request is durable.
     Ack,
-    /// The request exceeded a size budget.
-    TooLarge,
+    /// The request exceeded `ingress.max_request_bytes`.
+    RequestTooLarge,
+    /// The extracted request or one decoded attribute table exceeded
+    /// `ingress.max_extracted_bytes`.
+    ExtractedTooLarge,
+    /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.
+    RowTooLarge,
+    /// The request's worst case in one block exceeded `window.max_block_bytes`.
+    BlockTooLarge,
+    /// A nested value exceeded `ingress.max_nesting_depth`.
+    TooDeep,
     /// The request's content could not be used.
     Invalid,
     /// The request's signal is not handled by this exporter.
@@ -115,7 +129,7 @@ pub(super) enum Outcome {
 }
 
 /// Number of [`Outcome`] variants, and so the width of the counter array.
-pub(super) const OUTCOMES: usize = 7;
+pub(super) const OUTCOMES: usize = 11;
 
 /// Longest detail an error may contribute to a nack reason, in bytes.
 ///
@@ -149,7 +163,11 @@ impl Outcome {
     pub(super) fn reason(self) -> &'static str {
         match self {
             Self::Ack => "ack",
-            Self::TooLarge => "too_large",
+            Self::RequestTooLarge => "request_too_large",
+            Self::ExtractedTooLarge => "extracted_too_large",
+            Self::RowTooLarge => "row_too_large",
+            Self::BlockTooLarge => "block_too_large",
+            Self::TooDeep => "too_deep",
             Self::Invalid => "invalid",
             Self::Unsupported => "unsupported",
             Self::Storage => "storage",
@@ -163,8 +181,15 @@ impl Outcome {
     pub(super) fn sentence(self) -> &'static str {
         match self {
             Self::Ack => "stored",
-            Self::TooLarge => {
+            Self::RequestTooLarge
+            | Self::ExtractedTooLarge
+            | Self::RowTooLarge
+            | Self::BlockTooLarge => {
                 "the request exceeds a series_parquet size budget; split the batch upstream"
+            }
+            Self::TooDeep => {
+                "the request nests values deeper than ingress.max_nesting_depth; flatten them \
+                 in the producer"
             }
             Self::Invalid => "the request content is invalid; fix the producer",
             Self::Unsupported => {
@@ -185,7 +210,16 @@ impl Outcome {
 
     /// Whether the sender must change the request before retrying it.
     pub(super) fn refused(self) -> bool {
-        matches!(self, Self::TooLarge | Self::Invalid | Self::Unsupported)
+        matches!(
+            self,
+            Self::RequestTooLarge
+                | Self::ExtractedTooLarge
+                | Self::RowTooLarge
+                | Self::BlockTooLarge
+                | Self::TooDeep
+                | Self::Invalid
+                | Self::Unsupported
+        )
     }
 }
 
@@ -227,6 +261,9 @@ pub(super) struct Notifier {
     failures: u64,
     /// Largest single token observed, for capacity reporting.
     token_high_water: usize,
+    /// The shared `exporter.exports` outcome set, when the node registered
+    /// one: every decision is recorded here once, at the moment it is taken.
+    pub(super) exports: Option<MeasurementMetricSet<ExporterExportMetrics>>,
 }
 
 impl Notifier {
@@ -244,6 +281,31 @@ impl Notifier {
             outcomes: [0; OUTCOMES],
             failures: 0,
             token_high_water: 0,
+            exports: None,
+        }
+    }
+
+    /// Count one decision, once, when it is taken.
+    ///
+    /// The shared export set records it by signal and by the engine-wide
+    /// outcome class -- `success` for an ack, `refused` for a rule the
+    /// request broke, `failure` for everything the sender may retry -- with
+    /// the time from receipt to decision.
+    fn decided(&mut self, token: &AckToken, outcome: Outcome) {
+        self.token_high_water = self.token_high_water.max(token.bytes());
+        self.outcomes[outcome as usize] += 1;
+        if let Some(exports) = &mut self.exports {
+            let class = match outcome {
+                Outcome::Ack => ExportOutcome::Success,
+                refused if refused.refused() => ExportOutcome::Refused,
+                _ => ExportOutcome::Failure,
+            };
+            exports
+                .with(SignalOutcomeAttributes {
+                    signal: token.signal,
+                    outcome: class,
+                })
+                .record(clock::now().saturating_duration_since(token.received));
         }
     }
 
@@ -335,8 +397,7 @@ impl Notifier {
             self.len() + 1 + reserved <= self.capacity,
             "worker must reserve completion credit"
         );
-        self.token_high_water = self.token_high_water.max(token.bytes());
-        self.outcomes[outcome as usize] += 1;
+        self.decided(&token, outcome);
         self.queue.push_back((token, outcome, reason));
     }
 
@@ -452,8 +513,7 @@ impl Notifier {
 
         let (token, payload) = AckToken::split(data);
         drop(payload);
-        self.token_high_water = self.token_high_water.max(token.bytes());
-        self.outcomes[Outcome::Shutdown as usize] += 1;
+        self.decided(&token, Outcome::Shutdown);
         if self.sending.is_none() && self.queue.is_empty() {
             self.install(token, Outcome::Shutdown, None);
             let sending = self.sending.as_mut().expect("send was installed");
@@ -598,7 +658,7 @@ mod tests {
         let (handler, mut rx) = effects(4);
         let mut notify = Notifier::new(handler, 2);
 
-        for outcome in [Outcome::Ack, Outcome::TooLarge, Outcome::Storage] {
+        for outcome in [Outcome::Ack, Outcome::RowTooLarge, Outcome::Storage] {
             let (token, payload) = AckToken::split(empty_pdata());
             drop(payload);
             notify.push(token, outcome);
@@ -613,7 +673,7 @@ mod tests {
             PipelineCompletionMsg::DeliverNack { nack } => {
                 assert!(nack.permanent);
                 assert_eq!(nack.cause, NackCause::Refused);
-                assert_eq!(nack.reason, Outcome::TooLarge.sentence());
+                assert_eq!(nack.reason, Outcome::RowTooLarge.sentence());
             }
             other => panic!("expected a nack, got {other:?}"),
         }
@@ -626,7 +686,7 @@ mod tests {
             other => panic!("expected a nack, got {other:?}"),
         }
         assert_eq!(notify.outcomes()[Outcome::Ack as usize], 1);
-        assert_eq!(notify.outcomes()[Outcome::TooLarge as usize], 1);
+        assert_eq!(notify.outcomes()[Outcome::RowTooLarge as usize], 1);
         assert_eq!(notify.outcomes()[Outcome::Storage as usize], 1);
         assert_eq!(notify.failures(), 0);
         assert!(notify.is_empty());

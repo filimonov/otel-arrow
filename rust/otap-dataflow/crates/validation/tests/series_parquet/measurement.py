@@ -130,7 +130,7 @@ REQUIRED_EXPORTER_GAUGES = (
     "series_cache.entries",
     "memory.accounted_bytes",
     "memory.budget_bytes",
-    "oldest_unacked_seconds",
+    "oldest_unacked.age",
 )
 
 # Gauges that must all read zero before a worker counts as drained.

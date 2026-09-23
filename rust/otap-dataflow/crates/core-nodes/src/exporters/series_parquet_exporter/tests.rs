@@ -406,9 +406,13 @@ async fn a_storage_failure_after_validation_is_retryable() {
 /// Guarantees: every one of them is decided with a retryable `NodeShutdown`
 /// nack and the node returns its terminal state only after the upstream
 /// channel closes, so a node that has latched shutdown never returns while
-/// requests it could still be handed are outstanding.
+/// requests it could still be handed are outstanding; and the node ends with
+/// one `series_parquet.shutdown.complete` event summarizing that none was
+/// admitted, all three were nacked, none was left to the deadline, and the
+/// deadline was not reached.
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_decides_every_force_drained_request() {
+    let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
             let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(8);
@@ -478,7 +482,7 @@ async fn shutdown_decides_every_force_drained_request() {
             // collector with it: nothing else will ever report them.
             let snapshots = terminal.metrics();
             assert_eq!(
-                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
                 3,
                 "every force-drained request is counted as a shutdown refusal"
             );
@@ -488,6 +492,14 @@ async fn shutdown_decides_every_force_drained_request() {
                 "the completion channel took all three immediately"
             );
             assert_eq!(terminal_value(snapshots, "acks", &[]), 0);
+            let summary = events.named("series_parquet.shutdown.complete");
+            assert_eq!(summary.len(), 1, "{summary:?}");
+            let field = |name: &str| summary[0].fields.get(name).cloned();
+            assert_eq!(field("accepted"), Some(FieldValue::U64(0)));
+            assert_eq!(field("acked"), Some(FieldValue::U64(0)));
+            assert_eq!(field("nacked"), Some(FieldValue::U64(3)));
+            assert_eq!(field("abandoned"), Some(FieldValue::U64(0)));
+            assert_eq!(field("deadline_exceeded"), Some(FieldValue::Bool(false)));
             drop(control_tx);
         })
         .await;
@@ -545,15 +557,34 @@ async fn the_deadline_decides_every_outstanding_request() {
 
 /// Scenario: both failure classes are turned into the outcome the notifier
 /// delivers.
-/// Guarantees: a size refusal and an unsupported signal keep their own
-/// outcome, any other validation refusal is reported as invalid, and every
+/// Guarantees: a size refusal keeps the budget it exceeded as its outcome,
+/// excess nesting is its own outcome rather than invalid content, an
+/// unsupported signal keeps its own, any other validation refusal is
+/// reported as invalid, and every
 /// retryable failure becomes a storage outcome, so the phase a failure came
 /// from still decides what the sender is told.
 #[test]
 fn each_failure_class_maps_to_its_outcome() {
     assert_eq!(
         Failure::Permanent(lake::Error::too_large(lake::SizeBudget::Row, 2, 1)).outcome(),
-        Outcome::TooLarge
+        Outcome::RowTooLarge
+    );
+    for (budget, outcome) in [
+        (lake::SizeBudget::Request, Outcome::RequestTooLarge),
+        (lake::SizeBudget::Extracted, Outcome::ExtractedTooLarge),
+        (lake::SizeBudget::Table, Outcome::ExtractedTooLarge),
+        (lake::SizeBudget::Cell, Outcome::RowTooLarge),
+        (lake::SizeBudget::Block, Outcome::BlockTooLarge),
+    ] {
+        assert_eq!(
+            Failure::Permanent(lake::Error::too_large(budget, 2, 1)).outcome(),
+            outcome,
+            "{budget:?}"
+        );
+    }
+    assert_eq!(
+        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(32))).outcome(),
+        Outcome::TooDeep
     );
     assert_eq!(
         Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
@@ -1550,7 +1581,7 @@ async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
 /// Scenario: one request is refused by the extraction budget and, on a second
 /// worker, one by the block budget.
 /// Guarantees: each refusal is logged at WARN as
-/// `series_parquet.request_failed`, with the setting that refused it, the
+/// `series_parquet.request.failed`, with the setting that refused it, the
 /// size observed against it and the limit as numbers, and the reason sentence
 /// the producer is told states the same size and limit, at both stages, so an
 /// operator can see how far over which budget a producer is without
@@ -1560,7 +1591,7 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     let events = capture();
     /// The one refusal WARN logged since `before` events were recorded.
     fn refusal(events: &Capture, before: usize) -> CapturedEvent {
-        let logged = events.named("series_parquet.request_failed");
+        let logged = events.named("series_parquet.request.failed");
         assert_eq!(logged.len(), before + 1, "{logged:?}");
         let event = logged[before].clone();
         assert_eq!(event.level, tracing::Level::WARN);
@@ -1580,7 +1611,10 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     extract.admit(logs_pdata());
     let event = refusal(&events, 0);
     let field = |name: &str| event.fields.get(name).cloned();
-    assert_eq!(field("outcome"), Some(FieldValue::Str("too_large".into())));
+    assert_eq!(
+        field("outcome"),
+        Some(FieldValue::Str("extracted_too_large".into()))
+    );
     assert_eq!(field("signal"), Some(FieldValue::Debug("Logs".into())));
     assert_eq!(
         field("limit_setting"),
@@ -2510,7 +2544,7 @@ async fn series_emitted_requires_durable_completion() {
 async fn rotation_causes_and_flush_reasons_are_labelled() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            use super::metrics::{DatasetAttrs, DatasetLabel, EmitAttrs, EmitReason, FlushAttrs};
+            use super::metrics::{DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs};
             use super::metrics::{FlushReason, Metrics};
 
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -2604,8 +2638,11 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
                     "flush count for {reason:?}"
                 );
             }
-            for dataset in [DatasetLabel::LogsSeries, DatasetLabel::LogsValues] {
-                let written = metrics.written.get(DatasetAttrs { dataset });
+            for dataset in [
+                lake::schema::Dataset::LogsSeries,
+                lake::schema::Dataset::LogsValues,
+            ] {
+                let written = metrics.written.get(DatasetAttrs::from(dataset));
                 assert_eq!(written.files_written.get(), 3, "files for {dataset:?}");
                 assert!(written.rows_written.get() >= 3, "rows for {dataset:?}");
             }
@@ -2770,8 +2807,9 @@ async fn a_boundary_rotation_is_not_reported_under_a_stale_threshold_reason() {
 /// the node cancels it instead of waiting for it.
 /// Guarantees: the abandoned flush is counted exactly as a write that returned
 /// `Cancelled` would be -- one failure, one cancellation and one duration --
-/// so a node that always runs out of time does not silently report zero
-/// flush failures.
+/// and the retries it had already spent are counted too, so a node that
+/// always runs out of time does not silently report zero flush failures or
+/// zero retries.
 #[tokio::test(flavor = "current_thread")]
 async fn an_abandoned_flush_is_counted_as_cancelled() {
     tokio::task::LocalSet::new()
@@ -2793,12 +2831,22 @@ async fn an_abandoned_flush_is_counted_as_cancelled() {
             worker.admit(logs_pdata());
             worker.rotate();
             assert!(worker.flushing.is_some(), "a write is outstanding");
+            // Three attempts started: the write had been retried twice when
+            // the deadline decided it.
+            worker
+                .flushing
+                .as_ref()
+                .expect("a write is outstanding")
+                .attempts
+                .set(3);
 
             worker.abandon().await;
+            assert_eq!(worker.abandoned, 1, "the one admitted request");
             let metrics = worker.metrics.as_ref().expect("metrics");
             assert_eq!(metrics.worker.flush_failures.get(), 1);
             assert_eq!(metrics.worker.flush_cancelled.get(), 1);
             assert_eq!(metrics.worker.flush_duration.count, 1);
+            assert_eq!(metrics.worker.flush_retries.get(), 2);
         })
         .await;
 }
@@ -3746,7 +3794,7 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             drop(ticker);
         })
         .await;
-    let logged = events.named("series_parquet.flush_attempt_failed");
+    let logged = events.named("series_parquet.flush.attempt_failed");
     assert_eq!(
         logged.len(),
         2,
@@ -4016,7 +4064,7 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
 /// Scenario: a write attempt fails with an error no retry can cure, so the
 /// flush ends on that first attempt.
 /// Guarantees: the failed attempt still goes through the per-attempt WARN
-/// (`series_parquet.flush_attempt_failed`) with its attempt number and the
+/// (`series_parquet.flush.attempt_failed`) with its attempt number and the
 /// store's error, exactly as a retried failure does, so every failed attempt
 /// leaves a per-attempt trace and not only the block-level ERROR.
 #[tokio::test(flavor = "current_thread")]
@@ -4042,7 +4090,7 @@ async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
             assert_eq!(done.as_ref().expect("the flush resolves").attempts, 1);
         })
         .await;
-    let logged = events.named("series_parquet.flush_attempt_failed");
+    let logged = events.named("series_parquet.flush.attempt_failed");
     assert_eq!(logged.len(), 1, "one failed attempt, one WARN: {logged:?}");
     let event = &logged[0];
     assert_eq!(event.level, tracing::Level::WARN);
@@ -4577,7 +4625,7 @@ async fn shutdown_commits_both_blocks_before_deadline() {
             // Five requests in two blocks, plus the row-less marker.
             assert_eq!(terminal_value(snapshots, "acks", &[]), 6);
             assert_eq!(
-                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
                 0
             );
             // One values file per block: the block shutdown found flushing and
@@ -4711,7 +4759,7 @@ async fn saturated_inbox_shutdown_stays_bounded() {
 
             let snapshots = terminal.metrics();
             assert_eq!(
-                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
                 32,
                 "every force-drained request is decided exactly once"
             );
@@ -4949,7 +4997,7 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
                 .expect("the loop returns at its deadline");
             let snapshots = terminal.metrics();
             assert_eq!(
-                terminal_value(snapshots, "nacks", &[("reason", "shutdown")]),
+                terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
                 0,
                 "a block whose files exist is never refused"
             );
@@ -5120,4 +5168,261 @@ fn readme_states_operating_contract() {
         readme.contains(alloy),
         "README must reproduce the exact tested River config"
     );
+}
+
+/// Scenario: a worker's admission gate closes while a rotation waits for the
+/// flush slot, is sampled, reopens, and is sampled again; later a shutdown is
+/// latched with the gate closed.
+/// Guarantees: `admission.closed` reads 1 exactly while the gate is closed,
+/// `admission.closures` counts each open-to-closed transition once however
+/// many loop turns it lasts, `admission.closed.duration` accumulates the time
+/// spent closed, and a gate closed by shutdown is not reported as
+/// backpressure.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_closure_is_visible_in_metrics() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.set_metrics(Some(super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    )));
+    let sample = |worker: &mut Worker| {
+        worker.sample_metrics();
+        let m = &worker.metrics.as_ref().expect("metrics").worker;
+        (
+            m.admission_closed.get(),
+            m.admission_closures.get(),
+            m.admission_closed_duration.get(),
+        )
+    };
+
+    worker.observe_admission(true);
+    assert_eq!(sample(&mut worker), (0, 0, 0.0));
+
+    worker.rotation_requested = true;
+    for _ in 0..3 {
+        let accept = worker.accept();
+        assert!(!accept, "a pending rotation closes admission");
+        worker.observe_admission(accept);
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    let (closed, closures, secs) = sample(&mut worker);
+    assert_eq!(
+        (closed, closures),
+        (1, 1),
+        "one closure, however many turns"
+    );
+    assert!(secs >= 0.005, "the closure in progress is counted: {secs}");
+
+    worker.rotation_requested = false;
+    worker.observe_admission(worker.accept());
+    let (closed, closures, reopened) = sample(&mut worker);
+    assert_eq!((closed, closures), (0, 1));
+    assert!(reopened >= secs, "time closed only accumulates");
+
+    worker.shutdown(clock::now() + Duration::from_secs(30));
+    worker.observe_admission(worker.accept());
+    let (closed, closures, _) = sample(&mut worker);
+    assert_eq!(
+        (closed, closures),
+        (0, 1),
+        "a gate closed by shutdown is not backpressure"
+    );
+}
+
+/// Scenario: a worker whose metrics were installed through `set_metrics`
+/// refuses a traces request and force-drains a logs request at shutdown.
+/// Guarantees: both decisions are recorded once in the shared
+/// `exporter.exports` set, by signal and by the engine-wide outcome class --
+/// `refused` for the traces request, `failure` for the retryable shutdown
+/// refusal -- and the set is handed over with the terminal snapshots, so the
+/// exporter appears in the same cross-exporter views as its siblings.
+#[tokio::test(flavor = "current_thread")]
+async fn decisions_are_recorded_in_the_shared_export_metrics() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.set_metrics(Some(super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    )));
+    let mut traces = Context::default();
+    traces.set_source_node(7);
+    worker.admit(OtapPdata::new(traces, traces_payload()));
+    worker.shutdown(clock::now() + Duration::from_secs(30));
+    worker.notify.force_shutdown(logs_pdata());
+
+    let snapshots = worker.metric_snapshots();
+    let exports = |signal: &str, outcome: &str| {
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.descriptor().name == "exporter.exports")
+            .find(|snapshot| {
+                snapshot.measurement_attributes().collect::<Vec<_>>()
+                    == [("signal", signal), ("outcome", outcome)]
+            })
+            .map(|snapshot| {
+                let index = snapshot
+                    .descriptor()
+                    .metrics
+                    .iter()
+                    .position(|metric| metric.name == "messages")
+                    .expect("messages");
+                snapshot.get_metrics()[index].to_u64_lossy()
+            })
+    };
+    assert_eq!(exports("traces", "refused"), Some(1));
+    assert_eq!(exports("logs", "failure"), Some(1));
+    assert_eq!(exports("logs", "success"), None, "nothing was acked");
+}
+
+/// Scenario: a worker starts with a configuration whose worst-case shutdown
+/// is longer than the signal shutdown grace, on more cores than any host has
+/// memory for, and then with a configuration that fits both.
+/// Guarantees: the start event carries writer id, boot id and storage, and
+/// each predicted failure is its own WARN naming the numbers it compared,
+/// emitted only when the condition holds.
+#[tokio::test(flavor = "current_thread")]
+async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
+    let events = capture();
+    let (handler, _rx) = effects(8);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::clone(&wall) as _,
+        handler,
+    );
+    super::announce(
+        &worker,
+        &super::Startup {
+            storage: "file".to_owned(),
+            num_cores: 1 << 20,
+        },
+    );
+    let start = events.named("series_parquet.start");
+    assert_eq!(start.len(), 1, "{start:?}");
+    let field = |name: &str| start[0].fields.get(name).cloned();
+    assert_eq!(
+        field("writer_id").map(|v| v.text().to_owned()),
+        Some(worker.cfg.lake.writer_id.clone())
+    );
+    assert_eq!(
+        field("boot_id").map(|v| v.text().to_owned()),
+        Some(worker.boot_id.clone())
+    );
+    assert_eq!(field("storage"), Some(FieldValue::Str("file".into())));
+    if super::physical_memory_bytes().is_some() {
+        let warned = events.named("series_parquet.memory_budget.oversubscribed");
+        assert_eq!(warned.len(), 1, "a million cores oversubscribe any host");
+        assert_eq!(warned[0].level, tracing::Level::WARN);
+    }
+    // The test configuration's window, flush deadline and abort bound.
+    let window = &worker.cfg.window;
+    let bound =
+        window.interval + 2 * (window.flush_retry_deadline + worker.cfg.lake.upload.abort_timeout);
+    assert_eq!(
+        events.named("series_parquet.shutdown.grace_exceeded").len(),
+        usize::from(bound > Duration::from_secs(60)),
+    );
+
+    let (handler, _rx) = effects(8);
+    let mut fits = worker_config();
+    fits.window.interval = Duration::from_secs(1);
+    fits.window.flush_retry_deadline = Duration::from_secs(10);
+    fits.lake.upload.abort_timeout = Duration::from_secs(5);
+    let small = Worker::new(
+        fits,
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    let before = (
+        events
+            .named("series_parquet.memory_budget.oversubscribed")
+            .len(),
+        events.named("series_parquet.shutdown.grace_exceeded").len(),
+    );
+    super::announce(
+        &small,
+        &super::Startup {
+            storage: "file".to_owned(),
+            num_cores: 1,
+        },
+    );
+    assert_eq!(events.named("series_parquet.start").len(), 2);
+    assert_eq!(
+        (
+            events
+                .named("series_parquet.memory_budget.oversubscribed")
+                .len(),
+            events.named("series_parquet.shutdown.grace_exceeded").len(),
+        ),
+        before,
+        "a worker that fits both bounds warns about neither"
+    );
+}
+
+/// Scenario: one request is admitted, its block is written to an in-memory
+/// store on the first attempt, and the worker completes it.
+/// Guarantees: the commit is logged once as `series_parquet.block.committed`
+/// carrying the block's window start, its sequence, the path of its first
+/// object and the attempt count, so an operator can go from a log line to
+/// the files it wrote.
+#[tokio::test(flavor = "current_thread")]
+async fn a_committed_block_names_its_window_sequence_and_path() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                wall,
+                handler,
+            );
+            worker.admit(logs_pdata());
+            let window = worker.active.data.window_start_secs;
+            let seq = worker.active.data.seq;
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let path = done
+                .as_ref()
+                .expect("the flush task joins")
+                .result
+                .as_ref()
+                .expect("the write succeeds")
+                .files[0]
+                .1
+                .to_string();
+            worker.complete(done);
+
+            let logged = events.named("series_parquet.block.committed");
+            assert_eq!(logged.len(), 1, "{logged:?}");
+            let field = |name: &str| logged[0].fields.get(name).cloned();
+            assert_eq!(field("window_start"), Some(FieldValue::I64(window)));
+            assert_eq!(field("seq"), Some(FieldValue::U64(seq)));
+            assert_eq!(field("path"), Some(FieldValue::Str(path)));
+            assert_eq!(field("attempts"), Some(FieldValue::U64(1)));
+        })
+        .await;
 }

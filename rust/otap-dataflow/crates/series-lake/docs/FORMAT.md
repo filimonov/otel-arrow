@@ -67,12 +67,13 @@ Rules:
   recursively inside nested kvlists.
 - Nested values come from the OTAP `ser` column and are decoded from CBOR
   before encoding. Nesting deeper than `max_nesting_depth` (default 32)
-  makes the request invalid.
+  refuses the request permanently as too deep (`nacks{error.type=too_deep}`),
+  distinct from invalid content.
 - A duplicate key inside any attribute list this writer actually reads --
   resource attributes, scope attributes, the log record's own attributes
   (logs), or a supported data point's attributes (metrics: number and
   histogram points) -- makes the request invalid: permanent nack with
-  `NackCause::Refused`, `nacks{reason=invalid}`. This applies whether or not
+  `NackCause::Refused`, `nacks{error.type=invalid}`. This applies whether or not
   the list is part of the identity. Metric metadata attributes and exemplar
   attribute payloads are never decoded at all, so a duplicate key inside
   either goes undetected (see Limitations).
@@ -284,15 +285,15 @@ An empty attribute list is an empty map, never null.
 Unsupported inputs in v1 and their policy:
 
 - Exemplars (children of supported points) are always dropped, the parent
-  point is kept, `dropped_unsupported{kind=exemplar}` counts exemplars.
+  point is kept, `dropped.unsupported{kind=exemplar}` counts exemplars.
 - Exponential histogram and summary points: `unsupported: reject` (default)
   nacks the whole request with `NackCause::Refused`,
-  `nacks{reason=unsupported}`; `unsupported: drop` drops those points,
+  `nacks{error.type=unsupported}`; `unsupported: drop` drops those points,
   counts them and keeps the rest. Rejection is atomic per request. A request
   that yields zero output rows after drops is acked immediately; a request
   with any output rows is acked only when its block commits.
 - Traces: a traces request is nacked with `NackCause::Refused`,
-  `nacks{reason=unsupported}`, regardless of the policy.
+  `nacks{error.type=unsupported}`, regardless of the policy.
 
 ## 3. Denormalization
 
@@ -455,7 +456,7 @@ first successful seal timestamp remains fixed across flush retries.
 
 - Exponential histograms and summaries are not stored. Depending on the
   `unsupported` policy the whole request is rejected, or the points are
-  dropped and counted one per dropped data point row (`dropped_unsupported`).
+  dropped and counted one per dropped data point row (`dropped.unsupported`).
 - Exemplars are not stored. Their rows are counted as dropped, one per
   exemplar row, and their own attribute payloads are neither read nor
   validated.

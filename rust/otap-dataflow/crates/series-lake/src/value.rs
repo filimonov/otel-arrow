@@ -4,7 +4,7 @@
 //! Owned attribute value tree, CBOR decoding of the OTAP `ser` column and the
 //! `render_v1` storage rendering (spec section 5.1).
 
-use crate::error::{Error, Result};
+use crate::error::{Error, RefuseReason, Result};
 
 /// Limits applied while decoding one CBOR `ser` cell (spec section 5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +61,8 @@ pub enum Value {
 
 /// Decode a CBOR blob from the OTAP `ser` column into a [`Value`].
 ///
-/// Kvlist keys are sorted by raw bytes; duplicate keys and nesting deeper
-/// than `limits.max_depth` are refused as invalid content.
+/// Kvlist keys are sorted by raw bytes; duplicate keys are refused as invalid
+/// content and nesting deeper than `limits.max_depth` as too deep.
 ///
 /// Both limits are applied before the work they bound. An encoded cell longer
 /// than `limits.max_cell_bytes` is refused without being decoded at all: its
@@ -78,8 +78,9 @@ pub enum Value {
 /// `max_cell_bytes` is at most that many bytes times that constant.
 ///
 /// # Errors
-/// Refuses an oversized cell as `RequestTooLarge`, and a malformed payload,
-/// a duplicate key or excessive nesting as invalid content.
+/// Refuses an oversized cell as `RequestTooLarge`, nesting deeper than
+/// `limits.max_depth` as `TooDeep`, and a malformed payload or a duplicate key
+/// as invalid content.
 pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
     if bytes.len() > limits.max_cell_bytes {
         return Err(Error::too_large(
@@ -93,8 +94,20 @@ pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
     // `convert` is the definition of this crate's depth rule.
     let recursion = limits.max_depth.saturating_add(1);
     let raw: ciborium::Value = ciborium::de::from_reader_with_recursion_limit(bytes, recursion)
-        .map_err(|e| Error::invalid(format!("cbor decode: {e}")))?;
-    convert(raw, limits.max_depth)
+        .map_err(|e| match e {
+            // The parser's own limit is one level above the crate's, so a
+            // payload it refuses for depth is deeper than `max_depth` too.
+            ciborium::de::Error::RecursionLimitExceeded => {
+                Error::Refused(RefuseReason::TooDeep(limits.max_depth))
+            }
+            other => Error::invalid(format!("cbor decode: {other}")),
+        })?;
+    convert(raw, limits.max_depth).map_err(|e| match e {
+        Error::Refused(RefuseReason::TooDeep(_)) => {
+            Error::Refused(RefuseReason::TooDeep(limits.max_depth))
+        }
+        other => other,
+    })
 }
 
 fn convert(raw: ciborium::Value, depth_left: usize) -> Result<Value> {
@@ -112,7 +125,7 @@ fn convert(raw: ciborium::Value, depth_left: usize) -> Result<Value> {
         ciborium::Value::Bytes(b) => Value::Bytes(b),
         ciborium::Value::Array(items) => {
             if depth_left == 0 {
-                return Err(Error::invalid("cbor nesting too deep"));
+                return Err(Error::Refused(RefuseReason::TooDeep(0)));
             }
             let mut out = Vec::with_capacity(items.len());
             for item in items {
@@ -122,7 +135,7 @@ fn convert(raw: ciborium::Value, depth_left: usize) -> Result<Value> {
         }
         ciborium::Value::Map(entries) => {
             if depth_left == 0 {
-                return Err(Error::invalid("cbor nesting too deep"));
+                return Err(Error::Refused(RefuseReason::TooDeep(0)));
             }
             let mut out: Vec<(String, Value)> = Vec::with_capacity(entries.len());
             for (k, v) in entries {
@@ -329,11 +342,38 @@ mod tests {
         assert!(decode_cbor(&maps(limit, int()), limits).is_ok());
         assert!(matches!(
             decode_cbor(&maps(limit + 1, int()), limits),
-            Err(Error::Refused(RefuseReason::Invalid(_)))
+            Err(Error::Refused(RefuseReason::TooDeep(8)))
         ));
         let array = ciborium::Value::Array(vec![int()]);
         assert!(decode_cbor(&maps(limit - 1, array.clone()), limits).is_ok());
         assert!(decode_cbor(&maps(limit, array), limits).is_err());
+    }
+
+    /// Scenario: maps nested one level past the limit, which the conversion
+    /// refuses, and far past it, which ciborium's own recursion limit refuses
+    /// while parsing.
+    /// Guarantees: both are reported as `TooDeep` carrying the configured
+    /// limit, never as invalid content, so the refusal names the setting
+    /// that governs it whichever layer caught it.
+    #[test]
+    fn decode_cbor_reports_excess_depth_as_too_deep() {
+        let deep = |levels: usize| {
+            let mut v = ciborium::Value::Null;
+            for _ in 0..levels {
+                v = ciborium::Value::Array(vec![v]);
+            }
+            let mut buf = Vec::new();
+            ciborium::into_writer(&v, &mut buf).expect("encode test cbor");
+            buf
+        };
+        let limits = DecodeLimits::new(4, usize::MAX);
+        for levels in [5, 64] {
+            let result = decode_cbor(&deep(levels), limits);
+            assert!(
+                matches!(result, Err(Error::Refused(RefuseReason::TooDeep(4)))),
+                "levels={levels}: {result:?}"
+            );
+        }
     }
 
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.

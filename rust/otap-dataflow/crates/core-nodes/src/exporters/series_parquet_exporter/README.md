@@ -51,7 +51,7 @@ length of the step.
 A storage failure is retried against the identical sealed block, with the same
 file names and the same bytes, until an absolute deadline taken when the block
 was sealed (`window.flush_retry_deadline`). Every failed attempt is logged at
-WARN as `series_parquet.flush_attempt_failed` with the error the destination
+WARN as `series_parquet.flush.attempt_failed` with the error the destination
 returned. At that deadline every request of the block is nacked as retryable
 with a reason that carries the last attempt's error, the flush is reported as
 a deadline expiry rather than as a cancellation, and the abandoned write is
@@ -114,9 +114,9 @@ The status message of every nack is a sentence naming the rule or limit that
 decided it and what to do, for example `request of 20000000 bytes exceeds
 ingress.max_request_bytes (16777216 bytes); split the batch upstream or raise
 the limit`. Any error detail it quotes is cut to 256 bytes and kept on one
-line. The short machine form of the outcome is the `reason` label of the
+line. The short machine form of the outcome is the `error.type` label of the
 `nacks` metric. Refusals are also logged at WARN as
-`series_parquet.request_failed` with the signal and the same sentence, at most
+`series_parquet.request.failed` with the signal and the same sentence, at most
 one line per second; the next line reports how many were left out. A size
 refusal also carries `limit_setting`, `observed_bytes` and `limit_bytes`,
 whichever budget refused it: the request, its extracted output, one row or
@@ -172,7 +172,7 @@ than a failure: every expired attempt is resent, and a copy committed just
 after the client gave up is stored again by the retry. Under at-least-once
 delivery nothing is lost. What it costs is traffic and stored rows, and the
 symptom is a steady stream of client-side deadlines with acks and
-`rows_written` still rising, rather than an error.
+`rows.written` still rising, rather than an error.
 
 Size an attempt timeout as the sum of the parts one request can wait through:
 
@@ -902,13 +902,16 @@ Unlabelled worker state and totals:
 | `block.pending_slot_occupied` | `{slot}` | Whether the single parking slot is occupied. |
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
 | `flush.failures` | `{flush}` | Flushes that did not reach object storage. |
-| `flush.retries` | `{attempt}` | Write attempts beyond the first, per completed flush. |
+| `flush.retries` | `{attempt}` | Write attempts beyond the first, per flush, abandoned ones included. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
-| `acks` | `{request}` | Requests acknowledged as durable. |
+| `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_bytes` | `By` | Bytes the undelivered completions retain. |
 | `notify.failures` | `{request}` | Completions the engine would not accept. |
-| `oldest_unacked_seconds` | `s` | Age of the oldest completion the worker still owes. |
+| `oldest_unacked.age` | `s` | Age of the oldest completion the worker still owes. |
+| `admission.closed` | `{state}` | 1 while the node is not taking requests from its input channel. |
+| `admission.closures` | `{closure}` | Times admission went from open to closed. |
+| `admission.closed.duration` | `s` | Total time admission has been closed. |
 | `timestamp.out_of_range` | `{timestamp}` | Point timestamps outside the representable range. |
 | `memory.budget_bytes` | `By` | Bytes the configuration allows this worker to hold. |
 | `memory.accounted_bytes` | `By` | Bytes the worker is accounted as holding now. |
@@ -917,12 +920,24 @@ Labelled sets, each with one closed enumeration:
 
 | Metric | Unit | Label | Values |
 | --- | --- | --- | --- |
-| `flush.count` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
-| `nacks` | `{request}` | `reason` | `storage`, `too_large`, `invalid`, `unsupported`, `shutdown`, `internal` |
-| `rows_written`, `files_written` | `{row}`, `{file}` | `dataset` | `logs_series`, `logs_values`, `metrics_series`, `metrics_values` |
-| `series_emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
-| `dropped_unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |
+| `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
+| `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `block_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
+| `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
+| `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
+| `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |
 | `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |
+
+Each `*_too_large` value of `nacks` names the setting it exceeded:
+`ingress.max_request_bytes`, `ingress.max_extracted_bytes` (the extracted
+request or one decoded attribute table), `ingress.max_row_bytes` (one row,
+attribute value or CBOR cell) and `window.max_block_bytes`. `too_deep` is
+`ingress.max_nesting_depth`.
+
+The node also registers the shared `exporter.exports` set that every exporter
+registers, so it appears in cross-exporter views: `messages` (`{message}`)
+and `duration` (`s`, from receipt to decision), labelled `signal` and
+`outcome` (`success` for an ack, `refused` for a permanent refusal, `failure`
+for a retryable nack).
 
 `denormalize.type_mismatch` is the only label that is not an enumeration, and
 its values come from the `denormalize` configuration at startup: one metric
@@ -930,13 +945,43 @@ set is registered per configured column and no request can add another. Error
 strings, object store paths, request ids, series ids and producer ids are
 never used as labels, so no workload can grow this node's cardinality.
 
-A series row is counted in `series_emitted` only once the block write returned
-success, so an abandoned or failed block credits nothing. `series_emitted`
+A series row is counted in `series.emitted` only once the block write returned
+success, so an abandoned or failed block credits nothing. `series.emitted`
 with `reason=rotation` rising means byte or request rotations inside single
 windows are re-emitting descriptors, which is the signal to raise
 `window.max_block_bytes` or `window.max_requests_per_block`.
-`flush.retries` stays at zero until the sink performs a retry the job can
-observe.
+`flush.retries` counts every attempt beyond the first, whether the flush then
+succeeded, failed, or was decided by the shutdown deadline.
+
+`admission.closed` is where a slow destination becomes visible. While it
+reads 1 the node takes nothing from its input channel, so the receiver
+upstream refuses producers with its own concurrency or memory limit
+(`RESOURCE_EXHAUSTED` for OTLP gRPC) rather than this node reporting
+anything. A rising `admission.closed.duration` with `flush.duration` near the
+window interval means the destination, not the producers, is the limit.
+
+### Events
+
+| Event | Level | When |
+| --- | --- | --- |
+| `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
+| `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget_bytes` times the engine's cores exceeds physical memory. |
+| `series_parquet.shutdown.grace_exceeded` | WARN | At start, when `window.interval + 2 * (window.flush_retry_deadline + upload.abort_timeout)` exceeds the 60s signal shutdown grace. |
+| `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
+| `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt, with the file name and object count. |
+| `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt, with the error. |
+| `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
+| `series_parquet.flush.failed` | ERROR | A block failed; every request in it is nacked as retryable. |
+| `series_parquet.seal.failed` | WARN | A block could not be sealed. |
+| `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
+| `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |
+| `series_parquet.shutdown` | INFO | The Shutdown control message arrived. |
+| `series_parquet.shutdown.deadline_exceeded` | WARN | The shutdown deadline decided what was still held. |
+| `series_parquet.shutdown.complete` | INFO | The worker ended: `accepted`, `acked`, `nacked`, `abandoned`, `deadline_exceeded`, `duration`. |
+
+With the defaults, 15s + 2 * (60s + 5s) = 145s exceeds the 60s grace, so a
+default worker warns at start. Stop it through the admin API with a longer
+timeout, as described under shutdown above, or lower the flush deadline.
 
 ### Reading the process residual
 
@@ -992,7 +1037,7 @@ Traces have no dataset in the lake and are permanently refused on the signal
 alone, before any conversion. Points of an unsupported kind, namely
 exponential histograms and summaries, are rejected by default;
 `unsupported: drop` drops those points instead and counts them in
-`dropped_unsupported`. The policy decides the whole request atomically.
+`dropped.unsupported`. The policy decides the whole request atomically.
 Exemplars are always dropped and counted. A request that extracts no rows at
 all is acknowledged immediately without opening a file; a request that mixes
 supported and dropped rows waits for its block to commit.

@@ -16,7 +16,9 @@
 //! the value is republished rather than accumulated twice. Gauges report the
 //! worker's state at the moment it was sampled.
 
+use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
 use otel_arrow_dfe_series_lake::config::LakeConfig;
 use otel_arrow_dfe_series_lake::extract::ExtractStats;
 use otel_arrow_dfe_series_lake::schema::Dataset;
@@ -71,7 +73,7 @@ pub(super) struct WorkerMetrics {
     #[metric(name = "flush.cancelled", unit = "{flush}")]
     pub flush_cancelled: Counter<u64>,
     /// Requests acknowledged as durable.
-    #[metric(unit = "{request}")]
+    #[metric(unit = "{message}")]
     pub acks: ObserveCounter<u64>,
     /// Decided completions still waiting to be delivered.
     #[metric(name = "notify.queued", unit = "{request}")]
@@ -84,8 +86,25 @@ pub(super) struct WorkerMetrics {
     #[metric(name = "notify.failures", unit = "{request}")]
     pub notify_failures: ObserveCounter<u64>,
     /// Age of the oldest completion the worker still owes.
-    #[metric(name = "oldest_unacked_seconds", unit = "s")]
+    #[metric(name = "oldest_unacked.age", unit = "s")]
     pub oldest: Gauge<f64>,
+    /// Whether pdata admission is closed at the moment of sampling: 1 while
+    /// the node is not taking requests from its input channel, 0 otherwise.
+    ///
+    /// Admission closes while a rotation waits for the flush slot, while a
+    /// request is parked, and when the completion credit is spent. A closed
+    /// gate is where a slow destination becomes backpressure, which the
+    /// receiver upstream reports as its own refusals rather than as anything
+    /// this node counts.
+    #[metric(name = "admission.closed", unit = "{state}")]
+    pub admission_closed: Gauge<u64>,
+    /// Times admission went from open to closed.
+    #[metric(name = "admission.closures", unit = "{closure}")]
+    pub admission_closures: ObserveCounter<u64>,
+    /// Total time admission has been closed, a closure still in progress
+    /// included.
+    #[metric(name = "admission.closed.duration", unit = "s")]
+    pub admission_closed_duration: ObserveCounter<f64>,
     /// Point timestamps outside the representable range.
     #[metric(name = "timestamp.out_of_range", unit = "{timestamp}")]
     pub timestamp_out_of_range: Counter<u64>,
@@ -123,17 +142,29 @@ pub(super) struct FlushAttrs {
 #[derive(Debug, Default, Clone)]
 pub(super) struct FlushMetrics {
     /// Non-empty blocks handed to a write task.
-    #[metric(name = "flush.count", unit = "{flush}")]
+    #[metric(name = "flushes", unit = "{flush}")]
     pub count: Counter<u64>,
 }
 
-/// Why a request was refused.
+/// Why a request was refused: the `error.type` of one nack.
+///
+/// A size refusal names the budget it exceeded, one value per setting, so an
+/// operator can tell which limit to raise without reading the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
-pub(super) enum NackReason {
+pub(super) enum NackErrorType {
     /// Writing the request failed; the sender may retry.
     Storage,
-    /// The request exceeded a size budget.
-    TooLarge,
+    /// The request exceeded `ingress.max_request_bytes`.
+    RequestTooLarge,
+    /// The extracted request, or one decoded attribute table, exceeded
+    /// `ingress.max_extracted_bytes`.
+    ExtractedTooLarge,
+    /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.
+    RowTooLarge,
+    /// The request's worst case in one block exceeded `window.max_block_bytes`.
+    BlockTooLarge,
+    /// A nested value exceeded `ingress.max_nesting_depth`.
+    TooDeep,
     /// The request's content could not be used.
     Invalid,
     /// The request's signal is not handled by this exporter.
@@ -149,7 +180,8 @@ pub(super) enum NackReason {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NackAttrs {
     /// Why the request was refused.
-    pub reason: NackReason,
+    #[attribute_key = "error.type"]
+    pub error_type: NackErrorType,
 }
 
 /// Requests refused, split by the rule that refused them.
@@ -157,40 +189,40 @@ pub(super) struct NackAttrs {
 #[derive(Debug, Default, Clone)]
 pub(super) struct NackMetrics {
     /// Requests decided as a nack.
-    #[metric(unit = "{request}")]
+    #[metric(unit = "{message}")]
     pub nacks: ObserveCounter<u64>,
 }
 
-/// The lake dataset one written file belongs to.
+/// Which of a signal's two lake datasets one written file belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
-pub(super) enum DatasetLabel {
-    /// `signal=logs/dataset=series`.
-    LogsSeries,
-    /// `signal=logs/dataset=values`.
-    LogsValues,
-    /// `signal=metrics/dataset=series`.
-    MetricsSeries,
-    /// `signal=metrics/dataset=values`, holding number and histogram points.
-    MetricsValues,
+pub(super) enum DatasetKind {
+    /// `dataset=series`: one descriptor row per series.
+    Series,
+    /// `dataset=values`: the records or points themselves.
+    Values,
 }
 
-impl From<Dataset> for DatasetLabel {
-    fn from(dataset: Dataset) -> Self {
-        match dataset {
-            Dataset::LogsSeries => Self::LogsSeries,
-            Dataset::LogsValues => Self::LogsValues,
-            Dataset::MetricsSeries => Self::MetricsSeries,
-            Dataset::MetricsValues => Self::MetricsValues,
-        }
-    }
-}
-
-/// The dataset one durable write landed in.
+/// The signal and dataset one durable write landed in, as the two partition
+/// keys of its path.
 #[attribute_set(item, measurement)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DatasetAttrs {
+    /// Destination signal, `logs` or `metrics`.
+    pub signal: SignalType,
     /// Destination dataset.
-    pub dataset: DatasetLabel,
+    pub dataset: DatasetKind,
+}
+
+impl From<Dataset> for DatasetAttrs {
+    fn from(dataset: Dataset) -> Self {
+        let (signal, dataset) = match dataset {
+            Dataset::LogsSeries => (SignalType::Logs, DatasetKind::Series),
+            Dataset::LogsValues => (SignalType::Logs, DatasetKind::Values),
+            Dataset::MetricsSeries => (SignalType::Metrics, DatasetKind::Series),
+            Dataset::MetricsValues => (SignalType::Metrics, DatasetKind::Values),
+        };
+        Self { signal, dataset }
+    }
 }
 
 /// Rows and files that reached object storage, split by dataset.
@@ -198,10 +230,10 @@ pub(super) struct DatasetAttrs {
 #[derive(Debug, Default, Clone)]
 pub(super) struct WrittenMetrics {
     /// Rows in files the sink reported as written.
-    #[metric(name = "rows_written", unit = "{row}")]
+    #[metric(name = "rows.written", unit = "{row}")]
     pub rows_written: Counter<u64>,
     /// Files the sink reported as written.
-    #[metric(name = "files_written", unit = "{file}")]
+    #[metric(name = "files.written", unit = "{file}")]
     pub files_written: Counter<u64>,
 }
 
@@ -231,7 +263,7 @@ pub(super) struct EmitAttrs {
 #[derive(Debug, Default, Clone)]
 pub(super) struct EmittedMetrics {
     /// Descriptor rows durably written.
-    #[metric(name = "series_emitted", unit = "{row}")]
+    #[metric(name = "series.emitted", unit = "{row}")]
     pub series_emitted: Counter<u64>,
 }
 
@@ -259,7 +291,7 @@ pub(super) struct DroppedAttrs {
 #[derive(Debug, Default, Clone)]
 pub(super) struct DroppedMetrics {
     /// Rows the lake has no dataset for.
-    #[metric(name = "dropped_unsupported", unit = "{row}")]
+    #[metric(name = "dropped.unsupported", unit = "{row}")]
     pub dropped_unsupported: Counter<u64>,
 }
 
@@ -301,6 +333,13 @@ pub(super) struct Metrics {
     pub dropped: MeasurementMetricSet<DroppedMetrics>,
     /// One set per configured denormalized column.
     columns: BTreeMap<String, MetricSet<ColumnMetrics>>,
+    /// The shared `exporter.exports` set every exporter registers, so this
+    /// one appears in cross-exporter views: one terminal outcome per request,
+    /// by signal, with the time from receipt to decision.
+    ///
+    /// Taken by the worker's notifier, which is where every decision is made;
+    /// see [`Metrics::take_exports`].
+    exports: Option<MeasurementMetricSet<ExporterExportMetrics>>,
 }
 
 impl Metrics {
@@ -337,7 +376,14 @@ impl Metrics {
             emitted: EmittedMetrics::register(ctx),
             dropped: DroppedMetrics::register(ctx),
             columns,
+            exports: Some(ExporterExportMetrics::register(ctx)),
         }
+    }
+
+    /// Hand the shared export-outcome set to the component that decides each
+    /// request. Returns `None` once taken.
+    pub(super) fn take_exports(&mut self) -> Option<MeasurementMetricSet<ExporterExportMetrics>> {
+        self.exports.take()
     }
 
     /// Record what extracting one request produced.
@@ -372,6 +418,9 @@ impl Metrics {
 
     /// Hand every set to the collector on a `CollectTelemetry` message.
     pub(super) fn report(&mut self, reporter: &mut MetricsReporter) {
+        if let Some(exports) = &mut self.exports {
+            let _ = reporter.report_measurement(exports);
+        }
         let _ = reporter.report(&mut self.worker);
         let _ = reporter.report_measurement(&mut self.flush);
         let _ = reporter.report_measurement(&mut self.nacks);
@@ -386,6 +435,9 @@ impl Metrics {
     /// Take every set for terminal handoff, so the last interval is not lost.
     pub(super) fn snapshots(&mut self) -> Vec<MetricSetSnapshot> {
         let mut out = self.worker.terminal_snapshots();
+        if let Some(exports) = &mut self.exports {
+            out.extend(exports.terminal_snapshots());
+        }
         out.extend(self.flush.terminal_snapshots());
         out.extend(self.nacks.terminal_snapshots());
         out.extend(self.written.terminal_snapshots());
@@ -454,11 +506,14 @@ mod tests {
                 ("flush.failures", "{flush}"),
                 ("flush.retries", "{attempt}"),
                 ("flush.cancelled", "{flush}"),
-                ("acks", "{request}"),
+                ("acks", "{message}"),
                 ("notify.queued", "{request}"),
                 ("notify.token_bytes", "By"),
                 ("notify.failures", "{request}"),
-                ("oldest_unacked_seconds", "s"),
+                ("oldest_unacked.age", "s"),
+                ("admission.closed", "{state}"),
+                ("admission.closures", "{closure}"),
+                ("admission.closed.duration", "s"),
                 ("timestamp.out_of_range", "{timestamp}"),
                 ("memory.budget_bytes", "By"),
                 ("memory.accounted_bytes", "By"),
@@ -477,46 +532,54 @@ mod tests {
             assert_eq!(snapshots.len(), 1);
             assert_schema(
                 &snapshots[0],
-                &[("flush.count", "{flush}")],
+                &[("flushes", "{flush}")],
                 &[("reason", label)],
             );
         }
 
-        for (reason, label) in [
-            (NackReason::Storage, "storage"),
-            (NackReason::TooLarge, "too_large"),
-            (NackReason::Invalid, "invalid"),
-            (NackReason::Unsupported, "unsupported"),
-            (NackReason::Shutdown, "shutdown"),
-            (NackReason::Internal, "internal"),
+        for (error_type, label) in [
+            (NackErrorType::Storage, "storage"),
+            (NackErrorType::RequestTooLarge, "request_too_large"),
+            (NackErrorType::ExtractedTooLarge, "extracted_too_large"),
+            (NackErrorType::RowTooLarge, "row_too_large"),
+            (NackErrorType::BlockTooLarge, "block_too_large"),
+            (NackErrorType::TooDeep, "too_deep"),
+            (NackErrorType::Invalid, "invalid"),
+            (NackErrorType::Unsupported, "unsupported"),
+            (NackErrorType::Shutdown, "shutdown"),
+            (NackErrorType::Internal, "internal"),
         ] {
-            metrics.nacks.with(NackAttrs { reason }).nacks.observe(1);
+            metrics
+                .nacks
+                .with(NackAttrs { error_type })
+                .nacks
+                .observe(1);
             let snapshots = metrics.nacks.terminal_snapshots();
             assert_eq!(snapshots.len(), 1);
             assert_schema(
                 &snapshots[0],
-                &[("nacks", "{request}")],
-                &[("reason", label)],
+                &[("nacks", "{message}")],
+                &[("error.type", label)],
             );
         }
 
-        for (dataset, label) in [
-            (DatasetLabel::LogsSeries, "logs_series"),
-            (DatasetLabel::LogsValues, "logs_values"),
-            (DatasetLabel::MetricsSeries, "metrics_series"),
-            (DatasetLabel::MetricsValues, "metrics_values"),
+        for (dataset, signal, kind) in [
+            (Dataset::LogsSeries, "logs", "series"),
+            (Dataset::LogsValues, "logs", "values"),
+            (Dataset::MetricsSeries, "metrics", "series"),
+            (Dataset::MetricsValues, "metrics", "values"),
         ] {
             metrics
                 .written
-                .with(DatasetAttrs { dataset })
+                .with(DatasetAttrs::from(dataset))
                 .rows_written
                 .add(1);
             let snapshots = metrics.written.terminal_snapshots();
             assert_eq!(snapshots.len(), 1);
             assert_schema(
                 &snapshots[0],
-                &[("rows_written", "{row}"), ("files_written", "{file}")],
-                &[("dataset", label)],
+                &[("rows.written", "{row}"), ("files.written", "{file}")],
+                &[("signal", signal), ("dataset", kind)],
             );
         }
 
@@ -534,7 +597,7 @@ mod tests {
             assert_eq!(snapshots.len(), 1);
             assert_schema(
                 &snapshots[0],
-                &[("series_emitted", "{row}")],
+                &[("series.emitted", "{row}")],
                 &[("reason", label)],
             );
         }
@@ -553,7 +616,7 @@ mod tests {
             assert_eq!(snapshots.len(), 1);
             assert_schema(
                 &snapshots[0],
-                &[("dropped_unsupported", "{row}")],
+                &[("dropped.unsupported", "{row}")],
                 &[("kind", label)],
             );
         }

@@ -3148,7 +3148,7 @@ class OutageSlice(unittest.TestCase):
                         # the poll continues rather than returning.
                         if (
                             exporter_reported(document)
-                            and metric_max(document, "oldest_unacked_seconds") <= 1
+                            and metric_max(document, "oldest_unacked.age") <= 1
                             and metric_max(document, "block.requests_pending") == 0
                         ):
                             return

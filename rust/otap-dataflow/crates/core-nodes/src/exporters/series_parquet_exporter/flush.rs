@@ -42,6 +42,7 @@
 use super::token::AckToken;
 use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_series_lake as lake;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::task::{JoinError, JoinHandle};
@@ -176,6 +177,7 @@ async fn write_until(
     deadline: Instant,
     abort_timeout: Duration,
     result_tx: tokio::sync::oneshot::Sender<FlushDone>,
+    started_attempts: Rc<Cell<u64>>,
 ) {
     let mut attempts = 0_u64;
     let mut delay = FIRST_BACKOFF;
@@ -203,6 +205,7 @@ async fn write_until(
             return;
         }
         attempts += 1;
+        started_attempts.set(attempts);
         // The names this attempt will write, announced before it writes them,
         // so an operator can see that a retry rewrites objects rather than
         // adding any. Every object of a block shares one file name and differs
@@ -223,14 +226,14 @@ async fn write_until(
             .unwrap_or("");
         if attempts > 1 {
             otel_info!(
-                "series_parquet.flush_attempt",
+                "series_parquet.flush.attempt",
                 attempt = attempts,
                 file = file,
                 objects = planned.len()
             );
         } else {
             otel_debug!(
-                "series_parquet.flush_attempt",
+                "series_parquet.flush.attempt",
                 attempt = attempts,
                 file = file,
                 objects = planned.len()
@@ -322,7 +325,7 @@ async fn write_until(
 /// The only place the per-attempt WARN is emitted.
 fn log_failed_attempt(attempt: u64, file: &str, error: &lake::Error) {
     otel_warn!(
-        "series_parquet.flush_attempt_failed",
+        "series_parquet.flush.attempt_failed",
         attempt = attempt,
         file = file,
         retryable = retryable(error),
@@ -363,6 +366,15 @@ pub(super) struct FlushJob {
     /// Counted at admission but reported only once the write has returned
     /// success, so a series row is credited exactly when its file exists.
     pub(super) emitted: [u64; 3],
+    /// Attempts the task has started so far, the one in flight included.
+    ///
+    /// Shared with the task so a block decided without its result -- at the
+    /// shutdown deadline -- still reports the retries it spent.
+    pub(super) attempts: Rc<Cell<u64>>,
+    /// The sealed block's window start, in Unix seconds, for the commit log.
+    pub(super) window_start_secs: i64,
+    /// The sealed block's per-worker sequence, for the commit log.
+    pub(super) seq: u64,
 }
 
 impl FlushJob {
@@ -383,6 +395,9 @@ impl FlushJob {
     ) -> Self {
         let cancel = CancellationToken::new();
         let bytes = data.bytes;
+        let window_start_secs = data.window_start_secs;
+        let seq = data.seq;
+        let attempts = Rc::new(Cell::new(0));
         let started = clock::now();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::task::spawn_local(write_until(
@@ -392,6 +407,7 @@ impl FlushJob {
             deadline_at(started, retry_deadline),
             abort_timeout,
             result_tx,
+            Rc::clone(&attempts),
         ));
         Self {
             handle,
@@ -401,6 +417,9 @@ impl FlushJob {
             bytes,
             started,
             emitted,
+            attempts,
+            window_start_secs,
+            seq,
         }
     }
 
