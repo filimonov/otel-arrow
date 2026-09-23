@@ -31,7 +31,7 @@ use crate::clock::PartitionId;
 use crate::config::{LakeConfig, Nulls, SortOrder};
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, dataset_schema, schema_fingerprint};
-use crate::sort::{MergeBuild, MergeStep, SortSpec};
+use crate::sort::{MergeBuild, MergeIter, MergeStep, SortSpec};
 
 /// Window length assumed when the configured interval does not fit in `i64`.
 const DEFAULT_WINDOW_SECS: i64 = 15;
@@ -391,6 +391,20 @@ impl AsyncFileWriter for LedgeredWriter {
     fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
         self.inner.complete()
     }
+}
+
+/// Heap the merge's work on `chunk` holds beside the block: what producing
+/// it pins, plus the chunk itself when the merge allocated it.
+///
+/// With sorting disabled a chunk is one of the block's own runs, whose
+/// buffers the block already accounts for, so it adds nothing.
+fn chunk_charge(merge: &MergeIter, chunk: &RecordBatch) -> usize {
+    merge.chunk_workspace_bytes()
+        + if merge.allocates_chunks() {
+            record_batch_pinned_bytes(chunk, &mut CountedAllocations::default())
+        } else {
+            0
+        }
 }
 
 /// A sleep future of the sink's clock.
@@ -964,11 +978,7 @@ impl Sink {
                     break;
                 }
             };
-            workspace.set(
-                merge.chunk_workspace_bytes()
-                    + record_batch_pinned_bytes(&chunk, &mut CountedAllocations::default()),
-                writer.memory_size(),
-            );
+            workspace.set(chunk_charge(merge, &chunk), writer.memory_size());
             // Encoding one chunk is a stretch of its own, bounded by
             // `merge_chunk_bytes`; it does not follow the step that produced
             // the chunk without a return to the runtime in between.
@@ -2533,6 +2543,40 @@ mod tests {
         assert_eq!(ledger.live(), 7);
         ledger.put_landed();
         assert_eq!(ledger.live(), 0);
+    }
+
+    /// Scenario: the same runs merged sorted and with sorting disabled, and
+    /// each first chunk charged as the flush workspace charges it.
+    /// Guarantees: an unsorted chunk is one of the block's own runs, whose
+    /// buffers the block already accounts for, so it charges nothing; a
+    /// sorted chunk is interleaved into buffers of its own and charges at
+    /// least their pinned bytes.
+    #[test]
+    fn only_a_chunk_the_merge_allocated_is_charged() {
+        let cfg = LakeConfig::default();
+        let b = sealed_block(&cfg, 200);
+        let table = b
+            .tables()
+            .find(|table| !table.dataset().is_series() && !table.is_empty())
+            .expect("values");
+        let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
+        for (spec, owned) in [(table.spec().clone(), true), (SortSpec::new(vec![]), false)] {
+            let mut merge = merge_runs(runs.clone(), &spec, 1 << 20).expect("merge");
+            let chunk = loop {
+                match merge.step().expect("step") {
+                    MergeStep::Chunk(chunk) => break chunk,
+                    MergeStep::Progress => {}
+                    MergeStep::Done => panic!("no chunk"),
+                }
+            };
+            let pinned = record_batch_pinned_bytes(&chunk, &mut CountedAllocations::default());
+            let charged = chunk_charge(&merge, &chunk);
+            if owned {
+                assert!(charged >= pinned, "{charged} charged for {pinned} pinned");
+            } else {
+                assert_eq!(charged, 0, "the run belongs to the block");
+            }
+        }
     }
 
     /// An `ObjectStore` whose multipart parts wait for a permit before they

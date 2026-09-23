@@ -577,6 +577,16 @@ impl MergeIter {
         self.key_bytes + entries * size_of::<HeapItem>() + self.keys.len() * self.longest_key
     }
 
+    /// Whether the chunks this merge hands out are allocated by it.
+    ///
+    /// Sorted chunks are interleaved into buffers of their own; with sorting
+    /// disabled every chunk is one of the input runs, unchanged, and shares
+    /// its buffers.
+    #[must_use]
+    pub fn allocates_chunks(&self) -> bool {
+        self.sorted
+    }
+
     /// Heap the chunk being produced holds right now: the popped row
     /// indices and the columns interleaved so far.
     #[must_use]
