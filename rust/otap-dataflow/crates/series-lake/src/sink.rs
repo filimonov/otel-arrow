@@ -221,10 +221,10 @@ impl Drop for FlushWorkspaceHeld<'_> {
 /// The encoder hands over one buffer per row group; the buffered upload cuts
 /// parts out of that byte stream as slices, without copying, so a buffer
 /// stays allocated until every part cut from it has landed. The ledger keeps
-/// the stream offsets of both and counts each buffer whole until the parts
-/// before its end have all landed. A part that lands before an earlier one
-/// releases nothing until the earlier one lands too, which overstates the
-/// live bytes by at most the parts in flight, never understates them.
+/// the stream range of every buffer and of every part, and releases a
+/// buffer as soon as all of its bytes have landed, in whatever order the
+/// parts land: a stalled early part keeps only the buffers it overlaps
+/// charged, never the ones later parts have finished.
 #[derive(Debug, Default)]
 struct UploadLedger {
     state: std::sync::Mutex<LedgerState>,
@@ -232,35 +232,43 @@ struct UploadLedger {
 
 #[derive(Debug, Default)]
 struct LedgerState {
-    /// Handed buffers not yet released: stream end offset and length.
-    buffers: std::collections::VecDeque<(u64, usize)>,
+    /// Handed buffers not yet released, by stream start offset: stream end
+    /// offset, length, and the bytes of it that have not landed.
+    buffers: std::collections::BTreeMap<u64, (u64, usize, usize)>,
     /// Bytes handed so far: the stream offset of the next buffer.
     handed: u64,
-    /// Parts started and not yet folded into `landed`, by start offset:
-    /// end offset and whether the part has landed.
-    parts: std::collections::BTreeMap<u64, (u64, bool)>,
     /// Stream offset of the next part.
     next_part: u64,
-    /// Every byte before this offset has landed.
-    landed: u64,
-    /// Sum of the lengths in `buffers`.
+    /// Sum of the lengths of the buffers not yet released.
     live: usize,
 }
 
+/// The stream range `[start, end)` of one multipart part.
+type PartSpan = (u64, u64);
+
 impl LedgerState {
-    /// Fold landed parts into the landed prefix and release the buffers it
-    /// covers.
-    fn advance(&mut self) {
-        while let Some((&start, &(end, true))) = self.parts.first_key_value() {
-            let _ = self.parts.remove(&start);
-            self.landed = self.landed.max(end);
-        }
-        while let Some(&(end, len)) = self.buffers.front() {
-            if end > self.landed {
-                break;
+    /// The bytes `[start, end)` of the stream landed: take them off every
+    /// buffer they overlap and release each buffer none of whose bytes is
+    /// still outstanding.
+    fn land(&mut self, start: u64, end: u64) {
+        let overlapping: Vec<u64> = self
+            .buffers
+            .range(..end)
+            .rev()
+            .take_while(|(_, (buffer_end, _, _))| *buffer_end > start)
+            .map(|(buffer_start, _)| *buffer_start)
+            .collect();
+        for buffer_start in overlapping {
+            let Some(entry) = self.buffers.get_mut(&buffer_start) else {
+                continue;
+            };
+            let overlap = entry.0.min(end) - buffer_start.max(start);
+            entry.2 = entry.2.saturating_sub(overlap as usize);
+            if entry.2 == 0 {
+                let len = entry.1;
+                let _ = self.buffers.remove(&buffer_start);
+                self.live -= len;
             }
-            let _ = self.buffers.pop_front();
-            self.live -= len;
         }
     }
 }
@@ -278,37 +286,33 @@ impl UploadLedger {
             return;
         }
         let mut state = self.state();
+        let start = state.handed;
         state.handed += len as u64;
         let end = state.handed;
-        state.buffers.push_back((end, len));
+        let _ = state.buffers.insert(start, (end, len, len));
         state.live += len;
     }
 
-    /// A multipart part of `len` bytes was started; returns its start
-    /// offset, which [`UploadLedger::part_landed`] takes.
-    fn part_started(&self, len: usize) -> u64 {
+    /// A multipart part of `len` bytes was started; returns its stream
+    /// range, which [`UploadLedger::part_landed`] takes.
+    fn part_started(&self, len: usize) -> PartSpan {
         let mut state = self.state();
         let start = state.next_part;
         state.next_part += len as u64;
-        let _ = state.parts.insert(start, (start + len as u64, false));
-        start
+        (start, state.next_part)
     }
 
-    /// The part starting at `start` landed, or was dropped with its payload.
-    fn part_landed(&self, start: u64) {
-        let mut state = self.state();
-        if let Some(part) = state.parts.get_mut(&start) {
-            part.1 = true;
-        }
-        state.advance();
+    /// The part `span` landed, or was dropped with its payload.
+    fn part_landed(&self, span: PartSpan) {
+        self.state().land(span.0, span.1);
     }
 
     /// A single-request put of everything handed so far landed, or was
     /// dropped with its payload.
     fn put_landed(&self) {
         let mut state = self.state();
-        state.landed = state.handed;
-        state.advance();
+        let handed = state.handed;
+        state.land(0, handed);
     }
 
     /// Bytes the upload holds right now.
@@ -320,12 +324,12 @@ impl UploadLedger {
 /// Marks a part landed when its upload future completes or is dropped.
 struct PartLanded {
     ledger: Arc<UploadLedger>,
-    start: u64,
+    span: PartSpan,
 }
 
 impl Drop for PartLanded {
     fn drop(&mut self) {
-        self.ledger.part_landed(self.start);
+        self.ledger.part_landed(self.span);
     }
 }
 
@@ -349,7 +353,7 @@ struct LedgeredUpload {
 impl object_store::MultipartUpload for LedgeredUpload {
     fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
         let landed = PartLanded {
-            start: self.ledger.part_started(data.content_length()),
+            span: self.ledger.part_started(data.content_length()),
             ledger: Arc::clone(&self.ledger),
         };
         let part = self.inner.put_part(data);
@@ -2508,36 +2512,41 @@ mod tests {
         );
     }
 
-    /// Scenario: two 10-byte buffers are handed to the upload and cut into
-    /// an 8-byte part, a second 8-byte part and a 4-byte remainder, and the
-    /// second part lands before the first.
-    /// Guarantees: a buffer is released only once every byte before its end
-    /// has landed, so the out-of-order landing releases nothing, the first
-    /// part's landing releases the first buffer only -- the second is still
-    /// pinned by the remainder -- and a single-request put releases
-    /// everything handed before it.
+    /// Scenario: three 10-byte buffers are handed to the upload and cut
+    /// into parts of 8, 8, 8 and 6 bytes; the first part stalls while the
+    /// second and third land, then the first lands, then the last; and a
+    /// single-request put follows.
+    /// Guarantees: a buffer is released as soon as every byte of it has
+    /// landed, whatever the order the parts land in, so a stalled early part
+    /// keeps only the buffers it overlaps charged -- the middle buffer, fully
+    /// covered by the two later parts, is released while the first part is
+    /// still in flight -- and a put releases everything handed before it.
     #[test]
-    fn the_upload_ledger_releases_a_buffer_when_its_last_byte_lands() {
+    fn the_upload_ledger_releases_each_buffer_when_its_bytes_land() {
         let ledger = UploadLedger::default();
-        ledger.handed(10);
-        ledger.handed(10);
-        assert_eq!(ledger.live(), 20);
+        for _ in 0..3 {
+            ledger.handed(10);
+        }
+        assert_eq!(ledger.live(), 30);
         let first = ledger.part_started(8);
         let second = ledger.part_started(8);
+        let third = ledger.part_started(8);
         ledger.part_landed(second);
         assert_eq!(
             ledger.live(),
-            20,
-            "an out-of-order landing releases nothing"
+            30,
+            "bytes 8..16 landed: no buffer is whole yet"
         );
-        ledger.part_landed(first);
+        ledger.part_landed(third);
         assert_eq!(
             ledger.live(),
-            10,
-            "bytes 0..16 landed: the first buffer is free"
+            20,
+            "bytes 10..20 have all landed although part 0..8 is still in flight"
         );
-        let rest = ledger.part_started(4);
-        ledger.part_landed(rest);
+        ledger.part_landed(first);
+        assert_eq!(ledger.live(), 10, "bytes 0..10 landed");
+        let last = ledger.part_started(6);
+        ledger.part_landed(last);
         assert_eq!(ledger.live(), 0);
         ledger.handed(7);
         assert_eq!(ledger.live(), 7);
