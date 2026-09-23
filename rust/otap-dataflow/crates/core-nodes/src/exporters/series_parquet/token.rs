@@ -527,13 +527,14 @@ mod tests {
     use std::time::Duration;
 
     /// Scenario: a request carrying transport headers is split into its
-    /// completion and its payload.
-    /// Guarantees: the completion keeps the routing frames but neither the
-    /// transport headers nor any authorization claims, so the credentials a
-    /// producer sent are not held for as long as its request waits for its
-    /// block to be written.
+    /// completion and its payload. Authorization claims are not planted: the
+    /// only way to attach them, `capture_authorized_identity`, is private to
+    /// the otap crate, so this test cannot cover the claims half of `split`.
+    /// Guarantees: the completion keeps the routing frames but not the
+    /// transport headers, so the credentials a producer sent are not held for
+    /// as long as its request waits for its block to be written.
     #[test]
-    fn split_drops_transport_headers_and_claims() {
+    fn split_drops_transport_headers() {
         use otel_arrow_dfe_config::context::ContextEntryName;
         use otel_arrow_dfe_config::transport_headers::{
             TransportHeader, TransportHeaders, ValueKind,
@@ -553,7 +554,6 @@ mod tests {
 
         let (token, _payload) = AckToken::split(data);
         assert!(token.context.transport_headers().is_none());
-        assert!(token.context.authorized_identity_entries().is_none());
         assert_eq!(token.signal(), SignalType::Logs);
     }
 

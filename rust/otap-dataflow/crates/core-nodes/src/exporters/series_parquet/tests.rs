@@ -625,6 +625,59 @@ async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
     assert_eq!(notify.outcomes()[Outcome::Internal as usize], 1);
 }
 
+/// Scenario: a writer invariant really breaks inside the lake while a request
+/// is admitted: the values sort key is changed after validation to a column
+/// the dataset does not have, and the run target is one byte, so the lake's
+/// run sort fails with its own internal error on the first request. (No
+/// request content can make extraction itself break an invariant: its
+/// builders and rows are derived from the same configuration, and OTAP schema
+/// validation refuses mistyped columns before extraction runs.)
+/// Guarantees: the request is nacked as retryable, not refused, with the
+/// `internal` label and a reason carrying the lake's detail, so a bug of the
+/// writer never tells a producer to drop its data.
+#[tokio::test(flavor = "current_thread")]
+async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
+    let (handler, mut rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut cfg = worker_config();
+    cfg.lake.sorting.run_target_bytes = 1;
+    cfg.lake.logs.values_sort = vec![lake::config::SortKey {
+        column: "no_such_column".into(),
+        order: lake::config::SortOrder::Asc,
+        nulls: lake::config::Nulls::Last,
+    }];
+    let mut worker = Worker::new(
+        cfg,
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    worker.admit(logs_pdata());
+    assert!(
+        worker.active.tokens.is_empty(),
+        "the request is not admitted"
+    );
+    assert_eq!(worker.notify.outcomes()[Outcome::Internal as usize], 1);
+    worker
+        .notify
+        .next()
+        .await
+        .expect("the completion is accepted");
+    match rx.recv().await.expect("a nack") {
+        PipelineCompletionMsg::DeliverNack { nack } => {
+            assert!(!nack.permanent);
+            assert_ne!(nack.cause, NackCause::Refused);
+            assert!(
+                nack.reason.contains("sort column no_such_column missing")
+                    && nack.reason.contains("retry"),
+                "reason: {}",
+                nack.reason
+            );
+        }
+        other => panic!("expected a nack, got {other:?}"),
+    }
+}
+
 /// Scenario: an error detail longer than the reason bound, and one holding
 /// control characters and multi-byte characters at the cut.
 /// Guarantees: the detail a nack reason carries is bounded, single-line and
@@ -1669,6 +1722,42 @@ fn the_factory_creates_file_storage_without_a_capability() {
         &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
     );
     assert!(created.is_ok(), "file storage needs no capability");
+}
+
+/// Scenario: the factory builds the exporter for S3 storage, with a valid
+/// retry budget, and no capability bound to the node.
+/// Guarantees: creation succeeds without a bearer token provider, because S3
+/// authenticates through its own `auth` section; only Azure storage requires
+/// the capability.
+#[test]
+fn the_factory_creates_s3_storage_without_a_token_provider() {
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::config::ExporterConfig;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+
+    let metrics_system = otel_arrow_dfe_telemetry::InternalTelemetrySystem::default();
+    let controller = ControllerContext::new(metrics_system.registry());
+    let pipeline = controller
+        .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
+        .with_node_context(
+            "series".into(),
+            super::SERIES_PARQUET_URN.into(),
+            otel_arrow_dfe_config::node::NodeKind::Exporter,
+            std::collections::HashMap::new(),
+        );
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    node_config.config = serde_json::json!({
+        "storage": s3_storage(),
+        "retry": {"retry_timeout": "30s"}
+    });
+    let created = (super::SERIES_PARQUET.create)(
+        pipeline,
+        test_node("series"),
+        Arc::new(node_config),
+        &ExporterConfig::new("series"),
+        &otel_arrow_dfe_engine::capability::registry::Capabilities::empty(),
+    );
+    assert!(created.is_ok(), "S3 storage needs no bearer token provider");
 }
 
 /// Scenario: the factory builds the exporter for Azure storage, which
@@ -3390,6 +3479,34 @@ fn a_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
     }))
     .expect("file storage applies no store retry");
     assert!(cfg.retry.is_none());
+}
+
+/// An S3 storage section with the default credential chain, for tests that
+/// only load a configuration.
+fn s3_storage() -> serde_json::Value {
+    serde_json::json!({"s3": {"base_uri": "s3://bucket/lake", "auth": {"type": "default"}}})
+}
+
+/// Scenario: a configuration with S3 storage and no `retry` section is loaded
+/// through the factory's own `validate_config`, and then again with a retry
+/// budget shorter than the flush deadline.
+/// Guarantees: the first is refused at load, with a message naming the
+/// three-minute store default and the sixty-second flush deadline, and the
+/// second loads, so the rule is enforced on the path a pipeline actually
+/// starts from and not only by its helper.
+#[test]
+fn an_s3_config_without_a_retry_section_is_refused_at_load() {
+    let validate = super::SERIES_PARQUET.validate_config;
+    let err = validate(&serde_json::json!({"storage": s3_storage()}))
+        .expect_err("the 3m default is not below the 60s deadline")
+        .to_string();
+    assert!(err.contains("(180s)"), "{err}");
+    assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
+    validate(&serde_json::json!({
+        "storage": s3_storage(),
+        "retry": {"retry_timeout": "30s"}
+    }))
+    .expect("a 30s retry budget fits the 60s deadline");
 }
 
 /// Scenario: the one write of a flush never returns, so the block's retry
