@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sort specification, run sorting and k-way merge (spec sections 6.2, 6.5, 7.4).
+//! Sort specification, run sorting and the k-way merge that orders a
+//! table's rows by its `sort_key` (FORMAT.md section 5).
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -556,7 +557,7 @@ pub enum MergeStep {
 /// average pinned bytes per row over all runs, so a chunk whose rows happen to
 /// be wider than average exceeds `chunk_bytes`. The overshoot is bounded by
 /// `max_row_bytes` per row, and `max_row_bytes <= run_target_bytes / 4` is
-/// validated at startup. Exact byte-driven chunking is a plan 3 follow-up.
+/// validated at startup.
 ///
 /// A chunk can be produced in bounded steps through [`MergeIter::step`]: a
 /// step pops heap rows and interleaves output columns until it has done

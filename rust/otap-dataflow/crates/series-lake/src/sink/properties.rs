@@ -134,7 +134,7 @@ pub fn native_sorting_columns(
 }
 
 impl Sink {
-    /// File metadata of spec section 5.4.
+    /// File metadata of FORMAT.md section 5.
     ///
     /// `rows` and `time_range` are computed from the sealed runs before the merge,
     /// because the merged chunks are produced lazily and are not all available at

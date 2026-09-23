@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Writes a sealed block to an object store as Parquet files (spec sections 5.3 to 5.4, 6.5).
+//! Writes a sealed block to an object store as Parquet files, laid out
+//! and named as FORMAT.md sections 4 and 5 define.
 
 mod naming;
 mod properties;

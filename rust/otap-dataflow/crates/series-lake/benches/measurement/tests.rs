@@ -719,8 +719,7 @@ fn a_bare_cargo_bench_run_skips() -> Result<()> {
 // for the default two-column keys, and consistent between the peak table
 // and the total -- and the extract fixture reports that a one-row request
 // pins far more values bytes than its row occupies, so the two memory
-// terms Task 6 measures are observed on the production path rather than
-// estimated.
+// terms the memory ledger charges are observed on the production path.
 fn memory_terms_are_reported(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     for input in fixture_inputs(root)? {

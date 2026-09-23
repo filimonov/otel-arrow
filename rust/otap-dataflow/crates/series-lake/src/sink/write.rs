@@ -741,7 +741,7 @@ impl Sink {
         // down; `BufWriter::abort` panics once shutdown has started, so nothing is
         // aborted from here on. A partial multipart upload left by a cancellation
         // in this phase is reclaimed by the bucket's multipart lifecycle rule
-        // (spec 5.3), not by this crate.
+        // (FORMAT.md section 4), not by this crate.
         let finish = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(Error::cancelled(None)),

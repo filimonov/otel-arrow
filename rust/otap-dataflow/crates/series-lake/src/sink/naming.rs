@@ -43,7 +43,7 @@ fn utc_stamp(unix_secs: i64) -> String {
     )
 }
 
-/// Object path of a dataset file (spec section 5.3).
+/// Object path of a dataset file (FORMAT.md section 4).
 ///
 /// Built as one [`Path::from_iter`] over path segments, not a single
 /// delimiter-joined string: a `/` inside `naming.writer_id` or

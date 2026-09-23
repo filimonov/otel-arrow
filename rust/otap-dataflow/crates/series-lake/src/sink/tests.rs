@@ -735,7 +735,7 @@ async fn every_row_group_carries_the_native_sorting_columns() {
 }
 
 /// Scenario: path components for a known window and sequence.
-/// Guarantees: the Hive layout and file name of spec section 5.3 are produced exactly.
+/// Guarantees: the Hive layout and file name of FORMAT.md section 4 are produced exactly.
 #[test]
 fn object_path_layout() {
     let p = object_path(
@@ -780,7 +780,7 @@ fn object_path_encodes_slash_in_writer_id_as_one_segment() {
 
 /// Scenario: a block with 30 log rows written to a local directory, then read back.
 /// Guarantees: series file exists next to the values file, values are sorted by the spec,
-/// every metadata key of spec 5.4 carries the expected value, the row count agrees with the
+/// every metadata key of FORMAT.md section 5 carries the expected value, the row count agrees with the
 /// flush report, and the same block rewrites the same names.
 #[tokio::test]
 async fn writes_series_before_values_and_reads_back() {
@@ -958,7 +958,7 @@ fn gauge_and_histogram() -> MetricsData {
 }
 
 /// Scenario: a sealed block into which nothing was ever admitted.
-/// Guarantees: no dataset file is created for a zero-row dataset (spec 5.3).
+/// Guarantees: no dataset file is created for a zero-row dataset (FORMAT.md section 4).
 #[tokio::test]
 async fn empty_block_writes_no_file() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1095,8 +1095,8 @@ async fn cancellation_at_a_chunk_boundary() {
         tripped_multipart.load(Ordering::SeqCst),
         "the token must fire inside the chunk loop, not at finalization"
     );
-    // The series file was finalized before the token fired; a finalized file
-    // is never unwritten (spec 6.5 step 2).
+    // The series file was finalized before the token fired, and a finalized
+    // file is never unwritten.
     assert_eq!(parquet_count(dir.path(), "dataset=series"), 1);
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }

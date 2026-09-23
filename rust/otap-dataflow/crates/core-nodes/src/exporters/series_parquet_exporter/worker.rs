@@ -1008,8 +1008,7 @@ impl Worker {
     /// token vectors. The budget is the same shape derived from
     /// configuration, plus the sort, merge, writer, upload and conversion
     /// workspaces a flush may allocate. Those workspace terms are engineering
-    /// reservations rather than measurements; validating them empirically is
-    /// plan 3's work.
+    /// reservations, not measurements.
     pub(super) fn sample_metrics(&mut self) {
         // A worker with no registered instruments -- every worker a test
         // drives directly -- would compute the whole sample only to discard
