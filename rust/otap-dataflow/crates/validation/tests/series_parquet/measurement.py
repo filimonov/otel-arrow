@@ -2893,30 +2893,42 @@ def _clickhouse_record_expression(workload: Workload, signal: str):
 
 
 def _load_actual(ledger: Ledger, cursor_rows):
-    """Stream reader rows into the ledger's `actual` table in batches."""
+    """Stream reader rows into the ledger's `actual` table in batches.
+
+    The load is one transaction. The ledger runs in autocommit mode with
+    full synchronisation, so without it every row would be its own
+    committed transaction with its own fsync: free on a memory file system,
+    minutes per million rows on a disk.
+    """
     connection = ledger.connection
     with ledger.lock:
-        _ = connection.execute("DROP TABLE IF EXISTS actual")
-        _ = connection.execute(
-            "CREATE TABLE actual (record_id TEXT NOT NULL, signal TEXT NOT NULL, "
-            "payload_sha256 TEXT NOT NULL)"
-        )
-        batch = []
-        total = 0
-        for row in cursor_rows:
-            batch.append(row)
-            if len(batch) >= ORACLE_BATCH:
-                _ = connection.executemany(
-                    "INSERT INTO actual VALUES (?, ?, ?)", batch
-                )
+        _ = connection.execute("BEGIN IMMEDIATE")
+        try:
+            _ = connection.execute("DROP TABLE IF EXISTS actual")
+            _ = connection.execute(
+                "CREATE TABLE actual (record_id TEXT NOT NULL, signal TEXT NOT NULL, "
+                "payload_sha256 TEXT NOT NULL)"
+            )
+            batch = []
+            total = 0
+            for row in cursor_rows:
+                batch.append(row)
+                if len(batch) >= ORACLE_BATCH:
+                    _ = connection.executemany(
+                        "INSERT INTO actual VALUES (?, ?, ?)", batch
+                    )
+                    total += len(batch)
+                    batch = []
+            if batch:
+                _ = connection.executemany("INSERT INTO actual VALUES (?, ?, ?)", batch)
                 total += len(batch)
-                batch = []
-        if batch:
-            _ = connection.executemany("INSERT INTO actual VALUES (?, ?, ?)", batch)
-            total += len(batch)
-        _ = connection.execute(
-            "CREATE INDEX actual_by_record ON actual(record_id)"
-        )
+            _ = connection.execute(
+                "CREATE INDEX actual_by_record ON actual(record_id)"
+            )
+            _ = connection.execute("COMMIT")
+        except BaseException:
+            _ = connection.execute("ROLLBACK")
+            raise
     return total
 
 
