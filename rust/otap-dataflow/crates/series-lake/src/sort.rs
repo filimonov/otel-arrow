@@ -8,8 +8,12 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
-use arrow::array::{ArrayData, Capacities, MutableArrayData};
-use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
+use arrow::array::{
+    ArrayData, BooleanBufferBuilder, Capacities, ListArray, MapArray, MutableArrayData,
+    OffsetBufferBuilder, StructArray,
+};
+use arrow::buffer::NullBuffer;
+use arrow::compute::{SortColumn, SortOptions, interleave, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Float64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
@@ -185,12 +189,17 @@ const MIN_KEY_SLICE_ROWS: usize = 16;
 struct StepBudget {
     rows: usize,
     key_bytes: usize,
+    /// The largest value count an `i32` offset buffer may reach: a string
+    /// column's bytes, a list's items, a map's entries and their key and
+    /// value bytes. Lowered by tests only.
+    offset_limit: usize,
 }
 
 impl StepBudget {
     const DEFAULT: Self = Self {
         rows: MERGE_STEP_ROWS,
         key_bytes: MERGE_STEP_KEY_BYTES,
+        offset_limit: i32::MAX as usize,
     };
 
     /// Rows of the next key slice, given the average encoded key width seen
@@ -384,7 +393,11 @@ impl MergeBuild {
     #[cfg(test)]
     fn with_budget(self, rows: usize, key_bytes: usize) -> Self {
         Self {
-            budget: StepBudget { rows, key_bytes },
+            budget: StepBudget {
+                rows,
+                key_bytes,
+                ..StepBudget::DEFAULT
+            },
             ..self
         }
     }
@@ -619,7 +632,6 @@ impl MergeIter {
             merge: self,
             columns: Vec::with_capacity(self.schema.fields().len()),
             current: None,
-            last_step_rows: 0,
         }
     }
 
@@ -646,9 +658,20 @@ impl MergeIter {
     #[cfg(test)]
     fn with_budget(self, rows: usize, key_bytes: usize) -> Self {
         Self {
-            budget: StepBudget { rows, key_bytes },
+            budget: StepBudget {
+                rows,
+                key_bytes,
+                ..StepBudget::DEFAULT
+            },
             ..self
         }
+    }
+
+    /// The same merge with a lower offset limit (tests).
+    #[cfg(test)]
+    fn with_offset_limit(mut self, limit: usize) -> Self {
+        self.budget.offset_limit = limit;
+        self
     }
 
     /// Do one bounded step of producing the next chunk: pop at most the
@@ -734,23 +757,138 @@ impl MergeIter {
     }
 }
 
-/// How a column's builder is sized before its rows are copied.
-#[derive(Debug, Clone, Copy)]
-enum Sizing {
-    /// Fixed width, or a map whose entry buffers grow as they fill: the row
-    /// count is the whole capacity.
-    Rows,
-    /// `Utf8` or `Binary`: the value bytes of the chunk's rows.
-    Bytes(usize),
-    /// A list of fixed-width items: the items of the chunk's rows.
-    Items(usize),
+/// How one output column of a chunk is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnKind {
+    /// Fixed width, boolean, fixed-size binary, string or binary: copied by
+    /// row into a presized buffer.
+    Flat,
+    /// A list of fixed-width items.
+    List,
+    /// A map whose keys and values are strings or binaries and whose entries
+    /// carry no nulls of their own.
+    Map,
+    /// Anything else, dictionaries included: interleaved whole in one step,
+    /// as every column was before chunks were built in steps. No exporter
+    /// dataset has such a column.
+    Whole,
+}
+
+/// How `data_type` is built, given the runs' data for the column.
+fn column_kind(data_type: &DataType, sources: &[ArrayData]) -> ColumnKind {
+    let bytes = |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary);
+    match data_type {
+        DataType::Boolean | DataType::FixedSizeBinary(_) => ColumnKind::Flat,
+        dt if bytes(dt) || dt.primitive_width().is_some() => ColumnKind::Flat,
+        DataType::List(item) if item.data_type().primitive_width().is_some() => ColumnKind::List,
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields)
+                if fields.len() == 2
+                    && bytes(fields[0].data_type())
+                    && bytes(fields[1].data_type())
+                    && sources
+                        .iter()
+                        .all(|source| source.child_data()[0].null_count() == 0) =>
+            {
+                ColumnKind::Map
+            }
+            _ => ColumnKind::Whole,
+        },
+        _ => ColumnKind::Whole,
+    }
+}
+
+/// The logical `i32` offsets of a string, binary, list or map array.
+fn offsets_of(data: &ArrayData) -> &[i32] {
+    &data.buffers()[0].typed_data::<i32>()[data.offset()..]
+}
+
+/// Values the offsets of `data` span over rows `first..first + len`.
+fn span_of(data: &ArrayData, first: usize, len: usize) -> usize {
+    let offsets = offsets_of(data);
+    (offsets[first + len] - offsets[first]) as usize
+}
+
+/// `n` rounded up as arrow rounds a buffer's allocation.
+fn allocated(n: usize) -> usize {
+    arrow::util::bit_util::round_upto_multiple_of_64(n)
+}
+
+/// The row capacity a presized `MutableArrayData` of `rows` rows of
+/// `data_type` is created with.
+///
+/// Extending a string or binary array reserves one offset more than it
+/// writes, so an offsets buffer sized for exactly `rows` rows would be
+/// reallocated, and wholly copied, by the last extend of a column whose
+/// size happens to be a multiple of 64 bytes. One spare row keeps every
+/// extend inside the buffer.
+fn row_capacity(data_type: &DataType, rows: usize) -> usize {
+    match data_type {
+        DataType::Utf8 | DataType::Binary => rows + 1,
+        _ => rows,
+    }
+}
+
+/// The capacities a presized `MutableArrayData` of `rows` rows of
+/// `data_type` is created with, `bytes` being the value bytes of a string
+/// or binary column.
+fn flat_capacities(data_type: &DataType, rows: usize, bytes: usize) -> Capacities {
+    match data_type {
+        DataType::Utf8 | DataType::Binary => {
+            Capacities::Binary(row_capacity(data_type, rows), Some(bytes))
+        }
+        _ => Capacities::Array(rows),
+    }
+}
+
+/// Bytes a `MutableArrayData` created with [`flat_capacities`] allocates.
+fn flat_charge(data_type: &DataType, rows: usize, bytes: usize, nulls: bool) -> usize {
+    let capacity = row_capacity(data_type, rows);
+    let data = match data_type {
+        DataType::Utf8 | DataType::Binary => {
+            allocated((capacity + 1) * size_of::<i32>()) + allocated(bytes)
+        }
+        DataType::Boolean => allocated(capacity.div_ceil(8)),
+        DataType::FixedSizeBinary(width) => allocated(capacity * *width as usize),
+        other => allocated(capacity * other.primitive_width().unwrap_or(0)),
+    };
+    data + if nulls { capacity.div_ceil(8) } else { 0 }
+}
+
+/// Validity of rows `start..start + len` of `data`, appended to `builder`.
+fn append_validity(builder: &mut BooleanBufferBuilder, data: &ArrayData, start: usize, len: usize) {
+    match data.nulls() {
+        Some(nulls) => builder.append_buffer(&nulls.inner().slice(start, len)),
+        None => builder.append_n(len, true),
+    }
+}
+
+/// A column's buffers once allocated.
+enum Built<'a> {
+    Flat(MutableArrayData<'a>),
+    List {
+        offsets: OffsetBufferBuilder<i32>,
+        nulls: Option<BooleanBufferBuilder>,
+        items: MutableArrayData<'a>,
+    },
+    Map {
+        offsets: OffsetBufferBuilder<i32>,
+        nulls: Option<BooleanBufferBuilder>,
+        /// Keys and values, boxed: the one variant holding two children.
+        children: Box<[MutableArrayData<'a>; 2]>,
+    },
 }
 
 /// One column of a chunk being built.
 struct ColumnBuild<'a> {
-    sizing: Sizing,
-    /// `None` while the capacity is still being counted.
-    data: Option<MutableArrayData<'a>>,
+    kind: ColumnKind,
+    /// What the chunk's rows need, counted before allocation: the value
+    /// bytes of a string column, a list's items, or a map's entries and
+    /// their key and value bytes.
+    counts: [usize; 3],
+    built: Option<Built<'a>>,
+    /// Bytes the allocated buffers hold, as allocated.
+    charge: usize,
     /// The next range to count or copy, and the rows of it already copied.
     range: usize,
     offset: usize,
@@ -759,23 +897,32 @@ struct ColumnBuild<'a> {
 /// Builds one sorted chunk from the rows its [`MergeIter`] has popped, in
 /// bounded steps.
 ///
-/// Each column is built in a buffer sized up front for the chunk's rows --
-/// the value bytes of a string or binary column and the items of a list are
-/// counted first, a bounded number of ranges per step -- and then filled by
-/// copying at most [`MERGE_STEP_ROWS`] rows per step. Completing a column
-/// freezes that buffer as it is, so no step copies more than its budget,
-/// finishing included. A map column's entry buffers are the one exception
-/// to the up-front sizing: they grow as they fill, which amortizes to one
-/// extra copy of the map's entries per chunk.
+/// A step's budget is [`MERGE_STEP_ROWS`] elements: every row counts one,
+/// and every item of a list row or entry of a map row counts one more.
+/// Each column is first sized -- a string column's value bytes, a list's
+/// items, a map's entries and their key and value bytes are counted, a
+/// bounded number of ranges per step -- and then allocated once, at that
+/// size, so no buffer grows while rows are copied. Rows are then copied
+/// until the budget is spent, a range of rows split wherever its elements
+/// would pass the budget; a single row larger than the whole budget is
+/// copied in a step of its own, and a row is bounded by
+/// `ingress.max_row_bytes`. Completing a column freezes its buffers as they
+/// are. So no step copies more than its budget, finishing included, and no
+/// step reallocates.
 ///
-/// The column is the same array an interleave of the same rows would give,
-/// so the chunk, and every byte written from it, is unchanged.
+/// Lists and maps are assembled from their own offsets, validity and
+/// presized children, because `MutableArrayData` cannot presize a map's
+/// entries. A presized total an `i32` offset cannot hold is an error before
+/// anything is copied. A column of any other type, a dictionary for one,
+/// is interleaved whole in one step, as before; the exporter's datasets
+/// have none.
+///
+/// Every column is the same array an interleave of the same rows would
+/// give, so the chunk, and every byte written from it, is unchanged.
 pub struct ChunkBuilder<'a> {
     merge: &'a MergeIter,
     columns: Vec<ArrayRef>,
     current: Option<ColumnBuild<'a>>,
-    /// Rows the last step copied.
-    last_step_rows: usize,
 }
 
 impl<'a> ChunkBuilder<'a> {
@@ -784,83 +931,133 @@ impl<'a> ChunkBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Never, today; the signature leaves room for a failing step.
+    /// Returns an offset overflow for a column whose presized total does
+    /// not fit an `i32` offset, and the Arrow failure of interleaving or
+    /// assembling a column.
     pub fn step(&mut self) -> Result<bool> {
         let merge = self.merge;
         let budget = merge.budget.rows;
         let columns = merge.schema.fields().len();
-        let (mut work, mut copied) = (0usize, 0usize);
+        let mut work = 0usize;
         while self.columns.len() < columns && work < budget {
             let c = self.columns.len();
-            let column = self
-                .current
-                .get_or_insert_with(|| ColumnBuild::new(merge.schema.field(c).data_type()));
-            if column.data.is_none() {
+            let data_type = merge.schema.field(c).data_type();
+            let sources = &merge.sources[c];
+            let column = self.current.get_or_insert_with(|| ColumnBuild {
+                kind: column_kind(data_type, sources),
+                counts: [0; 3],
+                built: None,
+                charge: 0,
+                range: 0,
+                offset: 0,
+            });
+            if column.kind == ColumnKind::Whole {
+                let indices: Vec<(usize, usize)> = merge
+                    .ranges
+                    .iter()
+                    .flat_map(|&(run, first, len)| (first..first + len).map(move |idx| (run, idx)))
+                    .collect();
+                let arrays: Vec<&dyn Array> = merge
+                    .runs
+                    .iter()
+                    .map(|run| run.column(c).as_ref())
+                    .collect();
+                self.columns.push(interleave(&arrays, &indices)?);
+                self.current = None;
+                work += indices.len();
+                continue;
+            }
+            if column.built.is_none() {
                 while column.range < merge.ranges.len() && work < budget {
-                    column.count(&merge.sources[c], merge.ranges[column.range]);
+                    column.count(data_type, sources, merge.ranges[column.range]);
                     column.range += 1;
                     work += 1;
                 }
                 if column.range < merge.ranges.len() {
                     break;
                 }
-                column.start(&merge.sources[c], merge.pending_rows);
+                column.allocate(
+                    data_type,
+                    sources,
+                    merge.pending_rows,
+                    merge.budget.offset_limit,
+                )?;
             }
-            let data = column
-                .data
-                .as_mut()
-                .ok_or_else(|| Error::internal("chunk column without a builder"))?;
             while column.range < merge.ranges.len() && work < budget {
-                let (run, first, len) = merge.ranges[column.range];
-                let rows = (len - column.offset).min(budget - work);
-                data.extend(run, first + column.offset, first + column.offset + rows);
-                column.offset += rows;
-                work += rows;
-                copied += rows;
-                if column.offset == len {
-                    column.range += 1;
-                    column.offset = 0;
+                let copied = column.copy(
+                    sources,
+                    merge.ranges[column.range],
+                    budget - work,
+                    work == 0,
+                );
+                if copied == 0 {
+                    break;
                 }
+                work += copied;
             }
             if column.range < merge.ranges.len() {
                 break;
             }
-            if let Some(done) = self.current.take().and_then(|column| column.data) {
-                self.columns.push(arrow::array::make_array(done.freeze()));
-            }
+            let done = self
+                .current
+                .take()
+                .ok_or_else(|| Error::internal("chunk column vanished"))?;
+            self.columns.push(done.freeze(data_type)?);
         }
-        self.last_step_rows = copied;
         Ok(self.columns.len() == columns)
     }
 
-    /// Heap the chunk's columns hold so far: the built ones and the buffer
-    /// of the one being built, as sized.
+    /// Heap the chunk's columns hold so far: the built ones as measured,
+    /// and the one being built as its buffers were allocated.
     #[must_use]
     pub fn workspace_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>()
+            + self.current.as_ref().map_or(0, |column| column.charge)
+    }
+
+    /// Elements the builder's buffers hold, read from their lengths: rows,
+    /// plus the items of lists and the entries of maps (tests).
+    #[cfg(test)]
+    fn copied_elements(&self) -> usize {
+        let children = |array: &ArrayRef| {
+            if let Some(list) = array.as_list_opt::<i32>() {
+                list.values().len()
+            } else if let Some(map) = array.as_map_opt() {
+                map.entries().len()
+            } else {
+                0
+            }
+        };
         let built = self
             .columns
             .iter()
-            .map(|column| column.get_array_memory_size())
+            .map(|array| array.len() + children(array))
             .sum::<usize>();
-        let current = self.current.as_ref().map_or(0, |column| {
-            let rows = self.merge.pending_rows;
-            let width = self
-                .merge
-                .schema
-                .field(self.columns.len())
-                .data_type()
-                .primitive_width()
-                .unwrap_or(0);
-            match (column.data.is_some(), column.sizing) {
-                (false, _) => 0,
-                (true, Sizing::Rows) => rows * width,
-                (true, Sizing::Bytes(bytes)) => bytes + (rows + 1) * size_of::<i32>(),
-                (true, Sizing::Items(items)) => {
-                    items * size_of::<i64>() + (rows + 1) * size_of::<i32>()
-                }
-            }
-        });
+        let current = match self
+            .current
+            .as_ref()
+            .and_then(|column| column.built.as_ref())
+        {
+            None => 0,
+            Some(Built::Flat(data)) => data.len(),
+            Some(Built::List { offsets, items, .. }) => offsets.len() - 1 + items.len(),
+            Some(Built::Map {
+                offsets, children, ..
+            }) => offsets.len() - 1 + children[0].len(),
+        };
         built + current
+    }
+
+    /// What the column being built was charged when allocated (tests).
+    #[cfg(test)]
+    fn current_charge(&self) -> Option<usize> {
+        self.current
+            .as_ref()
+            .filter(|column| column.built.is_some())
+            .map(|column| column.charge)
     }
 
     /// The built chunk.
@@ -883,52 +1080,246 @@ impl<'a> ChunkBuilder<'a> {
 }
 
 impl<'a> ColumnBuild<'a> {
-    fn new(data_type: &DataType) -> Self {
-        let sizing = match data_type {
-            DataType::Utf8 | DataType::Binary => Sizing::Bytes(0),
-            DataType::List(item) if item.data_type().primitive_width().is_some() => {
-                Sizing::Items(0)
-            }
-            _ => Sizing::Rows,
-        };
-        Self {
-            sizing,
-            data: None,
-            range: 0,
-            offset: 0,
-        }
-    }
-
     /// Count what one range of rows needs.
-    fn count(&mut self, sources: &[ArrayData], (run, first, len): (usize, usize, usize)) {
-        let span = |data: &ArrayData| {
-            let offsets = data.buffers()[0].typed_data::<i32>();
-            let at = data.offset() + first;
-            (offsets[at + len] - offsets[at]) as usize
-        };
-        match &mut self.sizing {
-            Sizing::Rows => {}
-            Sizing::Bytes(bytes) => *bytes += span(&sources[run]),
-            Sizing::Items(items) => *items += span(&sources[run]),
+    fn count(
+        &mut self,
+        data_type: &DataType,
+        sources: &[ArrayData],
+        (run, first, len): (usize, usize, usize),
+    ) {
+        let data = &sources[run];
+        match self.kind {
+            ColumnKind::Flat if matches!(data_type, DataType::Utf8 | DataType::Binary) => {
+                self.counts[0] += span_of(data, first, len);
+            }
+            ColumnKind::List => self.counts[0] += span_of(data, first, len),
+            ColumnKind::Map => {
+                let offsets = offsets_of(data);
+                let (start, end) = (offsets[first] as usize, offsets[first + len] as usize);
+                let entries = &data.child_data()[0];
+                self.counts[0] += end - start;
+                self.counts[1] += span_of(&entries.child_data()[0], start, end - start);
+                self.counts[2] += span_of(&entries.child_data()[1], start, end - start);
+            }
+            ColumnKind::Flat | ColumnKind::Whole => {}
         }
     }
 
-    /// Allocate the column's buffer for `rows` rows, as counted.
-    fn start(&mut self, sources: &'a [ArrayData], rows: usize) {
-        let capacities = match self.sizing {
-            Sizing::Rows => Capacities::Array(rows),
-            Sizing::Bytes(bytes) => Capacities::Binary(rows, Some(bytes)),
-            Sizing::Items(items) => {
-                Capacities::List(rows, Some(Box::new(Capacities::Array(items))))
+    /// Allocate the column's buffers for `rows` rows, as counted, after
+    /// checking every counted total fits an `i32` offset.
+    fn allocate(
+        &mut self,
+        data_type: &DataType,
+        sources: &'a [ArrayData],
+        rows: usize,
+        limit: usize,
+    ) -> Result<()> {
+        if let Some(&total) = self.counts.iter().find(|&&total| total > limit) {
+            return Err(arrow::error::ArrowError::OffsetOverflowError(total).into());
+        }
+        let nulls = |data: &[&ArrayData]| data.iter().any(|d| d.null_count() > 0);
+        let validity = |data: &[&ArrayData]| nulls(data).then(|| BooleanBufferBuilder::new(rows));
+        let validity_charge = |present: bool| {
+            if present {
+                allocated(rows.div_ceil(8))
+            } else {
+                0
             }
         };
-        self.data = Some(MutableArrayData::with_capacities(
-            sources.iter().collect(),
-            false,
-            capacities,
-        ));
+        let tops: Vec<&ArrayData> = sources.iter().collect();
+        let offsets_charge = (rows + 1) * size_of::<i32>();
+        match self.kind {
+            ColumnKind::Flat => {
+                let bytes = self.counts[0];
+                let capacities = flat_capacities(data_type, rows, bytes);
+                self.charge = flat_charge(data_type, rows, bytes, nulls(&tops));
+                self.built = Some(Built::Flat(MutableArrayData::with_capacities(
+                    tops, false, capacities,
+                )));
+            }
+            ColumnKind::List => {
+                let children: Vec<&ArrayData> =
+                    sources.iter().map(|d| &d.child_data()[0]).collect();
+                let items = self.counts[0];
+                let item_type = children
+                    .first()
+                    .map_or(DataType::Null, |d| d.data_type().clone());
+                let nulls_builder = validity(&tops);
+                self.charge = offsets_charge
+                    + validity_charge(nulls_builder.is_some())
+                    + flat_charge(&item_type, items, 0, nulls(&children));
+                self.built = Some(Built::List {
+                    offsets: OffsetBufferBuilder::new(rows),
+                    nulls: nulls_builder,
+                    items: MutableArrayData::with_capacities(
+                        children,
+                        false,
+                        Capacities::Array(items),
+                    ),
+                });
+            }
+            ColumnKind::Map => {
+                let [entries, key_bytes, value_bytes] = self.counts;
+                let keys: Vec<&ArrayData> = sources
+                    .iter()
+                    .map(|d| &d.child_data()[0].child_data()[0])
+                    .collect();
+                let values: Vec<&ArrayData> = sources
+                    .iter()
+                    .map(|d| &d.child_data()[0].child_data()[1])
+                    .collect();
+                let key_type = keys
+                    .first()
+                    .map_or(DataType::Utf8, |d| d.data_type().clone());
+                let value_type = values
+                    .first()
+                    .map_or(DataType::Utf8, |d| d.data_type().clone());
+                let nulls_builder = validity(&tops);
+                self.charge = offsets_charge
+                    + validity_charge(nulls_builder.is_some())
+                    + flat_charge(&key_type, entries, key_bytes, nulls(&keys))
+                    + flat_charge(&value_type, entries, value_bytes, nulls(&values));
+                self.built = Some(Built::Map {
+                    offsets: OffsetBufferBuilder::new(rows),
+                    nulls: nulls_builder,
+                    children: Box::new([
+                        MutableArrayData::with_capacities(
+                            keys,
+                            false,
+                            flat_capacities(&key_type, entries, key_bytes),
+                        ),
+                        MutableArrayData::with_capacities(
+                            values,
+                            false,
+                            flat_capacities(&value_type, entries, value_bytes),
+                        ),
+                    ]),
+                });
+            }
+            ColumnKind::Whole => {}
+        }
         self.range = 0;
         self.offset = 0;
+        Ok(())
+    }
+
+    /// Copy the next rows of one range, at most `budget` elements; returns
+    /// the elements copied, zero when the next row does not fit. A row
+    /// larger than the whole budget is copied alone when `alone`, by a step
+    /// that has copied nothing else.
+    fn copy(
+        &mut self,
+        sources: &[ArrayData],
+        (run, first, len): (usize, usize, usize),
+        budget: usize,
+        alone: bool,
+    ) -> usize {
+        let data = &sources[run];
+        let start = first + self.offset;
+        let (rows, elements) = match self.built.as_mut() {
+            None => (len - self.offset, 0),
+            Some(Built::Flat(out)) => {
+                let rows = (len - self.offset).min(budget);
+                out.extend(run, start, start + rows);
+                (rows, rows)
+            }
+            Some(Built::List { offsets, nulls, .. } | Built::Map { offsets, nulls, .. }) => {
+                let source = offsets_of(data);
+                let mut rows = 0usize;
+                let mut elements = 0usize;
+                while self.offset + rows < len {
+                    let at = start + rows;
+                    let children = (source[at + 1] - source[at]) as usize;
+                    if (rows > 0 || !alone) && elements + 1 + children > budget {
+                        break;
+                    }
+                    offsets.push_length(children);
+                    rows += 1;
+                    elements += 1 + children;
+                    if elements >= budget {
+                        break;
+                    }
+                }
+                if let Some(nulls) = nulls {
+                    append_validity(nulls, data, start, rows);
+                }
+                (rows, elements)
+            }
+        };
+        let (from, to) = match self.built.as_ref() {
+            Some(Built::List { .. } | Built::Map { .. }) => {
+                let source = offsets_of(data);
+                (source[start] as usize, source[start + rows] as usize)
+            }
+            _ => (0, 0),
+        };
+        match self.built.as_mut() {
+            Some(Built::List { items, .. }) => items.extend(run, from, to),
+            Some(Built::Map { children, .. }) => {
+                for child in children.iter_mut() {
+                    child.extend(run, from, to);
+                }
+            }
+            _ => {}
+        }
+        self.offset += rows;
+        if self.offset == len {
+            self.range += 1;
+            self.offset = 0;
+        }
+        elements
+    }
+
+    /// The column, its buffers frozen as they are.
+    fn freeze(self, data_type: &DataType) -> Result<ArrayRef> {
+        let nulls_of = |nulls: Option<BooleanBufferBuilder>| {
+            nulls.map(|mut builder| NullBuffer::new(builder.finish()))
+        };
+        match (self.built, data_type) {
+            (Some(Built::Flat(out)), _) => Ok(arrow::array::make_array(out.freeze())),
+            (
+                Some(Built::List {
+                    offsets,
+                    nulls,
+                    items,
+                }),
+                DataType::List(field),
+            ) => Ok(Arc::new(ListArray::try_new(
+                Arc::clone(field),
+                offsets.finish(),
+                arrow::array::make_array(items.freeze()),
+                nulls_of(nulls),
+            )?)),
+            (
+                Some(Built::Map {
+                    offsets,
+                    nulls,
+                    children,
+                }),
+                DataType::Map(entries_field, ordered),
+            ) => {
+                let [keys, values] = *children;
+                let DataType::Struct(fields) = entries_field.data_type() else {
+                    return Err(Error::internal("map entries are not a struct"));
+                };
+                let entries = StructArray::try_new(
+                    fields.clone(),
+                    vec![
+                        arrow::array::make_array(keys.freeze()),
+                        arrow::array::make_array(values.freeze()),
+                    ],
+                    None,
+                )?;
+                Ok(Arc::new(MapArray::try_new(
+                    Arc::clone(entries_field),
+                    offsets.finish(),
+                    entries,
+                    nulls_of(nulls),
+                    *ordered,
+                )?))
+            }
+            _ => Err(Error::internal("chunk column built for another type")),
+        }
     }
 }
 
@@ -1734,22 +2125,110 @@ mod tests {
         }
     }
 
-    /// Scenario: the tie-heavy runs, 214 rows in one chunk, merged with a
-    /// budget of three rows per step.
-    /// Guarantees: no step does more than its budget, counted as the rows it
-    /// actually encodes, pops or copies: a key slice encodes at most three
-    /// rows, a merge step pops at most three, and a chunk-builder step
-    /// copies at most three rows, the step that completes a column
-    /// included. Every row of every column is copied exactly once, so no
-    /// step concatenates or recopies what earlier steps built.
+    /// Runs keyed by an Int64 `k` with ties, each row carrying a map of 0 to
+    /// 5 entries with a null value now and then, a list of 0 to 4 items, a
+    /// nullable string and a tag, every run sorted by `k`.
+    fn nested_runs() -> (Vec<RecordBatch>, SortSpec) {
+        use arrow::array::{Int64Builder, ListBuilder, MapBuilder, StringBuilder};
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        let runs = (0..3)
+            .map(|run| {
+                let n = 40 + run * 13;
+                let mut k = Int64Builder::new();
+                let mut m = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+                let mut l = ListBuilder::new(Int64Builder::new());
+                let mut v = StringBuilder::new();
+                let mut tag = StringBuilder::new();
+                for i in 0..n {
+                    k.append_value(((i * 7 + run * 5) % 11) as i64);
+                    for e in 0..(i + run) % 6 {
+                        m.keys().append_value(format!("key{e}"));
+                        if (i + e) % 4 == 0 {
+                            m.values().append_null();
+                        } else {
+                            m.values().append_value("v".repeat(1 + (i * e) % 9));
+                        }
+                    }
+                    m.append(true).expect("map row");
+                    for item in 0..(i * 3 + run) % 5 {
+                        l.values().append_value((i * 10 + item) as i64);
+                    }
+                    l.append(true);
+                    if i % 5 == 3 {
+                        v.append_null();
+                    } else {
+                        v.append_value("s".repeat(i % 13));
+                    }
+                    tag.append_value(format!("r{run}i{i}"));
+                }
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(k.finish()),
+                    Arc::new(m.finish()),
+                    Arc::new(l.finish()),
+                    Arc::new(v.finish()),
+                    Arc::new(tag.finish()),
+                ];
+                let schema = Arc::new(Schema::new(
+                    columns
+                        .iter()
+                        .zip(["k", "m", "l", "v", "tag"])
+                        .map(|(c, name)| Field::new(name, c.data_type().clone(), true))
+                        .collect::<Vec<_>>(),
+                ));
+                let batch = RecordBatch::try_new(schema, columns).expect("batch");
+                sort_batch(&batch, &spec).expect("sort")
+            })
+            .collect();
+        (runs, spec)
+    }
+
+    /// The runs' rows in the merge's order, as a stable sort of their
+    /// concatenation by `k` gives them: ties keep run order, then row order.
+    fn stable_merge_of(runs: &[RecordBatch]) -> RecordBatch {
+        let all = arrow::compute::concat_batches(&runs[0].schema(), runs).expect("concat");
+        let k = all.column(0).as_primitive::<Int64Type>();
+        let mut order: Vec<u32> = (0..all.num_rows() as u32).collect();
+        order.sort_by_key(|&i| k.value(i as usize));
+        let indices = arrow::array::UInt32Array::from(order);
+        let columns = all
+            .columns()
+            .iter()
+            .map(|c| take(c, &indices, None).expect("take"))
+            .collect();
+        RecordBatch::try_new(all.schema(), columns).expect("batch")
+    }
+
+    /// Scenario: runs with map, list and string columns, merged into one
+    /// chunk with a budget of eight elements per step.
+    /// Guarantees: no step copies more than its budget, measured from the
+    /// builder's own buffers -- the rows, list items and map entries they
+    /// hold before and after the step -- the step that completes a column
+    /// included, and every row, item and entry is copied exactly once. Key
+    /// slices and pops stay within the budget too, and the chunk equals a
+    /// stable sort of the runs.
     #[test]
     fn one_merge_step_does_bounded_work() {
-        let (runs, spec) = tie_heavy_runs();
-        let columns = runs[0].num_columns();
-        let expected = merged(runs.clone(), &spec, 1 << 20);
-        let mut build = MergeBuild::new(runs.clone(), &spec, 1 << 20)
+        let (runs, spec) = nested_runs();
+        let rows: usize = runs.iter().map(RecordBatch::num_rows).sum();
+        let expected = stable_merge_of(&runs);
+        let children: usize = [1usize, 2]
+            .iter()
+            .map(|&c| {
+                let column = expected.column(c);
+                column
+                    .as_list_opt::<i32>()
+                    .map(|l| l.values().len())
+                    .or_else(|| column.as_map_opt().map(|m| m.entries().len()))
+                    .unwrap_or(0)
+            })
+            .sum();
+        let mut build = MergeBuild::new(runs.clone(), &spec, 1 << 30)
             .expect("build")
-            .with_budget(3, 1 << 20);
+            .with_budget(8, 1 << 20);
         let mut encoded = 0usize;
         while !build.step().expect("slice") {
             let now = build
@@ -1759,31 +2238,27 @@ mod tests {
                 .map(Rows::num_rows)
                 .sum::<usize>();
             assert!(
-                now - encoded <= 3,
+                now - encoded <= 8,
                 "{} rows in one key slice",
                 now - encoded
             );
             encoded = now;
         }
-        let mut merge = build.finish().expect("finish").with_budget(3, 1 << 20);
+        let mut merge = build.finish().expect("finish").with_budget(8, 1 << 20);
         let mut chunks = Vec::new();
         let mut copied = 0usize;
-        let mut builder_steps = 0usize;
         loop {
             match merge.step().expect("step") {
-                MergeStep::Progress => assert!(merge.last_step_rows <= 3),
+                MergeStep::Progress => assert!(merge.last_step_rows <= 8),
                 MergeStep::Ready => {
-                    assert!(merge.last_step_rows <= 3);
+                    assert!(merge.last_step_rows <= 8);
                     let mut builder = merge.chunk_builder();
                     loop {
+                        let before = builder.copied_elements();
                         let done = builder.step().expect("build step");
-                        builder_steps += 1;
-                        assert!(
-                            builder.last_step_rows <= 3,
-                            "{} rows copied in one step",
-                            builder.last_step_rows
-                        );
-                        copied += builder.last_step_rows;
+                        let step = builder.copied_elements() - before;
+                        assert!(step <= 8, "{step} elements copied in one step");
+                        copied += step;
                         if done {
                             break;
                         }
@@ -1795,13 +2270,150 @@ mod tests {
                 MergeStep::Done => break,
             }
         }
-        assert_eq!(chunks, expected);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], expected);
         assert_eq!(
             copied,
-            214 * columns,
-            "every row of every column copied once"
+            rows * expected.num_columns() + children,
+            "every row, item and entry copied exactly once"
         );
-        assert!(builder_steps >= 214 * columns / 3);
+    }
+
+    /// Every buffer capacity an array's data holds, children and validity
+    /// included.
+    fn capacity_of(data: &ArrayData) -> usize {
+        data.buffers().iter().map(|b| b.capacity()).sum::<usize>()
+            + data.nulls().map_or(0, |n| n.buffer().capacity())
+            + data.child_data().iter().map(capacity_of).sum::<usize>()
+    }
+
+    /// Scenario: the nested runs' chunk built eight elements per step, the
+    /// charge of each column read while it is being built.
+    /// Guarantees: from the moment a column's buffers are allocated the
+    /// builder charges what they hold -- maps and lists with their children
+    /// and validity included -- and the charge equals the capacities the
+    /// completed column's buffers really have.
+    #[test]
+    fn the_builder_charges_what_its_buffers_allocate() {
+        let (runs, spec) = nested_runs();
+        let mut merge = merge_runs(runs, &spec, 1 << 30)
+            .expect("merge")
+            .with_budget(8, 1 << 20);
+        while !matches!(merge.step().expect("step"), MergeStep::Ready) {}
+        let mut builder = merge.chunk_builder();
+        let mut charged: Vec<Option<usize>> = Vec::new();
+        loop {
+            let done = builder.step().expect("build step");
+            while charged.len() < builder.columns.len() {
+                charged.push(None);
+            }
+            if let Some(charge) = builder.current_charge() {
+                let c = builder.columns.len();
+                if charged.len() <= c {
+                    charged.resize(c + 1, None);
+                }
+                charged[c] = Some(charge);
+            }
+            if done {
+                break;
+            }
+        }
+        let mut checked = 0;
+        for (c, column) in builder.columns.iter().enumerate() {
+            let Some(charge) = charged.get(c).copied().flatten() else {
+                continue;
+            };
+            let actual = capacity_of(&column.to_data());
+            assert_eq!(
+                charge, actual,
+                "column {c}: charged {charge}, allocated {actual}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "{checked} columns were charged while being built"
+        );
+    }
+
+    /// Scenario: two runs whose dictionary-encoded column uses different
+    /// dictionaries, then two runs whose dictionaries together hold more
+    /// values than an Int8 key can address.
+    /// Guarantees: a dictionary column is merged through the interleave that
+    /// merges dictionaries, so the first merge yields the right values and
+    /// the second returns an error rather than panicking.
+    #[test]
+    fn dictionary_columns_merge_or_fail_without_panicking() {
+        use arrow::array::{DictionaryArray, Int8Array, StringArray};
+        use arrow::datatypes::Int8Type;
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        let run = |keys: Vec<i64>, values: Vec<String>| {
+            let n = values.len();
+            let dictionary = DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from((0..n as i8).collect::<Vec<_>>()),
+                Arc::new(StringArray::from(values)),
+            )
+            .expect("dictionary");
+            let columns: Vec<ArrayRef> =
+                vec![Arc::new(Int64Array::from(keys)), Arc::new(dictionary)];
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("d", columns[1].data_type().clone(), false),
+            ]));
+            RecordBatch::try_new(schema, columns).expect("batch")
+        };
+        let a = run(vec![1, 3], vec!["one".into(), "three".into()]);
+        let b = run(vec![2, 4], vec!["two".into(), "four".into()]);
+        let all = concat(&merged(vec![a, b], &spec, 1 << 20));
+        let strings = arrow::compute::cast(all.column(1), &DataType::Utf8).expect("cast");
+        assert_eq!(
+            strings
+                .as_string::<i32>()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            ["one", "two", "three", "four"]
+        );
+        let wide = |base: i64| {
+            run(
+                (0..100).map(|i| base + i).collect(),
+                (0..100).map(|i| format!("value{}", base + i)).collect(),
+            )
+        };
+        let got = merge_runs(vec![wide(0), wide(1000)], &spec, 1 << 20)
+            .expect("merge")
+            .collect::<Result<Vec<_>>>();
+        assert!(got.is_err(), "200 dictionary values cannot fit Int8 keys");
+    }
+
+    /// Scenario: a string column whose chunk holds more value bytes than
+    /// the offset limit, lowered for the test to 16 bytes.
+    /// Guarantees: the builder refuses the column with an offset overflow
+    /// error before it copies anything, rather than panicking inside the
+    /// copy.
+    #[test]
+    fn an_offset_overflow_is_an_error_not_a_panic() {
+        let (runs, spec) = tie_heavy_runs();
+        let mut merge = merge_runs(runs, &spec, 1 << 30)
+            .expect("merge")
+            .with_offset_limit(16);
+        while !matches!(merge.step().expect("step"), MergeStep::Ready) {}
+        let mut builder = merge.chunk_builder();
+        let err = loop {
+            match builder.step() {
+                Ok(true) => panic!("the string column fits no 16-byte offset limit"),
+                Ok(false) => {}
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("offset"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Scenario: the tie-heavy runs' keys encoded two rows per step.
@@ -1882,5 +2494,49 @@ mod tests {
         assert_eq!(chunk.num_rows(), 100);
         assert_eq!(keys_of(&chunk)[0], Some(1));
         assert!(matches!(merge.step().expect("step"), MergeStep::Done));
+    }
+
+    /// Scenario: every column of the four lake datasets, with a denormalized
+    /// column of every type configured.
+    /// Guarantees: each is built in bounded steps -- as a flat, list or map
+    /// column -- and none falls to the whole-column interleave, which only a
+    /// type the exporter never writes, a dictionary for one, takes.
+    #[test]
+    fn every_lake_column_is_built_in_bounded_steps() {
+        use crate::config::{DenormType, Denormalize, LakeConfig};
+        use crate::schema::{Dataset, dataset_schema};
+        let mut cfg = LakeConfig::default();
+        for (i, ty) in [
+            DenormType::String,
+            DenormType::Int64,
+            DenormType::Double,
+            DenormType::Bool,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let denormalize = Denormalize {
+                path: format!("resource.attr{i}"),
+                column: format!("denorm_{i}"),
+                ty,
+            };
+            cfg.logs.denormalize.push(denormalize.clone());
+            cfg.metrics.denormalize.push(denormalize);
+        }
+        for dataset in [
+            Dataset::LogsSeries,
+            Dataset::LogsValues,
+            Dataset::MetricsSeries,
+            Dataset::MetricsValues,
+        ] {
+            for field in dataset_schema(dataset, &cfg).fields() {
+                assert_ne!(
+                    column_kind(field.data_type(), &[]),
+                    ColumnKind::Whole,
+                    "{dataset:?}.{}",
+                    field.name()
+                );
+            }
+        }
     }
 }
