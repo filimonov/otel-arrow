@@ -39,7 +39,6 @@ PLANNED_COMMANDS = (
     "capacity",
     "memory",
     "soak",
-    "fault-preflight",
     "failures",
     "buffered",
     "remediate",
@@ -1316,6 +1315,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="scrub one published evidence tree in place and re-hash it",
     )
     _ = rescrub.add_argument("--index", required=True, type=Path)
+    preflight = sub.add_parser(
+        "fault-preflight",
+        help="probe the disposable fault tools and record fault-preflight.json",
+    )
+    _ = preflight.add_argument("--output-dir", required=True, type=Path)
+    _ = preflight.add_argument("--option", action="append", default=[])
     for name in PLANNED_COMMANDS:
         planned = sub.add_parser(
             name, help=f"{name}: implemented by a later task of this plan"
@@ -1329,6 +1334,37 @@ def build_parser() -> argparse.ArgumentParser:
 # The exit status of an attribution the host could not profile: neither a
 # pass nor a measured failure, so a caller can tell the two apart.
 ATTRIBUTION_SKIPPED_EXIT = 3
+
+# The exit status of a fault preflight whose tools are optional and missing
+# or failed a probe: a clean skip, neither a pass nor a failure.
+FAULT_PREFLIGHT_SKIPPED_EXIT = 3
+
+
+def fault_preflight(arguments) -> int:
+    """`measure fault-preflight`: required when SERIES_REQUIRE_FAULT_TOOLS=1."""
+    try:
+        from . import faults
+    except ImportError:
+        import faults
+    options = parse_options(arguments.option)
+    keywords = {
+        key: options[key] for key in ("stores", "lease_wait_s") if key in options
+    }
+    try:
+        result = faults.preflight_fault_tools(
+            faults.fault_tools_required(), output_dir=arguments.output_dir, **keywords
+        )
+    except unittest.SkipTest as skipped:
+        sys.stderr.write(f"fault-preflight: skipped: {skipped}\n")
+        return FAULT_PREFLIGHT_SKIPPED_EXIT
+    except AssertionError as failure:
+        sys.stderr.write(f"fault-preflight: failed: {failure}\n")
+        return 1
+    sys.stderr.write(
+        f"fault-preflight: {result['status']} "
+        f"{json.dumps(result['metrics'], sort_keys=True)}\n"
+    )
+    return 0 if result["status"] == measurement.STATUS_PASSED else 1
 
 
 def main(argv=None) -> int:
@@ -1346,6 +1382,8 @@ def main(argv=None) -> int:
         for name in measurement.rescrub_tree(arguments.index):
             sys.stderr.write(f"rescrubbed {name}\n")
         return 0
+    if arguments.command == "fault-preflight":
+        return fault_preflight(arguments)
     if arguments.command == "stage-results":
         measurement.stage_run_files(arguments.index)
         return 0

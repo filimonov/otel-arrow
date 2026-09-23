@@ -1268,6 +1268,11 @@ CASE_ROLES = {
     "engine": ROLE_CORES,
     "stages": (("producer", 2), ("store", 1)),
     "attribution": (("producer", 1), ("store", 1), ("profiler", 1)),
+    # A fault case runs the engine in the fault rig's namespace. NGINX,
+    # Toxiproxy and the probes share one physical core of their own; the
+    # oracle reads back only after the engine has stopped, as for an
+    # attribution, so the case fits eight physical cores.
+    "faults": (("producer", 1), ("store", 1), ("fault_tools", 1)),
 }
 
 
@@ -2675,6 +2680,17 @@ def percentile(values, fraction):
     return ordered[min(rank, len(ordered)) - 1]
 
 
+def build_profile(binary) -> str:
+    """The cargo profile a binary was built with, from its target directory.
+
+    `debug` or `release`, or `custom:<directory>` for anything else. This is
+    the one rule every release check applies; it runs no toolchain, so it is
+    safe to call while a build monitor watches the host.
+    """
+    parent = Path(binary).parent.name
+    return parent if parent in ("debug", "release") else "custom:" + parent
+
+
 def engine_build(binary) -> dict:
     """The engine build a run used: profile, features, allocator, toolchain.
 
@@ -2687,9 +2703,7 @@ def engine_build(binary) -> dict:
     fingerprint.
     """
     binary = Path(binary)
-    profile = binary.parent.name if binary.parent.name in ("debug", "release") else (
-        "custom:" + binary.parent.name
-    )
+    profile = build_profile(binary)
     try:
         toolchain = subprocess.run(
             ["rustc", "--version"], capture_output=True, text=True, timeout=30,
@@ -3389,6 +3403,17 @@ HOST_PATH = re.compile(
     r"(?=/|$|[\s\"',;])"
     r"(?:/[^\s\"',;:/]+)*/?"
 )
+# A container bind specification, `SOURCE:TARGET[:OPTIONS]`, as `docker run
+# --volume` takes it. Both paths are scrubbed: HOST_PATH alone stops at the
+# first colon, and the target of a bind mounted at its own host path is as
+# much a host path as the source. (`--mount source=...,target=...` needs no
+# rule of its own: each path follows `=`, where HOST_PATH already starts.)
+# A source already reduced to a token (`<host-path>/x`) still matches, so
+# scrubbing stays idempotent over evidence scrubbed by an earlier rule.
+VOLUME_SPEC = re.compile(
+    r"(?<![^\s\"'=,])((?:<[a-z_-]+>)?/[^\s\"',;:]*)((?::/[^\s\"',;:]*)+)(:[A-Za-z,]+)?"
+    r"(?=$|[\s\"',;])"
+)
 # Word characters for the token boundary of a short credential value.
 WORD_CHAR = r"A-Za-z0-9_"
 
@@ -3464,6 +3489,14 @@ def scrub_published(value, *, repo_root=None, home=None):
                 )
         for root, token in roots:
             item = item.replace(root, token)
+
+        def volume(match):
+            """A bind specification with every host path in it reduced."""
+            paths = [match.group(1)] + match.group(2).split(":")[1:]
+            options = match.group(3) or ""
+            return ":".join(HOST_PATH.sub(host_path, path) for path in paths) + options
+
+        item = VOLUME_SPEC.sub(volume, item)
         return HOST_PATH.sub(host_path, item)
 
     def rewrite(item, key=None):

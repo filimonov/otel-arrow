@@ -222,6 +222,7 @@ def engine_config(
     buffer_path=None,
     cores=None,
     merge=None,
+    grpc_host="127.0.0.1",
 ):
     """The complete configuration one engine launch serializes.
 
@@ -231,7 +232,10 @@ def engine_config(
     `cores` pins one worker to each named core through a `core_set`, and
     `merge` deep-merges nested maps into the named nodes' configurations
     (and `engine` into the engine section). The result is what gets hashed
-    and recorded, so nothing is changed after it is returned.
+    and recorded, so nothing is changed after it is returned. `grpc_host`
+    is the address the receiver binds: a launcher that runs the engine in
+    its own network namespace binds every address there, and reaches it
+    through a port it publishes on host loopback.
     """
     if topology not in TOPOLOGIES:
         raise ValueError(f"topology must be one of {TOPOLOGIES}: {topology}")
@@ -241,7 +245,7 @@ def engine_config(
     pipeline = config["groups"]["default"]["pipelines"]["main"]
     nodes = pipeline["nodes"]
     nodes["receiver"]["config"]["protocols"]["grpc"]["listening_addr"] = (
-        f"127.0.0.1:{grpc_port}"
+        f"{grpc_host}:{grpc_port}"
     )
     if topology == "noop":
         # The noop exporter has no node configuration at all, so the
@@ -369,15 +373,23 @@ class Engine:
         self.root = Path(directory)
         self.data = self.root / "data"
         self.data.mkdir(exist_ok=True)
-        self.grpc_port = free_port()
-        self.admin_port = free_port()
+        self.launcher = launcher or LocalLauncher()
+        # A launcher that owns the engine's network namespace also owns its
+        # ports: it published them on host loopback before the engine
+        # existed, and the engine binds them on every address in there.
+        reserve = getattr(self.launcher, "reserve_ports", None)
+        if reserve is not None:
+            self.grpc_port, self.admin_port = reserve()
+        else:
+            self.grpc_port = free_port()
+            self.admin_port = free_port()
+        bind_host = getattr(self.launcher, "bind_host", "127.0.0.1")
         self.topology = topology
         self.cores = None if cores is None else [int(core) for core in cores]
         # The buffer directory is used as given. A restart passes the same
         # path again and finds its retained segments; nothing here creates a
         # fresh one or replaces what is already there.
         self.buffer_path = None if buffer_path is None else Path(buffer_path)
-        self.launcher = launcher or LocalLauncher()
         self.config = engine_config(
             grpc_port=self.grpc_port,
             data=self.data,
@@ -390,6 +402,7 @@ class Engine:
             buffer_path=self.buffer_path,
             cores=self.cores,
             merge=merge,
+            grpc_host=bind_host,
         )
         self.edges = graph_edges(self.config)
         if self.edges != EXPECTED_EDGES[topology]:
@@ -417,7 +430,7 @@ class Engine:
                 "--config",
                 str(self.path),
                 "--http-admin-bind",
-                f"127.0.0.1:{self.admin_port}",
+                f"{bind_host}:{self.admin_port}",
             ],
             self.log,
             dict(os.environ),
@@ -1741,8 +1754,14 @@ class DockerStore:
     nothing across a restart.
     """
 
-    def __init__(self, kind):
+    def __init__(self, kind, *, by_image_id=False):
         self.kind = kind
+        # With `by_image_id` the container starts from the image id the tag
+        # resolved to when inspected, so a tag moved in between cannot change
+        # what runs. The legacy suite keeps starting from the tag.
+        self.by_image_id = by_image_id
+        self.image = None
+        self.image_id = None
         self.name = "series-e2e-" + uuid.uuid4().hex
         self.container = None
         self.bucket = "series-test"
@@ -1796,6 +1815,16 @@ class DockerStore:
 
     def __enter__(self):
         image = require_docker_image(self.kind)
+        self.image = image
+        if self.by_image_id:
+            inspected = subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S,
+            )
+            self.image_id = inspected.stdout.strip() or None
+            if inspected.returncode or not self.image_id:
+                unavailable(f"the {self.kind} image {image} could not be inspected")
+            image = self.image_id
         try:
             self.start_container(image)
             mapping = subprocess.check_output(
@@ -1887,6 +1916,46 @@ class DockerStore:
             timeout=DOCKER_TIMEOUT_S,
         )
         self.ready()
+
+    def attach(self, network, alias):
+        """Also attach the store to `network`, reachable there as `alias`.
+
+        Everything else is unchanged: the loopback port stays published, so
+        the harness still reads and downloads the store directly. The
+        attachment survives `stop` and `recover`, as Docker keeps it in the
+        container's configuration.
+        """
+        subprocess.run(
+            ["docker", "network", "connect", "--alias", alias, network,
+             self.container],
+            check=True, capture_output=True, timeout=DOCKER_TIMEOUT_S,
+        )
+
+    def detach(self, network):
+        """Undo `attach`; a store that is already gone is not an error."""
+        subprocess.run(
+            ["docker", "network", "disconnect", "--force", network, self.name],
+            check=False, capture_output=True, timeout=DOCKER_TIMEOUT_S,
+        )
+
+    def network_address(self, network):
+        """The store's IPv4 address on an attached network, or None.
+
+        Read again after every `recover`: a restarted container may be
+        given a different address on a user-defined network.
+        """
+        done = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
+             self.container],
+            capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S,
+        )
+        if done.returncode != 0:
+            return None
+        networks = json.loads(done.stdout or "{}") or {}
+        for name, entry in networks.items():
+            if network in (name, (entry or {}).get("NetworkID")):
+                return (entry or {}).get("IPAddress") or None
+        return None
 
     def remove(self):
         """Remove the container by name, whether or not it ever started.

@@ -39,6 +39,15 @@ python3 -m crates.validation.tests.series_parquet.measure run \
 SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure \
   stages --output-dir /tmp/series-stages
 
+# The fault-tool contracts, then the disposable fault tools' preflight:
+# signed S3 through NGINX and both Toxiproxy routes, DNS/firewall/capture
+# probes, the capability split and the first activations, on MinIO and
+# RustFS. Provision the images first (Fault tools, below).
+python3 -m unittest crates.validation.tests.series_parquet.test_failures -v
+SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure fault-preflight \
+  --output-dir /tmp/series-fault-preflight
+
 # Stage one published evidence tree by exact file name, before a commit.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
   --index ../../docs/superpowers/reports/series-parquet-measurement/harness-contracts.json
@@ -175,9 +184,14 @@ agent's build is not this family's to stop -- is kept in the index as
 `invalidated_children`, never aggregated, and run again under a new ordinal
 once the host has been build-free for a minute, at most three times.
 
-The remaining subcommands (`capacity`, `memory`, `soak`, `fault-preflight`,
-`failures`, `buffered`, `remediate`, `report`) are named here so the command
-line is one contract; each is implemented by its own task.
+`fault-preflight` takes `--option stores=["minio"]` to probe one store and
+`--option lease_wait_s=...` (default four hours) to wait for the host lease.
+It exits 0 when every probe passed, 1 when a required probe failed and 3 when
+optional fault tools were missing or failed a probe, after cleanup.
+
+The remaining subcommands (`capacity`, `memory`, `soak`, `failures`,
+`buffered`, `remediate`, `report`) are named here so the command line is one
+contract; each is implemented by its own task.
 
 ## Environment variables
 
@@ -185,7 +199,9 @@ line is one contract; each is implemented by its own task.
 | --- | --- |
 | `DF_ENGINE` | The engine binary to run. The fixture suite defaults to `target/debug/df_engine`; measured cases default to `target/release/df_engine` and refuse any non-release profile. |
 | `SERIES_REQUIRE_DOCKER` | `1` makes missing images and Docker a failure rather than a skip. |
-| `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling a failure rather than a skip. |
+| `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling, or any failed fault-tool probe (UDP/TCP DNS, xt_bpf, capture, capabilities, S3 route), a failure rather than a skip. |
+| `SERIES_FAULT_TOOLS_IMAGE`, `SERIES_TOXIPROXY_IMAGE` | The fault-tools and Toxiproxy images. Default `series-measure-fault-tools:local` and `ghcr.io/shopify/toxiproxy:2.12.0`. |
+| `SERIES_FAULT_LEASE_WAIT_S` | How long the live rig test waits for the host lease. Default 3600. |
 | `SERIES_MEASURE_LONG` | `1` opts in to throughput sweeps, profiled memory runs, the soak and long failure runs. |
 | `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-parquet-host-measurement.lock`, shared by every checkout and launcher on the host. |
 | `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series-parquet,aws,durable-buffer` and `jemalloc`. |
@@ -197,6 +213,85 @@ line is one contract; each is implemented by its own task.
 Python dependencies are pinned in `requirements.txt` and, with hashes, in
 `requirements.lock.txt`; install with `pip install --require-hashes -r
 requirements.lock.txt`.
+
+## Fault tools
+
+`faults.py` builds one disposable rig per run around an existing
+`DockerStore`:
+
+```text
+engine --127.0.0.1:19000--> nginx --19001 general--> toxiproxy --> store
+                                  \--19002 values--/
+```
+
+A private bridge network (unique name, labelled `series-fault-run=<id>`)
+carries the store under the alias `store`. The fault-tools container is the
+namespace owner: it runs NGINX with `fault-nginx.conf` and is the only
+container started with `--cap-add=NET_ADMIN`. Toxiproxy and the engine join
+its namespace with `--network container:OWNER`, so the proxies' loopback
+listeners are real and every DNS, firewall and capture rule installed with
+`docker exec` in the owner applies to the engine's own traffic. Nothing uses
+`--privileged`, host networking, host firewall rules or module loading. The
+owner publishes NGINX, the Toxiproxy API and the engine's gRPC and admin
+ports on host loopback only. Every container starts from the inspected image
+id, never the mutable tag. The engine must be a release build (the harness's
+own profile rule; anything else is refused before launch) and its hash is
+recorded; it runs as the invoking user with the binary and the repository
+mounted read-only and its run and buffer directories read-write, after `ldd`
+inside the image proved its shared libraries resolve; `docker inspect` gives
+its host PID. Tool containers and the engine inherit the harness's CPU
+affinity through `--cpuset-cpus`, so a harness under `taskset` confines them
+too. A container is recorded only once Docker wrote its id to a cidfile, and
+is removed by that id. Teardown runs independent stages -- retry of any
+fault whose recovery failed, namespace rules, proxies, control file,
+artifacts, containers, store attachment, network, leftover check -- each of
+which runs whatever an earlier one raised, an interrupt included (re-raised
+at the end). Artifacts (access log, captures, dnsmasq log) stay under the
+rig's root.
+
+Registered faults: `slow` adds the upstream `bandwidth` (rate 256 KB/s) and
+downstream `latency` (1500 ms) toxics to both proxies; `http503` creates the
+control file NGINX answers 503 for; `store_outage` stops the store container
+and recovers the same container, repointing both proxies if its address
+changed. Any activation or recovery error after preflight is a failure, and
+a fault whose recovery failed stays active so the teardown retries it.
+
+Provision once, outside any measurement lease, from `rust/otap-dataflow`:
+
+```bash
+docker pull ghcr.io/shopify/toxiproxy:2.12.0
+docker pull ubuntu:24.04
+docker build -t series-measure-fault-tools:local \
+  --build-arg BASE=ubuntu@sha256:<digest docker pull printed> \
+  -f crates/validation/tests/series_parquet/fault-tools.Dockerfile \
+  crates/validation/tests/series_parquet
+```
+
+Nothing in the harness pulls or builds these images. `fault-preflight`
+records their ids, repository digests and the tools image's package
+versions, then, under the host lease, per store: signed PUT/HEAD/GET/DELETE
+and a multipart completion through each backend, route isolation (disabling
+one proxy breaks exactly its keys), the containerized release engine
+exporting through both backends, the capability split read from each
+container's configuration and `/proc/PID/status`, UDP and TCP DNS blocking
+(exact port-53 DROP rule, bounded `dig` timeout, positive counter, exact
+deletion, resolution restored), the `xt_bpf` ACK-only drop (bytecode from
+`tcpdump -ddd -y RAW`; a signed PUT through the route stalls under the rule,
+and the probe requires dropped ACKs, a non-empty capture and at least one
+retransmission, then after the exact deletion a signed PUT with a 2xx
+status and its bytes read back), a signed transfer captured and read back
+with tshark, the three activations, and the restored state. Every command's
+argv, exit status, output and duration is kept in `fault-preflight.json`,
+with the fault-class coverage those probes decide, per store: a class is
+available for a store only when that store's own probes passed, and
+available overall only when it is available for every store (the stores
+themselves start from their inspected image id, `DockerStore(kind,
+by_image_id=True)`; the legacy suite keeps the tag). `disconnect_reset` and
+`dropped_completion_response` stay unavailable until Task 11 adds their
+direct probes with negative controls; the coverage names what each must
+show.
+A failed `xt_bpf` probe names the host fix (`sudo modprobe xt_bpf`); the
+harness never runs it.
 
 ## What a measurement is allowed to claim
 
