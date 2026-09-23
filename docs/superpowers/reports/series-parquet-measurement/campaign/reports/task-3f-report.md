@@ -50,3 +50,65 @@ Per the lead's gate policy change, xtask check, E2E and stage spot-measurement a
 - make_builder adds a per-cell dynamic downcast in extraction; isolated in its own commit for revert if the extract spot-measurement regresses.
 - Item 2 addendum touched the otap crate (StorageType::kind).
 - Item 8 is two commits rather than one (for the revert isolation above).
+
+## S4 (items 7, 13, 14 rest, B8, 3i finding 3, C2) and review fixes
+
+Branch worktree-agent-a34d9a5c685620f7b, rebased onto series-parquet-exporter bdd44828c (3i closed at 4cbc696d9, then S1). Tip 540157cf6. The earlier commits above were rebased and have new ids (see the list below).
+
+### Commits since bdd44828c, history order
+
+1. 854bf37f3 item 2, two refusal vocabularies and one Outcome
+2. b2c18ea40 item 5, Block without T, Arc<LakeConfig>
+3. c13bb5aaf item 4, duplicate config rule dropped
+4. c2a4f4f46 item 9, reason sentences as Display structs
+5. 61f8199ba item 2 addendum, StorageType::kind
+6. 790c3eda1 item 2 addendum, Error::is_retryable
+7. 5a10ff68d item 2 addendum, RefuseReason Display
+8. ec9c25d41 item 8, one number/histogram point path
+9. 6ec7696c9 item 8, make_builder (reverted by 11)
+10. dee896bde item 14, spec references outside sink/sort, README pointer to test_e2e.py
+11. f71bfee6a item 11, tests.rs split (S1's new test and changed saturated test carried into tests/shutdown.rs unchanged; message updated to 88 tests / 102)
+12. 08f80c3bf review fix: revert of make_builder
+13. 65f24dfcd review fix: buffer.rs reemit comment reference
+14. ea03623db B8: MergeIter::step infallible, last_step_rows cfg(test), drain() test helper
+15. ae7d7b4df 3i finding 3: ChunkBuilder bound documented for the lake's column types only; fallback is one unbounded step and may panic on i32 offset overflow for some types
+16. 5cdf42802 item 7 (1/3): sink.rs -> sink/{mod,naming,properties,write,tests}.rs, pure move (line-multiset check: only rustfmt reflow differences)
+17. b89254766 item 7 (2/3): sink::writer_properties(compression) builder, sink::compression(), sink::row_group_full(); sink and benches call them; bench's copied properties, sink_equivalence, Equivalence, the diagnostic_encoding_matches_sink self-test and the stage fixture check removed
+18. 7bfe47510 item 7 (3/3), B6 scope: Sink::checkpoint (yield + cancel check) and write_chunks with ?; yields, cancellation points, accounting updates and release order unchanged; UploadLedger and CreationWatch unchanged
+19. d57d811a7 item 13: Sink::new takes StartAbortTimer (fn(Duration) -> AbortTimer future), started where the failure/cancellation is first seen and awaited in the unwinding step and the abort; SinkClock and its tokio default removed; exporter passes the engine clock with deadline_at; tests/oracle/benches pass tokio. No tokio::time in series-lake production code.
+20. 24146fdea item 14 rest: sink/ and sort.rs comments cite FORMAT.md sections 4/5; also removed "plan 3" (sort.rs, worker.rs) and "Task 6" (bench test comment)
+21. 85ff988e9 C2 (1/2): series-lake hook_store::{HookStore, StoreHooks, HookGuard} with default hooks before_put / before_multipart (may fail or return a guard held across the call) / wrap_upload; CreationWatch = HookStore<Creations> (same counting, settle wake-up, guard lifetimes, Display); sink tests' four wrappers become hooks
+22. 540157cf6 C2 (2/2): exporter GatedStore and FaultStore become HookStore hooks; FAULT_* u8 modes -> enum Fault, dead mode 4 removed, ValuesOnce heals under the mode lock; SeqCst/AtomicUsize one import
+
+Not done, with reason:
+- parquet_exporter's FailPutForPrefixStore not moved to HookStore: the parquet exporter does not depend on series-lake, so moving it would add a dependency beyond test code; other agents also work on exporters.
+- B6 extras (dropping ParquetObjectWriter, merging PutLanded/PartLanded, one Gauge for MergeKeys/FlushWorkspace) are outside the S4 brief ("the parts listed here") and left alone.
+
+### Checks on the tip 540157cf6
+
+| Suite | Result |
+| --- | --- |
+| series-lake lib | 172 passed (base 4cbc696d9: 172) |
+| series-lake integration fuzz_canonical/fuzz_extract/golden/golden_roundtrip/oracle | 3/5/6/2/3 |
+| core-nodes series_parquet | 102 passed (101 + S1's new test) |
+| measurement bench --self-test | passes, 10 checks (11 -> 10 by design) |
+| clippy -D warnings | clean: series-lake (all targets, bench-harness), core-nodes (series-parquet, all targets), otap |
+| bench-heap benches | compile |
+| golden regeneration diff | identical |
+
+Per-commit checks (clippy both crates + lake lib + core series_parquet) ran green for the first 9 commits after the rebase before the lead's speed-up ruling stopped them; the tip is checked in full.
+
+sanitycheck: fails only on three pre-existing campaign docs that are not mine (docs/superpowers/deslop-plan-2026-09-23.md, docs/superpowers/s3-compatitibility.md, docs/superpowers/reports/series-parquet-measurement/campaign/ledger.md: non-ASCII). No file of this task is flagged.
+
+Not run (gate policy): cargo xtask check, E2E, stage spot-measurement.
+
+### S4 concerns
+
+- Sink::new gained a required fourth argument (the abort timer); every caller changed (exporter, oracle, benches, tests).
+- The sink/encode stage results no longer carry the diagnostic_encoding_matches_sink fixture check or the "equivalence" extra; no Python reads them. The encoder now shares writer_properties and row_group_full with the sink instead of being cross-checked.
+- HookStore is a new public series-lake type (used by production CreationWatch and by the exporter tests).
+- Test the_abort_is_bounded_on_the_injected_clock renamed to the_abort_is_bounded_by_the_callers_timer (count unchanged).
+
+### Part-2 review fix
+
+- d1c9a7d7b: Fault::ValuesOnce is again taken only by an operation whose mode captured at entry was ValuesOnce (the guard the u8 compare-exchange gave). core-nodes clippy -D warnings clean; series_parquet 102 passed.

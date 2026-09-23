@@ -815,6 +815,14 @@ percent to the changed code.
   mode. Six fault classes are available. `disconnect_reset` and
   `dropped_completion_response` wait for Task 11 probes. See
   `campaign/reports/task-8-report.md`.
+- Task 3f and slice S4, behaviour-preserving simplification: one refusal
+  vocabulary with one exporter Outcome, `Block` without a type parameter,
+  one metrics point path, the exporter tests split by topic, sink.rs split
+  into five modules, the abort timer supplied by the caller (no tokio time
+  in series-lake), one HookStore for test object stores. Goldens, nack
+  causes, error.type labels and producer-visible sentences are unchanged.
+  One step was reverted: arrow's `make_builder` put a type downcast on
+  every extracted cell. See `campaign/reports/task-3f-report.md`.
 
 ## Open questions
 
