@@ -113,10 +113,10 @@ cfg_if! {
 ///
 /// Without it, jemalloc returns freed pages to the kernel only while the
 /// process keeps allocating, so a quiet engine holds an unpredictable amount
-/// of retained memory: in the series_parquet memory measurement the quiet
-/// resident set of identical engines spread by up to 23 percent without the
-/// thread, and the measured exporter engine's by 1.4 to 6.6 percent with it
-/// (retention right after an allocation burst still varies). jemalloc reads
+/// of retained memory: in the series_parquet memory measurement the measured
+/// engine's quiet resident set spread by 15 to 34 percent between identical
+/// runs without the thread, and by 1.4 to 6.6 percent with it (retention
+/// right after an allocation burst still varies). jemalloc reads
 /// this weak symbol before the `MALLOC_CONF` environment variable, so the
 /// environment still overrides or extends it. The symbol is `malloc_conf`
 /// because the `unprefixed_malloc_on_supported_platforms` feature leaves
