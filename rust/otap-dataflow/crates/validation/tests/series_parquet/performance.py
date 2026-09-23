@@ -5054,6 +5054,9 @@ def attribution_experiment(plan, job, spec, result, run_dir, controls):
         controls.register("store", plan["store_pid"], plan["store_cores"])
     result["environment"]["build"] = plan["provenance"]["build"]
     result["environment"]["git"] = plan["provenance"]["git"]
+    # The setting is not persistent: a reboot restores the distribution's
+    # default, so each repetition records the value it actually ran under.
+    result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
     result["ephemeral_values"] = dict(plan["ephemeral"])
     result["config"]["input"] = plan["inputs"][job["config_id"]]["prebuilt"].as_json()
     labels = ("control", "profiled") if plan["profile"] else ("control",)
@@ -5550,6 +5553,7 @@ def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir
     result["environment"]["host_at_start"] = plan.get("host_at_start")
     result["environment"]["host_at_end"] = host_neighbours(exclude=(os.getpid(),))
     result["family_ordinal"] = plan["family_ordinal"]
+    result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
     result["preflight"] = preflight
     result["classification"] = classification_rules()
     result["perf"] = {

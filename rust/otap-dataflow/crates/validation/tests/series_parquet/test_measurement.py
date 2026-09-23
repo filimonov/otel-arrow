@@ -4890,6 +4890,9 @@ class AttributionContracts(unittest.TestCase):
         self.assertEqual(index["status"], measurement.STATUS_SKIPPED)
         self.assertEqual(index["acceptance"]["mandatory"], "incomplete")
         self.assertEqual(index["preflight"]["perf_event_paranoid"], 4)
+        self.assertEqual(
+            index["environment"]["perf_event_paranoid"], performance.perf_event_paranoid()
+        )
         checks = {entry["name"]: entry for entry in index["checks"]}
         self.assertEqual(checks["perf_attached"]["status"], measurement.STATUS_FAILED)
         self.assertEqual(index["run_files"], [])
