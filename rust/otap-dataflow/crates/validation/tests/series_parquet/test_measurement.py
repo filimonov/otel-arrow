@@ -4837,6 +4837,16 @@ class AttributionContracts(unittest.TestCase):
         perf = fake_perf(self)
         attached = performance.perf_preflight(temporary_directory(self), perf=perf)
         self.assertTrue(attached["attached"], attached)
+        recording = temporary_directory(self)
+        recorder = performance.PerfRecorder(recording, perf=perf)
+        recorder.argv = performance.perf_record_argv(
+            perf, 1, recording / "perf.data", recording / "perf.ctl", recording / "perf.ack"
+        )
+        self.assertNotIn(str(recording), json.dumps(recorder.as_json()))
+        self.assertIn(
+            f"fifo:{performance.PERF_DIR_TOKEN}/perf.ctl,{performance.PERF_DIR_TOKEN}/perf.ack",
+            recorder.as_json()["argv"],
+        )
         self.assertEqual(attached["unwound_samples_count"], 2)
         self.assertEqual(attached["record_returncode"], 0)
         with mock.patch.dict(os.environ, {"FAKE_PERF_MODE": "refuse"}):

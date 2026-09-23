@@ -3781,8 +3781,14 @@ class PerfRecorder:
 
     def as_json(self) -> dict:
         """What this recording was, for a result."""
+        # The FIFO argument joins its paths with a colon, which the publish
+        # scrubber leaves alone, so the recording's own directory is
+        # replaced by a token here.
+        directory = str(self.directory)
         return {
-            "argv": self.argv,
+            "argv": [
+                argument.replace(directory, PERF_DIR_TOKEN) for argument in self.argv
+            ] if self.argv else None,
             "returncode": self.returncode,
             "data": measurement.file_entry(self.data) if self.data.is_file() else None,
             "log_tail": self.log_tail(),
@@ -3792,6 +3798,10 @@ class PerfRecorder:
             ),
             "demangler": self.demangler,
         }
+
+
+# What a recording's own directory reads as in a published result.
+PERF_DIR_TOKEN = "<perf_dir>"
 
 
 # The busy child the preflight profiles: it burns CPU until killed.
