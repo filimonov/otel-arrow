@@ -303,11 +303,15 @@ fn format_md_documents_every_schema_rendering() {
 }
 
 /// Scenario: every `render_v1` vector produced by the independent Python
-/// renderer: each scalar kind, NaN with and without a payload, both
-/// infinities, bytes of every base64 padding length and both non-alphanumeric
-/// alphabet characters, and nested arrays and kvlists holding them.
+/// renderer: each scalar kind, finite doubles on both sides of the fixed and
+/// scientific layout limits (1e15 and 1e16, 1e-5 and 1e-7, the largest and the
+/// smallest subnormal), NaN with and without a payload, both infinities, bytes
+/// of every base64 padding length and both non-alphanumeric alphabet
+/// characters, and nested arrays and kvlists holding them.
 /// Guarantees: the attribute-map and log-body entry points produce exactly the
-/// documented strings, so non-finite doubles are spelled `NaN`, `Infinity` and
+/// documented strings, so a finite double's layout and exponent spelling
+/// (`1e+16`, `1e-7`, `0.00001`) cannot move with a serde_json or float
+/// formatter upgrade unnoticed, non-finite doubles are spelled `NaN`, `Infinity` and
 /// `-Infinity` and bytes are padded standard base64 at every nesting level, as
 /// in the workspace OTLP JSON encoder.
 #[test]
@@ -315,7 +319,7 @@ fn render_v1_matches_the_golden_vectors() {
     let raw = include_str!("golden/render_v1.json");
     let doc: serde_json::Value = serde_json::from_str(raw).expect("json");
     let vectors = doc["vectors"].as_array().expect("vectors");
-    assert_eq!(vectors.len(), 20);
+    assert_eq!(vectors.len(), 30);
     for v in vectors {
         let name = v["name"].as_str().expect("name");
         let value = value_from_json(&v["value"]);

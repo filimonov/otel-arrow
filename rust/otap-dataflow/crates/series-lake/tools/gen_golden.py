@@ -14,7 +14,7 @@ Written from docs/FORMAT.md, not from the Rust code:
 Usage: gen_golden.py <golden directory>   (normally tests/golden)
 Requires: pip install xxhash
 """
-import base64, json, math, os, struct, sys
+import base64, decimal, json, math, os, struct, sys
 import xxhash
 
 TAG = dict(str=1, bytes=2, int=3, double=4, bool=5, null=6, array=7, kvlist=8)
@@ -261,6 +261,41 @@ def double_of(v):
     return v["value"]
 
 
+class JsonNumber:
+    """A JSON number already spelled as FORMAT.md section 2 requires."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+def spell_double(d):
+    """A finite double as FORMAT.md section 2 spells it.
+
+    Shortest round-trip digits (Python's repr picks the same digits), laid out
+    in fixed notation when the decimal exponent of the first digit is in
+    -5..=15 and in scientific notation otherwise, with an explicit exponent
+    sign and no exponent zero padding: 1e+16, 1e-7, 0.00001, 3.0.
+    """
+    if d == 0:
+        return "-0.0" if math.copysign(1.0, d) < 0 else "0.0"
+    sign = "-" if d < 0 else ""
+    t = decimal.Decimal(repr(abs(d))).normalize().as_tuple()
+    digits = "".join(str(x) for x in t.digits)
+    exp = len(digits) - 1 + t.exponent  # decimal exponent of the first digit
+    if -5 <= exp <= 15:
+        point = exp + 1  # digits before the decimal point
+        if point <= 0:
+            body = "0." + "0" * (-point) + digits
+        elif point >= len(digits):
+            body = digits + "0" * (point - len(digits)) + ".0"
+        else:
+            body = digits[:point] + "." + digits[point:]
+    else:
+        body = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+        body += "e" + ("+" if exp >= 0 else "-") + str(abs(exp))
+    return sign + body
+
+
 def render_v1(v):
     t = v["type"]
     if t == "null":
@@ -279,15 +314,26 @@ def render_v1(v):
             return "Infinity"
         if d == -math.inf:
             return "-Infinity"
-        return d
+        return JsonNumber(spell_double(d))
     if t == "bool":
         return v["value"]
     if t == "array":
         return [render_v1(i) for i in v["items"]]
     if t == "kvlist":
         entries = sorted(v["entries"], key=lambda e: e["key"].encode("utf-8"))
-        return {e["key"]: render_v1(e["value"]) for e in entries}
+        return [(e["key"], render_v1(e["value"])) for e in entries]
     raise ValueError(t)
+
+
+def compact_json(x):
+    """Compact JSON text, spelling doubles with spell_double."""
+    if isinstance(x, JsonNumber):
+        return x.text
+    if isinstance(x, list) and all(isinstance(e, tuple) for e in x) and x:
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + compact_json(v) for k, v in x) + "}"
+    if isinstance(x, list):
+        return "[" + ",".join(compact_json(e) for e in x) + "]"
+    return json.dumps(x, ensure_ascii=False)
 
 
 def map_value(v):
@@ -296,7 +342,7 @@ def map_value(v):
         return None
     if v["type"] == "str":
         return v["value"]
-    return json.dumps(render_v1(v), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return compact_json(render_v1(v))
 
 
 render_cases = [
@@ -307,6 +353,18 @@ render_cases = [
     ("int_min", I(-2**63)),
     ("double_finite", D(1.5)),
     ("double_integral_keeps_fraction", D(3.0)),
+    # Finite double layout: fixed notation for decimal exponents -5..=15,
+    # scientific outside it with an explicit sign and no zero padding.
+    ("double_large_scientific", D(1e16)),
+    ("double_large_negative_scientific", D(-1e16)),
+    ("double_large_fixed_limit", D(1e15)),
+    ("double_many_digits_scientific", D(1.2345678901234568e16)),
+    ("double_max", D(1.7976931348623157e308)),
+    ("double_small_scientific", D(1e-7)),
+    ("double_small_digits_scientific", D(1.23e-6)),
+    ("double_small_fixed_limit", D(1e-5)),
+    ("double_small_digits_fixed", D(1.23e-5)),
+    ("double_min_subnormal", D(5e-324)),
     ("double_neg_zero", DB(0x8000000000000000)),
     ("double_nan_quiet", DB(0x7FF8000000000000)),
     ("double_nan_payload", DB(0x7FF8000000000001)),

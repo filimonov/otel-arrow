@@ -268,8 +268,8 @@ Attribute maps: `MAP<STRING, STRING>` with non-null keys and nullable values.
 The format is intentionally lossy for attribute value types; identity
 hashing, `identity_bytes` and denormalized columns keep types. One recursive
 rendering `render_v1(value) -> JSON value` is defined: string to JSON
-string; int to JSON number; finite double to JSON number (shortest
-round-trip); non-finite double to the JSON strings `"NaN"` (any NaN,
+string; int to JSON number; finite double to JSON number (spelled as
+below); non-finite double to the JSON strings `"NaN"` (any NaN,
 whatever its sign or payload), `"Infinity"` and `"-Infinity"`; bool to JSON
 bool; bytes to a JSON string of standard base64 with padding (RFC 4648
 section 4, alphabet `A-Z a-z 0-9 + /`, `=` padding, no line breaks); unset
@@ -284,6 +284,26 @@ by raw key bytes. Two entry points use it:
 - Log body: for a string body the raw string; for an unset body the SQL
   null; otherwise the compact JSON serialization of `render_v1` (so a bytes
   body is the JSON string `"qxI="`, quotes included, never bare base64).
+
+A finite double is spelled from its shortest round-trip decimal digits
+`d1 d2 ... dn` (no trailing zeros) and the decimal exponent `e` of `d1`, so
+that the value is `d1.d2...dn * 10^e`, with a leading `-` for a negative
+value:
+
+- When `-5 <= e <= 15`, fixed notation: the digits with the decimal point
+  placed accordingly, zero-filled on either side as needed, and `.0`
+  appended when there is no fractional digit. So `3.0`, `1.5`,
+  `1000000000000000.0` (1e15), `0.00001` (1e-5) and `0.0000123`.
+- Otherwise scientific notation: `d1`, then `.` and `d2...dn` when `n > 1`,
+  then `e`, then the exponent with an explicit sign (`+` or `-`) and no
+  zero padding. So `1e+16`, `-1e+16`, `1.2345678901234568e+16`,
+  `1.7976931348623157e+308`, `1e-7`, `1.23e-6` and `5e-324`.
+- Zero is `0.0`, and negative zero is `-0.0` (values columns and attribute
+  cells store doubles as received; only the identity normalizes the sign).
+
+This is what the writer's JSON serializer (serde_json 1.0.151) produces.
+The golden vectors pin it, so a serializer upgrade that changed the spelling
+fails the tests instead of silently changing stored strings.
 
 The non-finite and bytes spellings are those of the workspace's OTLP JSON
 encoder (`crates/pdata/src/otlp/json/common.rs`), so a reader that already
@@ -738,6 +758,9 @@ release:
   `"NaN"`, and bytes as padded standard base64, as the workspace OTLP JSON
   encoder does (section 2). Revision 1 wrote `"inf"`, `"-inf"` and lowercase
   hex.
+  The layout and exponent spelling of finite doubles (`1e+16`, `1e-7`), which
+  revision 1 already produced but did not document, is now specified and
+  pinned by golden vectors.
 
 Series identity (section 1) does not use `render_v1`, so no `identity_bytes`
 and no `series_id` changed: `canonical_v1.json` is byte-identical across the
