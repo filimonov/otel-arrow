@@ -1594,6 +1594,10 @@ git commit -m "chore: prove buffered series acknowledgement and replay semantics
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
+**Amendment (user decision 2026-09-23): buffered topology becomes the shipped default.** After Task 13 has proved the durable-buffer topology (including the fix for the acknowledged-data replay after a graceful restart found in Task 2), switch the shipped example configs to durable_buffer in front of the exporter, and set the exporter defaults for that topology so the documented shutdown bound `window.interval + 2 x (flush_retry_deadline + upload.abort_timeout)` fits the documented 60 s termination grace (the buffer owns long retries; the exporter deadline can be short). Strict ack-after-flush stays a documented option with the in-flight formula and its own example config. Re-run the launcher smoke and the E2E suite on the new defaults; Task 14 reports both topologies.
+
+**Amendment (third review, 2026-09-23): bounded items for Task 12.** Increment `flush.retries` at attempt time, not at completion or abandon; `flush.failed` events carry window, sequence and object path like `block_committed`; `producer_id_attribute` accepts an ordered fallback list (default host.id, service.instance.id) and a counter reports requests with an empty producer id; validation covers `max_requests_per_block: 1` explicitly and gives every size limit an upper bound; decide Azure explicitly: either a tested bearer-token path or a startup refusal naming the reason; accumulate series rows into runs up to `run_target_bytes` instead of one run per request, and size values builders to the actual row count (both after Task 6's measurement).
+
 ### Task 14: Consolidated measured report and exact section-9.8 amendment
 
 **Expected wall-clock cost:** 1-3 minutes for report/lint validation; allow 15-60 additional minutes for required full workspace checks after implementation.
