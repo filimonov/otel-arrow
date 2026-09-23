@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 
+use super::validate::WireProblem;
 use crate::error::Error;
 use crate::proto::consts::wire_types;
 
@@ -15,48 +16,13 @@ use crate::proto::consts::wire_types;
 pub(crate) fn validate_message_wire_format(buf: &[u8]) -> Result<(), Error> {
     let mut pos = 0;
     while pos < buf.len() {
-        let (tag, next) = read_varint(buf, pos).ok_or(Error::InvalidProtobufWireFormat)?;
-        if tag > u64::from(u32::MAX) {
-            return Err(Error::InvalidProtobufWireFormat);
-        }
-        let field_num = tag >> 3;
-        let wire_type = tag & 7;
-        if field_num == 0 {
-            return Err(Error::InvalidProtobufWireFormat);
-        }
-        pos = match wire_type {
-            wire_types::VARINT => {
-                let (_, next) = read_varint(buf, next).ok_or(Error::InvalidProtobufWireFormat)?;
-                next
-            }
-            wire_types::LEN => {
-                let (len, next) = read_varint(buf, next).ok_or(Error::InvalidProtobufWireFormat)?;
-                let end = next
-                    .checked_add(
-                        usize::try_from(len).map_err(|_| Error::InvalidProtobufWireFormat)?,
-                    )
-                    .ok_or(Error::InvalidProtobufWireFormat)?;
-                if end > buf.len() {
-                    return Err(Error::InvalidProtobufWireFormat);
-                }
-                end
-            }
-            wire_types::FIXED64 => checked_fixed_end(next, 8, buf.len())?,
-            wire_types::FIXED32 => checked_fixed_end(next, 4, buf.len())?,
-            _ => return Err(Error::InvalidProtobufWireFormat),
-        };
+        let (_, wire_type, next) =
+            read_key(buf, pos).map_err(|_| Error::InvalidProtobufWireFormat)?;
+        pos = value_range(buf, wire_type, next)
+            .map_err(|_| Error::InvalidProtobufWireFormat)?
+            .1;
     }
     Ok(())
-}
-
-fn checked_fixed_end(start: usize, width: usize, buffer_len: usize) -> Result<usize, Error> {
-    let end = start
-        .checked_add(width)
-        .ok_or(Error::InvalidProtobufWireFormat)?;
-    if end > buffer_len {
-        return Err(Error::InvalidProtobufWireFormat);
-    }
-    Ok(end)
 }
 
 /// Clones the parser, sharing the underlying buffer and interior-mutability state.
@@ -227,27 +193,13 @@ where
     }
 }
 
-/// return the range of the positions in the byte slice containing values. The range is determined
-/// from the wire type. Returns `None` for truncated/invalid fields (out-of-range
-/// LEN payloads or fixed-width fields with too few bytes remaining) and for
-/// unknown wire types, so callers can treat malformed input as an absent field
-/// rather than producing an out-of-bounds range.
-///
-/// Groups (wire types 3 and 4) are not handled here, because skipping one
-/// needs its field number: scanners that walk a message call [`field_range`].
-#[inline]
-pub(crate) fn field_value_range(buf: &[u8], wire_type: u64, pos: usize) -> Option<(usize, usize)> {
-    value_range(buf, wire_type, pos).ok()
-}
-
 /// The range of the field whose key `tag` ends at `pos`, as a message scanner
-/// needs it to step to the next field: the value range for every wire type
-/// [`field_value_range`] handles, and for an unknown group the range from just
-/// past its start key to just past its end key, found by [`skip_group`]. So a
-/// balanced group -- which the validator accepts and prost skips -- never ends
-/// a scan early and hides the fields after it. A stray end group, or a group
-/// that is unbalanced or nested deeper than the validator's limit, is `None`:
-/// damage, exactly as the validator refuses it.
+/// needs it to step to the next field: the [`value_range`] of the value, and
+/// for an unknown group the range from just past its start key to just past
+/// its end key, found by [`skip_group`]. So a balanced group -- which the
+/// validator accepts and prost skips -- never ends a scan early and hides the
+/// fields after it. Anything [`value_range`] or [`skip_group`] refuses is
+/// `None`, so callers treat malformed input as an absent field.
 #[inline]
 pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, usize)> {
     match tag & 7 {
@@ -255,7 +207,7 @@ pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, us
             let end = skip_group(buf, pos, tag >> 3, 1, pos).ok()?;
             Some((pos, end))
         }
-        wire_type => field_value_range(buf, wire_type, pos),
+        wire_type => value_range(buf, wire_type, pos).ok(),
     }
 }
 
@@ -268,51 +220,51 @@ pub(crate) const END_GROUP: u64 = 4;
 /// position just past it. A key outside protobuf's 32-bit range, or with
 /// field number zero, is refused.
 #[inline]
-pub(crate) fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), &'static str> {
-    let (tag, next) = read_varint(buf, pos).ok_or("truncated or overlong field key")?;
+pub(crate) fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), WireProblem> {
+    let (tag, next) = read_varint(buf, pos).ok_or(WireProblem::TruncatedKey)?;
     let field_num = tag >> 3;
     if tag > u64::from(u32::MAX) || field_num == 0 {
-        return Err("invalid field key");
+        return Err(WireProblem::InvalidKey);
     }
     Ok((field_num, tag & 7, next))
 }
 
 /// The byte range of the value of a field of `wire_type` whose key ends at
 /// `pos`, bounds-checked against `buf`. For a length-delimited field the
-/// range excludes the length prefix. The error names the problem.
+/// range excludes the length prefix. Groups (wire types 3 and 4) are refused
+/// here, because skipping one needs its field number: see [`skip_group`].
 #[inline]
 pub(crate) fn value_range(
     buf: &[u8],
     wire_type: u64,
     pos: usize,
-) -> Result<(usize, usize), &'static str> {
+) -> Result<(usize, usize), WireProblem> {
     match wire_type {
         wire_types::VARINT => {
-            let (_, end) = read_varint(buf, pos).ok_or("truncated or overlong varint")?;
+            let (_, end) = read_varint(buf, pos).ok_or(WireProblem::TruncatedVarint)?;
             Ok((pos, end))
         }
         wire_types::LEN => {
-            let (len, start) =
-                read_varint(buf, pos).ok_or("truncated or overlong length prefix")?;
+            let (len, start) = read_varint(buf, pos).ok_or(WireProblem::TruncatedLength)?;
             let end = usize::try_from(len)
                 .ok()
                 .and_then(|len| start.checked_add(len))
                 .filter(|&end| end <= buf.len())
-                .ok_or("length-delimited field overruns its message")?;
+                .ok_or(WireProblem::LengthOverrun)?;
             Ok((start, end))
         }
         wire_types::FIXED64 => fixed_range(buf, pos, 8),
         wire_types::FIXED32 => fixed_range(buf, pos, 4),
-        _ => Err("unsupported wire type"),
+        _ => Err(WireProblem::UnsupportedWireType),
     }
 }
 
 #[inline]
-fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), &'static str> {
+fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), WireProblem> {
     pos.checked_add(width)
         .filter(|&end| end <= buf.len())
         .map(|end| (pos, end))
-        .ok_or("truncated fixed-width field")
+        .ok_or(WireProblem::TruncatedFixed)
 }
 
 /// Why [`skip_group`] could not skip a group; `at` is a position in the
@@ -320,7 +272,7 @@ fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), &
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipError {
     /// The group's framing is broken.
-    Framing { problem: &'static str, at: usize },
+    Framing { problem: WireProblem, at: usize },
     /// Groups nest deeper than
     /// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`].
     TooDeep { at: usize },
@@ -350,7 +302,7 @@ pub(crate) fn skip_group(
     loop {
         if pos >= buf.len() {
             return Err(SkipError::Framing {
-                problem: "group without an end group",
+                problem: WireProblem::UnclosedGroup,
                 at: group_at,
             });
         }
@@ -359,7 +311,7 @@ pub(crate) fn skip_group(
         let (num, wire_type, next) = read_key(buf, pos).map_err(fail)?;
         pos = match wire_type {
             END_GROUP if num == field_num => return Ok(next),
-            END_GROUP => return Err(fail("end group does not match its start group")),
+            END_GROUP => return Err(fail(WireProblem::MismatchedEndGroup)),
             START_GROUP => skip_group(buf, next, num, depth + 1, at)?,
             _ => value_range(buf, wire_type, next).map_err(fail)?.1,
         };

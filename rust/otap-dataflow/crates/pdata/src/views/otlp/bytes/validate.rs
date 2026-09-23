@@ -45,6 +45,7 @@ use super::decode::{
 use crate::error::Error;
 use crate::proto::consts::field_num::{common, logs, metrics, resource, traces};
 use crate::proto::consts::wire_types::{FIXED32, FIXED64, LEN, VARINT};
+use std::fmt;
 
 /// The deepest nesting of `AnyValue` arrays and key-value lists an OTLP
 /// request may carry and still pass [`validate_request`].
@@ -67,6 +68,65 @@ pub enum RepeatedSingular {
     Accept,
     /// Refuse the request as [`Error::DuplicateOtlpField`].
     Refuse,
+}
+
+/// A broken frame, as [`Error::InvalidOtlpWireFormat`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireProblem {
+    /// A field key that does not terminate or overflows a `u64`.
+    TruncatedKey,
+    /// A field key above the 32-bit key range or with field number zero.
+    InvalidKey,
+    /// A varint value that does not terminate or overflows a `u64`.
+    TruncatedVarint,
+    /// A length prefix that does not terminate or overflows a `u64`.
+    TruncatedLength,
+    /// A length-delimited value longer than what is left of its message.
+    LengthOverrun,
+    /// A fixed-width value longer than what is left of its message.
+    TruncatedFixed,
+    /// Wire type 6 or 7, or a group where no group may start.
+    UnsupportedWireType,
+    /// A known field with a wire type its schema does not give it.
+    WrongWireType,
+    /// A packed `fixed64` or `double` field that is not a multiple of 8 bytes.
+    RaggedPackedFixed64,
+    /// A packed varint field ending inside a varint.
+    TruncatedPackedVarint,
+    /// An end group key with no group open.
+    StrayEndGroup,
+    /// An end group key of another field number than the open group.
+    MismatchedEndGroup,
+    /// A group still open where its enclosing message ends.
+    UnclosedGroup,
+}
+
+impl WireProblem {
+    /// The sentence a refusal quotes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TruncatedKey => "truncated or overlong field key",
+            Self::InvalidKey => "invalid field key",
+            Self::TruncatedVarint => "truncated or overlong varint",
+            Self::TruncatedLength => "truncated or overlong length prefix",
+            Self::LengthOverrun => "length-delimited field overruns its message",
+            Self::TruncatedFixed => "truncated fixed-width field",
+            Self::UnsupportedWireType => "unsupported wire type",
+            Self::WrongWireType => "wrong wire type for a known field",
+            Self::RaggedPackedFixed64 => "packed fixed64 field is not a whole number of elements",
+            Self::TruncatedPackedVarint => "truncated or overlong varint in a packed field",
+            Self::StrayEndGroup => "end group without a start group",
+            Self::MismatchedEndGroup => "end group does not match its start group",
+            Self::UnclosedGroup => "group without an end group",
+        }
+    }
+}
+
+impl fmt::Display for WireProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The OTLP message types the validator descends into.
@@ -110,19 +170,66 @@ pub(crate) enum Message {
 
 /// What the schema says about one field number of one message.
 #[derive(Clone, Copy)]
-enum Field {
+struct Field {
+    kind: Kind,
+    /// Set for a field that occurs at most once per message.
+    singular: Option<Singular>,
+}
+
+/// How a field is encoded.
+#[derive(Clone, Copy)]
+enum Kind {
     /// A sub-message, always length-delimited.
     Message(Message),
-    /// A singular or repeated non-packable value with this wire type
-    /// (`bytes` fields are `LEN`).
+    /// A value with this wire type that protobuf never packs; `string` and
+    /// `bytes` are `LEN`.
     Scalar(u64),
-    /// A singular or repeated `string`: `LEN`.
-    Str,
     /// A repeated scalar with this element wire type, packed (`LEN`) or not.
     Packed(u64),
     /// Not in the schema: framing checked, content skipped.
     Unknown,
 }
+
+/// A singular field or a member of a oneof.
+#[derive(Clone, Copy)]
+struct Singular {
+    /// The field's name, or the oneof's.
+    name: &'static str,
+    /// For a oneof member, the field number of the oneof's first member, which
+    /// every member uses as its slot in the per-message bitmask; otherwise
+    /// the field's own number is its slot.
+    oneof: Option<u64>,
+}
+
+/// A singular field.
+const fn one(kind: Kind, name: &'static str) -> Field {
+    Field {
+        kind,
+        singular: Some(Singular { name, oneof: None }),
+    }
+}
+
+/// A member of the oneof `name` whose first member is field `first`.
+const fn member(kind: Kind, name: &'static str, first: u64) -> Field {
+    Field {
+        kind,
+        singular: Some(Singular {
+            name,
+            oneof: Some(first),
+        }),
+    }
+}
+
+/// A repeated field.
+const fn many(kind: Kind) -> Field {
+    Field {
+        kind,
+        singular: None,
+    }
+}
+
+/// A field number the message does not define.
+const UNKNOWN: Field = many(Kind::Unknown);
 
 impl Message {
     /// The message's name as the OTLP schema spells it.
@@ -170,364 +277,306 @@ impl Message {
         matches!(self, Self::ArrayValue | Self::KeyValueList)
     }
 
-    /// The singular fields of this message: for field `num`, its slot in a
-    /// per-message bitmask and its name, or `None` for a repeated or unknown
-    /// field. Members of one oneof share a slot. `AnyValue` has none: its
-    /// view reads a repeated oneof member as prost does (the last member
-    /// wins; `array_value` and `kvlist_value` following themselves merge).
-    ///
-    fn singular(self, num: u64) -> Option<(u32, &'static str)> {
-        use Message as M;
-        let name = match (self, num) {
-            (M::ResourceLogs | M::ResourceMetrics | M::ResourceSpans, 1) => "resource",
-            (M::ScopeLogs | M::ScopeMetrics | M::ScopeSpans, 1) => "scope",
-            (
-                M::ResourceLogs
-                | M::ResourceMetrics
-                | M::ResourceSpans
-                | M::ScopeLogs
-                | M::ScopeMetrics
-                | M::ScopeSpans,
-                3,
-            ) => "schema_url",
-            (M::LogRecord, 1) => "time_unix_nano",
-            (M::LogRecord, 2) => "severity_number",
-            (M::LogRecord, 3) => "severity_text",
-            (M::LogRecord, 5) => "body",
-            (M::LogRecord, 7) => "dropped_attributes_count",
-            (M::LogRecord, 8) => "flags",
-            (M::LogRecord, 9) => "trace_id",
-            (M::LogRecord, 10) => "span_id",
-            (M::LogRecord, 11) => "observed_time_unix_nano",
-            (M::LogRecord, 12) => "event_name",
-            (M::Metric, 1) => "name",
-            (M::Metric, 2) => "description",
-            (M::Metric, 3) => "unit",
-            // The `data` oneof: gauge, sum, histogram, exponential_histogram,
-            // summary share slot 5.
-            (M::Metric, 5 | 7 | 9 | 10 | 11) => return Some((5, "data")),
-            (M::Sum | M::Histogram | M::ExponentialHistogram, 2) => "aggregation_temporality",
-            (M::Sum, 3) => "is_monotonic",
-            (
-                M::NumberDataPoint
-                | M::HistogramDataPoint
-                | M::ExponentialHistogramDataPoint
-                | M::SummaryDataPoint,
-                2,
-            ) => "start_time_unix_nano",
-            (
-                M::NumberDataPoint
-                | M::HistogramDataPoint
-                | M::ExponentialHistogramDataPoint
-                | M::SummaryDataPoint,
-                3,
-            ) => "time_unix_nano",
-            // The `value` oneof: as_double, as_int share slot 4.
-            (M::NumberDataPoint, 4 | 6) => return Some((4, "value")),
-            (M::NumberDataPoint | M::SummaryDataPoint, 8) => "flags",
-            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint | M::SummaryDataPoint, 4) => {
-                "count"
-            }
-            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint | M::SummaryDataPoint, 5) => {
-                "sum"
-            }
-            (M::HistogramDataPoint | M::ExponentialHistogramDataPoint, 10) => "flags",
-            (M::HistogramDataPoint, 11) | (M::ExponentialHistogramDataPoint, 12) => "min",
-            (M::HistogramDataPoint, 12) | (M::ExponentialHistogramDataPoint, 13) => "max",
-            (M::ExponentialHistogramDataPoint, 6) => "scale",
-            (M::ExponentialHistogramDataPoint, 7) => "zero_count",
-            (M::ExponentialHistogramDataPoint, 8) => "positive",
-            (M::ExponentialHistogramDataPoint, 9) => "negative",
-            (M::ExponentialHistogramDataPoint, 14) => "zero_threshold",
-            (M::Buckets, 1) => "offset",
-            (M::ValueAtQuantile, 1) => "quantile",
-            (M::ValueAtQuantile, 2) => "value",
-            (M::Exemplar, 2) => "time_unix_nano",
-            // The `value` oneof: as_double, as_int share slot 3.
-            (M::Exemplar, 3 | 6) => return Some((3, "value")),
-            (M::Exemplar, 4) => "span_id",
-            (M::Exemplar, 5) => "trace_id",
-            (M::Span, 1) | (M::Link, 1) => "trace_id",
-            (M::Span, 2) | (M::Link, 2) => "span_id",
-            (M::Span, 3) | (M::Link, 3) => "trace_state",
-            (M::Span, 4) => "parent_span_id",
-            (M::Span, 5) | (M::Event, 2) => "name",
-            (M::Span, 6) => "kind",
-            (M::Span, 7) => "start_time_unix_nano",
-            (M::Span, 8) => "end_time_unix_nano",
-            (M::Span, 10) | (M::Event, 4) | (M::Link, 5) => "dropped_attributes_count",
-            (M::Span, 12) => "dropped_events_count",
-            (M::Span, 14) => "dropped_links_count",
-            (M::Span, 15) => "status",
-            (M::Span, 16) | (M::Link, 6) => "flags",
-            (M::Event, 1) => "time_unix_nano",
-            (M::Status, 2) => "message",
-            (M::Status, 3) => "code",
-            (M::Resource, 2) | (M::InstrumentationScope, 4) => "dropped_attributes_count",
-            (M::EntityRef, 1) => "schema_url",
-            (M::EntityRef, 2) => "type",
-            (M::InstrumentationScope, 1) => "name",
-            (M::InstrumentationScope, 2) => "version",
-            (M::KeyValue, 1) => "key",
-            (M::KeyValue, 2) => "value",
-            _ => return None,
-        };
-        // Every singular field number of OTLP is below 32.
-        Some((u32::try_from(num).ok()?, name))
-    }
-
     /// The schema of field `num` of this message.
     #[inline]
     fn field(self, num: u64) -> Field {
-        use Field::{Message as Sub, Packed, Scalar, Str, Unknown};
+        use Kind::{Message as Sub, Packed, Scalar};
         use Message as M;
         match self {
             M::ExportLogsServiceRequest => match num {
-                logs::LOGS_DATA_RESOURCE => Sub(M::ResourceLogs),
-                _ => Unknown,
+                logs::LOGS_DATA_RESOURCE => many(Sub(M::ResourceLogs)),
+                _ => UNKNOWN,
             },
             M::ResourceLogs => match num {
-                logs::RESOURCE_LOGS_RESOURCE => Sub(M::Resource),
-                logs::RESOURCE_LOGS_SCOPE_LOGS => Sub(M::ScopeLogs),
-                logs::RESOURCE_LOGS_SCHEMA_URL => Str,
-                _ => Unknown,
+                logs::RESOURCE_LOGS_RESOURCE => one(Sub(M::Resource), "resource"),
+                logs::RESOURCE_LOGS_SCOPE_LOGS => many(Sub(M::ScopeLogs)),
+                logs::RESOURCE_LOGS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
             M::ScopeLogs => match num {
-                logs::SCOPE_LOG_SCOPE => Sub(M::InstrumentationScope),
-                logs::SCOPE_LOGS_LOG_RECORDS => Sub(M::LogRecord),
-                logs::SCOPE_LOGS_SCHEMA_URL => Str,
-                _ => Unknown,
+                logs::SCOPE_LOG_SCOPE => one(Sub(M::InstrumentationScope), "scope"),
+                logs::SCOPE_LOGS_LOG_RECORDS => many(Sub(M::LogRecord)),
+                logs::SCOPE_LOGS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
             M::LogRecord => match num {
-                logs::LOG_RECORD_TIME_UNIX_NANO | logs::LOG_RECORD_OBSERVED_TIME_UNIX_NANO => {
-                    Scalar(FIXED64)
+                logs::LOG_RECORD_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                logs::LOG_RECORD_OBSERVED_TIME_UNIX_NANO => {
+                    one(Scalar(FIXED64), "observed_time_unix_nano")
                 }
-                logs::LOG_RECORD_SEVERITY_NUMBER | logs::LOG_RECORD_DROPPED_ATTRIBUTES_COUNT => {
-                    Scalar(VARINT)
+                logs::LOG_RECORD_SEVERITY_NUMBER => one(Scalar(VARINT), "severity_number"),
+                logs::LOG_RECORD_SEVERITY_TEXT => one(Scalar(LEN), "severity_text"),
+                logs::LOG_RECORD_BODY => one(Sub(M::AnyValue), "body"),
+                logs::LOG_RECORD_ATTRIBUTES => many(Sub(M::KeyValue)),
+                logs::LOG_RECORD_DROPPED_ATTRIBUTES_COUNT => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
                 }
-                logs::LOG_RECORD_SEVERITY_TEXT | logs::LOG_RECORD_EVENT_NAME => Str,
-                logs::LOG_RECORD_TRACE_ID | logs::LOG_RECORD_SPAN_ID => Scalar(LEN),
-                logs::LOG_RECORD_BODY => Sub(M::AnyValue),
-                logs::LOG_RECORD_ATTRIBUTES => Sub(M::KeyValue),
-                logs::LOG_RECORD_FLAGS => Scalar(FIXED32),
-                _ => Unknown,
+                logs::LOG_RECORD_FLAGS => one(Scalar(FIXED32), "flags"),
+                logs::LOG_RECORD_TRACE_ID => one(Scalar(LEN), "trace_id"),
+                logs::LOG_RECORD_SPAN_ID => one(Scalar(LEN), "span_id"),
+                logs::LOG_RECORD_EVENT_NAME => one(Scalar(LEN), "event_name"),
+                _ => UNKNOWN,
             },
             M::ExportMetricsServiceRequest => match num {
-                metrics::METRICS_DATA_RESOURCE_METRICS => Sub(M::ResourceMetrics),
-                _ => Unknown,
+                metrics::METRICS_DATA_RESOURCE_METRICS => many(Sub(M::ResourceMetrics)),
+                _ => UNKNOWN,
             },
             M::ResourceMetrics => match num {
-                metrics::RESOURCE_METRICS_RESOURCE => Sub(M::Resource),
-                metrics::RESOURCE_METRICS_SCOPE_METRICS => Sub(M::ScopeMetrics),
-                metrics::RESOURCE_METRICS_SCHEMA_URL => Str,
-                _ => Unknown,
+                metrics::RESOURCE_METRICS_RESOURCE => one(Sub(M::Resource), "resource"),
+                metrics::RESOURCE_METRICS_SCOPE_METRICS => many(Sub(M::ScopeMetrics)),
+                metrics::RESOURCE_METRICS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
             M::ScopeMetrics => match num {
-                metrics::SCOPE_METRICS_SCOPE => Sub(M::InstrumentationScope),
-                metrics::SCOPE_METRICS_METRICS => Sub(M::Metric),
-                metrics::SCOPE_METRICS_SCHEMA_URL => Str,
-                _ => Unknown,
+                metrics::SCOPE_METRICS_SCOPE => one(Sub(M::InstrumentationScope), "scope"),
+                metrics::SCOPE_METRICS_METRICS => many(Sub(M::Metric)),
+                metrics::SCOPE_METRICS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
-            M::Metric => match num {
-                metrics::METRIC_NAME | metrics::METRIC_DESCRIPTION | metrics::METRIC_UNIT => Str,
-                metrics::METRIC_GAUGE => Sub(M::Gauge),
-                metrics::METRIC_SUM => Sub(M::Sum),
-                metrics::METRIC_HISTOGRAM => Sub(M::Histogram),
-                metrics::METRIC_EXPONENTIAL_HISTOGRAM => Sub(M::ExponentialHistogram),
-                metrics::METRIC_SUMMARY => Sub(M::Summary),
-                metrics::METRIC_METADATA => Sub(M::KeyValue),
-                _ => Unknown,
-            },
+            M::Metric => {
+                // The `data` oneof.
+                let data = |child| member(Sub(child), "data", metrics::METRIC_GAUGE);
+                match num {
+                    metrics::METRIC_NAME => one(Scalar(LEN), "name"),
+                    metrics::METRIC_DESCRIPTION => one(Scalar(LEN), "description"),
+                    metrics::METRIC_UNIT => one(Scalar(LEN), "unit"),
+                    metrics::METRIC_GAUGE => data(M::Gauge),
+                    metrics::METRIC_SUM => data(M::Sum),
+                    metrics::METRIC_HISTOGRAM => data(M::Histogram),
+                    metrics::METRIC_EXPONENTIAL_HISTOGRAM => data(M::ExponentialHistogram),
+                    metrics::METRIC_SUMMARY => data(M::Summary),
+                    metrics::METRIC_METADATA => many(Sub(M::KeyValue)),
+                    _ => UNKNOWN,
+                }
+            }
             M::Gauge => match num {
-                metrics::GAUGE_DATA_POINTS => Sub(M::NumberDataPoint),
-                _ => Unknown,
+                metrics::GAUGE_DATA_POINTS => many(Sub(M::NumberDataPoint)),
+                _ => UNKNOWN,
             },
             M::Sum => match num {
-                metrics::SUM_DATA_POINTS => Sub(M::NumberDataPoint),
-                metrics::SUM_AGGREGATION_TEMPORALITY | metrics::SUM_IS_MONOTONIC => Scalar(VARINT),
-                _ => Unknown,
+                metrics::SUM_DATA_POINTS => many(Sub(M::NumberDataPoint)),
+                metrics::SUM_AGGREGATION_TEMPORALITY => {
+                    one(Scalar(VARINT), "aggregation_temporality")
+                }
+                metrics::SUM_IS_MONOTONIC => one(Scalar(VARINT), "is_monotonic"),
+                _ => UNKNOWN,
             },
             M::Histogram => match num {
-                metrics::HISTOGRAM_DATA_POINTS => Sub(M::HistogramDataPoint),
-                metrics::HISTOGRAM_AGGREGATION_TEMPORALITY => Scalar(VARINT),
-                _ => Unknown,
+                metrics::HISTOGRAM_DATA_POINTS => many(Sub(M::HistogramDataPoint)),
+                metrics::HISTOGRAM_AGGREGATION_TEMPORALITY => {
+                    one(Scalar(VARINT), "aggregation_temporality")
+                }
+                _ => UNKNOWN,
             },
             M::ExponentialHistogram => match num {
-                metrics::EXPONENTIAL_HISTOGRAM_DATA_POINTS => Sub(M::ExponentialHistogramDataPoint),
-                metrics::EXPONENTIAL_HISTOGRAM_AGGREGATION_TEMPORALITY => Scalar(VARINT),
-                _ => Unknown,
+                metrics::EXPONENTIAL_HISTOGRAM_DATA_POINTS => {
+                    many(Sub(M::ExponentialHistogramDataPoint))
+                }
+                metrics::EXPONENTIAL_HISTOGRAM_AGGREGATION_TEMPORALITY => {
+                    one(Scalar(VARINT), "aggregation_temporality")
+                }
+                _ => UNKNOWN,
             },
             M::Summary => match num {
-                metrics::SUMMARY_DATA_POINTS => Sub(M::SummaryDataPoint),
-                _ => Unknown,
+                metrics::SUMMARY_DATA_POINTS => many(Sub(M::SummaryDataPoint)),
+                _ => UNKNOWN,
             },
-            M::NumberDataPoint => match num {
-                metrics::NUMBER_DP_ATTRIBUTES => Sub(M::KeyValue),
-                metrics::NUMBER_DP_START_TIME_UNIX_NANO
-                | metrics::NUMBER_DP_TIME_UNIX_NANO
-                | metrics::NUMBER_DP_AS_DOUBLE
-                | metrics::NUMBER_DP_AS_INT => Scalar(FIXED64),
-                metrics::NUMBER_DP_EXEMPLARS => Sub(M::Exemplar),
-                metrics::NUMBER_DP_FLAGS => Scalar(VARINT),
-                _ => Unknown,
-            },
-            M::HistogramDataPoint => match num {
-                metrics::HISTOGRAM_DP_ATTRIBUTES => Sub(M::KeyValue),
-                metrics::HISTOGRAM_DP_START_TIME_UNIX_NANO
-                | metrics::HISTOGRAM_DP_TIME_UNIX_NANO
-                | metrics::HISTOGRAM_DP_COUNT
-                | metrics::HISTOGRAM_DP_SUM
-                | metrics::HISTOGRAM_DP_MIN
-                | metrics::HISTOGRAM_DP_MAX => Scalar(FIXED64),
-                metrics::HISTOGRAM_DP_BUCKET_COUNTS | metrics::HISTOGRAM_DP_EXPLICIT_BOUNDS => {
-                    Packed(FIXED64)
+            M::NumberDataPoint => {
+                // The `value` oneof.
+                let value = member(Scalar(FIXED64), "value", metrics::NUMBER_DP_AS_DOUBLE);
+                match num {
+                    metrics::NUMBER_DP_ATTRIBUTES => many(Sub(M::KeyValue)),
+                    metrics::NUMBER_DP_START_TIME_UNIX_NANO => {
+                        one(Scalar(FIXED64), "start_time_unix_nano")
+                    }
+                    metrics::NUMBER_DP_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                    metrics::NUMBER_DP_AS_DOUBLE | metrics::NUMBER_DP_AS_INT => value,
+                    metrics::NUMBER_DP_EXEMPLARS => many(Sub(M::Exemplar)),
+                    metrics::NUMBER_DP_FLAGS => one(Scalar(VARINT), "flags"),
+                    _ => UNKNOWN,
                 }
-                metrics::HISTOGRAM_DP_EXEMPLARS => Sub(M::Exemplar),
-                metrics::HISTOGRAM_DP_FLAGS => Scalar(VARINT),
-                _ => Unknown,
+            }
+            M::HistogramDataPoint => match num {
+                metrics::HISTOGRAM_DP_ATTRIBUTES => many(Sub(M::KeyValue)),
+                metrics::HISTOGRAM_DP_START_TIME_UNIX_NANO => {
+                    one(Scalar(FIXED64), "start_time_unix_nano")
+                }
+                metrics::HISTOGRAM_DP_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                metrics::HISTOGRAM_DP_COUNT => one(Scalar(FIXED64), "count"),
+                metrics::HISTOGRAM_DP_SUM => one(Scalar(FIXED64), "sum"),
+                metrics::HISTOGRAM_DP_BUCKET_COUNTS | metrics::HISTOGRAM_DP_EXPLICIT_BOUNDS => {
+                    many(Packed(FIXED64))
+                }
+                metrics::HISTOGRAM_DP_EXEMPLARS => many(Sub(M::Exemplar)),
+                metrics::HISTOGRAM_DP_FLAGS => one(Scalar(VARINT), "flags"),
+                metrics::HISTOGRAM_DP_MIN => one(Scalar(FIXED64), "min"),
+                metrics::HISTOGRAM_DP_MAX => one(Scalar(FIXED64), "max"),
+                _ => UNKNOWN,
             },
             M::ExponentialHistogramDataPoint => match num {
-                metrics::EXP_HISTOGRAM_DP_ATTRIBUTES => Sub(M::KeyValue),
-                metrics::EXP_HISTOGRAM_DP_START_TIME_UNIX_NANO
-                | metrics::EXP_HISTOGRAM_DP_TIME_UNIX_NANO
-                | metrics::EXP_HISTOGRAM_DP_COUNT
-                | metrics::EXP_HISTOGRAM_DP_SUM
-                | metrics::EXP_HISTOGRAM_DP_ZERO_COUNT
-                | metrics::EXP_HISTOGRAM_DP_MIN
-                | metrics::EXP_HISTOGRAM_DP_MAX
-                | metrics::EXP_HISTOGRAM_DP_ZERO_THRESHOLD => Scalar(FIXED64),
-                metrics::EXP_HISTOGRAM_DP_SCALE | metrics::EXP_HISTOGRAM_DP_FLAGS => Scalar(VARINT),
-                metrics::EXP_HISTOGRAM_DP_POSITIVE | metrics::EXP_HISTOGRAM_DP_NEGATIVE => {
-                    Sub(M::Buckets)
+                metrics::EXP_HISTOGRAM_DP_ATTRIBUTES => many(Sub(M::KeyValue)),
+                metrics::EXP_HISTOGRAM_DP_START_TIME_UNIX_NANO => {
+                    one(Scalar(FIXED64), "start_time_unix_nano")
                 }
-                metrics::EXP_HISTOGRAM_DP_EXEMPLARS => Sub(M::Exemplar),
-                _ => Unknown,
+                metrics::EXP_HISTOGRAM_DP_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                metrics::EXP_HISTOGRAM_DP_COUNT => one(Scalar(FIXED64), "count"),
+                metrics::EXP_HISTOGRAM_DP_SUM => one(Scalar(FIXED64), "sum"),
+                metrics::EXP_HISTOGRAM_DP_SCALE => one(Scalar(VARINT), "scale"),
+                metrics::EXP_HISTOGRAM_DP_ZERO_COUNT => one(Scalar(FIXED64), "zero_count"),
+                metrics::EXP_HISTOGRAM_DP_POSITIVE => one(Sub(M::Buckets), "positive"),
+                metrics::EXP_HISTOGRAM_DP_NEGATIVE => one(Sub(M::Buckets), "negative"),
+                metrics::EXP_HISTOGRAM_DP_FLAGS => one(Scalar(VARINT), "flags"),
+                metrics::EXP_HISTOGRAM_DP_EXEMPLARS => many(Sub(M::Exemplar)),
+                metrics::EXP_HISTOGRAM_DP_MIN => one(Scalar(FIXED64), "min"),
+                metrics::EXP_HISTOGRAM_DP_MAX => one(Scalar(FIXED64), "max"),
+                metrics::EXP_HISTOGRAM_DP_ZERO_THRESHOLD => one(Scalar(FIXED64), "zero_threshold"),
+                _ => UNKNOWN,
             },
             M::Buckets => match num {
-                metrics::EXP_HISTOGRAM_BUCKET_OFFSET => Scalar(VARINT),
-                metrics::EXP_HISTOGRAM_BUCKET_BUCKET_COUNTS => Packed(VARINT),
-                _ => Unknown,
+                metrics::EXP_HISTOGRAM_BUCKET_OFFSET => one(Scalar(VARINT), "offset"),
+                metrics::EXP_HISTOGRAM_BUCKET_BUCKET_COUNTS => many(Packed(VARINT)),
+                _ => UNKNOWN,
             },
             M::SummaryDataPoint => match num {
-                metrics::SUMMARY_DP_ATTRIBUTES => Sub(M::KeyValue),
-                metrics::SUMMARY_DP_START_TIME_UNIX_NANO
-                | metrics::SUMMARY_DP_TIME_UNIX_NANO
-                | metrics::SUMMARY_DP_COUNT
-                | metrics::SUMMARY_DP_SUM => Scalar(FIXED64),
-                metrics::SUMMARY_DP_QUANTILE_VALUES => Sub(M::ValueAtQuantile),
-                metrics::SUMMARY_DP_FLAGS => Scalar(VARINT),
-                _ => Unknown,
+                metrics::SUMMARY_DP_ATTRIBUTES => many(Sub(M::KeyValue)),
+                metrics::SUMMARY_DP_START_TIME_UNIX_NANO => {
+                    one(Scalar(FIXED64), "start_time_unix_nano")
+                }
+                metrics::SUMMARY_DP_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                metrics::SUMMARY_DP_COUNT => one(Scalar(FIXED64), "count"),
+                metrics::SUMMARY_DP_SUM => one(Scalar(FIXED64), "sum"),
+                metrics::SUMMARY_DP_QUANTILE_VALUES => many(Sub(M::ValueAtQuantile)),
+                metrics::SUMMARY_DP_FLAGS => one(Scalar(VARINT), "flags"),
+                _ => UNKNOWN,
             },
             M::ValueAtQuantile => match num {
-                metrics::VALUE_AT_QUANTILE_QUANTILE | metrics::VALUE_AT_QUANTILE_VALUE => {
-                    Scalar(FIXED64)
+                metrics::VALUE_AT_QUANTILE_QUANTILE => one(Scalar(FIXED64), "quantile"),
+                metrics::VALUE_AT_QUANTILE_VALUE => one(Scalar(FIXED64), "value"),
+                _ => UNKNOWN,
+            },
+            M::Exemplar => {
+                // The `value` oneof.
+                let value = member(Scalar(FIXED64), "value", metrics::EXEMPLAR_AS_DOUBLE);
+                match num {
+                    metrics::EXEMPLAR_FILTERED_ATTRIBUTES => many(Sub(M::KeyValue)),
+                    metrics::EXEMPLAR_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                    metrics::EXEMPLAR_AS_DOUBLE | metrics::EXEMPLAR_AS_INT => value,
+                    metrics::EXEMPLAR_SPAN_ID => one(Scalar(LEN), "span_id"),
+                    metrics::EXEMPLAR_TRACE_ID => one(Scalar(LEN), "trace_id"),
+                    _ => UNKNOWN,
                 }
-                _ => Unknown,
-            },
-            M::Exemplar => match num {
-                metrics::EXEMPLAR_FILTERED_ATTRIBUTES => Sub(M::KeyValue),
-                metrics::EXEMPLAR_TIME_UNIX_NANO
-                | metrics::EXEMPLAR_AS_DOUBLE
-                | metrics::EXEMPLAR_AS_INT => Scalar(FIXED64),
-                metrics::EXEMPLAR_SPAN_ID | metrics::EXEMPLAR_TRACE_ID => Scalar(LEN),
-                _ => Unknown,
-            },
+            }
             M::ExportTraceServiceRequest => match num {
-                traces::TRACES_DATA_RESOURCE_SPANS => Sub(M::ResourceSpans),
-                _ => Unknown,
+                traces::TRACES_DATA_RESOURCE_SPANS => many(Sub(M::ResourceSpans)),
+                _ => UNKNOWN,
             },
             M::ResourceSpans => match num {
-                traces::RESOURCE_SPANS_RESOURCE => Sub(M::Resource),
-                traces::RESOURCE_SPANS_SCOPE_SPANS => Sub(M::ScopeSpans),
-                traces::RESOURCE_SPANS_SCHEMA_URL => Str,
-                _ => Unknown,
+                traces::RESOURCE_SPANS_RESOURCE => one(Sub(M::Resource), "resource"),
+                traces::RESOURCE_SPANS_SCOPE_SPANS => many(Sub(M::ScopeSpans)),
+                traces::RESOURCE_SPANS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
             M::ScopeSpans => match num {
-                traces::SCOPE_SPANS_SCOPE => Sub(M::InstrumentationScope),
-                traces::SCOPE_SPANS_SPANS => Sub(M::Span),
-                traces::SCOPE_SPANS_SCHEMA_URL => Str,
-                _ => Unknown,
+                traces::SCOPE_SPANS_SCOPE => one(Sub(M::InstrumentationScope), "scope"),
+                traces::SCOPE_SPANS_SPANS => many(Sub(M::Span)),
+                traces::SCOPE_SPANS_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                _ => UNKNOWN,
             },
             M::Span => match num {
-                traces::SPAN_TRACE_ID | traces::SPAN_SPAN_ID | traces::SPAN_PARENT_SPAN_ID => {
-                    Scalar(LEN)
+                traces::SPAN_TRACE_ID => one(Scalar(LEN), "trace_id"),
+                traces::SPAN_SPAN_ID => one(Scalar(LEN), "span_id"),
+                traces::SPAN_TRACE_STATE => one(Scalar(LEN), "trace_state"),
+                traces::SPAN_PARENT_SPAN_ID => one(Scalar(LEN), "parent_span_id"),
+                traces::SPAN_NAME => one(Scalar(LEN), "name"),
+                traces::SPAN_KIND => one(Scalar(VARINT), "kind"),
+                traces::SPAN_START_TIME_UNIX_NANO => one(Scalar(FIXED64), "start_time_unix_nano"),
+                traces::SPAN_END_TIME_UNIX_NANO => one(Scalar(FIXED64), "end_time_unix_nano"),
+                traces::SPAN_ATTRIBUTES => many(Sub(M::KeyValue)),
+                traces::SPAN_DROPPED_ATTRIBUTES_COUNT => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
                 }
-                traces::SPAN_TRACE_STATE | traces::SPAN_NAME => Str,
-                traces::SPAN_FLAGS => Scalar(FIXED32),
-                traces::SPAN_KIND
-                | traces::SPAN_DROPPED_ATTRIBUTES_COUNT
-                | traces::SPAN_DROPPED_EVENTS_COUNT
-                | traces::SPAN_DROPPED_LINKS_COUNT => Scalar(VARINT),
-                traces::SPAN_START_TIME_UNIX_NANO | traces::SPAN_END_TIME_UNIX_NANO => {
-                    Scalar(FIXED64)
-                }
-                traces::SPAN_ATTRIBUTES => Sub(M::KeyValue),
-                traces::SPAN_EVENTS => Sub(M::Event),
-                traces::SPAN_LINKS => Sub(M::Link),
-                traces::SPAN_STATUS => Sub(M::Status),
-                _ => Unknown,
+                traces::SPAN_EVENTS => many(Sub(M::Event)),
+                traces::SPAN_DROPPED_EVENTS_COUNT => one(Scalar(VARINT), "dropped_events_count"),
+                traces::SPAN_LINKS => many(Sub(M::Link)),
+                traces::SPAN_DROPPED_LINKS_COUNT => one(Scalar(VARINT), "dropped_links_count"),
+                traces::SPAN_STATUS => one(Sub(M::Status), "status"),
+                traces::SPAN_FLAGS => one(Scalar(FIXED32), "flags"),
+                _ => UNKNOWN,
             },
             M::Event => match num {
-                traces::SPAN_EVENT_TIME_UNIX_NANO => Scalar(FIXED64),
-                traces::SPAN_EVENT_NAME => Str,
-                traces::SPAN_EVENT_ATTRIBUTES => Sub(M::KeyValue),
-                traces::SPAN_EVENT_DROPPED_ATTRIBUTES_COUNTS => Scalar(VARINT),
-                _ => Unknown,
+                traces::SPAN_EVENT_TIME_UNIX_NANO => one(Scalar(FIXED64), "time_unix_nano"),
+                traces::SPAN_EVENT_NAME => one(Scalar(LEN), "name"),
+                traces::SPAN_EVENT_ATTRIBUTES => many(Sub(M::KeyValue)),
+                traces::SPAN_EVENT_DROPPED_ATTRIBUTES_COUNTS => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
+                }
+                _ => UNKNOWN,
             },
             M::Link => match num {
-                traces::SPAN_LINK_TRACE_ID | traces::SPAN_LINK_SPAN_ID => Scalar(LEN),
-                traces::SPAN_LINK_TRACE_STATE => Str,
-                traces::SPAN_LINK_ATTRIBUTES => Sub(M::KeyValue),
-                traces::SPAN_LINK_DROPPED_ATTRIBUTES_COUNT => Scalar(VARINT),
-                traces::SPAN_LINK_FLAGS => Scalar(FIXED32),
-                _ => Unknown,
+                traces::SPAN_LINK_TRACE_ID => one(Scalar(LEN), "trace_id"),
+                traces::SPAN_LINK_SPAN_ID => one(Scalar(LEN), "span_id"),
+                traces::SPAN_LINK_TRACE_STATE => one(Scalar(LEN), "trace_state"),
+                traces::SPAN_LINK_ATTRIBUTES => many(Sub(M::KeyValue)),
+                traces::SPAN_LINK_DROPPED_ATTRIBUTES_COUNT => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
+                }
+                traces::SPAN_LINK_FLAGS => one(Scalar(FIXED32), "flags"),
+                _ => UNKNOWN,
             },
             // Field 1 is the reserved `deprecated_code`, skipped as unknown.
             M::Status => match num {
-                traces::SPAN_STATUS_MESSAGE => Str,
-                traces::SPAN_STATUS_CODE => Scalar(VARINT),
-                _ => Unknown,
+                traces::SPAN_STATUS_MESSAGE => one(Scalar(LEN), "message"),
+                traces::SPAN_STATUS_CODE => one(Scalar(VARINT), "code"),
+                _ => UNKNOWN,
             },
             M::Resource => match num {
-                resource::RESOURCE_ATTRIBUTES => Sub(M::KeyValue),
-                resource::RESOURCE_DROPPED_ATTRIBUTES_COUNT => Scalar(VARINT),
-                resource::RESOURCE_ENTITY_REFS => Sub(M::EntityRef),
-                _ => Unknown,
+                resource::RESOURCE_ATTRIBUTES => many(Sub(M::KeyValue)),
+                resource::RESOURCE_DROPPED_ATTRIBUTES_COUNT => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
+                }
+                resource::RESOURCE_ENTITY_REFS => many(Sub(M::EntityRef)),
+                _ => UNKNOWN,
             },
             M::EntityRef => match num {
-                common::ENTITY_REF_SCHEMA_URL
-                | common::ENTITY_REF_TYPE
-                | common::ENTITY_REF_ID_KEYS
-                | common::ENTITY_REF_DESCRIPTION_KEYS => Str,
-                _ => Unknown,
+                common::ENTITY_REF_SCHEMA_URL => one(Scalar(LEN), "schema_url"),
+                common::ENTITY_REF_TYPE => one(Scalar(LEN), "type"),
+                common::ENTITY_REF_ID_KEYS | common::ENTITY_REF_DESCRIPTION_KEYS => {
+                    many(Scalar(LEN))
+                }
+                _ => UNKNOWN,
             },
             M::InstrumentationScope => match num {
-                common::INSTRUMENTATION_SCOPE_NAME | common::INSTRUMENTATION_SCOPE_VERSION => Str,
-                common::INSTRUMENTATION_SCOPE_ATTRIBUTES => Sub(M::KeyValue),
-                common::INSTRUMENTATION_DROPPED_ATTRIBUTES_COUNT => Scalar(VARINT),
-                _ => Unknown,
+                common::INSTRUMENTATION_SCOPE_NAME => one(Scalar(LEN), "name"),
+                common::INSTRUMENTATION_SCOPE_VERSION => one(Scalar(LEN), "version"),
+                common::INSTRUMENTATION_SCOPE_ATTRIBUTES => many(Sub(M::KeyValue)),
+                common::INSTRUMENTATION_DROPPED_ATTRIBUTES_COUNT => {
+                    one(Scalar(VARINT), "dropped_attributes_count")
+                }
+                _ => UNKNOWN,
             },
             M::KeyValue => match num {
-                common::KEY_VALUE_KEY => Str,
-                common::KEY_VALUE_VALUE => Sub(M::AnyValue),
-                _ => Unknown,
+                common::KEY_VALUE_KEY => one(Scalar(LEN), "key"),
+                common::KEY_VALUE_VALUE => one(Sub(M::AnyValue), "value"),
+                _ => UNKNOWN,
             },
+            // The `value` oneof's members may repeat: the view reads them as
+            // prost does (the last member wins; `array_value` and
+            // `kvlist_value` following themselves merge).
             M::AnyValue => match num {
-                common::ANY_VALUE_STRING_VALUE => Str,
-                common::ANY_VALUE_BYTES_VALUE => Scalar(LEN),
-                common::ANY_VALUE_BOOL_VALUE | common::ANY_VALUE_INT_VALUE => Scalar(VARINT),
-                common::ANY_VALUE_DOUBLE_VALUE => Scalar(FIXED64),
-                common::ANY_VALUE_ARRAY_VALUE => Sub(M::ArrayValue),
-                common::ANY_VALUE_KVLIST_VALUE => Sub(M::KeyValueList),
-                _ => Unknown,
+                common::ANY_VALUE_STRING_VALUE | common::ANY_VALUE_BYTES_VALUE => many(Scalar(LEN)),
+                common::ANY_VALUE_BOOL_VALUE | common::ANY_VALUE_INT_VALUE => many(Scalar(VARINT)),
+                common::ANY_VALUE_DOUBLE_VALUE => many(Scalar(FIXED64)),
+                common::ANY_VALUE_ARRAY_VALUE => many(Sub(M::ArrayValue)),
+                common::ANY_VALUE_KVLIST_VALUE => many(Sub(M::KeyValueList)),
+                _ => UNKNOWN,
             },
             M::ArrayValue => match num {
-                common::ARRAY_VALUE_VALUES => Sub(M::AnyValue),
-                _ => Unknown,
+                common::ARRAY_VALUE_VALUES => many(Sub(M::AnyValue)),
+                _ => UNKNOWN,
             },
             M::KeyValueList => match num {
-                common::KEY_VALUE_LIST_VALUES => Sub(M::KeyValue),
-                _ => Unknown,
+                common::KEY_VALUE_LIST_VALUES => many(Sub(M::KeyValue)),
+                _ => UNKNOWN,
             },
         }
     }
@@ -576,7 +625,7 @@ pub(crate) fn validate_request(
 /// returns it cheaply and only the outermost call builds the crate error.
 enum Damage {
     Framing {
-        problem: &'static str,
+        problem: WireProblem,
         message: Message,
         offset: usize,
     },
@@ -599,13 +648,13 @@ fn walk(
     depth: usize,
     repeated: RepeatedSingular,
 ) -> Result<(), Damage> {
-    let fail = |problem: &'static str, at: usize| Damage::Framing {
+    let fail = |problem: WireProblem, at: usize| Damage::Framing {
         problem,
         message,
         offset: base + at,
     };
     // The singular fields seen so far in this message, one bit per slot.
-    let mut seen: u32 = 0;
+    let mut seen: u64 = 0;
     let mut pos = 0;
     while pos < buf.len() {
         let at = pos;
@@ -614,10 +663,10 @@ fn walk(
         let field = message.field(field_num);
         if wire_type == START_GROUP || wire_type == END_GROUP {
             if wire_type == END_GROUP {
-                return Err(fail("end group without a start group", at));
+                return Err(fail(WireProblem::StrayEndGroup, at));
             }
-            if !matches!(field, Field::Unknown) {
-                return Err(fail("wrong wire type for a known field", at));
+            if !matches!(field.kind, Kind::Unknown) {
+                return Err(fail(WireProblem::WrongWireType, at));
             }
             pos = skip_group(buf, next, field_num, depth + 1, at).map_err(|skip| match skip {
                 SkipError::Framing { problem, at } => fail(problem, at),
@@ -628,40 +677,36 @@ fn walk(
         let (start, end) =
             value_range(buf, wire_type, next).map_err(|problem| fail(problem, at))?;
         if repeated == RepeatedSingular::Refuse
-            && let Some((slot, name)) = message.singular(field_num)
+            && let Some(singular) = field.singular
         {
-            let bit = 1u32 << slot;
+            // Every singular field number of OTLP is below 64.
+            let bit = 1u64 << singular.oneof.unwrap_or(field_num);
             if seen & bit != 0 {
                 return Err(Damage::Duplicate {
                     message,
-                    field: name,
+                    field: singular.name,
                     offset: base + at,
                 });
             }
             seen |= bit;
         }
-        match field {
-            Field::Unknown => {}
-            Field::Scalar(expected) => {
+        match field.kind {
+            Kind::Unknown => {}
+            Kind::Scalar(expected) => {
                 if wire_type != expected {
-                    return Err(fail("wrong wire type for a known field", at));
+                    return Err(fail(WireProblem::WrongWireType, at));
                 }
             }
-            Field::Str => {
-                if wire_type != LEN {
-                    return Err(fail("wrong wire type for a known field", at));
-                }
-            }
-            Field::Packed(element) => {
+            Kind::Packed(element) => {
                 if wire_type == LEN {
                     check_packed(&buf[start..end], element).map_err(|problem| fail(problem, at))?;
                 } else if wire_type != element {
-                    return Err(fail("wrong wire type for a known field", at));
+                    return Err(fail(WireProblem::WrongWireType, at));
                 }
             }
-            Field::Message(child) => {
+            Kind::Message(child) => {
                 if wire_type != LEN {
-                    return Err(fail("wrong wire type for a known field", at));
+                    return Err(fail(WireProblem::WrongWireType, at));
                 }
                 let depth = depth + usize::from(child.is_value_container());
                 if depth > MAX_ANY_VALUE_NESTING_DEPTH {
@@ -676,18 +721,17 @@ fn walk(
 }
 
 /// Check the payload of a packed repeated field of `element` wire type.
-fn check_packed(payload: &[u8], element: u64) -> Result<(), &'static str> {
+fn check_packed(payload: &[u8], element: u64) -> Result<(), WireProblem> {
     if element == FIXED64 {
         return if payload.len().is_multiple_of(8) {
             Ok(())
         } else {
-            Err("packed fixed64 field is not a whole number of elements")
+            Err(WireProblem::RaggedPackedFixed64)
         };
     }
     let mut pos = 0;
     while pos < payload.len() {
-        let (_, next) =
-            read_varint(payload, pos).ok_or("truncated or overlong varint in a packed field")?;
+        let (_, next) = read_varint(payload, pos).ok_or(WireProblem::TruncatedPackedVarint)?;
         pos = next;
     }
     Ok(())
@@ -1047,8 +1091,8 @@ mod tests {
         while pos < buf.len() {
             let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
             let (start, end) = value_range(buf, wire_type, next).expect("value");
-            match message.field(field_num) {
-                Field::Message(child) => {
+            match message.field(field_num).kind {
+                Kind::Message(child) => {
                     let inner = decorate(&buf[start..end], child);
                     out.extend(len_field(field_num as u32, &inner));
                 }
@@ -1109,8 +1153,8 @@ mod tests {
         while pos < buf.len() {
             let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
             let (start, end) = value_range(buf, wire_type, next).expect("value");
-            let field = match message.field(field_num) {
-                Field::Message(child) => len_field(
+            let field = match message.field(field_num).kind {
+                Kind::Message(child) => len_field(
                     field_num as u32,
                     &duplicate(&buf[start..end], child, target),
                 ),
@@ -1131,10 +1175,11 @@ mod tests {
         while pos < buf.len() {
             let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
             let (start, end) = value_range(buf, wire_type, next).expect("value");
-            if message.singular(field_num).is_some() && !found.contains(&(message, field_num)) {
+            let field = message.field(field_num);
+            if field.singular.is_some() && !found.contains(&(message, field_num)) {
                 found.push((message, field_num));
             }
-            if let Field::Message(child) = message.field(field_num) {
+            if let Kind::Message(child) = field.kind {
                 singular_fields(&buf[start..end], child, found);
             }
             pos = end;
@@ -1168,7 +1213,7 @@ mod tests {
             singular_fields(&body, root, &mut found);
             for target in found {
                 let doubled = duplicate(&body, root, target);
-                let (_, field) = target.0.singular(target.1).expect("singular");
+                let field = target.0.field(target.1).singular.expect("singular").name;
                 assert!(
                     validate_request(&doubled, root, RepeatedSingular::Accept).is_ok(),
                     "{target:?}"
@@ -1315,7 +1360,7 @@ mod tests {
                 message,
                 offset,
             }) => {
-                assert_eq!(problem, "length-delimited field overruns its message");
+                assert_eq!(problem, WireProblem::LengthOverrun);
                 assert_eq!(message, "AnyValue");
                 assert_eq!(offset, expected);
                 assert_eq!(body[offset], 0x0a);
@@ -1500,7 +1545,7 @@ mod tests {
     }
 
     /// The problem an `InvalidOtlpWireFormat` names, or a panic.
-    fn problem(result: Result<(), Error>) -> &'static str {
+    fn problem(result: Result<(), Error>) -> WireProblem {
         match result {
             Err(Error::InvalidOtlpWireFormat { problem, .. }) => problem,
             other => panic!("expected a framing error, got {other:?}"),
@@ -1531,7 +1576,7 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "truncated or overlong varint"
+            WireProblem::TruncatedVarint
         );
         assert_eq!(
             problem(validate_request(
@@ -1539,19 +1584,19 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "truncated or overlong varint"
+            WireProblem::TruncatedVarint
         );
         // LogRecord.body (field 5, LEN) whose length is the overflowing varint.
         let length = in_log_record(&[&[0x2a][..], &overflow].concat());
         assert_eq!(
             problem(validate_request(&length, root, RepeatedSingular::Refuse)),
-            "truncated or overlong length prefix"
+            WireProblem::TruncatedLength
         );
         // An unknown field key that overflows.
         let key = in_log_record(&overflow);
         assert_eq!(
             problem(validate_request(&key, root, RepeatedSingular::Refuse)),
-            "truncated or overlong field key"
+            WireProblem::TruncatedKey
         );
         let buckets = |counts: &[u8]| {
             let point = len_field(8, &len_field(2, counts));
@@ -1566,7 +1611,7 @@ mod tests {
                 metrics,
                 RepeatedSingular::Refuse
             )),
-            "truncated or overlong varint in a packed field"
+            WireProblem::TruncatedPackedVarint
         );
     }
 
@@ -1648,7 +1693,7 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "end group without a start group"
+            WireProblem::StrayEndGroup
         );
         assert_eq!(
             problem(validate_request(
@@ -1656,7 +1701,7 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "end group does not match its start group"
+            WireProblem::MismatchedEndGroup
         );
         assert_eq!(
             problem(validate_request(
@@ -1664,7 +1709,7 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "group without an end group"
+            WireProblem::UnclosedGroup
         );
         // Field 1 of a log record (time_unix_nano) as a group.
         assert_eq!(
@@ -1673,7 +1718,7 @@ mod tests {
                 root,
                 RepeatedSingular::Refuse
             )),
-            "wrong wire type for a known field"
+            WireProblem::WrongWireType
         );
 
         let nested = |levels: usize| {

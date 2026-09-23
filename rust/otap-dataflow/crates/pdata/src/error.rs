@@ -154,7 +154,7 @@ pub enum Error {
     /// from the start of the request, inside a message of type `message`.
     #[error("Invalid protobuf wire format: {problem} in {message} at byte {offset}")]
     InvalidOtlpWireFormat {
-        problem: &'static str,
+        problem: crate::views::otlp::bytes::validate::WireProblem,
         message: &'static str,
         offset: usize,
     },
