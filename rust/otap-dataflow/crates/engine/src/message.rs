@@ -339,12 +339,18 @@ where
         Message::PData(pdata)
     }
 
+    /// Releases the latched Shutdown with its own deadline and reason, or a
+    /// one-second Shutdown when none has been latched.
     fn closed_pdata_shutdown(&mut self) -> Message<PData> {
+        let shutdown = self
+            .pending_shutdown
+            .take()
+            .unwrap_or_else(|| NodeControlMsg::Shutdown {
+                deadline: clock::now().add(Duration::from_secs(1)),
+                reason: "pdata channel closed".to_owned(),
+            });
         self.shutdown();
-        Message::Control(NodeControlMsg::Shutdown {
-            deadline: clock::now().add(Duration::from_secs(1)),
-            reason: "pdata channel closed".to_owned(),
-        })
+        Message::Control(shutdown)
     }
 
     /// Returns whether shutdown draining is allowed to pull `pdata` from the
@@ -1350,15 +1356,106 @@ mod tests {
         ));
     }
 
+    /// Scenario: an exporter with admission closed latches a Shutdown, is
+    /// handed a control message while it drains, and upstream then drops its
+    /// pdata sender.
+    /// Guarantees: the next receive releases the latched Shutdown with its own
+    /// deadline and reason, not a synthesized one-second Shutdown.
+    #[tokio::test]
+    async fn exporter_closed_pdata_releases_the_latched_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ExporterInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        control_tx
+            .send_async(NodeControlMsg::Config {
+                config: serde_json::json!({}),
+            })
+            .await
+            .expect("config");
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("config"),
+            Message::Control(NodeControlMsg::Config { .. })
+        ));
+        drop(pdata_tx);
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(released, deadline);
+                assert_eq!(reason, "admin");
+            }
+            other => panic!("expected the latched shutdown, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a processor with admission closed latches a Shutdown, is
+    /// handed a control message while it drains, and upstream then drops its
+    /// pdata sender.
+    /// Guarantees: the processor inbox releases the latched Shutdown with its
+    /// own deadline and reason, exactly as the exporter inbox does.
+    #[tokio::test]
+    async fn processor_closed_pdata_releases_the_latched_shutdown() {
+        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(4);
+        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(4);
+        let mut inbox = ProcessorInbox::new(
+            Receiver::Local(LocalReceiver::mpsc(control_rx)),
+            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
+            9,
+            Interests::empty(),
+        );
+        let deadline = clock::now() + Duration::from_secs(60);
+        control_tx
+            .send_async(NodeControlMsg::Shutdown {
+                deadline,
+                reason: "admin".to_owned(),
+            })
+            .await
+            .expect("shutdown");
+        control_tx
+            .send_async(NodeControlMsg::Config {
+                config: serde_json::json!({}),
+            })
+            .await
+            .expect("config");
+
+        assert!(matches!(
+            inbox.recv_when(false).await.expect("config"),
+            Message::Control(NodeControlMsg::Config { .. })
+        ));
+        drop(pdata_tx);
+        match inbox.recv_when(false).await.expect("shutdown") {
+            Message::Control(NodeControlMsg::Shutdown {
+                deadline: released,
+                reason,
+            }) => {
+                assert_eq!(released, deadline);
+                assert_eq!(reason, "admin");
+            }
+            other => panic!("expected the latched shutdown, got {other:?}"),
+        }
+    }
+
     /// Scenario: Shutdown is latched while an exporter with admission closed
     /// still has buffered pdata, and the drain then ends on a closed pdata
     /// channel.
     /// Guarantees: the read-only accessor exposes the latched deadline while
-    /// the forced drain runs, and drain order is unchanged. The control
-    /// message that ends the drain is the inbox's own synthesized Shutdown,
-    /// which carries a different deadline, so an exporter that must bound the
-    /// completion work it still owes has to read the deadline from the
-    /// accessor during the drain rather than wait for the control message.
+    /// the forced drain runs, drain order is unchanged, and the drain ends on
+    /// the latched Shutdown with its own deadline and reason.
     #[tokio::test]
     async fn exporter_deadline_is_visible_during_forced_drain() {
         let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(2);
@@ -1391,8 +1488,8 @@ mod tests {
         drop(pdata_tx);
         assert!(matches!(
             inbox.recv_when(false).await.expect("shutdown control"),
-            Message::Control(NodeControlMsg::Shutdown { ref reason, .. })
-                if reason == "pdata channel closed"
+            Message::Control(NodeControlMsg::Shutdown { deadline: released, ref reason })
+                if released == deadline && reason == "test"
         ));
         assert_eq!(inbox.shutdown_deadline(), None);
     }

@@ -5129,6 +5129,107 @@ async fn shutdown_commits_both_blocks_before_deadline() {
         .await;
 }
 
+/// Scenario: shutdown latches a 60 s deadline while a block's write is
+/// parked, the node learns it from a force-drained request, and upstream drops
+/// its pdata sender while the node is taking a control message; the clock then
+/// moves past one second before the store heals.
+/// Guarantees: the closed pdata channel releases the latched Shutdown with its
+/// own deadline, so the flush is still awaited after that second and every
+/// request of the block is acknowledged, not nacked `NodeShutdown`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let node = tokio::task::spawn_local(super::run(
+                worker_config(),
+                store.clone(),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+
+            // Four requests fill a block, so the node rotates it and its write
+            // parks.
+            for _ in 0..4 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request of the block enqueues");
+            }
+            store.entered.notified().await;
+
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(60),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            // Force-drained behind the latched Shutdown, which is how the node
+            // learns the deadline and closes its admission.
+            marker(&pdata_tx, &mut rx, 99).await;
+
+            // The control message ends the node's current receive, so its next
+            // receive starts on a pdata channel that is already closed.
+            control_tx
+                .send_async(NodeControlMsg::Config {
+                    config: serde_json::json!({}),
+                })
+                .await
+                .expect("the config enqueues");
+            drop(pdata_tx);
+            until("the node is handed the Shutdown", || {
+                !events.named("series_parquet.shutdown").is_empty()
+            })
+            .await;
+            let shutdown = events.named("series_parquet.shutdown");
+            assert_eq!(
+                shutdown[0].fields.get("reason").map(FieldValue::text),
+                Some("test"),
+                "the node is handed the latched Shutdown"
+            );
+
+            sim.advance(Duration::from_secs(2));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            store
+                .mode
+                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.release.notify_waiters();
+
+            for _ in 0..4 {
+                assert!(
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                            .await
+                            .expect("a completion arrives")
+                            .expect("a completion arrives"),
+                        PipelineCompletionMsg::DeliverAck { .. }
+                    ),
+                    "a block flushed inside the latched deadline is acknowledged"
+                );
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            drop(control_tx);
+        })
+        .await;
+}
+
 /// Scenario: the real `SeriesParquet::start` future is aborted while a storage
 /// write is parked and will never return.
 /// Guarantees: cancellation drops the parked write and releases the block, the
@@ -5186,11 +5287,14 @@ async fn dropping_start_cancels_flush_task() {
 /// completion channel is already full and nothing will ever read it.
 /// Guarantees: every request still gets exactly one shutdown decision, each
 /// undeliverable decision is counted as a delivery failure rather than parked,
-/// and the node returns instead of waiting for completion credit.
+/// and the node returns at the latched deadline instead of waiting for
+/// completion credit.
 #[tokio::test(flavor = "current_thread")]
 async fn saturated_inbox_shutdown_stays_bounded() {
     tokio::task::LocalSet::new()
         .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
             let (pdata_tx, control_tx, inbox) = inbox(32);
             let (handler, _completion_rx) = effects(1);
             // One delivered completion is enough to fill the channel, so every
@@ -5227,6 +5331,7 @@ async fn saturated_inbox_shutdown_stays_bounded() {
                 .expect("the shutdown enqueues");
             drop(pdata_tx);
 
+            let _ticker = ticking(&sim, Duration::from_secs(1));
             let terminal = tokio::time::timeout(
                 Duration::from_secs(2),
                 super::run(
