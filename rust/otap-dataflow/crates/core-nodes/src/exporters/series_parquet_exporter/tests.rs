@@ -4301,39 +4301,39 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
 /// Guarantees: only a failure with a storage origin earns whole-block retries.
 #[test]
 fn retry_classifier_distinguishes_encoding_from_storage() {
-    assert!(!super::flush::retryable(&lake::Error::from(
+    assert!(!lake::Error::is_retryable(&lake::Error::from(
         parquet::errors::ParquetError::General("encoding bug".into())
     )));
-    assert!(super::flush::retryable(&lake::Error::from(
+    assert!(lake::Error::is_retryable(&lake::Error::from(
         object_store::Error::Generic {
             store: "test",
             source: Box::new(std::io::Error::other("offline")),
         }
     )));
-    assert!(super::flush::retryable(&lake::Error::from(
+    assert!(lake::Error::is_retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(object_store::Error::Generic {
             store: "test",
             source: Box::new(std::io::Error::other("offline")),
         }))
     )));
-    assert!(!super::flush::retryable(&lake::Error::cancelled(None)));
+    assert!(!lake::Error::is_retryable(&lake::Error::cancelled(None)));
     // Refused credentials and a missing bucket or prefix are storage errors
     // that no retry cures, however they are wrapped.
     let denied = || object_store::Error::PermissionDenied {
         path: "p".into(),
         source: "denied".into(),
     };
-    assert!(!super::flush::retryable(&lake::Error::from(denied())));
-    assert!(!super::flush::retryable(&lake::Error::from(
+    assert!(!lake::Error::is_retryable(&lake::Error::from(denied())));
+    assert!(!lake::Error::is_retryable(&lake::Error::from(
         object_store::Error::NotFound {
             path: "p".into(),
             source: "no such bucket".into(),
         }
     )));
-    assert!(!super::flush::retryable(&lake::Error::from(
+    assert!(!lake::Error::is_retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(std::io::Error::other(denied())))
     )));
-    assert!(!super::flush::retryable(&lake::Error::from(
+    assert!(!lake::Error::is_retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )))

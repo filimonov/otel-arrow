@@ -161,6 +161,49 @@ impl From<object_store::Error> for Error {
     }
 }
 
+/// Whether an object store failure can succeed on a retry of the same write.
+fn transient_store_error(error: &object_store::Error) -> bool {
+    !matches!(
+        error,
+        object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. }
+            | object_store::Error::NotFound { .. }
+    )
+}
+
+/// Whether an I/O failure can succeed on a retry of the same write.
+fn transient_io_error(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+    )
+}
+
+/// Whether an error or any of its sources came from storage or I/O, and the
+/// first such source is one a retry can cure.
+fn contains_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if let Some(store) = error.downcast_ref::<object_store::Error>() {
+            return transient_store_error(store);
+        }
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            // An I/O error that carries an object store error is classified
+            // by what the store said.
+            return match io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<object_store::Error>())
+            {
+                Some(store) => transient_store_error(store),
+                None => transient_io_error(io),
+            };
+        }
+        match error.source() {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
+
 /// Crate result.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -199,9 +242,141 @@ impl Error {
         Error::Transient(TransientError::Cancelled { abort_error })
     }
 
+    /// Whether a failed write may succeed if the identical block is written
+    /// again.
+    ///
+    /// Only a failure whose origin is the storage layer can: the bytes are
+    /// already encoded and the file names are frozen, so a second attempt
+    /// differs from the first in nothing but the destination's state. An
+    /// encoding failure would produce the same failure forever, and a
+    /// cancellation or an expired deadline is a decision that has already
+    /// been taken rather than a transient fault.
+    ///
+    /// The Parquet writer wraps whatever the object store returned, so the
+    /// storage origin of a Parquet error is found by walking its source chain
+    /// rather than by its own variant; this lives here, beside the wrapping,
+    /// so a change in how the sink wraps a storage error is caught by this
+    /// crate's own tests.
+    ///
+    /// A storage error that no retry can cure -- the credentials are refused,
+    /// or the bucket or prefix does not exist -- is not retryable either:
+    /// repeating it until a deadline would only delay the same failure and
+    /// hide it behind a timeout.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Error::Transient(TransientError::ObjectStore(e)) => transient_store_error(e),
+            Error::Internal(InternalError::Parquet(parquet::errors::ParquetError::External(
+                source,
+            ))) => contains_storage_error(source.as_ref()),
+            Error::Transient(TransientError::AbortFailed { source, .. }) => source.is_retryable(),
+            _ => false,
+        }
+    }
+
     /// Whether this is a cancelled write, whatever its cleanup did.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Error::Transient(TransientError::Cancelled { .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A storage failure a retry can cure.
+    fn offline() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("offline")),
+        }
+    }
+
+    /// A storage failure no retry cures.
+    fn denied() -> object_store::Error {
+        object_store::Error::PermissionDenied {
+            path: "p".into(),
+            source: "denied".into(),
+        }
+    }
+
+    /// Scenario: one error of every class and of every wrapping the sink
+    /// produces -- a direct object store error, one wrapped by the Parquet
+    /// writer directly or inside an I/O error, a failed abort around each,
+    /// an encoding failure, a cancellation, an expired deadline, an invariant
+    /// and a refusal -- is asked whether the identical write may be retried.
+    /// Guarantees: only a curable storage failure is retryable, however it is
+    /// wrapped; refused credentials and a missing bucket are not, nor is any
+    /// failure that is not storage, so a change in error wrapping cannot flip
+    /// whether a block is retried.
+    #[test]
+    fn only_a_curable_storage_failure_is_retryable() {
+        use parquet::errors::ParquetError;
+        let parquet = |source: Box<dyn std::error::Error + Send + Sync>| {
+            Error::from(ParquetError::External(source))
+        };
+        let aborted = |source: Error| {
+            Error::Transient(TransientError::AbortFailed {
+                source: Box::new(source),
+                abort_error: "timed out".into(),
+            })
+        };
+        let cases: Vec<(Error, bool)> = vec![
+            (Error::from(offline()), true),
+            (Error::from(denied()), false),
+            (
+                Error::from(object_store::Error::NotFound {
+                    path: "p".into(),
+                    source: "no such bucket".into(),
+                }),
+                false,
+            ),
+            (
+                Error::from(object_store::Error::Unauthenticated {
+                    path: "p".into(),
+                    source: "expired".into(),
+                }),
+                false,
+            ),
+            (parquet(Box::new(offline())), true),
+            (parquet(Box::new(std::io::Error::other(offline()))), true),
+            (parquet(Box::new(std::io::Error::other(denied()))), false),
+            (
+                parquet(Box::new(std::io::Error::other("disk hiccup"))),
+                true,
+            ),
+            (
+                parquet(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+                false,
+            ),
+            (parquet("encoder bug".into()), false),
+            (
+                Error::from(ParquetError::General("encoding bug".into())),
+                false,
+            ),
+            (aborted(Error::from(offline())), true),
+            (aborted(Error::from(denied())), false),
+            (aborted(Error::internal("encode")), false),
+            (Error::cancelled(None), false),
+            (
+                Error::Transient(TransientError::DeadlineExceeded {
+                    attempts: 3,
+                    last: Some(Box::new(Error::from(offline()))),
+                }),
+                false,
+            ),
+            (Error::internal("invariant"), false),
+            (
+                Error::from(arrow::error::ArrowError::ComputeError("x".into())),
+                false,
+            ),
+            (Error::Refused(RefuseReason::BlockFull), false),
+        ];
+        for (error, retryable) in &cases {
+            assert_eq!(error.is_retryable(), *retryable, "{error:?}");
+        }
     }
 }

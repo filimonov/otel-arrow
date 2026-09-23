@@ -88,78 +88,6 @@ pub(super) struct FlushDone {
     pub(super) attempts: u64,
 }
 
-/// Whether a failed write may be retried with the identical block.
-///
-/// Only a failure whose origin is the storage layer can succeed on a retry:
-/// the bytes are already encoded and the file names are frozen, so a second
-/// attempt differs from the first in nothing but the destination's state. An
-/// encoding failure would produce the same failure forever, and a cancellation
-/// is a decision that has already been taken rather than a transient fault.
-///
-/// The Parquet writer wraps whatever the object store returned, so the storage
-/// origin of a `Parquet` error is found by walking its source chain rather
-/// than by its own variant.
-///
-/// A storage error that no retry can cure -- the credentials are refused, or
-/// the bucket or prefix does not exist -- is not retried either: repeating it
-/// until the deadline would only delay the same failure by the whole deadline
-/// and hide it behind a timeout.
-pub(super) fn retryable(error: &lake::Error) -> bool {
-    match error {
-        lake::Error::Transient(lake::TransientError::ObjectStore(e)) => transient_store_error(e),
-        lake::Error::Internal(lake::InternalError::Parquet(
-            parquet::errors::ParquetError::External(source),
-        )) => contains_storage_error(source.as_ref()),
-        lake::Error::Transient(lake::TransientError::AbortFailed { source, .. }) => {
-            retryable(source)
-        }
-        _ => false,
-    }
-}
-
-/// Whether an object store failure can succeed on a retry of the same write.
-fn transient_store_error(error: &object_store::Error) -> bool {
-    !matches!(
-        error,
-        object_store::Error::PermissionDenied { .. }
-            | object_store::Error::Unauthenticated { .. }
-            | object_store::Error::NotFound { .. }
-    )
-}
-
-/// Whether an I/O failure can succeed on a retry of the same write.
-fn transient_io_error(error: &std::io::Error) -> bool {
-    !matches!(
-        error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-    )
-}
-
-/// Whether an error or any of its sources came from storage or I/O, and the
-/// first such source is one a retry can cure.
-fn contains_storage_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
-    loop {
-        if let Some(store) = error.downcast_ref::<object_store::Error>() {
-            return transient_store_error(store);
-        }
-        if let Some(io) = error.downcast_ref::<std::io::Error>() {
-            // An I/O error that carries an object store error is classified
-            // by what the store said.
-            return match io
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<object_store::Error>())
-            {
-                Some(store) => transient_store_error(store),
-                None => transient_io_error(io),
-            };
-        }
-        match error.source() {
-            Some(source) => error = source,
-            None => return false,
-        }
-    }
-}
-
 /// Write one sealed block, retrying storage failures until `deadline`.
 ///
 /// The write is polled before the cancellation and the deadline: a write that
@@ -295,7 +223,7 @@ async fn write_until(
                 return;
             }
             Err(error)
-                if retryable(&error) && clock::now() < deadline && !cancel.is_cancelled() =>
+                if error.is_retryable() && clock::now() < deadline && !cancel.is_cancelled() =>
             {
                 last = Some(error);
                 // Never past the deadline: the wait itself must not outlive
@@ -328,7 +256,7 @@ fn log_failed_attempt(attempt: u64, file: &str, error: &lake::Error) {
         "series_parquet.flush.attempt_failed",
         attempt = attempt,
         file = file,
-        retryable = retryable(error),
+        retryable = error.is_retryable(),
         error = %error
     );
 }
