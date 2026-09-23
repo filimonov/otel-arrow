@@ -647,6 +647,51 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     }
 }
 
+/// Scenario: OTLP logs requests whose record attribute value is an array, or
+/// a key-value list, holding a string with a byte that is not UTF-8 (`0xc3`).
+/// Guarantees: each passes the framing check but is refused permanently as
+/// undecodable, never admitted: the conversion encodes array and list values
+/// strictly, unlike a top-level string, which it stores with U+FFFD.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_utf8_inside_an_array_or_kvlist_value_is_refused_as_undecodable() {
+    let len_field = |field: u32, payload: &[u8]| {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    };
+    let invalid = len_field(1, b"caf\xc3");
+    let key_value = |key: &[u8], value: &[u8]| [len_field(1, key), len_field(2, value)].concat();
+    let array = len_field(5, &len_field(1, &invalid));
+    let kvlist = len_field(6, &len_field(1, &key_value(b"inner", &invalid)));
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (handler, _rx) = effects(2);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(worker_config(), store, wall, handler);
+    for (name, value) in [("array", array), ("kvlist", kvlist)] {
+        let mut record = vec![0x09];
+        record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+        record.extend(len_field(6, &key_value(b"tags", &value)));
+        let body = len_field(1, &len_field(2, &len_field(2, &record)));
+        let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+        let mut context = Context::default();
+        context.set_source_node(7);
+        match worker.prepare(OtapPdata::new(context, payload.into())) {
+            Prepared::Failed(_, failure) => {
+                assert_eq!(Outcome::of(&failure), Outcome::Invalid, "{name}");
+                let sentence = Outcome::explain(&failure);
+                assert!(
+                    sentence.starts_with("invalid request content: undecodable pdata"),
+                    "{name}: {sentence}"
+                );
+            }
+            Prepared::Ready(_) => panic!("{name}: invalid UTF-8 inside the value was admitted"),
+        }
+    }
+}
+
 /// Scenario: one metrics request carries a supported gauge point next to an
 /// unsupported summary point, under the default `unsupported: reject`.
 /// Guarantees: the whole request is refused as one permanent `unsupported`

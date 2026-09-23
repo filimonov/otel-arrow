@@ -1098,7 +1098,9 @@ become null; a negative converted timestamp becomes null and increments
   refused too, although protobuf allows it, because the byte views would
   store one occurrence where prost keeps another; the file, parquet and otap
   exporters accept it. String fields are not checked for UTF-8: invalid bytes
-  are stored as U+FFFD.
+  are stored as U+FFFD. Invalid UTF-8 inside an array or key-value list
+  attribute value is refused as undecodable instead, unlike a top-level
+  string, which is repaired.
 - Dictionary-encoded OTAP Arrow columns are read through their dictionary,
   never expanded first. Every attribute key and value is charged as it is
   read: one longer than `ingress.max_row_bytes`, or an attribute table whose
