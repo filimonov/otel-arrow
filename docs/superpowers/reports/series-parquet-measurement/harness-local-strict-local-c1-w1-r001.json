@@ -4,21 +4,21 @@
     {
       "kind": "engine_log",
       "name": "engine.log",
-      "retention": "/tmp/series-measure",
+      "retention": "<host-path>/series-measure",
       "sha256": "91d961d8a4b214a4302d2c521de7da9589d88a8b34b1c420ca114c78ea7e5f88",
       "size_bytes": 4657
     },
     {
       "kind": "engine_config",
       "name": "pipeline.yaml",
-      "retention": "/tmp/series-measure",
+      "retention": "<host-path>/series-measure",
       "sha256": "0eb2e59bbef607dcdd358b22a65a59c4f6bd6f589f02728bee09fdf966621073",
       "size_bytes": 2522
     },
     {
       "kind": "ledger",
       "name": "ledger.sqlite",
-      "retention": "/tmp/series-measure",
+      "retention": "<host-path>/series-measure",
       "sha256": "e1ba7ad6bac81d85d3ee21ff2966355bd8affda0e7b9fe88a7e50a8acea2a6fe",
       "size_bytes": 3330048
     }
@@ -78,7 +78,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
       "kind": "hard",
       "name": "host_lease_held",
       "status": "passed"
@@ -192,7 +192,7 @@
                     },
                     "storage": {
                       "file": {
-                        "base_uri": "/tmp/series-measure/engine-1/data"
+                        "base_uri": "<host-path>/data"
                       }
                     },
                     "unsupported": "reject",
@@ -274,7 +274,7 @@
   "environment": {
     "build": {
       "allocator": "jemalloc",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/df_engine",
+      "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
       "binary_sha256": "2b678bcb6715cb7dfeee683a724aa484a618685f25644bd3f180e81984f674f5",
       "binary_size_bytes": 762526208,
       "features": "default,series_parquet,aws,durable-buffer",
@@ -1177,7 +1177,7 @@
     "lease": {
       "acquired_utc": "2026-09-22T16:39:17Z",
       "owner": "3596730-50a8e0971d4e413aa11c69f75e957027",
-      "path": "/tmp/series-parquet-host-measurement.lock",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
       "pid": 3596730,
       "released_utc": "2026-09-22T16:39:24Z",
       "run_id": "harness-local-strict-local-c1-w1-r001"
@@ -2367,7 +2367,7 @@
     ]
   },
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
-  "run_dir": "/tmp/series-measure",
+  "run_dir": "<host-path>/series-measure",
   "run_files": [],
   "run_id": "harness-local-strict-local-c1-w1-r001",
   "samples": [

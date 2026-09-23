@@ -4,28 +4,28 @@
     {
       "kind": "criterion",
       "name": "estimates.json",
-      "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
+      "retention": "<host-path>/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
       "sha256": "b20c70823382ec40264012c64da1741dd343f0a4039dfd36985fc42803d149cd",
       "size_bytes": 800
     },
     {
       "kind": "criterion",
       "name": "sample.json",
-      "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
+      "retention": "<host-path>/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
       "sha256": "622defba116093d11713597e354fe29fe76c5e32f9fecdd2071bcb468af28570",
       "size_bytes": 644
     },
     {
       "kind": "criterion",
       "name": "benchmark.json",
-      "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
+      "retention": "<host-path>/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
       "sha256": "a306a0480fac26bc53a20bc071712ecb563a8324ac2089f59d83fff7320a4f82",
       "size_bytes": 220
     },
     {
       "kind": "layer_summary",
       "name": "layered-summary.json",
-      "retention": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
+      "retention": "<host-path>/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
       "sha256": "0db358c0094f3e731a64504aca49fc217a34c15a46efd0ba57ea7d09f2279d8f",
       "size_bytes": 1050
     }
@@ -58,7 +58,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
       "kind": "hard",
       "name": "host_lease_held",
       "status": "passed"
@@ -185,11 +185,11 @@
           "window_interval": "15s",
           "writer_id": "local-1"
         },
-        "scratch_dir": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001/scratch",
+        "scratch_dir": "<host-path>/scratch",
         "seal_at_us": 1789960500000000,
         "storage": {
           "file": {
-            "base_uri": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001/store"
+            "base_uri": "<host-path>/store"
           }
         },
         "window_start_secs": 1789960500,
@@ -222,7 +222,7 @@
   "environment": {
     "build": {
       "allocator": "system",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/deps/layered-7cbeaff2416095eb",
+      "binary": "<repo>/rust/otap-dataflow/target/release/deps/layered-7cbeaff2416095eb",
       "binary_sha256": "48f95aee9dc7bab077d56f7bccc296007a26adcda93ecd163af7cb10ee252b55",
       "binary_size_bytes": 26917456,
       "features": "default",
@@ -834,7 +834,7 @@
     "lease": {
       "acquired_utc": "2026-09-22T21:52:51Z",
       "owner": "3934142-f4c7b0d4d15e4ebda9de6e2a720b819d",
-      "path": "/tmp/series-parquet-host-measurement.lock",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
       "pid": 3934142,
       "released_utc": "2026-09-22T21:53:08Z",
       "run_id": "stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001"
@@ -1509,7 +1509,7 @@
   "profile": "criterion",
   "repetition": 1,
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
-  "run_dir": "/tmp/series-stages/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
+  "run_dir": "<host-path>/stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
   "run_files": [],
   "run_id": "stages-otlp_noop-criterion-logs-1k-stable-zstd-criterion-r001",
   "samples": [],

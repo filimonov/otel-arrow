@@ -4,21 +4,21 @@
     {
       "kind": "bench_report",
       "name": "bench-report.json",
-      "retention": "/tmp/series-stages/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
+      "retention": "<host-path>/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
       "sha256": "aa41f8250486e782b4e2df7e0ee070da580aa4db4fb7bd1fa3803368a25555a9",
       "size_bytes": 9529
     },
     {
       "kind": "bench_config",
       "name": "bench-config.json",
-      "retention": "/tmp/series-stages/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
+      "retention": "<host-path>/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
       "sha256": "dab39b9a34afb0506e10a769c608d673ad6b82e5850a28e1e54b21c18f281e67",
       "size_bytes": 2107
     },
     {
       "kind": "bench_log",
       "name": "bench.log",
-      "retention": "/tmp/series-stages/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
+      "retention": "<host-path>/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
       "sha256": "b21d2fb96c015e19086cb9cd2657cbbe1d36a3ccb03d1f4c24cc2f5175de0969",
       "size_bytes": 37
     }
@@ -51,7 +51,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
       "kind": "hard",
       "name": "host_lease_held",
       "status": "passed"
@@ -178,14 +178,14 @@
           "window_interval": "15s",
           "writer_id": "local-1"
         },
-        "scratch_dir": "/tmp/series-stages/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003/scratch",
+        "scratch_dir": "<host-path>/scratch",
         "seal_at_us": 1789960500000000,
         "storage": {
           "s3": {
             "allow_http": true,
             "auth": {
-              "access_key_id": "series-test-access",
-              "secret_access_key": "series-test-secret-12345",
+              "access_key_id": "<redacted>",
+              "secret_access_key": "<redacted>",
               "type": "static_credentials"
             },
             "base_uri": "s3://series-test/otel",
@@ -224,7 +224,7 @@
   "environment": {
     "build": {
       "allocator": "system",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/deps/measurement-8bac121a1ae33e80",
+      "binary": "<repo>/rust/otap-dataflow/target/release/deps/measurement-8bac121a1ae33e80",
       "binary_sha256": "5aaf2d70e6ba3b9071caae69f6b76b2bff89db59fd2d73b893d0c3f14807b702",
       "binary_size_bytes": 23612376,
       "features": "default",
@@ -1203,7 +1203,7 @@
     "lease": {
       "acquired_utc": "2026-09-22T22:02:34Z",
       "owner": "3934142-d9a4e084627e4a0aa71e5a16da8449bc",
-      "path": "/tmp/series-parquet-host-measurement.lock",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
       "pid": 3934142,
       "released_utc": "2026-09-22T22:02:37Z",
       "run_id": "stages-otlp_minio-async-metrics-mixed-zstd-timing-r003"
@@ -2492,7 +2492,7 @@
   "profile": "timing",
   "repetition": 3,
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
-  "run_dir": "/tmp/series-stages/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
+  "run_dir": "<host-path>/stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
   "run_files": [],
   "run_id": "stages-otlp_minio-async-metrics-mixed-zstd-timing-r003",
   "samples": [
