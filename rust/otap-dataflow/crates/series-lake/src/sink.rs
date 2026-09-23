@@ -992,6 +992,38 @@ impl Sink {
                     continue;
                 }
                 Ok(MergeStep::Chunk(c)) => c,
+                Ok(MergeStep::Ready) => {
+                    // Build the chunk's columns in bounded steps of their
+                    // own, returning to the runtime between every two.
+                    let built = {
+                        let mut builder = merge.chunk_builder();
+                        loop {
+                            match builder.step() {
+                                Ok(true) => break builder.finish(),
+                                Ok(false) => {}
+                                Err(e) => break Err(e),
+                            }
+                            workspace.set(
+                                merge.chunk_workspace_bytes() + builder.workspace_bytes(),
+                                writer.memory_size(),
+                            );
+                            tokio::task::yield_now().await;
+                            if cancel.is_cancelled() {
+                                break Err(self.cancelled_here(&mut cleanup));
+                            }
+                        }
+                    };
+                    match built {
+                        Ok(chunk) => {
+                            merge.chunk_taken();
+                            chunk
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
                 Err(e) => {
                     failure = Some(e);
                     break;
@@ -2589,6 +2621,13 @@ mod tests {
             let chunk = loop {
                 match merge.step().expect("step") {
                     MergeStep::Chunk(chunk) => break chunk,
+                    MergeStep::Ready => {
+                        let mut builder = merge.chunk_builder();
+                        while !builder.step().expect("build") {}
+                        let chunk = builder.finish().expect("chunk");
+                        merge.chunk_taken();
+                        break chunk;
+                    }
                     MergeStep::Progress => {}
                     MergeStep::Done => panic!("no chunk"),
                 }
