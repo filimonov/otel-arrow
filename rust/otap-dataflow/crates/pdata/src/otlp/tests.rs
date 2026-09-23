@@ -821,3 +821,53 @@ fn test_metric_exponential_histogram() {
 
     assert_eq!(m1, m1_value);
 }
+
+/// Scenario: an encoded logs request, the same bytes cut short inside a
+/// length-delimited field, an empty body, and a metrics and a traces body
+/// holding one field tag with no value.
+/// Guarantees: a well-formed or empty body passes, and each damaged body is
+/// refused as `InvalidProtobufWireFormat` whatever its signal, so an
+/// exporter can refuse a request the lazy conversion would silently empty.
+#[test]
+fn validate_framing_refuses_a_damaged_body() {
+    use crate::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+    use otel_arrow_dfe_config::SignalType;
+    use prost::Message as _;
+
+    let request = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let bytes = request.encode_to_vec();
+    let whole = super::OtlpProtoBytes::ExportLogsRequest(bytes.clone().into());
+    assert!(whole.validate_framing().is_ok());
+    assert!(
+        super::OtlpProtoBytes::empty(SignalType::Logs)
+            .validate_framing()
+            .is_ok()
+    );
+    let cut = super::OtlpProtoBytes::ExportLogsRequest(bytes[..bytes.len() - 1].to_vec().into());
+    assert!(matches!(
+        cut.validate_framing(),
+        Err(crate::error::Error::InvalidProtobufWireFormat)
+    ));
+    // Field 1, wire type 2 (length-delimited), with the length missing.
+    for signal in [SignalType::Metrics, SignalType::Traces] {
+        let damaged = super::OtlpProtoBytes::new_from_bytes(signal, vec![0x0a]);
+        assert!(
+            matches!(
+                damaged.validate_framing(),
+                Err(crate::error::Error::InvalidProtobufWireFormat)
+            ),
+            "{signal:?}"
+        );
+    }
+}

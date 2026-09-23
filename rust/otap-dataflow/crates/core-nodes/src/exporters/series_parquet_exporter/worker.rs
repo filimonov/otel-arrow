@@ -59,8 +59,6 @@ use otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
-use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
-use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_pdata::{OtapPayload, OtlpProtoBytes, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
@@ -619,16 +617,14 @@ impl Worker {
         let PayloadData::OtlpBytes(bytes) = payload.data() else {
             return Ok(());
         };
-        let (signal, framed) = match bytes {
-            OtlpProtoBytes::ExportLogsRequest(buf) => ("logs", RawLogsData::try_new(buf).map(drop)),
-            OtlpProtoBytes::ExportMetricsRequest(buf) => {
-                ("metrics", RawMetricsData::try_new(buf).map(drop))
-            }
+        let signal = match bytes {
+            OtlpProtoBytes::ExportLogsRequest(_) => "logs",
+            OtlpProtoBytes::ExportMetricsRequest(_) => "metrics",
             // Traces are decided by the signal check before this runs, so
             // there is no body to walk here.
             OtlpProtoBytes::ExportTracesRequest(_) => return Ok(()),
         };
-        framed.map_err(|error| {
+        bytes.validate_framing().map_err(|error| {
             Failure::Permanent(lake::Error::invalid(format!(
                 "malformed OTLP {signal} body: {error}"
             )))

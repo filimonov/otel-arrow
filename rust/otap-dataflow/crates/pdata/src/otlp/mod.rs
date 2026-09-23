@@ -108,6 +108,26 @@ impl OtlpProtoBytes {
     pub fn num_bytes(&self) -> usize {
         self.as_bytes().len()
     }
+
+    /// Validate the top-level protobuf wire framing of the request body.
+    ///
+    /// The byte views and the conversion to OTAP records read the body
+    /// lazily and report no error for a damaged one: a truncated or corrupt
+    /// request converts into a request carrying fewer rows, or none. An
+    /// exporter that must not acknowledge such a request as delivered calls
+    /// this first.
+    ///
+    /// Cost: one linear walk of the body with no allocation. Every field tag
+    /// is decoded and every length-delimited or fixed-width field is
+    /// bounds-checked against the end of the body; nested messages are not
+    /// decoded, so corruption inside a submessage is not detected here.
+    ///
+    /// # Errors
+    /// [`crate::error::Error::InvalidProtobufWireFormat`] when the framing is
+    /// broken.
+    pub fn validate_framing(&self) -> Result<()> {
+        crate::views::otlp::bytes::decode::validate_message_wire_format(self.as_bytes())
+    }
 }
 
 /// Trait for types that can convert OTAP arrow records into the OTLP proto bytes representation

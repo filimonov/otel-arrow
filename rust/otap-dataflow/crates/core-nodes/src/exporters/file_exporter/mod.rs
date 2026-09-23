@@ -371,20 +371,23 @@ fn encode_payload(
     frame.clear();
     match payload.data() {
         PayloadData::OtlpBytes(bytes) => match bytes {
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(_) => {
-                let view = RawLogsData::try_from(bytes)
+            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(buf) => {
+                bytes
+                    .validate_framing()
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_logs(&view, frame, max_frame_bytes)?;
+                encode_logs(&RawLogsData::new(buf), frame, max_frame_bytes)?;
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(bytes) => {
-                let view = RawMetricsData::try_new(bytes)
+            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(buf) => {
+                bytes
+                    .validate_framing()
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_metrics(&view, frame, max_frame_bytes)?;
+                encode_metrics(&RawMetricsData::new(buf), frame, max_frame_bytes)?;
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(bytes) => {
-                let view = RawTraceData::try_new(bytes)
+            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(buf) => {
+                bytes
+                    .validate_framing()
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_traces(&view, frame, max_frame_bytes)?;
+                encode_traces(&RawTraceData::new(buf), frame, max_frame_bytes)?;
             }
         },
         PayloadData::OtapArrowRecords(records) => match records.signal_type() {

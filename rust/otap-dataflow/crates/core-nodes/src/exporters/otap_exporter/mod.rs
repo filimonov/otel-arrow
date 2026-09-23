@@ -736,6 +736,28 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
 
                         let payload = pdata.take_payload();
 
+                        // The conversion reads an OTLP body lazily and reports
+                        // no error for a damaged one, so a truncated request
+                        // would be sent on as an empty or partial batch and
+                        // acknowledged. Refuse it permanently instead: the
+                        // identical bytes would fail again.
+                        if let otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) = payload.data()
+                            && let Err(error) = bytes.validate_framing()
+                        {
+                            self.metrics.record_failure(
+                                signal_type,
+                                OtapExporterErrorType::PayloadConversion,
+                                export_started_at.elapsed(),
+                            );
+                            effect_handler
+                                .notify_nack(NackMsg::new_permanent(
+                                    format!("malformed OTLP request body: {error}"),
+                                    pdata,
+                                ))
+                                .await?;
+                            continue;
+                        }
+
                         let message: OtapArrowRecords = match payload.try_into_with_default() {
                             Ok(m) => m,
                             Err(e) => {
@@ -2922,6 +2944,97 @@ mod tests {
                 Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)) as Self::ArrowLogsStream,
             ))
         }
+    }
+
+    /// Scenario: a logs request whose OTLP protobuf framing is broken reaches
+    /// the exporter, with no destination listening.
+    /// Guarantees: it is nacked permanently, naming the malformed body,
+    /// before any stream is used, so a damaged request is never converted
+    /// into an empty batch and acknowledged as exported.
+    #[test]
+    fn a_malformed_otlp_body_is_nacked_permanently() {
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let grpc_endpoint = format!("http://127.0.0.1:{grpc_port}");
+        let tokio_rt = Runtime::new().unwrap();
+
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(OTAP_EXPORTER_URN));
+        let controller_ctx = ControllerContext::new(TelemetryRegistryHandle::new());
+        let node_id = test_node(test_runtime.config().name.clone());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let mut exporter = ExporterWrapper::local(
+            OTAPExporter::from_config(
+                pipeline_ctx,
+                &json!({
+                    "grpc_endpoint": grpc_endpoint,
+                    "compression_method": "none",
+                    "streams_per_signal": 1,
+                    "stream_queue_capacity": 4
+                }),
+            )
+            .unwrap(),
+            node_id.clone(),
+            node_config,
+            test_runtime.config(),
+        );
+        let control_sender = exporter.control_sender();
+        let (pdata_tx, pdata_rx) = create_not_send_channel::<OtapPdata>(1);
+        let pdata_tx = Sender::Local(LocalSender::mpsc(pdata_tx));
+        let pdata_rx = Receiver::Local(LocalReceiver::mpsc(pdata_rx));
+        let (runtime_ctrl_msg_tx, _runtime_ctrl_msg_rx) = runtime_ctrl_msg_channel(16);
+        let (pipeline_completion_msg_tx, mut pipeline_completion_msg_rx) =
+            pipeline_completion_msg_channel(16);
+        exporter
+            .set_pdata_receiver(node_id.clone(), pdata_rx)
+            .expect("Failed to set PData Receiver");
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+
+        tokio_rt.block_on(async move {
+            let local_set = tokio::task::LocalSet::new();
+            let _exporter_fut = local_set.spawn_local(async move {
+                let _ = exporter
+                    .start(
+                        runtime_ctrl_msg_tx,
+                        pipeline_completion_msg_tx,
+                        metrics_reporter,
+                        Interests::empty(),
+                        otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
+                    )
+                    .await;
+            });
+            tokio::join!(local_set, async {
+                // Field 1, length-delimited, with the length missing.
+                let damaged =
+                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(vec![0x0a].into());
+                let pdata = OtapPdata::new_default(damaged.into()).test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    calldata_with_id(41),
+                    0,
+                );
+                pdata_tx.send(pdata).await.expect("send pdata");
+                let nack = match timeout(Duration::from_secs(5), pipeline_completion_msg_rx.recv())
+                    .await
+                    .expect("a completion for the malformed body")
+                {
+                    Ok(PipelineCompletionMsg::DeliverNack { nack }) => nack,
+                    Ok(PipelineCompletionMsg::DeliverAck { .. }) => {
+                        panic!("a malformed body must not be acknowledged")
+                    }
+                    Err(_) => panic!("pipeline result channel closed"),
+                };
+                assert!(nack.permanent, "{nack:?}");
+                assert!(nack.reason.contains("malformed OTLP"), "{}", nack.reason);
+                assert_eq!(calldata_id(&nack.refused), 41);
+                control_sender
+                    .send(NodeControlMsg::Shutdown {
+                        deadline: Instant::now().add(Duration::from_millis(10)),
+                        reason: "test done".into(),
+                    })
+                    .await
+                    .unwrap();
+            })
+        });
     }
 
     /// Scenario: Exporter shutdown races with an OTAP stream-open request after

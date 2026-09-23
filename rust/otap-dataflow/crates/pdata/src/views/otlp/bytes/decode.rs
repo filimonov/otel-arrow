@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::proto::consts::wire_types;
 
 /// Validates the wire framing of one protobuf message without decoding nested messages.
-pub(super) fn validate_message_wire_format(buf: &[u8]) -> Result<(), Error> {
+pub(crate) fn validate_message_wire_format(buf: &[u8]) -> Result<(), Error> {
     let mut pos = 0;
     while pos < buf.len() {
         let (tag, next) = read_varint(buf, pos).ok_or(Error::InvalidProtobufWireFormat)?;

@@ -306,6 +306,29 @@ impl Exporter<OtapPdata> for ParquetExporter {
                     // Note: context is not used
                     let (_context, payload) = pdata.into_parts();
 
+                    // The conversion reads an OTLP body lazily and reports no
+                    // error for a damaged one, so a truncated request would be
+                    // written as an empty or partial batch. Refuse it here,
+                    // counted as a failed export, instead.
+                    if let otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) = payload.data()
+                        && let Err(error) = bytes.validate_framing()
+                    {
+                        if let Some(metrics) = self.pdata_metrics.as_mut() {
+                            metrics
+                                .with(SignalOutcomeAttributes {
+                                    signal: signal_type,
+                                    outcome: Outcome::Failure,
+                                })
+                                .record(export_start.elapsed());
+                        }
+                        otel_warn!(
+                            "parquet.exporter.malformed_otlp_body",
+                            error = %error,
+                            message = "dropped an OTLP request whose protobuf framing is broken"
+                        );
+                        continue;
+                    }
+
                     let mut otap_batch: OtapArrowRecords =
                         payload.try_into_with_default().inspect_err(|_| {
                             if let Some(metrics) = self.pdata_metrics.as_mut() {
@@ -957,6 +980,104 @@ mod test {
                     ] {
                         assert_parquet_file_has_rows(&base_dir, payload_type, num_rows).await;
                     }
+                })
+            });
+    }
+
+    /// Scenario: a logs request whose OTLP protobuf framing is cut short
+    /// reaches the exporter, followed by a valid logs batch.
+    /// Guarantees: the damaged request is refused rather than converted into
+    /// an empty batch, the exporter keeps running, and only the valid
+    /// batch's rows are written.
+    #[test]
+    fn a_malformed_otlp_body_is_not_written() {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_dir: String = temp_dir.path().to_str().unwrap().into();
+        let exporter = ParquetExporter::new(config::Config {
+            storage: object_store::StorageType::File {
+                base_uri: base_dir.clone(),
+            },
+            retry: None,
+            partitioning_strategies: None,
+            writer_options: None,
+        });
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(PARQUET_EXPORTER_URN));
+        let exporter = ExporterWrapper::<OtapPdata>::local::<ParquetExporter>(
+            exporter,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+        let num_rows = 7;
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(move |ctx| {
+                Box::pin(async move {
+                    // Three well-formed records, then a field tag whose
+                    // length is missing: the lazy conversion alone would
+                    // still read the three records.
+                    let mut body = prost::Message::encode_to_vec(
+                        &otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest {
+                            resource_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ResourceLogs {
+                                scope_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ScopeLogs {
+                                    log_records: vec![
+                                        otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord {
+                                            time_unix_nano: 1,
+                                            ..Default::default()
+                                        };
+                                        3
+                                    ],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        },
+                    );
+                    body.push(0x0a);
+                    let damaged =
+                        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                    ctx.send_pdata(OtapPdata::new_default(damaged.into()))
+                        .await
+                        .expect("send the damaged request");
+                    let mut consumer = Consumer::default();
+                    let otap_batch = consumer
+                        .consume_bar(&mut fixtures::create_simple_logs_arrow_record_batches(
+                            SimpleDataGenOptions {
+                                num_rows,
+                                ..Default::default()
+                            },
+                        ))
+                        .unwrap();
+                    ctx.send_pdata(OtapPdata::new_default(
+                        OtapArrowRecords::Logs(from_record_messages(otap_batch).unwrap()).into(),
+                    ))
+                    .await
+                    .expect("send the valid batch");
+                    ctx.send_shutdown(Instant::now().add(Duration::from_secs(1)), "done")
+                        .await
+                        .unwrap();
+                })
+            })
+            .run_validation(move |_ctx, exporter_result| {
+                Box::pin(async move {
+                    exporter_result.unwrap();
+                    let mut rows = 0;
+                    let mut dir = tokio::fs::read_dir(format!("{base_dir}/logs"))
+                        .await
+                        .expect("a logs table");
+                    while let Some(entry) = dir.next_entry().await.expect("read dir") {
+                        let file = File::open(entry.path()).await.unwrap();
+                        let mut reader = ParquetRecordBatchStreamBuilder::new(file)
+                            .await
+                            .unwrap()
+                            .build()
+                            .unwrap();
+                        while let Some(batch) = reader.next().await {
+                            rows += batch.unwrap().num_rows();
+                        }
+                    }
+                    assert_eq!(rows, num_rows, "only the valid batch is written");
                 })
             });
     }
