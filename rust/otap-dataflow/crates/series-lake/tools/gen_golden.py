@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Independent implementation of canonical encoding v1 (spec section 4).
+"""Independent implementations of the series lake format's golden vectors.
 
-Generates tests/golden/canonical_v1.json. Requires: pip install xxhash
+Written from docs/FORMAT.md, not from the Rust code:
+
+- canonical_v1.json: canonical identity encoding v1 and series ids (section 1).
+- schema_fingerprint_v1.json: the schema rendering and schema_fingerprint of
+  every dataset plus one denormalized schema (section 3).
+- render_v1.json: the attribute-map and log-body strings render_v1 produces
+  (section 2), including the non-finite double and base64 bytes spellings.
+
+Usage: gen_golden.py <golden directory>   (normally tests/golden)
+Requires: pip install xxhash
 """
-import json, struct, sys
+import base64, json, math, os, struct, sys
 import xxhash
 
 TAG = dict(str=1, bytes=2, int=3, double=4, bool=5, null=6, array=7, kvlist=8)
@@ -141,13 +150,196 @@ cases = [
     ("schema_urls", {**base_logs, "resource_schema_url": "https://r", "scope_schema_url": "https://s"}),
 ]
 
+
+# Schema fingerprint (FORMAT.md section 3). Each dataset is listed as
+# (name, type, nullable) straight from the column tables of section 2, with the
+# type already spelled in the series-lake-schema/1 vocabulary.
+SCHEMA_HEADER = "series-lake-schema/1"
+TS = "Ts<us,UTC>"
+MAP = "Map<Str!,Str?>"
+SERIES_COMMON = [
+    ("series_id", "FSB<16>", False),
+    ("identity_bytes", "Bin", False),
+    ("emitted_at", TS, False),
+    ("resource_schema_url", "Str", False),
+    ("resource_attrs", MAP, False),
+    ("scope_name", "Str", False),
+    ("scope_version", "Str", False),
+    ("scope_schema_url", "Str", False),
+    ("scope_attrs", MAP, False),
+    ("attrs", MAP, False),
+]
+DATASETS = {
+    "logs/series": SERIES_COMMON,
+    "logs/values": [
+        ("series_id", "FSB<16>", False),
+        ("producer_id", "Str", False),
+        ("time", TS, True),
+        ("time_unix_nano", "I64", True),
+        ("observed_time", TS, True),
+        ("observed_time_unix_nano", "I64", True),
+        ("severity_number", "I32", False),
+        ("severity_text", "Str", False),
+        ("body", "Str", True),
+        ("event_name", "Str", False),
+        ("trace_id", "FSB<16>", True),
+        ("span_id", "FSB<8>", True),
+        ("flags", "I32", False),
+        ("attrs", MAP, False),
+    ],
+    "metrics/series": SERIES_COMMON + [
+        ("metric_name", "Str", False),
+        ("unit", "Str", False),
+        ("metric_type", "Str", False),
+        ("temporality", "Str", False),
+        ("is_monotonic", "Bol", False),
+        ("description", "Str", False),
+    ],
+    "metrics/values": [
+        ("series_id", "FSB<16>", False),
+        ("producer_id", "Str", False),
+        ("metric_name", "Str", False),
+        ("time", TS, True),
+        ("time_unix_nano", "I64", True),
+        ("start_time", TS, True),
+        ("start_time_unix_nano", "I64", True),
+        ("flags", "I32", False),
+        ("value_int", "I64", True),
+        ("value_double", "F64", True),
+        ("count", "I64", True),
+        ("sum", "F64", True),
+        ("min", "F64", True),
+        ("max", "F64", True),
+        ("bucket_counts", "[I64!]", True),
+        ("explicit_bounds", "[F64!]", True),
+    ],
+}
+# Denormalized columns are appended after the intrinsic ones, always nullable.
+DENORM_TYPE = {"string": "Str", "int64": "I64", "double": "F64", "bool": "Bol"}
+DENORMALIZED = [
+    {"path": "resource.service.name", "column": "service_name", "type": "string"},
+    {"path": "attrs.http.status_code", "column": "http_status_code", "type": "int64"},
+    {"path": "attrs.latency", "column": "latency", "type": "double"},
+    {"path": "attrs.cached", "column": "cached", "type": "bool"},
+]
+
+
+def schema_rendering(fields):
+    out = SCHEMA_HEADER + "\n"
+    for name, ty, nullable in fields:
+        ty = ty + ("?" if nullable else "!")
+        out += "%d:%s%d:%s\n" % (len(name.encode("utf-8")), name, len(ty.encode("utf-8")), ty)
+    return out
+
+
+schemas = []
+for dataset, fields in DATASETS.items():
+    schemas.append({"name": dataset, "dataset": dataset, "logs_denormalize": [], "fields": fields})
+schemas.append({
+    "name": "logs/values+denormalized", "dataset": "logs/values",
+    "logs_denormalize": DENORMALIZED,
+    # Every path is outside the series identity except the resource one, but
+    # a values dataset carries every denormalized column (section 3).
+    "fields": DATASETS["logs/values"] + [(d["column"], DENORM_TYPE[d["type"]], True) for d in DENORMALIZED],
+})
+schema_vectors = []
+for sch in schemas:
+    rendering = schema_rendering(sch["fields"])
+    schema_vectors.append({
+        "name": sch["name"], "dataset": sch["dataset"],
+        "logs_denormalize": sch["logs_denormalize"],
+        "rendering": rendering,
+        "fingerprint": "%016x" % xxhash.xxh3_64_intdigest(rendering.encode("utf-8")),
+    })
+
+
+# render_v1 (FORMAT.md section 2): the spellings of the workspace OTLP JSON
+# encoder for non-finite doubles and bytes.
+def double_of(v):
+    if "bits" in v:
+        return struct.unpack(">d", struct.pack(">Q", v["bits"]))[0]
+    return v["value"]
+
+
+def render_v1(v):
+    t = v["type"]
+    if t == "null":
+        return None
+    if t == "str":
+        return v["value"]
+    if t == "bytes":
+        return base64.standard_b64encode(bytes.fromhex(v["value"])).decode("ascii")
+    if t == "int":
+        return v["value"]
+    if t == "double":
+        d = double_of(v)
+        if math.isnan(d):
+            return "NaN"
+        if d == math.inf:
+            return "Infinity"
+        if d == -math.inf:
+            return "-Infinity"
+        return d
+    if t == "bool":
+        return v["value"]
+    if t == "array":
+        return [render_v1(i) for i in v["items"]]
+    if t == "kvlist":
+        entries = sorted(v["entries"], key=lambda e: e["key"].encode("utf-8"))
+        return {e["key"]: render_v1(e["value"]) for e in entries}
+    raise ValueError(t)
+
+
+def map_value(v):
+    """Attribute-map cell and log body: raw string, SQL null, or compact JSON."""
+    if v["type"] == "null":
+        return None
+    if v["type"] == "str":
+        return v["value"]
+    return json.dumps(render_v1(v), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+render_cases = [
+    ("str_raw", S("hello")),
+    ("str_with_quote_is_raw", S('a"b')),
+    ("null_is_sql_null", NULL),
+    ("int_42", I(42)),
+    ("int_min", I(-2**63)),
+    ("double_finite", D(1.5)),
+    ("double_integral_keeps_fraction", D(3.0)),
+    ("double_neg_zero", DB(0x8000000000000000)),
+    ("double_nan_quiet", DB(0x7FF8000000000000)),
+    ("double_nan_payload", DB(0x7FF8000000000001)),
+    ("double_pos_inf", DB(0x7FF0000000000000)),
+    ("double_neg_inf", DB(0xFFF0000000000000)),
+    ("bool_true", BOOL(True)),
+    ("bytes_empty", B("")),
+    ("bytes_one_padded_twice", B("ab")),
+    ("bytes_two_padded_once", B("ab12")),
+    ("bytes_three_unpadded", B("00ff10")),
+    ("bytes_standard_alphabet", B("fbff")),
+    ("array_nested_spellings", ARR(DB(0x7FF0000000000000), DB(0xFFF0000000000000), DB(0x7FF8000000000000),
+                                   B("ff"), NULL, S("x\ny"), I(1))),
+    ("kvlist_sorted_keys", KV(kv("b", B("0102")), kv("a", KV(kv("z", BOOL(False)))), kv("\u00e9", S("\u4e2d")))),
+]
+render_vectors = [{"name": n, "value": v, "map_value": map_value(v)} for n, v in render_cases]
+
+def dump(name, doc, ensure_ascii):
+    with open(os.path.join(sys.argv[1], name), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1, ensure_ascii=ensure_ascii, allow_nan=False)
+        fh.write("\n")
+
+
 vectors = []
 for name, d in cases:
     b = canonical(d)
     vectors.append({"name": name, "descriptor": d, "canonical_hex": b.hex(),
                     "series_id_hex": xxhash.xxh3_128_hexdigest(b)})
-with open(sys.argv[1], "w", encoding="utf-8") as fh:
-    json.dump({"format": "canonical_v1", "vectors": vectors}, fh,
-              indent=1, ensure_ascii=False, allow_nan=False)
-    fh.write("\n")
-print(f"wrote {len(vectors)} vectors")
+# canonical_v1.json keeps its original non-escaped spelling of the Unicode
+# vectors, so regenerating it leaves the file byte-identical.
+dump("canonical_v1.json", {"format": "canonical_v1", "vectors": vectors}, ensure_ascii=False)
+dump("schema_fingerprint_v1.json",
+     {"format": "series-lake-schema/1", "vectors": schema_vectors}, ensure_ascii=True)
+dump("render_v1.json", {"format": "render_v1", "vectors": render_vectors}, ensure_ascii=True)
+print(f"wrote {len(vectors)} canonical vectors, {len(schema_vectors)} schema vectors, "
+      f"{len(render_vectors)} render vectors")
