@@ -30,7 +30,9 @@ use super::{
     timestamp_pair,
 };
 use crate::attrs::AttrTable;
-use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
+use crate::canonical::{
+    Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_double_bits,
+};
 use crate::config::{LakeConfig, UnsupportedPolicy};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, denorm_columns};
@@ -64,9 +66,11 @@ struct MetricRow {
 /// never hit. The attribute list is borrowed from the point kind's attribute
 /// table, which lives as long as that kind's loop, so the memo is one per
 /// point kind. A metric has exactly one kind, so no series spans the two
-/// memos. Equality is the list's own equality, so a hash collision can never
-/// merge two series; a list with a NaN double never equals itself and only
-/// misses the memo, which the `seen` check below still deduplicates.
+/// memos. Equality and hashing both compare doubles by
+/// [`canonical_double_bits`], the bits the canonical encoding writes, so two
+/// lists are one key exactly when they encode to the same identity: `0.0`
+/// and `-0.0` are one key, every NaN is one key and equals itself, and a hash
+/// collision can never merge two series because equality is exact.
 #[derive(Debug, Clone, Copy)]
 struct MemoKey<'t> {
     metric_id: u32,
@@ -75,7 +79,36 @@ struct MemoKey<'t> {
 
 impl PartialEq for MemoKey<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.metric_id == other.metric_id && self.attrs == other.attrs
+        self.metric_id == other.metric_id && kv_eq(self.attrs, other.attrs)
+    }
+}
+
+/// Attribute lists equal under the canonical encoding's value rules.
+fn kv_eq(a: &[(String, Value)], b: &[(String, Value)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|((ka, va), (kb, vb))| ka == kb && value_eq(va, vb))
+}
+
+/// Values equal under the canonical encoding's value rules: doubles by
+/// [`canonical_double_bits`], so the relation is reflexive for NaN and
+/// treats both zeros as one value, exactly as [`hash_value`] hashes them.
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Bytes(x), Value::Bytes(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Double(x), Value::Double(y)) => {
+            canonical_double_bits(*x) == canonical_double_bits(*y)
+        }
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q))
+        }
+        (Value::KvList(x), Value::KvList(y)) => kv_eq(x, y),
+        _ => false,
     }
 }
 
@@ -92,9 +125,8 @@ impl std::hash::Hash for MemoKey<'_> {
     }
 }
 
-/// Hash one attribute value consistently with its `PartialEq`: equal values
-/// hash alike (a double by its bits, which only splits `0.0` from `-0.0` into
-/// two memo entries of one series).
+/// Hash one attribute value consistently with [`value_eq`]: equal values hash
+/// alike, a double by its canonical bits.
 fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
     use std::hash::Hash;
     match value {
@@ -113,7 +145,7 @@ fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
         }
         Value::Double(d) => {
             4_u8.hash(state);
-            d.to_bits().hash(state);
+            canonical_double_bits(*d).hash(state);
         }
         Value::Bool(b) => {
             5_u8.hash(state);
@@ -1493,5 +1525,130 @@ mod tests {
                 .all(|row| std::sync::Arc::ptr_eq(&row.descriptor.resource_attrs, resource)),
             "every descriptor holds the one shared resource list"
         );
+    }
+
+    fn kvd(k: &str, v: f64) -> KeyValue {
+        KeyValue {
+            key: k.into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::DoubleValue(v)),
+            }),
+        }
+    }
+
+    /// Scenario: memo keys built from attribute lists holding `0.0` and
+    /// `-0.0`, two NaNs with different bit patterns, and a NaN nested in an
+    /// array, compared and hashed with the map's own hasher.
+    /// Guarantees: keys the canonical encoding cannot tell apart are equal
+    /// and hash alike, a NaN key equals itself, and a key with a different
+    /// value is not equal, so the memo honours the `Eq`/`Hash` contract.
+    #[test]
+    fn memo_keys_follow_the_canonical_double_rules() {
+        use std::hash::BuildHasher;
+        let hasher = std::collections::hash_map::RandomState::new();
+        let list = |v: Value| vec![("x".to_owned(), v)];
+        let pairs = [
+            (Value::Double(0.0), Value::Double(-0.0)),
+            (
+                Value::Double(f64::NAN),
+                Value::Double(f64::from_bits(0xFFF8_0000_0000_0001)),
+            ),
+            (
+                Value::Array(vec![Value::Double(f64::NAN)]),
+                Value::Array(vec![Value::Double(-f64::NAN)]),
+            ),
+        ];
+        for (a, b) in pairs {
+            let (la, lb) = (list(a), list(b));
+            let (ka, kb) = (
+                MemoKey {
+                    metric_id: 1,
+                    attrs: &la,
+                },
+                MemoKey {
+                    metric_id: 1,
+                    attrs: &lb,
+                },
+            );
+            assert!(ka == ka, "a key equals itself: {la:?}");
+            assert!(ka == kb, "{la:?} and {lb:?} encode alike");
+            assert_eq!(hasher.hash_one(ka), hasher.hash_one(kb), "{la:?}");
+            assert_eq!(
+                crate::canonical::canonical_bytes(&Descriptor {
+                    signal: Signal::Logs,
+                    resource_attrs: std::sync::Arc::from([]),
+                    resource_schema_url: String::new(),
+                    scope_name: String::new(),
+                    scope_version: String::new(),
+                    scope_schema_url: String::new(),
+                    scope_attrs: std::sync::Arc::from([]),
+                    metric: None,
+                    attrs: la.clone(),
+                }),
+                crate::canonical::canonical_bytes(&Descriptor {
+                    signal: Signal::Logs,
+                    resource_attrs: std::sync::Arc::from([]),
+                    resource_schema_url: String::new(),
+                    scope_name: String::new(),
+                    scope_version: String::new(),
+                    scope_schema_url: String::new(),
+                    scope_attrs: std::sync::Arc::from([]),
+                    metric: None,
+                    attrs: lb.clone(),
+                }),
+                "the premise: the canonical encoding cannot tell them apart"
+            );
+        }
+        let (one, two) = (list(Value::Double(1.0)), list(Value::Double(2.0)));
+        assert!(
+            MemoKey {
+                metric_id: 1,
+                attrs: &one
+            } != MemoKey {
+                metric_id: 1,
+                attrs: &two
+            }
+        );
+    }
+
+    /// Scenario: one gauge with six points whose only attribute is a double:
+    /// `0.0`, `-0.0`, NaN, a NaN with other bits, `1.5` and `1.5` again.
+    /// Guarantees: the memo answers every point whose value encodes like an
+    /// earlier one, so the memo misses equal the distinct canonical series
+    /// (three) and every other point is a hit.
+    #[test]
+    fn signed_zero_and_nan_attributes_hit_the_memo() {
+        let values = [
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::from_bits(0xFFF8_0000_0000_0001),
+            1.5,
+            1.5,
+        ];
+        let d = data(vec![Metric {
+            name: "g".into(),
+            data: Some(metric::Data::Gauge(Gauge {
+                data_points: values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        dp(
+                            10 + i as u64,
+                            number_data_point::Value::AsInt(1),
+                            vec![kvd("x", *v)],
+                        )
+                    })
+                    .collect(),
+            })),
+            ..Default::default()
+        }]);
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&encode_metrics(&d), &cfg, &mut budget).expect("extract");
+        assert_eq!(out.stats.rows, 6);
+        assert_eq!(out.descriptors.len(), 3, "three distinct canonical series");
+        assert_eq!(out.stats.series_memo_misses, 3);
+        assert_eq!(out.stats.series_memo_hits, 3);
     }
 }

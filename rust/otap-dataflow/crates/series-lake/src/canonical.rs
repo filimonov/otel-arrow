@@ -144,6 +144,26 @@ const TAG_ARRAY: u8 = 0x07;
 const TAG_KVLIST: u8 = 0x08;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
+/// The bits a double is identified by.
+///
+/// Two normalizations, both so that an identity never depends on a bit
+/// pattern the transport cannot carry: every NaN collapses to the canonical
+/// quiet NaN, and -0.0 collapses to +0.0. OTAP drops a value column whose
+/// entries are all zero, so the sign of a zero does not survive conversion
+/// and an identity that depended on it would change with request batching.
+/// Anything that compares or hashes values as series identity uses these
+/// bits, so it agrees with the canonical encoding exactly.
+#[must_use]
+pub(crate) fn canonical_double_bits(d: f64) -> u64 {
+    if d.is_nan() {
+        CANONICAL_NAN
+    } else if d == 0.0 {
+        0
+    } else {
+        d.to_bits()
+    }
+}
+
 fn put(out: &mut Vec<u8>, tag: u8, payload: &[u8]) {
     out.push(tag);
     out.extend((payload.len() as u32).to_be_bytes());
@@ -161,20 +181,7 @@ fn encode_value(out: &mut Vec<u8>, v: &Value) {
         Value::Bytes(b) => put(out, TAG_BYTES, b),
         Value::Int(i) => put(out, TAG_INT, &i.to_be_bytes()),
         Value::Double(d) => {
-            // Two normalizations, both so that an identity never depends on a
-            // bit pattern the transport cannot carry: every NaN collapses to the
-            // canonical quiet NaN, and -0.0 collapses to +0.0. OTAP drops a
-            // value column whose entries are all zero, so the sign of a zero
-            // does not survive conversion and an identity that depended on it
-            // would change with request batching.
-            let bits = if d.is_nan() {
-                CANONICAL_NAN
-            } else if *d == 0.0 {
-                0
-            } else {
-                d.to_bits()
-            };
-            put(out, TAG_DOUBLE, &bits.to_be_bytes());
+            put(out, TAG_DOUBLE, &canonical_double_bits(*d).to_be_bytes());
         }
         Value::Bool(b) => put(out, TAG_BOOL, &[u8::from(*b)]),
         Value::Array(items) => {
