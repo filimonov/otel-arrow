@@ -1,6 +1,6 @@
 # Task 6 report: retained memory, transients and the RSS residual
 
-Worktree: `/home/mfilimonov/workspace/otel-arrow/.claude/worktrees/agent-a3dc6950c02333ef6`, branch
+Worktree: `<repo>/.claude/worktrees/agent-a3dc6950c02333ef6`, branch
 `worktree-agent-a3dc6950c02333ef6`. The worktree was created from `main`, so I reset it to `936ace03a` first.
 This report sits in the session scratchpad. Worktree isolation refused writes to the main-checkout path
 `.superpowers/sdd/2026-09-22-series-parquet-measurement/task-6-report.md`; copy it there.
@@ -245,7 +245,7 @@ Published and committed in `docs/superpowers/reports/series-parquet-measurement/
 - the three `*-bgthread.json` indexes;
 - every pair and aggregate, and the one baseline.
 
-The raw artifacts, without Parquet, are in `/home/mfilimonov/workspace/otel-arrow/.measurement-artifacts/`: `memory-raw-20260923-default.tgz`, `memory-raw-20260923-bgthread-env.tgz` and `memory-raw-20260923-default-bgthread.tgz`. I deleted the `/tmp` output.
+The raw artifacts, without Parquet, are in `<repo>/.measurement-artifacts/`: `memory-raw-20260923-default.tgz`, `memory-raw-20260923-bgthread-env.tgz` and `memory-raw-20260923-default-bgthread.tgz`. I deleted the `/tmp` output.
 
 ## Concerns
 

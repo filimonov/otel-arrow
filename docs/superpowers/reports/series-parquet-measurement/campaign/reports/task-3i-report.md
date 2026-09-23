@@ -26,6 +26,9 @@ In history order:
 | 4980383c1 | fix round 1, item 3 follow-up: the cleanup deadline is taken where the cancellation is observed. |
 | 545c9f038 | bench: the probe removes a write's store directory best effort. |
 | 2f78bf190 | evidence: flush-stall re-measured with the fixed probe; README figures. |
+| 07b3a5206 | fix round 2, item 2: the build's live key figure includes the heap and every run's owned key. |
+| 8d5be48eb | fix round 2, item 1: chunk columns built in place by a `ChunkBuilder` over `MutableArrayData`, at most a step's budget copied per step. |
+| f8867b32b | evidence: flush-stall on the changed build; README step description and figures. |
 
 ## 1. Measure first: the flush-stall probe
 
@@ -512,3 +515,52 @@ Final gates at 2f78bf190 (HEAD after fix round 1), under the lease:
   engine rebuilt at HEAD.
 - Targeted tests: series-lake 166 lib tests plus fuzz, golden, round trip
   and oracle; core-nodes `series_parquet` 99; clippy `-D warnings` clean.
+
+## Fix round 2
+
+The scoped re-review confirmed items 2 to 5 and both minors, and found two
+points open.
+
+1. **A sliced column was concatenated in one step** (8d5be48eb).
+   - `MergeIter::step` now only pops rows. It returns `Ready` once a
+     chunk's rows are popped, recorded as runs of consecutive rows of one
+     input run.
+   - A `ChunkBuilder` borrows the merge and builds each column in a
+     `MutableArrayData` over the runs' column data. The build collects
+     that data run by run, so `finish()` stays constant.
+   - Each column is sized first: a string or binary column's value bytes
+     and a list's items are counted a bounded number of ranges per step.
+     Then at most `MERGE_STEP_ROWS` rows are copied per step.
+   - Completing a column freezes its buffer as it is.
+   - A map's entry buffers grow as they fill; arrow's `Capacities` cannot
+     presize a map's children. That amortizes to one extra copy of the
+     map's entries per chunk.
+   - The sink yields, checks the token and publishes the builder's
+     workspace between builder steps.
+   - `one_merge_step_does_bounded_work` counts rows copied per builder
+     step, the completing step included, and requires every row of every
+     column copied exactly once (214 rows by 3 columns).
+2. **The live key figure undercounted during the build** (07b3a5206).
+   `MergeBuild::resident_key_bytes()` now adds every seeded run's owned
+   key and the heap's allocation to the segments, still in constant time.
+   The test asserts that full figure against a recount at every slice.
+
+The changed build, probe source 8d5be48eb, 7 uncancelled and 20 cancelled
+writes per fixture. The before side stays round 1's.
+
+| Fixture | Longest stretch | Worst observation | Whole-flush CPU median, before to after |
+| --- | --- | --- | --- |
+| logs-1k-stable | 27.7 ms on the cold first write, 23.3 to 24.5 ms on the other six | 21.4 ms | 458.8 to 446.1 ms |
+| metrics-mixed | 21.0 ms | 19.8 ms | 133.9 to 135.4 ms |
+| logs-8k-churn-wide | 19.1 ms | 13.3 ms | 579.3 to 483.1 ms |
+| logs-512k-near-limit | 19.1 ms | 13.4 ms | 604.0 to 569.9 ms |
+
+- All 8 files are byte-identical to the committed pre-task manifest
+  (`flush-stall/files-head-8d5be48eb.sha256`).
+- Copying runs of consecutive rows instead of gathering row by row lowered
+  the CPU on the logs fixtures. metrics-mixed is 1.1 percent above, within
+  its range.
+- Tests: series-lake 166 lib plus fuzz, golden, round trip and oracle;
+  core-nodes `series_parquet` 99; clippy `-D warnings` clean.
+
+@@GATES3@@

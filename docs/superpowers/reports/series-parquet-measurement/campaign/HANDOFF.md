@@ -4,7 +4,7 @@ Read this first, then `progress.md` in this directory (the ledger, append-only),
 
 ## Where the work is
 
-- Repo /home/mfilimonov/workspace/otel-arrow, branch `series-parquet-exporter`. Fork remote `filimonov` has the branch up to 69d5b8eea. No PRs, ever, unless the user asks.
+- Repo <repo>, branch `series-parquet-exporter`. Fork remote `filimonov` has the branch up to 69d5b8eea. No PRs, ever, unless the user asks.
 - Spec (authority): docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md, revision 7.
 - Plan 2 (exporter): docs/superpowers/plans/2026-09-21-series-parquet-exporter-node.md -- COMPLETE, all tasks reviewed.
 - Plan 3 (measurement and failure models): docs/superpowers/plans/2026-09-22-series-parquet-measurement.md, 14 tasks.
@@ -20,7 +20,8 @@ Read this first, then `progress.md` in this directory (the ledger, append-only),
 ## Process that must continue
 
 - Subagent-driven: one implementer per task, fresh agent, opus for judgment-heavy tasks. Review every task, then fix rounds until clean. Stop the agent when its task closes.
-- Reviews run through codex, not Claude subagents, to save tokens: `codex exec -m gpt-5.6-sol --sandbox read-only -C /home/mfilimonov/workspace/otel-arrow - < prompt.txt > out.txt` in the background, prompt on stdin.
+- At every task close: add or update its section in docs/superpowers/reports/series-parquet-measurement/FINDINGS.md, then refresh the committed snapshot in docs/superpowers/reports/series-parquet-measurement/campaign/ (ledger.md, reports/, briefs/, HANDOFF.md) and commit both.
+- Reviews run through codex, not Claude subagents, to save tokens: `codex exec -m gpt-5.6-sol --sandbox read-only -C <repo> - < prompt.txt > out.txt` in the background, prompt on stdin.
 - Re-verify every review finding against current HEAD before dispatching a fix round. Reviews go stale fast here.
 - Commit trailers: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` and a `Claude-Session:` line with the NEW session's URL.
 - The 20-minute cron status check is session-only and dies with the session. Recreate it: every 20 minutes, list agents and processes, treat 25 minutes of no progress as hung, ledger "cron check OK <time>", never ask the user.

@@ -1,6 +1,6 @@
 # Task 3g report: never acknowledge a damaged OTLP body
 
-Worktree: /home/mfilimonov/workspace/otel-arrow/.claude/worktrees/agent-a52116d451bc6bbbd
+Worktree: <repo>/.claude/worktrees/agent-a52116d451bc6bbbd
 Branch: worktree-agent-a52116d451bc6bbbd (based on series-parquet-exporter at d141e8a49)
 Commit: ded42cc85
 

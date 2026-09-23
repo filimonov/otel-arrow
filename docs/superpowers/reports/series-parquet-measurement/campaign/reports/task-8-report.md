@@ -7,7 +7,7 @@ Status: DONE. All 28 probes (14 per store, MinIO and RustFS) passed in required 
 
 ## Worktree and commits
 
-- Worktree: `/home/mfilimonov/workspace/otel-arrow/.claude/worktrees/agent-a876ff9764ee0afe4`
+- Worktree: `<repo>/.claude/worktrees/agent-a876ff9764ee0afe4`
 - Branch: `series-parquet-task-8-faults`. The worktree was created from `main` (5ee994690), not from the campaign branch. It had no changes, so I hard-reset it to `series-parquet-exporter` @ 479d46785 before doing any work.
 - Commits on top of 479d46785:
   - `9218090a5` chore: provision isolated series fault tools
