@@ -12,6 +12,8 @@
 //! measurement --describe
 //! measurement --series-cost --signal logs|metrics --series N
 //!             [--denormalize] --output PATH
+//! measurement --flush-stall --input PATH --config PATH --output PATH
+//!             [--writes N] [--cancels N] [--dump DIR]
 //! ```
 //!
 //! Built only with the `bench-harness` feature. Run with no measurement
@@ -35,6 +37,8 @@
 //! writes `SERIES_STAGE_DONE` after its output file and waits for stdin to
 //! close, so that the harness can snapshot the live process at both edges.
 
+#[path = "measurement/flush_stall.rs"]
+mod flush_stall;
 #[path = "measurement/series_cost.rs"]
 mod series_cost;
 #[path = "measurement/stages.rs"]
@@ -111,6 +115,8 @@ enum Command {
     Describe,
     Measure(Box<Args>),
     SeriesCost(SeriesCostArgs),
+    /// How long a flush of the largest block holds its thread.
+    FlushStall(flush_stall::Args),
     /// Run with no measurement arguments at all, as a workspace-wide
     /// `cargo bench` runs every bench: there is nothing to measure.
     Skip,
@@ -147,11 +153,19 @@ fn describe() -> Description {
     }
 }
 
+/// Take one required value out of the parsed flags.
+fn required(values: &mut BTreeMap<String, String>, name: &str) -> Result<String> {
+    Ok(values
+        .remove(name)
+        .ok_or_else(|| format!("{name} is required"))?)
+}
+
 fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut handshake = false;
     let mut series_cost = false;
     let mut denormalize = false;
+    let mut flush_stall = false;
     let mut arguments = arguments.into_iter();
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
@@ -162,8 +176,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
             "--handshake" => handshake = true,
             "--series-cost" => series_cost = true,
             "--denormalize" => denormalize = true,
+            "--flush-stall" => flush_stall = true,
             "--stage" | "--input" | "--config" | "--output" | "--iterations" | "--profile"
-            | "--compression" | "--signal" | "--series" => {
+            | "--compression" | "--signal" | "--series" | "--writes" | "--cancels" | "--dump" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -174,6 +189,19 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
     }
     if values.is_empty() && !handshake {
         return Ok(Command::Skip);
+    }
+    if flush_stall {
+        let writes = values.remove("--writes").map_or(Ok(3), |v| v.parse())?;
+        let cancels = values.remove("--cancels").map_or(Ok(20), |v| v.parse())?;
+        let dump = values.remove("--dump").map(PathBuf::from);
+        return Ok(Command::FlushStall(flush_stall::Args {
+            input: PathBuf::from(required(&mut values, "--input")?),
+            config: PathBuf::from(required(&mut values, "--config")?),
+            output: PathBuf::from(required(&mut values, "--output")?),
+            writes,
+            cancels,
+            dump,
+        }));
     }
     let mut take = |name: &str| {
         values
@@ -584,6 +612,7 @@ fn main() -> Result<()> {
         }
         Command::Measure(args) => args,
         Command::SeriesCost(args) => return series_cost(&args),
+        Command::FlushStall(args) => return flush_stall::main(&args),
         Command::Skip => {
             writeln!(
                 std::io::stderr(),
