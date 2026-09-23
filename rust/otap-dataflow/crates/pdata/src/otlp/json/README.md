@@ -90,9 +90,7 @@ from the standard Protobuf JSON mapping:
 - trace and span identifiers are hexadecimal strings;
 - enum values are JSON integers;
 - other byte fields are base64 strings;
-- `NaN`, positive infinity, and negative infinity are strings;
-- a string holding bytes that are not UTF-8 is written with U+FFFD in their
-  place, as the conversion to OTAP records stores it; and
+- `NaN`, positive infinity, and negative infinity are strings; and
 - default scalar values and empty repeated fields are omitted.
 
 The serializer emits compact JSON without added whitespace.
@@ -108,7 +106,7 @@ The signal writers intentionally do not:
 - make a sequence of writes atomic.
 
 `JsonEncodeError` reports serde encoding failures, including I/O errors from
-the destination. Callers that require a
+the destination and invalid UTF-8 exposed by a view. Callers that require a
 complete frame before touching the destination should serialize into a
 temporary or reusable byte buffer first.
 

@@ -479,40 +479,6 @@ mod tests {
         );
     }
 
-    /// Scenario: A raw logs view whose record's string body, severity text and attribute key
-    /// hold bytes that are not UTF-8.
-    /// Guarantees: The document is written, with U+FFFD in place of the invalid bytes, rather than
-    /// refused.
-    #[test]
-    fn invalid_utf8_is_written_with_replacement_characters() {
-        let len_field = |field: u32, payload: &[u8]| {
-            let mut out = Vec::new();
-            prost::encoding::encode_key(
-                field,
-                prost::encoding::WireType::LengthDelimited,
-                &mut out,
-            );
-            prost::encoding::encode_varint(payload.len() as u64, &mut out);
-            out.extend_from_slice(payload);
-            out
-        };
-        let attribute = [len_field(1, b"k\xff"), len_field(2, &len_field(1, b"v"))].concat();
-        let record = [
-            len_field(3, b"\xc3"),
-            len_field(5, &len_field(1, b"caf\xc3")),
-            len_field(6, &attribute),
-        ]
-        .concat();
-        let body = len_field(1, &len_field(2, &len_field(2, &record)));
-        let mut document = Vec::new();
-        write_logs_json(&RawLogsData::new(&body), &mut document).unwrap();
-        let record =
-            &decoded_document(&document)["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
-        assert_eq!(record["severityText"], "\u{FFFD}");
-        assert_eq!(record["body"]["stringValue"], "caf\u{FFFD}");
-        assert_eq!(record["attributes"][0]["key"], "k\u{FFFD}");
-    }
-
     /// Scenario: Every signal receives a top-level protobuf message with a truncated field body.
     /// Guarantees: Validating raw views reject malformed framing before any JSON bytes are emitted.
     #[test]
