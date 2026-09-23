@@ -195,7 +195,7 @@ where
             let field = tag >> 3;
             let wire_type = tag & 7;
 
-            let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+            let (start, end) = field_range(self.buf, tag, next_pos)?;
             self.state.pos.set(end);
 
             // save the offset of the field we've encountered
@@ -232,31 +232,138 @@ where
 /// LEN payloads or fixed-width fields with too few bytes remaining) and for
 /// unknown wire types, so callers can treat malformed input as an absent field
 /// rather than producing an out-of-bounds range.
+///
+/// Groups (wire types 3 and 4) are not handled here, because skipping one
+/// needs its field number: scanners that walk a message call [`field_range`].
 #[inline]
 pub(crate) fn field_value_range(buf: &[u8], wire_type: u64, pos: usize) -> Option<(usize, usize)> {
-    let range = match wire_type {
+    value_range(buf, wire_type, pos).ok()
+}
+
+/// The range of the field whose key `tag` ends at `pos`, as a message scanner
+/// needs it to step to the next field: the value range for every wire type
+/// [`field_value_range`] handles, and for an unknown group the range from just
+/// past its start key to just past its end key, found by [`skip_group`]. So a
+/// balanced group -- which the validator accepts and prost skips -- never ends
+/// a scan early and hides the fields after it. A stray end group, or a group
+/// that is unbalanced or nested deeper than the validator's limit, is `None`:
+/// damage, exactly as the validator refuses it.
+#[inline]
+pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, usize)> {
+    match tag & 7 {
+        START_GROUP => {
+            let end = skip_group(buf, pos, tag >> 3, 1, pos).ok()?;
+            Some((pos, end))
+        }
+        wire_type => field_value_range(buf, wire_type, pos),
+    }
+}
+
+/// Wire type 3: the start of a group (proto2), carrying no length.
+pub(crate) const START_GROUP: u64 = 3;
+/// Wire type 4: the end of the group opened by the same field number.
+pub(crate) const END_GROUP: u64 = 4;
+
+/// Decode the field key at `pos`: its field number, its wire type and the
+/// position just past it. A key outside protobuf's 32-bit range, or with
+/// field number zero, is refused.
+#[inline]
+pub(crate) fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), &'static str> {
+    let (tag, next) = read_varint(buf, pos).ok_or("truncated or overlong field key")?;
+    let field_num = tag >> 3;
+    if tag > u64::from(u32::MAX) || field_num == 0 {
+        return Err("invalid field key");
+    }
+    Ok((field_num, tag & 7, next))
+}
+
+/// The byte range of the value of a field of `wire_type` whose key ends at
+/// `pos`, bounds-checked against `buf`. For a length-delimited field the
+/// range excludes the length prefix. The error names the problem.
+#[inline]
+pub(crate) fn value_range(
+    buf: &[u8],
+    wire_type: u64,
+    pos: usize,
+) -> Result<(usize, usize), &'static str> {
+    match wire_type {
         wire_types::VARINT => {
-            // /// TODO this could maybe be read_variant bytes for faster perf
-            let (_, p) = read_varint(buf, pos)?;
-            (pos, p)
+            let (_, end) = read_varint(buf, pos).ok_or("truncated or overlong varint")?;
+            Ok((pos, end))
         }
-
         wire_types::LEN => {
-            let (slice, end) = read_len_delim(buf, pos)?;
-            (end - slice.len(), end)
+            let (len, start) =
+                read_varint(buf, pos).ok_or("truncated or overlong length prefix")?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| start.checked_add(len))
+                .filter(|&end| end <= buf.len())
+                .ok_or("length-delimited field overruns its message")?;
+            Ok((start, end))
         }
-        wire_types::FIXED64 => {
-            let (_, end) = read_fixed64(buf, pos)?;
-            (pos, end)
-        }
-        wire_types::FIXED32 => {
-            let (_, end) = read_fixed32(buf, pos)?;
-            (pos, end)
-        }
-        _ => return None,
-    };
+        wire_types::FIXED64 => fixed_range(buf, pos, 8),
+        wire_types::FIXED32 => fixed_range(buf, pos, 4),
+        _ => Err("unsupported wire type"),
+    }
+}
 
-    Some(range)
+#[inline]
+fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), &'static str> {
+    pos.checked_add(width)
+        .filter(|&end| end <= buf.len())
+        .map(|end| (pos, end))
+        .ok_or("truncated fixed-width field")
+}
+
+/// Why [`skip_group`] could not skip a group; `at` is a position in the
+/// buffer it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipError {
+    /// The group's framing is broken.
+    Framing { problem: &'static str, at: usize },
+    /// Groups nest deeper than
+    /// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`].
+    TooDeep { at: usize },
+}
+
+/// Skip the group of field `field_num` whose start key is at `group_at` and
+/// ends at `pos`, as prost skips an unknown group: every field inside is
+/// framed and skipped, nested groups are skipped the same way, and the group
+/// must close with an end key of its own field number before `buf` ends.
+/// `depth` is the nesting level of this group, counted against
+/// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`] -- which bounds the
+/// recursion -- together with whatever nesting the caller already holds.
+/// Returns the position just past the end key.
+///
+/// This is the one group skipper: the validator and the byte-view scanners
+/// both call it, so what the validator accepts the views can step over.
+pub(crate) fn skip_group(
+    buf: &[u8],
+    mut pos: usize,
+    field_num: u64,
+    depth: usize,
+    group_at: usize,
+) -> Result<usize, SkipError> {
+    if depth > super::validate::MAX_ANY_VALUE_NESTING_DEPTH {
+        return Err(SkipError::TooDeep { at: group_at });
+    }
+    loop {
+        if pos >= buf.len() {
+            return Err(SkipError::Framing {
+                problem: "group without an end group",
+                at: group_at,
+            });
+        }
+        let at = pos;
+        let fail = |problem| SkipError::Framing { problem, at };
+        let (num, wire_type, next) = read_key(buf, pos).map_err(fail)?;
+        pos = match wire_type {
+            END_GROUP if num == field_num => return Ok(next),
+            END_GROUP => return Err(fail("end group does not match its start group")),
+            START_GROUP => skip_group(buf, next, num, depth + 1, at)?,
+            _ => value_range(buf, wire_type, next).map_err(fail)?.1,
+        };
+    }
 }
 
 /// `RepeatedFieldProtoBytesParser` is an iterator over byte slices for some field (represented by
@@ -335,7 +442,7 @@ where
                     let field = tag >> 3;
                     let wire_type = tag & 7;
 
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+                    let (start, end) = field_range(self.buf, tag, next_pos)?;
 
                     // save the offset of the field we've encountered
                     self.state
@@ -365,7 +472,7 @@ where
             let (tag, next_pos) = read_varint(self.buf, range.1)?;
             let field = tag >> 3;
             let wire_type = tag & 7;
-            range = field_value_range(self.buf, wire_type, next_pos)?;
+            range = field_range(self.buf, tag, next_pos)?;
 
             if field == self.field_num && wire_type == self.expected_wire_type {
                 break;
@@ -612,7 +719,7 @@ where
                     let field = tag >> 3;
                     let wire_type = tag & 7;
 
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+                    let (start, end) = field_range(self.buf, tag, next_pos)?;
 
                     // save the offset of the field we've encountered
                     self.state

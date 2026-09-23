@@ -1160,6 +1160,144 @@ async fn a_body_damaged_inside_a_nested_message_is_refused_not_acked() {
         .await;
 }
 
+/// Scenario: an OTLP logs and an OTLP metrics request, each once plain and
+/// once with a balanced unknown group (field 31, holding a varint) placed
+/// before the first known field of its resource, of its log record and of its
+/// gauge data point -- which prost skips and the framing walk accepts.
+/// Guarantees: the decorated request is admitted with exactly the rows,
+/// descriptors and values of the plain one: the resource attributes, the log
+/// body and attributes, the point's value and attributes are all read, so an
+/// unknown group never ends a field lookup early and the request is never
+/// acknowledged with part of its data missing.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unknown_group_before_known_fields_loses_nothing() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
+    use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
+
+    const GROUP: &[u8] = &[0xfb, 0x01, 0x08, 0x05, 0xfc, 0x01];
+    let len_field = |field: u32, payload: &[u8]| {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    };
+    let string = |value: &str| AnyValue {
+        value: Some(any_value::Value::StringValue(value.to_owned())),
+    };
+    let attribute = |key: &str, value: &str| KeyValue {
+        key: key.to_owned(),
+        value: Some(string(value)),
+    };
+    // A message's encoding, with the group first when `decorated`.
+    let message = |bytes: Vec<u8>, decorated: bool| {
+        if decorated {
+            [GROUP, &bytes].concat()
+        } else {
+            bytes
+        }
+    };
+    let resource = |decorated| {
+        message(
+            encoded(&Resource {
+                attributes: vec![attribute("service.name", "checkout")],
+                ..Default::default()
+            }),
+            decorated,
+        )
+    };
+    let logs = |decorated| {
+        let record = message(
+            encoded(&LogRecord {
+                time_unix_nano: 1_789_960_500_000_000_000,
+                body: Some(string("payment accepted")),
+                attributes: vec![attribute("order", "o-17")],
+                ..Default::default()
+            }),
+            decorated,
+        );
+        let scope_logs = len_field(2, &record);
+        let resource_logs = [
+            len_field(1, &resource(decorated)),
+            len_field(2, &scope_logs),
+        ]
+        .concat();
+        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(len_field(1, &resource_logs).into())
+    };
+    let metrics = |decorated| {
+        let point = message(
+            encoded(&NumberDataPoint {
+                time_unix_nano: 1_789_960_500_000_000_000,
+                attributes: vec![attribute("route", "/pay")],
+                value: Some(number_data_point::Value::AsInt(42)),
+                ..Default::default()
+            }),
+            decorated,
+        );
+        let gauge = len_field(1, &point);
+        let metric = [len_field(1, b"requests"), len_field(5, &gauge)].concat();
+        let scope_metrics = len_field(2, &metric);
+        let resource_metrics = [
+            len_field(1, &resource(decorated)),
+            len_field(2, &scope_metrics),
+        ]
+        .concat();
+        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
+            len_field(1, &resource_metrics).into(),
+        )
+    };
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (handler, _rx) = effects(2);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(worker_config(), store, wall, handler);
+    let extract = |payload: otel_arrow_dfe_pdata::OtlpProtoBytes| {
+        assert!(payload.validate_framing().is_ok());
+        let mut context = Context::default();
+        context.set_source_node(7);
+        match worker.prepare(OtapPdata::new(context, payload.into())) {
+            Prepared::Ready(pending) => pending.extracted,
+            Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
+        }
+    };
+    for (name, plain, decorated, expected) in [
+        (
+            "logs",
+            logs(false),
+            logs(true),
+            ["checkout", "payment accepted", "o-17"],
+        ),
+        (
+            "metrics",
+            metrics(false),
+            metrics(true),
+            ["checkout", "/pay", "requests"],
+        ),
+    ] {
+        let plain = extract(plain);
+        let decorated = extract(decorated);
+        assert_eq!(decorated.stats.rows, 1, "{name}");
+        assert_eq!(decorated.stats, plain.stats, "{name}");
+        assert_eq!(
+            format!("{:?}", decorated.descriptors),
+            format!("{:?}", plain.descriptors),
+            "{name}"
+        );
+        assert_eq!(
+            format!("{:?}", decorated.values),
+            format!("{:?}", plain.values),
+            "{name}"
+        );
+        let all = format!("{:?}{:?}", decorated.descriptors, decorated.values);
+        for value in expected {
+            assert!(all.contains(value), "{name}: {value} is missing");
+        }
+        if name == "metrics" {
+            assert!(format!("{:?}", decorated.values).contains("42"), "{name}");
+        }
+    }
+}
+
 /// Scenario: OTLP logs requests whose record body nests arrays exactly at the
 /// framing walk's bound of 256 levels and one level beyond it, under the
 /// default `ingress.max_nesting_depth` of 32.

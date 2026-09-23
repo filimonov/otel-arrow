@@ -16,7 +16,7 @@ use crate::proto::consts::field_num::common::{
 };
 use crate::proto::consts::wire_types;
 use crate::views::otlp::bytes::decode::{
-    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_value_range,
+    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_range,
     from_option_nonzero_range_to_primitive, read_dropped_count, read_fixed64, read_len_delim,
     read_varint, to_nonzero_range,
 };
@@ -69,7 +69,7 @@ impl<'a> RawKeyValue<'a> {
             }
         };
 
-        let (start, end) = match field_value_range(self.buf, wire_types::LEN, next_pos) {
+        let (start, end) = match field_range(self.buf, tag, next_pos) {
             Some(range) => range,
             // invalid bytes in buffer: mark parsing exhausted so callers stop looping
             None => {
@@ -80,6 +80,11 @@ impl<'a> RawKeyValue<'a> {
         self.pos.set(end);
 
         let field = tag >> 3;
+        if tag & 7 != wire_types::LEN {
+            // Only `key` and `value` are read, both length-delimited; any
+            // other field has been stepped over by its own wire type.
+            return;
+        }
 
         match field {
             KEY_VALUE_KEY => self.key_range.set(to_nonzero_range(start, end)),
@@ -246,6 +251,10 @@ impl<'a> Iterator for AnyValueIter<'a> {
 
                 return Some(RawAnyValue::new(slice));
             }
+            // Step over any other field -- unknown, or known with another wire
+            // type -- so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None
@@ -318,27 +327,35 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
         match self.variant.get() {
             Some(variant_type) => variant_type,
             None => {
-                let variant_type = match read_varint(self.buf, 0) {
-                    Some((tag, pos)) => {
-                        let field = tag >> 3;
-                        self.value_offset.set(Some(pos));
-
-                        match field {
-                            ANY_VALUE_STRING_VALUE => ValueType::String,
-                            ANY_VALUE_BOOL_VALUE => ValueType::Bool,
-                            ANY_VALUE_INT_VALUE => ValueType::Int64,
-                            ANY_VALUE_DOUBLE_VALUE => ValueType::Double,
-                            ANY_VALUE_ARRAY_VALUE => ValueType::Array,
-                            ANY_VALUE_KVLIST_VALUE => ValueType::KeyValueList,
-                            ANY_VALUE_BYTES_VALUE => ValueType::Bytes,
-                            _ => {
-                                // treat unknown types as an empty value
-                                ValueType::Empty
-                            }
-                        }
+                // Every field is scanned: an unknown field may precede the
+                // value, and when a sender sets the oneof more than once the
+                // last member wins, as prost decodes it. A value with no
+                // member, or only unknown fields, is empty.
+                let mut variant_type = ValueType::Empty;
+                let mut pos = 0;
+                while pos < self.buf.len() {
+                    let Some((tag, next)) = read_varint(self.buf, pos) else {
+                        break;
+                    };
+                    let member = match (tag >> 3, tag & 7) {
+                        (ANY_VALUE_STRING_VALUE, wire_types::LEN) => Some(ValueType::String),
+                        (ANY_VALUE_BOOL_VALUE, wire_types::VARINT) => Some(ValueType::Bool),
+                        (ANY_VALUE_INT_VALUE, wire_types::VARINT) => Some(ValueType::Int64),
+                        (ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64) => Some(ValueType::Double),
+                        (ANY_VALUE_ARRAY_VALUE, wire_types::LEN) => Some(ValueType::Array),
+                        (ANY_VALUE_KVLIST_VALUE, wire_types::LEN) => Some(ValueType::KeyValueList),
+                        (ANY_VALUE_BYTES_VALUE, wire_types::LEN) => Some(ValueType::Bytes),
+                        _ => None,
+                    };
+                    if let Some(member) = member {
+                        variant_type = member;
+                        self.value_offset.set(Some(next));
                     }
-                    None => ValueType::Empty,
-                };
+                    let Some((_, end)) = field_range(self.buf, tag, next) else {
+                        break;
+                    };
+                    pos = end;
+                }
 
                 self.variant.set(Some(variant_type));
                 variant_type

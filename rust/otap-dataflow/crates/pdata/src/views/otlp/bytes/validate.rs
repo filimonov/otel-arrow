@@ -37,7 +37,9 @@
 //! `AnyValue` nesting level, or one per unknown group level. String fields are
 //! read a second time by the UTF-8 check.
 
-use super::decode::read_varint;
+use super::decode::{
+    END_GROUP, START_GROUP, SkipError, read_key, read_varint, skip_group, value_range,
+};
 use crate::error::Error;
 use crate::proto::consts::field_num::{common, logs, metrics, resource, traces};
 use crate::proto::consts::wire_types::{FIXED32, FIXED64, LEN, VARINT};
@@ -447,23 +449,6 @@ enum Damage {
     },
 }
 
-/// Wire type 3: the start of a group (proto2), carrying no length.
-const START_GROUP: u64 = 3;
-/// Wire type 4: the end of the group opened by the same field number.
-const END_GROUP: u64 = 4;
-
-/// Decode the field key at `pos`: its field number, its wire type and the
-/// position just past it.
-#[inline]
-fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), &'static str> {
-    let (tag, next) = read_varint(buf, pos).ok_or("truncated or overlong field key")?;
-    let field_num = tag >> 3;
-    if tag > u64::from(u32::MAX) || field_num == 0 {
-        return Err("invalid field key");
-    }
-    Ok((field_num, tag & 7, next))
-}
-
 /// Walk one message of type `message`; `base` is the offset of `buf` within
 /// the request and `depth` the `AnyValue` nesting level `buf` is at.
 fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), Damage> {
@@ -485,7 +470,10 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
             if !matches!(field, Field::Unknown) {
                 return Err(fail("wrong wire type for a known field", at));
             }
-            pos = skip_group(buf, base, message, next, field_num, depth + 1, at)?;
+            pos = skip_group(buf, next, field_num, depth + 1, at).map_err(|skip| match skip {
+                SkipError::Framing { problem, at } => fail(problem, at),
+                SkipError::TooDeep { at } => Damage::TooDeep { offset: base + at },
+            })?;
             continue;
         }
         let (start, end) =
@@ -526,85 +514,6 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
         pos = end;
     }
     Ok(())
-}
-
-/// Skip an unknown group of field `field_num` inside `message`, whose start
-/// key is at `group_at` and ends at `pos`, as prost skips it: every field
-/// inside is framed and skipped, nested groups are skipped the same way, and
-/// the group must close with an end key of the same field number before the
-/// enclosing message ends. `depth` counts the group against the same nesting
-/// limit as `AnyValue` containers, which bounds this recursion too. Returns
-/// the position just past the end key.
-fn skip_group(
-    buf: &[u8],
-    base: usize,
-    message: Message,
-    mut pos: usize,
-    field_num: u64,
-    depth: usize,
-    group_at: usize,
-) -> Result<usize, Damage> {
-    let fail = |problem: &'static str, at: usize| Damage::Framing {
-        problem,
-        message,
-        offset: base + at,
-    };
-    if depth > MAX_ANY_VALUE_NESTING_DEPTH {
-        return Err(Damage::TooDeep {
-            offset: base + group_at,
-        });
-    }
-    loop {
-        if pos >= buf.len() {
-            return Err(fail("group without an end group", group_at));
-        }
-        let at = pos;
-        let (num, wire_type, next) = read_key(buf, pos).map_err(|problem| fail(problem, at))?;
-        pos = match wire_type {
-            END_GROUP if num == field_num => return Ok(next),
-            END_GROUP => return Err(fail("end group does not match its start group", at)),
-            START_GROUP => skip_group(buf, base, message, next, num, depth + 1, at)?,
-            _ => {
-                value_range(buf, wire_type, next)
-                    .map_err(|problem| fail(problem, at))?
-                    .1
-            }
-        };
-    }
-}
-
-/// The byte range of the value of a field of `wire_type` whose key ends at
-/// `pos`, bounds-checked against `buf`. For a length-delimited field the
-/// range excludes the length prefix.
-#[inline]
-fn value_range(buf: &[u8], wire_type: u64, pos: usize) -> Result<(usize, usize), &'static str> {
-    match wire_type {
-        VARINT => {
-            let (_, end) = read_varint(buf, pos).ok_or("truncated or overlong varint")?;
-            Ok((pos, end))
-        }
-        LEN => {
-            let (len, start) =
-                read_varint(buf, pos).ok_or("truncated or overlong length prefix")?;
-            let end = usize::try_from(len)
-                .ok()
-                .and_then(|len| start.checked_add(len))
-                .filter(|&end| end <= buf.len())
-                .ok_or("length-delimited field overruns its message")?;
-            Ok((start, end))
-        }
-        FIXED64 => fixed_range(buf, pos, 8),
-        FIXED32 => fixed_range(buf, pos, 4),
-        _ => Err("unsupported wire type"),
-    }
-}
-
-#[inline]
-fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), &'static str> {
-    pos.checked_add(width)
-        .filter(|&end| end <= buf.len())
-        .map(|end| (pos, end))
-        .ok_or("truncated fixed-width field")
 }
 
 /// Check the payload of a packed repeated field of `element` wire type.
@@ -953,6 +862,77 @@ mod tests {
     fn a_fully_populated_request_passes() {
         for (root, body) in requests() {
             assert!(validate_request(&body, root).is_ok(), "{root:?}");
+        }
+    }
+
+    /// Unknown content a newer or proto2 sender may put in any message: a
+    /// balanced group of field 31 holding a varint field and a nested group
+    /// of field 32, then field 31 as a length-delimited value whose bytes
+    /// look like a `resource_logs` / `values` / `key` field (`0a 00`), then
+    /// field 31 as a varint. No OTLP message defines field 31 or 32.
+    const UNKNOWN: &[u8] = &[
+        0xfb, 0x01, 0x08, 0x05, 0x83, 0x02, 0x84, 0x02, 0xfc, 0x01, // group 31
+        0xfa, 0x01, 0x02, 0x0a, 0x00, // field 31, LEN, `0a 00`
+        0xf8, 0x01, 0x0a, // field 31, varint
+    ];
+
+    /// Re-encode `buf`, a message of type `message`, with `UNKNOWN` placed
+    /// before its first field, and every sub-message the schema defines
+    /// inside it re-encoded the same way.
+    fn decorate(buf: &[u8], message: Message) -> Vec<u8> {
+        let mut out = UNKNOWN.to_vec();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            match message.field(field_num) {
+                Field::Message(child) => {
+                    let inner = decorate(&buf[start..end], child);
+                    out.extend(len_field(field_num as u32, &inner));
+                }
+                _ => out.extend_from_slice(&buf[pos..end]),
+            }
+            pos = end;
+        }
+        out
+    }
+
+    /// Scenario: each fully populated logs, metrics and traces request, and
+    /// the same request with a balanced unknown group, an unknown
+    /// length-delimited field whose bytes look like a known field, and an
+    /// unknown varint placed before the first field of every message -- the
+    /// request itself, resources, scopes, log records, metrics, every data
+    /// point kind, exemplars, spans, events, links, key-values, any-values,
+    /// arrays and lists.
+    /// Guarantees: the decorated request passes validation and converts to
+    /// exactly the OTAP records the plain one does, so every field after
+    /// unknown content is still read by the byte views: nothing the
+    /// validator accepts is silently dropped, and no unknown bytes are read
+    /// as a phantom record.
+    #[test]
+    fn unknown_content_before_known_fields_is_skipped_by_the_views() {
+        use crate::otap::OtapArrowRecords;
+        use crate::{OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
+        use otel_arrow_dfe_config::SignalType;
+
+        let convert = |signal, body: Vec<u8>| {
+            let payload = OtapPayload::from(OtlpProtoBytes::new_from_bytes(signal, body));
+            let records: OtapArrowRecords = payload.try_into_with_default().expect("converts");
+            format!("{records:?}")
+        };
+        for ((root, body), signal) in
+            requests()
+                .into_iter()
+                .zip([SignalType::Logs, SignalType::Metrics, SignalType::Traces])
+        {
+            let decorated = decorate(&body, root);
+            assert!(decorated.len() > body.len() + 100, "{root:?}");
+            assert!(validate_request(&decorated, root).is_ok(), "{root:?}");
+            assert_eq!(
+                convert(signal, decorated),
+                convert(signal, body),
+                "{root:?}: the unknown content changed what the views read"
+            );
         }
     }
 
