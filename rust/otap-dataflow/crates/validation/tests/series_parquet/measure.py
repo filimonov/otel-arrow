@@ -950,7 +950,7 @@ def run_legacy_suite(output_dir) -> dict:
 
 
 # The original suite's size. A different count is changed legacy behavior.
-LEGACY_TEST_COUNT = 18
+LEGACY_TEST_COUNT = 19
 
 
 def write_index(case, output_dir, report_dir, children, *, publishable, legacy=None):

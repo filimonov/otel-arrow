@@ -11,7 +11,7 @@ measurement lane extends the end-to-end helpers; it never replaces them.
 Every command runs from `rust/otap-dataflow`.
 
 ```bash
-# The standing suite: 18 tests, no skips when Docker is required.
+# The standing suite: 19 tests, no skips when Docker is required.
 SERIES_REQUIRE_DOCKER=1 python3 -m unittest \
   crates.validation.tests.series_parquet.test_e2e -v
 
