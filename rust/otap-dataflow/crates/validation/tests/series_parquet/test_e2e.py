@@ -2115,7 +2115,7 @@ def verify_files(test, root, log_ids, metric_count, allow_duplicates=False):
 def flush_attempts(engine):
     """The object names the exporter announced for each write attempt.
 
-    The exporter emits `series_parquet.flush_attempt` before every attempt.
+    The exporter emits `series_parquet.flush.attempt` before every attempt.
     Every object of one block carries the same file name and differs only in
     its dataset directory, so the announced name and count are the whole set
     of names that attempt was about to write. Reading them back is what lets a
@@ -2125,7 +2125,7 @@ def flush_attempts(engine):
     return [
         (int(attempt), file, int(count))
         for attempt, file, count in re.findall(
-            r"series_parquet\.flush_attempt.*?"
+            r"series_parquet\.flush\.attempt.*?"
             r"\[attempt=(\d+), file=(\S+), objects=(\d+)\]",
             engine.engine_log(),
         )
