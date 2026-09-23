@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buffer::{Block, SortedTableBuffer};
 use crate::clock::PartitionId;
 use crate::config::{LakeConfig, Nulls, SortOrder};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TransientError};
 use crate::schema::{Dataset, dataset_schema, schema_fingerprint};
 use crate::sort::{MergeBuild, MergeIter, MergeStep, SortSpec};
 
@@ -817,19 +817,17 @@ impl Sink {
         }
         let deadline = *cleanup.get_or_insert_with(|| self.cleanup_deadline());
         if !watch.creating() {
-            return Err(Error::Cancelled { abort_error: None });
+            return Err(Error::cancelled(None));
         }
         tokio::select! {
             biased;
-            _ = &mut op => Err(Error::Cancelled { abort_error: None }),
-            () = watch.settled() => Err(Error::Cancelled { abort_error: None }),
-            () = (self.clock.sleep_until)(deadline) => Err(Error::Cancelled {
-                abort_error: Some(format!(
-                    "the write in flight did not finish within {:?}, so a multipart upload \
-                     it was creating may be left to the bucket lifecycle rule",
-                    self.cfg.upload.abort_timeout
-                )),
-            }),
+            _ = &mut op => Err(Error::cancelled(None)),
+            () = watch.settled() => Err(Error::cancelled(None)),
+            () = (self.clock.sleep_until)(deadline) => Err(Error::cancelled(Some(format!(
+                "the write in flight did not finish within {:?}, so a multipart upload \
+                 it was creating may be left to the bucket lifecycle rule",
+                self.cfg.upload.abort_timeout
+            )))),
         }
     }
 
@@ -842,7 +840,7 @@ impl Sink {
     /// the start of it.
     fn cancelled_here(&self, cleanup: &mut Option<Instant>) -> Error {
         let _ = cleanup.get_or_insert_with(|| self.cleanup_deadline());
-        Error::Cancelled { abort_error: None }
+        Error::cancelled(None)
     }
 
     /// The instant the cleanup of a failed or cancelled write must end by.
@@ -857,18 +855,16 @@ impl Sink {
     fn with_abort(cause: Error, abort_error: Option<String>) -> Error {
         match (cause, abort_error) {
             (
-                Error::Cancelled {
+                Error::Transient(TransientError::Cancelled {
                     abort_error: earlier,
-                },
+                }),
                 abort_error,
-            ) => Error::Cancelled {
-                abort_error: earlier.or(abort_error),
-            },
+            ) => Error::cancelled(earlier.or(abort_error)),
             (cause, None) => cause,
-            (cause, Some(abort_error)) => Error::AbortFailed {
+            (cause, Some(abort_error)) => Error::Transient(TransientError::AbortFailed {
                 source: Box::new(cause),
                 abort_error,
-            },
+            }),
         }
     }
 
@@ -1077,7 +1073,7 @@ impl Sink {
         }
         if cancel.is_cancelled() {
             let abort_error = self.abort_upload(writer, self.cleanup_deadline()).await;
-            return Err(Error::Cancelled { abort_error });
+            return Err(Error::cancelled(abort_error));
         }
 
         // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
@@ -1087,7 +1083,7 @@ impl Sink {
         // (spec 5.3), not by this crate.
         let finish = tokio::select! {
             biased;
-            () = cancel.cancelled() => Err(Error::Cancelled { abort_error: None }),
+            () = cancel.cancelled() => Err(Error::cancelled(None)),
             r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
         };
         finish?;
@@ -1122,7 +1118,7 @@ impl Sink {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Cancelled`] when `cancel` fires, and the underlying
+    /// Returns [`TransientError::Cancelled`] when `cancel` fires, and the underlying
     /// Arrow, Parquet or object store failure otherwise.
     pub async fn write_block<T>(
         &self,
@@ -1138,7 +1134,7 @@ impl Sink {
             return Err(Error::internal("unsealed block"));
         }
         if cancel.is_cancelled() {
-            return Err(Error::Cancelled { abort_error: None });
+            return Err(Error::cancelled(None));
         }
         let mut report = FlushReport::default();
         for (table, path) in block
@@ -2198,10 +2194,11 @@ mod tests {
         let sink = Sink::new(local(&dir), cfg, FileNaming::new("w"));
         let token = CancellationToken::new();
         token.cancel();
-        assert!(matches!(
-            sink.write_block(&b, &token).await,
-            Err(Error::Cancelled { .. })
-        ));
+        assert!(
+            sink.write_block(&b, &token)
+                .await
+                .is_err_and(|e| e.is_cancelled())
+        );
         assert_eq!(walkdir_count(dir.path()), 0);
     }
 
@@ -2227,7 +2224,7 @@ mod tests {
             tokio::spawn(async move { token.cancel() })
         };
         let got = sink.write_block(&b, &token).await;
-        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
         canceller.await.expect("cancelling task");
     }
 
@@ -2249,7 +2246,7 @@ mod tests {
         });
         let sink = Sink::new(store, cfg, FileNaming::new("w"));
         let got = sink.write_block(&b, &token).await;
-        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
         assert!(
             tripped_multipart.load(Ordering::SeqCst),
             "the token must fire inside the chunk loop, not at finalization"
@@ -2291,7 +2288,7 @@ mod tests {
         });
         let got = sink.write_block(&b, &token).await;
         handle.await.expect("canceller");
-        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
         assert!(
             parts.load(Ordering::SeqCst) > 0,
             "the writer must have handed a real part to the upload"
@@ -2358,10 +2355,10 @@ mod tests {
         let b = sealed_upload_block(&cfg);
         let sink = Sink::new(store, cfg, FileNaming::new("w"));
         let got = sink.write_block(&b, &CancellationToken::new()).await;
-        let Err(Error::AbortFailed {
+        let Err(Error::Transient(TransientError::AbortFailed {
             source,
             abort_error,
-        }) = got
+        })) = got
         else {
             panic!("expected AbortFailed, got {got:?}");
         };
@@ -2409,7 +2406,7 @@ mod tests {
         )
         .await
         .expect("the abort is bounded by the injected clock, not by tokio time");
-        let Err(Error::AbortFailed { abort_error, .. }) = got else {
+        let Err(Error::Transient(TransientError::AbortFailed { abort_error, .. })) = got else {
             panic!("expected AbortFailed, got {got:?}");
         };
         assert!(abort_error.contains("timed out"), "{abort_error}");
@@ -2436,7 +2433,7 @@ mod tests {
         let b = sealed_upload_block(&cfg);
         let sink = Sink::new(store, cfg, FileNaming::new("w"));
         let got = sink.write_block(&b, &CancellationToken::new()).await;
-        let Err(Error::AbortFailed { abort_error, .. }) = got else {
+        let Err(Error::Transient(TransientError::AbortFailed { abort_error, .. })) = got else {
             panic!("expected AbortFailed, got {got:?}");
         };
         assert!(
@@ -2551,7 +2548,7 @@ mod tests {
         };
         let got = sink.write_block(&b, &token).await;
         canceller.await.expect("cancelling task");
-        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
         let built = sink.merge_key_high_water_bytes();
         assert!(
             built < full / 2,
@@ -2812,7 +2809,7 @@ mod tests {
         });
         let mut cleanup = None;
         let got = sink.step(op, &watch, &cancel, &mut cleanup).await;
-        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert!(got.as_ref().is_err_and(Error::is_cancelled), "got {got:?}");
         assert_eq!(
             polled.get(),
             0,

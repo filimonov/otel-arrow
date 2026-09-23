@@ -106,11 +106,13 @@ pub(super) struct FlushDone {
 /// and hide it behind a timeout.
 pub(super) fn retryable(error: &lake::Error) -> bool {
     match error {
-        lake::Error::ObjectStore(e) => transient_store_error(e),
-        lake::Error::Parquet(parquet::errors::ParquetError::External(source)) => {
-            contains_storage_error(source.as_ref())
+        lake::Error::Transient(lake::TransientError::ObjectStore(e)) => transient_store_error(e),
+        lake::Error::Internal(lake::InternalError::Parquet(
+            parquet::errors::ParquetError::External(source),
+        )) => contains_storage_error(source.as_ref()),
+        lake::Error::Transient(lake::TransientError::AbortFailed { source, .. }) => {
+            retryable(source)
         }
-        lake::Error::AbortFailed { source, .. } => retryable(source),
         _ => false,
     }
 }
@@ -186,9 +188,7 @@ async fn write_until(
     let mut last: Option<lake::Error> = None;
     loop {
         if cancel.is_cancelled() {
-            let error = last
-                .take()
-                .unwrap_or(lake::Error::Cancelled { abort_error: None });
+            let error = last.take().unwrap_or(lake::Error::cancelled(None));
             let _ = result_tx.send(FlushDone {
                 data: Rc::clone(&data),
                 attempts,
@@ -250,7 +250,7 @@ async fn write_until(
             result = &mut write => Ok(result),
             () = cancel.cancelled() => Err(last
                 .take()
-                .unwrap_or(lake::Error::Cancelled { abort_error: None })),
+                .unwrap_or(lake::Error::cancelled(None))),
             () = clock::sleep_until(deadline) => Err(expired(attempts, last.take())),
         };
         let result = match result {
@@ -340,10 +340,10 @@ fn log_failed_attempt(attempt: u64, file: &str, error: &lake::Error) {
 /// ran out, and it is a distinct error rather than a cancellation, so a
 /// storage hang is never counted as a shutdown.
 fn expired(attempts: u64, last: Option<lake::Error>) -> lake::Error {
-    lake::Error::DeadlineExceeded {
+    lake::Error::Transient(lake::TransientError::DeadlineExceeded {
         attempts,
         last: last.map(Box::new),
-    }
+    })
 }
 
 /// One local flush task and the completions its block still owes.

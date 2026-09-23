@@ -67,30 +67,34 @@ pub enum RefuseReason {
     Unsupported(String),
 }
 
-/// Crate error.
+/// Crate error, in three classes by who can act on the failure.
+///
+/// Only [`Error::Refused`] judges the request's own content: the identical
+/// bytes will be refused again, so a caller reports it to the producer as
+/// permanent. [`Error::Transient`] is a failure of the destination or of the
+/// write in progress, which a later attempt may survive. [`Error::Internal`]
+/// is a failure of this crate or of the libraries it drives; the request is
+/// not at fault, so a caller never reports it to a producer as a permanent
+/// refusal of the producer's data.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The request must be nacked as non-retryable.
     #[error("refused: {0:?}")]
     Refused(RefuseReason),
-    /// Arrow failure.
-    #[error("arrow: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
-    /// Parquet failure.
-    #[error("parquet: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError),
+    /// Storage or the write in progress failed.
+    #[error(transparent)]
+    Transient(#[from] TransientError),
+    /// A writer invariant, or an Arrow or Parquet operation, failed.
+    #[error(transparent)]
+    Internal(#[from] InternalError),
+}
+
+/// A failure of the destination or of the write in progress.
+#[derive(Debug, thiserror::Error)]
+pub enum TransientError {
     /// Object store failure.
     #[error("object store: {0}")]
     ObjectStore(#[from] object_store::Error),
-    /// pdata failure.
-    #[error("pdata: {0}")]
-    Pdata(String),
-    /// A writer invariant did not hold: the request's content is not at fault.
-    ///
-    /// Distinct from [`Error::Refused`] so a caller never reports its own bug
-    /// to a producer as a permanent refusal of the producer's data.
-    #[error("internal: {0}")]
-    Internal(String),
     /// Flush cancelled. `abort_error` is set when the best-effort multipart
     /// abort also failed or timed out.
     #[error("cancelled{}", match abort_error { Some(e) => format!(" (multipart abort failed: {e})"), None => String::new() })]
@@ -100,11 +104,11 @@ pub enum Error {
     },
     /// A caller that retries the sink ran out of its retry deadline.
     ///
-    /// Distinct from [`Error::Cancelled`], which is a decision taken by the
-    /// caller, so a destination that keeps failing or never answers is not
-    /// reported as a cancellation. `last` is the failure of the last attempt
-    /// that returned, and `None` when the attempt in flight at the deadline
-    /// was the first and had not returned.
+    /// Distinct from [`TransientError::Cancelled`], which is a decision taken
+    /// by the caller, so a destination that keeps failing or never answers is
+    /// not reported as a cancellation. `last` is the failure of the last
+    /// attempt that returned, and `None` when the attempt in flight at the
+    /// deadline was the first and had not returned.
     #[error("flush retry deadline exceeded after {attempts} attempt(s); {}", match last { Some(e) => format!("last error: {e}"), None => "no attempt returned before the deadline".to_owned() })]
     DeadlineExceeded {
         /// Attempts started before the deadline, the unfinished one included.
@@ -120,6 +124,41 @@ pub enum Error {
         /// Why the cleanup abort did not succeed.
         abort_error: String,
     },
+}
+
+/// A failure of this crate or of a library it drives; the request is not at
+/// fault.
+#[derive(Debug, thiserror::Error)]
+pub enum InternalError {
+    /// Arrow failure.
+    #[error("arrow: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+    /// Parquet failure. The Parquet writer wraps whatever the object store
+    /// returned, so a caller that retries storage failures looks through its
+    /// source chain.
+    #[error("parquet: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+    /// A writer invariant did not hold.
+    #[error("internal: {0}")]
+    Invariant(String),
+}
+
+impl From<arrow::error::ArrowError> for Error {
+    fn from(error: arrow::error::ArrowError) -> Self {
+        Error::Internal(InternalError::Arrow(error))
+    }
+}
+
+impl From<parquet::errors::ParquetError> for Error {
+    fn from(error: parquet::errors::ParquetError) -> Self {
+        Error::Internal(InternalError::Parquet(error))
+    }
+}
+
+impl From<object_store::Error> for Error {
+    fn from(error: object_store::Error) -> Self {
+        Error::Transient(TransientError::ObjectStore(error))
+    }
 }
 
 /// Crate result.
@@ -151,6 +190,18 @@ impl Error {
 
     /// Shorthand for a broken writer invariant.
     pub fn internal(msg: impl Into<String>) -> Self {
-        Error::Internal(msg.into())
+        Error::Internal(InternalError::Invariant(msg.into()))
+    }
+
+    /// Shorthand for a cancelled write, with the outcome of its cleanup abort.
+    #[must_use]
+    pub fn cancelled(abort_error: Option<String>) -> Self {
+        Error::Transient(TransientError::Cancelled { abort_error })
+    }
+
+    /// Whether this is a cancelled write, whatever its cleanup did.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Transient(TransientError::Cancelled { .. }))
     }
 }

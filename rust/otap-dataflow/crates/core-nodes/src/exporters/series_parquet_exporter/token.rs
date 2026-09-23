@@ -16,8 +16,9 @@
 //! branch safe. Dropping a poll never drops a token, so no request can lose
 //! its decision because the exporter was busy elsewhere.
 
+use super::outcome::{OUTCOMES, Outcome};
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg};
+use otel_arrow_dfe_engine::control::{AckMsg, NackMsg};
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_engine::{ConsumerEffectHandlerExtension, clock};
@@ -91,135 +92,6 @@ impl AckToken {
     /// Rebuild the pdata the completion is delivered on, with an empty payload.
     fn pdata(self) -> OtapPdata {
         OtapPdata::new(self.context, OtapPayload::empty(self.signal))
-    }
-}
-
-/// How a request was decided, in the form the sender is told about it.
-///
-/// Each refusal rule is a separate variant rather than one, so the counters
-/// keep saying which validation rule rejected a request after the error value
-/// itself has been dropped with the payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
-pub(super) enum Outcome {
-    /// The request is durable.
-    Ack,
-    /// The request exceeded `ingress.max_request_bytes`.
-    RequestTooLarge,
-    /// The extracted request or one decoded attribute table exceeded
-    /// `ingress.max_extracted_bytes`.
-    ExtractedTooLarge,
-    /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.
-    RowTooLarge,
-    /// The request's worst case in one block exceeded `window.max_block_bytes`.
-    BlockTooLarge,
-    /// A nested value exceeded `ingress.max_nesting_depth`.
-    TooDeep,
-    /// The request's content could not be used.
-    Invalid,
-    /// The request's signal is not handled by this exporter.
-    Unsupported,
-    /// Writing the request failed; the sender may retry.
-    Storage,
-    /// The node shut down before the request could be decided.
-    Shutdown,
-    /// A writer invariant failed while handling the request; the request is
-    /// not at fault and the sender may retry.
-    Internal,
-}
-
-/// Number of [`Outcome`] variants, and so the width of the counter array.
-pub(super) const OUTCOMES: usize = 11;
-
-/// Longest detail an error may contribute to a nack reason, in bytes.
-///
-/// The reason is the status message a producer sees and logs, so it carries
-/// enough of the underlying error to act on but never an unbounded amount of
-/// request-derived text.
-const MAX_DETAIL_BYTES: usize = 256;
-
-/// A bounded, printable rendering of an error for a nack reason.
-///
-/// Control characters, including line breaks, become spaces so the reason
-/// stays one line, and the text is cut at a character boundary once it passes
-/// [`MAX_DETAIL_BYTES`].
-pub(super) fn sanitized(detail: &str) -> String {
-    let mut out = String::with_capacity(detail.len().min(MAX_DETAIL_BYTES + 3));
-    for c in detail.chars() {
-        if out.len() + c.len_utf8() > MAX_DETAIL_BYTES {
-            out.push_str("...");
-            break;
-        }
-        out.push(if c.is_control() { ' ' } else { c });
-    }
-    out
-}
-
-impl Outcome {
-    /// Stable machine token of the outcome: the metric label and log field.
-    ///
-    /// Never the reason a producer is told; that is a sentence, see
-    /// [`Outcome::sentence`].
-    pub(super) fn reason(self) -> &'static str {
-        match self {
-            Self::Ack => "ack",
-            Self::RequestTooLarge => "request_too_large",
-            Self::ExtractedTooLarge => "extracted_too_large",
-            Self::RowTooLarge => "row_too_large",
-            Self::BlockTooLarge => "block_too_large",
-            Self::TooDeep => "too_deep",
-            Self::Invalid => "invalid",
-            Self::Unsupported => "unsupported",
-            Self::Storage => "storage",
-            Self::Shutdown => "shutdown",
-            Self::Internal => "internal",
-        }
-    }
-
-    /// The reason sentence a completion carries when its decision supplied
-    /// none of its own: what happened and what the sender should do.
-    pub(super) fn sentence(self) -> &'static str {
-        match self {
-            Self::Ack => "stored",
-            Self::RequestTooLarge
-            | Self::ExtractedTooLarge
-            | Self::RowTooLarge
-            | Self::BlockTooLarge => {
-                "the request exceeds a series_parquet size budget; split the batch upstream"
-            }
-            Self::TooDeep => {
-                "the request nests values deeper than ingress.max_nesting_depth; flatten them \
-                 in the producer"
-            }
-            Self::Invalid => "the request content is invalid; fix the producer",
-            Self::Unsupported => {
-                "the request carries data series_parquet does not store; route it elsewhere"
-            }
-            Self::Storage => {
-                "series_parquet could not write the block holding this request to object \
-                 storage; retry the request"
-            }
-            Self::Shutdown => {
-                "series_parquet shut down before the request was stored; retry the request"
-            }
-            Self::Internal => {
-                "series_parquet hit an internal error handling the request; retry the request"
-            }
-        }
-    }
-
-    /// Whether the sender must change the request before retrying it.
-    pub(super) fn refused(self) -> bool {
-        matches!(
-            self,
-            Self::RequestTooLarge
-                | Self::ExtractedTooLarge
-                | Self::RowTooLarge
-                | Self::BlockTooLarge
-                | Self::TooDeep
-                | Self::Invalid
-                | Self::Unsupported
-        )
     }
 }
 
@@ -418,29 +290,16 @@ impl Notifier {
         reason: Option<Rc<str>>,
     ) -> Result<(), Error> {
         let data = token.pdata();
-        let sentence = || reason.as_deref().unwrap_or(outcome.sentence()).to_owned();
-        match outcome {
-            Outcome::Ack => effects.notify_ack(AckMsg::new(data)).await,
-            Outcome::Shutdown => {
-                effects
-                    .notify_nack(NackMsg::new_with_cause(
-                        sentence(),
-                        data,
-                        NackCause::NodeShutdown,
-                    ))
-                    .await
-            }
-            refused if refused.refused() => {
-                effects
-                    .notify_nack(NackMsg::new_permanent_with_cause(
-                        sentence(),
-                        data,
-                        NackCause::Refused,
-                    ))
-                    .await
-            }
-            _ => effects.notify_nack(NackMsg::new(sentence(), data)).await,
-        }
+        let Some(cause) = outcome.nack_cause() else {
+            return effects.notify_ack(AckMsg::new(data)).await;
+        };
+        let sentence = reason.as_deref().unwrap_or(outcome.sentence()).to_owned();
+        let nack = if outcome.refused() {
+            NackMsg::new_permanent_with_cause(sentence, data, cause)
+        } else {
+            NackMsg::new_with_cause(sentence, data, cause)
+        };
+        effects.notify_nack(nack).await
     }
 
     /// Drive the single completion send to completion.
@@ -583,7 +442,7 @@ impl Notifier {
 mod tests {
     use super::super::tests::{effects, empty_pdata};
     use super::*;
-    use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
+    use otel_arrow_dfe_engine::control::{NackCause, PipelineCompletionMsg};
     use std::time::Duration;
 
     /// Scenario: a request carrying transport headers is split into its

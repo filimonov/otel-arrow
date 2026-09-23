@@ -16,6 +16,7 @@
 //! the value is republished rather than accumulated twice. Gauges report the
 //! worker's state at the moment it was sampled.
 
+use super::outcome::{OUTCOMES, Outcome};
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
@@ -152,42 +153,36 @@ pub(super) struct FlushMetrics {
     pub count: Counter<u64>,
 }
 
-/// Why a request was refused: the `error.type` of one nack.
+/// The refusal class of one nacked request: its [`Outcome`], never `ack`.
 ///
 /// A size refusal names the budget it exceeded, one value per setting, so an
 /// operator can tell which limit to raise without reading the log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
-pub(super) enum NackErrorType {
-    /// Writing the request failed; the sender may retry.
-    Storage,
-    /// The request exceeded `ingress.max_request_bytes`.
-    RequestTooLarge,
-    /// The extracted request, or one decoded attribute table, exceeded
-    /// `ingress.max_extracted_bytes`.
-    ExtractedTooLarge,
-    /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.
-    RowTooLarge,
-    /// The request's worst case in one block exceeded `window.max_block_bytes`.
-    BlockTooLarge,
-    /// A nested value exceeded `ingress.max_nesting_depth`.
-    TooDeep,
-    /// The request's content could not be used.
-    Invalid,
-    /// The request's signal is not handled by this exporter.
-    Unsupported,
-    /// The node shut down before the request could be decided.
-    Shutdown,
-    /// A writer invariant failed; the request is not at fault.
-    Internal,
-}
-
-/// The refusal class of one nacked request.
 #[attribute_set(item, measurement)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NackAttrs {
     /// Why the request was refused.
     #[attribute_key = "error.type"]
-    pub error_type: NackErrorType,
+    pub error_type: Outcome,
+}
+
+// Every outcome but `Ack` is a nack label, so the list cannot fall behind the
+// enum without failing to compile.
+const _: () = assert!(NackAttrs::ERROR_TYPES.len() + 1 == OUTCOMES);
+
+impl NackAttrs {
+    /// Every outcome a nack can carry, in label order.
+    pub(super) const ERROR_TYPES: [Outcome; 10] = [
+        Outcome::Storage,
+        Outcome::RequestTooLarge,
+        Outcome::ExtractedTooLarge,
+        Outcome::RowTooLarge,
+        Outcome::BlockTooLarge,
+        Outcome::TooDeep,
+        Outcome::Invalid,
+        Outcome::Unsupported,
+        Outcome::Shutdown,
+        Outcome::Internal,
+    ];
 }
 
 /// Requests refused, split by the rule that refused them.
@@ -619,18 +614,19 @@ mod tests {
             );
         }
 
-        for (error_type, label) in [
-            (NackErrorType::Storage, "storage"),
-            (NackErrorType::RequestTooLarge, "request_too_large"),
-            (NackErrorType::ExtractedTooLarge, "extracted_too_large"),
-            (NackErrorType::RowTooLarge, "row_too_large"),
-            (NackErrorType::BlockTooLarge, "block_too_large"),
-            (NackErrorType::TooDeep, "too_deep"),
-            (NackErrorType::Invalid, "invalid"),
-            (NackErrorType::Unsupported, "unsupported"),
-            (NackErrorType::Shutdown, "shutdown"),
-            (NackErrorType::Internal, "internal"),
-        ] {
+        let labels = [
+            "storage",
+            "request_too_large",
+            "extracted_too_large",
+            "row_too_large",
+            "block_too_large",
+            "too_deep",
+            "invalid",
+            "unsupported",
+            "shutdown",
+            "internal",
+        ];
+        for (error_type, label) in NackAttrs::ERROR_TYPES.into_iter().zip(labels) {
             metrics
                 .nacks
                 .with(NackAttrs { error_type })

@@ -4,8 +4,9 @@
 //! Configuration adapter tests for the series Parquet exporter.
 
 use super::config::Config;
-use super::token::{AckToken, Notifier, Outcome};
-use super::worker::{Failure, Prepared, Worker};
+use super::outcome::Outcome;
+use super::token::{AckToken, Notifier};
+use super::worker::{Prepared, Worker};
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -634,7 +635,7 @@ async fn the_deadline_decides_every_outstanding_request() {
 #[test]
 fn each_failure_class_maps_to_its_outcome() {
     assert_eq!(
-        Failure::Permanent(lake::Error::too_large(lake::SizeBudget::Row, 2, 1)).outcome(),
+        Outcome::of(&lake::Error::too_large(lake::SizeBudget::Row, 2, 1)),
         Outcome::RowTooLarge
     );
     for (budget, outcome) in [
@@ -645,36 +646,34 @@ fn each_failure_class_maps_to_its_outcome() {
         (lake::SizeBudget::Block, Outcome::BlockTooLarge),
     ] {
         assert_eq!(
-            Failure::Permanent(lake::Error::too_large(budget, 2, 1)).outcome(),
+            Outcome::of(&lake::Error::too_large(budget, 2, 1)),
             outcome,
             "{budget:?}"
         );
     }
     assert_eq!(
-        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(32))).outcome(),
+        Outcome::of(&lake::Error::Refused(lake::RefuseReason::TooDeep(32))),
         Outcome::TooDeep
     );
     assert_eq!(
-        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
+        Outcome::of(&lake::Error::Refused(lake::RefuseReason::Unsupported(
             "signal".into()
-        )))
-        .outcome(),
+        ))),
         Outcome::Unsupported
     );
     assert_eq!(
-        Failure::Permanent(lake::Error::invalid("undecodable pdata")).outcome(),
+        Outcome::of(&lake::Error::invalid("undecodable pdata")),
         Outcome::Invalid
     );
     assert_eq!(
-        Failure::Retryable(lake::Error::ObjectStore(object_store::Error::Generic {
+        Outcome::of(&lake::Error::from(object_store::Error::Generic {
             store: "test",
             source: "unreachable".into(),
-        }))
-        .outcome(),
+        })),
         Outcome::Storage
     );
     assert_eq!(
-        Failure::Retryable(lake::Error::internal("flush failed")).outcome(),
+        Outcome::of(&lake::Error::internal("flush failed")),
         Outcome::Internal
     );
 }
@@ -689,28 +688,22 @@ fn each_failure_class_maps_to_its_outcome() {
 /// exporter bug and an operator can still see what went wrong.
 #[tokio::test(flavor = "current_thread")]
 async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
-    let failure = Failure::classify(lake::Error::internal(
-        "column/builder mismatch for Str(None)\nsecond line",
-    ));
-    assert!(matches!(failure, Failure::Retryable(_)));
-    assert_eq!(failure.outcome(), Outcome::Internal);
-    assert!(!failure.outcome().refused());
-    let sentence = failure.sentence();
+    let failure = lake::Error::internal("column/builder mismatch for Str(None)\nsecond line");
+    assert!(matches!(failure, lake::Error::Internal(_)));
+    assert_eq!(Outcome::of(&failure), Outcome::Internal);
+    assert!(!Outcome::of(&failure).refused());
+    let sentence = Outcome::explain(&failure);
     assert!(
         sentence.contains("column/builder mismatch for Str(None) second line"),
         "the detail is kept, on one line: {sentence}"
     );
-    assert!(
-        Failure::classify(lake::Error::invalid("bad"))
-            .outcome()
-            .refused()
-    );
+    assert!(Outcome::of(&lake::Error::invalid("bad")).refused());
 
     let (handler, mut rx) = effects(1);
     let mut notify = Notifier::new(handler, 4);
     let (token, payload) = AckToken::split(empty_pdata());
     drop(payload);
-    notify.push_with(token, failure.outcome(), Some(sentence.clone().into()));
+    notify.push_with(token, Outcome::of(&failure), Some(sentence.clone().into()));
     notify.next().await.expect("the completion is accepted");
     match rx.recv().await.expect("a nack") {
         PipelineCompletionMsg::DeliverNack { nack } => {
@@ -784,13 +777,13 @@ async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
 #[test]
 fn a_reason_detail_is_bounded_and_single_line() {
     let long = "x".repeat(10_000);
-    let cut = super::token::sanitized(&long);
+    let cut = super::outcome::sanitized(&long);
     assert!(cut.len() <= 256 + 3);
     assert!(cut.ends_with("..."));
     let wide = "\u{e9}".repeat(1_000);
-    let cut = super::token::sanitized(&wide);
+    let cut = super::outcome::sanitized(&wide);
     assert!(cut.len() <= 256 + 3);
-    assert_eq!(super::token::sanitized("a\r\nb\tc"), "a  b c");
+    assert_eq!(super::outcome::sanitized("a\r\nb\tc"), "a  b c");
 }
 
 /// Scenario: the bounded engine completion channel fills while a second
@@ -1581,10 +1574,9 @@ async fn nesting_beyond_the_framing_bound_is_refused_as_too_deep() {
         let mut context = Context::default();
         context.set_source_node(7);
         match worker.prepare(OtapPdata::new(context, payload.into())) {
-            Prepared::Failed(
-                _,
-                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(refused))),
-            ) => assert_eq!(refused, limit, "{levels} levels"),
+            Prepared::Failed(_, lake::Error::Refused(lake::RefuseReason::TooDeep(refused))) => {
+                assert_eq!(refused, limit, "{levels} levels")
+            }
             Prepared::Failed(_, other) => panic!("{levels} levels: refused as {other:?}"),
             Prepared::Ready(_) => panic!("{levels} levels were admitted"),
         }
@@ -4165,10 +4157,12 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
             assert!(
                 matches!(
                     finished.result,
-                    Err(lake::Error::DeadlineExceeded {
-                        attempts: 1,
-                        last: None
-                    })
+                    Err(lake::Error::Transient(
+                        lake::TransientError::DeadlineExceeded {
+                            attempts: 1,
+                            last: None
+                        }
+                    ))
                 ),
                 "a hung write is a deadline, not a cancellation: {:?}",
                 finished.result.as_ref().err()
@@ -4246,10 +4240,10 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             // failing when the deadline expires at 60 s.
             assert_eq!(finished.attempts, 3);
             match &finished.result {
-                Err(lake::Error::DeadlineExceeded {
+                Err(lake::Error::Transient(lake::TransientError::DeadlineExceeded {
                     attempts: 3,
                     last: Some(last),
-                }) => assert!(
+                })) => assert!(
                     last.to_string().contains("injected store failure"),
                     "{last}"
                 ),
@@ -4307,43 +4301,39 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
 /// Guarantees: only a failure with a storage origin earns whole-block retries.
 #[test]
 fn retry_classifier_distinguishes_encoding_from_storage() {
-    assert!(!super::flush::retryable(&lake::Error::Parquet(
+    assert!(!super::flush::retryable(&lake::Error::from(
         parquet::errors::ParquetError::General("encoding bug".into())
     )));
-    assert!(super::flush::retryable(&lake::Error::ObjectStore(
+    assert!(super::flush::retryable(&lake::Error::from(
         object_store::Error::Generic {
             store: "test",
             source: Box::new(std::io::Error::other("offline")),
         }
     )));
-    assert!(super::flush::retryable(&lake::Error::Parquet(
+    assert!(super::flush::retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(object_store::Error::Generic {
             store: "test",
             source: Box::new(std::io::Error::other("offline")),
         }))
     )));
-    assert!(!super::flush::retryable(&lake::Error::Cancelled {
-        abort_error: None
-    }));
+    assert!(!super::flush::retryable(&lake::Error::cancelled(None)));
     // Refused credentials and a missing bucket or prefix are storage errors
     // that no retry cures, however they are wrapped.
     let denied = || object_store::Error::PermissionDenied {
         path: "p".into(),
         source: "denied".into(),
     };
-    assert!(!super::flush::retryable(
-        &lake::Error::ObjectStore(denied())
-    ));
-    assert!(!super::flush::retryable(&lake::Error::ObjectStore(
+    assert!(!super::flush::retryable(&lake::Error::from(denied())));
+    assert!(!super::flush::retryable(&lake::Error::from(
         object_store::Error::NotFound {
             path: "p".into(),
             source: "no such bucket".into(),
         }
     )));
-    assert!(!super::flush::retryable(&lake::Error::Parquet(
+    assert!(!super::flush::retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(std::io::Error::other(denied())))
     )));
-    assert!(!super::flush::retryable(&lake::Error::Parquet(
+    assert!(!super::flush::retryable(&lake::Error::from(
         parquet::errors::ParquetError::External(Box::new(std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )))

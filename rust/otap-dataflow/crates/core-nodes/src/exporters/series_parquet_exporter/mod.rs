@@ -59,6 +59,7 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 pub mod config;
 mod flush;
 mod metrics;
+mod outcome;
 #[cfg(test)]
 mod tests;
 mod token;
@@ -323,7 +324,7 @@ async fn run_announced(
 /// how it was decided, and how long the drain took.
 fn summarize(worker: &worker::Worker, since: Option<Instant>, deadline_exceeded: bool) {
     let outcomes = worker.notify.outcomes();
-    let acked = outcomes[token::Outcome::Ack as usize];
+    let acked = outcomes[outcome::Outcome::Ack as usize];
     let nacked = outcomes.iter().sum::<u64>() - acked;
     let duration =
         since.map(|since| otel_arrow_dfe_engine::clock::now().saturating_duration_since(since));
