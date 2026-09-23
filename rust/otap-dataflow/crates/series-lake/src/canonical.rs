@@ -3,6 +3,8 @@
 
 //! Canonical encoding v1 and series identity (spec section 4).
 
+use std::sync::Arc;
+
 use crate::value::Value;
 
 /// 16-byte series identity: XXH3-128 of the canonical bytes, big-endian.
@@ -111,7 +113,11 @@ pub struct Descriptor {
     /// Signal.
     pub signal: Signal,
     /// Resource attributes.
-    pub resource_attrs: Vec<(String, Value)>,
+    ///
+    /// Shared: every series of one request under the same resource holds the
+    /// one decoded list, so a request of many series under a large resource
+    /// copies that resource once, not once per series.
+    pub resource_attrs: Arc<[(String, Value)]>,
     /// Resource schema URL.
     pub resource_schema_url: String,
     /// Scope name.
@@ -120,8 +126,8 @@ pub struct Descriptor {
     pub scope_version: String,
     /// Scope schema URL.
     pub scope_schema_url: String,
-    /// Scope attributes.
-    pub scope_attrs: Vec<(String, Value)>,
+    /// Scope attributes, shared like `resource_attrs`.
+    pub scope_attrs: Arc<[(String, Value)]>,
     /// Metric fields (metrics only).
     pub metric: Option<MetricDescriptor>,
     /// Identity attributes: data point attributes, or allow-listed log attributes.
@@ -240,12 +246,12 @@ mod tests {
     fn logs_desc() -> Descriptor {
         Descriptor {
             signal: Signal::Logs,
-            resource_attrs: vec![("host.id".into(), Value::Str("a1".into()))],
+            resource_attrs: vec![("host.id".into(), Value::Str("a1".into()))].into(),
             resource_schema_url: String::new(),
             scope_name: "lib".into(),
             scope_version: "1".into(),
             scope_schema_url: String::new(),
-            scope_attrs: vec![],
+            scope_attrs: Arc::from([]),
             metric: None,
             attrs: vec![],
         }

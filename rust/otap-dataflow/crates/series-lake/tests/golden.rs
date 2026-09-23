@@ -92,12 +92,12 @@ fn descriptor_from_json(j: &serde_json::Value) -> Descriptor {
     );
     Descriptor {
         signal,
-        resource_attrs: kv_from_json(&j["resource_attrs"]),
+        resource_attrs: kv_from_json(&j["resource_attrs"]).into(),
         resource_schema_url: str_field(j, "resource_schema_url"),
         scope_name: str_field(j, "scope_name"),
         scope_version: str_field(j, "scope_version"),
         scope_schema_url: str_field(j, "scope_schema_url"),
-        scope_attrs: kv_from_json(&j["scope_attrs"]),
+        scope_attrs: kv_from_json(&j["scope_attrs"]).into(),
         metric,
         attrs: kv_from_json(&j["attrs"]),
     }

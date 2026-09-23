@@ -4,6 +4,7 @@
 //! Logs extraction.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
@@ -15,9 +16,10 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, any_value_col,
-    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at, flags_at, i64_at,
-    map_cell, opt_u16_at, plain, producer_id, str_at, struct_child, timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
+    any_value_col, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at,
+    flags_at, i64_at, identity, map_cell, opt_u16_at, plain, producer_id, str_at, struct_child,
+    timestamp_pair,
 };
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
@@ -56,6 +58,7 @@ pub(crate) fn extract_logs(
             descriptors: vec![],
             values: vec![],
             pinned_bytes: 0,
+            shared_bytes: 0,
             stats,
         });
     };
@@ -87,6 +90,8 @@ pub(crate) fn extract_logs(
     let mut descriptors: Vec<DescriptorRow> = Vec::new();
     let mut seen: HashSet<SeriesId> = HashSet::new();
     let mut memo: HashMap<MemoKey, SeriesId> = HashMap::new();
+    let mut resources = SharedLists::default();
+    let mut scopes = SharedLists::default();
 
     for row in 0..logs.num_rows() {
         let rid = opt_u16_at(&res_id, row);
@@ -101,12 +106,12 @@ pub(crate) fn extract_logs(
             .partition(|(k, _)| allow.iter().any(|a| a == k));
         let identity_key = crate::canonical::canonical_bytes(&Descriptor {
             signal: Signal::Logs,
-            resource_attrs: vec![],
+            resource_attrs: Arc::from([]),
             resource_schema_url: String::new(),
             scope_name: String::new(),
             scope_version: String::new(),
             scope_schema_url: String::new(),
-            scope_attrs: vec![],
+            scope_attrs: Arc::from([]),
             metric: None,
             attrs: identity_attrs.clone(),
         });
@@ -124,23 +129,29 @@ pub(crate) fn extract_logs(
             None => {
                 let descriptor = Descriptor {
                     signal: Signal::Logs,
-                    resource_attrs: resource.to_vec(),
+                    resource_attrs: resources.get(&resource_attrs, rid, budget)?,
                     resource_schema_url: key.resource_schema_url.clone(),
                     scope_name: key.scope_name.clone(),
                     scope_version: key.scope_version.clone(),
                     scope_schema_url: key.scope_schema_url.clone(),
-                    scope_attrs: scope.to_vec(),
+                    scope_attrs: scopes.get(&scope_attrs, sid, budget)?,
                     metric: None,
                     attrs: identity_attrs.clone(),
                 };
-                let dr = descriptor_row(descriptor, Dataset::LogsSeries, cfg, &mut stats, budget)?;
-                let id = dr.series_id;
+                // Two memo keys can name the same series; the identity is
+                // checked before the row is built, so a duplicate is neither
+                // built nor charged.
+                let identified = identity(&descriptor);
+                let id = identified.1;
                 if seen.insert(id) {
-                    descriptors.push(dr);
-                } else {
-                    // Two memo keys can hash to the same series: the duplicate
-                    // is not retained, so give its charge back.
-                    budget.uncharge(dr.approx_bytes);
+                    descriptors.push(descriptor_row(
+                        descriptor,
+                        identified,
+                        Dataset::LogsSeries,
+                        cfg,
+                        &mut stats,
+                        budget,
+                    )?);
                 }
                 let _ = memo.insert(key, id);
                 id
@@ -219,6 +230,7 @@ pub(crate) fn extract_logs(
         descriptors,
         values,
         pinned_bytes,
+        shared_bytes: resources.bytes() + scopes.bytes(),
         stats,
     })
 }
@@ -610,7 +622,8 @@ mod tests {
             .iter()
             .map(|d| d.approx_bytes)
             .sum::<usize>()
-            + out.pinned_bytes;
+            + out.pinned_bytes
+            + out.shared_bytes;
 
         let mut exact = cfg();
         exact.ingress.max_extracted_bytes = measured;

@@ -59,12 +59,12 @@ fn canon_nan(v: &Value) -> Value {
 fn desc(attrs: Vec<(String, Value)>) -> Descriptor {
     Descriptor {
         signal: Signal::Logs,
-        resource_attrs: vec![],
+        resource_attrs: vec![].into(),
         resource_schema_url: String::new(),
         scope_name: String::new(),
         scope_version: String::new(),
         scope_schema_url: String::new(),
-        scope_attrs: vec![],
+        scope_attrs: vec![].into(),
         metric: None,
         attrs,
     }

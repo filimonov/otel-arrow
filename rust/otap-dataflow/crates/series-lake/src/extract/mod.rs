@@ -59,20 +59,63 @@ pub struct DescriptorRow {
     /// Denormalized identity columns, in `denorm_columns(series dataset)` order.
     pub denorm: Vec<Option<DenormValue>>,
     /// Approximate retained bytes of the row.
+    ///
+    /// Counts the row's own decoded identity attributes, but not the resource
+    /// and scope lists, which are shared by every row of the request that
+    /// carries them and are charged once per request instead (see
+    /// [`SharedLists`]).
     pub approx_bytes: usize,
+    /// The decoded attribute tree bytes `approx_bytes` includes.
+    ///
+    /// Trees die at admission, so the block subtracts exactly these from the
+    /// row's charge.
+    pub decoded_bytes: usize,
 }
 
 impl DescriptorRow {
     /// Conservative Arrow series-row estimate, including stamp-swap headroom.
     #[must_use]
     pub fn series_row_bytes(&self) -> usize {
-        let decoded = kv_bytes(&self.descriptor.resource_attrs)
-            + kv_bytes(&self.descriptor.scope_attrs)
-            + kv_bytes(&self.descriptor.attrs);
         let columns = 10 + usize::from(self.descriptor.metric.is_some()) * 6 + self.denorm.len();
         // Builder growth, offsets and validity are charged here; decoded
         // attribute trees die at admission and are not charged to the block.
-        2 * (self.approx_bytes.saturating_sub(decoded) + columns * 64) + 8
+        2 * (self.approx_bytes.saturating_sub(self.decoded_bytes) + columns * 64) + 8
+    }
+}
+
+/// The resource or scope attribute lists of one request, decoded once per
+/// parent id and shared by every descriptor that carries them.
+///
+/// A list is copied out of its attribute table and charged to the request's
+/// budget the first time a new series needs it, never again: a request of
+/// many series under one large resource holds and charges one copy.
+#[derive(Default)]
+pub(crate) struct SharedLists {
+    lists: std::collections::HashMap<Option<u32>, Arc<[(String, Value)]>>,
+}
+
+impl SharedLists {
+    /// Decoded bytes of every list handed out so far.
+    pub(crate) fn bytes(&self) -> usize {
+        self.lists.values().map(|list| kv_bytes(list)).sum()
+    }
+
+    /// The shared list of parent `id` in `table`, copied and charged on first
+    /// use.
+    pub(crate) fn get(
+        &mut self,
+        table: &AttrTable,
+        id: Option<u32>,
+        budget: &mut Budget,
+    ) -> Result<Arc<[(String, Value)]>> {
+        if let Some(list) = self.lists.get(&id) {
+            return Ok(Arc::clone(list));
+        }
+        let source = attrs_of(table, id);
+        budget.charge(kv_bytes(source))?;
+        let list: Arc<[(String, Value)]> = Arc::from(source);
+        let _ = self.lists.insert(id, Arc::clone(&list));
+        Ok(list)
     }
 }
 
@@ -100,6 +143,12 @@ pub struct ExtractStats {
     /// always one of `cfg.logs.denormalize`/`cfg.metrics.denormalize`'s
     /// `column` names, so no attacker-controlled label can grow this map.
     pub denorm_type_mismatch_by_column: std::collections::BTreeMap<String, u64>,
+    /// Points whose series the per-request memo already knew, so no identity
+    /// was encoded or hashed for them (metrics only).
+    pub series_memo_hits: u64,
+    /// Series identities encoded and hashed because the memo did not know
+    /// the point's content (metrics only).
+    pub series_memo_misses: u64,
 }
 
 /// Result of extracting one request.
@@ -113,6 +162,12 @@ pub struct Extracted {
     pub values: Vec<(Dataset, Vec<RecordBatch>)>,
     /// Pinned bytes of all values batches.
     pub pinned_bytes: usize,
+    /// Decoded bytes of the resource and scope attribute lists the
+    /// descriptors share, charged once per request rather than per row.
+    ///
+    /// Retained with the descriptors until admission drops their trees, so
+    /// whoever holds an extraction holds these bytes too.
+    pub shared_bytes: usize,
     /// Counters.
     pub stats: ExtractStats,
 }
@@ -825,20 +880,32 @@ pub fn series_batch(
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
-/// Descriptor row constructor shared by logs and metrics.
+/// The canonical identity bytes of a descriptor and the series id they hash
+/// to.
+pub(crate) fn identity(descriptor: &Descriptor) -> (Vec<u8>, SeriesId) {
+    let identity_bytes = crate::canonical::canonical_bytes(descriptor);
+    let series_id = crate::canonical::series_id(&identity_bytes);
+    (identity_bytes, series_id)
+}
+
+/// Build and charge the series row of a descriptor whose identity is already
+/// known to be new in this request. Shared by logs and metrics.
 ///
 /// The row is charged to `budget` like any other row, so an oversized
 /// descriptor refuses the request through `max_row_bytes` and a request with
 /// very many series refuses through `max_extracted_bytes`.
+///
+/// The caller computes the identity with [`identity`] and checks it against
+/// the series it already holds first, so a duplicate is never built, looked
+/// up for denormalized columns or charged.
 pub(crate) fn descriptor_row(
     descriptor: Descriptor,
+    (identity_bytes, series_id): (Vec<u8>, SeriesId),
     ds_series: Dataset,
     cfg: &LakeConfig,
     stats: &mut ExtractStats,
     budget: &mut Budget,
 ) -> Result<DescriptorRow> {
-    let identity_bytes = crate::canonical::canonical_bytes(&descriptor);
-    let series_id = crate::canonical::series_id(&identity_bytes);
     let denorm: Vec<Option<DenormValue>> = denorm_columns(ds_series, cfg)
         .into_iter()
         .map(|d| {
@@ -854,10 +921,14 @@ pub(crate) fn descriptor_row(
     // series row: series_id + identity_bytes + emitted_at + the four schema/scope
     // strings + three attribute maps + the metric block + denormalized columns.
     //
-    // Each attribute list is counted twice on purpose: extraction temporarily
-    // retains both the decoded tree and its future rendered series row;
-    // admission drops the tree. The rendered map cell (`rendered_kv_bytes`) can
-    // be much larger than the tree, through hex encoding and JSON escaping.
+    // The identity attribute list is counted twice on purpose: extraction
+    // temporarily retains both the decoded tree and its future rendered series
+    // row; admission drops the tree. The rendered map cell
+    // (`rendered_kv_bytes`) can be much larger than the tree, through hex
+    // encoding and JSON escaping. The resource and scope trees are shared by
+    // the request's rows and charged once, by `SharedLists`; each row still
+    // renders its own copy of them.
+    let decoded_bytes = kv_bytes(&descriptor.attrs);
     let approx_bytes = 16
         + identity_bytes.len()
         + 8
@@ -865,9 +936,7 @@ pub(crate) fn descriptor_row(
         + descriptor.scope_name.len()
         + descriptor.scope_version.len()
         + descriptor.scope_schema_url.len()
-        + kv_bytes(&descriptor.resource_attrs)
-        + kv_bytes(&descriptor.scope_attrs)
-        + kv_bytes(&descriptor.attrs)
+        + decoded_bytes
         + rendered_kv_bytes(&descriptor.resource_attrs)
         + rendered_kv_bytes(&descriptor.scope_attrs)
         + rendered_kv_bytes(&descriptor.attrs)
@@ -882,6 +951,7 @@ pub(crate) fn descriptor_row(
         descriptor,
         denorm,
         approx_bytes,
+        decoded_bytes,
     })
 }
 

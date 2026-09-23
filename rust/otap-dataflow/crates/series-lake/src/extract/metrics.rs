@@ -24,9 +24,10 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, ValuesRow, attr_table, attrs_of,
-    denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, kv_bytes, list_col, opt_f64,
-    opt_i64, opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child, timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
+    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at, i64_at, identity,
+    list_col, opt_f64, opt_i64, opt_u16_at, opt_u32_at, plain, producer_id, str_at, struct_child,
+    timestamp_pair,
 };
 use crate::attrs::AttrTable;
 use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
@@ -40,9 +41,9 @@ use crate::value::{DecodeLimits, Value};
 /// The resource and scope attribute *ids* are kept, not their attribute lists:
 /// many metrics of one request share a single resource, and copying that list
 /// per metric here would allocate a multiple of the request's attribute volume
-/// before any [`Budget`] charge could refuse it. The lists are resolved and
-/// copied once per distinct series, in [`Common::series_for`], after the copy
-/// has been charged.
+/// before any [`Budget`] charge could refuse it. The lists are resolved,
+/// charged and copied once per request, by [`SharedLists`], the first time a
+/// new series needs them, and shared by every descriptor after that.
 struct MetricRow {
     /// Resource attribute parent id, `None` when the metric carries none.
     resource_id: Option<u32>,
@@ -55,21 +56,85 @@ struct MetricRow {
     metric: MetricDescriptor,
 }
 
-/// Memo key for a metrics series: the metric and the point's attribute parent.
+/// Memo key for a metrics series: the metric and the *content* of the point's
+/// attributes.
 ///
-/// `attrs_id` is the point's own OTAP `id`, which is the parent key of its
-/// attribute batch. The key needs no discriminator for which attribute table
-/// the id came from: a metric has exactly one kind, so all of a metric's points
-/// live in a single point payload and therefore resolve against a single
-/// attribute table (`NumberDpAttrs` or `HistogramDpAttrs`). Two metrics never
-/// share a `metric_id`, so ids from the two tables cannot collide in this map.
-///
-/// Both ids are optional, because pdata writes a null id for a point that has
-/// no attributes; `None` must stay distinct from attribute parent 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct MemoKey {
+/// Not the point's attribute parent id: pdata gives every point its own id,
+/// so two points of one series never share it, and a memo keyed on it would
+/// never hit. The attribute list is borrowed from the point kind's attribute
+/// table, which lives as long as that kind's loop, so the memo is one per
+/// point kind. A metric has exactly one kind, so no series spans the two
+/// memos. Equality is the list's own equality, so a hash collision can never
+/// merge two series; a list with a NaN double never equals itself and only
+/// misses the memo, which the `seen` check below still deduplicates.
+#[derive(Debug, Clone, Copy)]
+struct MemoKey<'t> {
     metric_id: u32,
-    attrs_id: Option<u32>,
+    attrs: &'t [(String, Value)],
+}
+
+impl PartialEq for MemoKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.metric_id == other.metric_id && self.attrs == other.attrs
+    }
+}
+
+impl Eq for MemoKey<'_> {}
+
+impl std::hash::Hash for MemoKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.metric_id.hash(state);
+        self.attrs.len().hash(state);
+        for (key, value) in self.attrs {
+            key.hash(state);
+            hash_value(value, state);
+        }
+    }
+}
+
+/// Hash one attribute value consistently with its `PartialEq`: equal values
+/// hash alike (a double by its bits, which only splits `0.0` from `-0.0` into
+/// two memo entries of one series).
+fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
+    use std::hash::Hash;
+    match value {
+        Value::Null => 0_u8.hash(state),
+        Value::Str(s) => {
+            1_u8.hash(state);
+            s.hash(state);
+        }
+        Value::Bytes(b) => {
+            2_u8.hash(state);
+            b.hash(state);
+        }
+        Value::Int(i) => {
+            3_u8.hash(state);
+            i.hash(state);
+        }
+        Value::Double(d) => {
+            4_u8.hash(state);
+            d.to_bits().hash(state);
+        }
+        Value::Bool(b) => {
+            5_u8.hash(state);
+            b.hash(state);
+        }
+        Value::Array(items) => {
+            6_u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::KvList(entries) => {
+            7_u8.hash(state);
+            entries.len().hash(state);
+            for (key, value) in entries {
+                key.hash(state);
+                hash_value(value, state);
+            }
+        }
+    }
 }
 
 fn metric_rows(records: &OtapArrowRecords, cfg: &LakeConfig) -> Result<HashMap<u32, MetricRow>> {
@@ -182,9 +247,12 @@ struct Common<'a> {
     metrics: &'a HashMap<u32, MetricRow>,
     resource_attrs: &'a AttrTable,
     scope_attrs: &'a AttrTable,
+    /// Resource lists shared by the request's descriptors, one per parent.
+    resources: SharedLists,
+    /// Scope lists shared by the request's descriptors, one per parent.
+    scopes: SharedLists,
     descriptors: Vec<DescriptorRow>,
     seen: HashSet<SeriesId>,
-    memo: HashMap<MemoKey, SeriesId>,
     stats: ExtractStats,
 }
 
@@ -199,63 +267,59 @@ fn metric_of(metrics: &HashMap<u32, MetricRow>, metric_id: u32) -> Result<&Metri
 }
 
 impl Common<'_> {
-    /// Series id for (metric, point attrs), memoized before any hashing.
+    /// Series id for (metric, point attrs), memoized on content before any
+    /// encoding or hashing.
     ///
-    /// Without the memo, `canonical_bytes` plus XXH3 plus the denormalized
-    /// lookups would run once per data point instead of once per series, and
-    /// `stats.denorm_type_mismatch` would count points rather than series.
-    ///
-    /// The descriptor's attribute lists are copied here, once per distinct memo
-    /// key, and the copy is charged to `budget` *before* it is made: a request
-    /// whose metrics all share one large resource attribute list is refused at
-    /// the charge rather than after allocating a copy per metric. The charge is
-    /// released as soon as the copy exists and before [`descriptor_row`]
-    /// charges the whole row, which already includes that copy; counting the
-    /// two together would refuse a request that fits its budget.
-    fn series_for(
+    /// Without the memo, `canonical_bytes` plus XXH3 would run once per data
+    /// point instead of once per series. On a miss the identity is computed
+    /// from a descriptor whose resource and scope lists are the request's
+    /// shared copies, and it is checked against the series already held
+    /// before the row is built: a duplicate is neither built nor charged, and
+    /// its denormalized columns are not looked up, so
+    /// `stats.denorm_type_mismatch` counts series rather than points.
+    fn series_for<'t>(
         &mut self,
+        memo: &mut HashMap<MemoKey<'t>, SeriesId>,
         metric_id: u32,
-        attrs_id: Option<u32>,
-        attrs: &[(String, Value)],
+        attrs: &'t [(String, Value)],
         budget: &mut Budget,
     ) -> Result<SeriesId> {
-        let key = MemoKey {
-            metric_id,
-            attrs_id,
-        };
-        if let Some(id) = self.memo.get(&key) {
+        let key = MemoKey { metric_id, attrs };
+        if let Some(id) = memo.get(&key) {
+            self.stats.series_memo_hits += 1;
             return Ok(*id);
         }
+        self.stats.series_memo_misses += 1;
         let m = metric_of(self.metrics, metric_id)?;
-        let resource = attrs_of(self.resource_attrs, m.resource_id);
-        let scope = attrs_of(self.scope_attrs, m.scope_id);
-        let copy_bytes = kv_bytes(resource) + kv_bytes(scope) + kv_bytes(attrs);
-        budget.charge_row(copy_bytes)?;
+        let resource_attrs = self
+            .resources
+            .get(self.resource_attrs, m.resource_id, budget)?;
+        let scope_attrs = self.scopes.get(self.scope_attrs, m.scope_id, budget)?;
         let d = Descriptor {
             signal: Signal::Metrics,
-            resource_attrs: resource.to_vec(),
+            resource_attrs,
             resource_schema_url: m.resource_schema_url.clone(),
             scope_name: m.scope_name.clone(),
             scope_version: m.scope_version.clone(),
             scope_schema_url: m.scope_schema_url.clone(),
-            scope_attrs: scope.to_vec(),
+            scope_attrs,
             metric: Some(m.metric.clone()),
             attrs: attrs.to_vec(),
         };
-        // The copy exists now and `descriptor_row` charges the whole row that
-        // holds it, so the provisional charge is released first rather than
-        // stacked on top of the row charge.
-        budget.uncharge(copy_bytes);
-        let dr = descriptor_row(d, Dataset::MetricsSeries, self.cfg, &mut self.stats, budget)?;
-        let id = dr.series_id;
+        let identified = identity(&d);
+        let id = identified.1;
         if self.seen.insert(id) {
+            let dr = descriptor_row(
+                d,
+                identified,
+                Dataset::MetricsSeries,
+                self.cfg,
+                &mut self.stats,
+                budget,
+            )?;
             self.descriptors.push(dr);
-        } else {
-            // Two memo keys can hash to the same series: the duplicate is not
-            // retained, so give its charge back.
-            budget.uncharge(dr.approx_bytes);
         }
-        let _ = self.memo.insert(key, id);
+        let _ = memo.insert(key, id);
         Ok(id)
     }
 }
@@ -361,9 +425,10 @@ pub(crate) fn extract_metrics(
         metrics: &metrics,
         resource_attrs: &resource_attrs,
         scope_attrs: &scope_attrs,
+        resources: SharedLists::default(),
+        scopes: SharedLists::default(),
         descriptors: Vec::new(),
         seen: HashSet::new(),
-        memo: HashMap::new(),
         stats: ExtractStats::default(),
     };
 
@@ -417,6 +482,7 @@ pub(crate) fn extract_metrics(
     // Number points.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, limits)?;
+        let mut memo = HashMap::new();
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let pid = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -432,7 +498,7 @@ pub(crate) fn extract_metrics(
                 Some(id) => attrs.get(id),
                 None => &[],
             };
-            let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
+            let id = c.series_for(&mut memo, metric_id, point_attrs, budget)?;
             let m = metric_of(&metrics, metric_id)?;
             let resource = attrs_of(&resource_attrs, m.resource_id);
             let scope = attrs_of(&scope_attrs, m.scope_id);
@@ -479,6 +545,7 @@ pub(crate) fn extract_metrics(
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, limits)?;
+        let mut memo = HashMap::new();
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
         let pid = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
@@ -498,7 +565,7 @@ pub(crate) fn extract_metrics(
                 Some(id) => attrs.get(id),
                 None => &[],
             };
-            let id = c.series_for(metric_id, attrs_id, point_attrs, budget)?;
+            let id = c.series_for(&mut memo, metric_id, point_attrs, budget)?;
             let m = metric_of(&metrics, metric_id)?;
             let counts = bucket_counts_at(&bc, row)?;
             let bounds = explicit_bounds_at(&eb, row)?;
@@ -574,6 +641,7 @@ pub(crate) fn extract_metrics(
         descriptors,
         values,
         pinned_bytes,
+        shared_bytes: c.resources.bytes() + c.scopes.bytes(),
         stats: c.stats,
     })
 }
@@ -746,17 +814,19 @@ mod tests {
         ));
     }
 
-    /// Scenario: one metric under a resource carrying a 64 KiB attribute, with
-    /// `max_extracted_bytes` set just above what the request actually retains.
-    /// Guarantees: the request is accepted. The provisional charge for the
-    /// attribute copy is released before the descriptor row -- which already
-    /// includes that copy -- is charged, so the two are never counted together
-    /// and a request that fits its budget is not refused transiently.
+    /// Scenario: one metric under a resource carrying a 256 KiB attribute,
+    /// with `max_extracted_bytes` set just above what the request actually
+    /// retains: its descriptor rows, its values and its one shared resource
+    /// copy.
+    /// Guarantees: the request is accepted. The shared copy is charged once,
+    /// when it is made, and the descriptor row that holds it charges only its
+    /// own rendering of it, so the two are never counted together and a
+    /// request that fits its budget is not refused transiently.
     #[test]
-    fn the_copy_charge_is_released_before_the_descriptor_row_is_charged() {
-        // Large enough that the provisional copy charge outweighs the fixed
-        // Arrow builder overhead the values batch adds at the end, so the
-        // descriptor charge is the peak the limit below binds on.
+    fn the_shared_resource_copy_is_charged_once() {
+        // Large enough that the copy outweighs the fixed Arrow builder
+        // overhead the values batch adds at the end, so the descriptor charge
+        // is the peak the limit below binds on.
         const ATTR_BYTES: usize = 256 << 10;
         let d = many_metrics_one_big_resource(1, ATTR_BYTES);
 
@@ -769,7 +839,8 @@ mod tests {
             .iter()
             .map(|r| r.approx_bytes)
             .sum::<usize>()
-            + out.pinned_bytes;
+            + out.pinned_bytes
+            + out.shared_bytes;
         // The premise: the copy alone is a large fraction of the retained size,
         // so counting it twice would take the request past the limit below.
         assert!(retained > ATTR_BYTES);
@@ -1335,6 +1406,92 @@ mod tests {
         assert_eq!(
             explicit_bounds_at(&None, 0).expect("absent"),
             Vec::<f64>::new()
+        );
+    }
+
+    /// A request shaped like a Kubernetes node's metrics: one resource with
+    /// 25 attributes of realistic size, `metrics` gauges, each with
+    /// `sets` distinct point attribute sets and `points` points per set.
+    fn k8s_request(metrics: usize, sets: usize, points: usize) -> MetricsData {
+        let resource = (0..25)
+            .map(|i| {
+                kv(
+                    &format!("k8s.resource.attribute.{i:02}"),
+                    &format!("{i:02}-{}", "v".repeat(60)),
+                )
+            })
+            .collect();
+        let metrics = (0..metrics)
+            .map(|m| Metric {
+                name: format!("k8s.container.metric.{m}"),
+                unit: "1".into(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: (0..sets)
+                        .flat_map(|set| {
+                            (0..points).map(move |p| {
+                                dp(
+                                    10 + p as u64,
+                                    number_data_point::Value::AsInt(p as i64),
+                                    vec![
+                                        kv("k8s.pod.name", &format!("pod-{set:05}")),
+                                        kv("k8s.container.name", "app"),
+                                        kv("k8s.namespace.name", "default"),
+                                    ],
+                                )
+                            })
+                        })
+                        .collect(),
+                })),
+                ..Default::default()
+            })
+            .collect();
+        MetricsData {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: resource,
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Scenario: 8192 points under one 25-attribute resource at the default
+    /// limits: eight gauges, 512 point attribute sets each, two points per
+    /// set, so 4096 series of two points.
+    /// Guarantees: the request is accepted; the memo answers the second point
+    /// of every series without encoding or hashing it again (4096 hits, 4096
+    /// misses); every series is built once; and the resource list is decoded
+    /// and charged once for the whole request rather than once per series.
+    /// Before the memo was keyed on content and the resource shared, the same
+    /// request was refused as too large for `ingress.max_extracted_bytes`.
+    #[test]
+    fn many_points_under_a_wide_resource_hit_the_memo_and_fit_the_default_budget() {
+        let d = k8s_request(8, 512, 2);
+        let cfg = LakeConfig::default();
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&encode_metrics(&d), &cfg, &mut budget)
+            .expect("8k points under a wide resource fit the default budget");
+        assert_eq!(out.stats.rows, 8192);
+        assert_eq!(out.descriptors.len(), 4096);
+        assert_eq!(out.stats.series_memo_hits, 4096);
+        assert_eq!(out.stats.series_memo_misses, 4096);
+        let resource = &out.descriptors[0].descriptor.resource_attrs;
+        assert_eq!(resource.len(), 25);
+        assert_eq!(
+            out.shared_bytes,
+            super::super::kv_bytes(resource),
+            "one shared copy of the resource, no scope attributes"
+        );
+        assert!(
+            out.descriptors
+                .iter()
+                .all(|row| std::sync::Arc::ptr_eq(&row.descriptor.resource_attrs, resource)),
+            "every descriptor holds the one shared resource list"
         );
     }
 }

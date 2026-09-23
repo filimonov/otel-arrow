@@ -1190,6 +1190,7 @@ impl Worker {
             .sum::<usize>();
         let pending = self.pending.as_ref().map_or(0, |parked| {
             parked.extracted.pinned_bytes
+                + parked.extracted.shared_bytes
                 + parked
                     .extracted
                     .descriptors

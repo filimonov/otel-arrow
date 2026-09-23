@@ -1159,12 +1159,7 @@ mod tests {
                 + token
                 + e.descriptors
                     .iter()
-                    .map(|d| {
-                        let decoded = crate::extract::kv_bytes(&d.descriptor.resource_attrs)
-                            + crate::extract::kv_bytes(&d.descriptor.scope_attrs)
-                            + crate::extract::kv_bytes(&d.descriptor.attrs);
-                        2 * (d.approx_bytes - decoded) + 128 * columns + 8 + q
-                    })
+                    .map(|d| 2 * (d.approx_bytes - d.decoded_bytes) + 128 * columns + 8 + q)
                     .sum::<usize>();
             let block: Block<u32> = Block::new(0, 1, &cfg);
             let reservation = block

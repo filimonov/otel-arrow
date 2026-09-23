@@ -525,12 +525,12 @@ fn log_rec() -> impl Strategy<Value = LogRec> {
 fn logs_descriptor(r: &LogRec) -> Descriptor {
     Descriptor {
         signal: Signal::Logs,
-        resource_attrs: vec![attr("host.id", &host_name(r.host))],
+        resource_attrs: vec![attr("host.id", &host_name(r.host))].into(),
         resource_schema_url: resource_schema(r.host),
         scope_name: scope_name(r.scope),
         scope_version: scope_version(r.scope),
         scope_schema_url: scope_schema(r.scope),
-        scope_attrs: vec![attr("sa", &scope_attr_value(r.scope))],
+        scope_attrs: vec![attr("sa", &scope_attr_value(r.scope))].into(),
         metric: None,
         attrs: vec![attr("logger.name", &logger_name(r.logger))],
     }
@@ -767,12 +767,12 @@ fn metrics_descriptor(
 ) -> Descriptor {
     Descriptor {
         signal: Signal::Metrics,
-        resource_attrs: vec![attr("host.id", &host_name(host))],
+        resource_attrs: vec![attr("host.id", &host_name(host))].into(),
         resource_schema_url: resource_schema(host),
         scope_name: scope_name(scope),
         scope_version: scope_version(scope),
         scope_schema_url: scope_schema(scope),
-        scope_attrs: vec![attr("sa", &scope_attr_value(scope))],
+        scope_attrs: vec![attr("sa", &scope_attr_value(scope))].into(),
         metric: Some(MetricDescriptor {
             name: metric_name(m),
             unit: metric_unit(m),
