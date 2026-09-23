@@ -6,15 +6,20 @@
 //! The user-facing shape is deliberately flatter than
 //! [`otel_arrow_dfe_series_lake::config::LakeConfig`]: block budgets live under
 //! `window` next to the interval that governs them, and byte-valued settings
-//! accept the human byte units (`64MiB`) the rest of the engine accepts.
-//! [`RawConfig`] is the literal user document; [`Config`] is the validated
-//! result, and every constraint the core crate enforces is checked here so a
-//! bad pipeline is refused at startup rather than at the first request.
+//! accept the human byte units (`64MiB`) the rest of the engine accepts,
+//! through field annotations on the typed sections. [`RawConfig`] is the
+//! literal user document; [`Config`] is the validated result, and every
+//! constraint the core crate enforces is checked here so a bad pipeline is
+//! refused at startup rather than at the first request. Every refusal names
+//! the dotted key a user writes, one rule per message.
 
+use otel_arrow_dfe_config::byte_units::deserialize_required_usize;
 use otel_arrow_dfe_otap::object_store::{RetryOptions, StorageType};
-use otel_arrow_dfe_series_lake::config::{LakeConfig, SignalConfig, UnsupportedPolicy};
+use otel_arrow_dfe_series_lake::config::{
+    IngressLimits, LakeConfig, ParquetConfig, SignalConfig, SortingConfig, UnsupportedPolicy,
+    UploadConfig,
+};
 use serde::{Deserialize, Deserializer};
-use serde_json::Value;
 use std::time::Duration;
 
 /// Window rotation interval and the budgets of one block.
@@ -25,7 +30,7 @@ pub(super) struct Window {
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
     /// Retained-bytes limit of one block.
-    #[serde(deserialize_with = "byte_size")]
+    #[serde(deserialize_with = "deserialize_required_usize")]
     pub max_block_bytes: usize,
     /// Ack tokens one block may hold.
     pub max_requests_per_block: usize,
@@ -45,11 +50,58 @@ impl Default for Window {
     }
 }
 
-/// Deserialize a byte size written either as a number or as `64MiB`.
-fn byte_size<'de, D: Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
-    let n = otel_arrow_dfe_config::byte_units::deserialize_u64(d)?
-        .ok_or_else(|| serde::de::Error::custom("byte size cannot be null"))?;
-    usize::try_from(n).map_err(serde::de::Error::custom)
+/// The request-level budgets a user sets under `ingress`.
+///
+/// Only four of the lake's ingress limits: the two block-level ones are set
+/// under `window`, so writing them here is an unknown field rather than a
+/// value that would be silently overridden.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Ingress {
+    #[serde(deserialize_with = "deserialize_required_usize")]
+    max_request_bytes: usize,
+    #[serde(deserialize_with = "deserialize_required_usize")]
+    max_extracted_bytes: usize,
+    #[serde(deserialize_with = "deserialize_required_usize")]
+    max_row_bytes: usize,
+    max_nesting_depth: usize,
+}
+
+impl Default for Ingress {
+    fn default() -> Self {
+        let lake = IngressLimits::default();
+        Self {
+            max_request_bytes: lake.max_request_bytes,
+            max_extracted_bytes: lake.max_extracted_bytes,
+            max_row_bytes: lake.max_row_bytes,
+            max_nesting_depth: lake.max_nesting_depth,
+        }
+    }
+}
+
+/// The Parquet writer settings a user sets under `parquet`.
+///
+/// `compression` documents the one codec the sink writes; any other value is
+/// refused rather than ignored.
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Parquet {
+    compression: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_usize")]
+    row_group_bytes: usize,
+    #[serde(deserialize_with = "deserialize_required_usize")]
+    writer_limit_bytes: usize,
+}
+
+impl Default for Parquet {
+    fn default() -> Self {
+        let lake = ParquetConfig::default();
+        Self {
+            compression: None,
+            row_group_bytes: lake.row_group_bytes,
+            writer_limit_bytes: lake.writer_limit_bytes,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,6 +118,27 @@ impl Default for Cache {
     }
 }
 
+/// Define a `deserialize_with` function that reads one section and prefixes
+/// its error with the section's key, so a misspelled or malformed setting is
+/// reported as `ingress: unknown field ...` rather than without a location.
+macro_rules! section {
+    ($name:ident, $ty:ty, $key:literal) => {
+        fn $name<'de, D: Deserializer<'de>>(d: D) -> Result<$ty, D::Error> {
+            <$ty>::deserialize(d)
+                .map_err(|e| serde::de::Error::custom(format!(concat!($key, ": {}"), e)))
+        }
+    };
+}
+
+section!(window_section, Window, "window");
+section!(ingress_section, Ingress, "ingress");
+section!(cache_section, Cache, "series_cache");
+section!(sorting_section, SortingConfig, "sorting");
+section!(upload_section, UploadConfig, "upload");
+section!(parquet_section, Parquet, "parquet");
+section!(logs_section, SignalConfig, "logs");
+section!(metrics_section, SignalConfig, "metrics");
+
 /// The user document exactly as written, before cross-field validation.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,28 +150,25 @@ struct RawConfig {
     writer_id: String,
     #[serde(default = "producer")]
     producer_id_attribute: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "window_section")]
     window: Window,
-    // The budget sections below stay as raw JSON until their byte-unit strings
-    // have been rewritten into numbers, because the core crate's own structs
-    // deserialize plain integers.
-    #[serde(default = "object")]
-    ingress: Value,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "ingress_section")]
+    ingress: Ingress,
+    #[serde(default, deserialize_with = "cache_section")]
     series_cache: Cache,
-    #[serde(default = "object")]
-    sorting: Value,
-    #[serde(default = "object")]
-    upload: Value,
-    #[serde(default = "object")]
-    parquet: Value,
+    #[serde(default, deserialize_with = "sorting_section")]
+    sorting: SortingConfig,
+    #[serde(default, deserialize_with = "upload_section")]
+    upload: UploadConfig,
+    #[serde(default, deserialize_with = "parquet_section")]
+    parquet: Parquet,
     #[serde(default = "batch")]
     notify_batch: usize,
     #[serde(default)]
     unsupported: UnsupportedPolicy,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "logs_section")]
     logs: SignalConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "metrics_section")]
     metrics: SignalConfig,
 }
 
@@ -112,29 +182,6 @@ fn producer() -> String {
 
 fn batch() -> usize {
     64
-}
-
-fn object() -> Value {
-    Value::Object(serde_json::Map::new())
-}
-
-/// Rewrite every `*_bytes` field of a budget section from a byte-unit string
-/// into a plain number, so the core crate's structs can deserialize it.
-fn normalized(mut value: Value) -> Result<Value, String> {
-    let fields = value
-        .as_object_mut()
-        .ok_or("budget section must be an object")?;
-    for (name, field) in fields {
-        if name.ends_with("_bytes") {
-            let n = byte_size(field.clone()).map_err(|e| e.to_string())?;
-            *field = Value::from(n);
-        }
-    }
-    Ok(value)
-}
-
-fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, String> {
-    serde_json::from_value(normalized(value)?).map_err(|e| e.to_string())
 }
 
 /// Refuse a store retry budget that one write attempt could spend past the
@@ -191,7 +238,7 @@ pub struct Config {
 impl TryFrom<RawConfig> for Config {
     type Error = String;
 
-    fn try_from(mut raw: RawConfig) -> Result<Self, String> {
+    fn try_from(raw: RawConfig) -> Result<Self, String> {
         let interval = raw.window.interval;
         if interval.is_zero()
             || interval.subsec_nanos() != 0
@@ -199,80 +246,98 @@ impl TryFrom<RawConfig> for Config {
         {
             return Err("window.interval must be positive whole seconds fitting i64".into());
         }
-        if raw.notify_batch == 0
-            || raw.series_cache.max_entries == 0
-            || raw.window.flush_retry_deadline.is_zero()
-        {
-            return Err("notify_batch, cache entries and flush deadline must be positive".into());
+        if raw.window.flush_retry_deadline.is_zero() {
+            return Err("window.flush_retry_deadline must be positive".into());
         }
-        // `ingress` carries only the four request-level budgets here; the two
-        // block-level ones are taken from `window` below, so a user who sets
-        // them in both places would otherwise get a silently ignored value.
-        for key in raw
-            .ingress
-            .as_object()
-            .ok_or("ingress must be an object")?
-            .keys()
+        if raw.window.max_requests_per_block == 0 {
+            return Err("window.max_requests_per_block must be at least 1".into());
+        }
+        // The node sizes its notification buffer from this count; refuse a
+        // value that cannot be doubled rather than overflowing there.
+        if raw.window.max_requests_per_block.checked_mul(2).is_none() {
+            return Err("window.max_requests_per_block overflows the notification capacity".into());
+        }
+        if raw.notify_batch == 0 {
+            return Err("notify_batch must be positive".into());
+        }
+        if raw.series_cache.max_entries == 0 {
+            return Err("series_cache.max_entries must be positive".into());
+        }
+        if let Some(compression) = &raw.parquet.compression
+            && compression != "zstd"
         {
-            if ![
-                "max_request_bytes",
-                "max_extracted_bytes",
-                "max_row_bytes",
-                "max_nesting_depth",
-            ]
-            .contains(&key.as_str())
-            {
-                return Err(format!("unknown ingress setting {key}"));
+            // The sink always writes zstd; refuse anything else rather than
+            // writing a different codec than the document claims.
+            return Err(format!(
+                "parquet.compression must be zstd (the only codec written), not {compression:?}"
+            ));
+        }
+        for (key, value) in [
+            ("ingress.max_request_bytes", raw.ingress.max_request_bytes),
+            (
+                "ingress.max_extracted_bytes",
+                raw.ingress.max_extracted_bytes,
+            ),
+            ("ingress.max_row_bytes", raw.ingress.max_row_bytes),
+            ("ingress.max_nesting_depth", raw.ingress.max_nesting_depth),
+            ("sorting.run_target_bytes", raw.sorting.run_target_bytes),
+            ("sorting.merge_chunk_bytes", raw.sorting.merge_chunk_bytes),
+            ("parquet.row_group_bytes", raw.parquet.row_group_bytes),
+            ("parquet.writer_limit_bytes", raw.parquet.writer_limit_bytes),
+        ] {
+            if value == 0 {
+                return Err(format!("{key} must be positive"));
             }
         }
-        // The sink always writes zstd. Accept the value that documents it and
-        // refuse anything else rather than writing a different codec silently.
-        let parquet = raw
-            .parquet
-            .as_object_mut()
-            .ok_or("parquet must be an object")?;
-        if let Some(compression) = parquet.remove("compression")
-            && compression != Value::String("zstd".into())
-        {
-            return Err("parquet.compression must be zstd".into());
+        if raw.upload.abort_timeout.is_zero() {
+            return Err("upload.abort_timeout must be positive".into());
         }
-        let mut lake = LakeConfig {
+        // The two cross-field rules whose lake form names lake keys: checked
+        // here first with the keys the user writes.
+        if raw.window.max_block_bytes / 2 < raw.ingress.max_extracted_bytes {
+            return Err(
+                "window.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
+                 because a request's series rows may take up to twice their extracted size \
+                 in a block"
+                    .into(),
+            );
+        }
+        if raw.ingress.max_row_bytes > raw.sorting.run_target_bytes / 4 {
+            return Err(
+                "ingress.max_row_bytes must be at most sorting.run_target_bytes / 4".into(),
+            );
+        }
+        let lake = LakeConfig {
             writer_id: raw.writer_id,
             producer_id_attribute: raw.producer_id_attribute,
             window_interval: interval,
-            ingress: decode(raw.ingress)?,
-            sorting: decode(raw.sorting)?,
-            upload: decode(raw.upload)?,
-            parquet: decode(raw.parquet)?,
+            ingress: IngressLimits {
+                max_request_bytes: raw.ingress.max_request_bytes,
+                max_extracted_bytes: raw.ingress.max_extracted_bytes,
+                max_row_bytes: raw.ingress.max_row_bytes,
+                max_nesting_depth: raw.ingress.max_nesting_depth,
+                max_block_bytes: raw.window.max_block_bytes,
+                max_requests_per_block: raw.window.max_requests_per_block,
+                ..IngressLimits::default()
+            },
+            sorting: raw.sorting,
+            upload: raw.upload,
+            parquet: ParquetConfig {
+                row_group_bytes: raw.parquet.row_group_bytes,
+                writer_limit_bytes: raw.parquet.writer_limit_bytes,
+            },
             unsupported: raw.unsupported,
             logs: raw.logs,
             metrics: raw.metrics,
         };
-        lake.ingress.max_block_bytes = raw.window.max_block_bytes;
-        lake.ingress.max_requests_per_block = raw.window.max_requests_per_block;
-        if [
-            lake.ingress.max_request_bytes,
-            lake.ingress.max_extracted_bytes,
-            lake.ingress.max_row_bytes,
-            lake.ingress.max_nesting_depth,
-            lake.sorting.run_target_bytes,
-            lake.sorting.merge_chunk_bytes,
-            lake.parquet.row_group_bytes,
-            lake.parquet.writer_limit_bytes,
-        ]
-        .contains(&0)
-            || lake.upload.abort_timeout.is_zero()
-        {
-            return Err("all byte, depth and abort budgets must be positive".into());
-        }
-        // The node sizes its notification buffer from this count; refuse a
-        // value that cannot be doubled rather than overflowing there.
-        let _ = lake
-            .ingress
-            .max_requests_per_block
-            .checked_mul(2)
-            .ok_or("request count overflows notification capacity")?;
-        lake.validate().map_err(|e| e.to_string())?;
+        lake.validate().map_err(|e| match e {
+            // A configuration rule's own sentence, without the request
+            // refusal wrapper the lake error type carries.
+            otel_arrow_dfe_series_lake::Error::Refused(
+                otel_arrow_dfe_series_lake::RefuseReason::Invalid(rule),
+            ) => rule,
+            other => other.to_string(),
+        })?;
         check_retry_deadline(
             !matches!(raw.storage, StorageType::File { .. }),
             raw.retry.as_ref(),

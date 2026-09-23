@@ -10,6 +10,38 @@ use serde::{Deserialize, Deserializer};
 
 use crate::error::{Error, Result};
 
+/// Deserialize a byte size written either as a number of bytes or as a
+/// string with units (`64MiB`, `1 GB`), the form every byte-valued engine
+/// setting accepts.
+///
+/// Local to this crate, over the same `byte-unit` parser the engine's config
+/// crate uses, so the format library does not depend on the engine's
+/// configuration stack.
+fn byte_size<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<usize, D::Error> {
+    use serde::de::Error as _;
+    let bytes = match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            D::Error::custom(format!("byte size {n} must be a non-negative integer"))
+        })?,
+        serde_json::Value::String(text) => text
+            .parse::<byte_unit::Byte>()
+            .map_err(|e| D::Error::custom(format!("byte size {text:?}: {e}")))?
+            .as_u64(),
+        serde_json::Value::Null => return Err(D::Error::custom("byte size must not be null")),
+        other => {
+            return Err(D::Error::custom(format!(
+                "byte size must be a number of bytes or a string such as \"64MiB\", not {other}"
+            )));
+        }
+    };
+    usize::try_from(bytes).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "byte size {bytes} exceeds this platform's usize::MAX ({})",
+            usize::MAX
+        ))
+    })
+}
+
 /// Storage type of a denormalized column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -208,6 +240,7 @@ impl Default for SignalConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct IngressLimits {
     /// Logical input size limit.
+    #[serde(deserialize_with = "byte_size")]
     pub max_request_bytes: usize,
     /// Extracted output limit, enforced on the *measured* extracted output.
     ///
@@ -216,16 +249,20 @@ pub struct IngressLimits {
     /// bytes of the Arrow batch, so a row is never counted twice. Descriptor
     /// rows, which are not sealed into Arrow batches during extraction, stay
     /// charged at their estimated size.
+    #[serde(deserialize_with = "byte_size")]
     pub max_extracted_bytes: usize,
     /// Single row limit.
+    #[serde(deserialize_with = "byte_size")]
     pub max_row_bytes: usize,
     /// Nested value depth limit.
     pub max_nesting_depth: usize,
     /// Retained-bytes limit of one block (spec section 6.1).
+    #[serde(deserialize_with = "byte_size")]
     pub max_block_bytes: usize,
     /// Ack tokens (requests) one block may hold (spec section 6.1).
     pub max_requests_per_block: usize,
     /// Fixed bytes charged per `pending_series` entry (spec section 6.1).
+    #[serde(deserialize_with = "byte_size")]
     pub pending_series_entry_bytes: usize,
 }
 
@@ -250,8 +287,10 @@ pub struct SortingConfig {
     /// Sort values datasets at all.
     pub enabled: bool,
     /// Run size target.
+    #[serde(deserialize_with = "byte_size")]
     pub run_target_bytes: usize,
     /// Merge output chunk size.
+    #[serde(deserialize_with = "byte_size")]
     pub merge_chunk_bytes: usize,
 }
 
@@ -270,6 +309,7 @@ impl Default for SortingConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct UploadConfig {
     /// Multipart part size and `BufWriter` capacity.
+    #[serde(deserialize_with = "byte_size")]
     pub part_bytes: usize,
     /// In-flight parts.
     pub concurrency: usize,
@@ -293,8 +333,10 @@ impl Default for UploadConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ParquetConfig {
     /// Row group target.
+    #[serde(deserialize_with = "byte_size")]
     pub row_group_bytes: usize,
     /// Enforced writer memory threshold.
+    #[serde(deserialize_with = "byte_size")]
     pub writer_limit_bytes: usize,
 }
 
@@ -444,7 +486,7 @@ impl LakeConfig {
         }
         if self.ingress.max_row_bytes > self.sorting.run_target_bytes / 4 {
             return Err(Error::invalid(
-                "max_row_bytes must be at most run_target_bytes / 4",
+                "ingress.max_row_bytes must be at most sorting.run_target_bytes / 4",
             ));
         }
         if self.upload.part_bytes < 5 << 20 {
@@ -456,7 +498,9 @@ impl LakeConfig {
             return Err(Error::invalid("upload.concurrency must be at least 1"));
         }
         if self.ingress.max_requests_per_block == 0 {
-            return Err(Error::invalid("max_requests_per_block must be >= 1"));
+            return Err(Error::invalid(
+                "ingress.max_requests_per_block must be at least 1",
+            ));
         }
         // A block charges a request's series rows at up to twice the estimate
         // extraction charged them (`DescriptorRow::series_row_bytes`), so a
@@ -472,8 +516,9 @@ impl LakeConfig {
         // too large, consistently, by `Block::reserve`.
         if self.ingress.max_block_bytes / 2 < self.ingress.max_extracted_bytes {
             return Err(Error::invalid(
-                "max_block_bytes must be at least twice max_extracted_bytes, because a \
-                 request's series rows may take up to twice their extracted size in a block",
+                "ingress.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
+                 because a request's series rows may take up to twice their extracted size in \
+                 a block",
             ));
         }
         // The window boundary arithmetic and the `window_secs` file metadata
@@ -654,7 +699,7 @@ mod tests {
             .expect_err("max_block_bytes < 2 * max_extracted_bytes");
         assert!(
             err.to_string()
-                .contains("at least twice max_extracted_bytes")
+                .contains("at least twice ingress.max_extracted_bytes")
         );
         cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes;
         cfg.validate().expect("exactly twice is enough");
@@ -843,5 +888,43 @@ mod tests {
         assert_eq!(cfg.window_interval, Duration::from_secs(30));
         assert_eq!(cfg.upload.abort_timeout, Duration::from_secs(10));
         assert_eq!(cfg.upload.part_bytes, UploadConfig::default().part_bytes);
+    }
+
+    /// Scenario: every byte-valued lake setting is written with units, one is
+    /// written as a plain number, and one as a string the parser cannot read.
+    /// Guarantees: units and numbers parse to the exact byte counts, fields
+    /// left unset keep their defaults, and an unreadable size is refused
+    /// rather than defaulted, so the typed configuration accepts the same
+    /// byte syntax as every other engine setting without a rewriting layer.
+    #[test]
+    fn byte_valued_settings_accept_units() {
+        let cfg: LakeConfig = serde_json::from_str(
+            r#"{
+                "ingress": {"max_request_bytes": "8MiB", "max_extracted_bytes": 1024,
+                            "max_row_bytes": "1 KiB", "max_block_bytes": "1GiB",
+                            "pending_series_entry_bytes": "64B"},
+                "sorting": {"run_target_bytes": "4MiB", "merge_chunk_bytes": "2MiB"},
+                "upload": {"part_bytes": "5MiB"},
+                "parquet": {"row_group_bytes": "32MiB", "writer_limit_bytes": "48MiB"}
+            }"#,
+        )
+        .expect("valid json");
+        assert_eq!(cfg.ingress.max_request_bytes, 8 << 20);
+        assert_eq!(cfg.ingress.max_extracted_bytes, 1024);
+        assert_eq!(cfg.ingress.max_row_bytes, 1024);
+        assert_eq!(cfg.ingress.max_block_bytes, 1 << 30);
+        assert_eq!(cfg.ingress.pending_series_entry_bytes, 64);
+        assert_eq!(cfg.sorting.run_target_bytes, 4 << 20);
+        assert_eq!(cfg.sorting.merge_chunk_bytes, 2 << 20);
+        assert_eq!(cfg.upload.part_bytes, 5 << 20);
+        assert_eq!(cfg.parquet.row_group_bytes, 32 << 20);
+        assert_eq!(cfg.parquet.writer_limit_bytes, 48 << 20);
+        assert_eq!(
+            cfg.ingress.max_nesting_depth,
+            IngressLimits::default().max_nesting_depth
+        );
+        assert!(
+            serde_json::from_str::<LakeConfig>(r#"{"upload": {"part_bytes": "lots"}}"#).is_err()
+        );
     }
 }

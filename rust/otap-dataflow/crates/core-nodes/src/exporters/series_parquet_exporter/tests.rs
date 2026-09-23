@@ -109,7 +109,8 @@ fn a_block_budget_written_under_ingress_is_refused() {
     }))
     .expect_err("max_block_bytes does not belong to ingress");
     assert!(
-        err.to_string().contains("unknown ingress setting"),
+        err.to_string()
+            .contains("ingress: unknown field `max_block_bytes`"),
         "unexpected error: {err}"
     );
 }
@@ -5050,22 +5051,22 @@ fn startup_rejects_invalid_configuration() {
         (
             "window",
             serde_json::json!({"max_block_bytes": "1MiB"}),
-            "at least twice max_extracted_bytes",
+            "window.max_block_bytes must be at least twice ingress.max_extracted_bytes",
         ),
         (
             "ingress",
             serde_json::json!({"max_row_bytes": "3MiB"}),
-            "run_target_bytes / 4",
+            "ingress.max_row_bytes must be at most sorting.run_target_bytes / 4",
         ),
         (
             "ingress",
             serde_json::json!({"max_requset_bytes": "1MiB"}),
-            "unknown ingress setting max_requset_bytes",
+            "ingress: unknown field `max_requset_bytes`",
         ),
         (
             "ingress",
             serde_json::json!({"max_nesting_depth": 257}),
-            "max_nesting_depth must be at most 256",
+            "ingress.max_nesting_depth must be at most 256",
         ),
         (
             "upload",
@@ -5114,9 +5115,58 @@ fn startup_rejects_invalid_configuration() {
         (
             "series_cache",
             serde_json::json!({"max_entries": 0}),
-            "cache entries",
+            "series_cache.max_entries must be positive",
         ),
-        ("notify_batch", serde_json::json!(0), "notify_batch"),
+        (
+            "notify_batch",
+            serde_json::json!(0),
+            "notify_batch must be positive",
+        ),
+        (
+            "window",
+            serde_json::json!({"flush_retry_deadline": "0s"}),
+            "window.flush_retry_deadline must be positive",
+        ),
+        (
+            "window",
+            serde_json::json!({"max_requests_per_block": 0}),
+            "window.max_requests_per_block must be at least 1",
+        ),
+        (
+            "window",
+            serde_json::json!({"max_block_bytes": "lots"}),
+            "window: ",
+        ),
+        (
+            "ingress",
+            serde_json::json!({"max_request_bytes": 0}),
+            "ingress.max_request_bytes must be positive",
+        ),
+        (
+            "sorting",
+            serde_json::json!({"merge_chunk_bytes": 0}),
+            "sorting.merge_chunk_bytes must be positive",
+        ),
+        (
+            "parquet",
+            serde_json::json!({"writer_limit_bytes": 0}),
+            "parquet.writer_limit_bytes must be positive",
+        ),
+        (
+            "upload",
+            serde_json::json!({"abort_timeout": "0s"}),
+            "upload.abort_timeout must be positive",
+        ),
+        (
+            "upload",
+            serde_json::json!({"part_bytes": null}),
+            "upload: byte size must not be null",
+        ),
+        (
+            "metrics",
+            serde_json::json!({"denormalise": []}),
+            "metrics: unknown field `denormalise`",
+        ),
     ];
     for (section, value, expected) in cases {
         let mut candidate = base.clone();
