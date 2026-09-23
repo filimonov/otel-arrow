@@ -271,6 +271,64 @@ async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
     }
 }
 
+/// Scenario: a metrics request is admitted, and a logs request's admission
+/// then breaks a writer invariant (the logs values sort names a column the
+/// dataset does not have and every append sorts a run), so the partially
+/// updated ACTIVE block is failed with the metrics request inside it.
+/// Guarantees: the co-tenant is nacked as a retryable `internal` failure with
+/// the internal-error sentence, not as a storage failure, because nothing was
+/// written and neither request is at fault.
+#[tokio::test(flavor = "current_thread")]
+async fn an_admission_failure_nacks_its_co_tenant_as_internal() {
+    let (handler, mut rx) = effects(4);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut cfg = worker_config();
+    cfg.lake.sorting.run_target_bytes = 1;
+    cfg.lake.logs.values_sort = vec![lake::config::SortKey {
+        column: "no_such_column".into(),
+        order: lake::config::SortOrder::Asc,
+        nulls: lake::config::Nulls::Last,
+    }];
+    let mut worker = Worker::new(
+        cfg,
+        Arc::new(object_store::memory::InMemory::new()),
+        wall,
+        handler,
+    );
+    let mut context = Context::default();
+    context.set_source_node(1);
+    worker.admit(OtapPdata::new(context, metrics_payload()));
+    assert_eq!(
+        worker.active.tokens.len(),
+        1,
+        "the metrics request is admitted"
+    );
+    worker.admit(logs_pdata_from(2));
+    assert!(worker.active.tokens.is_empty(), "the block is failed");
+    assert_eq!(worker.notify.outcomes()[Outcome::Internal as usize], 2);
+    assert_eq!(worker.notify.outcomes()[Outcome::Storage as usize], 0);
+
+    // The failing request is decided first, then the block it failed.
+    for expected in [2, 1] {
+        worker
+            .notify
+            .next()
+            .await
+            .expect("the completion is accepted");
+        match rx.recv().await.expect("a nack") {
+            PipelineCompletionMsg::DeliverNack { nack } => {
+                assert!(!nack.permanent);
+                assert_eq!(nack.cause, NackCause::Unspecified);
+                if expected == 1 {
+                    assert_eq!(nack.reason, Outcome::Internal.sentence());
+                }
+                assert_eq!((*nack.refused).into_parts().0.source_node(), Some(expected));
+            }
+            other => panic!("expected a nack, got {other:?}"),
+        }
+    }
+}
+
 /// Scenario: an error detail longer than the reason bound, and one holding
 /// control characters and multi-byte characters at the cut.
 /// Guarantees: the detail a nack reason carries is bounded, single-line and

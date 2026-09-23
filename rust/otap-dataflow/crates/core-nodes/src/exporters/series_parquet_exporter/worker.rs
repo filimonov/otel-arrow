@@ -610,9 +610,10 @@ impl Worker {
             Err(error) => {
                 // A failed admission leaves the block partially updated by
                 // contract, so the whole ACTIVE block is failed rather than
-                // written.
+                // written. The failure is in memory, not in storage, and the
+                // co-tenants are not at fault.
                 self.refuse(pending.token, &error);
-                self.fail_active(Outcome::Storage);
+                self.fail_active(Outcome::Internal);
             }
         }
     }
@@ -738,6 +739,12 @@ impl Worker {
     /// worker to two blocks and keeps two writes off the same file names.
     pub(super) fn rotate(&mut self) {
         if self.active.data.is_empty() {
+            // A request without rows is acknowledged before it reaches a
+            // block, so an empty block owes nothing.
+            debug_assert!(
+                self.active.tokens.is_empty(),
+                "an empty block holds no completion"
+            );
             self.rotation_requested = false;
             // A parked request may be waiting for a later window than the one
             // this empty block was opened for, so the block is replaced rather
@@ -758,7 +765,8 @@ impl Worker {
                 metrics.worker.flush_failures.add(1);
             }
             otel_warn!("series_parquet.seal.failed", error = %error);
-            self.fail_active(Outcome::Storage);
+            // Sealing is in-memory Arrow work; storage was never touched.
+            self.fail_active(Outcome::Internal);
             return;
         }
         // Counted here rather than on every rotation call: an empty block is
