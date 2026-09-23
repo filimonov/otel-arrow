@@ -280,8 +280,6 @@ pub(super) enum DroppedKind {
     ExpHistogram,
     /// Summary points.
     Summary,
-    /// Exemplar rows.
-    Exemplar,
 }
 
 /// The kind of dropped, unsupported point.
@@ -299,6 +297,23 @@ pub(super) struct DroppedMetrics {
     /// Rows the lake has no dataset for.
     #[metric(name = "dropped.unsupported", unit = "{row}")]
     pub dropped_unsupported: Counter<u64>,
+}
+
+/// The signal a dropped exemplar belonged to.
+#[attribute_set(item, measurement)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExemplarAttrs {
+    /// Source signal; only `metrics` points carry exemplars.
+    pub signal: SignalType,
+}
+
+/// Exemplars dropped under `metrics.exemplars: drop`, split by signal.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = ExemplarAttrs)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct ExemplarMetrics {
+    /// Exemplars of stored or dropped points that no dataset keeps.
+    #[metric(name = "dropped.exemplars", unit = "{exemplar}")]
+    pub dropped_exemplars: Counter<u64>,
 }
 
 /// One configured denormalized physical column.
@@ -337,6 +352,8 @@ pub(super) struct Metrics {
     pub emitted: MeasurementMetricSet<EmittedMetrics>,
     /// Dropped unsupported points, by kind.
     pub dropped: MeasurementMetricSet<DroppedMetrics>,
+    /// Dropped exemplars, by signal.
+    pub exemplars: MeasurementMetricSet<ExemplarMetrics>,
     /// One set per configured denormalized column.
     columns: BTreeMap<String, MetricSet<ColumnMetrics>>,
     /// The shared `exporter.exports` set every exporter registers, so this
@@ -381,6 +398,7 @@ impl Metrics {
             written: WrittenMetrics::register(ctx),
             emitted: EmittedMetrics::register(ctx),
             dropped: DroppedMetrics::register(ctx),
+            exemplars: ExemplarMetrics::register(ctx),
             columns,
             exports: Some(ExporterExportMetrics::register(ctx)),
         }
@@ -406,7 +424,6 @@ impl Metrics {
         for (kind, count) in [
             (DroppedKind::ExpHistogram, stats.dropped_exp_histogram),
             (DroppedKind::Summary, stats.dropped_summary),
-            (DroppedKind::Exemplar, stats.dropped_exemplars),
         ] {
             if count != 0 {
                 self.dropped
@@ -414,6 +431,15 @@ impl Metrics {
                     .dropped_unsupported
                     .add(count);
             }
+        }
+        // Exemplars exist only on metric points.
+        if stats.dropped_exemplars != 0 {
+            self.exemplars
+                .with(ExemplarAttrs {
+                    signal: SignalType::Metrics,
+                })
+                .dropped_exemplars
+                .add(stats.dropped_exemplars);
         }
         for (column, count) in &stats.denorm_type_mismatch_by_column {
             if let Some(metrics) = self.columns.get_mut(column) {
@@ -433,6 +459,7 @@ impl Metrics {
         let _ = reporter.report_measurement(&mut self.written);
         let _ = reporter.report_measurement(&mut self.emitted);
         let _ = reporter.report_measurement(&mut self.dropped);
+        let _ = reporter.report_measurement(&mut self.exemplars);
         for metrics in self.columns.values_mut() {
             let _ = reporter.report(metrics);
         }
@@ -449,6 +476,7 @@ impl Metrics {
         out.extend(self.written.terminal_snapshots());
         out.extend(self.emitted.terminal_snapshots());
         out.extend(self.dropped.terminal_snapshots());
+        out.extend(self.exemplars.terminal_snapshots());
         for metrics in self.columns.values_mut() {
             out.extend(metrics.terminal_snapshots());
         }
@@ -659,7 +687,6 @@ mod tests {
         for (kind, label) in [
             (DroppedKind::ExpHistogram, "exp_histogram"),
             (DroppedKind::Summary, "summary"),
-            (DroppedKind::Exemplar, "exemplar"),
         ] {
             metrics
                 .dropped
@@ -674,6 +701,21 @@ mod tests {
                 &[("kind", label)],
             );
         }
+
+        metrics
+            .exemplars
+            .with(ExemplarAttrs {
+                signal: SignalType::Metrics,
+            })
+            .dropped_exemplars
+            .add(1);
+        let snapshots = metrics.exemplars.terminal_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_schema(
+            &snapshots[0],
+            &[("dropped.exemplars", "{exemplar}")],
+            &[("signal", "metrics")],
+        );
 
         assert_eq!(
             metrics
@@ -773,13 +815,14 @@ mod tests {
         );
         assert_eq!(
             metrics
-                .dropped
-                .get(DroppedAttrs {
-                    kind: DroppedKind::Exemplar
+                .exemplars
+                .get(ExemplarAttrs {
+                    signal: SignalType::Metrics
                 })
-                .dropped_unsupported
+                .dropped_exemplars
                 .get(),
-            11
+            11,
+            "exemplars have a counter of their own, not a kind of dropped.unsupported"
         );
         assert_eq!(
             metrics

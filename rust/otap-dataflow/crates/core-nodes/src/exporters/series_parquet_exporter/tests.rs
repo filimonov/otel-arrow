@@ -115,6 +115,42 @@ fn a_block_budget_written_under_ingress_is_refused() {
     );
 }
 
+/// Scenario: the exemplar policy in a user document: `metrics.exemplars:
+/// reject` beside `unsupported: drop`, `metrics.exemplars: drop` beside the
+/// default `unsupported: reject`, and `logs.exemplars`.
+/// Guarantees: the first is accepted and rejects exemplars; the other two
+/// are refused at startup naming the setting, so no document can ask to
+/// drop exemplars while `unsupported: reject` rejects them, or configure a
+/// policy for log records, which carry none.
+#[test]
+fn the_exemplar_policy_is_validated_at_startup() {
+    let cfg = serde_json::from_value::<Config>(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-test"}},
+        "unsupported": "drop",
+        "metrics": {"exemplars": "reject"}
+    }))
+    .expect("valid");
+    assert_eq!(
+        cfg.lake.exemplar_policy(),
+        lake::config::ExemplarPolicy::Reject
+    );
+    for (document, setting) in [
+        (
+            serde_json::json!({"metrics": {"exemplars": "drop"}}),
+            "metrics.exemplars: drop",
+        ),
+        (
+            serde_json::json!({"unsupported": "drop", "logs": {"exemplars": "drop"}}),
+            "logs.exemplars",
+        ),
+    ] {
+        let mut document = document;
+        document["storage"] = serde_json::json!({"file": {"base_uri": "/tmp/series-test"}});
+        let err = serde_json::from_value::<Config>(document).expect_err("refused");
+        assert!(err.to_string().contains(setting), "unexpected error: {err}");
+    }
+}
+
 /// Scenario: `parquet.compression` names a codec the sink does not write.
 /// Guarantees: the configuration is refused instead of writing zstd while the
 /// document claims another codec.
@@ -272,6 +308,43 @@ fn mixed_metrics_payload() -> OtapPayload {
     let bytes = encoded(&request);
     let view = RawMetricsData::try_new(&bytes).expect("valid metrics bytes");
     OtapPayload::from(encode_metrics_otap_batch(&view).expect("encodes to OTAP"))
+}
+
+/// One metrics request whose only gauge point carries an exemplar.
+fn exemplar_metrics_pdata() -> OtapPdata {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{Exemplar, exemplar};
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "requests".to_owned(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_789_960_500_000_000_000,
+                            value: Some(number_data_point::Value::AsInt(1)),
+                            exemplars: vec![Exemplar {
+                                time_unix_nano: 1_789_960_500_000_000_000,
+                                value: Some(exemplar::Value::AsInt(1)),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let bytes = encoded(&request);
+    let view = RawMetricsData::try_new(&bytes).expect("valid metrics bytes");
+    let mut context = Context::default();
+    context.set_source_node(9);
+    OtapPdata::new(
+        context,
+        OtapPayload::from(encode_metrics_otap_batch(&view).expect("encodes to OTAP")),
+    )
 }
 
 /// One mixed metrics request that still carries a routing frame.
@@ -5958,6 +6031,73 @@ async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
             let metrics = worker.metrics.as_ref().expect("registered");
             assert_eq!(metrics.worker.flush_workspace_bytes.get(), 0);
             assert_eq!(worker.sink.flush_workspace_bytes(), 0);
+        })
+        .await;
+}
+
+/// Scenario: a metrics request whose gauge point carries an exemplar
+/// arrives under the default `unsupported: reject`, and again under
+/// `unsupported: drop` with telemetry registered.
+/// Guarantees: under reject the request is refused as a permanent
+/// `unsupported` nack whose reason names exemplars and says how to keep the
+/// points, and nothing enters the block; under drop the point is admitted
+/// and the exemplar is counted in `dropped.exemplars{signal=metrics}`.
+#[tokio::test(flavor = "current_thread")]
+async fn an_exemplar_is_refused_by_name_or_dropped_and_counted() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::clone(&wall) as _,
+                handler,
+            );
+            worker.admit(exemplar_metrics_pdata());
+            assert!(worker.active.data.is_empty(), "nothing was admitted");
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert!(nack.reason.contains("exemplars"), "reason: {}", nack.reason);
+                    assert!(
+                        nack.reason.contains("unsupported: drop"),
+                        "reason: {}",
+                        nack.reason
+                    );
+                }
+                other => panic!("expected an exemplar refusal, got {other:?}"),
+            }
+
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(4);
+            let mut cfg = worker_config();
+            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Drop;
+            let mut worker = Worker::new(
+                cfg,
+                Arc::new(object_store::memory::InMemory::new()),
+                wall,
+                handler,
+            );
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+            worker.admit(exemplar_metrics_pdata());
+            assert_eq!(worker.active.tokens.len(), 1, "the point is admitted");
+            let metrics = worker.metrics.as_ref().expect("registered");
+            assert_eq!(
+                metrics
+                    .exemplars
+                    .get(super::metrics::ExemplarAttrs {
+                        signal: SignalType::Metrics
+                    })
+                    .dropped_exemplars
+                    .get(),
+                1
+            );
         })
         .await;
 }

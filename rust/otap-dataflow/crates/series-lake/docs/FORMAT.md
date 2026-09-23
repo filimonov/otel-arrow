@@ -322,8 +322,13 @@ An empty attribute list is an empty map, never null.
 
 Unsupported inputs in v1 and their policy:
 
-- Exemplars (children of supported points) are always dropped, the parent
-  point is kept, `dropped.unsupported{kind=exemplar}` counts exemplars.
+- Exemplars (children of supported points) are never stored. Under
+  `unsupported: reject`, or under `unsupported: drop` with
+  `metrics.exemplars: reject`, a request whose stored points carry any is
+  refused whole (`nacks{error.type=unsupported}`, a reason naming
+  exemplars). Otherwise the parent point is kept and `dropped.exemplars`
+  counts the exemplars. An exemplar of a point `unsupported: drop` discards
+  goes with its point and is counted.
 - Exponential histogram and summary points: `unsupported: reject` (default)
   nacks the whole request with `NackCause::Refused`,
   `nacks{error.type=unsupported}`; `unsupported: drop` drops those points,
@@ -710,9 +715,9 @@ first successful seal timestamp remains fixed across flush retries.
 - Exponential histograms and summaries are not stored. Depending on the
   `unsupported` policy the whole request is rejected, or the points are
   dropped and counted one per dropped data point row (`dropped.unsupported`).
-- Exemplars are not stored. Their rows are counted as dropped, one per
-  exemplar row, and their own attribute payloads are neither read nor
-  validated.
+- Exemplars are not stored. A request carrying them is refused or they are
+  counted as dropped, one per exemplar row, as the exemplar policy above
+  says, and their own attribute payloads are neither read nor validated.
 - Metric metadata attributes and exemplar attribute payloads are never read,
   so a duplicate key inside either goes undetected. Duplicate-key validation
   covers only the attribute lists this writer actually decodes: resource,

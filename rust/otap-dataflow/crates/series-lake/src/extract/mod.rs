@@ -126,7 +126,7 @@ pub struct ExtractStats {
     pub rows: usize,
     /// Points dropped under the drop policy.
     pub dropped_unsupported: u64,
-    /// Exemplar rows dropped (spec 5.1 `dropped_unsupported{kind=exemplar}`).
+    /// Exemplar rows dropped (`dropped.exemplars`).
     pub dropped_exemplars: u64,
     /// Timestamps outside `1..=i64::MAX`.
     pub timestamp_out_of_range: u64,

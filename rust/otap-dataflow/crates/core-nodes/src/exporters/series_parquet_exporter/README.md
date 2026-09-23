@@ -299,6 +299,7 @@ silently writing zstd.
 | `parquet.writer_limit_bytes` | 96MiB |
 | `notify_batch` | 64 |
 | `unsupported` | reject |
+| `metrics.exemplars` | drop (applies under `unsupported: drop` only) |
 | `writer_id` | `writer` |
 | `producer_id_attribute` | `host.id` |
 
@@ -1061,7 +1062,8 @@ Labelled sets, each with one closed enumeration:
 | `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `block_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
-| `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `exemplar` |
+| `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary` |
+| `dropped.exemplars` | `{exemplar}` | `signal` | `metrics` |
 | `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |
 
 Each `*_too_large` value of `nacks` names the setting it exceeded:
@@ -1184,6 +1186,33 @@ receiver and channel memory, the engine baseline and allocator retention.
 Input bytes before admission belong to the receiver and channel limits and are
 outside exporter-owned accounting.
 
+## What this exporter does not keep
+
+This is the contract a producer can rely on: everything below is lost on
+purpose, and nothing else is. Each loss says how an operator sees it. A
+request the exporter refuses is nacked as a permanent `unsupported` refusal
+(`nacks{error.type=unsupported}`) and nothing of it is stored. A loss the
+exporter accepts is counted where a counter can be exact and documented
+where it cannot.
+
+| What | Kept instead | How it shows |
+| --- | --- | --- |
+| Traces | Nothing: the request is refused. | `nacks{error.type=unsupported}` |
+| Exponential histogram and summary points | Nothing under `unsupported: reject`: the request is refused. Under `drop`, the request's other points. | `nacks{error.type=unsupported}`, or `dropped.unsupported{kind}` per point |
+| Exemplars, with their filtered attributes, trace and span ids | Nothing under `unsupported: reject` or `metrics.exemplars: reject`: the request is refused with a reason naming exemplars. Otherwise the point, without its exemplars. | `nacks{error.type=unsupported}`, or `dropped.exemplars{signal=metrics}` per exemplar |
+| Attribute value types in the `attrs`, `resource_attrs` and `scope_attrs` maps | Every value rendered to a string by `render_v1`, so `"42"` and `42` read the same. Identity attributes keep their types in `identity_bytes` and `series_id`, and a typed denormalized column keeps one. Log record attributes outside `logs.series_attributes` keep none. | Documented, by format decision; no counter |
+| The type of a log body that is not a string | The body rendered to JSON text, so a string body `"42"` and an integer body `42` read the same; a bytes body is a quoted base64 string. | Documented; no counter |
+| An optional metrics value, such as a histogram `sum`, `min` or `max`, that is exactly zero in every point of a request | Null. The OTAP transport omits a column whose every entry in a request is the type default, so that zero cannot be told apart from an absent value. | Documented; no counter |
+| A timestamp of zero, or one that does not fit `i64` nanoseconds | Null in both timestamp columns. Zero and absent are already one value upstream. | `timestamp.out_of_range` for the ones that do not fit |
+| A denormalized attribute of the wrong type | Null in its typed column; the attribute itself stays in its map and in the identity. | `denormalize.type_mismatch{column}` |
+| Metric metadata attributes | Nothing: they are never read or validated. | Documented; no counter |
+| `dropped_attributes_count` of a resource, a scope, a log record or a point | Nothing: no dataset has a column for it. | Documented; no counter |
+| Arrival order | Values rows are sorted by `values_sort`; rows whose sort keys are equal keep no defined order. | Documented |
+
+Nothing is deduplicated. At-least-once delivery can store a row twice when
+a producer retries after its request's block was written but before the
+ack reached it; readers deduplicate if they need to.
+
 ## Limits
 
 ### Unsupported signals and points
@@ -1193,7 +1222,14 @@ alone, before any conversion. Points of an unsupported kind, namely
 exponential histograms and summaries, are rejected by default;
 `unsupported: drop` drops those points instead and counts them in
 `dropped.unsupported`. The policy decides the whole request atomically.
-Exemplars are always dropped and counted. A request that extracts no rows at
+No dataset stores exemplars. Under `unsupported: reject` a request whose
+stored points carry exemplars is refused too, with a reason naming
+exemplars. Under `unsupported: drop`, `metrics.exemplars` decides: `drop`
+(the default) keeps the points and counts the exemplars in
+`dropped.exemplars`, and `reject` refuses the request. `metrics.exemplars:
+drop` beside `unsupported: reject` is refused at startup, and so is
+`logs.exemplars`. An exemplar of a point that `unsupported: drop` discards
+goes with that point and is counted. A request that extracts no rows at
 all is acknowledged immediately without opening a file; a request that mixes
 supported and dropped rows waits for its block to commit.
 

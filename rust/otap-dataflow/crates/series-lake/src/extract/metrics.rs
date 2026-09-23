@@ -33,7 +33,7 @@ use crate::attrs::AttrTable;
 use crate::canonical::{
     Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_double_bits,
 };
-use crate::config::{LakeConfig, UnsupportedPolicy};
+use crate::config::{ExemplarPolicy, LakeConfig, UnsupportedPolicy};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, denorm_columns};
 use crate::value::{DecodeLimits, Value};
@@ -492,14 +492,27 @@ pub(crate) fn extract_metrics(
         }
     }
 
-    // Exemplars are not part of the v1 format (spec 5.1). Count the rows we
-    // drop; their own attribute payloads are ignored and not validated.
+    // Exemplars are not part of the v1 format (spec 5.1). The exemplar policy
+    // refuses a request whose stored points carry any; otherwise the rows are
+    // counted as dropped. An exemplar of an exponential histogram point goes
+    // with that point, which the drop policy has already discarded, so it is
+    // counted but never refuses the request. Their own attribute payloads are
+    // ignored and not validated.
     for pt in [
         ArrowPayloadType::NumberDpExemplars,
         ArrowPayloadType::HistogramDpExemplars,
         ArrowPayloadType::ExpHistogramDpExemplars,
     ] {
-        if let Some(b) = records.get(pt) {
+        if let Some(b) = records.get(pt)
+            && b.num_rows() > 0
+        {
+            if pt != ArrowPayloadType::ExpHistogramDpExemplars
+                && cfg.exemplar_policy() == ExemplarPolicy::Reject
+            {
+                return Err(Error::Refused(RefuseReason::Unsupported(
+                    "exemplars".to_string(),
+                )));
+            }
             c.stats.dropped_exemplars += b.num_rows() as u64;
         }
     }
@@ -681,7 +694,7 @@ pub(crate) fn extract_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LakeConfig, UnsupportedPolicy};
+    use crate::config::{ExemplarPolicy, LakeConfig, UnsupportedPolicy};
     use crate::error::{Error, RefuseReason};
     use crate::schema::Dataset;
     use arrow::array::{Array, AsArray, Float64Builder, ListBuilder, UInt64Builder};
@@ -885,12 +898,17 @@ mod tests {
         assert_eq!(out.descriptors.len(), 1);
     }
 
-    /// Scenario: a gauge with two series and a cumulative histogram.
+    /// Scenario: a gauge with two series and a cumulative histogram, each
+    /// point kind carrying one exemplar, under `unsupported: drop`.
     /// Guarantees: three descriptors, number rows keep int and double separately with
-    /// INT64_MAX intact, histogram lists are stored as signed integers.
+    /// INT64_MAX intact, histogram lists are stored as signed integers, and
+    /// both exemplars are dropped and counted.
     #[test]
     fn extracts_number_and_histogram() {
-        let cfg = LakeConfig::default();
+        let cfg = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            ..LakeConfig::default()
+        };
         let mut budget = Budget::new(&cfg);
         let records = encode_metrics(&gauge_and_hist());
         // The assertion on dropped_exemplars below is only meaningful if the
@@ -1147,6 +1165,90 @@ mod tests {
             extract_metrics(&encode_metrics(&md), &cfg, &mut budget),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
+    }
+
+    /// Scenario: the gauge-and-histogram request, whose number point and
+    /// histogram point each carry an exemplar, under the default
+    /// configuration (`unsupported: reject`), under `unsupported: drop` with
+    /// `metrics.exemplars: reject`, and under `unsupported: drop` alone.
+    /// Guarantees: either reject policy refuses the whole request with a
+    /// reason naming exemplars; `unsupported: drop` alone keeps every point
+    /// and counts both exemplars as dropped.
+    #[test]
+    fn exemplars_are_refused_under_either_reject_policy() {
+        let records = encode_metrics(&gauge_and_hist());
+        let mut exemplars_reject = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            ..LakeConfig::default()
+        };
+        exemplars_reject.metrics.exemplars = Some(ExemplarPolicy::Reject);
+        for cfg in [LakeConfig::default(), exemplars_reject] {
+            let mut budget = Budget::new(&cfg);
+            match extract_metrics(&records, &cfg, &mut budget) {
+                Err(Error::Refused(RefuseReason::Unsupported(what))) => {
+                    assert_eq!(what, "exemplars");
+                }
+                other => panic!("expected an exemplar refusal, got {other:?}"),
+            }
+        }
+        let drop = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            ..LakeConfig::default()
+        };
+        let mut budget = Budget::new(&drop);
+        let out = extract_metrics(&records, &drop, &mut budget).expect("drop");
+        assert_eq!(out.descriptors.len(), 3);
+        assert_eq!(out.stats.dropped_exemplars, 2);
+    }
+
+    /// Scenario: an exponential histogram point carrying an exemplar, beside
+    /// a gauge point without one, under `unsupported: drop` and
+    /// `metrics.exemplars: reject`.
+    /// Guarantees: the exemplar goes with the unsupported point it belongs
+    /// to: the request is not refused, the gauge point is kept, and the
+    /// exemplar is counted as dropped beside its point.
+    #[test]
+    fn an_exemplar_of_a_dropped_point_is_dropped_with_it() {
+        let md = data(vec![
+            Metric {
+                name: "cpu".into(),
+                data: Some(metric::Data::Gauge(Gauge {
+                    data_points: vec![dp(10, number_data_point::Value::AsInt(1), vec![])],
+                })),
+                ..Default::default()
+            },
+            Metric {
+                name: "e".into(),
+                data: Some(metric::Data::ExponentialHistogram(ExponentialHistogram {
+                    aggregation_temporality: AggregationTemporality::Delta as i32,
+                    data_points: vec![ExponentialHistogramDataPoint {
+                        time_unix_nano: 1,
+                        count: 1,
+                        exemplars: vec![ex(3)],
+                        ..Default::default()
+                    }],
+                })),
+                ..Default::default()
+            },
+        ]);
+        let records = encode_metrics(&md);
+        assert_eq!(
+            records
+                .get(ArrowPayloadType::ExpHistogramDpExemplars)
+                .map(arrow::record_batch::RecordBatch::num_rows),
+            Some(1),
+            "the encoder produced the exemplar"
+        );
+        let mut cfg = LakeConfig {
+            unsupported: UnsupportedPolicy::Drop,
+            ..LakeConfig::default()
+        };
+        cfg.metrics.exemplars = Some(ExemplarPolicy::Reject);
+        let mut budget = Budget::new(&cfg);
+        let out = extract_metrics(&records, &cfg, &mut budget).expect("not refused");
+        assert_eq!(out.stats.rows, 1);
+        assert_eq!(out.stats.dropped_exp_histogram, 1);
+        assert_eq!(out.stats.dropped_exemplars, 1);
     }
 
     /// Scenario: an exponential histogram under reject and under drop.

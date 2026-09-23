@@ -35,8 +35,10 @@
 //! exponential histograms and summaries -- is decided by the configured
 //! `unsupported` policy inside that one extraction call, atomically for the
 //! whole request: `reject` refuses it, `drop` keeps the supported points and
-//! counts the rest. Metadata and exemplar attribute tables are neither read
-//! nor validated, under either policy.
+//! counts the rest. Exemplars, which no dataset stores, are refused under
+//! `unsupported: reject` or `metrics.exemplars: reject` and otherwise dropped
+//! and counted. Metadata and exemplar attribute tables are neither read nor
+//! validated, under any policy.
 //!
 //! A block-scoped refusal -- a full block, or one already holding its request
 //! limit -- is not the request's fault, so the request is not nacked for it.
@@ -287,6 +289,15 @@ impl Failure {
                 if what == "traces" =>
             {
                 "traces are not stored by series_parquet; route traces to another exporter"
+                    .to_owned()
+            }
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(what)))
+                if what == "exemplars" =>
+            {
+                "exemplars are not stored by series_parquet, and unsupported: reject or \
+                 metrics.exemplars: reject refuses a request that carries them; set \
+                 unsupported: drop to store the points without their exemplars, or route \
+                 the request to another exporter"
                     .to_owned()
             }
             Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(what))) => {
