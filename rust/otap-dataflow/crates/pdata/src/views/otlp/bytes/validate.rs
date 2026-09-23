@@ -56,8 +56,8 @@ use std::fmt;
 /// content, so it is set no lower than any consumer's own nesting limit.
 pub const MAX_ANY_VALUE_NESTING_DEPTH: usize = 256;
 
-/// What [`validate_request`] decides about a singular field or oneof that
-/// occurs more than once in one message.
+/// What [`crate::OtapPayload::validate_otlp_framing`] decides about a
+/// singular field or oneof that occurs more than once in one message.
 ///
 /// Protobuf allows the repetition: the last scalar wins and message
 /// occurrences merge. The byte views read one occurrence instead, except in
