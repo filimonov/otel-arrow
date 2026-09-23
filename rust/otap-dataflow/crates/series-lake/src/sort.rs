@@ -769,9 +769,8 @@ enum ColumnKind {
     /// A map whose keys and values are strings or binaries and whose entries
     /// carry no nulls of their own.
     Map,
-    /// Anything else, dictionaries included: interleaved whole in one step,
-    /// as every column was before chunks were built in steps. No exporter
-    /// dataset has such a column.
+    /// Anything else, dictionaries included: interleaved whole in one
+    /// unbounded step. No lake dataset has such a column.
     Whole,
 }
 
@@ -896,7 +895,7 @@ struct ColumnBuild<'a> {
 }
 
 /// Builds one sorted chunk from the rows its [`MergeIter`] has popped, in
-/// bounded steps.
+/// steps.
 ///
 /// A step's budget is [`MERGE_STEP_ROWS`] elements: every row counts one,
 /// and every item of a list row or entry of a map row counts one more.
@@ -914,9 +913,13 @@ struct ColumnBuild<'a> {
 /// Lists and maps are assembled from their own offsets, validity and
 /// presized children, because `MutableArrayData` cannot presize a map's
 /// entries. A presized total an `i32` offset cannot hold is an error before
-/// anything is copied. A column of any other type, a dictionary for one,
-/// is interleaved whole in one step, as before; the exporter's datasets
-/// have none.
+/// anything is copied.
+///
+/// The bound holds for the column types of the lake datasets, which
+/// `every_lake_column_is_built_in_bounded_steps` pins. A column of any other
+/// type, a dictionary for one, is interleaved whole by Arrow in one
+/// unbounded step; for some such types, a map with non-string keys for one,
+/// Arrow panics on an `i32` offset overflow instead of returning an error.
 ///
 /// Every column is the same array an interleave of the same rows would
 /// give, so the chunk, and every byte written from it, is unchanged.
@@ -927,8 +930,8 @@ pub struct ChunkBuilder<'a> {
 }
 
 impl<'a> ChunkBuilder<'a> {
-    /// Do one bounded step of building the chunk. Returns whether every
-    /// column is built.
+    /// Do one step of building the chunk, bounded for the lake's column types
+    /// (see [`ChunkBuilder`]). Returns whether every column is built.
     ///
     /// # Errors
     ///
