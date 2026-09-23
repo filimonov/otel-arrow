@@ -9,7 +9,10 @@ fixtures, each with 3 uncancelled and 20 cancelled writes, under
 - `*-final2.json`: library at 75732cafd (flush workspace accounting and one
   step per budget across runs and columns).
 - `*-input-sidecar.json`, `*-bench-config.json`: the harness input and the
-  bench configuration each run read.
+  bench configuration each run read. The configurations are written
+  through the harness's `measurement.scrub_published`, so the run's scratch
+  directory reads `<scratch>/...` instead of a host path; nothing else in
+  them differs from what the probe read.
 - `files-before.sha256`: SHA-256 of every Parquet file written by the
   library at fcceef306, the pre-task source (probe source of a223a4d25 +
   fcceef306). Reproduced byte for byte by the round-1 before build.
