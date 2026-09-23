@@ -1268,6 +1268,11 @@ CASE_ROLES = {
     "engine": ROLE_CORES,
     "stages": (("producer", 2), ("store", 1)),
     "attribution": (("producer", 1), ("store", 1), ("profiler", 1)),
+    # A fault case runs the engine in the fault rig's namespace. NGINX,
+    # Toxiproxy and the probes share one physical core of their own; the
+    # oracle reads back only after the engine has stopped, as for an
+    # attribution, so the case fits eight physical cores.
+    "faults": (("producer", 1), ("store", 1), ("fault_tools", 1)),
 }
 
 
