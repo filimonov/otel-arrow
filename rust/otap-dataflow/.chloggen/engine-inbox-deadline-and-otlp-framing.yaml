@@ -1,0 +1,26 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
+# Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
+component: engine
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Exporters and processors can read the latched shutdown deadline while draining, and the parquet and otap exporters refuse OTLP requests whose protobuf framing is broken.
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+# PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
+issues: [4128]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
+# section with the specific action consumers must take. Keep notes to 200
+# characters and subtext to 300 characters.
+subtext: |
+  A truncated OTLP body was written or sent on as a partial or empty
+  batch. The parquet exporter now drops it as a failed export with a WARN, the
+  otap exporter nacks it permanently. The file-storage retry warning of both
+  object-store exporters is now object_store.retry_ignored_for_file_storage.
