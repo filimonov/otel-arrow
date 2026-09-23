@@ -1285,6 +1285,38 @@ def _drive(lifetime, producer, spec, result, controls, again=None):
     controls.raise_if_invalid()
 
 
+BACKGROUND_THREAD_LINE = re.compile(
+    r"INFO memory allocator (\S+), background_thread (on|off|not applicable)"
+)
+
+
+def engine_background_thread(log_path):
+    """The allocator and background-thread state the engine reported at start."""
+    try:
+        text = Path(log_path).read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    match = BACKGROUND_THREAD_LINE.search(text)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def allocator_label(build_allocator, malloc_conf, reported) -> str:
+    """The allocator a pair ran, as the fingerprint names it.
+
+    The engine's own startup line decides whether jemalloc's background
+    thread ran; a binary too old to print it ran without one, because that
+    was the only default before the thread was compiled in. Allocator
+    options beyond the statistics print are appended verbatim.
+    """
+    state = reported[1] if reported else "off"
+    label = build_allocator
+    if state == "on":
+        label += "+background_thread"
+    if malloc_conf != JEMALLOC_STATS_CONF:
+        label += f":{malloc_conf}"
+    return label
+
+
 def pair_allocation(spec) -> dict:
     """The role placement of one pair: a store role only when it has one."""
     topology_info = measurement.core_topology()
@@ -1326,8 +1358,8 @@ def pair_experiment(spec, result, output_dir, controls, *, provenance, prebuilt,
     # The allocator options change what is measured, so a non-default set
     # is part of the build the fingerprint covers.
     build = dict(provenance["build"])
-    if malloc_conf != JEMALLOC_STATS_CONF:
-        build["allocator"] = f"{build['allocator']}:{malloc_conf}"
+    base_allocator = build["allocator"]
+    build["allocator"] = allocator_label(base_allocator, malloc_conf, None)
     result["environment"]["build"] = build
     result["environment"]["git"] = provenance["git"]
     result["environment"]["allocator_conf"] = malloc_conf
@@ -1385,6 +1417,12 @@ def pair_experiment(spec, result, output_dir, controls, *, provenance, prebuilt,
             storage=storage,
         ).launch()
         lifetimes.append(measured)
+        reported = engine_background_thread(Path(measured.engine.root) / "engine.log")
+        result["environment"]["engine_allocator_report"] = (
+            {"allocator": reported[0], "background_thread": reported[1]}
+            if reported else None
+        )
+        build["allocator"] = allocator_label(base_allocator, malloc_conf, reported)
         roles = {"engine": (measured.engine.pid, list(spec.cores))}
         if control:
             snapshot = controls.checkpoint(

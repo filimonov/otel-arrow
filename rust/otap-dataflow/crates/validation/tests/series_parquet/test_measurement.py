@@ -4669,5 +4669,32 @@ class MemoryContracts(unittest.TestCase):
         )
 
 
+    # Scenario: engine logs from a binary with the compiled-in background
+    # thread, from one with it off, and from one too old to say.
+    # Guarantees: the fingerprint's allocator names the background thread
+    # only when the engine itself reported it on, appends non-default
+    # allocator options, and reads an engine that reported nothing as off.
+    def test_allocator_label_follows_the_engine_report(self):
+        directory = temporary_directory(self)
+        log = directory / "engine.log"
+        log.write_text("banner\nINFO memory allocator jemalloc, background_thread on\n")
+        reported = memory.engine_background_thread(log)
+        self.assertEqual(reported, ("jemalloc", "on"))
+        self.assertEqual(
+            memory.allocator_label("jemalloc", memory.JEMALLOC_STATS_CONF, reported),
+            "jemalloc+background_thread",
+        )
+        decay = memory.DIAGNOSTIC_CONF["decay0"]
+        self.assertEqual(
+            memory.allocator_label("jemalloc", decay, ("jemalloc", "off")),
+            f"jemalloc:{decay}",
+        )
+        log.write_text("an older engine prints no allocator line\n")
+        self.assertIsNone(memory.engine_background_thread(log))
+        self.assertEqual(
+            memory.allocator_label("jemalloc", memory.JEMALLOC_STATS_CONF, None), "jemalloc"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
