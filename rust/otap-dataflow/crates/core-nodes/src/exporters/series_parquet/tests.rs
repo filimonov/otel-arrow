@@ -3636,6 +3636,46 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
         .await;
 }
 
+/// Scenario: a write attempt fails with an error no retry can cure, so the
+/// flush ends on that first attempt.
+/// Guarantees: the failed attempt still goes through the per-attempt WARN
+/// (`series_parquet.flush_attempt_failed`) with its attempt number and the
+/// store's error, exactly as a retried failure does, so every failed attempt
+/// leaves a per-attempt trace and not only the block-level ERROR. The WARN is
+/// observed through the test record its one emitting helper keeps, because a
+/// tracing subscriber installed per test races the global callsite cache
+/// against the tests running beside it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let _ = super::flush::take_logged_attempts();
+            let store = Arc::new(FaultStore::default());
+            store
+                .mode
+                .store(FAULT_DENIED, std::sync::atomic::Ordering::SeqCst);
+            let (handler, _rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert_eq!(done.as_ref().expect("the flush resolves").attempts, 1);
+            let logged = super::flush::take_logged_attempts();
+            assert_eq!(logged.len(), 1, "one failed attempt, one WARN: {logged:?}");
+            let (attempt, retryable, error) = &logged[0];
+            assert_eq!(*attempt, 1);
+            assert!(!retryable, "a refused credential is not retryable");
+            assert!(error.contains("access denied"), "{error}");
+        })
+        .await;
+}
+
 /// Scenario: the last object of a block is written in the same engine-clock
 /// step in which the block's retry deadline expires, so the write result and
 /// the deadline are both ready when the flush task is next polled.
