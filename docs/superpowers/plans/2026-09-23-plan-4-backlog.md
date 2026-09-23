@@ -40,6 +40,8 @@ priority where stated.
 
 ## Other deferred items
 
+- Larger CPU candidates from the Task 4 attribution (2026-09-23): sort on fixed-width keys (series_id + time) instead of row-format keys materialised for every row (sort/seal/merge 11-13 percent of engine CPU); extract directly from OTLP bytes via pdata views, skipping OTAP Arrow construction (conversion is 20 percent of metrics CPU, 8 percent of logs).
+
 - Spatial aggregation processor (user question 2026-09-23): otap-dataflow has `processor:attribute` (delete/hash) and `processor:temporal_reaggregation` (temporal only) but nothing that drops attributes AND merges the colliding streams with temporality-correct aggregation (sum cumulative totals per stream with reset handling, sum deltas, chosen function for gauges), the equivalent of SDK Views or the Go collector's aggregate_labels. A separate node, worth raising upstream; temporal_reaggregation already tracks streams and cumulative state.
 
 - Fifth review (2026-09-23): histogram `sum` of exactly zero becomes null after an OTAP round trip because the transport omits an all-default column; fix in the pdata transport layer by preserving presence, then in the exporter (pdata PR, upstream-relevant). A lossless high-cardinality mode (physical grouping by stable fields with varying attributes kept per point and the full stream identity stored separately) is a format change and a separate mode, not a hash tweak. Bounded yielding inside merge-key building and per-chunk encoding, if the flush does not move off the ingest core first.
