@@ -1340,6 +1340,25 @@ def main(argv=None) -> int:
             f"{json.dumps(result['metrics'], sort_keys=True)}\n"
         )
         return 0 if result["status"] == measurement.STATUS_PASSED else 1
+    if arguments.command == "memory":
+        try:
+            from . import memory
+        except ImportError:
+            import memory
+        options = parse_options(arguments.option)
+        indexes = memory.run_memory(
+            arguments.output_dir or Path("/tmp/series-memory"),
+            options.pop("report_dir", None),
+            **options,
+        )
+        for index in indexes:
+            sys.stderr.write(
+                f"{index['run_id']}: {index['status']} "
+                f"{json.dumps(index['metrics'], sort_keys=True)}\n"
+            )
+        return 0 if all(
+            index["status"] == measurement.STATUS_PASSED for index in indexes
+        ) else 1
     if arguments.command == "run":
         result = run_named(
             arguments.case,

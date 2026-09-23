@@ -1263,6 +1263,10 @@ ROLE_CORES = (("producer", 2), ("store", 1), ("reader", 1))
 CASE_ROLES = {
     "engine": ROLE_CORES,
     "stages": (("producer", 2), ("store", 1)),
+    # A memory pair writes to the local filesystem, so it runs no store.
+    "memory": (("producer", 2), ("reader", 1)),
+    # A memory pair on an object store gives up one producer core to it.
+    "memory_store": (("producer", 1), ("store", 1), ("reader", 1)),
 }
 
 

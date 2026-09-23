@@ -230,7 +230,8 @@ def engine_config(
     inserts the durable buffer between the receiver and the exporter,
     `cores` pins one worker to each named core through a `core_set`, and
     `merge` deep-merges nested maps into the named nodes' configurations
-    (and `engine` into the engine section). The result is what gets hashed
+    (`engine` into the engine section and `policies` into the top-level
+    policies). The result is what gets hashed
     and recorded, so nothing is changed after it is returned.
     """
     if topology not in TOPOLOGIES:
@@ -298,6 +299,8 @@ def engine_config(
     for name, patch in (merge or {}).items():
         if name == "engine":
             deep_merge(config["engine"], patch)
+        elif name == "policies":
+            deep_merge(config["policies"], patch)
         elif name in nodes:
             deep_merge(nodes[name].setdefault("config", {}), patch)
         else:

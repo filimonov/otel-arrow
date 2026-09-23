@@ -85,8 +85,34 @@ keeps the `dhat-heap.json` it writes. `stages` takes
 `--option configs='["logs-1k-stable"]'`, `--option stages='["extract"]'` and
 `--option repetitions=3`.
 
+`memory` (`SERIES_MEASURE_LONG=1`) measures the real engine's memory in
+pairs: each pair launches a control engine whose exporter is the noop
+exporter and then the measured strict or buffered engine, fresh, on the same
+cores, under the same offered workload (prebuilt harness-local requests at 50
+requests per second on one-second windows), each warmed separately. A 100 ms
+sampler reads the telemetry (at a 100 ms reporting interval), the process's
+mapping list and the allocator totals that jemalloc's `stats_interval` option
+prints into the engine log, and splits RSS into non-heap mappings, allocator
+retention, jemalloc allocated and the tracked heap; the exporter's accounted
+bytes are reconciled against the live heap and the control's heap with the
+frozen residual tolerance. Three pairs per topology form a family whose
+primary metrics must spread by at most 15 percent before the baseline policy
+applies. The strict family also runs a `decay0` and a `prof` diagnostic pair
+and the accounting probes: the merge-key and values-capacity terms through the
+measurement bench's fixtures, and the per-series row cost through
+`measurement --series-cost` in the DHAT build. It needs the release engine
+and both measurement benches, and it waits for a busy host lease instead of
+failing. Options: `topologies`, `pairs`, `diagnostics`, `probes`,
+`requests`, `rate_requests_per_s`, `report_dir` and `evidence` (a map of
+names to earlier JSON evidence carried into the strict index).
+
+```bash
+SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure \
+  memory --output-dir /tmp/series-memory
+```
+
 The remaining subcommands (`attribution`,
-`capacity`, `memory`, `soak`, `fault-preflight`, `failures`, `buffered`,
+`capacity`, `soak`, `fault-preflight`, `failures`, `buffered`,
 `remediate`, `report`) are named here so the command line is one contract;
 each is implemented by its own task.
 

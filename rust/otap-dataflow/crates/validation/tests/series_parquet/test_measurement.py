@@ -25,10 +25,12 @@ from unittest import mock
 try:  # Imported as a package module by `python3 -m crates...`.
     from . import measurement
     from . import measure
+    from . import memory
     from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
     import measurement
     import measure
+    import memory
     import performance
 
 Ledger = measurement.Ledger
@@ -4334,6 +4336,337 @@ class HarnessHygieneContracts(unittest.TestCase):
         self.assertEqual(len(removals), 1)
         self.assertEqual(removals[0][0][-1], store.name)
         self.assertTrue(all(kwargs.get("timeout") for _, kwargs in calls))
+
+
+class MemoryContracts(unittest.TestCase):
+    """The Task 6 memory ledger, its sources and its family rules."""
+
+    # Scenario: a double-counted workspace estimate exceeds observed process RSS.
+    # Guarantees: reconciliation retains a negative residual instead of clamping it away.
+    def test_residual_preserves_negative_discrepancy(self):
+        self.assertEqual(memory.residual(100, 60, 15, 10, 20, 5), -10)
+
+    # Scenario: the example configuration's exporter settings and the budget
+    # a release worker reported for them in a trial run (1,637,851,136 bytes).
+    # Guarantees: the transcribed reservations add up to the worker's own
+    # budget with a whole token high-water, and a budget that is not such a
+    # sum is refused instead of yielding a fractional token size.
+    def test_ledger_transcription_reproduces_the_worker_budget(self):
+        exporter = measurement.test_e2e.yaml.safe_load(
+            (measurement.test_e2e.WORKSPACE / "configs/series-parquet-local.yaml").read_text()
+        )["groups"]["default"]["pipelines"]["main"]["nodes"]["exporter"]["config"]
+        inputs = memory.ledger_inputs(exporter)
+        self.assertEqual(inputs["B"], 500 * 1024 * 1024)
+        self.assertEqual(inputs["C"], 200000)
+        token = memory.token_high_water_of(inputs, 1637851136)
+        self.assertEqual(token, 200)
+        self.assertEqual(
+            memory.retained_reservation(inputs, token) + memory.workspace_reservation(inputs),
+            1637851136,
+        )
+        self.assertIsNone(memory.token_high_water_of(inputs, 1637851137))
+        self.assertEqual(memory.parse_bytes("96MiB"), 96 * 1024 * 1024)
+        with self.assertRaises(ValueError):
+            _ = memory.parse_bytes("12 parsecs")
+
+    # Scenario: an engine log carries tracing lines and jemalloc totals, one
+    # record split across two reads.
+    # Guarantees: every totals record is returned exactly once, the split one
+    # on the read that completes it, and ordinary log text is never kept as
+    # a pending fragment.
+    def test_allocator_totals_are_read_across_split_writes(self):
+        directory = temporary_directory(self)
+        log = directory / "engine.log"
+        record = (
+            '{"jemalloc":{"stats":{"allocated":%d,"active":2,"metadata":3,'
+            '"metadata_edata":0,"metadata_rtree":0,"metadata_thp":0,"resident":4,'
+            '"mapped":5,"retained":6,"zero_reallocs":0,"background_thread":'
+            '{"num_threads":0,"num_runs":0,"run_interval":0}}}}'
+        )
+        whole = "INFO start\n" + record % 1 + (record % 7)[:40]
+        log.write_text(whole)
+        stats = memory.JemallocStats(log)
+        first = stats.poll()
+        self.assertEqual([entry["allocated_bytes"] for entry in first], [1])
+        with open(log, "a", encoding="ascii") as handle:
+            _ = handle.write((record % 7)[40:] + "\nINFO more\n")
+        second = stats.poll()
+        self.assertEqual([entry["allocated_bytes"] for entry in second], [7])
+        self.assertEqual(second[0]["resident_bytes"], 4)
+        self.assertEqual(stats.pending, "")
+        self.assertEqual(stats.poll(), [])
+
+    # Scenario: one sample of a measured engine with its mapping categories,
+    # allocator totals, tracked heap and accounted bytes.
+    # Guarantees: the split adds up -- non-heap plus allocator retention plus
+    # allocated equals RSS -- the tracked counters' excess over the live
+    # heap is a negative untracked term rather than hidden, and the ledger
+    # residual is exactly the live heap neither accounted nor held by the
+    # paired control.
+    def test_sample_split_adds_up_to_rss(self):
+        sample = {
+            "rss_bytes": 1000, "anonymous_bytes": 700,
+            "smaps": {"rss_total_bytes": 1000, "anonymous_other_bytes": 600,
+                      "binary_file_bytes": 250, "file_file_bytes": 50,
+                      "thread_stack_bytes": 100},
+            "jemalloc": {"allocated_bytes": 250, "resident_bytes": 650,
+                         "metadata_bytes": 40},
+            "telemetry": {"jemalloc_resident_bytes": 640, "tracked_heap_bytes": 300,
+                          "exporter": {"memory.accounted": 120}},
+        }
+        terms = memory.sample_terms(sample, control=100)
+        self.assertEqual(
+            terms["non_heap_bytes"] + terms["allocator_retention_bytes"]
+            + terms["jemalloc_allocated_bytes"],
+            terms["rss_bytes"],
+        )
+        self.assertEqual(terms["untracked_heap_bytes"], -50)
+        self.assertEqual(terms["allocator_resident_overstatement_bytes"], 50)
+        self.assertEqual(terms["unexplained_bytes"], 250 - 120 - 100)
+        self.assertEqual(terms["file_backed_bytes"], 300)
+
+    # Scenario: a mapping list with a guarded thread stack, the binary, a
+    # library, the heap and an anonymous allocator extent.
+    # Guarantees: each mapping lands in one category, a guard page's
+    # neighbour is a stack and an unguarded extent is not, and the
+    # categories add up to the list's own resident total.
+    def test_smaps_categories_separate_stacks_from_the_heap(self):
+        text = "\n".join([
+            "55d000000000-55d000100000 r-xp 00000000 fd:00 1 /opt/df_engine",
+            "Rss:                 400 kB",
+            "Anonymous:             0 kB",
+            "7f0000000000-7f0000001000 ---p 00000000 00:00 0 ",
+            "Rss:                   0 kB",
+            "7f0000001000-7f0000201000 rw-p 00000000 00:00 0 ",
+            "Rss:                  16 kB",
+            "Anonymous:            16 kB",
+            "7f1000000000-7f1000400000 rw-p 00000000 00:00 0 ",
+            "Rss:                1024 kB",
+            "Anonymous:          1024 kB",
+            "7f2000000000-7f2000010000 r--p 00000000 fd:00 2 /usr/lib/libc.so.6",
+            "Rss:                  64 kB",
+            "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]",
+            "Rss:                  12 kB",
+            "",
+        ])
+        with mock.patch.object(memory.Path, "read_text", return_value=text):
+            found = memory.smaps_categories(1, binary="/opt/df_engine")
+        self.assertEqual(found["binary_file_bytes"], 400 * 1024)
+        self.assertEqual(found["thread_stack_bytes"], 16 * 1024)
+        self.assertEqual(found["thread_stack_count"], 1)
+        self.assertEqual(found["anonymous_other_bytes"], 1024 * 1024)
+        self.assertEqual(found["file_file_bytes"], 64 * 1024)
+        self.assertEqual(found["main_stack_bytes"], 12 * 1024)
+        self.assertEqual(found["rss_total_bytes"], (400 + 16 + 1024 + 64 + 12) * 1024)
+
+    # Scenario: an active block grows, empties across one pair of samples
+    # and grows again; another flush is reported directly.
+    # Guarantees: the interval that contains each flush and the one after it
+    # (the gauges are one collection stale) are marked, and growth alone is
+    # never mistaken for a flush.
+    def test_flush_intervals_are_recognized_by_the_block_emptying(self):
+        def sample(active, flushing=0):
+            """One sample carrying only the two block gauges."""
+            return {"telemetry": {"exporter": {
+                "block.active": active, "block.flushing": flushing,
+            }}}
+
+        samples = [sample(1), sample(5), sample(9), sample(2), sample(4),
+                   sample(6), sample(6, flushing=3), sample(7), sample(8)]
+        self.assertEqual(memory.annotate_flushes(samples), 4)
+        self.assertEqual(
+            [memory.flushing(entry) for entry in samples],
+            [False, False, False, True, True, False, True, True, False],
+        )
+
+    # Scenario: accounted and tracked values of consecutive collections, with
+    # repeated responses of one collection in between.
+    # Guarantees: the block-pair uncertainty is the largest change between
+    # distinct collections; a repeated response adds no pair.
+    def test_block_pair_uncertainty_is_the_change_between_collections(self):
+        def sample(uptime, accounted):
+            """One sample of the measured pipeline at one collection."""
+            return {
+                "rss_bytes": 10, "anonymous_bytes": 5, "smaps": None, "jemalloc": None,
+                "telemetry": {
+                    "jemalloc_resident_bytes": None, "tracked_heap_bytes": accounted,
+                    "exporter": {"memory.accounted": accounted},
+                    "pipelines": {"w": {"group_id": "default", "uptime_s": uptime}},
+                },
+            }
+
+        samples = [sample(1.0, 0), sample(1.0, 0), sample(1.1, 400), sample(1.2, 100)]
+        bound = memory.block_pair_uncertainty(samples)
+        self.assertEqual(bound["accounted_bytes"]["epochs"], 2)
+        self.assertEqual(bound["accounted_bytes"]["max_change_bytes"], 400)
+
+    # Scenario: three pairs whose primary metric spreads 10 and 20 percent,
+    # and signed differences of one sign, of mixed sign within the
+    # measurement uncertainty, and of mixed sign beyond it.
+    # Guarantees: the spread is (max - min) / median, and a paired difference
+    # may change sign only when its whole range is inside the uncertainty.
+    def test_family_stability_and_sign_rules(self):
+        self.assertAlmostEqual(memory.spread([95, 100, 105]), 0.10)
+        self.assertGreater(memory.spread([90, 100, 110]), memory.MAXIMUM_SPREAD)
+        self.assertIsNone(memory.spread([]))
+        self.assertTrue(memory.signed_consistent([3, 5, 9], uncertainty=0))
+        self.assertTrue(memory.signed_consistent([-2, 1, 3], uncertainty=6))
+        self.assertFalse(memory.signed_consistent([-20, 1, 30], uncertainty=6))
+        self.assertFalse(memory.signed_consistent([-2, 3], uncertainty=None))
+
+    # Scenario: the lease file is held by a live process of this test, then
+    # released.
+    # Guarantees: a busy lease names its holder so the family waits for that
+    # process instead of failing, and a free lease is reported free without
+    # being kept.
+    def test_a_busy_lease_is_waited_for_not_failed(self):
+        directory = temporary_directory(self)
+        path = directory / "lease.lock"
+        lease = measurement.HostLease(path, run_id="holder")
+        _ = lease.acquire(deadline_ns=measurement.time.monotonic_ns() + 10**9)
+        try:
+            self.assertEqual(memory.lease_holder(path), os.getpid())
+        finally:
+            lease.release()
+        self.assertIsNone(memory.lease_holder(path))
+        again = measurement.HostLease(path, run_id="after")
+        _ = again.acquire(deadline_ns=measurement.time.monotonic_ns() + 10**9)
+        again.release()
+
+    # Scenario: a pair invalidated by a compiler, a pair refused the lease and
+    # a clean pair.
+    # Guarantees: the first two are recognized so the family reruns them
+    # rather than accepting them; the clean one is neither.
+    def test_invalidated_and_refused_pairs_are_rerun(self):
+        built = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_FAILED
+        )], "events": []}
+        refused = {"checks": [], "events": [
+            {"kind": "failed", "detail": "AssertionError: another measurement holds x"}
+        ]}
+        clean = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_PASSED
+        )], "events": []}
+        self.assertTrue(memory.invalidated(built))
+        self.assertTrue(memory.lease_refused(refused))
+        self.assertFalse(memory.invalidated(clean) or memory.lease_refused(clean))
+
+    # Scenario: a minimal pprof profile with two samples, one allocated under
+    # an arrow_row frame and one under a tokio frame.
+    # Guarantees: the parser attributes each sample's bytes to its category
+    # and the live total is their sum.
+    def test_heap_profile_attributes_live_bytes(self):
+        def varint(value):
+            """One protobuf varint."""
+            out = bytearray()
+            while True:
+                byte = value & 0x7F
+                value >>= 7
+                if value:
+                    out.append(byte | 0x80)
+                else:
+                    out.append(byte)
+                    return bytes(out)
+
+        def field(number, payload):
+            """One length-delimited protobuf field."""
+            return varint(number << 3 | 2) + varint(len(payload)) + payload
+
+        def packed(number, values):
+            """One packed repeated integer field."""
+            return field(number, b"".join(varint(value) for value in values))
+
+        strings = [b"", b"space", b"bytes", b"arrow_row::RowConverter::convert_columns",
+                   b"tokio::runtime::task"]
+        profile = b"".join(field(6, text) for text in strings)
+        profile += field(1, varint(1 << 3) + varint(1) + varint(2 << 3) + varint(2))
+        for identifier, name in ((1, 3), (2, 4)):
+            profile += field(5, varint(1 << 3) + varint(identifier) + varint(2 << 3) + varint(name))
+            line = varint(1 << 3) + varint(identifier)
+            profile += field(4, varint(1 << 3) + varint(identifier) + field(4, line))
+        profile += field(2, packed(1, [1]) + packed(2, [1, 4096]))
+        profile += field(2, packed(1, [2]) + packed(2, [1, 1000]))
+        summary = memory.pprof_summary(profile)
+        self.assertEqual(summary["live_bytes"], 5096)
+        self.assertEqual(summary["by_category_bytes"]["merge_keys"], 4096)
+        self.assertEqual(summary["by_category_bytes"]["tokio"], 1000)
+
+    # Scenario: the command line's memory subcommand and the memory case's
+    # role placement.
+    # Guarantees: `memory` is a long command that must be opted into, and a
+    # memory pair claims a producer and a reader but no object store.
+    def test_memory_command_and_roles(self):
+        self.assertIn("memory", measure.LONG_COMMANDS)
+        self.assertEqual(
+            dict(measurement.CASE_ROLES["memory"]), {"producer": 2, "reader": 1}
+        )
+        with mock.patch.dict(os.environ, {"SERIES_MEASURE_LONG": ""}):
+            self.assertEqual(measure.main(["memory", "--output-dir", "/nonexistent"]), 2)
+
+
+    # Scenario: a full mapping classification, then a cheaper rollup read
+    # whose anonymous total grew by 3 MiB and whose RSS grew by 4 MiB.
+    # Guarantees: the interpolated categories keep the stacks and binary
+    # data of the last full read, give the anonymous growth to the heap and
+    # the file-backed rest to the binary text, and add up to the rollup RSS.
+    def test_rollup_samples_interpolate_the_last_classification(self):
+        mib = 1024 * 1024
+        last = {"rss_total_bytes": 100 * mib, "anonymous_other_bytes": 40 * mib,
+                "thread_stack_bytes": 2 * mib, "binary_anonymous_bytes": 5 * mib,
+                "binary_file_bytes": 50 * mib, "file_file_bytes": 3 * mib}
+        now = memory.interpolate_smaps(
+            last, {"smaps_rss_bytes": 104 * mib, "smaps_anonymous_bytes": 50 * mib}
+        )
+        self.assertEqual(now["anonymous_other_bytes"], 43 * mib)
+        self.assertEqual(now["thread_stack_bytes"], 2 * mib)
+        self.assertEqual(now["binary_file_bytes"], 51 * mib)
+        self.assertEqual(now["rss_total_bytes"], 104 * mib)
+        self.assertEqual(
+            sum(value for key, value in now.items()
+                if key.endswith("_bytes") and key != "rss_total_bytes"),
+            now["rss_total_bytes"],
+        )
+
+    # Scenario: harness residual entries with a one-second gauge residual
+    # that peaks where the 100 ms gauge residual is much smaller.
+    # Guarantees: the shares are taken at the one-second peak and the
+    # sampling skew is exactly the difference between the two cadences.
+    def test_residual_shares_split_the_one_second_peak(self):
+        entries = [
+            {"monotonic_ns": 1, "phase": "load", "residual_bytes": 5,
+             "one_second_gauge_residual_bytes": 10, "allocator_retention_growth_bytes": 3,
+             "non_heap_anonymous_growth_bytes": 0, "heap_beyond_tracked_growth_bytes": 2},
+            {"monotonic_ns": 2, "phase": "load", "residual_bytes": 15,
+             "one_second_gauge_residual_bytes": 47, "allocator_retention_growth_bytes": 12,
+             "non_heap_anonymous_growth_bytes": 0, "heap_beyond_tracked_growth_bytes": 3},
+        ]
+        shares = memory.residual_shares(entries)
+        self.assertEqual(shares["monotonic_ns"], 2)
+        self.assertEqual(shares["sampling_skew_bytes"], 32)
+        self.assertEqual(
+            shares["sampling_skew_bytes"] + shares["hundred_ms_gauge_residual_bytes"],
+            shares["one_second_gauge_residual_bytes"],
+        )
+
+    # Scenario: the high-rate logs shape of the Task 4 attribution workload.
+    # Guarantees: it is logs only, 256 in flight against 128-request blocks
+    # on a MinIO store with the harness's S3 retry section, and its case and
+    # run id name the shape and the store.
+    def test_high_rate_shape_matches_the_attribution_workload(self):
+        with mock.patch.object(measure, "default_engine_cores", return_value=(1,)):
+            spec = memory.memory_spec("strict", config="logs-high-rate")
+        self.assertEqual(spec.case, "memory-strict-logs-high-rate")
+        self.assertEqual(spec.store, "minio")
+        self.assertIn("-strict-minio-", spec.run_id)
+        self.assertEqual(spec.max_in_flight, 256)
+        self.assertEqual(spec.workload.signal_of(5), "logs")
+        exporter = spec.overrides["exporter"]
+        self.assertEqual(exporter["window"]["max_requests_per_block"], 128)
+        self.assertEqual(exporter["retry"], measurement.test_e2e.S3_RETRY)
+        self.assertEqual(
+            dict(measurement.CASE_ROLES["memory_store"]),
+            {"producer": 1, "store": 1, "reader": 1},
+        )
 
 
 if __name__ == "__main__":
