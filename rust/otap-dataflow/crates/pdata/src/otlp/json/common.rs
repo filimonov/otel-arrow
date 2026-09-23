@@ -19,6 +19,8 @@ use serde::{Serialize, Serializer};
 use std::cell::RefCell;
 use std::marker::PhantomData;
 
+/// A protobuf `string` field, written with U+FFFD in place of bytes that are
+/// not UTF-8, as the conversion to OTAP records stores it.
 pub(super) struct Utf8<'a>(pub(super) &'a [u8]);
 
 impl Serialize for Utf8<'_> {
@@ -26,8 +28,7 @@ impl Serialize for Utf8<'_> {
     where
         S: Serializer,
     {
-        let value = std::str::from_utf8(self.0).map_err(S::Error::custom)?;
-        serializer.serialize_str(value)
+        serializer.serialize_str(&String::from_utf8_lossy(self.0))
     }
 }
 
