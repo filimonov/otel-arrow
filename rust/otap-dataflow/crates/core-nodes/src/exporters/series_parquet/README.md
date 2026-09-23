@@ -34,19 +34,19 @@ that block before anything newer.
 
 Rotation follows aligned wall-clock windows. A block covers one
 `window.interval` window and is sealed when that window ends, so the
-boundary-driven case writes one file set per window rather than one per
-request, and two writers of the same lake agree on where a window starts.
-Intervals are positive whole seconds of at least one second. A block that
-reaches `window.max_block_bytes` or `window.max_requests_per_block` is sealed
-before its window ends, which writes more than one file set for that window
-and re-emits that block's descriptors. The waiting is done on the engine's
-monotonic clock, so a wall clock that steps backwards cannot reopen a window
-that was already written, and boundaries missed while the worker was busy
-coalesce into one rotation. A window also ends after one interval of monotonic
-time: if the wall clock has stepped back by more than about a second, the
-block is rotated anyway, and its replacement keeps the same window start and
-re-emits its descriptors, so a backward step delays acknowledgements by at
-most one interval instead of by the length of the step.
+boundary-driven case writes one file set per window rather than one per request,
+and two writers of the same lake agree on where a window starts. Intervals are
+positive whole seconds of at least one second. A block that reaches
+`window.max_block_bytes` or `window.max_requests_per_block` is sealed before its
+window ends, which writes more than one file set for that window and re-emits
+that block's descriptors. The waiting is done on the engine's monotonic clock,
+so a wall clock that steps backwards cannot reopen a window that was already
+written, and boundaries missed while the worker was busy coalesce into one
+rotation. A window also ends after one interval of monotonic time: if the wall
+clock has stepped back, by any amount, the block is rotated anyway, and its
+replacement keeps the same window start and re-emits its descriptors, so a
+backward step delays acknowledgements by at most one interval instead of by the
+length of the step.
 
 A storage failure is retried against the identical sealed block, with the same
 file names and the same bytes, until an absolute deadline taken when the block

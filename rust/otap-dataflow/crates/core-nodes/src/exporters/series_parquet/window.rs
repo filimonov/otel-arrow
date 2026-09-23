@@ -57,18 +57,6 @@ pub(super) struct Window {
     pub(super) floored: bool,
 }
 
-/// How far the wall clock may trail the next boundary once a monotonic
-/// interval has passed and still count as rate drift rather than a step.
-///
-/// A slewing wall clock runs a few hundred parts per million slow, so it
-/// reaches a boundary slightly after the monotonic interval does; rotating
-/// then would seal the block a moment early with the old window start and
-/// write an extra file set per window. A shortfall this small is slept off
-/// instead, and anything larger is a step and rotates at once.
-fn drift_tolerance(interval: Duration) -> Duration {
-    Duration::from_secs(1) + interval / 1000
-}
-
 impl Window {
     /// Start a window aligned to the wall clock, with the next boundary armed.
     pub(super) fn new(interval: Duration, wall: Arc<dyn WallClock>) -> Self {
@@ -122,8 +110,11 @@ impl Window {
     ///
     /// A wake that finds the wall clock short of the boundary still rotates
     /// once a whole interval of monotonic time has passed since the last
-    /// rotation, unless the shortfall is small enough to be drift (see
-    /// [`drift_tolerance`]). The window clock's last boundary is left where it
+    /// rotation, however small the shortfall. The bound is strict on purpose:
+    /// a wall clock that runs slow can make a window end a moment before its
+    /// boundary, which costs one extra file set for that window, while any
+    /// tolerance for drift would let a backward step of that size hold a block
+    /// past one interval. The window clock's last boundary is left where it
     /// is, so the next block keeps the same, floored window start.
     pub(super) fn wake(&mut self) -> bool {
         let nanos = self.wall.now_unix_nanos();
@@ -134,9 +125,7 @@ impl Window {
                 (true, self.clock.next_boundary(now))
             }
             WakeOutcome::TooEarly { sleep_until } => {
-                let shortfall = i128::from(sleep_until) * 1_000_000_000 - i128::from(nanos);
-                let tolerance = drift_tolerance(self.interval).as_nanos() as i128;
-                let stalled = clock::now() >= self.deadline() && shortfall > tolerance;
+                let stalled = clock::now() >= self.deadline();
                 if stalled {
                     self.floored = true;
                 }
@@ -146,11 +135,7 @@ impl Window {
         if rotate {
             self.rotated_at = clock::now();
         }
-        // A drift shortfall is slept off past the monotonic deadline, but
-        // never by more than the tolerance that classified it as drift.
-        let cap = self
-            .deadline()
-            .max(clock::now() + drift_tolerance(self.interval));
+        let cap = self.deadline();
         self.sleep = Self::arm(target, nanos, cap);
         rotate
     }

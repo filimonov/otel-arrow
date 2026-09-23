@@ -1372,15 +1372,54 @@ async fn a_backward_clock_step_rotates_within_one_monotonic_interval() {
         .await;
 }
 
+/// Scenario: a one-second window opened 600 ms into its interval, and the wall
+/// clock steps back by one and a half seconds -- just over one interval --
+/// right after, while monotonic time advances in 100 ms steps, so when the
+/// monotonic interval ends the wall clock is 900 ms short of the boundary.
+/// Guarantees: the window is rotated once one interval of monotonic time has
+/// passed, with its start floored, however small the step is, so no backward
+/// step of any size keeps a block open past one monotonic interval.
+#[tokio::test(flavor = "current_thread")]
+async fn a_step_just_over_one_interval_rotates_within_one_monotonic_interval() {
+    use futures::FutureExt;
+
+    let sim = clock::SimClock::new();
+    let _clock_guard = sim.install();
+    let wall = Arc::new(lake::clock::TestWallClock::new(100_000_600_000_000));
+    let mut window = super::window::Window::new(Duration::from_secs(1), Arc::clone(&wall) as _);
+    wall.set(100_000_600_000_000 - 1_500_000_000);
+    let mut rotated_after_ms = None;
+    for step in 1..=30_u64 {
+        sim.advance(Duration::from_millis(100));
+        wall.advance(100_000_000);
+        tokio::task::yield_now().await;
+        if window.sleep.as_mut().now_or_never().is_some() && window.wake() {
+            rotated_after_ms = Some(step * 100);
+            break;
+        }
+    }
+    let rotated_after_ms = rotated_after_ms.expect("the window is rotated");
+    assert!(
+        rotated_after_ms <= 1_000,
+        "rotated only after {rotated_after_ms} ms of monotonic time"
+    );
+    assert!(
+        window.floored,
+        "the start stays floored at the consumed boundary"
+    );
+    assert_eq!(window.clock.last_boundary(), 100_000);
+}
+
 /// Scenario: the wall clock runs half a second slow over one fifteen-second
 /// window, so the monotonic interval ends just before the wall clock reaches
 /// the boundary.
-/// Guarantees: that shortfall is treated as drift, not as a backward step: no
-/// early rotation with the old window start happens, and the ordinary
-/// boundary rotation follows once the wall clock arrives, so a slewing clock
-/// does not add a file set per window.
+/// Guarantees: the monotonic bound is strict: the window is rotated at the end
+/// of the monotonic interval with its start floored, and the ordinary
+/// boundary rotation follows once the wall clock arrives and moves the start
+/// forward. A slewing clock therefore costs at most one extra file set per
+/// window, never a block held open past one monotonic interval.
 #[tokio::test(flavor = "current_thread")]
-async fn wall_clock_drift_is_not_mistaken_for_a_backward_step() {
+async fn wall_clock_drift_rotates_at_the_monotonic_bound_then_at_the_boundary() {
     use futures::FutureExt;
 
     let sim = clock::SimClock::new();
@@ -1395,15 +1434,18 @@ async fn wall_clock_drift_is_not_mistaken_for_a_backward_step() {
         window.sleep.as_mut().now_or_never().is_some(),
         "the monotonic bound fires"
     );
-    assert!(!window.wake(), "half a second short is drift, not a step");
-    assert!(!window.floored);
+    assert!(
+        window.wake(),
+        "the monotonic bound rotates regardless of drift"
+    );
+    assert!(window.floored);
 
     sim.advance(Duration::from_millis(500));
     wall.set(100_005 * 1_000_000_000);
     tokio::task::yield_now().await;
     assert!(
         window.sleep.as_mut().now_or_never().is_some(),
-        "the drift is slept off"
+        "the boundary is still owed"
     );
     assert!(window.wake(), "the boundary itself rotates");
     assert!(
