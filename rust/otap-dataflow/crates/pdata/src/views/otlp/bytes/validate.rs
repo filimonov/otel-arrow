@@ -11,27 +11,31 @@
 //! message the same way the top level is checked, so such a body is refused
 //! instead.
 //!
-//! What is checked, in every message of the request:
-//! - every field tag is a well-formed varint inside the protobuf key range,
-//!   with a non-zero field number and one of the four wire types in use;
-//! - every varint value terminates, and every fixed-width or length-delimited
-//!   value lies inside the enclosing message;
+//! What is checked, in every message of the request, as prost 0.14 checks it:
+//! - every field key is a well-formed varint inside the protobuf key range,
+//!   with a non-zero field number and a wire type protobuf defines;
+//! - every varint terminates within ten bytes and fits a `u64`, and every
+//!   fixed-width or length-delimited value lies inside the enclosing message;
 //! - a field the schema knows arrives with the wire type the schema gives it
-//!   (a repeated scalar may also arrive packed), as a protobuf decoder such as
-//!   prost requires;
+//!   (a repeated scalar may also arrive packed);
+//! - a `string` field holds valid UTF-8 (a `bytes` field may hold anything);
 //! - a packed `fixed64`/`double` field holds a whole number of elements, and a
-//!   packed varint field holds only terminated varints;
+//!   packed varint field holds only well-formed varints;
 //! - `AnyValue` arrays and key-value lists nest at most
 //!   [`MAX_ANY_VALUE_NESTING_DEPTH`] levels.
 //!
-//! A field the schema does not know keeps proto3 semantics: its framing is
-//! checked and its content is skipped. Strings are not checked for UTF-8 and
-//! no value is range-checked: that is content, not framing.
+//! A field the schema does not know keeps protobuf skip semantics: its
+//! framing is checked and its content is skipped. An unknown group (wire
+//! types 3 and 4) is skipped when it is balanced -- closed by an end key of
+//! its own field number, nested groups included, each group counted against
+//! the same nesting limit -- and a stray or mismatched end group is refused.
+//! No value is range-checked: that is content, not framing.
 //!
 //! Cost: each byte of the request is read once, by the innermost message that
 //! holds it, so the walk is linear in the body size; it allocates nothing, and
 //! its recursion depth is bounded by the schema's fixed levels plus three per
-//! `AnyValue` nesting level.
+//! `AnyValue` nesting level, or one per unknown group level. String fields are
+//! read a second time by the UTF-8 check.
 
 use super::decode::read_varint;
 use crate::error::Error;
@@ -92,8 +96,10 @@ enum Field {
     /// A sub-message, always length-delimited.
     Message(Message),
     /// A singular or repeated non-packable value with this wire type
-    /// (strings and bytes are `LEN`).
+    /// (`bytes` fields are `LEN`).
     Scalar(u64),
+    /// A singular or repeated `string`: `LEN`, holding valid UTF-8.
+    Str,
     /// A repeated scalar with this element wire type, packed (`LEN`) or not.
     Packed(u64),
     /// Not in the schema: framing checked, content skipped.
@@ -149,7 +155,7 @@ impl Message {
     /// The schema of field `num` of this message.
     #[inline]
     fn field(self, num: u64) -> Field {
-        use Field::{Message as Sub, Packed, Scalar, Unknown};
+        use Field::{Message as Sub, Packed, Scalar, Str, Unknown};
         use Message as M;
         match self {
             M::ExportLogsServiceRequest => match num {
@@ -159,13 +165,13 @@ impl Message {
             M::ResourceLogs => match num {
                 logs::RESOURCE_LOGS_RESOURCE => Sub(M::Resource),
                 logs::RESOURCE_LOGS_SCOPE_LOGS => Sub(M::ScopeLogs),
-                logs::RESOURCE_LOGS_SCHEMA_URL => Scalar(LEN),
+                logs::RESOURCE_LOGS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::ScopeLogs => match num {
                 logs::SCOPE_LOG_SCOPE => Sub(M::InstrumentationScope),
                 logs::SCOPE_LOGS_LOG_RECORDS => Sub(M::LogRecord),
-                logs::SCOPE_LOGS_SCHEMA_URL => Scalar(LEN),
+                logs::SCOPE_LOGS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::LogRecord => match num {
@@ -175,10 +181,8 @@ impl Message {
                 logs::LOG_RECORD_SEVERITY_NUMBER | logs::LOG_RECORD_DROPPED_ATTRIBUTES_COUNT => {
                     Scalar(VARINT)
                 }
-                logs::LOG_RECORD_SEVERITY_TEXT
-                | logs::LOG_RECORD_TRACE_ID
-                | logs::LOG_RECORD_SPAN_ID
-                | logs::LOG_RECORD_EVENT_NAME => Scalar(LEN),
+                logs::LOG_RECORD_SEVERITY_TEXT | logs::LOG_RECORD_EVENT_NAME => Str,
+                logs::LOG_RECORD_TRACE_ID | logs::LOG_RECORD_SPAN_ID => Scalar(LEN),
                 logs::LOG_RECORD_BODY => Sub(M::AnyValue),
                 logs::LOG_RECORD_ATTRIBUTES => Sub(M::KeyValue),
                 logs::LOG_RECORD_FLAGS => Scalar(FIXED32),
@@ -191,19 +195,17 @@ impl Message {
             M::ResourceMetrics => match num {
                 metrics::RESOURCE_METRICS_RESOURCE => Sub(M::Resource),
                 metrics::RESOURCE_METRICS_SCOPE_METRICS => Sub(M::ScopeMetrics),
-                metrics::RESOURCE_METRICS_SCHEMA_URL => Scalar(LEN),
+                metrics::RESOURCE_METRICS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::ScopeMetrics => match num {
                 metrics::SCOPE_METRICS_SCOPE => Sub(M::InstrumentationScope),
                 metrics::SCOPE_METRICS_METRICS => Sub(M::Metric),
-                metrics::SCOPE_METRICS_SCHEMA_URL => Scalar(LEN),
+                metrics::SCOPE_METRICS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::Metric => match num {
-                metrics::METRIC_NAME | metrics::METRIC_DESCRIPTION | metrics::METRIC_UNIT => {
-                    Scalar(LEN)
-                }
+                metrics::METRIC_NAME | metrics::METRIC_DESCRIPTION | metrics::METRIC_UNIT => Str,
                 metrics::METRIC_GAUGE => Sub(M::Gauge),
                 metrics::METRIC_SUM => Sub(M::Sum),
                 metrics::METRIC_HISTOGRAM => Sub(M::Histogram),
@@ -313,21 +315,20 @@ impl Message {
             M::ResourceSpans => match num {
                 traces::RESOURCE_SPANS_RESOURCE => Sub(M::Resource),
                 traces::RESOURCE_SPANS_SCOPE_SPANS => Sub(M::ScopeSpans),
-                traces::RESOURCE_SPANS_SCHEMA_URL => Scalar(LEN),
+                traces::RESOURCE_SPANS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::ScopeSpans => match num {
                 traces::SCOPE_SPANS_SCOPE => Sub(M::InstrumentationScope),
                 traces::SCOPE_SPANS_SPANS => Sub(M::Span),
-                traces::SCOPE_SPANS_SCHEMA_URL => Scalar(LEN),
+                traces::SCOPE_SPANS_SCHEMA_URL => Str,
                 _ => Unknown,
             },
             M::Span => match num {
-                traces::SPAN_TRACE_ID
-                | traces::SPAN_SPAN_ID
-                | traces::SPAN_TRACE_STATE
-                | traces::SPAN_PARENT_SPAN_ID
-                | traces::SPAN_NAME => Scalar(LEN),
+                traces::SPAN_TRACE_ID | traces::SPAN_SPAN_ID | traces::SPAN_PARENT_SPAN_ID => {
+                    Scalar(LEN)
+                }
+                traces::SPAN_TRACE_STATE | traces::SPAN_NAME => Str,
                 traces::SPAN_FLAGS => Scalar(FIXED32),
                 traces::SPAN_KIND
                 | traces::SPAN_DROPPED_ATTRIBUTES_COUNT
@@ -344,15 +345,14 @@ impl Message {
             },
             M::Event => match num {
                 traces::SPAN_EVENT_TIME_UNIX_NANO => Scalar(FIXED64),
-                traces::SPAN_EVENT_NAME => Scalar(LEN),
+                traces::SPAN_EVENT_NAME => Str,
                 traces::SPAN_EVENT_ATTRIBUTES => Sub(M::KeyValue),
                 traces::SPAN_EVENT_DROPPED_ATTRIBUTES_COUNTS => Scalar(VARINT),
                 _ => Unknown,
             },
             M::Link => match num {
-                traces::SPAN_LINK_TRACE_ID
-                | traces::SPAN_LINK_SPAN_ID
-                | traces::SPAN_LINK_TRACE_STATE => Scalar(LEN),
+                traces::SPAN_LINK_TRACE_ID | traces::SPAN_LINK_SPAN_ID => Scalar(LEN),
+                traces::SPAN_LINK_TRACE_STATE => Str,
                 traces::SPAN_LINK_ATTRIBUTES => Sub(M::KeyValue),
                 traces::SPAN_LINK_DROPPED_ATTRIBUTES_COUNT => Scalar(VARINT),
                 traces::SPAN_LINK_FLAGS => Scalar(FIXED32),
@@ -360,7 +360,7 @@ impl Message {
             },
             // Field 1 is the reserved `deprecated_code`, skipped as unknown.
             M::Status => match num {
-                traces::SPAN_STATUS_MESSAGE => Scalar(LEN),
+                traces::SPAN_STATUS_MESSAGE => Str,
                 traces::SPAN_STATUS_CODE => Scalar(VARINT),
                 _ => Unknown,
             },
@@ -374,24 +374,23 @@ impl Message {
                 common::ENTITY_REF_SCHEMA_URL
                 | common::ENTITY_REF_TYPE
                 | common::ENTITY_REF_ID_KEYS
-                | common::ENTITY_REF_DESCRIPTION_KEYS => Scalar(LEN),
+                | common::ENTITY_REF_DESCRIPTION_KEYS => Str,
                 _ => Unknown,
             },
             M::InstrumentationScope => match num {
-                common::INSTRUMENTATION_SCOPE_NAME | common::INSTRUMENTATION_SCOPE_VERSION => {
-                    Scalar(LEN)
-                }
+                common::INSTRUMENTATION_SCOPE_NAME | common::INSTRUMENTATION_SCOPE_VERSION => Str,
                 common::INSTRUMENTATION_SCOPE_ATTRIBUTES => Sub(M::KeyValue),
                 common::INSTRUMENTATION_DROPPED_ATTRIBUTES_COUNT => Scalar(VARINT),
                 _ => Unknown,
             },
             M::KeyValue => match num {
-                common::KEY_VALUE_KEY => Scalar(LEN),
+                common::KEY_VALUE_KEY => Str,
                 common::KEY_VALUE_VALUE => Sub(M::AnyValue),
                 _ => Unknown,
             },
             M::AnyValue => match num {
-                common::ANY_VALUE_STRING_VALUE | common::ANY_VALUE_BYTES_VALUE => Scalar(LEN),
+                common::ANY_VALUE_STRING_VALUE => Str,
+                common::ANY_VALUE_BYTES_VALUE => Scalar(LEN),
                 common::ANY_VALUE_BOOL_VALUE | common::ANY_VALUE_INT_VALUE => Scalar(VARINT),
                 common::ANY_VALUE_DOUBLE_VALUE => Scalar(FIXED64),
                 common::ANY_VALUE_ARRAY_VALUE => Sub(M::ArrayValue),
@@ -448,6 +447,23 @@ enum Damage {
     },
 }
 
+/// Wire type 3: the start of a group (proto2), carrying no length.
+const START_GROUP: u64 = 3;
+/// Wire type 4: the end of the group opened by the same field number.
+const END_GROUP: u64 = 4;
+
+/// Decode the field key at `pos`: its field number, its wire type and the
+/// position just past it.
+#[inline]
+fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), &'static str> {
+    let (tag, next) = read_varint(buf, pos).ok_or("truncated or overlong field key")?;
+    let field_num = tag >> 3;
+    if tag > u64::from(u32::MAX) || field_num == 0 {
+        return Err("invalid field key");
+    }
+    Ok((field_num, tag & 7, next))
+}
+
 /// Walk one message of type `message`; `base` is the offset of `buf` within
 /// the request and `depth` the `AnyValue` nesting level `buf` is at.
 fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), Damage> {
@@ -459,19 +475,34 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
     let mut pos = 0;
     while pos < buf.len() {
         let at = pos;
-        let (tag, next) = read_varint(buf, pos).ok_or_else(|| fail("truncated field key", at))?;
-        let field_num = tag >> 3;
-        if tag > u64::from(u32::MAX) || field_num == 0 {
-            return Err(fail("invalid field key", at));
+        let (field_num, wire_type, next) =
+            read_key(buf, pos).map_err(|problem| fail(problem, at))?;
+        let field = message.field(field_num);
+        if wire_type == START_GROUP || wire_type == END_GROUP {
+            if wire_type == END_GROUP {
+                return Err(fail("end group without a start group", at));
+            }
+            if !matches!(field, Field::Unknown) {
+                return Err(fail("wrong wire type for a known field", at));
+            }
+            pos = skip_group(buf, base, message, next, field_num, depth + 1, at)?;
+            continue;
         }
-        let wire_type = tag & 7;
         let (start, end) =
             value_range(buf, wire_type, next).map_err(|problem| fail(problem, at))?;
-        match message.field(field_num) {
+        match field {
             Field::Unknown => {}
             Field::Scalar(expected) => {
                 if wire_type != expected {
                     return Err(fail("wrong wire type for a known field", at));
+                }
+            }
+            Field::Str => {
+                if wire_type != LEN {
+                    return Err(fail("wrong wire type for a known field", at));
+                }
+                if std::str::from_utf8(&buf[start..end]).is_err() {
+                    return Err(fail("invalid UTF-8 in a string field", at));
                 }
             }
             Field::Packed(element) => {
@@ -497,6 +528,51 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
     Ok(())
 }
 
+/// Skip an unknown group of field `field_num` inside `message`, whose start
+/// key is at `group_at` and ends at `pos`, as prost skips it: every field
+/// inside is framed and skipped, nested groups are skipped the same way, and
+/// the group must close with an end key of the same field number before the
+/// enclosing message ends. `depth` counts the group against the same nesting
+/// limit as `AnyValue` containers, which bounds this recursion too. Returns
+/// the position just past the end key.
+fn skip_group(
+    buf: &[u8],
+    base: usize,
+    message: Message,
+    mut pos: usize,
+    field_num: u64,
+    depth: usize,
+    group_at: usize,
+) -> Result<usize, Damage> {
+    let fail = |problem: &'static str, at: usize| Damage::Framing {
+        problem,
+        message,
+        offset: base + at,
+    };
+    if depth > MAX_ANY_VALUE_NESTING_DEPTH {
+        return Err(Damage::TooDeep {
+            offset: base + group_at,
+        });
+    }
+    loop {
+        if pos >= buf.len() {
+            return Err(fail("group without an end group", group_at));
+        }
+        let at = pos;
+        let (num, wire_type, next) = read_key(buf, pos).map_err(|problem| fail(problem, at))?;
+        pos = match wire_type {
+            END_GROUP if num == field_num => return Ok(next),
+            END_GROUP => return Err(fail("end group does not match its start group", at)),
+            START_GROUP => skip_group(buf, base, message, next, num, depth + 1, at)?,
+            _ => {
+                value_range(buf, wire_type, next)
+                    .map_err(|problem| fail(problem, at))?
+                    .1
+            }
+        };
+    }
+}
+
 /// The byte range of the value of a field of `wire_type` whose key ends at
 /// `pos`, bounds-checked against `buf`. For a length-delimited field the
 /// range excludes the length prefix.
@@ -504,11 +580,12 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
 fn value_range(buf: &[u8], wire_type: u64, pos: usize) -> Result<(usize, usize), &'static str> {
     match wire_type {
         VARINT => {
-            let (_, end) = read_varint(buf, pos).ok_or("truncated varint")?;
+            let (_, end) = read_varint(buf, pos).ok_or("truncated or overlong varint")?;
             Ok((pos, end))
         }
         LEN => {
-            let (len, start) = read_varint(buf, pos).ok_or("truncated length prefix")?;
+            let (len, start) =
+                read_varint(buf, pos).ok_or("truncated or overlong length prefix")?;
             let end = usize::try_from(len)
                 .ok()
                 .and_then(|len| start.checked_add(len))
@@ -541,7 +618,8 @@ fn check_packed(payload: &[u8], element: u64) -> Result<(), &'static str> {
     }
     let mut pos = 0;
     while pos < payload.len() {
-        let (_, next) = read_varint(payload, pos).ok_or("truncated varint in a packed field")?;
+        let (_, next) =
+            read_varint(payload, pos).ok_or("truncated or overlong varint in a packed field")?;
         pos = next;
     }
     Ok(())
@@ -1053,6 +1131,168 @@ mod tests {
                 limit: MAX_ANY_VALUE_NESTING_DEPTH,
                 ..
             })
+        ));
+    }
+
+    /// A logs request whose only log record is `record`.
+    fn in_log_record(record: &[u8]) -> Vec<u8> {
+        len_field(1, &len_field(2, &len_field(2, record)))
+    }
+
+    /// The problem an `InvalidOtlpWireFormat` names, or a panic.
+    fn problem(result: Result<(), Error>) -> &'static str {
+        match result {
+            Err(Error::InvalidOtlpWireFormat { problem, .. }) => problem,
+            other => panic!("expected a framing error, got {other:?}"),
+        }
+    }
+
+    /// Scenario: a log record's `severity_number` (a varint) holding
+    /// `u64::MAX` in ten bytes, then the ten-byte varint
+    /// `80 80 80 80 80 80 80 80 80 02` and an eleven-byte varint in the same
+    /// field, one as a nested length prefix, and one inside packed
+    /// exponential-histogram bucket counts.
+    /// Guarantees: the maximum `u64` passes, and a varint carrying bits past
+    /// the 64th is refused wherever it appears -- key, length, scalar or
+    /// packed element -- instead of being read as a wrapped value, as prost
+    /// refuses it.
+    #[test]
+    fn a_varint_that_overflows_u64_is_refused() {
+        let root = Message::ExportLogsServiceRequest;
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        let overflow = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        let mut eleven = [0x80; 11];
+        eleven[10] = 0x00;
+        let severity = |varint: &[u8]| in_log_record(&[&[0x10][..], varint].concat());
+        assert!(validate_request(&severity(&max), root).is_ok());
+        assert_eq!(
+            problem(validate_request(&severity(&overflow), root)),
+            "truncated or overlong varint"
+        );
+        assert_eq!(
+            problem(validate_request(&severity(&eleven), root)),
+            "truncated or overlong varint"
+        );
+        // LogRecord.body (field 5, LEN) whose length is the overflowing varint.
+        let length = in_log_record(&[&[0x2a][..], &overflow].concat());
+        assert_eq!(
+            problem(validate_request(&length, root)),
+            "truncated or overlong length prefix"
+        );
+        // An unknown field key that overflows.
+        let key = in_log_record(&overflow);
+        assert_eq!(
+            problem(validate_request(&key, root)),
+            "truncated or overlong field key"
+        );
+        let buckets = |counts: &[u8]| {
+            let point = len_field(8, &len_field(2, counts));
+            let metric = len_field(10, &len_field(1, &point));
+            len_field(1, &len_field(2, &len_field(2, &metric)))
+        };
+        let metrics = Message::ExportMetricsServiceRequest;
+        assert!(validate_request(&buckets(&max), metrics).is_ok());
+        assert_eq!(
+            problem(validate_request(&buckets(&overflow), metrics)),
+            "truncated or overlong varint in a packed field"
+        );
+    }
+
+    /// Scenario: `AnyValue.string_value` holding the byte `0xff`, the same
+    /// value as a valid multibyte UTF-8 string, `AnyValue.bytes_value`
+    /// holding `0xff`, and a `KeyValue.key` and a `Metric.name` holding
+    /// `0xff`.
+    /// Guarantees: a `string` field must hold valid UTF-8, as prost requires,
+    /// so the conversion never replaces damaged text with U+FFFD and stores it
+    /// as if it had been sent; multibyte text and arbitrary `bytes` pass.
+    #[test]
+    fn a_string_field_must_hold_valid_utf8() {
+        let root = Message::ExportLogsServiceRequest;
+        let attribute = |key: &[u8], value: &[u8]| {
+            let key_value = [len_field(1, key), len_field(2, value)].concat();
+            in_log_record(&len_field(6, &key_value))
+        };
+        assert_eq!(
+            problem(validate_request(
+                &attribute(b"k", &len_field(1, &[0xff])),
+                root
+            )),
+            "invalid UTF-8 in a string field"
+        );
+        let text = "h\u{e9}llo \u{2713} \u{1f600}";
+        assert!(validate_request(&attribute(b"k", &len_field(1, text.as_bytes())), root).is_ok());
+        assert!(validate_request(&attribute(b"k", &len_field(7, &[0xff])), root).is_ok());
+        assert_eq!(
+            problem(validate_request(
+                &attribute(&[0xff], &len_field(1, b"v")),
+                root
+            )),
+            "invalid UTF-8 in a string field"
+        );
+        let metric = len_field(1, &[0xc3]);
+        let body = len_field(1, &len_field(2, &len_field(2, &metric)));
+        assert_eq!(
+            problem(validate_request(
+                &body,
+                Message::ExportMetricsServiceRequest
+            )),
+            "invalid UTF-8 in a string field"
+        );
+    }
+
+    /// Scenario: unknown field 31 of a log record encoded as a group --
+    /// empty (`fb 01 fc 01`), holding fields of every other wire type, and
+    /// holding a nested group of field 32 -- then a stray end group, an end
+    /// group of the wrong field, a group never closed, a group on a known
+    /// field, and groups nested exactly at and one beyond the nesting limit.
+    /// Guarantees: a balanced unknown group is skipped as prost skips it, so a
+    /// sender's proto2 extension never refuses a request; every unbalanced or
+    /// misplaced group is refused, and group nesting is bounded by the same
+    /// limit as `AnyValue` nesting.
+    #[test]
+    fn unknown_groups_are_skipped_when_balanced() {
+        let root = Message::ExportLogsServiceRequest;
+        let start31 = [0xfb, 0x01];
+        let end31 = [0xfc, 0x01];
+        let start32 = [0x83, 0x02];
+        let end32 = [0x84, 0x02];
+        let record = |parts: &[&[u8]]| in_log_record(&parts.concat());
+        assert!(validate_request(&record(&[&start31, &end31]), root).is_ok());
+        let fields: &[u8] = &[
+            0x08, 0x05, 0x11, 1, 2, 3, 4, 5, 6, 7, 8, 0x1a, 0x01, 0xff, 0x25, 1, 2, 3, 4,
+        ];
+        assert!(validate_request(&record(&[&start31, fields, &end31]), root).is_ok());
+        assert!(
+            validate_request(&record(&[&start31, &start32, fields, &end32, &end31]), root).is_ok()
+        );
+
+        assert_eq!(
+            problem(validate_request(&record(&[&end31]), root)),
+            "end group without a start group"
+        );
+        assert_eq!(
+            problem(validate_request(&record(&[&start31, &end32]), root)),
+            "end group does not match its start group"
+        );
+        assert_eq!(
+            problem(validate_request(&record(&[&start31, fields]), root)),
+            "group without an end group"
+        );
+        // Field 1 of a log record (time_unix_nano) as a group.
+        assert_eq!(
+            problem(validate_request(&record(&[&[0x0b, 0x0c]]), root)),
+            "wrong wire type for a known field"
+        );
+
+        let nested = |levels: usize| {
+            let mut parts = vec![&start31[..]; levels];
+            parts.extend(vec![&end31[..]; levels]);
+            record(&parts)
+        };
+        assert!(validate_request(&nested(MAX_ANY_VALUE_NESTING_DEPTH), root).is_ok());
+        assert!(matches!(
+            validate_request(&nested(MAX_ANY_VALUE_NESTING_DEPTH + 1), root),
+            Err(Error::OtlpNestingTooDeep { .. })
         ));
     }
 }

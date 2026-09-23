@@ -121,10 +121,12 @@ impl OtlpProtoBytes {
     /// The walk follows the OTLP logs, metrics or traces schema into every
     /// length-delimited field it defines as a sub-message, down to data
     /// points, exemplars and `AnyValue` arrays and key-value lists, and checks
-    /// each nested message's framing as the top level is checked. A known
-    /// field with the wrong wire type, or a packed field that is not a whole
-    /// number of elements, is refused; an unknown field is framed and
-    /// skipped. See [`crate::views::otlp::bytes::validate`].
+    /// each nested message's framing as the top level is checked, as prost
+    /// would: a varint that overflows `u64`, a known field with the wrong
+    /// wire type, a `string` field that is not UTF-8, or a packed field that
+    /// is not a whole number of elements is refused; an unknown field,
+    /// including a balanced group, is framed and skipped. See
+    /// [`crate::views::otlp::bytes::validate`].
     ///
     /// Cost: one linear walk of the body with no allocation; each byte is
     /// read once, by the innermost message holding it.

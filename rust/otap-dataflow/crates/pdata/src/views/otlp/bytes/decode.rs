@@ -684,7 +684,13 @@ where
     }
 }
 
-/// Decode variant at position in buffer
+/// Decode the varint at `pos` in `buf`, returning its value and the position
+/// just past it.
+///
+/// Returns `None` for a varint that runs past the end of `buf`, is longer
+/// than ten bytes, or whose tenth byte carries bits beyond the 64th (a tenth
+/// byte above `0x01`), as prost refuses them: such a varint does not encode a
+/// `u64`, and reading it modulo 2^64 would turn damage into a value.
 #[inline]
 #[must_use]
 pub fn read_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
@@ -698,6 +704,10 @@ pub fn read_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
         out |= ((byte & 0x7F) as u64) << shift;
 
         if byte < 0x80 {
+            // At shift 63 only the lowest bit still fits in a u64.
+            if shift == 63 && byte > 0x01 {
+                return None;
+            }
             return Some((out, pos));
         }
 
@@ -799,5 +809,33 @@ mod tests {
         assert_eq!(decode_sint32(1), -1);
         assert_eq!(decode_sint32(u32::MAX - 1), i32::MAX);
         assert_eq!(decode_sint32(u32::MAX), i32::MIN);
+    }
+
+    /// Scenario: ten-byte varints whose tenth byte is `0x01` (`u64::MAX`),
+    /// `0x02` (the 65th bit set) and `0x7f`, an eleven-byte varint, and the
+    /// same overflowing varint as the value of a top-level varint field.
+    /// Guarantees: the maximum `u64` decodes to itself in ten bytes, and every
+    /// varint carrying bits past the 64th is refused rather than read modulo
+    /// 2^64, as prost refuses it -- `80 80 80 80 80 80 80 80 80 02` is not
+    /// zero.
+    #[test]
+    fn refuses_varints_that_overflow_u64() {
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(read_varint(&max, 0), Some((u64::MAX, 10)));
+        let mut overflow = [0x80; 10];
+        overflow[9] = 0x02;
+        assert_eq!(read_varint(&overflow, 0), None);
+        overflow[9] = 0x7f;
+        assert_eq!(read_varint(&overflow, 0), None);
+        let mut eleven = [0x80; 11];
+        eleven[10] = 0x00;
+        assert_eq!(read_varint(&eleven, 0), None);
+
+        let mut field = vec![0x08];
+        field.extend([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        assert!(matches!(
+            validate_message_wire_format(&field),
+            Err(Error::InvalidProtobufWireFormat)
+        ));
     }
 }
