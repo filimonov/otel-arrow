@@ -661,6 +661,15 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - [ ] Measure the extra cost on the stage bench (otlp_convert) and record it; the check must stay a small fraction of conversion.
 - [ ] chloggen bug_fix for pdata (upstream-relevant); ASCII; Scenario/Guarantees.
 
+### Task 3h: Smoke test with processor:attribute collapsing a high-cardinality attribute (user request 2026-09-23)
+
+**Goal:** prove the exporter coexists correctly with `processor:attribute` deleting a per-point-unique metric attribute upstream. Expected and accepted outcome: two data points that were distinct streams before the delete arrive with the same identity, get the same series_id, and nothing breaks.
+
+- [ ] Add one E2E test to test_e2e.py (functional lane, no measurement): pipeline OTLP receiver -> `processor:attribute` with `apply_to: ["signal"]` and `actions: [{action: delete, key: request.id}]` -> series_parquet exporter (local storage is enough; one S3 variant optional). Producer sends, in one request and in two separate requests, delta sum points and delta histogram points from two streams that differ only in `request.id`, with equal timestamps, plus one cumulative sum pair.
+- [ ] Assert: every request acknowledged (no nack); exactly one metrics/series row for the collapsed identity (descriptor written once per partition and worker); two metrics/values rows with the same series_id and timestamp for each collapsed pair; no `request.id` attribute survives anywhere in the written files; both DuckDB and ClickHouse read the files, and `sum(value)` over the collapsed delta series equals the sum of the originals; the series/points ratio signal from Task 5 (if already present) reports the collapse.
+- [ ] Document the result in the README next to the high-cardinality strategy: delete is correct for delta sums and histograms (readers sum), wrong for cumulative (interleaved running totals) and ambiguous for gauges; spatial aggregation is not available in otap-dataflow today (plan-4 backlog item).
+- [ ] Standard rules: Scenario/Guarantees comments, ASCII, SERIES_REQUIRE_DOCKER=1, measured launches unaffected.
+
 ### Task 3f: Behaviour-preserving simplification (fourth review, user decision 2026-09-23)
 
 **Order:** after Task 6 has merged (it edits series-lake buffer/sort and bench stages) and before the fault matrix (Tasks 9-11, 13), so the fault tasks exercise the simplified code. No behaviour, format, golden vector, metric name or config key changes; the existing unit, golden, contract and E2E suites are the safety net, and every commit keeps them green. Items 1 (worker state machine behind an event API), 3 (notifier rewrite) and 6 (LakeWriter facade) are NOT in this task: they rewrite exactly what plan 4's shared writer rewrites, and go there (see docs/superpowers/plans/2026-09-23-plan-4-backlog.md).
