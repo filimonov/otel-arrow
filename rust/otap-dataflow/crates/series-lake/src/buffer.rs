@@ -1122,7 +1122,7 @@ mod tests {
         for cfg in [defaults.clone(), denormalized] {
             for (host, n) in [("one", 1), ("many", 64)] {
                 let e = extracted(&cfg, host, n);
-                let columns = 10 + crate::schema::denorm_columns(Dataset::LogsSeries, &cfg).len();
+                let columns = cfg.series_columns(Signal::Logs);
                 cases.push((cfg.clone(), columns, Signal::Logs, e));
             }
         }
@@ -1130,7 +1130,8 @@ mod tests {
             let mut records = encode_metrics(&gauge_request(n));
             let e = extract(&mut records, &defaults).expect("extract metrics");
             assert_eq!(e.descriptors.len(), n);
-            cases.push((defaults.clone(), 16, Signal::Metrics, e));
+            let columns = defaults.series_columns(Signal::Metrics);
+            cases.push((defaults.clone(), columns, Signal::Metrics, e));
         }
 
         for (cfg, columns, signal, e) in cases {

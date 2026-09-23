@@ -289,6 +289,8 @@ struct Common<'a> {
     descriptors: Vec<DescriptorRow>,
     seen: HashSet<SeriesId>,
     stats: ExtractStats,
+    /// [`LakeConfig::series_columns`] of metrics.
+    series_columns: usize,
 }
 
 /// The metric a data point belongs to.
@@ -348,6 +350,7 @@ impl Common<'_> {
                 d,
                 identified,
                 Dataset::MetricsSeries,
+                self.series_columns,
                 self.cfg,
                 &mut self.stats,
                 budget,
@@ -551,6 +554,7 @@ pub(crate) fn extract_metrics(
         descriptors: Vec::new(),
         seen: HashSet::new(),
         stats: ExtractStats::default(),
+        series_columns: cfg.series_columns(Signal::Metrics),
     };
 
     // Unsupported point kinds. `metric_rows` has already refused the request

@@ -380,15 +380,6 @@ impl AttrTable {
         self.groups.get(&parent_id).map_or(&[], Vec::as_slice)
     }
 
-    /// Approximate retained bytes of one parent's attributes.
-    #[must_use]
-    pub fn approx_bytes(&self, parent_id: u32) -> usize {
-        self.get(parent_id)
-            .iter()
-            .map(|(k, v)| k.len() + 24 + value_bytes(v))
-            .sum()
-    }
-
     /// Drop the table and give back what it charged to `budget`.
     pub(crate) fn release(self, budget: &mut Budget) {
         budget.uncharge(self.bytes);

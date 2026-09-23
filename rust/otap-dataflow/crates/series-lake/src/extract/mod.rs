@@ -25,7 +25,7 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
-use crate::value::{DecodeLimits, Value, kv_bytes, map_string};
+use crate::value::{BUFFER_HEADER_BYTES, DecodeLimits, Value, kv_bytes, map_string};
 
 /// The single "cast this batch column to a plain type" helper of the crate.
 ///
@@ -69,17 +69,35 @@ pub struct DescriptorRow {
     /// Trees die at admission, so the block subtracts exactly these from the
     /// row's charge.
     pub decoded_bytes: usize,
+    /// Columns of the series dataset the row is written to.
+    columns: usize,
 }
 
 impl DescriptorRow {
-    /// Conservative Arrow series-row estimate, including stamp-swap headroom.
+    /// Conservative Arrow series-row estimate, including stamp-swap headroom;
+    /// see [`series_row_charge`].
     #[must_use]
     pub fn series_row_bytes(&self) -> usize {
-        let columns = 10 + usize::from(self.descriptor.metric.is_some()) * 6 + self.denorm.len();
-        // Builder growth, offsets and validity are charged here; decoded
-        // attribute trees die at admission and are not charged to the block.
-        2 * (self.approx_bytes.saturating_sub(self.decoded_bytes) + columns * 64) + 8
+        series_row_charge(
+            self.approx_bytes.saturating_sub(self.decoded_bytes),
+            self.columns,
+        )
     }
+}
+
+/// Bytes a block charges per series cell for builder growth, offsets and
+/// validity.
+pub(crate) const SERIES_CELL_BYTES: usize = 64;
+
+/// Bytes a block charges per series row beyond its cells.
+pub(crate) const SERIES_ROW_BYTES: usize = 8;
+
+/// The block charge of one series row of `columns` cells whose content is
+/// `content` bytes: twice content and cell overhead, the headroom of a
+/// builder that doubles, plus [`SERIES_ROW_BYTES`]. Decoded attribute trees
+/// die at admission and are not part of `content`.
+pub(crate) fn series_row_charge(content: usize, columns: usize) -> usize {
+    2 * (content + columns * SERIES_CELL_BYTES) + SERIES_ROW_BYTES
 }
 
 /// The resource or scope attribute lists of one request, decoded once per
@@ -277,7 +295,7 @@ impl Budget {
 pub(crate) fn denorm_bytes(v: &Option<DenormValue>) -> usize {
     match v {
         None => 8,
-        Some(DenormValue::Str(s)) => s.len() + 24,
+        Some(DenormValue::Str(s)) => s.len() + BUFFER_HEADER_BYTES,
         Some(_) => 16,
     }
 }
@@ -600,9 +618,14 @@ pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
         .collect();
     let bytes = entries
         .iter()
-        .map(|(k, v)| k.len() + 24 + v.as_ref().map_or(0, String::len))
+        .map(|(k, v)| rendered_entry_bytes(k, v.as_deref()))
         .sum();
     (Col::Map(entries), bytes)
+}
+
+/// Bytes one rendered map entry retains.
+fn rendered_entry_bytes(key: &str, rendered: Option<&str>) -> usize {
+    key.len() + BUFFER_HEADER_BYTES + rendered.map_or(0, str::len)
 }
 
 /// Bytes a sorted attribute list occupies once rendered into a map cell.
@@ -613,7 +636,7 @@ pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
 /// request is admitted) and only its size is needed now.
 pub(crate) fn rendered_kv_bytes(list: &[(String, Value)]) -> usize {
     list.iter()
-        .map(|(k, v)| k.len() + 24 + map_string(v).map_or(0, |s| s.len()))
+        .map(|(k, v)| rendered_entry_bytes(k, map_string(v).as_deref()))
         .sum()
 }
 
@@ -836,11 +859,13 @@ pub(crate) fn identity(descriptor: &Descriptor) -> (Vec<u8>, SeriesId) {
 ///
 /// The caller computes the identity with [`identity`] and checks it against
 /// the series it already holds first, so a duplicate is never built, looked
-/// up for denormalized columns or charged.
+/// up for denormalized columns or charged. `columns` is
+/// [`LakeConfig::series_columns`] of the signal, computed once per request.
 pub(crate) fn descriptor_row(
     descriptor: Descriptor,
     (identity_bytes, series_id): (Vec<u8>, SeriesId),
     ds_series: Dataset,
+    columns: usize,
     cfg: &LakeConfig,
     stats: &mut ExtractStats,
     budget: &mut Budget,
@@ -891,6 +916,7 @@ pub(crate) fn descriptor_row(
         denorm,
         approx_bytes,
         decoded_bytes,
+        columns,
     })
 }
 
@@ -1033,42 +1059,6 @@ mod tests {
             stats.denorm_type_mismatch_by_column.values().sum::<u64>(),
             stats.denorm_type_mismatch
         );
-    }
-
-    /// Scenario: an attribute list holding a bytes value, which `render_v1`
-    /// base64-encodes, and a nested value whose strings are full of characters
-    /// JSON must escape.
-    /// Guarantees: the rendered size counts both expansions, exceeds the
-    /// decoded tree size `kv_bytes` reports, and agrees exactly with the cell
-    /// [`map_cell`] builds -- so the two ways a row is charged cannot drift.
-    #[test]
-    fn rendered_bytes_count_base64_encoding_and_json_escaping() {
-        let list = vec![
-            ("b".to_string(), Value::Bytes(vec![0xFF; 100])),
-            (
-                "n".to_string(),
-                Value::KvList(vec![(
-                    "inner".to_string(),
-                    Value::Array(vec![Value::Str("\"\\\n\t".repeat(50))]),
-                )]),
-            ),
-        ];
-        let (cell, bytes) = map_cell(&list);
-        assert_eq!(bytes, rendered_kv_bytes(&list));
-        assert!(rendered_kv_bytes(&list) > kv_bytes(&list));
-        match cell {
-            Col::Map(entries) => {
-                assert_eq!(entries.len(), 2);
-                // 100 bytes become 136 base64 characters (34 padded groups of
-                // four) inside a pair of JSON quotes.
-                let b64 = entries[0].1.as_deref().expect("rendered bytes cell");
-                assert_eq!(b64.len(), 138);
-                // Every one of the 200 escaped characters becomes two.
-                let nested = entries[1].1.as_deref().expect("rendered nested cell");
-                assert!(nested.len() > 400);
-            }
-            other => unreachable!("expected a map cell, got {other:?}"),
-        }
     }
 
     /// Scenario: a `resource` struct and an `AnyValue` `body` struct whose

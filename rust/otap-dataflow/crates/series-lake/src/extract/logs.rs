@@ -90,6 +90,7 @@ pub(crate) fn extract_logs(
     let mut memo: HashMap<MemoKey, SeriesId> = HashMap::new();
     let mut resources = SharedLists::default();
     let mut scopes = SharedLists::default();
+    let series_columns = cfg.series_columns(Signal::Logs);
 
     for row in 0..logs.num_rows() {
         let rid = prim_at::<UInt16Type>(&res_id, row).map(u32::from);
@@ -146,6 +147,7 @@ pub(crate) fn extract_logs(
                         descriptor,
                         identified,
                         Dataset::LogsSeries,
+                        series_columns,
                         cfg,
                         &mut stats,
                         budget,

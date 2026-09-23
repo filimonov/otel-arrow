@@ -463,10 +463,16 @@ impl LakeConfig {
     /// only (see [`LakeConfig::validate`]); the rest is decided per request.
     #[must_use]
     pub fn series_row_fixed_bytes(&self, signal: crate::canonical::Signal) -> usize {
-        let ds = crate::schema::Dataset::series_of(signal);
-        let metric = usize::from(signal == crate::canonical::Signal::Metrics) * 6;
-        let columns = 10 + metric + crate::schema::denorm_columns(ds, self).len();
-        2 * 64 * columns + 8 + self.ingress.pending_series_entry_bytes
+        crate::extract::series_row_charge(0, self.series_columns(signal))
+            + self.ingress.pending_series_entry_bytes
+    }
+
+    /// Columns of the series dataset of `signal` under this configuration.
+    #[must_use]
+    pub fn series_columns(&self, signal: crate::canonical::Signal) -> usize {
+        crate::schema::dataset_schema(crate::schema::Dataset::series_of(signal), self)
+            .fields()
+            .len()
     }
 
     /// Validate cross-field constraints (FORMAT.md section 3 for the
