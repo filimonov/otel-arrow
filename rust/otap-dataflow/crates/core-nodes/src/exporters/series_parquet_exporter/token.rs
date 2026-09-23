@@ -43,6 +43,24 @@ pub(super) struct AckToken {
     signal: SignalType,
     /// When the exporter took ownership of the completion.
     received: Instant,
+    /// Fails a test that drops the token without deciding it.
+    #[cfg(test)]
+    bomb: DropBomb,
+}
+
+/// Panics when dropped, unless the token carrying it is decided or its owner
+/// is torn down with it.
+#[cfg(test)]
+struct DropBomb;
+
+#[cfg(test)]
+impl Drop for DropBomb {
+    fn drop(&mut self) {
+        assert!(
+            std::thread::panicking(),
+            "an AckToken was dropped without a decision"
+        );
+    }
 }
 
 impl AckToken {
@@ -61,9 +79,24 @@ impl AckToken {
                 context,
                 signal,
                 received: clock::now(),
+                #[cfg(test)]
+                bomb: DropBomb,
             },
             payload,
         )
+    }
+
+    /// Release the token undecided, because the worker or notifier holding
+    /// it is being torn down by a test.
+    #[cfg(test)]
+    pub(super) fn discard(self) {
+        std::mem::forget(self.bomb);
+    }
+
+    /// The node the request was routed from, which a test identifies it by.
+    #[cfg(test)]
+    pub(super) fn source(&self) -> Option<usize> {
+        self.context.source_node()
     }
 
     /// Total bytes this token keeps resident, inline storage included.
@@ -91,7 +124,16 @@ impl AckToken {
 
     /// Rebuild the pdata the completion is delivered on, with an empty payload.
     fn pdata(self) -> OtapPdata {
-        OtapPdata::new(self.context, OtapPayload::empty(self.signal))
+        let Self {
+            context,
+            signal,
+            #[cfg(test)]
+            bomb,
+            ..
+        } = self;
+        #[cfg(test)]
+        std::mem::forget(bomb);
+        OtapPdata::new(context, OtapPayload::empty(signal))
     }
 }
 
@@ -435,9 +477,20 @@ impl Notifier {
     }
 }
 
+/// A test that drops a notifier still holding queued completions tears them
+/// down with it rather than deciding them.
+#[cfg(test)]
+impl Drop for Notifier {
+    fn drop(&mut self) {
+        for (token, _, _) in self.queue.drain(..) {
+            token.discard();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{effects, empty_pdata};
+    use super::super::tests::{assert_no_more_completions, effects, empty_pdata};
     use super::*;
     use otel_arrow_dfe_engine::control::{NackCause, PipelineCompletionMsg};
     use std::time::Duration;
@@ -471,6 +524,7 @@ mod tests {
         let (token, _payload) = AckToken::split(data);
         assert!(token.context.transport_headers().is_none());
         assert_eq!(token.signal(), SignalType::Logs);
+        token.discard();
     }
 
     /// Scenario: a token moves from a reserved queue cell into a blocked send
@@ -547,6 +601,7 @@ mod tests {
         assert_eq!(notify.failures(), 0);
         assert!(notify.is_empty());
         assert!(notify.token_high_water() > 0);
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: force-drained requests are refused while the completion
@@ -593,6 +648,7 @@ mod tests {
             }
         }
         assert!(notify.is_empty());
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: three hundred decided completions -- more than tokio's
@@ -622,6 +678,7 @@ mod tests {
             delivered += 1;
         }
         assert_eq!(delivered, N);
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: three hundred force-drained requests arrive after shutdown
@@ -651,6 +708,7 @@ mod tests {
         }
         assert_eq!(delivered + notify.len(), N);
         assert_eq!(delivered, N);
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: a notifier is created with a capacity no queue could ever
@@ -672,6 +730,7 @@ mod tests {
             rx.recv().await.expect("an ack"),
             PipelineCompletionMsg::DeliverAck { .. }
         ));
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: one completion is parked in a blocked send and a second,
@@ -752,6 +811,7 @@ mod tests {
             rx.try_recv(),
             Ok(PipelineCompletionMsg::DeliverNack { .. })
         ));
+        assert_no_more_completions(&mut rx);
     }
 
     /// Scenario: completions are pushed past the notifier's bound, first while
@@ -776,5 +836,6 @@ mod tests {
             rx.try_recv(),
             Ok(PipelineCompletionMsg::DeliverNack { .. })
         ));
+        assert_no_more_completions(&mut rx);
     }
 }

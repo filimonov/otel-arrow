@@ -8,8 +8,9 @@ mod admission;
 mod config;
 mod flush;
 mod metrics;
+mod model;
 mod rotation;
 mod shutdown;
 mod support;
 
-pub(super) use support::{effects, empty_pdata};
+pub(super) use support::{assert_no_more_completions, effects, empty_pdata};

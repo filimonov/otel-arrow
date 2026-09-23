@@ -106,6 +106,16 @@ pub(in super::super) fn effects(
     (effects, rx)
 }
 
+/// Assert that the completion channel holds nothing more, so a test that has
+/// taken every completion it expects also proves none was delivered twice.
+pub(in super::super) fn assert_no_more_completions(
+    rx: &mut PipelineCompletionMsgReceiver<OtapPdata>,
+) {
+    if let Ok(message) = rx.try_recv() {
+        panic!("an unexpected completion: {message:?}");
+    }
+}
+
 /// A payload-free request that still carries a routing frame, so the
 /// completion it owes is actually routed rather than skipped.
 pub(in super::super) fn empty_pdata() -> OtapPdata {

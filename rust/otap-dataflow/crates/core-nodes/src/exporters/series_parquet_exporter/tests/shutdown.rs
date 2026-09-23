@@ -110,6 +110,7 @@ async fn shutdown_decides_every_force_drained_request() {
             assert_eq!(field("abandoned"), Some(FieldValue::U64(0)));
             assert_eq!(field("deadline_exceeded"), Some(FieldValue::Bool(false)));
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -144,6 +145,7 @@ async fn the_deadline_decides_every_outstanding_request() {
                 }
                 other => panic!("expected a nack, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -238,6 +240,7 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
                 worker.is_idle(),
                 "both slot holders are gone once the deadline returns"
             );
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -294,6 +297,7 @@ async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
             }
             drop(pdata_tx);
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -362,6 +366,7 @@ async fn deadline_nacks_both_blocks_and_pending() {
             assert!(worker.flushing.is_none());
             assert!(worker.cleaning.is_none());
             assert!(worker.is_idle(), "nothing is left undecided");
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -464,6 +469,7 @@ async fn shutdown_commits_both_blocks_before_deadline() {
                 .collect();
             assert_eq!(written.len(), 2, "both blocks reached storage: {written:?}");
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -599,6 +605,7 @@ async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
                 .collect();
             acked.sort_unstable();
             assert_eq!(acked, vec![1, 2, 3, 4, 5], "both blocks are acknowledged");
+            assert_no_more_completions(&mut rx);
             assert!(clock::now() < deadline, "the drain ends inside the grace");
             let _ = node
                 .await
@@ -661,6 +668,7 @@ async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
                 .await
                 .expect("the node task joins")
                 .expect("the node succeeds");
+            assert_no_more_completions(&mut rx);
             drop(control_tx);
         })
         .await;
@@ -715,6 +723,7 @@ async fn no_attempt_starts_that_cannot_finish_by_the_deadline() {
                 .await
                 .expect("the node task joins")
                 .expect("the node succeeds");
+            assert_no_more_completions(&mut rx);
             drop(control_tx);
         })
         .await;
@@ -813,6 +822,7 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
                 .expect("the node task joins")
                 .expect("the node succeeds");
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1005,12 +1015,12 @@ async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
             expect_shutdown_nack(&mut rx).await;
             worker.notify.next().await.expect("the ack is sent");
             assert_eq!(expect_ack(&mut rx).await, Some(1));
-            assert!(rx.try_recv().is_err(), "no request is decided twice");
             let outcomes = worker.notify.outcomes();
             assert_eq!(outcomes[Outcome::Shutdown as usize], 3);
             assert_eq!(outcomes[Outcome::Ack as usize], 1);
             assert_eq!(outcomes.iter().sum::<u64>(), 4);
             assert!(worker.is_idle());
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1033,7 +1043,6 @@ async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
             worker.abandon().await;
 
             expect_shutdown_nack(&mut rx).await;
-            assert!(rx.try_recv().is_err(), "no request is decided twice");
             let outcomes = worker.notify.outcomes();
             assert_eq!(outcomes[Outcome::Shutdown as usize], 4);
             assert_eq!(outcomes.iter().sum::<u64>(), 4);
@@ -1043,6 +1052,7 @@ async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
                 "one delivered, three counted: every decision is accounted for"
             );
             assert!(worker.is_idle());
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1195,6 +1205,7 @@ async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
             node.abort();
             drop(pdata_tx);
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1280,6 +1291,7 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
             assert!(worker.is_idle(), "nothing is left holding a slot");
             drop(pdata_tx);
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }

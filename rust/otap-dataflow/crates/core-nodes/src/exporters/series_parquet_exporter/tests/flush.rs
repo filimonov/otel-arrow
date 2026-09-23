@@ -68,6 +68,7 @@ async fn complete_files_before_ack() {
                 rx.recv().await.expect("ack"),
                 PipelineCompletionMsg::DeliverAck { .. }
             ));
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -133,6 +134,7 @@ async fn values_retry_reuses_paths_and_bytes() {
             assert_eq!(writes.len(), 4, "two files, one of them written twice");
             assert_eq!(writes[0], writes[2], "the series file is rewritten as-is");
             assert_eq!(writes[1], writes[3], "the values file is rewritten as-is");
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -204,6 +206,7 @@ async fn failed_descriptor_does_not_poison_cache() {
                 .await;
             worker.complete(done);
             assert_eq!(worker.notify.len(), 1, "the second block is acknowledged");
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -497,6 +500,7 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
             let mut job = worker.cleaning.take().expect("the cleanup slot");
             sim.advance(Duration::from_secs(10));
             job.cleanup().await.expect("the task is released");
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -572,6 +576,7 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
                 }
                 other => panic!("expected a nack, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
             let mut job = worker.cleaning.take().expect("the cleanup slot");
             let ticker = ticking(&sim, Duration::from_secs(1));
             job.cleanup().await.expect("the task is released");

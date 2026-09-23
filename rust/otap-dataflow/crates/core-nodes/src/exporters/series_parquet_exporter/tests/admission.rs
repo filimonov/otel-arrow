@@ -48,6 +48,7 @@ async fn validation_refusals_are_permanent() {
                     other => panic!("expected a nack, got {other:?}"),
                 }
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -122,6 +123,7 @@ async fn a_storage_failure_after_validation_is_retryable() {
                 }
                 other => panic!("expected a nack, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -216,6 +218,7 @@ async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
         other => panic!("expected a nack, got {other:?}"),
     }
     assert_eq!(notify.outcomes()[Outcome::Internal as usize], 1);
+    assert_no_more_completions(&mut rx);
 }
 
 /// Scenario: a writer invariant really breaks inside the lake while a request
@@ -269,6 +272,7 @@ async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
         }
         other => panic!("expected a nack, got {other:?}"),
     }
+    assert_no_more_completions(&mut rx);
 }
 
 /// Scenario: a metrics request is admitted, and a logs request's admission
@@ -327,6 +331,7 @@ async fn an_admission_failure_nacks_its_co_tenant_as_internal() {
             other => panic!("expected a nack, got {other:?}"),
         }
     }
+    assert_no_more_completions(&mut rx);
 }
 
 /// Scenario: an error detail longer than the reason bound, and one holding
@@ -385,6 +390,7 @@ async fn notification_survives_cancelled_poll() {
         PipelineCompletionMsg::DeliverAck { .. }
     ));
     assert_eq!(notify.len(), 0);
+    assert_no_more_completions(&mut rx);
 }
 
 /// Scenario: two requests fill a two-request block and a third request needs
@@ -448,6 +454,7 @@ async fn oversized_input_is_refused_atomically() {
                 }
                 other => panic!("expected a refusal, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -482,6 +489,7 @@ async fn prepare_releases_original_arrow_payload() {
         weak.upgrade().is_none(),
         "the prepared output cannot pin the input arrays"
     );
+    prepared.discard();
 }
 
 /// Scenario: a well-formed request is converted and then fails the extraction
@@ -515,6 +523,7 @@ async fn extraction_failure_is_refused_atomically() {
                 }
                 other => panic!("expected an extraction refusal, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -639,6 +648,7 @@ async fn a_body_the_framing_check_refuses_is_nacked_atomically() {
                     other => panic!("{named:?}: expected a refusal, got {other:?}"),
                 }
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -700,6 +710,7 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
             assert_eq!(pending.extracted.stats.rows, 1);
             let values = format!("{:?}", pending.extracted.values);
             assert!(values.contains("caf\u{FFFD}"), "{values}");
+            pending.token.discard();
         }
         Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
     }
@@ -737,7 +748,8 @@ async fn invalid_utf8_inside_an_array_or_kvlist_value_is_refused_as_undecodable(
         let mut context = Context::default();
         context.set_source_node(7);
         match worker.prepare(OtapPdata::new(context, payload.into())) {
-            Prepared::Failed(_, failure) => {
+            Prepared::Failed(token, failure) => {
+                token.discard();
                 assert_eq!(Outcome::of(&failure), Outcome::Invalid, "{name}");
                 let sentence = Outcome::explain(&failure);
                 assert!(
@@ -801,6 +813,7 @@ async fn a_mixed_metrics_request_is_rejected_atomically() {
             // Exactly one completion, and it belongs to the rejected request:
             // the admitted one is still owed by the ACTIVE block.
             assert_eq!(worker.live_tokens(), requests);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -857,6 +870,7 @@ async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
                 rx.recv().await.expect("ack"),
                 PipelineCompletionMsg::DeliverAck { .. }
             ));
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -924,10 +938,12 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
                 Arc::clone(&wall) as _,
                 effects(1).0,
             );
+            let prepared = worker.prepare(logs_pdata());
             assert!(
-                matches!(worker.prepare(logs_pdata()), Prepared::Ready(_)),
+                matches!(prepared, Prepared::Ready(_)),
                 "preparation must succeed, or the refusal would not be the block budget"
             );
+            prepared.discard();
             let mut worker = Worker::new(cfg, store, wall, handler);
 
             worker.admit(logs_pdata());
@@ -951,6 +967,7 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
                 }
                 other => panic!("expected a block-budget refusal, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1034,6 +1051,7 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
                 panic!("unexpected node failure: {error}");
             }
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -1101,6 +1119,7 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
         ),
         other => panic!("expected a nack, got {other:?}"),
     }
+    assert_no_more_completions(&mut rx);
 
     let (handler, _rx) = effects(4);
     let mut cfg = worker_config();
@@ -1231,6 +1250,7 @@ async fn an_exemplar_is_dropped_and_counted_by_default_and_refused_when_asked() 
                 }
                 other => panic!("expected an exemplar refusal, got {other:?}"),
             }
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }

@@ -420,6 +420,7 @@ async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
                 panic!("unexpected node failure: {error}");
             }
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -562,6 +563,7 @@ async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
                 panic!("unexpected node failure: {error}");
             }
             drop(control_tx);
+            assert_no_more_completions(&mut rx);
         })
         .await;
 }
@@ -756,6 +758,7 @@ async fn a_seal_failure_nacks_every_co_tenant_as_internal() {
             other => panic!("expected a nack, got {other:?}"),
         }
     }
+    assert_no_more_completions(&mut rx);
 }
 
 /// Scenario: a block asks for a rotation because it filled its request budget,

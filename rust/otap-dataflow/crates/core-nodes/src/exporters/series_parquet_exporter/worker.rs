@@ -185,6 +185,17 @@ pub(super) enum Prepared {
     Failed(AckToken, lake::Error),
 }
 
+#[cfg(test)]
+impl Prepared {
+    /// Release the request undecided, for a test that only inspects it.
+    pub(super) fn discard(self) {
+        match self {
+            Prepared::Ready(pending) => pending.token.discard(),
+            Prepared::Failed(token, _) => token.discard(),
+        }
+    }
+}
+
 /// The ACTIVE and FLUSHING pair of one exporter instance.
 pub(super) struct Worker {
     /// Validated user configuration.
@@ -253,6 +264,26 @@ pub(super) struct Worker {
     /// the exporters account for from the one process RSS sample it already
     /// takes; dropping the worker withdraws its bytes and its registration.
     pub(super) accounting: SeriesMemoryAccounting,
+}
+
+/// A test that drops a worker still holding completions tears them down with
+/// it; a completion dropped any other way trips its drop bomb.
+#[cfg(test)]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let flushing = self
+            .flushing
+            .iter_mut()
+            .flat_map(|job| std::mem::take(&mut job.tokens));
+        let held: Vec<AckToken> = std::mem::take(&mut self.active.tokens)
+            .into_iter()
+            .chain(flushing)
+            .chain(self.pending.take().map(|pending| pending.token))
+            .collect();
+        for token in held {
+            token.discard();
+        }
+    }
 }
 
 impl Worker {
