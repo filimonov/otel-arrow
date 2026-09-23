@@ -756,12 +756,19 @@ thread_local! {
 /// [`binary_to_utf8_array`]); a caller that reports the repairs wraps the
 /// conversion in this. A value of a dictionary-encoded column counts once per
 /// row that references it. Calls may nest: an outer call counts the repairs of
-/// an inner one too.
+/// an inner one too, also when the inner closure panics.
 pub fn count_utf8_repairs<T>(convert: impl FnOnce() -> T) -> (T, u64) {
-    let outer = UTF8_REPAIRS.replace(0);
+    /// Adds the enclosing call's count back on drop, unwinding included.
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UTF8_REPAIRS.set(self.0 + UTF8_REPAIRS.get());
+        }
+    }
+    let restore = Restore(UTF8_REPAIRS.replace(0));
     let result = convert();
     let repaired = UTF8_REPAIRS.get();
-    UTF8_REPAIRS.set(outer + repaired);
+    drop(restore);
     (result, repaired)
 }
 
@@ -1882,5 +1889,32 @@ pub mod test {
         });
         assert_eq!(inner, (2, 3));
         assert_eq!(outer, 5);
+    }
+
+    /// Scenario: an outer `count_utf8_repairs` whose closure repairs one value,
+    /// then runs an inner `count_utf8_repairs` that repairs one more and
+    /// panics, catches the panic, and repairs a third.
+    /// Guarantees: the outer call reports all three: an unwinding inner call
+    /// restores the enclosing count and adds its own repairs to it.
+    #[test]
+    fn a_panicking_inner_count_keeps_the_outer_count() {
+        let convert = || {
+            let _ = binary_to_utf8_array(
+                &(Arc::new(BinaryArray::from_iter_values([&[0xffu8][..]])) as ArrayRef),
+            )
+            .unwrap();
+        };
+        let ((), repaired) = count_utf8_repairs(|| {
+            convert();
+            let unwound = std::panic::catch_unwind(|| {
+                count_utf8_repairs(|| {
+                    convert();
+                    panic!("inner conversion failed");
+                })
+            });
+            assert!(unwound.is_err());
+            convert();
+        });
+        assert_eq!(repaired, 3);
     }
 }
