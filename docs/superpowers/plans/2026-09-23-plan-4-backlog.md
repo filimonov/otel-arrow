@@ -40,6 +40,8 @@ priority where stated.
 
 ## Other deferred items
 
+- Fifth review (2026-09-23): histogram `sum` of exactly zero becomes null after an OTAP round trip because the transport omits an all-default column; fix in the pdata transport layer by preserving presence, then in the exporter (pdata PR, upstream-relevant). A lossless high-cardinality mode (physical grouping by stable fields with varying attributes kept per point and the full stream identity stored separately) is a format change and a separate mode, not a hash tweak. Bounded yielding inside merge-key building and per-chunk encoding, if the flush does not move off the ingest core first.
+
 - Refactoring folded into the shared writer (fourth review, 2026-09-23): the worker state machine behind a narrow event API (on_pdata, on_window, on_flush_done, on_cleanup_done, on_shutdown, one private after_slot_freed, futures out instead of fields, metrics and accounting injected at construction); the notifier as a plain VecDeque of (token, outcome) with one live-token counter and a real await-until-deadline drain; and the LakeWriter facade { offer, seal, commit(FlushReport), abort } with LakeConfig::workspace_bytes() next to the allocating code and private Block fields.
 
 - Oversize requests: option B, separate `target_block_bytes` (rotation, file
