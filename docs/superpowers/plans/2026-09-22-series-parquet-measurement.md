@@ -701,7 +701,27 @@ Placement in core-nodes versus contrib-nodes is decided when the upstream PR is 
 
 Python harness unification (item 12) is decided at upstream time, with the measurement lane's fate.
 
+### Execution slices for Tasks 3f (rest), 3k, 3j and 5a (user decision 2026-09-23)
+
+Tasks 3k, 3j and 5a are grouped by their source (a review, the deslop plan, the CPU attribution). They are executed instead as slices by code area, so each slice owns its files, gets a small review and runs only the tests of the crates it touches. The task sections stay the requirements; each slice names the items it takes. Full gates (`cargo xtask check`, one E2E under taskset -c 0-7,16-23) run once per wave, after the wave's slice reviews approve. Every slice follows the campaign writing rules.
+
+| Slice | Items | Files | Focused tests |
+| --- | --- | --- | --- |
+| S1 Engine shutdown deadline | 3j blocker 2; drop the unused `ProcessorInbox::shutdown_deadline` (3k B14 part) | engine `message.rs`, one exporter shutdown test | engine, exporter shutdown tests |
+| S2 OTLP validation policy | 3j majors 4 and 5 except the series_parquet counter wiring; 3k B16 and C4; 5a double UTF-8 check | pdata `views/otlp/bytes/validate.rs`, `decode.rs`, `otlp/` conversion, file/parquet/otap exporters | pdata, the three exporters |
+| S3 Harness and CI | 3j workflow path filters and `test_failures.py` unit classes in CI; 3k D6 stub subcommands | `.github/workflows/series-parquet-e2e.yml`, validation/tests/series_parquet | Python contract tests |
+| S4 Sink structure | 3f items 7, 13 and the sink.rs/sort.rs part of 14; 3k B8 and C2 | series-lake `sink.rs`, `sort.rs`, benches, sink tests | series-lake |
+| S5 Attribute and extraction budget | 3j blocker 3; `metric_rows` null `metric_type` and duplicate `metric_id`; 3k B1 and B2 | series-lake `attrs.rs`, `value.rs`, `extract/`, `config.rs`, `buffer.rs` sizing | series-lake |
+| S6 Extraction and write speed | all of Task 5a except the double UTF-8 check | series-lake `extract/`, `buffer.rs`, `sort.rs` heap, writer properties, otap object store options | series-lake, stage spot-measurement per change |
+| S7 Exporter delivery | 3j blocker 1, major 13 (shutdown under a terminate), major 12, co-tenant `Outcome::Internal`, `rotate()` debug assertion; 3k B15 and C3 | exporter `token.rs`, `worker.rs`, `mod.rs`, `flush.rs`, tests | exporter |
+| S8 Exporter config, metrics and logs | 3j major 11, `unsupported: drop`, derived `retry_timeout`, fixed nack sentence, `OUTCOMES` const asserts and u64 mask, the `repaired.invalid_utf8` counter, `part_bytes` upper bound | exporter `config.rs`, `metrics.rs`, `worker.rs` telemetry, series-lake `config.rs` defaults | exporter, series-lake config |
+| S9 Prose and README | 3k A1 (amended), A2-A7, remaining README contradictions of 3j | all touched files, READMEs | build and all focused suites |
+
+Waves: (1) S1, S2, S3 in parallel, each in its own worktree; (2) S4 after Tasks 3i and 3f close; (3) S5 and S7 in parallel (disjoint files); (4) S6 after S5, S8 after S7; (5) S9 last, then the wave's full gates and the fault tasks.
+
 ### Task 3k: De-slop of prose, duplicated formulas and test scaffolding (deslop plan, user decision 2026-09-23)
+
+**Executed through the slices above** (see "Execution slices"); this section is the requirement text the slices cite.
 
 **Source:** docs/superpowers/deslop-plan-2026-09-23.md (item ids below are its ids). **Order:** after Tasks 3i and 3f have both closed, before Task 3j, so 3j, 5a and the fault tasks work on the compact code and their reviews read less. No behaviour, format, golden vector, metric name or config key changes; the unit, golden, oracle, fuzz and contract suites are the safety net and stay green on every commit. One commit per item. Gate policy: focused checks per item; `cargo xtask check` and one E2E only after the task review approves.
 
@@ -719,6 +739,8 @@ Python harness unification (item 12) is decided at upstream time, with the measu
 **Not in this task:** B1 drift, B11, B13 grace copy (Task 3j); B3 (Task 5a); B12 (plan 4, with the shared writer); B14, D1-D5 (upstream preparation); items already done by Task 3f (B4, B5, B7, B10 part, B13 part, C1, A4 part).
 
 ### Task 3j: Umbrella review of 2026-09-23: defects, validation policy, shutdown under a terminate (user decisions 2026-09-23)
+
+**Executed through the slices above** (see "Execution slices"); this section is the requirement text the slices cite.
 
 **Source:** docs/superpowers/umbrella-review-2026-09-23.md (numbers below are its item numbers). **Order:** after Tasks 3f and 3k (it edits token.rs, worker.rs and mod.rs, which 3f restructures) and before Task 5a. Every fix starts with a regression test that fails before it.
 
@@ -799,6 +821,8 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
 ### Task 5a: Cheap CPU wins found by the Task 4 attribution (user decision 2026-09-23)
+
+**Executed through the slices above** (see "Execution slices"); this section is the requirement text the slices cite.
 
 **Evidence (Task 4, family f001/f002, one core, taskset 0-7,16-23):** logs-1k-stable 5,271-5,345 engine CPU ns/record: encoding 33%, extraction 16%, allocator 12%, engine runtime 12%, sort/seal/merge 11%, conversion 8%, upload 6%. metrics-mixed 2,423-2,453 ns/record: extraction 24%, conversion 20%, allocator 15%, engine runtime 14%, sort/seal/merge 13%, encoding 11%. Writer properties today (series-lake sink.rs around 529-536): ZSTD at the parquet crate's default level, page statistics and dictionary encoding on EVERY column; S3 uploads use object_store's default signed payload (a SHA-256 over every uploaded byte).
 
