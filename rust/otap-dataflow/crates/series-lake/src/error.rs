@@ -139,6 +139,16 @@ impl Error {
         Error::Refused(RefuseReason::Invalid(msg.into()))
     }
 
+    /// The sentence of an invalid-content refusal, such as a configuration
+    /// rule, without the refusal wrapper; `None` for any other error.
+    #[must_use]
+    pub fn invalid_detail(&self) -> Option<&str> {
+        match self {
+            Error::Refused(RefuseReason::Invalid(detail)) => Some(detail),
+            _ => None,
+        }
+    }
+
     /// Shorthand for a broken writer invariant.
     pub fn internal(msg: impl Into<String>) -> Self {
         Error::Internal(msg.into())

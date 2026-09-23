@@ -530,49 +530,65 @@ impl LakeConfig {
                 "window_interval must be a whole number of seconds and at least 1s",
             ));
         }
-        for d in self
-            .logs
-            .denormalize
-            .iter()
-            .chain(self.metrics.denormalize.iter())
-        {
-            if d.column.contains(':') || d.column.contains(';') {
-                return Err(Error::invalid(format!(
-                    "denormalized column name must not contain ':' or ';': {}",
-                    d.column
-                )));
-            }
-            if PARTITION_KEYS
-                .iter()
-                .any(|key| d.column.eq_ignore_ascii_case(key))
-            {
-                return Err(Error::invalid(format!(
-                    "denormalized column {} is named like a partition key of the layout",
-                    d.column
-                )));
+        // Every rule below names the key a user writes: the signal section,
+        // the list, the entry's position and the field.
+        for (section, signal) in [("logs", &self.logs), ("metrics", &self.metrics)] {
+            for (i, d) in signal.denormalize.iter().enumerate() {
+                if d.source().is_err() {
+                    return Err(Error::invalid(format!(
+                        "{section}.denormalize[{i}].path {:?} must start with resource., \
+                         scope. or attrs.",
+                        d.path
+                    )));
+                }
+                if d.column.contains(':') || d.column.contains(';') {
+                    return Err(Error::invalid(format!(
+                        "{section}.denormalize[{i}].column {:?} must not contain ':' or ';'",
+                        d.column
+                    )));
+                }
+                if PARTITION_KEYS
+                    .iter()
+                    .any(|key| d.column.eq_ignore_ascii_case(key))
+                {
+                    return Err(Error::invalid(format!(
+                        "{section}.denormalize[{i}].column {:?} is named like a partition key \
+                         of the layout",
+                        d.column
+                    )));
+                }
             }
         }
         for ds in crate::schema::Dataset::ALL {
+            let (section, signal) = if ds.signal() == crate::canonical::Signal::Logs {
+                ("logs", &self.logs)
+            } else {
+                ("metrics", &self.metrics)
+            };
             let schema = crate::schema::dataset_schema(ds, self);
             let mut seen = HashSet::new();
             for f in schema.fields() {
                 if !seen.insert(f.name().to_lowercase()) {
+                    // Intrinsic names are unique, so a collision always
+                    // involves a denormalized column of this signal.
+                    let entry = signal
+                        .denormalize
+                        .iter()
+                        .rposition(|d| d.column.eq_ignore_ascii_case(f.name()))
+                        .map_or_else(String::new, |i| format!("[{i}]"));
                     return Err(Error::invalid(format!(
-                        "column name collision: {}",
-                        f.name()
+                        "{section}.denormalize{entry}.column {:?} is a column name collision \
+                         (case-insensitive) in {}",
+                        f.name(),
+                        ds.name()
                     )));
                 }
             }
             if !ds.is_series() {
-                let sig = if ds.signal() == crate::canonical::Signal::Logs {
-                    &self.logs
-                } else {
-                    &self.metrics
-                };
-                for key in &sig.values_sort {
+                for (i, key) in signal.values_sort.iter().enumerate() {
                     let Some((_, field)) = schema.column_with_name(&key.column) else {
                         return Err(Error::invalid(format!(
-                            "sort key {} not in {}",
+                            "{section}.values_sort[{i}].column {:?} is not a column of {}",
                             key.column,
                             ds.name()
                         )));
@@ -584,21 +600,14 @@ impl LakeConfig {
                     if !arrow::row::RowConverter::supports_fields(std::slice::from_ref(&sort_field))
                     {
                         return Err(Error::invalid(format!(
-                            "sort key {} has type {}, which Arrow's row converter cannot sort",
+                            "{section}.values_sort[{i}].column {:?} has type {}, which Arrow's \
+                             row converter cannot sort",
                             key.column,
                             field.data_type()
                         )));
                     }
                 }
             }
-        }
-        for d in self
-            .logs
-            .denormalize
-            .iter()
-            .chain(self.metrics.denormalize.iter())
-        {
-            let _ = d.source()?;
         }
         Ok(())
     }
@@ -607,6 +616,12 @@ impl LakeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule sentence of a configuration refusal.
+    fn rule(err: &Error) -> String {
+        err.invalid_detail()
+            .map_or_else(|| err.to_string(), str::to_owned)
+    }
 
     /// Scenario: `max_row_bytes` exceeds a quarter of `run_target_bytes`.
     /// Guarantees: `validate` refuses the configuration and names the rule.
@@ -642,6 +657,10 @@ mod tests {
             nulls: Nulls::Last,
         }];
         let err = cfg.validate().expect_err("a Map sort key is unsortable");
+        assert!(
+            rule(&err).contains("logs.values_sort[0].column \"attrs\" has type"),
+            "{err}"
+        );
         assert!(err.to_string().contains("row converter cannot sort"));
     }
 
@@ -680,7 +699,12 @@ mod tests {
                 ty: DenormType::String,
             }];
             let err = cfg.validate().expect_err("separator in a column name");
-            assert!(err.to_string().contains("must not contain"));
+            assert!(
+                rule(&err).contains(&format!(
+                    "logs.denormalize[0].column {column:?} must not contain"
+                )),
+                "{err}"
+            );
         }
     }
 
@@ -697,10 +721,7 @@ mod tests {
         let err = cfg
             .validate()
             .expect_err("max_block_bytes < 2 * max_extracted_bytes");
-        assert!(
-            err.to_string()
-                .contains("at least twice ingress.max_extracted_bytes")
-        );
+        assert!(rule(&err).contains("at least twice ingress.max_extracted_bytes"));
         cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes;
         cfg.validate().expect("exactly twice is enough");
     }
@@ -810,7 +831,12 @@ mod tests {
                 ty: DenormType::String,
             }];
             let err = cfg.validate().expect_err(column);
-            assert!(err.to_string().contains("partition key"), "{column}: {err}");
+            assert!(
+                rule(&err).contains(&format!(
+                    "metrics.denormalize[0].column {column:?} is named like a partition key"
+                )),
+                "{column}: {err}"
+            );
         }
     }
 

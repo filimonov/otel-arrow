@@ -240,6 +240,12 @@ pub fn schema_fingerprint(schema: &Schema) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule sentence of a configuration refusal.
+    fn rule(err: &crate::error::Error) -> String {
+        err.invalid_detail()
+            .map_or_else(|| err.to_string(), str::to_owned)
+    }
     use crate::config::{DenormType, Denormalize, LakeConfig};
 
     /// Scenario: the default `logs_values` schema, whose column set and types
@@ -411,8 +417,10 @@ mod tests {
         );
     }
 
-    /// Scenario: two denormalized columns whose names differ only by case.
-    /// Guarantees: validation refuses the configuration.
+    /// Scenario: two denormalized columns whose names differ only by case, and
+    /// a sort key naming no column.
+    /// Guarantees: validation refuses each, naming the user-facing dotted key
+    /// of the entry at fault.
     #[test]
     fn collision_is_a_config_error() {
         let mut cfg = LakeConfig::default();
@@ -428,13 +436,21 @@ mod tests {
                 ty: DenormType::String,
             },
         ];
-        assert!(cfg.validate().is_err());
+        let err = cfg.validate().expect_err("case-insensitive collision");
+        assert!(
+            rule(&err).contains("logs.denormalize[1].column \"col\" is a column name collision"),
+            "{err}"
+        );
         let mut cfg = LakeConfig::default();
         cfg.logs.values_sort = vec![crate::config::SortKey {
             column: "nope".into(),
             order: crate::config::SortOrder::Asc,
             nulls: crate::config::Nulls::Last,
         }];
-        assert!(cfg.validate().is_err());
+        let err = cfg.validate().expect_err("an unknown sort column");
+        assert!(
+            rule(&err).contains("logs.values_sort[0].column \"nope\" is not a column of"),
+            "{err}"
+        );
     }
 }

@@ -5041,12 +5041,12 @@ fn startup_rejects_invalid_configuration() {
         (
             "window",
             serde_json::json!({"interval": "500ms"}),
-            "whole seconds",
+            "window.interval must be positive whole seconds",
         ),
         (
             "window",
             serde_json::json!({"max_requests_per_block": 0}),
-            "max_requests_per_block",
+            "window.max_requests_per_block must be at least 1",
         ),
         (
             "window",
@@ -5071,47 +5071,55 @@ fn startup_rejects_invalid_configuration() {
         (
             "upload",
             serde_json::json!({"concurrency": 0}),
-            "concurrency",
+            "upload.concurrency must be at least 1",
         ),
-        ("upload", serde_json::json!({"part_bytes": "1MiB"}), "5MiB"),
+        (
+            "upload",
+            serde_json::json!({"part_bytes": "1MiB"}),
+            "upload.part_bytes must be at least 5MiB",
+        ),
         (
             "parquet",
             serde_json::json!({"compression": "snappy"}),
-            "must be zstd",
+            "parquet.compression must be zstd",
         ),
         (
             "metrics",
             serde_json::json!({"values_sort": ["no_such_column"]}),
-            "sort key no_such_column",
+            "metrics.values_sort[0].column \"no_such_column\" is not a column of",
         ),
         // `attrs` is a Map column of logs/values: present, but not a type the
         // Arrow row format can sort by.
         (
             "logs",
             serde_json::json!({"values_sort": ["attrs"]}),
-            "row converter cannot sort",
+            "logs.values_sort[0].column \"attrs\" has type",
         ),
         (
             "logs",
             serde_json::json!({"denormalize": [{"path": "resource.x", "column": "SERIES_ID"}]}),
-            "collision",
+            "logs.denormalize[0].column \"SERIES_ID\" is a column name collision",
         ),
         (
             "logs",
             serde_json::json!({"denormalize": [{"path": "resource.x", "column": "date"}]}),
-            "partition key",
+            "logs.denormalize[0].column \"date\" is named like a partition key",
         ),
         (
             "logs",
             serde_json::json!({"denormalize": ["unknown.x"]}),
-            "denormalize path",
+            "logs.denormalize[0].path \"unknown.x\" must start with",
         ),
         (
             "metrics",
             serde_json::json!({"series_attributes": ["k8s.pod.name"]}),
             "metrics.series_attributes",
         ),
-        ("writer_id", serde_json::json!("local-1"), "[A-Za-z0-9_.]"),
+        (
+            "writer_id",
+            serde_json::json!("local-1"),
+            "writer_id \"local-1\" must use only [A-Za-z0-9_.]",
+        ),
         (
             "series_cache",
             serde_json::json!({"max_entries": 0}),
