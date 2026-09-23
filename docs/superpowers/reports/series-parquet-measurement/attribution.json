@@ -7,9 +7,9 @@
   "artifacts": [],
   "baseline_files": [
     {
-      "name": "baseline-attribution-8f03a228463b4555.json",
-      "sha256": "485d9f0f53df72e4749ff99ef041fde5dd3a16c5c892868906e90494d11ab58d",
-      "size_bytes": 3374
+      "name": "baseline-attribution-10b18890c3147099.json",
+      "sha256": "ca6c2486fc35c58c9987fc8e66089e61bf337b7d520b3fbda0af5cac6dacd5b1",
+      "size_bytes": 3371
     }
   ],
   "case": "attribution",
@@ -21,51 +21,57 @@
       "status": "passed"
     },
     {
-      "detail": "attribution-logs-1k-stable-strict-minio-c1-w15-f001: failed; failed [\"baseline_policy\", \"rss_reconciliation\"]",
+      "detail": "attribution-logs-1k-stable-strict-minio-c1-w15-f002: failed; failed [\"baseline_policy\", \"rss_reconciliation\"]",
       "kind": "hard",
-      "name": "child_attribution-logs-1k-stable-strict-minio-c1-w15-f001",
+      "name": "child_attribution-logs-1k-stable-strict-minio-c1-w15-f002",
       "status": "failed"
     },
     {
-      "detail": "attribution-metrics-mixed-strict-minio-c1-w15-f001: passed; failed []",
+      "detail": "attribution-metrics-mixed-strict-minio-c1-w15-f002: passed; failed []",
       "kind": "hard",
-      "name": "child_attribution-metrics-mixed-strict-minio-c1-w15-f001",
+      "name": "child_attribution-metrics-mixed-strict-minio-c1-w15-f002",
       "status": "passed"
     },
     {
-      "detail": "every joined stage verified and on the same denominator",
+      "detail": "the plan's Stage agreement row: exclusive category CPU plus the named residual against the measured engine CPU; an error above 10% or unexplained CPU above 20% invalidates the attribution: held in every workload",
       "kind": "hard",
       "name": "reconciliation_valid",
       "status": "passed"
     }
   ],
-  "child_indexes": [],
+  "child_indexes": [
+    {
+      "name": "attribution-e137b294fdec.json",
+      "sha256": "e137b294fdec616d569355ff3b35036471fb6a5f2ad3e6d34f5643393a4aa184",
+      "size_bytes": 79371
+    }
+  ],
   "children": [
     {
       "failed_checks": [
         "rss_reconciliation"
       ],
       "metrics": {
-        "allocator_cpu_ns_per_record": 642.4848795949812,
-        "buffer_cpu_ns_per_record": 18.838291222692348,
-        "classified_samples_count": 5138,
-        "control_engine_cpu_ns_per_record": 5331.3623828125,
-        "control_throughput_records_per_s": 56284.13950233735,
-        "conversion_cpu_ns_per_record": 385.6892255593328,
-        "encoding_cpu_ns_per_record": 1696.4376990540318,
-        "engine_cpu_ns_per_record": 5160.700306005982,
-        "engine_runtime_cpu_ns_per_record": 643.4763686067017,
-        "extraction_cpu_ns_per_record": 813.0209896109329,
-        "flush_wall_s": 34.131678193,
-        "peak_rss_bytes": 150425600,
-        "sort_seal_merge_cpu_ns_per_record": 551.2678905166813,
-        "throughput_records_per_s": 84655.71117268309,
-        "unknown_cpu_ns_per_record": 66.42976378528353,
-        "upload_cpu_ns_per_record": 343.0551980553449,
-        "upload_wait_s": 24.031176943
+        "allocator_cpu_ns_per_record": 787.6885144864566,
+        "buffer_cpu_ns_per_record": 11.859801974701982,
+        "classified_samples_count": 6048,
+        "control_engine_cpu_ns_per_record": 5823.228114938447,
+        "control_throughput_records_per_s": 102387.60972784949,
+        "conversion_cpu_ns_per_record": 479.33366314420505,
+        "encoding_cpu_ns_per_record": 1993.4350485811576,
+        "engine_cpu_ns_per_record": 6064.312076397613,
+        "engine_runtime_cpu_ns_per_record": 731.3544551066223,
+        "extraction_cpu_ns_per_record": 979.4219797441385,
+        "flush_wall_s": 36.15529643200001,
+        "peak_rss_bytes": 152608768,
+        "sort_seal_merge_cpu_ns_per_record": 656.2423759335096,
+        "throughput_records_per_s": 84862.73375413672,
+        "unknown_cpu_ns_per_record": 86.97188114781453,
+        "upload_cpu_ns_per_record": 338.00435627900646,
+        "upload_wait_s": 24.381428557000007
       },
       "repetition": 1,
-      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r001",
+      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r005",
       "status": "failed",
       "workload_config_id": "logs-1k-stable"
     },
@@ -74,26 +80,26 @@
         "rss_reconciliation"
       ],
       "metrics": {
-        "allocator_cpu_ns_per_record": 641.4228846948846,
-        "buffer_cpu_ns_per_record": 20.81898080153412,
-        "classified_samples_count": 5240,
-        "control_engine_cpu_ns_per_record": 5284.6222135416665,
-        "control_throughput_records_per_s": 56282.13062844092,
-        "conversion_cpu_ns_per_record": 422.3278962596922,
-        "encoding_cpu_ns_per_record": 1706.1650456876298,
-        "engine_cpu_ns_per_record": 5271.167662940806,
-        "engine_runtime_cpu_ns_per_record": 633.4918443895383,
-        "extraction_cpu_ns_per_record": 843.6644124812161,
-        "flush_wall_s": 32.924973532,
-        "peak_rss_bytes": 149164032,
-        "sort_seal_merge_cpu_ns_per_record": 594.8280229009749,
-        "throughput_records_per_s": 84675.96917103931,
-        "unknown_cpu_ns_per_record": 76.33626293895844,
-        "upload_cpu_ns_per_record": 332.11231278637763,
-        "upload_wait_s": 22.693819032
+        "allocator_cpu_ns_per_record": 682.3680809048567,
+        "buffer_cpu_ns_per_record": 18.789845706075766,
+        "classified_samples_count": 5329,
+        "control_engine_cpu_ns_per_record": 5449.829457859849,
+        "control_throughput_records_per_s": 106311.02379472626,
+        "conversion_cpu_ns_per_record": 377.7747926168917,
+        "encoding_cpu_ns_per_record": 1749.4335291604225,
+        "engine_cpu_ns_per_record": 5345.216633754711,
+        "engine_runtime_cpu_ns_per_record": 632.9211185204468,
+        "extraction_cpu_ns_per_record": 911.8019863685187,
+        "flush_wall_s": 35.22021503700001,
+        "peak_rss_bytes": 148979712,
+        "sort_seal_merge_cpu_ns_per_record": 574.5737029068431,
+        "throughput_records_per_s": 104087.3609383523,
+        "unknown_cpu_ns_per_record": 75.15938282430307,
+        "upload_cpu_ns_per_record": 322.3941947463526,
+        "upload_wait_s": 24.69760328700001
       },
       "repetition": 2,
-      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r002",
+      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r006",
       "status": "failed",
       "workload_config_id": "logs-1k-stable"
     },
@@ -102,104 +108,104 @@
         "rss_reconciliation"
       ],
       "metrics": {
-        "allocator_cpu_ns_per_record": 633.5177028466042,
-        "buffer_cpu_ns_per_record": 23.794092125694053,
-        "classified_samples_count": 5317,
-        "control_engine_cpu_ns_per_record": 5166.973272964015,
-        "control_throughput_records_per_s": 110516.94875511267,
-        "conversion_cpu_ns_per_record": 414.41377118917137,
-        "encoding_cpu_ns_per_record": 1771.6684428589695,
-        "engine_cpu_ns_per_record": 5342.7651027235515,
-        "engine_runtime_cpu_ns_per_record": 632.5262823413668,
-        "extraction_cpu_ns_per_record": 894.2612957240015,
-        "flush_wall_s": 34.306116431999996,
-        "peak_rss_bytes": 151793664,
-        "sort_seal_merge_cpu_ns_per_record": 566.1011084904709,
-        "throughput_records_per_s": 105572.85075652563,
-        "unknown_cpu_ns_per_record": 71.38227637708215,
-        "upload_cpu_ns_per_record": 335.1001307701912,
-        "upload_wait_s": 23.853856431999994
+        "allocator_cpu_ns_per_record": 611.2075307933336,
+        "buffer_cpu_ns_per_record": 19.78017899007552,
+        "classified_samples_count": 5141,
+        "control_engine_cpu_ns_per_record": 5338.143052201704,
+        "control_throughput_records_per_s": 107563.74641719737,
+        "conversion_cpu_ns_per_record": 382.7464634579614,
+        "encoding_cpu_ns_per_record": 1713.9525094900437,
+        "engine_cpu_ns_per_record": 5146.802573217651,
+        "engine_runtime_cpu_ns_per_record": 613.1855486923412,
+        "extraction_cpu_ns_per_record": 884.1740008563758,
+        "flush_wall_s": 34.824470521999984,
+        "peak_rss_bytes": 150446080,
+        "sort_seal_merge_cpu_ns_per_record": 539.009877479558,
+        "throughput_records_per_s": 105741.96856562197,
+        "unknown_cpu_ns_per_record": 62.307563818737904,
+        "upload_cpu_ns_per_record": 320.43889963922345,
+        "upload_wait_s": 24.723969271999984
       },
       "repetition": 3,
-      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r003",
+      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r007",
       "status": "failed",
       "workload_config_id": "logs-1k-stable"
     },
     {
       "failed_checks": [],
       "metrics": {
-        "allocator_cpu_ns_per_record": 358.1701766874785,
-        "buffer_cpu_ns_per_record": 40.68387357278153,
-        "classified_samples_count": 6420,
-        "control_engine_cpu_ns_per_record": 2383.92529053442,
-        "control_throughput_records_per_s": 253795.36018494985,
-        "conversion_cpu_ns_per_record": 500.37362263346245,
-        "encoding_cpu_ns_per_record": 279.84421448193643,
-        "engine_cpu_ns_per_record": 2445.21486865942,
-        "engine_runtime_cpu_ns_per_record": 336.8776821073311,
-        "extraction_cpu_ns_per_record": 581.3611466615229,
-        "flush_wall_s": 25.891221139000006,
-        "peak_rss_bytes": 111669248,
-        "sort_seal_merge_cpu_ns_per_record": 316.34563376218904,
-        "throughput_records_per_s": 220798.93079589756,
-        "unknown_cpu_ns_per_record": 4.182454292528941,
-        "upload_cpu_ns_per_record": 27.376064460189436,
-        "upload_wait_s": 20.494236889000007
+        "allocator_cpu_ns_per_record": 368.8987802022696,
+        "buffer_cpu_ns_per_record": 39.27628522369178,
+        "classified_samples_count": 5025,
+        "control_engine_cpu_ns_per_record": 2497.712254971591,
+        "control_throughput_records_per_s": 242560.51320663965,
+        "conversion_cpu_ns_per_record": 488.21914037551045,
+        "encoding_cpu_ns_per_record": 276.9226692353965,
+        "engine_cpu_ns_per_record": 2500.755881964173,
+        "engine_runtime_cpu_ns_per_record": 355.97240785016857,
+        "extraction_cpu_ns_per_record": 615.4941912269674,
+        "flush_wall_s": 18.666821124,
+        "peak_rss_bytes": 115732480,
+        "sort_seal_merge_cpu_ns_per_record": 329.1253268111894,
+        "throughput_records_per_s": 225323.66863829116,
+        "unknown_cpu_ns_per_record": 2.4858408369425176,
+        "upload_cpu_ns_per_record": 24.361240202036676,
+        "upload_wait_s": 14.511042748999998
       },
       "repetition": 1,
-      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r001",
+      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r008",
       "status": "passed",
       "workload_config_id": "metrics-mixed"
     },
     {
       "failed_checks": [],
       "metrics": {
-        "allocator_cpu_ns_per_record": 355.48970944735436,
-        "buffer_cpu_ns_per_record": 38.0202897804657,
-        "classified_samples_count": 6363,
-        "control_engine_cpu_ns_per_record": 2446.688094429348,
-        "control_throughput_records_per_s": 254007.06779083642,
-        "conversion_cpu_ns_per_record": 481.7170715185005,
-        "encoding_cpu_ns_per_record": 258.1577676093621,
-        "engine_cpu_ns_per_record": 2423.413270606884,
-        "engine_runtime_cpu_ns_per_record": 339.9013906373634,
-        "extraction_cpu_ns_per_record": 579.0490133564927,
-        "flush_wall_s": 23.865120665000003,
-        "peak_rss_bytes": 109449216,
-        "sort_seal_merge_cpu_ns_per_record": 340.28159353516804,
-        "throughput_records_per_s": 220852.84739565794,
-        "unknown_cpu_ns_per_record": 4.182231875851228,
-        "upload_cpu_ns_per_record": 26.61420284632599,
-        "upload_wait_s": 18.518387665000002
+        "allocator_cpu_ns_per_record": 374.3754209652718,
+        "buffer_cpu_ns_per_record": 40.27145962574636,
+        "classified_samples_count": 4928,
+        "control_engine_cpu_ns_per_record": 2434.167528705019,
+        "control_throughput_records_per_s": 252033.21142314907,
+        "conversion_cpu_ns_per_record": 472.3195882031981,
+        "encoding_cpu_ns_per_record": 281.4030388663265,
+        "engine_cpu_ns_per_record": 2452.5816090593435,
+        "engine_runtime_cpu_ns_per_record": 304.7704290195373,
+        "extraction_cpu_ns_per_record": 616.0041787197499,
+        "flush_wall_s": 19.156673052,
+        "peak_rss_bytes": 113094656,
+        "sort_seal_merge_cpu_ns_per_record": 327.64064065885003,
+        "throughput_records_per_s": 225435.18748902503,
+        "unknown_cpu_ns_per_record": 2.4858925694905163,
+        "upload_cpu_ns_per_record": 33.31096043117292,
+        "upload_wait_s": 15.106422301999999
       },
       "repetition": 2,
-      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r002",
+      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r009",
       "status": "passed",
       "workload_config_id": "metrics-mixed"
     },
     {
       "failed_checks": [],
       "metrics": {
-        "allocator_cpu_ns_per_record": 348.35590222199727,
-        "buffer_cpu_ns_per_record": 34.22710829692114,
-        "classified_samples_count": 6219,
-        "control_engine_cpu_ns_per_record": 2370.72974682971,
-        "control_throughput_records_per_s": 252649.6921235882,
-        "conversion_cpu_ns_per_record": 476.1371065305029,
-        "encoding_cpu_ns_per_record": 274.1971675786682,
-        "engine_cpu_ns_per_record": 2368.8961953502417,
-        "engine_runtime_cpu_ns_per_record": 322.875721600956,
-        "extraction_cpu_ns_per_record": 580.3396362344628,
-        "flush_wall_s": 23.644919096000002,
-        "peak_rss_bytes": 109203456,
-        "sort_seal_merge_cpu_ns_per_record": 299.29704699641036,
-        "throughput_records_per_s": 220911.66649545362,
-        "unknown_cpu_ns_per_record": 3.803012032991237,
-        "upload_cpu_ns_per_record": 29.663493857331652,
-        "upload_wait_s": 18.418789096
+        "allocator_cpu_ns_per_record": 361.20920155654704,
+        "buffer_cpu_ns_per_record": 34.282578964789195,
+        "classified_samples_count": 4865,
+        "control_engine_cpu_ns_per_record": 2465.7037174479165,
+        "control_throughput_records_per_s": 246933.84610183162,
+        "conversion_cpu_ns_per_record": 499.3332153567121,
+        "encoding_cpu_ns_per_record": 272.2732358362968,
+        "engine_cpu_ns_per_record": 2420.1513353259156,
+        "engine_runtime_cpu_ns_per_record": 330.4045653852872,
+        "extraction_cpu_ns_per_record": 588.2691810769625,
+        "flush_wall_s": 18.227842093,
+        "peak_rss_bytes": 110120960,
+        "sort_seal_merge_cpu_ns_per_record": 297.11568436150634,
+        "throughput_records_per_s": 225370.4948027174,
+        "unknown_cpu_ns_per_record": 2.981093823025147,
+        "upload_cpu_ns_per_record": 34.282578964789195,
+        "upload_wait_s": 14.132365218
       },
       "repetition": 3,
-      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r003",
+      "run_id": "attribution-metrics-mixed-strict-minio-c1-w15-r010",
       "status": "passed",
       "workload_config_id": "metrics-mixed"
     }
@@ -351,7 +357,7 @@
     "effective": {},
     "requested": {}
   },
-  "elapsed_s": 1189.113156695,
+  "elapsed_s": 1143.336550035,
   "engine_configuration": {
     "block_requests": 128,
     "in_flight_requests": 256,
@@ -378,15 +384,60 @@
       "binary": "<repo>/rust/otap-dataflow/target/release/df_engine-perf",
       "binary_sha256": "bb9e43889b9e7f06543c455021001b75ef35ddf2953c3f1f2b9f79101905b6ca",
       "binary_size_bytes": 762948944,
-      "canonical_release_sha256": "c479bc282e8ed6d526d18131714ae7943b55849e310ed2decbe47f8cbe8c2c8c",
+      "build_commands": {
+        "canonical": "cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
+        "profiled": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments",
+        "restore": "cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer"
+      },
+      "canonical": {
+        "allocator": "jemalloc",
+        "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
+        "binary_sha256": "c479bc282e8ed6d526d18131714ae7943b55849e310ed2decbe47f8cbe8c2c8c",
+        "binary_size_bytes": 762946672,
+        "features": "default,series-parquet,aws,durable-buffer",
+        "function_symbols": {
+          "count": 191989,
+          "sha256": "3e0cd91a85a2597add98daa47e09a6a84ceda50c65b020e067111e142a413423",
+          "tool": "nm --defined-only --size-sort -C, types t T w W"
+        },
+        "layout": {
+          "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
+          "build": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments && cp target/release/df_engine target/release/df_engine-perf && cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
+          "compatible": false,
+          "skewed_executable_segments": [
+            {
+              "offset": "0x1ca7d40",
+              "vaddr": "0x1ca8d40"
+            }
+          ]
+        },
+        "profile": "release",
+        "rustc_vv": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
+      },
       "features": "default,series-parquet,aws,durable-buffer",
-      "link_layout": {
+      "function_symbols": {
+        "count": 191989,
+        "sha256": "3e0cd91a85a2597add98daa47e09a6a84ceda50c65b020e067111e142a413423",
+        "tool": "nm --defined-only --size-sort -C, types t T w W"
+      },
+      "identical_function_symbols": true,
+      "layout": {
         "binary": "<repo>/rust/otap-dataflow/target/release/df_engine-perf",
         "build": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments && cp target/release/df_engine target/release/df_engine-perf && cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
         "compatible": true,
         "skewed_executable_segments": []
       },
       "profile": "release",
+      "rustc_vv": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+      "rustflags_difference": {
+        "canonical": [],
+        "profiled": [
+          "-C",
+          "link-arg=-Wl,-z,separate-loadable-segments"
+        ],
+        "scope": "the df_engine binary crate only, through cargo rustc"
+      },
       "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
     },
     "core_allocation": {
@@ -435,13 +486,13 @@
       "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
-        4.7,
-        8.55,
-        8.29
+        9.66,
+        10.73,
+        8.22
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 221210716083363,
-      "observed_utc": "2026-09-23T08:41:24Z",
+      "monotonic_ns": 233911108732783,
+      "observed_utc": "2026-09-23T12:13:04Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
       "sibling_groups": [
@@ -514,360 +565,360 @@
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 17,
+          "last_cpu": 16,
           "name": "python3",
-          "nspid": "804291",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007078",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804291
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "804292",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804292
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "804293",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804293
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804294",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804294
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 4,
-          "name": "python3",
-          "nspid": "804295",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804295
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "804296",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804296
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "804297",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804297
+          "tid": 1007078
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 21,
           "name": "python3",
-          "nspid": "804298",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007079",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804298
+          "tid": 1007079
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "804299",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007080",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804299
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804300",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804300
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "804301",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804301
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "804302",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804302
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 5,
-          "name": "python3",
-          "nspid": "804303",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804303
+          "tid": 1007080
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 3,
           "name": "python3",
-          "nspid": "804304",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007081",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804304
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804305",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804305
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 22,
-          "name": "python3",
-          "nspid": "804306",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804306
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 20,
-          "name": "python3",
-          "nspid": "804307",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804307
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 6,
-          "name": "python3",
-          "nspid": "804308",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804308
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 19,
-          "name": "python3",
-          "nspid": "804309",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804309
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804310",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804310
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "804311",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804311
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 5,
-          "name": "python3",
-          "nspid": "804312",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804312
+          "tid": 1007081
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "804313",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007082",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804313
+          "tid": 1007082
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 18,
+          "last_cpu": 3,
           "name": "python3",
-          "nspid": "804314",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007083",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804314
+          "tid": 1007083
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 16,
+          "last_cpu": 17,
           "name": "python3",
-          "nspid": "804315",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007084",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804315
+          "tid": 1007084
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "1007085",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007085
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007086",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007086
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007087",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007087
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007088",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007088
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007089",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007089
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007090",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007090
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007091",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007091
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007092",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007092
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007093",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007093
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "1007094",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007094
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007095",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007095
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "1007096",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007096
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 20,
           "name": "python3",
-          "nspid": "804316",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007097",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804316
+          "tid": 1007097
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007098",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007098
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 18,
           "name": "python3",
-          "nspid": "804317",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007099",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804317
+          "tid": 1007099
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007100",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007100
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 17,
           "name": "python3",
-          "nspid": "804318",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007101",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804318
+          "tid": 1007101
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 21,
           "name": "python3",
-          "nspid": "804319",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007102",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804319
+          "tid": 1007102
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "1007103",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007103
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007104",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007104
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "1007105",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007105
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 21,
+          "name": "python3",
+          "nspid": "1007106",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007106
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007107",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007107
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007108",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007108
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 17,
           "name": "python3",
-          "nspid": "804320",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007109",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804320
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "804321",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804321
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 18,
-          "name": "python3",
-          "nspid": "804322",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804322
+          "tid": 1007109
         }
       ]
     },
     "git": {
       "dirty": false,
-      "revision": "5e87fff73bc92fe58eacfcf7dc8391209ebb4e37"
+      "revision": "865b7dfc7b23f38507487f9d39098f2dd8341ea9"
     },
     "host_at_end": {
       "family_affinity": [
@@ -891,39 +942,39 @@
       "heaviest_other_processes": [
         {
           "comm": "gnome-shell",
-          "cpu_s": 4651.16,
+          "cpu_s": 5565.06,
           "cpus_allowed": "0-31",
           "pid": 5733
         },
         {
+          "comm": "htop",
+          "cpu_s": 2162.95,
+          "cpus_allowed": "0-31",
+          "pid": 3691346
+        },
+        {
           "comm": "gnome-terminal-",
-          "cpu_s": 1835.53,
+          "cpu_s": 2030.31,
           "cpus_allowed": "0-31",
           "pid": 6495
         },
         {
           "comm": "htop",
-          "cpu_s": 1739.57,
-          "cpus_allowed": "0-31",
-          "pid": 3691346
-        },
-        {
-          "comm": "htop",
-          "cpu_s": 1444.23,
+          "cpu_s": 1870.1,
           "cpus_allowed": "0-31",
           "pid": 3822814
         },
         {
-          "comm": "brave",
-          "cpu_s": 1419.23,
+          "comm": "zoom",
+          "cpu_s": 1730.22,
           "cpus_allowed": "0-31",
-          "pid": 264644
+          "pid": 960620
         }
       ],
       "load_average_1_5_15": [
-        4.7,
-        8.55,
-        8.29
+        9.66,
+        10.73,
+        8.22
       ]
     },
     "host_at_start": {
@@ -948,45 +999,54 @@
       "heaviest_other_processes": [
         {
           "comm": "gnome-shell",
-          "cpu_s": 4577.03,
+          "cpu_s": 5420.69,
           "cpus_allowed": "0-31",
           "pid": 5733
         },
         {
+          "comm": "htop",
+          "cpu_s": 2125.1,
+          "cpus_allowed": "0-31",
+          "pid": 3691346
+        },
+        {
           "comm": "gnome-terminal-",
-          "cpu_s": 1816.74,
+          "cpu_s": 1977.76,
           "cpus_allowed": "0-31",
           "pid": 6495
         },
         {
           "comm": "htop",
-          "cpu_s": 1703.39,
-          "cpus_allowed": "0-31",
-          "pid": 3691346
-        },
-        {
-          "comm": "brave",
-          "cpu_s": 1415.58,
-          "cpus_allowed": "0-31",
-          "pid": 264644
-        },
-        {
-          "comm": "htop",
-          "cpu_s": 1408.02,
+          "cpu_s": 1830.17,
           "cpus_allowed": "0-31",
           "pid": 3822814
+        },
+        {
+          "comm": "zoom",
+          "cpu_s": 1717.74,
+          "cpus_allowed": "0-31",
+          "pid": 960620
         }
       ],
       "load_average_1_5_15": [
-        1.49,
-        2.7,
-        5.45
+        1.82,
+        3.88,
+        3.17
       ]
+    },
+    "ledger_filesystem": {
+      "directory": "<host-path>/series-attribution-ledgers-1007078",
+      "fallback": false,
+      "fstype": "tmpfs",
+      "mount_point": "<host-path>/tmp",
+      "path": "<host-path>/series-attribution-ledgers-1007078",
+      "requested": "<host-path>/series-attribution-ledgers-1007078"
     },
     "match": {
       "differences": {},
       "matched": true
     },
+    "perf_event_paranoid": 1,
     "start": {
       "absent_roles": {},
       "available_cores": [
@@ -1011,13 +1071,13 @@
       "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
       "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
       "load_average_1_5_15": [
-        4.7,
-        8.55,
-        8.29
+        9.66,
+        10.73,
+        8.22
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 221210693535326,
-      "observed_utc": "2026-09-23T08:41:24Z",
+      "monotonic_ns": 233911084895868,
+      "observed_utc": "2026-09-23T12:13:04Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
       "sibling_groups": [
@@ -1090,360 +1150,373 @@
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 17,
+          "last_cpu": 16,
           "name": "python3",
-          "nspid": "804291",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007078",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804291
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "804292",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804292
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "804293",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804293
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804294",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804294
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 4,
-          "name": "python3",
-          "nspid": "804295",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804295
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 3,
-          "name": "python3",
-          "nspid": "804296",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804296
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 23,
-          "name": "python3",
-          "nspid": "804297",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804297
+          "tid": 1007078
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 21,
           "name": "python3",
-          "nspid": "804298",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007079",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804298
+          "tid": 1007079
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "804299",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007080",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804299
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804300",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804300
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 2,
-          "name": "python3",
-          "nspid": "804301",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804301
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "804302",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804302
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 5,
-          "name": "python3",
-          "nspid": "804303",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804303
+          "tid": 1007080
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 3,
           "name": "python3",
-          "nspid": "804304",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007081",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804304
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804305",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804305
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 22,
-          "name": "python3",
-          "nspid": "804306",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804306
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 20,
-          "name": "python3",
-          "nspid": "804307",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804307
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 6,
-          "name": "python3",
-          "nspid": "804308",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804308
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 19,
-          "name": "python3",
-          "nspid": "804309",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804309
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 0,
-          "name": "python3",
-          "nspid": "804310",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804310
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 1,
-          "name": "python3",
-          "nspid": "804311",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804311
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 5,
-          "name": "python3",
-          "nspid": "804312",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804312
+          "tid": 1007081
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 2,
           "name": "python3",
-          "nspid": "804313",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007082",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804313
+          "tid": 1007082
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 18,
+          "last_cpu": 3,
           "name": "python3",
-          "nspid": "804314",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007083",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804314
+          "tid": 1007083
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 16,
+          "last_cpu": 17,
           "name": "python3",
-          "nspid": "804315",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007084",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804315
+          "tid": 1007084
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "1007085",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007085
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007086",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007086
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007087",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007087
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007088",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007088
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007089",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007089
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007090",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007090
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007091",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007091
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007092",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007092
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007093",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007093
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "1007094",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007094
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007095",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007095
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "1007096",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007096
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 20,
           "name": "python3",
-          "nspid": "804316",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007097",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804316
+          "tid": 1007097
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "1007098",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007098
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 18,
           "name": "python3",
-          "nspid": "804317",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007099",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804317
+          "tid": 1007099
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007100",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007100
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 17,
           "name": "python3",
-          "nspid": "804318",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007101",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804318
+          "tid": 1007101
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 1,
+          "last_cpu": 21,
           "name": "python3",
-          "nspid": "804319",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007102",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804319
+          "tid": 1007102
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "1007103",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007103
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007104",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007104
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "1007105",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007105
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 21,
+          "name": "python3",
+          "nspid": "1007106",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007106
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "1007107",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007107
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "1007108",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
+          "role": "harness",
+          "tid": 1007108
         },
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
           "last_cpu": 17,
           "name": "python3",
-          "nspid": "804320",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
+          "nspid": "1007109",
+          "observed_utc": "2026-09-23T12:13:04Z",
+          "pid": 1007078,
           "role": "harness",
-          "tid": 804320
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 17,
-          "name": "python3",
-          "nspid": "804321",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804321
-        },
-        {
-          "cpus_allowed_list": "0-7,16-23",
-          "expected_cores": [],
-          "last_cpu": 18,
-          "name": "python3",
-          "nspid": "804322",
-          "observed_utc": "2026-09-23T08:41:24Z",
-          "pid": 804291,
-          "role": "harness",
-          "tid": 804322
+          "tid": 1007109
         }
       ]
     }
   },
   "events": [],
-  "family_ordinal": 1,
+  "family_ordinal": 2,
+  "invalidated_children": [
+    {
+      "failed_checks": [
+        "affinity_matched",
+        "environment_matched",
+        "environment_snapshots_complete",
+        "no_concurrent_build"
+      ],
+      "repetition": 1,
+      "run_id": "attribution-logs-1k-stable-strict-minio-c1-w15-r004",
+      "workload_config_id": "logs-1k-stable"
+    }
+  ],
   "mandatory_metrics": [
     "aggregates_count",
     "aggregates_passed_count",
@@ -1458,7 +1531,7 @@
     "aggregates_passed_count": 1,
     "children_count": 6,
     "children_passed_count": 3,
-    "classified_samples_count": 34697,
+    "classified_samples_count": 31336,
     "repetitions_count": 3,
     "workloads_count": 2
   },
@@ -1512,24 +1585,127 @@
       "compatible": true,
       "skewed_executable_segments": []
     },
+    "engine_provenance": {
+      "built": true,
+      "canonical": {
+        "allocator": "jemalloc",
+        "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
+        "binary_sha256": "c479bc282e8ed6d526d18131714ae7943b55849e310ed2decbe47f8cbe8c2c8c",
+        "binary_size_bytes": 762946672,
+        "features": "default,series-parquet,aws,durable-buffer",
+        "function_symbols": {
+          "count": 191989,
+          "sha256": "3e0cd91a85a2597add98daa47e09a6a84ceda50c65b020e067111e142a413423",
+          "tool": "nm --defined-only --size-sort -C, types t T w W"
+        },
+        "layout": {
+          "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
+          "build": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments && cp target/release/df_engine target/release/df_engine-perf && cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
+          "compatible": false,
+          "skewed_executable_segments": [
+            {
+              "offset": "0x1ca7d40",
+              "vaddr": "0x1ca8d40"
+            }
+          ]
+        },
+        "profile": "release",
+        "rustc_vv": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
+      },
+      "canonical_sha256_before": "c479bc282e8ed6d526d18131714ae7943b55849e310ed2decbe47f8cbe8c2c8c",
+      "commands": {
+        "canonical": "cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
+        "profiled": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments",
+        "restore": "cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer"
+      },
+      "environment_rustflags": {
+        "CARGO_BUILD_RUSTFLAGS": null,
+        "CARGO_ENCODED_RUSTFLAGS": null,
+        "RUSTFLAGS": null
+      },
+      "git": {
+        "dirty": false,
+        "revision": "865b7dfc7b23f38507487f9d39098f2dd8341ea9"
+      },
+      "lease": {
+        "acquired_utc": "2026-09-23T11:54:01Z",
+        "owner": "1007078-d5a49aad5e984b92b41ae655d075def1",
+        "path": "<host-path>/series-parquet-host-measurement.lock",
+        "pid": 1007078,
+        "released_utc": null,
+        "run_id": "attribution-engine-build"
+      },
+      "problems": [],
+      "profiled": {
+        "allocator": "jemalloc",
+        "binary": "<repo>/rust/otap-dataflow/target/release/df_engine-perf",
+        "binary_sha256": "bb9e43889b9e7f06543c455021001b75ef35ddf2953c3f1f2b9f79101905b6ca",
+        "binary_size_bytes": 762948944,
+        "features": "default,series-parquet,aws,durable-buffer",
+        "function_symbols": {
+          "count": 191989,
+          "sha256": "3e0cd91a85a2597add98daa47e09a6a84ceda50c65b020e067111e142a413423",
+          "tool": "nm --defined-only --size-sort -C, types t T w W"
+        },
+        "layout": {
+          "binary": "<repo>/rust/otap-dataflow/target/release/df_engine-perf",
+          "build": "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer -- -C link-arg=-Wl,-z,separate-loadable-segments && cp target/release/df_engine target/release/df_engine-perf && cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer",
+          "compatible": true,
+          "skewed_executable_segments": []
+        },
+        "profile": "release",
+        "rustc_vv": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+        "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
+      },
+      "rust_tree": {
+        "changes": [],
+        "clean": true,
+        "returncode": 0
+      },
+      "rustflags_difference": {
+        "canonical": [],
+        "profiled": [
+          "-C",
+          "link-arg=-Wl,-z,separate-loadable-segments"
+        ],
+        "scope": "the df_engine binary crate only, through cargo rustc"
+      },
+      "valid": true
+    },
     "event": "cpu-clock",
     "frequency_hz": 199,
     "perf": "/usr/bin/perf",
     "perf_event_paranoid": 1,
-    "perf_log_tail": " | If some relocation was applied (e.g. kexec) symbols may be misresolved | even with a suitable vmlinux or kallsyms file. |  | Couldn't record kernel reference relocation symbol | Symbol resolution may be skewed if relocation was used (e.g. kexec). | Check /proc/kallsyms permission or run as root. | Events disabled | Events enabled | Events disabled | [ perf record: Woken up 3 times to write data ] | [ perf record: Captured and wrote 0.501 MB <host-path>/perf.data (61 samples) ]",
+    "perf_log_tail": " | If some relocation was applied (e.g. kexec) symbols may be misresolved | even with a suitable vmlinux or kallsyms file. |  | Couldn't record kernel reference relocation symbol | Symbol resolution may be skewed if relocation was used (e.g. kexec). | Check /proc/kallsyms permission or run as root. | Events disabled | Events enabled | Events disabled | [ perf record: Woken up 3 times to write data ] | [ perf record: Captured and wrote 0.493 MB <host-path>/perf.data (60 samples) ]",
     "record_returncode": -2,
-    "samples_count": 61,
+    "samples_count": 60,
     "unparsed_lines_count": 0,
-    "unwound_samples_count": 61,
+    "unwound_samples_count": 60,
     "version": "perf version 6.14.11"
   },
+  "quiet_host_waits": [
+    {
+      "last_builds_seen": [],
+      "observed_utc": "2026-09-23T11:57:15Z",
+      "quiet_s": 60,
+      "waited_s": 60.02225527
+    }
+  ],
   "reconciliation": {
-    "agreement_bounds": [
-      0.5,
-      2.0
-    ],
+    "binding_rule": "the plan's Stage agreement row: exclusive category CPU plus the named residual against the measured engine CPU; an error above 10% or unexplained CPU above 20% invalidates the attribution",
     "byte_rates": "each stage row carries its own output_bytes_per_input_record with its output representation; no byte rate is added across stages",
     "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
+    "descriptive_stage_comparison": {
+      "agreement_bounds": [
+        0.5,
+        2.0
+      ],
+      "gating": false,
+      "note": "engine-attributed stage costs against isolated bench costs; descriptive only, not an acceptance model",
+      "reference": "pinned",
+      "supplementary": "spot"
+    },
     "problems": [],
     "references": {
       "pinned": {
@@ -1600,222 +1776,246 @@
     "valid": true,
     "workloads": {
       "logs-1k-stable": {
-        "engine_cpu_ns_per_record": 5271.167662940806,
-        "flush_wall_s": 34.131678193,
-        "rows": [
+        "binding": {
+          "checks": {
+            "attribution_exclusive": true,
+            "reference_family_verified": true,
+            "stage_agreement_error": true,
+            "stage_agreement_unexplained": true
+          },
+          "error_limit": 0.1,
+          "repetitions": [
+            {
+              "error_ratio": 0.0019377348699987124,
+              "unexplained_ratio": 0.01625153528255414
+            },
+            {
+              "error_ratio": 0.0025658931581859345,
+              "unexplained_ratio": 0.016590868573537993
+            },
+            {
+              "error_ratio": 0.002636188748737571,
+              "unexplained_ratio": 0.014710347109388903
+            }
+          ],
+          "unexplained_limit": 0.2
+        },
+        "descriptive_stage_comparison": [
           {
-            "attributed_exclusive_cpu_ns_per_record": 414.41377118917137,
-            "attributed_with_allocator_cpu_ns_per_record": 481.3345095408804,
+            "attributed_exclusive_cpu_ns_per_record": 382.7464634579614,
+            "attributed_with_allocator_cpu_ns_per_record": 447.54664122160466,
             "attribution_categories": [
               "conversion"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 389.075,
-            "ratio_to_pinned": 1.2371252574462004,
-            "ratio_to_reference": 1.2565405570512975,
-            "reference_cpu_ns_per_record": 383.06325,
+            "explanation": null,
+            "ratio_to_reference": 1.1502837273574624,
+            "ratio_to_supplementary": 1.1683361461106088,
+            "reference_cpu_ns_per_record": 389.075,
             "row": "conversion",
-            "share_ratio": 0.07749355791590723,
+            "share_ratio": 0.07488802627650044,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otlp_wire_bytes",
                 "metrics": {
                   "allocated_bytes_per_record": 5175.51,
-                  "cpu_ns_per_record": 383.06325,
+                  "cpu_ns_per_record": 389.075,
                   "output_bytes_per_input_record": 1997.04,
                   "peak_live_heap_bytes": 63752517.0,
-                  "peak_rss_bytes": 81981440.0,
+                  "peak_rss_bytes": 82313216.0,
                   "peak_workspace_bytes": 42115117.0,
-                  "records_per_s_per_core": 2610534.9442944475,
-                  "wall_ns_per_record": 383.059075
+                  "records_per_s_per_core": 2570198.5478378204,
+                  "wall_ns_per_record": 389.07495
                 },
                 "mode": "isolated",
                 "output_representation": "otap_arrow_records",
-                "pinned_cpu_ns_per_record": 389.075,
-                "source": "spot",
-                "stage": "convert"
+                "reference": "pinned",
+                "stage": "convert",
+                "supplementary_spot_cpu_ns_per_record": 383.06325
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 383.06325,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 843.6644124812161,
-            "attributed_with_allocator_cpu_ns_per_record": 1114.3289829433265,
+            "attributed_exclusive_cpu_ns_per_record": 911.8019863685187,
+            "attributed_with_allocator_cpu_ns_per_record": 1200.6894783689972,
             "attribution_categories": [
               "extraction"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 1114.8755,
-            "ratio_to_pinned": 0.9995097954375411,
-            "ratio_to_reference": 0.9261947484663506,
-            "reference_cpu_ns_per_record": 1203.126,
+            "explanation": null,
+            "ratio_to_reference": 1.0769718039090437,
+            "ratio_to_supplementary": 0.9979748408470911,
+            "reference_cpu_ns_per_record": 1114.8755,
             "row": "extraction",
-            "share_ratio": 0.16171202312865313,
+            "share_ratio": 0.16763212899372948,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otap_arrow_records",
                 "metrics": {
-                  "allocated_bytes_per_record": 8704.36,
-                  "cpu_ns_per_record": 1203.126,
-                  "output_bytes_per_input_record": 2503.81,
-                  "peak_live_heap_bytes": 113540242.0,
-                  "peak_rss_bytes": 84946944.0,
-                  "peak_workspace_bytes": 51962042.0,
-                  "records_per_s_per_core": 831168.1403277795,
-                  "wall_ns_per_record": 1203.4216
+                  "allocated_bytes_per_record": 9797.11,
+                  "cpu_ns_per_record": 1114.8755,
+                  "output_bytes_per_input_record": 2505.24,
+                  "peak_live_heap_bytes": 113639914.0,
+                  "peak_rss_bytes": 85622784.0,
+                  "peak_workspace_bytes": 52061714.0,
+                  "records_per_s_per_core": 896961.1405040293,
+                  "wall_ns_per_record": 1115.4928
                 },
                 "mode": "isolated",
                 "output_representation": "extracted_rows",
-                "pinned_cpu_ns_per_record": 1114.8755,
-                "source": "spot",
-                "stage": "extract"
+                "reference": "pinned",
+                "stage": "extract",
+                "supplementary_spot_cpu_ns_per_record": 1203.126
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 1203.126,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 586.9200892920051,
-            "attributed_with_allocator_cpu_ns_per_record": 621.705621603537,
+            "attributed_exclusive_cpu_ns_per_record": 593.3635486129189,
+            "attributed_with_allocator_cpu_ns_per_record": 624.3271803521967,
             "attribution_categories": [
               "buffer",
               "sort_seal_merge"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 609.96775,
-            "ratio_to_pinned": 1.0192434298428679,
-            "ratio_to_reference": 1.032439465506981,
-            "reference_cpu_ns_per_record": 602.1714999999999,
+            "explanation": null,
+            "ratio_to_reference": 1.0235412943589177,
+            "ratio_to_supplementary": 1.0367929740152046,
+            "reference_cpu_ns_per_record": 609.96775,
             "row": "admission_sort_seal_merge",
-            "share_ratio": 0.11256363522091635,
+            "share_ratio": 0.10994326664676023,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "extracted_rows",
                 "metrics": {
-                  "allocated_bytes_per_record": 2691.0167,
-                  "cpu_ns_per_record": 467.8905,
+                  "allocated_bytes_per_record": 2690.9071,
+                  "cpu_ns_per_record": 473.208,
                   "output_bytes_per_input_record": 1159.0978,
-                  "peak_live_heap_bytes": 98927701.0,
-                  "peak_rss_bytes": 110338048.0,
-                  "peak_workspace_bytes": 27214101.0,
-                  "records_per_s_per_core": 2137252.198965356,
-                  "wall_ns_per_record": 467.9199
+                  "peak_live_heap_bytes": 98954109.0,
+                  "peak_rss_bytes": 114946048.0,
+                  "peak_workspace_bytes": 27211909.0,
+                  "records_per_s_per_core": 2113235.6173183885,
+                  "wall_ns_per_record": 473.23055
                 },
                 "mode": "isolated",
                 "output_representation": "sealed_block",
-                "pinned_cpu_ns_per_record": 473.208,
-                "source": "spot",
-                "stage": "sort_seal"
+                "reference": "pinned",
+                "stage": "sort_seal",
+                "supplementary_spot_cpu_ns_per_record": 467.8905
               },
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "sealed_block",
                 "metrics": {
                   "allocated_bytes_per_record": 1346.7111,
-                  "cpu_ns_per_record": 134.281,
+                  "cpu_ns_per_record": 136.75975,
                   "output_bytes_per_input_record": 1168.6985,
                   "peak_live_heap_bytes": 62640410.0,
-                  "peak_rss_bytes": 151986176.0,
+                  "peak_rss_bytes": 152002560.0,
                   "peak_workspace_bytes": 17849854.0,
-                  "records_per_s_per_core": 7447069.950328043,
-                  "wall_ns_per_record": 134.2667
+                  "records_per_s_per_core": 7312092.922076854,
+                  "wall_ns_per_record": 136.7964
                 },
                 "mode": "isolated",
                 "output_representation": "merged_chunks",
-                "pinned_cpu_ns_per_record": 136.75975,
-                "source": "spot",
-                "stage": "merge"
+                "reference": "pinned",
+                "stage": "merge",
+                "supplementary_spot_cpu_ns_per_record": 134.281
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 602.1714999999999,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 1706.1650456876298,
-            "attributed_with_allocator_cpu_ns_per_record": 1744.2634858383553,
+            "attributed_exclusive_cpu_ns_per_record": 1749.4335291604225,
+            "attributed_with_allocator_cpu_ns_per_record": 1786.4622021682187,
             "attribution_categories": [
               "encoding"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 1913.5065,
-            "ratio_to_pinned": 0.911553467855142,
-            "ratio_to_reference": 1.068062134092185,
-            "reference_cpu_ns_per_record": 1633.1105,
+            "explanation": null,
+            "ratio_to_reference": 0.9336065501571167,
+            "ratio_to_supplementary": 1.0939016081080972,
+            "reference_cpu_ns_per_record": 1913.5065,
             "row": "encoding",
-            "share_ratio": 0.3280120671233738,
+            "share_ratio": 0.3295909226634816,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "merged_chunks",
                 "metrics": {
                   "allocated_bytes_per_record": 8727.81585,
-                  "cpu_ns_per_record": 1633.1105,
+                  "cpu_ns_per_record": 1913.5065,
                   "output_bytes_per_input_record": 755.31,
                   "peak_live_heap_bytes": 81239862.0,
-                  "peak_rss_bytes": 160141312.0,
+                  "peak_rss_bytes": 160165888.0,
                   "peak_workspace_bytes": 36228492.0,
-                  "records_per_s_per_core": 612328.4370530959,
-                  "wall_ns_per_record": 1633.20415
+                  "records_per_s_per_core": 522600.78552124073,
+                  "wall_ns_per_record": 1913.42865
                 },
                 "mode": "isolated",
                 "output_representation": "parquet_bytes",
-                "pinned_cpu_ns_per_record": 1913.5065,
-                "source": "spot",
-                "stage": "encode"
+                "reference": "pinned",
+                "stage": "encode",
+                "supplementary_spot_cpu_ns_per_record": 1633.1105
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 1633.1105,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 335.1001307701912,
-            "attributed_with_allocator_cpu_ns_per_record": 387.4440746294488,
+            "attributed_exclusive_cpu_ns_per_record": 322.3941947463526,
+            "attributed_with_allocator_cpu_ns_per_record": 379.2140550514191,
             "attribution_categories": [
               "upload"
             ],
-            "known_deviation": "the upload bench sends pre-encoded bytes in one object, the engine streams each file as multipart parts while it encodes, so their per-record costs are not expected to match closely",
-            "pinned_reference_cpu_ns_per_record": 402.21,
-            "ratio_to_pinned": 0.9632880202616763,
-            "ratio_to_reference": 0.9562193763672333,
-            "reference_cpu_ns_per_record": 405.18325,
+            "explanation": null,
+            "ratio_to_reference": 0.9428260238467943,
+            "ratio_to_supplementary": 0.9359075308552837,
+            "reference_cpu_ns_per_record": 402.21,
             "row": "upload",
-            "share_ratio": 0.06404374332222991,
+            "share_ratio": 0.059241564646163036,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "pre_encoded_parquet_bytes",
                 "metrics": {
-                  "allocated_bytes_per_record": 13.11975,
-                  "cpu_ns_per_record": 405.18325,
+                  "allocated_bytes_per_record": 13.13205,
+                  "cpu_ns_per_record": 402.21,
                   "output_bytes_per_input_record": 755.31,
-                  "peak_live_heap_bytes": 36845234.0,
-                  "peak_rss_bytes": 125685760.0,
-                  "peak_workspace_bytes": 101634.0,
-                  "records_per_s_per_core": 2468019.0999998148,
-                  "wall_ns_per_record": 3815.272925
+                  "peak_live_heap_bytes": 36845241.0,
+                  "peak_rss_bytes": 125591552.0,
+                  "peak_workspace_bytes": 101641.0,
+                  "records_per_s_per_core": 2486263.3947440395,
+                  "wall_ns_per_record": 5384.6298
                 },
                 "mode": "async",
                 "output_representation": "stored_objects",
-                "pinned_cpu_ns_per_record": 402.21,
-                "source": "spot",
-                "stage": "upload"
+                "reference": "pinned",
+                "stage": "upload",
+                "supplementary_spot_cpu_ns_per_record": 405.18325
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 405.18325,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 633.4918443895383,
-            "attributed_with_allocator_cpu_ns_per_record": 727.5784270226342,
+            "attributed_exclusive_cpu_ns_per_record": 632.9211185204468,
+            "attributed_with_allocator_cpu_ns_per_record": 730.9194169117694,
             "attribution_categories": [
               "engine_runtime"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 1738.3905,
-            "ratio_to_pinned": 0.4185356667691374,
-            "ratio_to_reference": 0.4185356667691374,
+            "explanation": {
+              "detail": "no published measurement brings this row into the band; the supplementary family did not measure it",
+              "status": "unexplained"
+            },
+            "ratio_to_reference": 0.4204575536461856,
+            "ratio_to_supplementary": null,
             "reference_cpu_ns_per_record": 1738.3905,
             "row": "engine_runtime",
-            "share_ratio": 0.12104833134309598,
+            "share_ratio": 0.11943863839952225,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
@@ -1832,16 +2032,17 @@
                 },
                 "mode": "pipeline",
                 "output_representation": "none",
-                "pinned_cpu_ns_per_record": 1738.3905,
-                "source": "pinned",
-                "stage": "otlp_noop"
+                "reference": "pinned",
+                "stage": "otlp_noop",
+                "supplementary_spot_cpu_ns_per_record": null
               }
             ],
-            "verdict": "differs"
+            "supplementary_spot_cpu_ns_per_record": null,
+            "verdict": "outside_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 5271.167662940806,
-            "attributed_with_allocator_cpu_ns_per_record": 5271.167662940806,
+            "attributed_exclusive_cpu_ns_per_record": 5345.216633754711,
+            "attributed_with_allocator_cpu_ns_per_record": 5345.216633754711,
             "attribution_categories": [
               "conversion",
               "extraction",
@@ -1853,11 +2054,10 @@
               "allocator",
               "unknown"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 6580.8645,
-            "ratio_to_pinned": 0.8009840748036684,
-            "ratio_to_reference": 0.7980757255964701,
-            "reference_cpu_ns_per_record": 6604.8465,
+            "explanation": null,
+            "ratio_to_reference": 0.812236239441598,
+            "ratio_to_supplementary": null,
+            "reference_cpu_ns_per_record": 6580.8645,
             "row": "total",
             "share_ratio": 1.0,
             "stages": [
@@ -1876,252 +2076,279 @@
                 },
                 "mode": "pipeline",
                 "output_representation": "none",
-                "pinned_cpu_ns_per_record": 1738.3905,
-                "source": "pinned",
-                "stage": "otlp_noop"
+                "reference": "pinned",
+                "stage": "otlp_noop",
+                "supplementary_spot_cpu_ns_per_record": null
               },
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otlp_wire_bytes",
                 "metrics": {
-                  "allocated_bytes_per_record": 26661.5445,
-                  "cpu_ns_per_record": 4866.456,
-                  "output_bytes_per_input_record": 755.3424,
-                  "peak_live_heap_bytes": 82263530.0,
-                  "peak_rss_bytes": 155607040.0,
-                  "peak_workspace_bytes": 60626130.0,
-                  "records_per_s_per_core": 205488.34716680885,
-                  "wall_ns_per_record": 9553.06005
+                  "allocated_bytes_per_record": 27753.73965,
+                  "cpu_ns_per_record": 4842.474,
+                  "output_bytes_per_input_record": 755.34155,
+                  "peak_live_heap_bytes": 82261253.0,
+                  "peak_rss_bytes": 159862784.0,
+                  "peak_workspace_bytes": 60623853.0,
+                  "records_per_s_per_core": 206506.01324859977,
+                  "wall_ns_per_record": 8038.04015
                 },
                 "mode": "async",
                 "output_representation": "stored_objects",
-                "pinned_cpu_ns_per_record": 4842.474,
-                "source": "spot",
-                "stage": "otlp_minio"
+                "reference": "pinned",
+                "stage": "otlp_minio",
+                "supplementary_spot_cpu_ns_per_record": 4866.456
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": null,
+            "verdict": "within_band"
           }
         ],
-        "upload_wait_s": 23.853856431999994
+        "engine_cpu_ns_per_record": 5345.216633754711,
+        "flush_wall_s": 35.22021503700001,
+        "upload_wait_s": 24.69760328700001
       },
       "metrics-mixed": {
-        "engine_cpu_ns_per_record": 2423.413270606884,
-        "flush_wall_s": 23.865120665000003,
-        "rows": [
+        "binding": {
+          "checks": {
+            "attribution_exclusive": true,
+            "reference_family_verified": true,
+            "stage_agreement_error": true,
+            "stage_agreement_unexplained": true
+          },
+          "error_limit": 0.1,
+          "repetitions": [
+            {
+              "error_ratio": 0.002969591363998493,
+              "unexplained_ratio": 0.003960675269203266
+            },
+            {
+              "error_ratio": 0.0029903400174615337,
+              "unexplained_ratio": 0.004000891061433294
+            },
+            {
+              "error_ratio": 0.0023290566766098098,
+              "unexplained_ratio": 0.003557967713345663
+            }
+          ],
+          "unexplained_limit": 0.2
+        },
+        "descriptive_stage_comparison": [
           {
-            "attributed_exclusive_cpu_ns_per_record": 481.7170715185005,
-            "attributed_with_allocator_cpu_ns_per_record": 560.7829347656832,
+            "attributed_exclusive_cpu_ns_per_record": 488.21914037551045,
+            "attributed_with_allocator_cpu_ns_per_record": 569.398698825567,
             "attribution_categories": [
               "conversion"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 505.349,
-            "ratio_to_pinned": 1.1096943592758335,
-            "ratio_to_reference": 1.1074714495500921,
-            "reference_cpu_ns_per_record": 506.36333333333334,
+            "explanation": null,
+            "ratio_to_reference": 1.126743495733774,
+            "ratio_to_supplementary": 1.1244864336390212,
+            "reference_cpu_ns_per_record": 505.349,
             "row": "conversion",
-            "share_ratio": 0.20148155931491016,
+            "share_ratio": 0.19799110152352703,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otlp_wire_bytes",
                 "metrics": {
                   "allocated_bytes_per_record": 7081.87,
-                  "cpu_ns_per_record": 506.36333333333334,
+                  "cpu_ns_per_record": 505.349,
                   "output_bytes_per_input_record": 1732.2,
                   "peak_live_heap_bytes": 30501587.0,
-                  "peak_rss_bytes": 42053632.0,
+                  "peak_rss_bytes": 42237952.0,
                   "peak_workspace_bytes": 29593637.0,
-                  "records_per_s_per_core": 1974866.5319368832,
-                  "wall_ns_per_record": 506.35813333333334
+                  "records_per_s_per_core": 1978830.4716146663,
+                  "wall_ns_per_record": 505.3464
                 },
                 "mode": "isolated",
                 "output_representation": "otap_arrow_records",
-                "pinned_cpu_ns_per_record": 505.349,
-                "source": "spot",
-                "stage": "convert"
+                "reference": "pinned",
+                "stage": "convert",
+                "supplementary_spot_cpu_ns_per_record": 506.36333333333334
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 506.36333333333334,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 580.3396362344628,
-            "attributed_with_allocator_cpu_ns_per_record": 725.8666598923207,
+            "attributed_exclusive_cpu_ns_per_record": 615.4941912269674,
+            "attributed_with_allocator_cpu_ns_per_record": 777.1919675287091,
             "attribution_categories": [
               "extraction"
             ],
-            "known_deviation": "Task 3c's content-keyed memo made metrics extraction about a third cheaper after the pinned family was measured; the spot family at the attribution's revision is the comparable reference",
-            "pinned_reference_cpu_ns_per_record": 1367.912,
-            "ratio_to_pinned": 0.5306384181821058,
-            "ratio_to_reference": 0.9175633920506052,
-            "reference_cpu_ns_per_record": 791.0806666666666,
+            "explanation": null,
+            "ratio_to_reference": 0.5681593315423135,
+            "ratio_to_supplementary": 0.9824433844446236,
+            "reference_cpu_ns_per_record": 1367.912,
             "row": "extraction",
-            "share_ratio": 0.2405169696332878,
+            "share_ratio": 0.24679789672374275,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otap_arrow_records",
                 "metrics": {
-                  "allocated_bytes_per_record": 4432.01,
-                  "cpu_ns_per_record": 791.0806666666666,
-                  "output_bytes_per_input_record": 1438.94,
-                  "peak_live_heap_bytes": 49908674.0,
-                  "peak_rss_bytes": 42168320.0,
-                  "peak_workspace_bytes": 23017724.0,
-                  "records_per_s_per_core": 1264093.5901184962,
-                  "wall_ns_per_record": 791.0705333333333
+                  "allocated_bytes_per_record": 5487.97,
+                  "cpu_ns_per_record": 1367.912,
+                  "output_bytes_per_input_record": 1447.52,
+                  "peak_live_heap_bytes": 50031926.0,
+                  "peak_rss_bytes": 42196992.0,
+                  "peak_workspace_bytes": 23140976.0,
+                  "records_per_s_per_core": 731041.1780874793,
+                  "wall_ns_per_record": 1367.9128
                 },
                 "mode": "isolated",
                 "output_representation": "extracted_rows",
-                "pinned_cpu_ns_per_record": 1367.912,
-                "source": "spot",
-                "stage": "extract"
+                "reference": "pinned",
+                "stage": "extract",
+                "supplementary_spot_cpu_ns_per_record": 791.0806666666666
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 791.0806666666666,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 354.36592354265474,
-            "attributed_with_allocator_cpu_ns_per_record": 405.67597650338683,
+            "attributed_exclusive_cpu_ns_per_record": 366.9169258825418,
+            "attributed_with_allocator_cpu_ns_per_record": 417.0134762091551,
             "attribution_categories": [
               "buffer",
               "sort_seal_merge"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 455.5533333333333,
-            "ratio_to_pinned": 0.8905125850688251,
-            "ratio_to_reference": 0.8346749982581003,
-            "reference_cpu_ns_per_record": 486.02866666666665,
+            "explanation": null,
+            "ratio_to_reference": 0.9153999009464427,
+            "ratio_to_supplementary": 0.8580018110231258,
+            "reference_cpu_ns_per_record": 455.5533333333333,
             "row": "admission_sort_seal_merge",
-            "share_ratio": 0.14768309341178942,
+            "share_ratio": 0.14480248078738034,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "extracted_rows",
                 "metrics": {
-                  "allocated_bytes_per_record": 1677.0725333333332,
-                  "cpu_ns_per_record": 366.88666666666666,
+                  "allocated_bytes_per_record": 1675.9109333333333,
+                  "cpu_ns_per_record": 350.82466666666664,
                   "output_bytes_per_input_record": 199.11506666666668,
-                  "peak_live_heap_bytes": 27331287.0,
-                  "peak_rss_bytes": 40210432.0,
-                  "peak_workspace_bytes": 4839237.0,
-                  "records_per_s_per_core": 2725637.344865808,
-                  "wall_ns_per_record": 366.9318666666667
+                  "peak_live_heap_bytes": 27442563.0,
+                  "peak_rss_bytes": 45056000.0,
+                  "peak_workspace_bytes": 4821813.0,
+                  "records_per_s_per_core": 2850426.7088783192,
+                  "wall_ns_per_record": 350.8495
                 },
                 "mode": "isolated",
                 "output_representation": "sealed_block",
-                "pinned_cpu_ns_per_record": 350.82466666666664,
-                "source": "spot",
-                "stage": "sort_seal"
+                "reference": "pinned",
+                "stage": "sort_seal",
+                "supplementary_spot_cpu_ns_per_record": 366.88666666666666
               },
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "sealed_block",
                 "metrics": {
                   "allocated_bytes_per_record": 578.3954666666667,
-                  "cpu_ns_per_record": 119.142,
+                  "cpu_ns_per_record": 104.72866666666667,
                   "output_bytes_per_input_record": 192.284,
                   "peak_live_heap_bytes": 8567716.0,
-                  "peak_rss_bytes": 42397696.0,
+                  "peak_rss_bytes": 42561536.0,
                   "peak_workspace_bytes": 4711440.0,
-                  "records_per_s_per_core": 8393345.755485052,
-                  "wall_ns_per_record": 119.13676666666667
+                  "records_per_s_per_core": 9548484.01902058,
+                  "wall_ns_per_record": 104.72486666666667
                 },
                 "mode": "isolated",
                 "output_representation": "merged_chunks",
-                "pinned_cpu_ns_per_record": 104.72866666666667,
-                "source": "spot",
-                "stage": "merge"
+                "reference": "pinned",
+                "stage": "merge",
+                "supplementary_spot_cpu_ns_per_record": 119.142
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 486.02866666666665,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 274.1971675786682,
-            "attributed_with_allocator_cpu_ns_per_record": 309.08291078273913,
+            "attributed_exclusive_cpu_ns_per_record": 276.9226692353965,
+            "attributed_with_allocator_cpu_ns_per_record": 307.8403422092469,
             "attribution_categories": [
               "encoding"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 225.548,
-            "ratio_to_pinned": 1.370364227493656,
-            "ratio_to_reference": 1.3677021721724663,
-            "reference_cpu_ns_per_record": 225.987,
+            "explanation": null,
+            "ratio_to_reference": 1.3648551182420012,
+            "ratio_to_supplementary": 1.3622037648592482,
+            "reference_cpu_ns_per_record": 225.548,
             "row": "encoding",
-            "share_ratio": 0.1122202374697909,
+            "share_ratio": 0.1126466226237023,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "merged_chunks",
                 "metrics": {
                   "allocated_bytes_per_record": 1013.8294,
-                  "cpu_ns_per_record": 225.987,
+                  "cpu_ns_per_record": 225.548,
                   "output_bytes_per_input_record": 21.125066666666665,
                   "peak_live_heap_bytes": 8058475.0,
-                  "peak_rss_bytes": 46379008.0,
+                  "peak_rss_bytes": 49610752.0,
                   "peak_workspace_bytes": 4266265.0,
-                  "records_per_s_per_core": 4425033.29837557,
-                  "wall_ns_per_record": 225.98683333333332
+                  "records_per_s_per_core": 4433646.053168284,
+                  "wall_ns_per_record": 225.55193333333332
                 },
                 "mode": "isolated",
                 "output_representation": "parquet_bytes",
-                "pinned_cpu_ns_per_record": 225.548,
-                "source": "spot",
-                "stage": "encode"
+                "reference": "pinned",
+                "stage": "encode",
+                "supplementary_spot_cpu_ns_per_record": 225.987
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": 225.987,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 27.376064460189436,
-            "attributed_with_allocator_cpu_ns_per_record": 30.813710688327813,
+            "attributed_exclusive_cpu_ns_per_record": 33.31096043117292,
+            "attributed_with_allocator_cpu_ns_per_record": 36.12165797425023,
             "attribution_categories": [
               "upload"
             ],
-            "known_deviation": "the upload bench sends pre-encoded bytes in one object, the engine streams each file as multipart parts while it encodes, so their per-record costs are not expected to match closely",
-            "pinned_reference_cpu_ns_per_record": 15.894,
-            "ratio_to_pinned": 1.938700810892652,
-            "ratio_to_reference": 2.16545555213248,
-            "reference_cpu_ns_per_record": 14.229666666666667,
+            "explanation": {
+              "detail": "no published measurement brings this row into the band; the supplementary family gives 2.538",
+              "status": "unexplained"
+            },
+            "ratio_to_reference": 2.2726599958632336,
+            "ratio_to_supplementary": 2.5384753431270513,
+            "reference_cpu_ns_per_record": 15.894,
             "row": "upload",
-            "share_ratio": 0.011558264158873595,
+            "share_ratio": 0.012471349602265067,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "pre_encoded_parquet_bytes",
                 "metrics": {
-                  "allocated_bytes_per_record": 7.064533333333333,
-                  "cpu_ns_per_record": 14.229666666666667,
+                  "allocated_bytes_per_record": 7.068133333333333,
+                  "cpu_ns_per_record": 15.894,
                   "output_bytes_per_input_record": 21.125066666666665,
-                  "peak_live_heap_bytes": 1281611.0,
-                  "peak_rss_bytes": 46534656.0,
-                  "peak_workspace_bytes": 56785.0,
-                  "records_per_s_per_core": 70275715.05540068,
-                  "wall_ns_per_record": 1010.0978
+                  "peak_live_heap_bytes": 1281614.0,
+                  "peak_rss_bytes": 49098752.0,
+                  "peak_workspace_bytes": 56788.0,
+                  "records_per_s_per_core": 62916823.95872656,
+                  "wall_ns_per_record": 1060.0880666666667
                 },
                 "mode": "async",
                 "output_representation": "stored_objects",
-                "pinned_cpu_ns_per_record": 15.894,
-                "source": "spot",
-                "stage": "upload"
+                "reference": "pinned",
+                "stage": "upload",
+                "supplementary_spot_cpu_ns_per_record": 14.229666666666667
               }
             ],
-            "verdict": "differs"
+            "supplementary_spot_cpu_ns_per_record": 14.229666666666667,
+            "verdict": "outside_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 336.8776821073311,
-            "attributed_with_allocator_cpu_ns_per_record": 375.455712000884,
+            "attributed_exclusive_cpu_ns_per_record": 330.4045653852872,
+            "attributed_with_allocator_cpu_ns_per_record": 369.75433098836953,
             "attribution_categories": [
               "engine_runtime"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 312.17533333333336,
-            "ratio_to_pinned": 1.2027078116386003,
-            "ratio_to_reference": 1.2027078116386003,
+            "explanation": null,
+            "ratio_to_reference": 1.1844444179500713,
+            "ratio_to_supplementary": null,
             "reference_cpu_ns_per_record": 312.17533333333336,
             "row": "engine_runtime",
-            "share_ratio": 0.13812125669853945,
+            "share_ratio": 0.13442092490225158,
             "stages": [
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
@@ -2138,16 +2365,17 @@
                 },
                 "mode": "pipeline",
                 "output_representation": "none",
-                "pinned_cpu_ns_per_record": 312.17533333333336,
-                "source": "pinned",
-                "stage": "otlp_noop"
+                "reference": "pinned",
+                "stage": "otlp_noop",
+                "supplementary_spot_cpu_ns_per_record": null
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": null,
+            "verdict": "within_band"
           },
           {
-            "attributed_exclusive_cpu_ns_per_record": 2423.413270606884,
-            "attributed_with_allocator_cpu_ns_per_record": 2423.413270606884,
+            "attributed_exclusive_cpu_ns_per_record": 2452.5816090593435,
+            "attributed_with_allocator_cpu_ns_per_record": 2452.5816090593435,
             "attribution_categories": [
               "conversion",
               "extraction",
@@ -2159,11 +2387,10 @@
               "allocator",
               "unknown"
             ],
-            "known_deviation": null,
-            "pinned_reference_cpu_ns_per_record": 3305.258,
-            "ratio_to_pinned": 0.7331994266731626,
-            "ratio_to_reference": 0.9576047725105963,
-            "reference_cpu_ns_per_record": 2530.7030000000004,
+            "explanation": null,
+            "ratio_to_reference": 0.7420242562182268,
+            "ratio_to_supplementary": null,
+            "reference_cpu_ns_per_record": 3305.258,
             "row": "total",
             "share_ratio": 1.0,
             "stages": [
@@ -2182,123 +2409,131 @@
                 },
                 "mode": "pipeline",
                 "output_representation": "none",
-                "pinned_cpu_ns_per_record": 312.17533333333336,
-                "source": "pinned",
-                "stage": "otlp_noop"
+                "reference": "pinned",
+                "stage": "otlp_noop",
+                "supplementary_spot_cpu_ns_per_record": null
               },
               {
                 "denominator": "logical upstream records of the input file (log records or metric points), whatever form this stage's own input takes",
                 "input_representation": "otlp_wire_bytes",
                 "metrics": {
-                  "allocated_bytes_per_record": 14794.405133333334,
-                  "cpu_ns_per_record": 2218.527666666667,
-                  "output_bytes_per_input_record": 21.168333333333333,
-                  "peak_live_heap_bytes": 26712025.0,
-                  "peak_rss_bytes": 49614848.0,
-                  "peak_workspace_bytes": 25804075.0,
-                  "records_per_s_per_core": 450749.3934040038,
-                  "wall_ns_per_record": 3333.1124
+                  "allocated_bytes_per_record": 15848.405866666666,
+                  "cpu_ns_per_record": 2993.0826666666667,
+                  "output_bytes_per_input_record": 21.1672,
+                  "peak_live_heap_bytes": 26765431.0,
+                  "peak_rss_bytes": 53665792.0,
+                  "peak_workspace_bytes": 25857481.0,
+                  "records_per_s_per_core": 334103.7022253979,
+                  "wall_ns_per_record": 4116.470533333333
                 },
                 "mode": "async",
                 "output_representation": "stored_objects",
-                "pinned_cpu_ns_per_record": 2993.0826666666667,
-                "source": "spot",
-                "stage": "otlp_minio"
+                "reference": "pinned",
+                "stage": "otlp_minio",
+                "supplementary_spot_cpu_ns_per_record": 2218.527666666667
               }
             ],
-            "verdict": "agrees"
+            "supplementary_spot_cpu_ns_per_record": null,
+            "verdict": "within_band"
           }
         ],
-        "upload_wait_s": 18.518387665000002
+        "engine_cpu_ns_per_record": 2452.5816090593435,
+        "flush_wall_s": 18.666821124,
+        "upload_wait_s": 14.511042748999998
       }
     }
   },
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
   "run_files": [
     {
-      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r001.json",
-      "sha256": "b5100ad08ad89e45eababb0263efc09e6f7208fd8f8c73f64cd26b5577ce15ef",
-      "size_bytes": 1174105
+      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r005.json",
+      "sha256": "cdb00075529d45917a7c658bc8f05f1063e5ec702fb8ae1c681a282e8a993abd",
+      "size_bytes": 1124307
     },
     {
-      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r002.json",
-      "sha256": "95b38b67b8e186ec2fb4ace409ee4872143bb03cca8616ff5c31109e5720cad9",
-      "size_bytes": 1174497
+      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r006.json",
+      "sha256": "85949049e6d2a03ec3468af6d145fdb7d92fd42ed316b6acdf1f0754153a97e6",
+      "size_bytes": 885547
     },
     {
-      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r003.json",
-      "sha256": "bbec831c8f29f9a4636b77a93f9252e6b5799672aa3bdc87cf12e71e541690df",
-      "size_bytes": 1009977
+      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r007.json",
+      "sha256": "5216063adca837f604fe99680d4790ee8dc3ecb4336d0d1c9debae195aeb143e",
+      "size_bytes": 993544
     },
     {
-      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r001.json",
-      "sha256": "b60507a2d473e268689cffafdc82590255fcd29dd6c85259e5042f4a9d01d139",
-      "size_bytes": 1200893
+      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r008.json",
+      "sha256": "bf0e4b0e229200ba5949aadf976252472425c6d17154962791336e9a8ab484e9",
+      "size_bytes": 936492
     },
     {
-      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r002.json",
-      "sha256": "7749e7fd5bfb3d30f617a601b900df18b62644f7887fcb25cc41dece2449ffa9",
-      "size_bytes": 1109870
+      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r009.json",
+      "sha256": "c794924b1be507fc59e7c34c7d8790ead5238f42c8efdaeefe5712b6c5a4b614",
+      "size_bytes": 937617
     },
     {
-      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r003.json",
-      "sha256": "991bf902325af0704396a8a00113e23d890f1845feaad562f8bbc4f7177ae9fb",
-      "size_bytes": 1111762
+      "name": "attribution-metrics-mixed-strict-minio-c1-w15-r010.json",
+      "sha256": "5d9ca0affdf205c437559e67030fcdf44d3602b0fca40ef6fb92c22f52cfdf13",
+      "size_bytes": 938929
     },
     {
-      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-f001.json",
-      "sha256": "7760c672895596f3a051dc2b73eb94b630c2e532865fe913397af168754c4325",
-      "size_bytes": 93155
+      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-r004.json",
+      "sha256": "43f0737cef4a9d0b028d81084cf1ac9d53b215b3cc40057e8e6f5b43fd76eab8",
+      "size_bytes": 55996
     },
     {
-      "name": "attribution-metrics-mixed-strict-minio-c1-w15-f001.json",
-      "sha256": "53d86f47f60fa7c30044a9c5d50c1c37bb603fdf267fec0d91c3f5b953d448b1",
-      "size_bytes": 93668
+      "name": "attribution-logs-1k-stable-strict-minio-c1-w15-f002.json",
+      "sha256": "39d9fc7f81f41cbf1136ebc7a133cb9e885ae8357122252caf9854ca2bdc26bf",
+      "size_bytes": 96193
+    },
+    {
+      "name": "attribution-metrics-mixed-strict-minio-c1-w15-f002.json",
+      "sha256": "90779357a5d8918aa3cc808a0908c9d0fdd189213c78258525eef2930bf263f3",
+      "size_bytes": 96948
     }
   ],
   "run_id": "attribution",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-23T08:41:24Z",
+  "started_utc": "2026-09-23T12:13:04Z",
   "status": "failed",
   "workload": {},
   "workloads": {
     "logs-1k-stable": {
       "input": {
-        "build_s": 74.46335659,
+        "build_s": 74.888539732,
         "files": {
           "digests.bin": {
             "name": "digests.bin",
-            "sha256": "6733e1210f4efe6641e9315bdc760e030efefdebb5f3c3734a2baa0c273ba5ec",
-            "size_bytes": 167692800
+            "sha256": "48f4e38033918c128b38e9461fbb9c93aec7be82aeb00c2157196f9a68dd1d76",
+            "size_bytes": 168115200
           },
           "offsets.bin": {
             "name": "offsets.bin",
-            "sha256": "a16ac145e77d66b146613e9ea6c632dcfb5627f92bae9f9a97cd17cf18526d8d",
-            "size_bytes": 1016320
+            "sha256": "b85342fa13ddee151f62cbbf23300e22d030900c6bde67133211581081e8e34d",
+            "size_bytes": 1018880
           },
           "wire.bin": {
             "name": "wire.bin",
-            "sha256": "6bb8e6789addaeeefa9b75328568cd46305333017a961847250a85084a465c4d",
-            "size_bytes": 5497630592
+            "sha256": "655afa5edd759ac3002eaa1a56c15d0e0af99cb471ffe3243c4add4e9ffbbd79",
+            "size_bytes": 5511478528
           }
         },
         "format": "series-attribution-prebuilt/1",
         "processes": 16,
-        "records": 5081600,
-        "requests": 50816,
+        "records": 5094400,
+        "requests": 50944,
         "signal": "logs",
-        "wire_bytes": 5497630592,
+        "wire_bytes": 5511478528,
         "workload": {
           "body_bytes": 1024,
           "metrics_every": 1000,
           "records_per_request": 100,
-          "requests": 50867,
+          "requests": 50995,
           "seed": 20260922,
           "series": 100
         }
       },
-      "sizing_cpu_ns_per_record": 6604.8465,
+      "sizing_cpu_ns_per_record": 6580.8645,
       "stage_workload": {
         "body_bytes": 1024,
         "metrics_every": 1000,
@@ -2310,40 +2545,40 @@
     },
     "metrics-mixed": {
       "input": {
-        "build_s": 9.094306683,
+        "build_s": 6.804876859,
         "files": {
           "digests.bin": {
             "name": "digests.bin",
-            "sha256": "6c0b1d9f7d2f51907b92efdec8f9790a4f624341b9037594024272ddef986e29",
-            "size_bytes": 437184000
+            "sha256": "45246347d3fc051195fbe9a528ce4e09c4f144d4442a9e193f414c56d386504d",
+            "size_bytes": 334540800
           },
           "offsets.bin": {
             "name": "offsets.bin",
-            "sha256": "b340f5de86a5d73dcb51b7d51510339efca622d1143a715ac4dd2327a54d284a",
-            "size_bytes": 2649600
+            "sha256": "5568209293f8722292e188584591914e8a671ebac02ce8d153c353ca0527dfe2",
+            "size_bytes": 2027520
           },
           "wire.bin": {
             "name": "wire.bin",
-            "sha256": "d78710264f33466be0131f7094d739352c00ad76b24fbfa632287f9059bda0a7",
-            "size_bytes": 801901440
+            "sha256": "1f1324da7fc4a970fad922cb5113324473c2b5d17b2d2f6e7e0f18ff641bd4ae",
+            "size_bytes": 613628928
           }
         },
         "format": "series-attribution-prebuilt/1",
         "processes": 16,
-        "records": 13248000,
-        "requests": 132480,
+        "records": 10137600,
+        "requests": 101376,
         "signal": "metrics",
-        "wire_bytes": 801901440,
+        "wire_bytes": 613628928,
         "workload": {
           "body_bytes": 1024,
           "metrics_every": 1,
           "records_per_request": 100,
-          "requests": 132480,
+          "requests": 101376,
           "seed": 20260922,
           "series": 100
         }
       },
-      "sizing_cpu_ns_per_record": 2530.7030000000004,
+      "sizing_cpu_ns_per_record": 3305.258,
       "stage_workload": {
         "body_bytes": 1024,
         "metrics_every": 1,
