@@ -461,12 +461,16 @@ impl Worker {
             // there is no body to walk here.
             OtlpProtoBytes::ExportTracesRequest(_) => return Ok(()),
         };
-        bytes.validate_framing().map_err(|error| match error {
-            otel_arrow_dfe_pdata::error::Error::OtlpNestingTooDeep { .. } => {
-                lake::Error::Refused(lake::RefuseReason::TooDeep(max_nesting_depth))
-            }
-            error => lake::Error::invalid(format!("malformed OTLP {signal} body: {error}")),
-        })
+        payload
+            .validate_otlp_framing(
+                otel_arrow_dfe_pdata::views::otlp::bytes::validate::RepeatedSingular::Refuse,
+            )
+            .map_err(|error| match error {
+                otel_arrow_dfe_pdata::error::Error::OtlpNestingTooDeep { .. } => {
+                    lake::Error::Refused(lake::RefuseReason::TooDeep(max_nesting_depth))
+                }
+                error => lake::Error::invalid(format!("malformed OTLP {signal} body: {error}")),
+            })
     }
 
     /// Convert one payload and extract its rows, dropping the conversion.

@@ -741,9 +741,9 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                         // would be sent on as an empty or partial batch and
                         // acknowledged. Refuse it permanently instead: the
                         // identical bytes would fail again.
-                        if let otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) = payload.data()
-                            && let Err(error) = bytes.validate_framing()
-                        {
+                        if let Err(error) = payload.validate_otlp_framing(
+                            otel_arrow_dfe_pdata::views::otlp::bytes::validate::RepeatedSingular::Accept,
+                        ) {
                             self.metrics.record_failure(
                                 signal_type,
                                 OtapExporterErrorType::PayloadConversion,

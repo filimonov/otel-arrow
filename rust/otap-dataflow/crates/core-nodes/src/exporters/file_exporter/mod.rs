@@ -40,6 +40,7 @@ use otel_arrow_dfe_pdata::views::otap::{OtapLogsView, OtapMetricsView, OtapTrace
 use otel_arrow_dfe_pdata::views::otlp::bytes::logs::RawLogsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::metrics::RawMetricsData;
 use otel_arrow_dfe_pdata::views::otlp::bytes::traces::RawTraceData;
+use otel_arrow_dfe_pdata::views::otlp::bytes::validate::RepeatedSingular;
 use otel_arrow_dfe_pdata::{OtapPayload, OtapPayloadHelpers, PayloadData};
 use otel_arrow_dfe_telemetry::attributes::AttributeEnum as _;
 use otel_arrow_dfe_telemetry::common_attributes::{
@@ -372,20 +373,20 @@ fn encode_payload(
     match payload.data() {
         PayloadData::OtlpBytes(bytes) => match bytes {
             otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(buf) => {
-                bytes
-                    .validate_framing()
+                payload
+                    .validate_otlp_framing(RepeatedSingular::Accept)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_logs(&RawLogsData::new(buf), frame, max_frame_bytes)?;
             }
             otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(buf) => {
-                bytes
-                    .validate_framing()
+                payload
+                    .validate_otlp_framing(RepeatedSingular::Accept)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_metrics(&RawMetricsData::new(buf), frame, max_frame_bytes)?;
             }
             otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(buf) => {
-                bytes
-                    .validate_framing()
+                payload
+                    .validate_otlp_framing(RepeatedSingular::Accept)
                     .map_err(|error| EncodeFailure::View(error.to_string()))?;
                 encode_traces(&RawTraceData::new(buf), frame, max_frame_bytes)?;
             }

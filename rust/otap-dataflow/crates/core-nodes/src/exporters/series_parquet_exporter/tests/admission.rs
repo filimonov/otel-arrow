@@ -720,7 +720,6 @@ async fn an_unknown_group_before_known_fields_loses_nothing() {
     let wall = Arc::new(lake::clock::TestWallClock::new(0));
     let worker = Worker::new(worker_config(), store, wall, handler);
     let extract = |payload: otel_arrow_dfe_pdata::OtlpProtoBytes| {
-        assert!(payload.validate_framing().is_ok());
         let mut context = Context::default();
         context.set_source_node(7);
         match worker.prepare(OtapPdata::new(context, payload.into())) {
@@ -905,7 +904,6 @@ async fn a_repeated_any_value_member_is_merged_end_to_end() {
     let worker = Worker::new(worker_config(), store, wall, handler);
     let extract = |body: Vec<u8>| {
         let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
-        assert!(payload.validate_framing().is_ok());
         let mut context = Context::default();
         context.set_source_node(7);
         match worker.prepare(OtapPdata::new(context, payload.into())) {
@@ -974,11 +972,6 @@ async fn nesting_beyond_the_framing_bound_is_refused_as_too_deep() {
     let worker = Worker::new(cfg, store, wall, handler);
     for levels in [MAX_ANY_VALUE_NESTING_DEPTH, MAX_ANY_VALUE_NESTING_DEPTH + 1] {
         let payload = body(levels);
-        assert_eq!(
-            payload.validate_framing().is_ok(),
-            levels == MAX_ANY_VALUE_NESTING_DEPTH,
-            "{levels} levels"
-        );
         let mut context = Context::default();
         context.set_source_node(7);
         match worker.prepare(OtapPdata::new(context, payload.into())) {

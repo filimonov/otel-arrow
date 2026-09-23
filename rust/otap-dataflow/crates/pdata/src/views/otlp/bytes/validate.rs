@@ -18,29 +18,26 @@
 //!   fixed-width or length-delimited value lies inside the enclosing message;
 //! - a field the schema knows arrives with the wire type the schema gives it
 //!   (a repeated scalar may also arrive packed);
-//! - a `string` field holds valid UTF-8 (a `bytes` field may hold anything);
 //! - a packed `fixed64`/`double` field holds a whole number of elements, and a
 //!   packed varint field holds only well-formed varints;
 //! - `AnyValue` arrays and key-value lists nest at most
 //!   [`MAX_ANY_VALUE_NESTING_DEPTH`] levels;
-//! - a singular field, or a oneof, occurs at most once per message, except
-//!   `AnyValue`'s value, whose view reads repeated members as prost does.
-//!   Protobuf allows the repetition (last scalar wins, messages merge), but no
-//!   OTLP encoder emits it and the byte views read it differently, so it is
-//!   refused rather than stored as something prost would not decode.
+//! - under [`RepeatedSingular::Refuse`], a singular field or a oneof occurs at
+//!   most once per message.
 //!
 //! A field the schema does not know keeps protobuf skip semantics: its
 //! framing is checked and its content is skipped. An unknown group (wire
 //! types 3 and 4) is skipped when it is balanced -- closed by an end key of
 //! its own field number, nested groups included, each group counted against
 //! the same nesting limit -- and a stray or mismatched end group is refused.
-//! No value is range-checked: that is content, not framing.
+//! Content is not checked: no value is range-checked and a `string` field may
+//! hold invalid UTF-8, which the conversion to OTAP records replaces with
+//! U+FFFD.
 //!
 //! Cost: each byte of the request is read once, by the innermost message that
 //! holds it, so the walk is linear in the body size; it allocates nothing, and
 //! its recursion depth is bounded by the schema's fixed levels plus three per
-//! `AnyValue` nesting level, or one per unknown group level. String fields are
-//! read a second time by the UTF-8 check.
+//! `AnyValue` nesting level, or one per unknown group level.
 
 use super::decode::{
     END_GROUP, START_GROUP, SkipError, read_key, read_varint, skip_group, value_range,
@@ -57,6 +54,20 @@ use crate::proto::consts::wire_types::{FIXED32, FIXED64, LEN, VARINT};
 /// none. The limit exists to bound the validator's recursion, not to judge
 /// content, so it is set no lower than any consumer's own nesting limit.
 pub const MAX_ANY_VALUE_NESTING_DEPTH: usize = 256;
+
+/// What [`validate_request`] decides about a singular field or oneof that
+/// occurs more than once in one message.
+///
+/// Protobuf allows the repetition: the last scalar wins and message
+/// occurrences merge. The byte views read one occurrence instead, except in
+/// `AnyValue`, whose members they read as prost does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepeatedSingular {
+    /// Accept the request; the byte views read one of the occurrences.
+    Accept,
+    /// Refuse the request as [`Error::DuplicateOtlpField`].
+    Refuse,
+}
 
 /// The OTLP message types the validator descends into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +116,7 @@ enum Field {
     /// A singular or repeated non-packable value with this wire type
     /// (`bytes` fields are `LEN`).
     Scalar(u64),
-    /// A singular or repeated `string`: `LEN`, holding valid UTF-8.
+    /// A singular or repeated `string`: `LEN`.
     Str,
     /// A repeated scalar with this element wire type, packed (`LEN`) or not.
     Packed(u64),
@@ -165,11 +176,6 @@ impl Message {
     /// view reads a repeated oneof member as prost does (the last member
     /// wins; `array_value` and `kvlist_value` following themselves merge).
     ///
-    /// Protobuf lets a singular field occur more than once -- the last scalar
-    /// wins, message occurrences are merged -- but no OTLP encoder emits that,
-    /// and the byte views read the first occurrence or one occurrence only.
-    /// A request that repeats one is refused, so none is ever stored as read
-    /// differently from prost.
     fn singular(self, num: u64) -> Option<(u32, &'static str)> {
         use Message as M;
         let name = match (self, num) {
@@ -533,9 +539,14 @@ impl Message {
 ///
 /// # Errors
 /// [`Error::InvalidOtlpWireFormat`] naming the problem, the innermost message
-/// holding it and its byte offset in `buf`, or [`Error::OtlpNestingTooDeep`].
-pub(crate) fn validate_request(buf: &[u8], root: Message) -> Result<(), Error> {
-    walk(buf, 0, root, 0).map_err(|damage| match damage {
+/// holding it and its byte offset in `buf`, [`Error::OtlpNestingTooDeep`], or,
+/// under [`RepeatedSingular::Refuse`], [`Error::DuplicateOtlpField`].
+pub(crate) fn validate_request(
+    buf: &[u8],
+    root: Message,
+    repeated: RepeatedSingular,
+) -> Result<(), Error> {
+    walk(buf, 0, root, 0, repeated).map_err(|damage| match damage {
         Damage::Framing {
             problem,
             message,
@@ -581,7 +592,13 @@ enum Damage {
 
 /// Walk one message of type `message`; `base` is the offset of `buf` within
 /// the request and `depth` the `AnyValue` nesting level `buf` is at.
-fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), Damage> {
+fn walk(
+    buf: &[u8],
+    base: usize,
+    message: Message,
+    depth: usize,
+    repeated: RepeatedSingular,
+) -> Result<(), Damage> {
     let fail = |problem: &'static str, at: usize| Damage::Framing {
         problem,
         message,
@@ -610,7 +627,9 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
         }
         let (start, end) =
             value_range(buf, wire_type, next).map_err(|problem| fail(problem, at))?;
-        if let Some((slot, name)) = message.singular(field_num) {
+        if repeated == RepeatedSingular::Refuse
+            && let Some((slot, name)) = message.singular(field_num)
+        {
             let bit = 1u32 << slot;
             if seen & bit != 0 {
                 return Err(Damage::Duplicate {
@@ -632,9 +651,6 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
                 if wire_type != LEN {
                     return Err(fail("wrong wire type for a known field", at));
                 }
-                if std::str::from_utf8(&buf[start..end]).is_err() {
-                    return Err(fail("invalid UTF-8 in a string field", at));
-                }
             }
             Field::Packed(element) => {
                 if wire_type == LEN {
@@ -651,7 +667,7 @@ fn walk(buf: &[u8], base: usize, message: Message, depth: usize) -> Result<(), D
                 if depth > MAX_ANY_VALUE_NESTING_DEPTH {
                     return Err(Damage::TooDeep { offset: base + at });
                 }
-                walk(&buf[start..end], base + start, child, depth)?;
+                walk(&buf[start..end], base + start, child, depth, repeated)?;
             }
         }
         pos = end;
@@ -1004,7 +1020,10 @@ mod tests {
     #[test]
     fn a_fully_populated_request_passes() {
         for (root, body) in requests() {
-            assert!(validate_request(&body, root).is_ok(), "{root:?}");
+            assert!(
+                validate_request(&body, root, RepeatedSingular::Refuse).is_ok(),
+                "{root:?}"
+            );
         }
     }
 
@@ -1070,7 +1089,10 @@ mod tests {
         {
             let decorated = decorate(&body, root);
             assert!(decorated.len() > body.len() + 100, "{root:?}");
-            assert!(validate_request(&decorated, root).is_ok(), "{root:?}");
+            assert!(
+                validate_request(&decorated, root, RepeatedSingular::Refuse).is_ok(),
+                "{root:?}"
+            );
             assert_eq!(
                 convert(signal, decorated),
                 convert(signal, body),
@@ -1127,23 +1149,31 @@ mod tests {
     /// `Metric.data`, the exponential histogram buckets, `Span.status` and
     /// `KeyValue.value`), plus a number data point and an exemplar carrying
     /// both members of their `value` oneof.
-    /// Guarantees: each is refused as `DuplicateOtlpField` naming the message
-    /// and the field, because the byte views read a repeated singular field
+    /// Guarantees: under `RepeatedSingular::Refuse` each is refused as
+    /// `DuplicateOtlpField` naming the message and the field, because the byte views read a repeated singular field
     /// differently from prost (first occurrence instead of the last, one
     /// occurrence instead of the merge); the requests with each field once
-    /// pass, and `AnyValue`'s own repeated members -- which its view reads as
-    /// prost does -- are still accepted.
+    /// pass, `AnyValue`'s own repeated members -- which its view reads as
+    /// prost does -- are still accepted, and under `RepeatedSingular::Accept`
+    /// every doubled request passes.
     #[test]
     fn a_repeated_singular_field_is_refused() {
         let mut targets = Vec::new();
         for (root, body) in requests() {
-            assert!(validate_request(&body, root).is_ok(), "{root:?}");
+            assert!(
+                validate_request(&body, root, RepeatedSingular::Refuse).is_ok(),
+                "{root:?}"
+            );
             let mut found = Vec::new();
             singular_fields(&body, root, &mut found);
             for target in found {
                 let doubled = duplicate(&body, root, target);
                 let (_, field) = target.0.singular(target.1).expect("singular");
-                match validate_request(&doubled, root) {
+                assert!(
+                    validate_request(&doubled, root, RepeatedSingular::Accept).is_ok(),
+                    "{target:?}"
+                );
+                match validate_request(&doubled, root, RepeatedSingular::Refuse) {
                     Err(Error::DuplicateOtlpField {
                         message,
                         field: refused,
@@ -1186,7 +1216,11 @@ mod tests {
         let gauge = len_field(5, &len_field(1, &point));
         let body = len_field(1, &len_field(2, &len_field(2, &gauge)));
         assert!(matches!(
-            validate_request(&body, Message::ExportMetricsServiceRequest),
+            validate_request(
+                &body,
+                Message::ExportMetricsServiceRequest,
+                RepeatedSingular::Refuse
+            ),
             Err(Error::DuplicateOtlpField {
                 message: "NumberDataPoint",
                 field: "value",
@@ -1201,7 +1235,11 @@ mod tests {
         let gauge = len_field(5, &len_field(1, &len_field(5, &exemplar)));
         let body = len_field(1, &len_field(2, &len_field(2, &gauge)));
         assert!(matches!(
-            validate_request(&body, Message::ExportMetricsServiceRequest),
+            validate_request(
+                &body,
+                Message::ExportMetricsServiceRequest,
+                RepeatedSingular::Refuse
+            ),
             Err(Error::DuplicateOtlpField {
                 message: "Exemplar",
                 field: "value",
@@ -1213,7 +1251,12 @@ mod tests {
         let any_value = [len_field(1, b"x"), len_field(1, b"y"), len_field(5, &[])].concat();
         let record = len_field(5, &any_value);
         assert!(
-            validate_request(&in_log_record(&record), Message::ExportLogsServiceRequest).is_ok()
+            validate_request(
+                &in_log_record(&record),
+                Message::ExportLogsServiceRequest,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
         );
     }
 
@@ -1235,7 +1278,7 @@ mod tests {
                 pos = end;
             }
             for cut in 1..body.len() {
-                let result = validate_request(&body[..cut], root);
+                let result = validate_request(&body[..cut], root, RepeatedSingular::Refuse);
                 assert_eq!(
                     result.is_ok(),
                     boundaries.contains(&cut),
@@ -1262,7 +1305,11 @@ mod tests {
         // one-byte length before the AnyValue's content, and the KeyValue's
         // key field adds three more.
         let expected = 5 * 2 + 3;
-        match validate_request(&body, Message::ExportLogsServiceRequest) {
+        match validate_request(
+            &body,
+            Message::ExportLogsServiceRequest,
+            RepeatedSingular::Refuse,
+        ) {
             Err(Error::InvalidOtlpWireFormat {
                 problem,
                 message,
@@ -1290,13 +1337,24 @@ mod tests {
         record.extend([0xfd, 0x01, 1, 2, 3, 4]); // field 31, fixed32
         record.extend(len_field(31, &[0xff, 0xff, 0xff])); // not a message
         let body = len_field(1, &len_field(2, &len_field(2, &record)));
-        assert!(validate_request(&body, Message::ExportLogsServiceRequest).is_ok());
+        assert!(
+            validate_request(
+                &body,
+                Message::ExportLogsServiceRequest,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
 
         let mut overrun = record.clone();
         overrun.extend([0xfa, 0x01, 0x09, 0x00]); // field 31, 9 bytes declared
         let body = len_field(1, &len_field(2, &len_field(2, &overrun)));
         assert!(matches!(
-            validate_request(&body, Message::ExportLogsServiceRequest),
+            validate_request(
+                &body,
+                Message::ExportLogsServiceRequest,
+                RepeatedSingular::Refuse
+            ),
             Err(Error::InvalidOtlpWireFormat {
                 message: "LogRecord",
                 ..
@@ -1313,16 +1371,19 @@ mod tests {
     #[test]
     fn a_known_field_with_the_wrong_wire_type_is_refused() {
         let root = Message::ExportLogsServiceRequest;
-        assert!(validate_request(&[0x08, 0x01], root).is_err());
+        assert!(validate_request(&[0x08, 0x01], root, RepeatedSingular::Refuse).is_err());
         let record = [0x08, 0x01];
         let body = len_field(1, &len_field(2, &len_field(2, &record)));
-        assert!(validate_request(&body, root).is_err());
+        assert!(validate_request(&body, root, RepeatedSingular::Refuse).is_err());
         let any_value = [0x0d, 1, 2, 3, 4];
         let key_value = len_field(2, &any_value);
         let body = len_field(1, &len_field(2, &len_field(2, &len_field(6, &key_value))));
-        assert!(validate_request(&body, root).is_err());
+        assert!(validate_request(&body, root, RepeatedSingular::Refuse).is_err());
         for key in [0x0b, 0x0c, 0x0e, 0x0f, 0x02] {
-            assert!(validate_request(&[key, 0x00], root).is_err(), "{key:#x}");
+            assert!(
+                validate_request(&[key, 0x00], root, RepeatedSingular::Refuse).is_err(),
+                "{key:#x}"
+            );
         }
     }
 
@@ -1343,11 +1404,17 @@ mod tests {
         // Field 6, fixed64, twice (unpacked); field 7, fixed64 (unpacked).
         let mut unpacked = vec![0x31, 1, 0, 0, 0, 0, 0, 0, 0, 0x31, 2, 0, 0, 0, 0, 0, 0, 0];
         unpacked.extend([0x39, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
-        assert!(validate_request(&wrap_histogram(&unpacked), root).is_ok());
+        assert!(
+            validate_request(&wrap_histogram(&unpacked), root, RepeatedSingular::Refuse).is_ok()
+        );
         let ragged = len_field(6, &[1, 0, 0, 0, 0, 0, 0, 0, 2]);
-        assert!(validate_request(&wrap_histogram(&ragged), root).is_err());
+        assert!(
+            validate_request(&wrap_histogram(&ragged), root, RepeatedSingular::Refuse).is_err()
+        );
         let ragged = len_field(7, &[0; 12]);
-        assert!(validate_request(&wrap_histogram(&ragged), root).is_err());
+        assert!(
+            validate_request(&wrap_histogram(&ragged), root, RepeatedSingular::Refuse).is_err()
+        );
 
         let wrap_buckets = |buckets: &[u8]| {
             let point = len_field(8, buckets);
@@ -1355,9 +1422,30 @@ mod tests {
             let metric = len_field(10, &histogram);
             len_field(1, &len_field(2, &len_field(2, &metric)))
         };
-        assert!(validate_request(&wrap_buckets(&len_field(2, &[0x01, 0xac, 0x02])), root).is_ok());
-        assert!(validate_request(&wrap_buckets(&[0x10, 0x01, 0x10, 0x02]), root).is_ok());
-        assert!(validate_request(&wrap_buckets(&len_field(2, &[0x01, 0xac])), root).is_err());
+        assert!(
+            validate_request(
+                &wrap_buckets(&len_field(2, &[0x01, 0xac, 0x02])),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_request(
+                &wrap_buckets(&[0x10, 0x01, 0x10, 0x02]),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_request(
+                &wrap_buckets(&len_field(2, &[0x01, 0xac])),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_err()
+        );
     }
 
     /// A log body nesting `levels` arrays, the innermost holding a string.
@@ -1385,9 +1473,20 @@ mod tests {
     #[test]
     fn nesting_is_bounded_exactly() {
         let root = Message::ExportLogsServiceRequest;
-        assert!(validate_request(&nested_body(MAX_ANY_VALUE_NESTING_DEPTH), root).is_ok());
+        assert!(
+            validate_request(
+                &nested_body(MAX_ANY_VALUE_NESTING_DEPTH),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            validate_request(&nested_body(MAX_ANY_VALUE_NESTING_DEPTH + 1), root),
+            validate_request(
+                &nested_body(MAX_ANY_VALUE_NESTING_DEPTH + 1),
+                root,
+                RepeatedSingular::Refuse
+            ),
             Err(Error::OtlpNestingTooDeep {
                 limit: MAX_ANY_VALUE_NESTING_DEPTH,
                 ..
@@ -1425,25 +1524,33 @@ mod tests {
         let mut eleven = [0x80; 11];
         eleven[10] = 0x00;
         let severity = |varint: &[u8]| in_log_record(&[&[0x10][..], varint].concat());
-        assert!(validate_request(&severity(&max), root).is_ok());
+        assert!(validate_request(&severity(&max), root, RepeatedSingular::Refuse).is_ok());
         assert_eq!(
-            problem(validate_request(&severity(&overflow), root)),
+            problem(validate_request(
+                &severity(&overflow),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "truncated or overlong varint"
         );
         assert_eq!(
-            problem(validate_request(&severity(&eleven), root)),
+            problem(validate_request(
+                &severity(&eleven),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "truncated or overlong varint"
         );
         // LogRecord.body (field 5, LEN) whose length is the overflowing varint.
         let length = in_log_record(&[&[0x2a][..], &overflow].concat());
         assert_eq!(
-            problem(validate_request(&length, root)),
+            problem(validate_request(&length, root, RepeatedSingular::Refuse)),
             "truncated or overlong length prefix"
         );
         // An unknown field key that overflows.
         let key = in_log_record(&overflow);
         assert_eq!(
-            problem(validate_request(&key, root)),
+            problem(validate_request(&key, root, RepeatedSingular::Refuse)),
             "truncated or overlong field key"
         );
         let buckets = |counts: &[u8]| {
@@ -1452,53 +1559,47 @@ mod tests {
             len_field(1, &len_field(2, &len_field(2, &metric)))
         };
         let metrics = Message::ExportMetricsServiceRequest;
-        assert!(validate_request(&buckets(&max), metrics).is_ok());
+        assert!(validate_request(&buckets(&max), metrics, RepeatedSingular::Refuse).is_ok());
         assert_eq!(
-            problem(validate_request(&buckets(&overflow), metrics)),
+            problem(validate_request(
+                &buckets(&overflow),
+                metrics,
+                RepeatedSingular::Refuse
+            )),
             "truncated or overlong varint in a packed field"
         );
     }
 
-    /// Scenario: `AnyValue.string_value` holding the byte `0xff`, the same
-    /// value as a valid multibyte UTF-8 string, `AnyValue.bytes_value`
-    /// holding `0xff`, and a `KeyValue.key` and a `Metric.name` holding
-    /// `0xff`.
-    /// Guarantees: a `string` field must hold valid UTF-8, as prost requires,
-    /// so the conversion never replaces damaged text with U+FFFD and stores it
-    /// as if it had been sent; multibyte text and arbitrary `bytes` pass.
+    /// Scenario: `AnyValue.string_value`, a `KeyValue.key` and a `Metric.name`
+    /// holding bytes that are not UTF-8 (`0xff`, a lone `0xc3`), under both
+    /// policies.
+    /// Guarantees: each passes: UTF-8 is content, which the conversion to OTAP
+    /// records replaces with U+FFFD, not framing.
     #[test]
-    fn a_string_field_must_hold_valid_utf8() {
-        let root = Message::ExportLogsServiceRequest;
+    fn a_string_field_is_not_checked_for_utf8() {
         let attribute = |key: &[u8], value: &[u8]| {
             let key_value = [len_field(1, key), len_field(2, value)].concat();
             in_log_record(&len_field(6, &key_value))
         };
-        assert_eq!(
-            problem(validate_request(
-                &attribute(b"k", &len_field(1, &[0xff])),
-                root
-            )),
-            "invalid UTF-8 in a string field"
-        );
-        let text = "h\u{e9}llo \u{2713} \u{1f600}";
-        assert!(validate_request(&attribute(b"k", &len_field(1, text.as_bytes())), root).is_ok());
-        assert!(validate_request(&attribute(b"k", &len_field(7, &[0xff])), root).is_ok());
-        assert_eq!(
-            problem(validate_request(
-                &attribute(&[0xff], &len_field(1, b"v")),
-                root
-            )),
-            "invalid UTF-8 in a string field"
-        );
         let metric = len_field(1, &[0xc3]);
-        let body = len_field(1, &len_field(2, &len_field(2, &metric)));
-        assert_eq!(
-            problem(validate_request(
-                &body,
-                Message::ExportMetricsServiceRequest
-            )),
-            "invalid UTF-8 in a string field"
-        );
+        for repeated in [RepeatedSingular::Accept, RepeatedSingular::Refuse] {
+            for (body, root) in [
+                (
+                    attribute(b"k", &len_field(1, &[0xff])),
+                    Message::ExportLogsServiceRequest,
+                ),
+                (
+                    attribute(&[0xff], &len_field(1, b"v")),
+                    Message::ExportLogsServiceRequest,
+                ),
+                (
+                    len_field(1, &len_field(2, &len_field(2, &metric))),
+                    Message::ExportMetricsServiceRequest,
+                ),
+            ] {
+                assert!(validate_request(&body, root, repeated).is_ok(), "{root:?}");
+            }
+        }
     }
 
     /// Scenario: unknown field 31 of a log record encoded as a group --
@@ -1518,30 +1619,60 @@ mod tests {
         let start32 = [0x83, 0x02];
         let end32 = [0x84, 0x02];
         let record = |parts: &[&[u8]]| in_log_record(&parts.concat());
-        assert!(validate_request(&record(&[&start31, &end31]), root).is_ok());
+        assert!(
+            validate_request(&record(&[&start31, &end31]), root, RepeatedSingular::Refuse).is_ok()
+        );
         let fields: &[u8] = &[
             0x08, 0x05, 0x11, 1, 2, 3, 4, 5, 6, 7, 8, 0x1a, 0x01, 0xff, 0x25, 1, 2, 3, 4,
         ];
-        assert!(validate_request(&record(&[&start31, fields, &end31]), root).is_ok());
         assert!(
-            validate_request(&record(&[&start31, &start32, fields, &end32, &end31]), root).is_ok()
+            validate_request(
+                &record(&[&start31, fields, &end31]),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_request(
+                &record(&[&start31, &start32, fields, &end32, &end31]),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
         );
 
         assert_eq!(
-            problem(validate_request(&record(&[&end31]), root)),
+            problem(validate_request(
+                &record(&[&end31]),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "end group without a start group"
         );
         assert_eq!(
-            problem(validate_request(&record(&[&start31, &end32]), root)),
+            problem(validate_request(
+                &record(&[&start31, &end32]),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "end group does not match its start group"
         );
         assert_eq!(
-            problem(validate_request(&record(&[&start31, fields]), root)),
+            problem(validate_request(
+                &record(&[&start31, fields]),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "group without an end group"
         );
         // Field 1 of a log record (time_unix_nano) as a group.
         assert_eq!(
-            problem(validate_request(&record(&[&[0x0b, 0x0c]]), root)),
+            problem(validate_request(
+                &record(&[&[0x0b, 0x0c]]),
+                root,
+                RepeatedSingular::Refuse
+            )),
             "wrong wire type for a known field"
         );
 
@@ -1550,9 +1681,20 @@ mod tests {
             parts.extend(vec![&end31[..]; levels]);
             record(&parts)
         };
-        assert!(validate_request(&nested(MAX_ANY_VALUE_NESTING_DEPTH), root).is_ok());
+        assert!(
+            validate_request(
+                &nested(MAX_ANY_VALUE_NESTING_DEPTH),
+                root,
+                RepeatedSingular::Refuse
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            validate_request(&nested(MAX_ANY_VALUE_NESTING_DEPTH + 1), root),
+            validate_request(
+                &nested(MAX_ANY_VALUE_NESTING_DEPTH + 1),
+                root,
+                RepeatedSingular::Refuse
+            ),
             Err(Error::OtlpNestingTooDeep { .. })
         ));
     }

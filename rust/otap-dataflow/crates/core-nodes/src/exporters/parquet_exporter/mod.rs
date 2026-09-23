@@ -310,9 +310,9 @@ impl Exporter<OtapPdata> for ParquetExporter {
                     // error for a damaged one, so a truncated request would be
                     // written as an empty or partial batch. Refuse it here,
                     // counted as a failed export, instead.
-                    if let otel_arrow_dfe_pdata::PayloadData::OtlpBytes(bytes) = payload.data()
-                        && let Err(error) = bytes.validate_framing()
-                    {
+                    if let Err(error) = payload.validate_otlp_framing(
+                        otel_arrow_dfe_pdata::views::otlp::bytes::validate::RepeatedSingular::Accept,
+                    ) {
                         if let Some(metrics) = self.pdata_metrics.as_mut() {
                             metrics
                                 .with(SignalOutcomeAttributes {
