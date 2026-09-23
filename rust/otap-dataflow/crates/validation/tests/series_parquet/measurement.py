@@ -1259,10 +1259,20 @@ ROLE_CORES = (("producer", 2), ("store", 1), ("reader", 1))
 # produces, stores and reads its output back, while a stages family sends
 # through the producer for its pipeline baseline and uploads to the store,
 # but runs no reader. The engine reservation is kept whole for both,
-# because both launch the engine binary.
+# because both launch the engine binary. An attribution family runs perf
+# beside the engine, so it gives the profiler a physical core of its own
+# and its producer one: the producer only sends prebuilt bytes. It claims
+# no reader: the oracle reads back only after each engine has stopped,
+# when nothing is being measured.
 CASE_ROLES = {
     "engine": ROLE_CORES,
     "stages": (("producer", 2), ("store", 1)),
+    "attribution": (("producer", 1), ("store", 1), ("profiler", 1)),
+    # A fault case runs the engine in the fault rig's namespace. NGINX,
+    # Toxiproxy and the probes share one physical core of their own; the
+    # oracle reads back only after the engine has stopped, as for an
+    # attribution, so the case fits eight physical cores.
+    "faults": (("producer", 1), ("store", 1), ("fault_tools", 1)),
     # A memory pair writes to the local filesystem, so it runs no store.
     "memory": (("producer", 2), ("reader", 1)),
     # A memory pair on an object store gives up one producer core to it.
@@ -2400,10 +2410,14 @@ class Producer:
     classification and left failed.
     """
 
-    def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight):
+    def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight,
+                 source=None):
         self.channel = channel
         self.ledger = ledger
         self.workload = workload
+        # Where request bytes come from: `build_request` by default, or a
+        # prebuilt input that returns exactly what it would, read by index.
+        self.source = source or (lambda index: build_request(self.workload, index))
         self.cores = set(cores)
         self.timeout_s = timeout_s
         self.max_in_flight = max_in_flight
@@ -2423,7 +2437,7 @@ class Producer:
 
     def send_one(self, index):
         """Send request `index` once and record what happened."""
-        signal, wire, rows = build_request(self.workload, index)
+        signal, wire, rows = self.source(index)
         start = time.monotonic_ns()
         _ = self.ledger.add_request(index, signal, wire, rows, send_ns=start)
         try:
@@ -2670,6 +2684,17 @@ def percentile(values, fraction):
     return ordered[min(rank, len(ordered)) - 1]
 
 
+def build_profile(binary) -> str:
+    """The cargo profile a binary was built with, from its target directory.
+
+    `debug` or `release`, or `custom:<directory>` for anything else. This is
+    the one rule every release check applies; it runs no toolchain, so it is
+    safe to call while a build monitor watches the host.
+    """
+    parent = Path(binary).parent.name
+    return parent if parent in ("debug", "release") else "custom:" + parent
+
+
 def engine_build(binary) -> dict:
     """The engine build a run used: profile, features, allocator, toolchain.
 
@@ -2682,9 +2707,7 @@ def engine_build(binary) -> dict:
     fingerprint.
     """
     binary = Path(binary)
-    profile = binary.parent.name if binary.parent.name in ("debug", "release") else (
-        "custom:" + binary.parent.name
-    )
+    profile = build_profile(binary)
     try:
         toolchain = subprocess.run(
             ["rustc", "--version"], capture_output=True, text=True, timeout=30,
@@ -2888,30 +2911,42 @@ def _clickhouse_record_expression(workload: Workload, signal: str):
 
 
 def _load_actual(ledger: Ledger, cursor_rows):
-    """Stream reader rows into the ledger's `actual` table in batches."""
+    """Stream reader rows into the ledger's `actual` table in batches.
+
+    The load is one transaction. The ledger runs in autocommit mode with
+    full synchronisation, so without it every row would be its own
+    committed transaction with its own fsync: free on a memory file system,
+    minutes per million rows on a disk.
+    """
     connection = ledger.connection
     with ledger.lock:
-        _ = connection.execute("DROP TABLE IF EXISTS actual")
-        _ = connection.execute(
-            "CREATE TABLE actual (record_id TEXT NOT NULL, signal TEXT NOT NULL, "
-            "payload_sha256 TEXT NOT NULL)"
-        )
-        batch = []
-        total = 0
-        for row in cursor_rows:
-            batch.append(row)
-            if len(batch) >= ORACLE_BATCH:
-                _ = connection.executemany(
-                    "INSERT INTO actual VALUES (?, ?, ?)", batch
-                )
+        _ = connection.execute("BEGIN IMMEDIATE")
+        try:
+            _ = connection.execute("DROP TABLE IF EXISTS actual")
+            _ = connection.execute(
+                "CREATE TABLE actual (record_id TEXT NOT NULL, signal TEXT NOT NULL, "
+                "payload_sha256 TEXT NOT NULL)"
+            )
+            batch = []
+            total = 0
+            for row in cursor_rows:
+                batch.append(row)
+                if len(batch) >= ORACLE_BATCH:
+                    _ = connection.executemany(
+                        "INSERT INTO actual VALUES (?, ?, ?)", batch
+                    )
+                    total += len(batch)
+                    batch = []
+            if batch:
+                _ = connection.executemany("INSERT INTO actual VALUES (?, ?, ?)", batch)
                 total += len(batch)
-                batch = []
-        if batch:
-            _ = connection.executemany("INSERT INTO actual VALUES (?, ?, ?)", batch)
-            total += len(batch)
-        _ = connection.execute(
-            "CREATE INDEX actual_by_record ON actual(record_id)"
-        )
+            _ = connection.execute(
+                "CREATE INDEX actual_by_record ON actual(record_id)"
+            )
+            _ = connection.execute("COMMIT")
+        except BaseException:
+            _ = connection.execute("ROLLBACK")
+            raise
     return total
 
 
@@ -3372,6 +3407,17 @@ HOST_PATH = re.compile(
     r"(?=/|$|[\s\"',;])"
     r"(?:/[^\s\"',;:/]+)*/?"
 )
+# A container bind specification, `SOURCE:TARGET[:OPTIONS]`, as `docker run
+# --volume` takes it. Both paths are scrubbed: HOST_PATH alone stops at the
+# first colon, and the target of a bind mounted at its own host path is as
+# much a host path as the source. (`--mount source=...,target=...` needs no
+# rule of its own: each path follows `=`, where HOST_PATH already starts.)
+# A source already reduced to a token (`<host-path>/x`) still matches, so
+# scrubbing stays idempotent over evidence scrubbed by an earlier rule.
+VOLUME_SPEC = re.compile(
+    r"(?<![^\s\"'=,])((?:<[a-z_-]+>)?/[^\s\"',;:]*)((?::/[^\s\"',;:]*)+)(:[A-Za-z,]+)?"
+    r"(?=$|[\s\"',;])"
+)
 # Word characters for the token boundary of a short credential value.
 WORD_CHAR = r"A-Za-z0-9_"
 
@@ -3447,6 +3493,14 @@ def scrub_published(value, *, repo_root=None, home=None):
                 )
         for root, token in roots:
             item = item.replace(root, token)
+
+        def volume(match):
+            """A bind specification with every host path in it reduced."""
+            paths = [match.group(1)] + match.group(2).split(":")[1:]
+            options = match.group(3) or ""
+            return ":".join(HOST_PATH.sub(host_path, path) for path in paths) + options
+
+        item = VOLUME_SPEC.sub(volume, item)
         return HOST_PATH.sub(host_path, item)
 
     def rewrite(item, key=None):

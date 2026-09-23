@@ -4597,6 +4597,7 @@ class MemoryContracts(unittest.TestCase):
     # memory pair claims a producer and a reader but no object store.
     def test_memory_command_and_roles(self):
         self.assertIn("memory", measure.LONG_COMMANDS)
+        self.assertNotIn("memory", measure.PLANNED_COMMANDS)
         self.assertEqual(
             dict(measurement.CASE_ROLES["memory"]), {"producer": 2, "reader": 1}
         )
@@ -4843,6 +4844,1170 @@ class MemoryContracts(unittest.TestCase):
         self.assertEqual(gates, [measurement.STATUS_FAILED, measurement.STATUS_PASSED])
         self.assertFalse(family["family_passes_under_corrected_ledger"])
         self.assertTrue((report / "fam-reagg-t1.json").is_file())
+
+# A stand-in for perf that speaks the control-FIFO protocol a real one does:
+# `record` acknowledges enable and disable, writes its data file when it is
+# interrupted, and `script` prints a fixed two-sample profile. With
+# FAKE_PERF_MODE=refuse, `record` fails the way a host with a restrictive
+# perf_event_paranoid makes it fail.
+FAKE_PERF = r"""
+import os, select, signal, sys
+mode = os.environ.get("FAKE_PERF_MODE", "record")
+arguments = sys.argv[1:]
+if arguments[:1] == ["--version"]:
+    print("perf version fake")
+    sys.exit(0)
+if arguments[:1] == ["script"]:
+    print("df_engine  101 [003]  10.000001:    5000000 cpu-clock:u: ")
+    print("\t    55d0a1 otel_arrow_dfe_series_lake::extract::logs::extract_logs+0x12 (/bin/df_engine)")
+    print("\t    55d0a0 main (/bin/df_engine)")
+    print("")
+    print("df_engine  101 [003]  10.005001:    5000000 cpu-clock:u: ")
+    print("\t    55d0b1 parquet::arrow::arrow_writer::ArrowWriter::write+0x9 (/bin/df_engine)")
+    print("\t    55d0b0 main (/bin/df_engine)")
+    print("")
+    sys.exit(0)
+if mode == "refuse":
+    sys.stderr.write("Error:\nAccess to performance monitoring and observability "
+                     "operations is limited.\nperf_event_paranoid setting is 4:\n")
+    sys.exit(255)
+output = arguments[arguments.index("-o") + 1]
+ctl, ack = arguments[arguments.index("--control") + 1].split(":", 1)[1].split(",")
+stop = []
+signal.signal(signal.SIGINT, lambda *_: stop.append(True))
+ctl_fd = os.open(ctl, os.O_RDONLY | os.O_NONBLOCK)
+ack_fd = os.open(ack, os.O_WRONLY)
+pending = b""
+while not stop:
+    ready, _, _ = select.select([ctl_fd], [], [], 0.05)
+    if not ready:
+        continue
+    try:
+        pending += os.read(ctl_fd, 64)
+    except BlockingIOError:
+        continue
+    while b"\n" in pending:
+        line, pending = pending.split(b"\n", 1)
+        if line in (b"enable", b"disable"):
+            os.write(ack_fd, b"ack\n")
+with open(output, "w") as handle:
+    handle.write("fake")
+sys.exit(0)
+"""
+
+
+def fake_perf(case) -> str:
+    """An executable stand-in for perf in a directory of this test's own."""
+    path = temporary_directory(case) / "perf"
+    path.write_text(f"#!{sys.executable}\n{FAKE_PERF}", encoding="ascii")
+    path.chmod(0o755)
+    return str(path)
+
+
+# The shape of a `perf script -F comm,tid,cpu,time,period,event,ip,sym,dso`
+# profile: two samples, innermost frame first, one of them through the
+# kernel, and one line that is neither a header nor a frame.
+PERF_SCRIPT_TEXT = """\
+pipeline-defaul  4242 [001] 12345.000100:    5025125 cpu-clock:
+\tffffffff9a2b1c00 copy_user_enhanced_fast_string+0x10 ([kernel.kallsyms])
+\t    55d0c3a1b2c4 <object_store::aws::client::S3Client>::put_part::{{closure}}+0x44 (/tmp/df_engine)
+\t    55d0c3a1b000 <otel_arrow_dfe_series_lake::sink::Sink>::write_block::<T>::{{closure}}+0x1f (/tmp/df_engine)
+\t    55d0c3a10000 tokio::runtime::task::raw::poll+0x3 (/tmp/df_engine)
+
+pipeline-defaul  4242 [001] 12345.005100:    4999875 cpu-clock:
+\t    55d0c3a2a000 _rjem_malloc+0x5 (/tmp/df_engine)
+\t    55d0c3a29000 otel_arrow_dfe_series_lake::extract::logs::extract_logs+0x800 (/tmp/df_engine)
+\t    55d0c3a28000 [unknown] ([unknown])
+
+this line is neither
+"""
+
+
+class AttributionContracts(unittest.TestCase):
+    """Direct CPU attribution of the real engine and its reconciliation."""
+
+    # Scenario: extraction, encoding and upload have distinct CPU stacks and durations.
+    # Guarantees: overlapping async wall intervals cannot inflate CPU percentages.
+    def test_cpu_attribution_is_exclusive(self):
+        samples = [
+            {"frames": ["Worker::extract", "extract::logs::extract"], "weight": 7},
+            {"frames": ["Sink::write_block", "parquet::arrow::arrow_writer"], "weight": 5},
+            {"frames": ["Sink::write_block", "object_store::client::http"], "weight": 2},
+        ]
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(cpu["extraction"], 7)
+        self.assertEqual(cpu["encoding"], 5)
+        self.assertEqual(cpu["upload"], 2)
+        self.assertEqual(sum(cpu.values()), 14)
+
+    # Scenario: stacks as the release engine produces them -- the allocator
+    # under extraction, Tokio and hyper frames under an object store call,
+    # an Arrow kernel under the merge, a bare scheduler stack, and a stack
+    # of frames no rule knows.
+    # Guarantees: the innermost production frame decides, a runtime frame
+    # never takes a production sample, the runtime fallback still claims
+    # the scheduler's own work, unmatched samples stay unknown, and the
+    # allocator's callers are named.
+    def test_the_innermost_production_frame_decides(self):
+        lake = "otel_arrow_dfe_series_lake"
+        stacks = {
+            "allocator": [
+                "tokio::runtime::task::raw::poll",
+                f"{lake}::extract::logs::extract_logs",
+                "alloc::vec::Vec<T>::push",
+                "<tikv_jemallocator::Jemalloc as core::alloc::global::GlobalAlloc>::alloc",
+                "_rjem_je_malloc_default",
+            ],
+            "upload": [
+                f"<{lake}::sink::Sink>::write_block::{{{{closure}}}}",
+                "<object_store::buffered::BufWriter as tokio::io::AsyncWrite>::poll_write",
+                "hyper::proto::h1::dispatch::Dispatcher::poll",
+                "tokio::net::tcp::stream::TcpStream::poll_write",
+                "__libc_send",
+            ],
+            "sort_seal_merge": [
+                f"<{lake}::sink::Sink>::write_table::{{{{closure}}}}",
+                f"<{lake}::sort::MergeIter as core::iter::traits::iterator::Iterator>::next",
+                "arrow_select::interleave::interleave",
+                "__memmove_avx_unaligned_erms",
+            ],
+            "encoding": [
+                f"<{lake}::sink::Sink>::write_table::{{{{closure}}}}",
+                "parquet::arrow::arrow_writer::ArrowWriter<W>::write",
+                "ZSTD_compressBlock_doubleFast",
+            ],
+            "conversion": [
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::extract",
+                "<otel_arrow_dfe_pdata::otap::OtapArrowRecords as otel_arrow_dfe_pdata::payload::TryFromWithOptions<otel_arrow_dfe_pdata::OtlpProtoBytes>>::try_from_with_options",
+                "otel_arrow_dfe_pdata::encode::encode_logs_otap_batch",
+                "arrow_array::builder::GenericByteBuilder<T>::append_value",
+            ],
+            "buffer": [
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::offer",
+                f"<{lake}::buffer::Block<T>>::admit",
+                f"{lake}::cache::SeriesCache::is_committed",
+            ],
+            "engine_runtime": [
+                "std::sys::pal::unix::thread::Thread::new::thread_start",
+                "tokio::runtime::scheduler::current_thread::CurrentThread::block_on",
+                "mio::poll::Poll::poll",
+                "epoll_wait",
+            ],
+            "unknown": ["[unknown]", "__memmove_avx_unaligned_erms"],
+        }
+        samples = [
+            {"frames": frames, "weight": 3} for frames in stacks.values()
+        ]
+        for category, frames in stacks.items():
+            with self.subTest(category=category):
+                self.assertEqual(performance.classify_frames(frames)[0], category)
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(sum(cpu.values()), 3 * len(stacks))
+        self.assertEqual(set(cpu), set(performance.CPU_CATEGORIES))
+        callers = performance.allocator_callers(samples)
+        self.assertEqual(callers["extraction"], 3)
+        self.assertEqual(sum(callers.values()), cpu["allocator"])
+
+    # Scenario: a sample with a zero, negative, fractional or boolean weight,
+    # or without a list of frames.
+    # Guarantees: it is refused rather than added, and an empty stack is an
+    # unknown sample, not an error.
+    def test_invalid_samples_are_refused(self):
+        for weight in (0, -1, 1.5, True, None):
+            with self.subTest(weight=weight):
+                with self.assertRaises(ValueError):
+                    _ = performance.classify_cpu([{"frames": ["main"], "weight": weight}])
+        with self.assertRaises(ValueError):
+            _ = performance.classify_cpu([{"frames": "main", "weight": 1}])
+        self.assertEqual(
+            performance.classify_cpu([{"frames": [], "weight": 4}])["unknown"], 4
+        )
+
+    # Scenario: demangled Rust symbols with offsets, legacy hashes, generic
+    # arguments, turbofish, trait impls and nested qualified paths.
+    # Guarantees: each reduces to the implementing type's module path, which
+    # is what a rule prefix matches.
+    def test_frame_paths_drop_rust_symbol_syntax(self):
+        cases = {
+            "<otel_arrow_dfe_series_lake::sink::Sink>::write_block::<u8>::{{closure}}+0x1f":
+                "otel_arrow_dfe_series_lake::sink::Sink::write_block::{{closure}}",
+            "otel_arrow_dfe_series_lake::extract::metrics::extract_metrics::h0123456789abcdef":
+                "otel_arrow_dfe_series_lake::extract::metrics::extract_metrics",
+            "<alloc::vec::Vec<T,A> as core::ops::drop::Drop>::drop":
+                "alloc::vec::Vec::drop",
+            "<&mut F as core::ops::function::FnOnce<A>>::call_once": "F::call_once",
+            "<<tokio::runtime::task::Task<S> as X>::Output as Y>::poll":
+                "tokio::runtime::task::Task::Output::poll",
+            "<[otel_arrow_dfe_series_lake::value::Value] as Z>::to_vec":
+                "otel_arrow_dfe_series_lake::value::Value]::to_vec",
+            # Rust's v0 mangling, as c++filt demangles it, with crate
+            # disambiguators and const generics.
+            "<otel_arrow_dfe_core_nodes[ac52c27a24eadf66]::exporters::series_parquet_exporter"
+            "::worker::Worker>::admit":
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::admit",
+            "arrow_ord[4b22431ba0740f66]::ord::compare_impl::<false: bool, false: bool>"
+            "::{closure#0}": "arrow_ord::ord::compare_impl::{closure#0}",
+        }
+        for symbol, path in cases.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(performance.frame_path(symbol), path)
+        self.assertEqual(
+            performance.classify_frame(
+                "<[otel_arrow_dfe_series_lake::value::Value] as Z>::to_vec", 1
+            ),
+            "extraction",
+        )
+        self.assertEqual(
+            performance.classify_frame("__rustc[100742bb89c490cb]::__rust_alloc", 1),
+            "allocator",
+        )
+
+    # Scenario: three ELF files: one linked the way lld links the engine by
+    # default, with the executable segment 4 KiB above its file offset, one
+    # relinked with page-aligned segments, and one where every segment shares
+    # one base.
+    # Guarantees: only a binary whose executable segments share the first
+    # segment's base is accepted, since perf's unwinder places the module
+    # there; the refusal names the relink command, and the preflight
+    # refuses such an engine before recording anything.
+    def test_an_engine_perf_cannot_unwind_is_refused(self):
+        def elf(path, segments):
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            struct.pack_into("<Q", header, 32, 64)
+            struct.pack_into("<HH", header, 54, 56, len(segments))
+            table = b"".join(
+                struct.pack("<IIQQQQQQ", 1, flags, offset, vaddr, vaddr, 0, 0, 0x1000)
+                for offset, vaddr, flags in segments
+            )
+            path.write_bytes(bytes(header) + table)
+            return path
+
+        root = temporary_directory(self)
+        lld = elf(root / "lld", [(0, 0, 4), (0x1ca7d40, 0x1ca8d40, 5)])
+        relinked = elf(root / "relinked", [(0, 0, 4), (0x1ca8000, 0x1ca8000, 5)])
+        fixed = elf(root / "fixed", [(0, 0x400000, 4), (0x20000, 0x420000, 5)])
+        refused = performance.unwind_layout(lld)
+        self.assertFalse(refused["compatible"])
+        self.assertIn("separate-loadable-segments", refused["build"])
+        self.assertTrue(performance.unwind_layout(relinked)["compatible"])
+        self.assertTrue(performance.unwind_layout(fixed)["compatible"])
+        facts = performance.perf_preflight(
+            temporary_directory(self), perf=fake_perf(self), engine=lld
+        )
+        self.assertFalse(facts["attached"])
+        self.assertIn("relink", facts["reason"])
+
+    # Scenario: the text `perf script` prints for two samples, one through
+    # the kernel, followed by a stray line.
+    # Guarantees: frames come out outermost first with their period as the
+    # weight, the kernel sample is marked, and the stray line is counted,
+    # never silently dropped.
+    def test_perf_script_is_parsed_outermost_first(self):
+        parsed = performance.parse_perf_script(PERF_SCRIPT_TEXT)
+        samples = parsed["samples"]
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(parsed["unparsed_lines_count"], 1)
+        first, second = samples
+        self.assertEqual(first["weight"], 5025125)
+        self.assertEqual((first["comm"], first["tid"], first["cpu"]), ("pipeline-defaul", 4242, 1))
+        self.assertEqual(first["frames"][0], "tokio::runtime::task::raw::poll+0x3")
+        self.assertEqual(first["frames"][-1], "copy_user_enhanced_fast_string+0x10")
+        self.assertTrue(first["kernel"])
+        self.assertFalse(second["kernel"])
+        self.assertEqual(performance.classify_frames(first["frames"])[0], "upload")
+        self.assertEqual(performance.classify_frames(second["frames"])[0], "allocator")
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(cpu["upload"] + cpu["allocator"], 5025125 + 4999875)
+
+    # Scenario: a profile of ten samples, three of them unknown, one inside
+    # the flush task.
+    # Guarantees: shares are by weight and add up to one, each has the
+    # binomial interval of its sample count, CPU seconds are split by
+    # logical CPU and thread, and the unknown share is named by its leaf.
+    def test_profile_summary_states_shares_intervals_and_the_residual(self):
+        flush = "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::flush::write_until::{{closure}}"
+        samples = (
+            [{"frames": ["otel_arrow_dfe_series_lake::extract::extract"], "weight": 10,
+              "cpu": 1, "comm": "worker"}] * 6
+            + [{"frames": [flush, "parquet::file::writer::write"], "weight": 10,
+                "cpu": 2, "comm": "worker"}]
+            + [{"frames": ["__memcpy_evex"], "weight": 10, "cpu": 1, "comm": "other"}] * 3
+        )
+        summary = performance.profile_summary(samples)
+        categories = summary["categories"]
+        self.assertAlmostEqual(sum(entry["share_ratio"] for entry in categories.values()), 1.0)
+        self.assertAlmostEqual(categories["extraction"]["share_ratio"], 0.6)
+        self.assertAlmostEqual(
+            categories["extraction"]["share_ci95_ratio"], 1.96 * (0.6 * 0.4 / 10) ** 0.5
+        )
+        self.assertEqual(summary["classified_samples_count"], 7)
+        self.assertEqual(summary["flush_task_weight"], 10)
+        self.assertEqual(summary["cpu_s_by_logical_cpu"], {"1": 90e-9, "2": 10e-9})
+        self.assertEqual(summary["named_residual"][0]["symbol"], "__memcpy_evex")
+
+    # Scenario: the rules are recorded with a result.
+    # Guarantees: every category is named, every rule states its pass, its
+    # pattern and why, and the decision procedure is written down.
+    def test_the_mapping_rules_are_retained(self):
+        rules = performance.classification_rules()
+        self.assertEqual(rules["categories"], list(performance.CPU_CATEGORIES))
+        self.assertIn("innermost", rules["decision"])
+        self.assertTrue(all({"pass", "category", "pattern", "why"} <= set(rule)
+                            for rule in rules["rules"]))
+        named = {rule["category"] for rule in rules["rules"]}
+        self.assertEqual(named, set(performance.CPU_CATEGORIES) - {"unknown"})
+
+    # Scenario: a logs and a metrics workload are prebuilt, and the logs one
+    # is asked for again.
+    # Guarantees: every request read back is byte for byte what
+    # `build_request` returns, records included, and an identical input is
+    # reused rather than rebuilt.
+    def test_prebuilt_requests_are_the_built_requests(self):
+        root = temporary_directory(self)
+        for signal_name, workload in (
+            ("logs", Workload(requests=7, records_per_request=5, body_bytes=64,
+                              series=3, metrics_every=4)),
+            ("metrics", Workload(requests=4, records_per_request=9, series=5,
+                                 metrics_every=1)),
+        ):
+            prebuilt = performance.PrebuiltRequests.build(
+                workload, signal_name, root / signal_name, processes=0
+            )
+            self.addCleanup(prebuilt.close)
+            self.assertEqual(
+                prebuilt.indexes, performance.request_indexes(workload, signal_name)
+            )
+            for index in prebuilt.indexes:
+                self.assertEqual(prebuilt.request(index), build_request(workload, index))
+            self.assertEqual(
+                prebuilt.sidecar["records"],
+                len(prebuilt.indexes) * workload.records_per_request,
+            )
+        logs = Workload(requests=7, records_per_request=5, body_bytes=64, series=3,
+                        metrics_every=4)
+        before = (root / "logs" / "sidecar.json").read_text(encoding="ascii")
+        again = performance.PrebuiltRequests.build(logs, "logs", root / "logs", processes=0)
+        self.addCleanup(again.close)
+        self.assertEqual((root / "logs" / "sidecar.json").read_text(encoding="ascii"), before)
+
+    # Scenario: the logs workload is sized for a profile at 5 us of engine
+    # CPU per record over three repetitions.
+    # Guarantees: the stage family's shape is kept, the logs requests are a
+    # whole number of blocks carrying enough records for the sample target
+    # with its margin, and the total is the smallest that carries them.
+    def test_the_profile_is_sized_for_the_sample_target(self):
+        workload = performance.attribution_workload(
+            "logs-1k-stable", 5000.0, repetitions=3
+        )
+        base = performance.WORKLOAD_CONFIGS["logs-1k-stable"]["workload"]
+        for field in ("records_per_request", "body_bytes", "series", "metrics_every", "seed"):
+            self.assertEqual(getattr(workload, field), getattr(base, field))
+        logs = performance.signal_request_count(workload, "logs")
+        self.assertEqual(logs % performance.ATTRIBUTION_BLOCK_REQUESTS, 0)
+        self.assertEqual(logs, len(performance.request_indexes(workload, "logs")))
+        cpu_s = logs * workload.records_per_request * 5000.0 / 1e9
+        expected = cpu_s * performance.PERF_FREQUENCY_HZ * 3
+        self.assertGreaterEqual(
+            expected,
+            performance.ATTRIBUTION_MINIMUM_SAMPLES * performance.ATTRIBUTION_SAMPLE_MARGIN,
+        )
+        shorter = measurement.dataclasses.replace(workload, requests=workload.requests - 1)
+        self.assertLess(performance.signal_request_count(shorter, "logs"), logs)
+        with self.assertRaisesRegex(AssertionError, "positive reference"):
+            _ = performance.attribution_workload("metrics-mixed", 0, repetitions=3)
+
+    # Scenario: a profiled and a control lifetime take their requests from
+    # one prebuilt input of 1,000 blocks, and from one of a single block.
+    # Guarantees: the profiled lifetime sends everything, the control sends
+    # the first third in whole blocks, and never less than one block.
+    def test_the_control_lifetime_sends_a_whole_block_prefix(self):
+        block = performance.ATTRIBUTION_BLOCK_REQUESTS
+        indexes = list(range(1000 * block))
+        self.assertEqual(performance.lifetime_indexes(indexes, profiled=True), indexes)
+        control = performance.lifetime_indexes(indexes, profiled=False)
+        self.assertEqual(control, indexes[: 333 * block])
+        self.assertEqual(len(control) % block, 0)
+        single = list(range(block))
+        self.assertEqual(performance.lifetime_indexes(single, profiled=False), single)
+
+    # Scenario: the campaign's pin, physical cores 0-7 with their SMT
+    # siblings, is offered to an attribution family.
+    # Guarantees: the observability core, the engine's four-core
+    # reservation, the producer, the store and the profiler each own a
+    # physical core, eight in all, and no reader is claimed; the read-back
+    # after an engine stops uses only that engine's cores and siblings.
+    def test_the_attribution_roles_fit_the_campaign_pin(self):
+        groups = [[core, core + 16] for core in range(16)]
+        pinned = list(range(8)) + list(range(16, 24))
+        allocation = measurement.role_allocation(
+            groups, pinned, [1], roles=measurement.CASE_ROLES["attribution"]
+        )
+        self.assertEqual(
+            allocation,
+            {
+                "engine_observability": [0],
+                "engine": [1],
+                "engine_reserved": [2, 3, 4],
+                "producer": [5],
+                "store": [6],
+                "profiler": [7],
+            },
+        )
+        with mock.patch.object(os, "sched_getaffinity", return_value=set(pinned)):
+            self.assertEqual(
+                performance.oracle_cores(allocation, groups),
+                [1, 2, 3, 4, 17, 18, 19, 20],
+            )
+
+    # Scenario: a lifetime's ledger is written under the plan's ledger
+    # directory, with its journal, and then retired.
+    # Guarantees: each repetition's ledgers are kept apart by run id, and
+    # retiring one records its name, hash and size before the file and its
+    # journal are deleted.
+    def test_a_retired_ledger_keeps_its_identity(self):
+        root = temporary_directory(self)
+        plan = {"ledger_dir": str(root / "ledgers")}
+        path = performance.ledger_path(plan, root / "attribution-x-r001", "control")
+        self.assertEqual(path.parent, root / "ledgers" / "attribution-x-r001")
+        ledger = Ledger(path)
+        _ = ledger.add_request(1, "logs", b"wire", [("id", "log", "h")], send_ns=1)
+        ledger.close()
+        digest = measurement.file_digest(path)
+        entry = performance.retire_ledger(path)
+        self.assertEqual((entry["name"], entry["sha256"]), ("ledger-control.sqlite", digest))
+        self.assertEqual(entry["retention"], "deleted")
+        self.assertFalse(list(path.parent.iterdir()))
+
+    # Scenario: two telemetry documents of one worker, before and after a
+    # window with two flushes, the admin API serving the flush instrument
+    # cumulatively.
+    # Guarantees: the window's flushes are the difference of the readings,
+    # a worker with no flush yet reads as none, and a reading that goes
+    # backwards is an error, never a negative wall time.
+    def test_flush_wall_time_is_a_difference_of_cumulative_readings(self):
+        def document(sum_s, count, max_s):
+            built = telemetry(5)
+            if count is not None:
+                built["metric_sets"][1]["metrics"].append(
+                    {"name": "flush.duration",
+                     "value": {"min": 0.1, "max": max_s, "sum": sum_s, "count": count}}
+                )
+            return built
+
+        before = performance.flush_reading(document(0.0, None, 0.0))
+        self.assertEqual(before["count"], 0)
+        middle = performance.flush_reading(document(0.5, 1, 0.5))
+        after = performance.flush_reading(document(1.25, 3, 0.5))
+        window = performance.flush_window(middle, after)
+        self.assertEqual(window["flush_count"], 2)
+        self.assertAlmostEqual(window["flush_wall_s"], 0.75)
+        with self.assertRaisesRegex(AssertionError, "backwards"):
+            _ = performance.flush_window(after, middle)
+
+    # Scenario: a worker thread and a helper thread over a two-second window,
+    # and a thread that started inside it.
+    # Guarantees: the worker's window splits into on-CPU, run-queue and
+    # off-CPU fractions that add up to one, and every thread is listed with
+    # its role.
+    def test_thread_schedule_splits_the_window(self):
+        before = {
+            10: {"comm": "pipeline-defaul", "on_cpu_ns": 1_000, "runqueue_wait_ns": 0,
+                 "timeslices_count": 1},
+            11: {"comm": "tokio-rt", "on_cpu_ns": 0, "runqueue_wait_ns": 0,
+                 "timeslices_count": 0},
+        }
+        after = {
+            10: {"comm": "pipeline-defaul", "on_cpu_ns": 1_000 + 1_200_000_000,
+                 "runqueue_wait_ns": 200_000_000, "timeslices_count": 9},
+            11: {"comm": "tokio-rt", "on_cpu_ns": 100_000_000, "runqueue_wait_ns": 0,
+                 "timeslices_count": 2},
+            12: {"comm": "new", "on_cpu_ns": 5, "runqueue_wait_ns": 0,
+                 "timeslices_count": 1},
+        }
+        schedule = performance.thread_schedule(before, after, 2_000_000_000, {10})
+        worker = schedule["workers"]["10"]
+        self.assertAlmostEqual(worker["on_cpu_ratio"], 0.6)
+        self.assertAlmostEqual(worker["runqueue_wait_ratio"], 0.1)
+        self.assertAlmostEqual(worker["off_cpu_ratio"], 0.3)
+        roles = {thread["tid"]: thread["role"] for thread in schedule["threads"]}
+        self.assertEqual(roles, {10: "worker", 11: "other", 12: "other"})
+        self.assertTrue(schedule["threads"][2]["started_in_window"])
+
+    # Scenario: the preflight profiles a busy process through a stand-in
+    # perf that speaks the control-FIFO protocol, and again through one
+    # that refuses the way perf_event_paranoid 4 makes perf refuse.
+    # Guarantees: the preflight passes only when perf attached,
+    # acknowledged enable and disable and produced an unwound sample; a
+    # refusal is reported with perf's own words, and nothing is left
+    # running either way.
+    def test_the_preflight_proves_the_recording_or_names_the_refusal(self):
+        perf = fake_perf(self)
+        attached = performance.perf_preflight(temporary_directory(self), perf=perf)
+        self.assertTrue(attached["attached"], attached)
+        recording = temporary_directory(self)
+        recorder = performance.PerfRecorder(recording, perf=perf)
+        recorder.argv = performance.perf_record_argv(
+            perf, 1, recording / "perf.data", recording / "perf.ctl", recording / "perf.ack"
+        )
+        self.assertNotIn(str(recording), json.dumps(recorder.as_json()))
+        self.assertIn(
+            f"fifo:{performance.PERF_DIR_TOKEN}/perf.ctl,{performance.PERF_DIR_TOKEN}/perf.ack",
+            recorder.as_json()["argv"],
+        )
+        self.assertEqual(attached["unwound_samples_count"], 2)
+        self.assertEqual(attached["record_returncode"], 0)
+        with mock.patch.dict(os.environ, {"FAKE_PERF_MODE": "refuse"}):
+            refused = performance.perf_preflight(temporary_directory(self), perf=perf)
+        self.assertFalse(refused["attached"])
+        self.assertIn("perf exited with 255", refused["reason"])
+        self.assertIn("perf_event_paranoid", refused["perf_log_tail"])
+        missing = performance.perf_preflight(
+            temporary_directory(self), perf="/no/such/perf"
+        )
+        self.assertFalse(missing["attached"])
+        self.assertIn("no perf executable", missing["reason"])
+
+    # Scenario: the attribution command runs on a host where perf cannot
+    # attach.
+    # Guarantees: nothing is built, no store is started and no repetition
+    # runs; the published index is skipped with a failed perf_attached
+    # check, the preflight's evidence and acceptance marked incomplete, and
+    # the command exits with the skipped status, not success.
+    def test_a_host_that_cannot_profile_publishes_an_incomplete_index(self):
+        report = temporary_directory(self)
+        output = temporary_directory(self)
+        refusal = {"attached": False, "perf_event_paranoid": 4,
+                   "reason": "perf exited with 255 before acknowledging enable"}
+        allocation = {"engine_observability": [0], "engine": [1],
+                      "engine_reserved": [2, 3, 4], "producer": [5], "store": [6],
+                      "profiler": [7]}
+        engines = {"valid": True, "problems": []}
+        with mock.patch.object(performance, "perf_preflight", return_value=refusal), \
+                mock.patch.object(performance, "prepare_profiled_engine",
+                                  return_value=engines), \
+                mock.patch.object(measurement, "role_allocation", return_value=allocation), \
+                mock.patch.object(measure, "prepare_build",
+                                  side_effect=AssertionError("must not build")), \
+                mock.patch.object(measurement.test_e2e, "DockerStore",
+                                  side_effect=AssertionError("must not start a store")), \
+                mock.patch.dict(os.environ, {"SERIES_MEASURE_LONG": "1"}):
+            code = measure.main([
+                "attribution", "--output-dir", str(output),
+                "--option", f"report_dir={report}", "--option", "cores=[1]",
+            ])
+        self.assertEqual(code, measure.ATTRIBUTION_SKIPPED_EXIT)
+        index = json.loads((report / "attribution.json").read_text(encoding="ascii"))
+        self.assertEqual(index["status"], measurement.STATUS_SKIPPED)
+        self.assertEqual(index["acceptance"]["mandatory"], "incomplete")
+        self.assertEqual(index["preflight"]["perf_event_paranoid"], 4)
+        self.assertEqual(
+            index["environment"]["perf_event_paranoid"], performance.perf_event_paranoid()
+        )
+        checks = {entry["name"]: entry for entry in index["checks"]}
+        self.assertEqual(checks["perf_attached"]["status"], measurement.STATUS_FAILED)
+        self.assertEqual(index["run_files"], [])
+        self.assertEqual(index["metrics"]["children_count"], 0)
+        self.assertEqual(index["classification"]["categories"],
+                         list(performance.CPU_CATEGORIES))
+
+    def evidence(self, *, verified=True, spot_extract=800.0, pinned_extract=1400.0):
+        """Two stage families as the reconciliation reads them."""
+        def summary(cost):
+            return {
+                "metrics": dict({name: 1.0 for name in performance.STAGE_METRICS},
+                                cpu_ns_per_record=cost,
+                                output_bytes_per_input_record=100.0),
+                "input_representation": "otlp_wire_bytes",
+                "output_representation": "otap_arrow_records",
+                "denominator": performance.DENOMINATOR,
+                "repetitions": 3,
+            }
+
+        config = "metrics-mixed"
+        costs = {"convert": 500.0, "extract": pinned_extract, "sort_seal": 350.0,
+                 "merge": 100.0, "encode": 220.0, "upload": 15.0,
+                 "otlp_noop": 300.0, "otlp_minio": 3000.0}
+        modes = {"upload": "async", "otlp_minio": "async", "otlp_noop": "pipeline"}
+        pinned = {
+            f"{stage}/{modes.get(stage, 'isolated')}/{config}": summary(cost)
+            for stage, cost in costs.items()
+        }
+        spot = {f"extract/isolated/{config}": summary(spot_extract)}
+        return {
+            "pinned": {"index": "stages.json", "present": True, "verified": verified,
+                       "expected_sha256": "a" * 64, "file": {"sha256": "b" * 64},
+                       "summaries": pinned},
+            "spot": {"index": "stages-spot.json", "present": True, "verified": True,
+                     "git": {"revision": "r1"}, "summaries": spot},
+        }
+
+    def aggregate(self):
+        """One workload's aggregate as reconciliation reads it."""
+        categories = {name: {"share_ratio": 0.0} for name in performance.CPU_CATEGORIES}
+        categories["extraction"]["share_ratio"] = 0.25
+        return {
+            "workload_config_id": "metrics-mixed",
+            "environment": {"git": {"revision": "r1"}},
+            "metrics": dict(
+                {f"{name}_cpu_ns_per_record": 0.0 for name in performance.CPU_CATEGORIES},
+                engine_cpu_ns_per_record=3200.0,
+                extraction_cpu_ns_per_record=800.0,
+                upload_wait_s=4.0,
+                flush_wall_s=6.0,
+            ),
+            "checks": [
+                measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+                for name in performance.BINDING_RECONCILIATION_CHECKS
+            ],
+            "observations": {
+                "pooled_profile": {
+                    "categories": categories,
+                    "allocator_callers_share_ratio": {"extraction": 0.025},
+                },
+                "stage_agreement": {"repetitions": [
+                    {"error_ratio": 0.003, "unexplained_ratio": 0.005}
+                ]},
+            },
+        }
+
+    # Scenario: a metrics workload whose binding checks all passed is joined
+    # with the pinned family, whose extraction cost is far from the engine's,
+    # and with a later spot family that re-measured extraction.
+    # Guarantees: the reconciliation is valid on the binding rule alone; the
+    # stage comparison is labelled descriptive and uses the pinned family as
+    # its reference, never the spot family in its place; the allocator
+    # samples a stage caused are added back before comparing; an
+    # out-of-band row is explained only by the published spot measurement
+    # bringing it into the band, and otherwise says it is unexplained; and
+    # no byte rate is added across stages.
+    def test_reconciliation_joins_stage_evidence_by_workload(self):
+        reconciliation = performance.reconcile_attribution(
+            [self.aggregate()], self.evidence(pinned_extract=2000.0)
+        )
+        self.assertTrue(reconciliation["valid"], reconciliation["problems"])
+        self.assertIn("10%", reconciliation["binding_rule"])
+        self.assertFalse(reconciliation["descriptive_stage_comparison"]["gating"])
+        self.assertTrue(reconciliation["spot_revision_matches"])
+        workload = reconciliation["workloads"]["metrics-mixed"]
+        self.assertTrue(all(workload["binding"]["checks"].values()))
+        rows = {row["row"]: row for row in workload["descriptive_stage_comparison"]}
+        extraction = rows["extraction"]
+        self.assertEqual(extraction["stages"][0]["reference"], "pinned")
+        self.assertEqual(extraction["reference_cpu_ns_per_record"], 2000.0)
+        self.assertEqual(extraction["supplementary_spot_cpu_ns_per_record"], 800.0)
+        self.assertAlmostEqual(
+            extraction["attributed_with_allocator_cpu_ns_per_record"], 800.0 + 0.025 * 3200.0
+        )
+        self.assertEqual(extraction["verdict"], "outside_band")
+        self.assertEqual(extraction["explanation"]["status"], "explained")
+        self.assertEqual(extraction["explanation"]["evidence"]["index"], "stages-spot.json")
+        conversion = rows["conversion"]
+        self.assertEqual(conversion["verdict"], "outside_band")
+        self.assertEqual(conversion["explanation"]["status"], "unexplained")
+        total = rows["total"]
+        self.assertEqual(total["reference_cpu_ns_per_record"], 3300.0)
+        self.assertEqual(total["verdict"], "within_band")
+        self.assertIsNone(total["explanation"])
+        for row in rows.values():
+            self.assertFalse([key for key in row if "bytes" in key])
+            for stage in row["stages"]:
+                self.assertIn("output_representation", stage)
+
+    # Scenario: the pinned family on disk no longer has the recorded hash,
+    # a joined stage is missing from it, and the aggregate passed none of
+    # the binding checks.
+    # Guarantees: each makes the reconciliation invalid and names why.
+    def test_an_unverified_or_incomplete_reconciliation_is_invalid(self):
+        evidence = self.evidence(verified=False)
+        del evidence["pinned"]["summaries"]["merge/isolated/metrics-mixed"]
+        aggregate = self.aggregate()
+        aggregate["checks"] = []
+        reconciliation = performance.reconcile_attribution([aggregate], evidence)
+        self.assertFalse(reconciliation["valid"])
+        problems = " ".join(reconciliation["problems"])
+        self.assertIn("hashes to", problems)
+        self.assertIn("merge/isolated/metrics-mixed", problems)
+        self.assertIn("binding checks not passed", problems)
+        for name in performance.BINDING_RECONCILIATION_CHECKS:
+            self.assertIn(name, problems)
+
+    def child(self, repetition, classified, cpu=3000.0):
+        """One profiled repetition that passed every gate."""
+        metrics = dict(
+            {f"{name}_cpu_ns_per_record": cpu / 10 for name in performance.CPU_CATEGORIES},
+            engine_cpu_ns_per_record=cpu,
+            control_engine_cpu_ns_per_record=cpu * 0.98,
+            throughput_records_per_s=1e5,
+            control_throughput_records_per_s=1.02e5,
+            classified_samples_count=classified,
+            flush_wall_s=5.0,
+            upload_wait_s=2.0,
+            peak_rss_bytes=1e8,
+        )
+        categories = {name: {"weight": 10, "samples_count": classified // 8,
+                             "share_ratio": 0.1, "share_ci95_ratio": 0.01}
+                      for name in performance.CPU_CATEGORIES}
+        categories["unknown"]["samples_count"] = 0
+        checks = passed_hard_checks() + [
+            measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+            for name in ("perf_recorded", "stage_agreement_error",
+                         "attribution_exclusive", "stage_agreement_unexplained")
+        ]
+        return measured_result(
+            run_id=f"attribution-metrics-mixed-strict-minio-c1-w15-r{repetition:03d}",
+            case="attribution",
+            metrics=metrics,
+            metric_directions={
+                name: performance.ATTRIBUTION_METRIC_DIRECTIONS[name] for name in metrics
+            },
+            checks=checks,
+            repetition=repetition,
+            workload_config_id="metrics-mixed",
+            observations={
+                "attribution": {"categories": categories,
+                                "allocator_callers": {"extraction": 5},
+                                "named_residual": [{"symbol": "x", "weight": 1}]},
+                "profile_overhead": {"cpu_per_record_ratio": 0.02},
+            },
+        )
+
+    # Scenario: three profiled repetitions of one workload carry 12,000
+    # classified samples in all, and three others carry 6,000.
+    # Guarantees: the aggregate takes the medians, pools the profile, and
+    # passes the sample gate only with 10,000 or more; a first valid
+    # aggregate creates its baseline, and a short one never does.
+    def test_the_family_needs_ten_thousand_classified_samples(self):
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 10_000,
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": True, "file": {"sha256": "a"},
+                                        "expected_sha256": "a"}}}
+
+        def written(children, directory):
+            """The children, each also written where the aggregate hashes it."""
+            for child in children:
+                _ = measurement.write_result(directory / f"{child['run_id']}.json", child)
+            return children
+
+        output = temporary_directory(self)
+        enough = performance.aggregate_attribution(
+            written([self.child(index, 4000) for index in (1, 2, 3)], output),
+            plan=plan, output_dir=output,
+        )
+        checks = {entry["name"]: entry for entry in enough["checks"]}
+        self.assertEqual(checks["classified_samples_sufficient"]["status"],
+                         measurement.STATUS_PASSED)
+        self.assertEqual(enough["status"], measurement.STATUS_PASSED, enough["checks"])
+        self.assertEqual(enough["metrics"]["engine_cpu_ns_per_record"], 3000.0)
+        self.assertEqual(len(enough["baseline_files"]), 1)
+        self.assertEqual(
+            enough["observations"]["pooled_profile"]["classified_samples_count"], 12000
+        )
+        other = temporary_directory(self)
+        short = performance.aggregate_attribution(
+            written([self.child(index, 2000) for index in (4, 5, 6)], other),
+            plan=plan, output_dir=other,
+        )
+        checks = {entry["name"]: entry for entry in short["checks"]}
+        self.assertEqual(checks["classified_samples_sufficient"]["status"],
+                         measurement.STATUS_FAILED)
+        self.assertEqual(short["baseline_files"], [])
+
+    # Scenario: profiles whose categories and named residual hold all of the
+    # measured engine CPU, 85 percent of it, and all of it with a quarter
+    # named residual.
+    # Guarantees: the reconciliation error is the relative difference from
+    # the measured CPU and unexplained CPU is the residual plus what no
+    # sample covered, so the plan's 10 and 20 percent limits catch both.
+    def test_stage_agreement_is_the_plan_rule(self):
+        full = performance.stage_agreement(1000, 10, 1000)
+        self.assertEqual(full, {"error_ratio": 0.0, "unexplained_ratio": 0.01})
+        short = performance.stage_agreement(850, 10, 1000)
+        self.assertAlmostEqual(short["error_ratio"], 0.15)
+        self.assertAlmostEqual(short["unexplained_ratio"], 0.16)
+        self.assertGreater(short["error_ratio"], performance.STAGE_AGREEMENT_ERROR_LIMIT)
+        residual = performance.stage_agreement(1000, 250, 1000)
+        self.assertGreater(residual["unexplained_ratio"], performance.UNEXPLAINED_CPU_LIMIT)
+        self.assertEqual(
+            performance.stage_agreement(10, 0, 0),
+            {"error_ratio": None, "unexplained_ratio": None},
+        )
+
+    # Scenario: three repetitions pass every gate, but the pinned reference
+    # the family is reconciled against does not verify.
+    # Guarantees: the reference is a binding gate of the aggregate itself, so
+    # it fails there and no baseline is written.
+    def test_no_baseline_without_the_verified_reference(self):
+        output = temporary_directory(self)
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 10_000,
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": False}}}
+        children = [self.child(index, 4000) for index in (1, 2, 3)]
+        for child in children:
+            _ = measurement.write_result(output / f"{child['run_id']}.json", child)
+        aggregate = performance.aggregate_attribution(children, plan=plan, output_dir=output)
+        checks = {entry["name"]: entry for entry in aggregate["checks"]}
+        self.assertEqual(checks["reference_family_verified"]["status"],
+                         measurement.STATUS_FAILED)
+        self.assertEqual(aggregate["baseline_files"], [])
+        self.assertEqual(aggregate["status"], measurement.STATUS_FAILED)
+
+    # Scenario: the ledger directory is asked for on an ext4 disk while
+    # /dev/shm is tmpfs, on tmpfs itself, and on a host with no memory file
+    # system at all.
+    # Guarantees: the file system type is read from mountinfo and recorded;
+    # a disk directory falls back to /dev/shm, a tmpfs one is kept, and with
+    # neither the family is refused rather than throttled.
+    def test_ledgers_live_on_a_memory_file_system(self):
+        root = temporary_directory(self)
+        mountinfo = root / "mountinfo"
+        mountinfo.write_text(
+            "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "23 22 0:5 / /dev/shm rw - tmpfs tmpfs rw\n"
+            "24 22 0:6 / /tmp rw - tmpfs tmpfs rw\n",
+            encoding="ascii",
+        )
+        moved = performance.memory_ledger_dir("/var/tmp/ledgers", mountinfo=mountinfo)
+        self.assertEqual((moved["fstype"], moved["fallback"]), ("tmpfs", True))
+        self.assertEqual(moved["directory"], "/dev/shm/ledgers")
+        kept = performance.memory_ledger_dir("/tmp/ledgers", mountinfo=mountinfo)
+        self.assertEqual((kept["mount_point"], kept["fallback"]), ("/tmp", False))
+        disk_only = root / "disk-only"
+        disk_only.write_text("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n", encoding="ascii")
+        with self.assertRaisesRegex(AssertionError, "memory file system"):
+            _ = performance.memory_ledger_dir("/var/tmp/ledgers", mountinfo=disk_only)
+
+    def engine_proof(self, *, clean=True, same_symbols=True):
+        """prepare_profiled_engine with cargo, nm and git replaced."""
+        root = temporary_directory(self)
+        (root / "target" / "release").mkdir(parents=True)
+        canonical = root / "target" / "release" / "df_engine"
+        profiled = root / "target" / "release" / "df_engine-perf"
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            canonical.write_bytes(b"relinked" if argv[1] == "rustc" else b"canonical")
+            return subprocess.CompletedProcess(argv, 0)
+
+        def symbols(path, nm="nm"):
+            digest = "same" if same_symbols or Path(path) == canonical else "other"
+            return {"count": 3, "sha256": digest, "tool": "nm"}
+
+        def build(path):
+            return {"profile": "release", "features": "f", "allocator": "jemalloc",
+                    "toolchain": "rustc 1", "binary": str(path),
+                    "binary_sha256": measurement.file_digest(path)}
+
+        with mock.patch.object(measurement.test_e2e, "WORKSPACE", root), \
+                mock.patch.dict(os.environ, {performance.ATTRIBUTION_ENGINE_ENV: str(profiled)}), \
+                mock.patch.object(performance, "rust_tree_status",
+                                  return_value={"clean": clean, "changes": [] if clean else [" M a.rs"]}), \
+                mock.patch.object(performance.subprocess, "run", side_effect=run), \
+                mock.patch.object(performance, "function_symbols", side_effect=symbols), \
+                mock.patch.object(performance, "rustc_version", return_value="rustc 1 -vV"), \
+                mock.patch.object(performance, "unwind_layout",
+                                  return_value={"compatible": True, "skewed_executable_segments": []}), \
+                mock.patch.object(measurement, "engine_build", side_effect=build), \
+                mock.patch.object(measurement, "git_provenance",
+                                  return_value={"revision": "r", "dirty": not clean}):
+            facts = performance.prepare_profiled_engine(
+                root / "log", lease_path=root / "lease",
+            )
+        return facts, commands
+
+    # Scenario: the attribution builds its two engines from a clean tree with
+    # identical function symbols, from a dirty tree, and into binaries whose
+    # function symbols differ.
+    # Guarantees: the canonical build, the one-flag relink and the restore
+    # run in order under the lease; only a clean tree whose two binaries list
+    # the same functions is valid; the exact flag difference is recorded;
+    # and each refusal says why.
+    def test_the_profiled_engine_is_proven_the_canonical_one(self):
+        facts, commands = self.engine_proof()
+        self.assertTrue(facts["valid"], facts["problems"])
+        self.assertEqual([argv[1] for argv in commands], ["build", "rustc", "build"])
+        self.assertEqual(commands[1][-2:], ["-C", performance.PROFILED_LINK_ARG])
+        self.assertEqual(facts["rustflags_difference"]["profiled"],
+                         ["-C", performance.PROFILED_LINK_ARG])
+        self.assertEqual(facts["canonical"]["function_symbols"],
+                         facts["profiled"]["function_symbols"])
+        dirty, commands = self.engine_proof(clean=False)
+        self.assertFalse(dirty["valid"])
+        self.assertIn("uncommitted", " ".join(dirty["problems"]))
+        self.assertEqual(commands, [])
+        different, _ = self.engine_proof(same_symbols=False)
+        self.assertFalse(different["valid"])
+        self.assertIn("function symbols differ", " ".join(different["problems"]))
+
+    # Scenario: the reader's rows fail part-way through a second load, after
+    # a first load committed.
+    # Guarantees: the failed load is rolled back whole -- the first load's
+    # rows are what the ledger still holds -- and the connection is left
+    # outside any transaction, usable by the comparison that follows.
+    def test_a_failed_read_back_load_is_rolled_back(self):
+        ledger = Ledger(temporary_directory(self) / "ledger.sqlite")
+        self.addCleanup(ledger.close)
+        rows = [(f"id{index}", "logs", "h") for index in range(5)]
+        self.assertEqual(measurement._load_actual(ledger, iter(rows)), 5)
+
+        def failing():
+            for index in range(7):
+                yield (f"new{index}", "logs", "h")
+            raise OSError("reader failed")
+
+        with mock.patch.object(measurement, "ORACLE_BATCH", 3):
+            with self.assertRaisesRegex(OSError, "reader failed"):
+                _ = measurement._load_actual(ledger, failing())
+        self.assertFalse(ledger.connection.in_transaction)
+        kept = ledger.connection.execute("SELECT record_id FROM actual ORDER BY 1").fetchall()
+        self.assertEqual([row[0] for row in kept], [row[0] for row in rows])
+
+    # Scenario: a lifetime fails immediately after its engine started, while
+    # constructing its phase.
+    # Guarantees: the engine is closed anyway, so no failure can leave an
+    # engine behind on a measured core, and the failure propagates.
+    def test_an_early_lifetime_failure_closes_its_engine(self):
+        closed = []
+
+        class FakeEngine:
+            pid = 4242
+            config_sha256 = "c"
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                closed.append(True)
+
+        class FailingCommand:
+            @staticmethod
+            def EnginePhase(*args, **kwargs):
+                raise RuntimeError("phase failed")
+
+        prebuilt = mock.Mock(workload=Workload())
+        plan = {"inputs": {"logs-1k-stable": {"prebuilt": prebuilt}}, "storage": {},
+                "merge": {}, "provenance": {"build": {"binary": "/bin/true"}},
+                "ledger_dir": str(temporary_directory(self))}
+        spec = measure.harness_local_spec()
+        controls = mock.Mock()
+        with mock.patch.object(measurement.test_e2e, "Engine", FakeEngine), \
+                mock.patch.object(performance, "_command", return_value=FailingCommand):
+            with self.assertRaisesRegex(RuntimeError, "phase failed"):
+                _ = performance.attribution_lifetime(
+                    "control", plan, {"config_id": "logs-1k-stable"}, spec,
+                    {"config": {}, "ephemeral_values": {}}, temporary_directory(self),
+                    controls, edge="start", last=True, profile=False,
+                )
+        self.assertEqual(closed, [True])
+        controls.unwatch_workers.assert_called()
+
+    # Scenario: another agent's compile invalidates a repetition: the host
+    # shows a build for two scans and then none, and earlier children with
+    # ordinals up to 6 are published in two directories.
+    # Guarantees: only a failed no_concurrent_build marks a child as
+    # invalidated by a build; the family waits until the host has been
+    # build-free for a whole quiet period before running it again; and the
+    # rerun takes an ordinal no published child has used.
+    def test_a_build_invalidated_repetition_is_rerun_on_a_quiet_host(self):
+        failed = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        other = {"checks": [measurement.check(
+            "rss_reconciliation", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        self.assertTrue(performance.invalidated_by_build(failed))
+        self.assertFalse(performance.invalidated_by_build(other))
+        scans = iter([[{"pid": 7, "comm": "cargo"}]] * 2 + [[]] * 1000)
+        waited = performance.wait_for_quiet_host(
+            quiet_s=0.2, deadline_s=30, scan=lambda: next(scans)
+        )
+        self.assertGreaterEqual(waited["waited_s"], 0.2)
+        self.assertEqual(waited["last_builds_seen"], [{"pid": 7, "comm": "cargo"}])
+        with self.assertRaisesRegex(AssertionError, "without a build"):
+            _ = performance.wait_for_quiet_host(
+                quiet_s=5, deadline_s=0.3, scan=lambda: [{"pid": 8, "comm": "rustc"}]
+            )
+        report = temporary_directory(self)
+        local = temporary_directory(self)
+        (report / "attribution-logs-1k-stable-strict-minio-c1-w15-r003.json").write_text("{}")
+        (local / "attribution-metrics-mixed-strict-minio-c1-w15-r006.json").write_text("{}")
+        self.assertEqual(performance.attribution_child_ordinal(report, local), 7)
+
+    # Scenario: the family runs one workload of two repetitions; the first
+    # repetition's run is valid, and every attempt at the second -- the first
+    # run and all three reruns -- is invalidated by a concurrent build.
+    # Guarantees: all four invalidated attempts are published as invalidated
+    # and none reaches the aggregate, which sees the valid repetition alone;
+    # the exhausted repetition is simply missing.
+    def test_exhausted_build_retries_aggregate_nothing_invalidated(self):
+        invalid = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        runs = []
+
+        def run_child(plan, job, output_dir, report_dir):
+            runs.append(job)
+            child = dict(
+                {"checks": []} if job["repetition"] == 1 else invalid,
+                run_id=f"attribution-metrics-mixed-r{job['ordinal']:03d}",
+                repetition=job["repetition"],
+                workload_config_id=job["config_id"],
+            )
+            return child
+
+        aggregated = []
+
+        def aggregate(members, *, plan, output_dir):
+            aggregated.extend(members)
+            return {"workload_config_id": members[0]["workload_config_id"],
+                    "run_id": "agg", "status": measurement.STATUS_FAILED,
+                    "checks": [], "baseline_files": []}
+
+        published = {}
+
+        def publish(spec, plan, children, aggregates, output_dir, report_dir,
+                    started, *, preflight, invalidated=()):
+            published.update(children=children, aggregates=aggregates,
+                             invalidated=list(invalidated))
+            return {"status": "failed"}
+
+        store = mock.MagicMock(storage={"s3": {}}, endpoint="http://x", container="c")
+        store.__enter__.return_value = store
+        prebuilt = mock.Mock(workload=Workload(), close=mock.Mock())
+        engines = {"valid": True, "problems": [], "profiled": {"binary": "b"},
+                   "canonical": {}, "rustflags_difference": {}, "commands": {},
+                   "git": {"revision": "r"}}
+        allocation = {"engine_observability": [0], "engine": [1],
+                      "engine_reserved": [2, 3, 4], "producer": [5], "store": [6],
+                      "profiler": [7]}
+        spec = performance.attribution_spec(cores=[1])
+        with mock.patch.object(measurement, "role_allocation", return_value=allocation), \
+                mock.patch.object(performance, "prepare_profiled_engine", return_value=engines), \
+                mock.patch.object(performance, "perf_preflight", return_value={"attached": True}), \
+                mock.patch.object(performance.PrebuiltRequests, "build", return_value=prebuilt), \
+                mock.patch.object(measurement.test_e2e, "DockerStore", return_value=store), \
+                mock.patch.object(performance, "container_pid", return_value=1), \
+                mock.patch.object(performance, "pin_container", return_value=True), \
+                mock.patch.object(measurement, "build_activity", return_value=[]), \
+                mock.patch.object(performance, "wait_for_quiet_host", return_value={}), \
+                mock.patch.object(performance, "run_attribution_child", side_effect=run_child), \
+                mock.patch.object(performance, "aggregate_attribution", side_effect=aggregate), \
+                mock.patch.object(performance, "publish_attribution", side_effect=publish):
+            _ = performance.run_attribution(
+                spec, temporary_directory(self), report_dir=temporary_directory(self),
+                configs=["metrics-mixed"], repetitions=2, cpu_ns_per_record=1000.0,
+            )
+        self.assertEqual([job["repetition"] for job in runs], [1, 2, 2, 2, 2])
+        self.assertEqual([job["attempt"] for job in runs if job["repetition"] == 2],
+                         [1, 2, 3, 4])
+        self.assertEqual(len({job["ordinal"] for job in runs}), 5)
+        self.assertEqual(len(published["invalidated"]), 4)
+        self.assertEqual([child["repetition"] for child in aggregated], [1])
+        invalid_ids = {child["run_id"] for child in published["invalidated"]}
+        self.assertFalse(invalid_ids & {child["run_id"] for child in aggregated})
+        self.assertFalse(invalid_ids & {child["run_id"] for child in published["children"]})
+
+    # Scenario: a workload's aggregate is built from repetitions 1 and 3 of
+    # three, repetition 2 having no valid run.
+    # Guarantees: completeness is a hard gate that names the missing
+    # repetition, and no baseline is written.
+    def test_a_missing_repetition_fails_completeness(self):
+        output = temporary_directory(self)
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 1,
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": True}}}
+        children = [self.child(index, 6000) for index in (1, 3)]
+        for child in children:
+            _ = measurement.write_result(output / f"{child['run_id']}.json", child)
+        aggregate = performance.aggregate_attribution(children, plan=plan, output_dir=output)
+        checks = {entry["name"]: entry for entry in aggregate["checks"]}
+        self.assertEqual(checks["repetitions_complete"]["status"], measurement.STATUS_FAILED)
+        self.assertIn("[2]", checks["repetitions_complete"]["detail"])
+        self.assertEqual(aggregate["baseline_files"], [])
+
+    # Scenario: the Rust tree is clean when the engine build starts waiting
+    # for the lease, but has an edit once the lease is held; and in another
+    # run the revision moves while the builds run.
+    # Guarantees: the source is re-checked after the lease and after the
+    # builds; a change in either window refuses the engines, and a tree that
+    # changed while waiting is never built.
+    def test_a_tree_that_moves_around_the_build_is_refused(self):
+        clean = {"clean": True, "changes": [], "revision": "r"}
+        with mock.patch.object(performance, "source_state",
+                               return_value={"clean": False, "changes": [" M a.rs"],
+                                             "revision": "r"}):
+            waited, commands = self.engine_proof()
+        self.assertFalse(waited["valid"])
+        self.assertIn("while waiting for the lease", " ".join(waited["problems"]))
+        self.assertEqual(commands, [])
+        with mock.patch.object(performance, "source_state",
+                               side_effect=[clean, dict(clean, revision="s")]):
+            moved, commands = self.engine_proof()
+        self.assertFalse(moved["valid"])
+        self.assertIn("during the builds, the revision moved", " ".join(moved["problems"]))
+        self.assertEqual(len(commands), 3)
+
+    # Scenario: a git repository whose rust/ directory has one committed file
+    # and one untracked .rs file.
+    # Guarantees: the untracked source makes the tree unclean, since it can
+    # be compiled in, and it is named.
+    def test_an_untracked_rust_file_makes_the_tree_unclean(self):
+        root = temporary_directory(self)
+        (root / "rust").mkdir()
+        (root / "rust" / "lib.rs").write_text("pub fn a() {}\n")
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *arguments],
+                cwd=root, capture_output=True, text=True, check=True,
+            )
+
+        _ = git("init", "-q")
+        _ = git("add", "rust/lib.rs")
+        _ = git("commit", "-q", "-m", "init")
+        with mock.patch.object(measurement, "REPO_ROOT", root):
+            self.assertTrue(performance.rust_tree_status()["clean"])
+            (root / "rust" / "new.rs").write_text("pub fn b() {}\n")
+            status = performance.rust_tree_status()
+        self.assertFalse(status["clean"])
+        self.assertIn("?? rust/new.rs", status["changes"])
+
+    # Scenario: a stages family is asked for a filtered set of stages or
+    # workloads, or the complete set under another name.
+    # Guarantees: a filtered family must publish under its own index and is
+    # checked against what it asked for; the complete family is only ever
+    # `stages.json`; unknown names are refused.
+    def test_a_spot_family_never_replaces_the_family_of_record(self):
+        with self.assertRaisesRegex(AssertionError, "spot family"):
+            _ = performance.family_scope(["metrics-mixed"], ["extract"])
+        spot = performance.family_scope(
+            ["metrics-mixed"], ["extract", "upload"], "stages-spot"
+        )
+        self.assertEqual(spot["kind"], "spot")
+        self.assertEqual(spot["stages"], ["extract", "upload"])
+        full = performance.family_scope(list(performance.WORKLOAD_CONFIGS), None)
+        self.assertEqual((full["kind"], full["index"]), ("full", "stages"))
+        with self.assertRaisesRegex(AssertionError, "family of record"):
+            _ = performance.family_scope(
+                list(performance.WORKLOAD_CONFIGS), None, "stages-spot"
+            )
+        with self.assertRaisesRegex(AssertionError, "unknown stages"):
+            _ = performance.family_scope(["metrics-mixed"], ["nope"], "stages-spot")
+
+    # Scenario: the attribution subcommand is asked for without the long
+    # opt-in, and the command line is inspected.
+    # Guarantees: it is a real, long subcommand, no longer a planned one.
+    def test_attribution_is_a_long_subcommand(self):
+        self.assertNotIn("attribution", measure.PLANNED_COMMANDS)
+        self.assertIn("attribution", measure.LONG_COMMANDS)
+        environment = dict(os.environ)
+        environment.pop("SERIES_MEASURE_LONG", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                measure.main(["attribution", "--output-dir", str(temporary_directory(self))]),
+                2,
+            )
 
 
 if __name__ == "__main__":

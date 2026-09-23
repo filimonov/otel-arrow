@@ -19,11 +19,20 @@ first lease is taken, and a build seen while a measurement runs invalidates
 it.
 """
 import collections
+import concurrent.futures
+import dataclasses
+import functools
+import hashlib
 import json
 import math
+import mmap
+import multiprocessing
 import os
 from pathlib import Path
+import re
+import select
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -2567,6 +2576,7 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     configs = list(options.get("configs") or WORKLOAD_CONFIGS)
     repetitions = int(options.get("repetitions", REPETITIONS))
     stages_filter = options.get("stages")
+    scope = family_scope(configs, stages_filter, options.get("index_name"))
     for config_id in configs:
         check_fixture(config_id)
     # Everything below is prebuilt. This family never invokes cargo: it
@@ -2609,6 +2619,7 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     }
     plan["engines"] = engine_binaries()
     plan["repetitions"] = repetitions
+    plan["scope"] = scope
     plan["family_ordinal"] = family_ordinal(report_dir)
     topology = measurement.core_topology()
     # A stages family runs the engine (its pipeline baseline), the producer
@@ -2658,6 +2669,59 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
     return publish_stages(
         spec, children, plan, output_dir, report_dir, started, configs, repetitions
     )
+
+
+# The index of the complete family of record. A family that measures only
+# some stages or workloads is a spot family: it publishes under an index
+# name of its own, so it can never replace the family of record.
+FULL_FAMILY_INDEX = "stages"
+
+
+def family_scope(configs, stages_filter, index_name=None) -> dict:
+    """What one stages family measures and the index it publishes.
+
+    Every stage and workload is the full family, published as
+    `stages.json`. A filtered family is a spot family: it must name an
+    index of its own, and its coverage checks cover what it asked for
+    rather than failing on what it deliberately left out.
+    """
+    configs = list(configs)
+    unknown = sorted(set(configs) - set(WORKLOAD_CONFIGS))
+    if unknown:
+        raise AssertionError(f"unknown workload configurations {unknown}")
+    stages = list(stages_filter or [])
+    unknown = sorted(set(stages) - set(STAGES))
+    if unknown:
+        raise AssertionError(f"unknown stages {unknown}; registered are {list(STAGES)}")
+    full = not stages and set(configs) == set(WORKLOAD_CONFIGS)
+    name = index_name or FULL_FAMILY_INDEX
+    _ = measurement.safe_json_name(f"{name}.json")
+    if not full and name == FULL_FAMILY_INDEX:
+        raise AssertionError(
+            f"a family filtered to stages {stages or 'all'} and workloads "
+            f"{configs} is a spot family; it publishes under its own index, "
+            f"never as {FULL_FAMILY_INDEX}.json: pass --option "
+            f"index_name=stages-spot"
+        )
+    if full and name != FULL_FAMILY_INDEX:
+        raise AssertionError(
+            f"the complete family is the family of record and publishes as "
+            f"{FULL_FAMILY_INDEX}.json, not {name}.json"
+        )
+    requested = [
+        stage
+        for stage in STAGES
+        if any(
+            stage in WORKLOAD_CONFIGS[config_id]["stages"] for config_id in configs
+        )
+        and (not stages or stage in stages)
+    ]
+    return {
+        "kind": "full" if full else "spot",
+        "index": name,
+        "configs": configs,
+        "stages": requested,
+    }
 
 
 def host_neighbours(proc_root="/proc", exclude=(), limit=5) -> dict:
@@ -2733,9 +2797,17 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
             )
     stage_results = composite_stage_results(aggregates, children)
     summaries = stage_summaries(stage_results)
+    # A plan without a scope predates spot families: it is the family of
+    # record, checked against every registered stage.
+    scope = plan.get("scope") or {
+        "kind": "full", "index": FULL_FAMILY_INDEX, "configs": list(configs),
+        "stages": list(STAGES),
+    }
+    index = scope["index"]
     result = measurement.new_result(
-        {"run_id": "stages", "case": "stages"}, artifact_kind="index"
+        {"run_id": index, "case": "stages"}, artifact_kind="index"
     )
+    result["family_scope"] = scope
     result["environment"]["start"] = measurement.environment_snapshot(
         {"harness": os.getpid()}
     )
@@ -2770,43 +2842,50 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
             )
         )
     covered = {result_entry["stage"] for result_entry in stage_results}
-    missing = sorted(set(STAGES) - covered)
+    # A spot family is checked against the stages it asked for; the full
+    # family against every registered stage.
+    requested = STAGES if scope["kind"] == "full" else scope["stages"]
+    missing = sorted(set(requested) - covered)
     checks.append(
         measurement.check(
             "registered_stages_covered",
             measurement.CHECK_HARD,
             measurement.STATUS_FAILED if missing else measurement.STATUS_PASSED,
-            f"missing {missing}" if missing else f"{len(covered)} stages measured",
+            f"missing {missing}" if missing
+            else f"{len(covered)} of the {scope['kind']} family's stages measured",
         )
     )
     layers = {
         entry["stage"] for entry in stage_results if entry["mode"] == "criterion"
     }
-    missing_layers = sorted(set(CRITERION_LAYERS) - layers)
-    checks.append(
-        measurement.check(
-            "criterion_layers_registered",
-            measurement.CHECK_HARD,
-            measurement.STATUS_FAILED if missing_layers else measurement.STATUS_PASSED,
-            f"missing {missing_layers}" if missing_layers
-            else f"{len(layers)} cumulative layers",
+    wanted_layers = [layer for layer in CRITERION_LAYERS if layer in requested]
+    if wanted_layers:
+        missing_layers = sorted(set(wanted_layers) - layers)
+        checks.append(
+            measurement.check(
+                "criterion_layers_registered",
+                measurement.CHECK_HARD,
+                measurement.STATUS_FAILED if missing_layers else measurement.STATUS_PASSED,
+                f"missing {missing_layers}" if missing_layers
+                else f"{len(layers)} cumulative layers",
+            )
         )
-    )
-    modes = {
-        (entry["stage"], entry["mode"])
-        for entry in stage_results
-        if entry["stage"] == "otlp_noop"
-    }
-    checks.append(
-        measurement.check(
-            "noop_modes_are_separate",
-            measurement.CHECK_HARD,
-            measurement.STATUS_PASSED
-            if {("otlp_noop", "pipeline"), ("otlp_noop", "criterion")} <= modes
-            else measurement.STATUS_FAILED,
-            f"otlp_noop modes {sorted(mode for _, mode in modes)}",
+    if "otlp_noop" in requested:
+        modes = {
+            (entry["stage"], entry["mode"])
+            for entry in stage_results
+            if entry["stage"] == "otlp_noop"
+        }
+        checks.append(
+            measurement.check(
+                "noop_modes_are_separate",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED
+                if {("otlp_noop", "pipeline"), ("otlp_noop", "criterion")} <= modes
+                else measurement.STATUS_FAILED,
+                f"otlp_noop modes {sorted(mode for _, mode in modes)}",
+            )
         )
-    )
     incomplete = [
         f"{entry['stage']}/{entry['mode']}/{entry['workload_config_id']} "
         f"r{entry['repetition']}: {entry['incomplete']}"
@@ -2871,7 +2950,9 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
     result["baseline_files"] = [
         entry for aggregate in aggregates for entry in aggregate["baseline_files"]
     ]
-    previous = measurement.archive_published_index("stages.json", output_dir, report_dir)
+    previous = measurement.archive_published_index(
+        f"{index}.json", output_dir, report_dir
+    )
     result["child_indexes"] = [previous] if previous else []
     result["environment"]["end"] = measurement.environment_snapshot(
         {"harness": os.getpid()}
@@ -2885,8 +2966,8 @@ def publish_stages(spec, children, plan, output_dir, report_dir, started, config
         else measurement.STATUS_FAILED
     )
     result["elapsed_s"] = (time.monotonic_ns() - started) / 1e9
-    index = measurement.write_result(output_dir / "stages.json", result)
-    _ = measurement.publish_result_tree(index, report_dir)
+    written = measurement.write_result(output_dir / f"{index}.json", result)
+    _ = measurement.publish_result_tree(written, report_dir)
     return result
 
 
@@ -2909,4 +2990,3461 @@ def stages_spec(**options) -> measurement.RunSpec:
         duration_s=1,
         max_in_flight=64,
         overrides={"family": "stages"},
+    )
+
+
+# --------------------------------------------------------------------------
+# Direct CPU attribution of the real engine
+# --------------------------------------------------------------------------
+#
+# `measure attribution` profiles a real engine with `perf record` while the
+# harness's producer drives it, and assigns every sample exactly once to the
+# pipeline stage of the innermost production frame on its stack. The stage
+# family above supplies per-stage timing, allocation, resident memory and
+# output metrics from isolated benches; attribution supplies exclusive CPU
+# shares of the running engine and the flush wall time that is not CPU at
+# all. The two are joined by workload configuration and never by a shared
+# byte-rate denominator.
+
+# Every category a sample can land in, `unknown` last. A sample is counted
+# in exactly one of them.
+CPU_CATEGORIES = (
+    "conversion",
+    "extraction",
+    "sort_seal_merge",
+    "encoding",
+    "upload",
+    "buffer",
+    "engine_runtime",
+    "allocator",
+    "unknown",
+)
+UNKNOWN_CATEGORY = "unknown"
+
+# Every production path may be written with or without its crate, so that a
+# recorded demangled symbol and a hand-written test frame are read by the
+# same rule. A real demangled symbol always starts with its crate.
+_LAKE = r"(?:otel_arrow_dfe_series_lake::)?"
+_NODE = r"(?:otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::)?"
+_WORKER = _NODE + r"(?:worker::)?Worker::"
+_END = r"(?:$|::)"
+
+# The mapping rules, in the order they are tried on one frame. Frames are
+# walked from the innermost outwards and the first frame some rule of the
+# current pass matches decides the sample. Pass 1 holds the production
+# namespaces -- this crate's code, the engine's own crates, and the
+# libraries whose work is a stage by itself (Parquet, the object store
+# client, the allocator). Pass 2 is the runtime fallback: the async runtime
+# and the network server stack decide a sample only when no production
+# frame is on its stack at all, so a Tokio or hyper frame inside an upload
+# never takes the upload's sample, while the scheduler's own idle polling
+# still lands in engine_runtime rather than in `unknown`. Library frames that
+# are in neither pass -- Arrow kernels, `core`, `std`, libc copies -- are
+# walked past, so their CPU belongs to the stage that called them.
+CPU_RULES = (
+    (1, "allocator",
+     r"^(?:_rjem_|je_|(?:__rustc::)?__rust_(?:alloc|dealloc|realloc|alloc_zeroed)$|__rdl_|"
+     r"tikv_jemalloc|tikv_jemallocator::|jemallocator::|malloc$|free$|"
+     r"realloc$|calloc$|cfree$|_int_(?:malloc|free|realloc)$|"
+     r"__libc_(?:malloc|free|realloc|calloc)$|alloc::alloc::|alloc::raw_vec::|"
+     r"std::alloc::)",
+     "the global allocator and heap growth, wherever it is called from; "
+     "allocator_callers names the stage that called it"),
+    (1, "conversion", rf"^{_WORKER}check_wire_format{_END}",
+     "the exporter's OTLP framing check before conversion"),
+    (1, "conversion",
+     r"^otel_arrow_dfe_pdata::(?:encode|views|otlp|payload|arrays|schema|"
+     r"validation)::",
+     "wire-to-OTAP conversion: the OTLP views and the Arrow encoder"),
+    (1, "conversion", r"^otel_arrow_dfe_pdata::otap::OtapArrowRecords::try_from",
+     "the payload conversion trait itself"),
+    (1, "extraction", rf"^{_WORKER}(?:prepare|extract){_END}",
+     "the worker's per-request preparation around the lake extraction"),
+    (1, "extraction", rf"^{_LAKE}(?:extract|canonical|attrs|value)::",
+     "series/values extraction and series identity hashing"),
+    (1, "sort_seal_merge",
+     rf"^{_LAKE}buffer::(?:Block|SortedTableBuffer)::"
+     rf"(?:seal|stamped|finalized|into_parts){_END}",
+     "sealing a block: stamping and sorting its runs"),
+    (1, "sort_seal_merge", rf"^{_LAKE}sort::",
+     "run sorting and the k-way merge the sink consumes"),
+    (1, "sort_seal_merge", rf"^{_WORKER}(?:rotate|fail_active){_END}",
+     "rotating the ACTIVE block into a flush"),
+    (1, "buffer", rf"^{_LAKE}(?:buffer|cache)::",
+     "admission: reservation, the series cache and appending to the block"),
+    (1, "buffer",
+     rf"^{_WORKER}(?:admit|offer|park|resume_pending|new_active|refuse|"
+     rf"reservation_failure){_END}",
+     "the worker's admission path"),
+    (1, "buffer",
+     r"^(?:otel_arrow_dfe_core_nodes::processors::durable_buffer_processor|"
+     r"otel_arrow_dfe_quiver)::",
+     "the durable buffer of the buffered topology"),
+    (1, "encoding", r"^parquet::",
+     "Parquet encoding, including its compression and statistics"),
+    (1, "encoding",
+     rf"^{_LAKE}(?:schema::|sink::(?:time_range|native_sorting_columns){_END}|"
+     rf"(?:sink::)?Sink::file_metadata{_END})",
+     "the file schema and metadata the sink writes with each file"),
+    (1, "upload", r"^(?:object_store|reqwest)::",
+     "the object store client and its HTTP client"),
+    (1, "upload", r"^otel_arrow_dfe_otap::object_store::",
+     "the engine's object store construction"),
+    (1, "upload", rf"^{_LAKE}(?:sink::|Sink::|CreationWatch::)",
+     "the sink's write orchestration around encoding and the store"),
+    (1, "upload", rf"^{_NODE}flush::",
+     "the flush task's retry loop around the sink"),
+    (1, "engine_runtime",
+     r"^otel_arrow_dfe_(?:engine|channel|control_channel|telemetry|controller|"
+     r"admin|admin_api|config|state|otap|core_nodes|pdata)::",
+     "the engine's own crates: the receiver, channels, telemetry, and the "
+     "exporter's control loop and completion routing"),
+    (2, "engine_runtime",
+     r"^(?:tokio|mio|futures_util|futures_core|futures_executor|"
+     r"futures_channel|hyper|hyper_util|h2|http|http_body|tonic|tower|axum|"
+     r"std::thread|std::sys|std::rt|std::panicking|core::ops::function)::",
+     "the async runtime and the network server stack, only when no "
+     "production frame is on the stack"),
+    (2, "engine_runtime",
+     r"^(?:__libc_start_main|__libc_start_call_main|start_thread|clone3?|"
+     r"_start|main|epoll_wait|__GI_epoll_wait)$",
+     "thread and process entry points, only when nothing else matched"),
+)
+
+_COMPILED_RULES = tuple(
+    (pass_, category, re.compile(pattern)) for pass_, category, pattern, _ in CPU_RULES
+)
+
+# The order `frames` is read in, stated once because the classifier and the
+# perf script parser must agree on it.
+FRAME_ORDER = "outermost first, innermost last, as a call path reads"
+
+
+def classification_rules() -> dict:
+    """The mapping rules as recorded with every attribution result."""
+    return {
+        "categories": list(CPU_CATEGORIES),
+        "frame_order": FRAME_ORDER,
+        "decision": (
+            "walk frames from the innermost outwards; the first frame a "
+            "pass-1 rule matches decides the sample, otherwise the first "
+            "frame a pass-2 rule matches, otherwise the sample is unknown; "
+            "within one frame the first matching rule wins; every sample's "
+            "weight is added once"
+        ),
+        "rules": [
+            {"pass": pass_, "category": category, "pattern": pattern, "why": why}
+            for pass_, category, pattern, why in CPU_RULES
+        ],
+    }
+
+
+_SYMBOL_OFFSET = re.compile(r"\+0x[0-9a-fA-F]+$")
+# The crate disambiguator a v0 symbol demangles with: `crate[4f8f0dac]::...`.
+_CRATE_DISAMBIGUATOR = re.compile(r"\[[0-9a-f]{4,}\]")
+_LEGACY_HASH = re.compile(r"::h[0-9a-f]{16}$")
+_SELF_TYPE_PREFIX = re.compile(r"^(?:[&*\[( ]|mut |const |dyn )+")
+
+
+def _strip_generics(text: str) -> str:
+    """Remove every balanced `<...>` group, turbofish included."""
+    out = []
+    depth = 0
+    for position, char in enumerate(text):
+        if char == "<":
+            depth += 1
+        elif char == ">" and text[position - 1:position] != "-":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            out.append(char)
+    stripped = "".join(out)
+    while "::::" in stripped:
+        stripped = stripped.replace("::::", "::")
+    return stripped.rstrip(":").strip()
+
+
+def _split_self_type(inner: str) -> str:
+    """The implementing type of `A as Trait`, or `A` itself."""
+    depth = 0
+    for position in range(len(inner)):
+        char = inner[position]
+        if char == "<":
+            depth += 1
+        elif char == ">" and inner[position - 1:position] != "-":
+            depth -= 1
+        elif depth == 0 and inner.startswith(" as ", position):
+            return inner[:position]
+    return inner
+
+
+@functools.lru_cache(maxsize=65536)
+def frame_path(symbol: str) -> str:
+    """The module path one demangled symbol names, generics removed.
+
+    `<otel_arrow_dfe_series_lake::sink::Sink>::write_block::{{closure}}`
+    and `<crate::Type<T> as Trait<U>>::method+0x1f` both reduce to the
+    implementing type's path and the method, so a rule can match a module
+    prefix without knowing Rust's symbol syntax.
+    """
+    text = _LEGACY_HASH.sub("", _SYMBOL_OFFSET.sub("", symbol.strip()))
+    text = _CRATE_DISAMBIGUATOR.sub("", text)
+    if text.startswith("<"):
+        depth = 0
+        for position, char in enumerate(text):
+            if char == "<":
+                depth += 1
+            elif char == ">" and text[position - 1:position] != "-":
+                depth -= 1
+                if depth == 0:
+                    self_type = _split_self_type(text[1:position])
+                    self_type = _SELF_TYPE_PREFIX.sub("", self_type)
+                    if self_type.startswith("<"):
+                        self_type = frame_path(self_type)
+                    text = self_type + text[position + 1:]
+                    break
+    return _strip_generics(text)
+
+
+@functools.lru_cache(maxsize=65536)
+def classify_frame(symbol: str, pass_: int):
+    """The category a pass's first matching rule gives one frame, or None."""
+    path = frame_path(symbol)
+    for rule_pass, category, pattern in _COMPILED_RULES:
+        if rule_pass == pass_ and pattern.match(path):
+            return category
+    return None
+
+
+def classify_frames(frames, *, skip=()):
+    """The category of one stack and the position of the deciding frame.
+
+    `frames` is outermost first. Positions in `skip` are passed over, which
+    is how `allocator_callers` looks outward past the allocator frame.
+    """
+    for pass_ in (1, 2):
+        for position in range(len(frames) - 1, -1, -1):
+            if position in skip:
+                continue
+            category = classify_frame(frames[position], pass_)
+            if category is not None:
+                return category, position
+    return UNKNOWN_CATEGORY, None
+
+
+def _checked_weight(sample) -> int:
+    """One sample's weight, refused unless it is a positive integer."""
+    weight = sample.get("weight") if isinstance(sample, dict) else None
+    if isinstance(weight, bool) or not isinstance(weight, int):
+        raise ValueError(f"a sample weight must be an integer: {weight!r}")
+    if weight <= 0:
+        raise ValueError(f"a sample weight must be positive: {weight}")
+    frames = sample.get("frames")
+    if not isinstance(frames, (list, tuple)) or not all(
+        isinstance(frame, str) for frame in frames
+    ):
+        raise ValueError(f"a sample's frames must be a list of symbols: {frames!r}")
+    return weight
+
+
+def classify_cpu(samples: list) -> dict:
+    """Assign each weighted sample exactly once to one CPU category.
+
+    Each sample is `{"frames": [...], "weight": n}` with frames outermost
+    first. The innermost frame some production rule matches decides it, so
+    an encoder frame takes precedence over the sink and upload frames that
+    are its ancestors; a sample no rule matches stays in `unknown`. The
+    result names every category, zeros included, and its values add up to
+    the input weight, which is asserted rather than assumed.
+    """
+    totals = dict.fromkeys(CPU_CATEGORIES, 0)
+    total = 0
+    for sample in samples:
+        weight = _checked_weight(sample)
+        category, _ = classify_frames(sample["frames"])
+        totals[category] += weight
+        total += weight
+    classified = sum(
+        value for name, value in totals.items() if name != UNKNOWN_CATEGORY
+    )
+    if classified + totals[UNKNOWN_CATEGORY] != total:
+        raise AssertionError(
+            f"classified {classified} plus unknown {totals[UNKNOWN_CATEGORY]} "
+            f"is not the input weight {total}: a sample was counted twice or "
+            f"dropped"
+        )
+    return totals
+
+
+def allocator_callers(samples: list) -> dict:
+    """The stage each allocator sample was called from, by weight.
+
+    The allocator is a category of its own, but every isolated bench stage
+    includes the allocations it makes. This looks outward past the deciding
+    allocator frame for the next frame another rule matches, so a stage's
+    exclusive CPU can be compared with its bench cost with the allocations
+    it caused added back. Only allocator samples are counted.
+    """
+    callers = dict.fromkeys(CPU_CATEGORIES, 0)
+    for sample in samples:
+        weight = _checked_weight(sample)
+        frames = sample["frames"]
+        category, position = classify_frames(frames)
+        if category != "allocator":
+            continue
+        skip = {
+            index for index in range(len(frames))
+            if classify_frame(frames[index], 1) == "allocator"
+        }
+        skip.add(position)
+        caller, _ = classify_frames(frames, skip=skip)
+        callers[caller] += weight
+    return callers
+
+
+# How wide a two-sided confidence interval on a share is, in standard errors.
+CONFIDENCE_Z = 1.96
+
+
+def category_statistics(samples: list) -> dict:
+    """Per-category weight, sample count, share and its 95% interval.
+
+    The share is by weight -- CPU nanoseconds for a `cpu-clock` profile --
+    and its interval is the binomial one over the number of samples, which
+    is what bounds how well a share of that many samples is known.
+    """
+    weights = classify_cpu(samples)
+    counts = classify_cpu(
+        [{"frames": sample["frames"], "weight": 1} for sample in samples]
+    )
+    total_weight = sum(weights.values())
+    total_count = sum(counts.values())
+    categories = {}
+    for name in CPU_CATEGORIES:
+        share = weights[name] / total_weight if total_weight else 0.0
+        interval = (
+            CONFIDENCE_Z * math.sqrt(share * (1 - share) / total_count)
+            if total_count else None
+        )
+        categories[name] = {
+            "weight": weights[name],
+            "samples_count": counts[name],
+            "share_ratio": share,
+            "share_ci95_ratio": interval,
+        }
+    return {
+        "total_weight": total_weight,
+        "samples_count": total_count,
+        "classified_samples_count": total_count - counts[UNKNOWN_CATEGORY],
+        "categories": categories,
+    }
+
+
+# `perf script` output: a header line per sample, then one line per frame,
+# innermost first, then a blank line.
+PERF_SCRIPT_FIELDS = "comm,tid,cpu,time,period,event,ip,sym,dso"
+_PERF_HEADER = re.compile(
+    r"^\s*(?P<comm>.*?)\s+(?P<tid>\d+)\s+\[(?P<cpu>\d+)\]\s+"
+    r"(?P<time>\d+\.\d+):\s+(?P<period>\d+)\s+(?P<event>\S+?):?\s*$"
+)
+_PERF_FRAME = re.compile(r"^\s+(?P<ip>[0-9a-fA-F]+)\s+(?P<rest>.*?)\s*$")
+KERNEL_DSO = "[kernel.kallsyms]"
+
+
+def _perf_frame(rest: str) -> tuple:
+    """A frame line's symbol and object, the object in its last parentheses."""
+    if rest.endswith(")") and " (" in rest:
+        symbol, _, dso = rest.rpartition(" (")
+        return symbol.strip() or "[unknown]", dso[:-1]
+    return rest.strip() or "[unknown]", "[unknown]"
+
+
+def parse_perf_script(text: str) -> dict:
+    """Samples from `perf script -F PERF_SCRIPT_FIELDS` output.
+
+    Each sample carries its thread, CPU, event, `weight` (the sample
+    period: nanoseconds for `cpu-clock`) and `frames` outermost first, the
+    reverse of the order perf prints them. A line that is neither a header
+    nor a frame is counted, never silently dropped.
+    """
+    samples = []
+    unparsed = []
+    current = None
+
+    def finish():
+        """Close the sample being read, if any."""
+        if current is not None:
+            current["frames"] = list(reversed(current.pop("leaf_first")))
+            current["dsos"] = list(reversed(current.pop("leaf_first_dsos")))
+            current["kernel"] = KERNEL_DSO in current["dsos"]
+            samples.append(current)
+
+    for line in text.splitlines():
+        if not line.strip():
+            finish()
+            current = None
+            continue
+        if current is not None and line[:1] in (" ", "\t"):
+            frame = _PERF_FRAME.match(line)
+            if frame:
+                symbol, dso = _perf_frame(frame.group("rest"))
+                current["leaf_first"].append(symbol)
+                current["leaf_first_dsos"].append(dso)
+                continue
+        header = _PERF_HEADER.match(line)
+        if header:
+            finish()
+            current = {
+                "comm": header.group("comm").strip(),
+                "tid": int(header.group("tid")),
+                "cpu": int(header.group("cpu")),
+                "time_s": float(header.group("time")),
+                "weight": int(header.group("period")),
+                "event": header.group("event"),
+                "leaf_first": [],
+                "leaf_first_dsos": [],
+            }
+            continue
+        unparsed.append(line[:160])
+    finish()
+    return {
+        "samples": [sample for sample in samples if sample["weight"] > 0],
+        "zero_weight_samples_count": sum(1 for sample in samples if sample["weight"] <= 0),
+        "unparsed_lines_count": len(unparsed),
+        "unparsed_lines": unparsed[:5],
+    }
+
+
+def leaf_symbols(samples, category=None, limit=10) -> list:
+    """The heaviest innermost symbols, optionally of one category only.
+
+    For `unknown` this is the named residual: what the samples no rule
+    matched were actually executing.
+    """
+    weights = collections.Counter()
+    for sample in samples:
+        if category is not None and classify_frames(sample["frames"])[0] != category:
+            continue
+        leaf = frame_path(sample["frames"][-1]) if sample["frames"] else "[no frames]"
+        weights[leaf] += sample["weight"]
+    total = sum(weights.values())
+    return [
+        {"symbol": symbol, "weight": weight, "share_ratio": weight / total if total else 0.0}
+        for symbol, weight in weights.most_common(limit)
+    ]
+
+
+def profile_summary(samples, *, flush_marker="series_parquet_exporter::flush::") -> dict:
+    """Everything one profile says, reduced to what a result keeps.
+
+    Per category statistics, the stage each allocator sample was called
+    from, CPU seconds per logical CPU and per thread name, the share of
+    samples that carried kernel frames, the flush task's own CPU and the
+    named residual. The raw samples stay in the run's artifacts.
+    """
+    statistics = category_statistics(samples)
+    per_cpu = collections.Counter()
+    per_comm = collections.Counter()
+    flush_task_weight = 0
+    kernel = 0
+    for sample in samples:
+        per_cpu[sample.get("cpu")] += sample["weight"]
+        per_comm[sample.get("comm")] += sample["weight"]
+        if sample.get("kernel"):
+            kernel += 1
+        if any(flush_marker in frame for frame in sample["frames"]):
+            flush_task_weight += sample["weight"]
+    statistics["allocator_callers"] = allocator_callers(samples)
+    statistics["cpu_s_by_logical_cpu"] = {
+        str(cpu): weight / 1e9 for cpu, weight in sorted(per_cpu.items(), key=str)
+    }
+    statistics["cpu_s_by_thread_name"] = {
+        str(comm): weight / 1e9 for comm, weight in per_comm.most_common()
+    }
+    statistics["kernel_samples_count"] = kernel
+    statistics["events"] = sorted({str(sample.get("event")) for sample in samples})
+    # perf names a user-space-only event with a `:u` modifier.
+    statistics["user_space_only"] = bool(samples) and all(
+        str(sample.get("event", "")).endswith(":u") for sample in samples
+    )
+    statistics["flush_task_weight"] = flush_task_weight
+    statistics["named_residual"] = leaf_symbols(samples, UNKNOWN_CATEGORY)
+    statistics["heaviest_leaves_by_category"] = {
+        name: leaf_symbols(samples, name, limit=5)
+        for name in CPU_CATEGORIES
+        if statistics["categories"][name]["samples_count"]
+    }
+    return statistics
+
+
+# --------------------------------------------------------------------------
+# Recording a profile
+# --------------------------------------------------------------------------
+
+# The profile every attribution records: a software CPU clock, so each
+# sample's period is CPU nanoseconds whatever the core's frequency, at 199
+# samples per second of each thread's CPU time, with DWARF call graphs.
+PERF_BINARY_ENV = "SERIES_PERF"
+PERF_EVENT = "cpu-clock"
+PERF_FREQUENCY_HZ = 199
+PERF_CALL_GRAPH = "dwarf"
+
+# How long perf may take to acknowledge a control command, to stop and to
+# write the script of one profile.
+PERF_ACK_DEADLINE_S = 30
+PERF_STOP_DEADLINE_S = 120
+PERF_SCRIPT_DEADLINE_S = 1800
+
+# How much CPU the preflight's busy child must burn while perf records it.
+PREFLIGHT_BUSY_NS = 300_000_000
+PREFLIGHT_DEADLINE_S = 30
+
+
+# The demangler `perf script` output passes through: binutils' c++filt
+# reads Rust's v0 mangling, which perf itself leaves mangled.
+DEMANGLER = ("c++filt",)
+
+# The engine an attribution profiles, and how it is built. The workspace's
+# default linker, lld, places the executable segment at a virtual address
+# that differs from its file offset, and perf's libdw unwinder derives the
+# module's base from the file offset: every call-frame lookup lands 4 KiB
+# away and each stack ends after its first frame. Relinking only the binary
+# crate with `-z separate-loadable-segments` makes every segment's offset
+# equal its address and changes no generated code.
+ATTRIBUTION_ENGINE_ENV = "SERIES_ATTRIBUTION_ENGINE"
+ATTRIBUTION_ENGINE = "target/release/df_engine-perf"
+ATTRIBUTION_ENGINE_BUILD = (
+    "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine "
+    "--features series-parquet,aws,durable-buffer -- "
+    "-C link-arg=-Wl,-z,separate-loadable-segments && "
+    "cp target/release/df_engine target/release/df_engine-perf && "
+    "cargo build --release --locked -p otel-arrow-dfe --bin df_engine "
+    "--features series-parquet,aws,durable-buffer"
+)
+
+
+def attribution_engine() -> Path:
+    """The engine binary an attribution profiles."""
+    return Path(
+        os.environ.get(ATTRIBUTION_ENGINE_ENV)
+        or Path(test_e2e.WORKSPACE) / ATTRIBUTION_ENGINE
+    )
+
+
+def elf_load_segments(path) -> list:
+    """Every PT_LOAD of a 64-bit little-endian ELF: offset, address, flags."""
+    with open(path, "rb") as handle:
+        header = handle.read(64)
+        if header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+            raise AssertionError(f"{path} is not a 64-bit little-endian ELF")
+        phoff = struct.unpack_from("<Q", header, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", header, 54)
+        handle.seek(phoff)
+        table = handle.read(phentsize * phnum)
+    segments = []
+    for index in range(phnum):
+        kind, flags, offset, vaddr = struct.unpack_from("<IIQQ", table, index * phentsize)
+        if kind == 1:
+            segments.append({"offset": offset, "vaddr": vaddr, "executable": bool(flags & 1)})
+    return segments
+
+
+def unwind_layout(path) -> dict:
+    """Whether perf's libdw unwinder can place this binary's code.
+
+    It can when every executable segment sits at the same address-minus-
+    offset as the first segment, which is where the unwinder puts the
+    module's base.
+    """
+    segments = elf_load_segments(path)
+    base = segments[0]["vaddr"] - segments[0]["offset"] if segments else None
+    skewed = [
+        segment for segment in segments
+        if segment["executable"] and segment["vaddr"] - segment["offset"] != base
+    ]
+    return {
+        "binary": str(path),
+        "compatible": bool(segments) and not skewed,
+        "skewed_executable_segments": [
+            {"offset": hex(segment["offset"]), "vaddr": hex(segment["vaddr"])}
+            for segment in skewed
+        ],
+        "build": ATTRIBUTION_ENGINE_BUILD,
+    }
+
+
+# The canonical release engine, the features both engines are built with,
+# and the one flag the profiled engine adds.
+CANONICAL_ENGINE = "target/release/df_engine"
+ENGINE_FEATURES = "series-parquet,aws,durable-buffer"
+PROFILED_LINK_ARG = "link-arg=-Wl,-z,separate-loadable-segments"
+ENGINE_BUILD_LOG = "engine-build.log"
+
+
+def engine_build_commands() -> dict:
+    """The cargo commands that build both engines, in order.
+
+    The canonical engine is built first, so it is the release engine of the
+    current tree; the profiled one is the same crate graph with the single
+    extra linker argument passed to the binary crate only, which relinks it
+    and compiles nothing; the last command restores the canonical binary,
+    which cargo keeps beside the relinked one.
+    """
+    base = [
+        "cargo", "build", "--release", "--locked", "-p", "otel-arrow-dfe",
+        "--bin", "df_engine", "--features", ENGINE_FEATURES,
+    ]
+    profiled = [
+        "cargo", "rustc", "--release", "--locked", "-p", "otel-arrow-dfe",
+        "--bin", "df_engine", "--features", ENGINE_FEATURES, "--", "-C",
+        PROFILED_LINK_ARG,
+    ]
+    return {"canonical": base, "profiled": profiled, "restore": base}
+
+
+def rust_tree_status() -> dict:
+    """Whether the Rust tree has any change: tracked, or an untracked file.
+
+    An untracked source file can be compiled in -- a new module, a build
+    script input -- so it makes the tree as unrecorded as an edit does;
+    ignored build output does not appear here.
+    """
+    done = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", "rust"],
+        capture_output=True, text=True, timeout=60, cwd=str(measurement.REPO_ROOT),
+    )
+    changes = [line for line in done.stdout.splitlines() if line.strip()]
+    return {
+        "clean": done.returncode == 0 and not changes,
+        "changes": changes[:10],
+        "returncode": done.returncode,
+    }
+
+
+def function_symbols(binary, nm="nm") -> dict:
+    """A digest of every defined function symbol with its size.
+
+    Two binaries linked from the same objects list the same functions with
+    the same sizes whatever their segment layout; any difference in source,
+    features, profile or compiler changes the list. The digest covers the
+    sorted `(size, demangled name)` pairs of text and weak symbols.
+    """
+    done = subprocess.run(
+        [nm, "--defined-only", "--size-sort", "-C", str(binary)],
+        capture_output=True, text=True, errors="replace", timeout=600,
+    )
+    if done.returncode != 0:
+        raise AssertionError(f"{nm} failed on {binary}: {done.stderr[-300:]}")
+    entries = []
+    for line in done.stdout.splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) == 3 and fields[1] in ("t", "T", "w", "W"):
+            entries.append(f"{int(fields[0], 16)} {fields[2]}")
+    entries.sort()
+    return {
+        "count": len(entries),
+        "sha256": hashlib.sha256("\n".join(entries).encode("utf-8", "replace")).hexdigest(),
+        "tool": f"{nm} --defined-only --size-sort -C, types t T w W",
+    }
+
+
+def rustc_version() -> str:
+    """The full `rustc -vV` of the toolchain that builds the engines."""
+    done = subprocess.run(
+        ["rustc", "-vV"], capture_output=True, text=True, timeout=60,
+        cwd=str(test_e2e.WORKSPACE),
+    )
+    return done.stdout.strip()
+
+
+def source_state() -> dict:
+    """The Rust tree's cleanliness and the checked-out revision, now."""
+    tree = rust_tree_status()
+    return {
+        "clean": tree["clean"],
+        "changes": tree["changes"],
+        "revision": measurement.git_provenance().get("revision"),
+    }
+
+
+def source_changed(before, after) -> list:
+    """Why the source two states describe is not the same clean source."""
+    problems = []
+    if not after["clean"]:
+        problems.append(f"the Rust tree has changes {after['changes']}")
+    if after["revision"] != before["revision"]:
+        problems.append(
+            f"the revision moved from {before['revision']} to {after['revision']}"
+        )
+    return problems
+
+
+def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
+                            lease_path=None) -> dict:
+    """Build both engines from the current tree and prove them one engine.
+
+    The Rust tree must be clean, so the revision recorded is the source that
+    was compiled. Both engines are built by `engine_build_commands`, holding
+    the host lease so no one's measurement overlaps the compile, before any
+    of this family's measured windows. Each binary's profile, features,
+    allocator, toolchain, `rustc -vV`, hash, segment layout and
+    function-symbol digest are recorded, with the exact flag difference. The
+    engines are one engine only when their function symbols are identical;
+    the profiled one must also have a layout perf can unwind. Any failure
+    is a named problem and the attribution is refused.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    workspace = Path(test_e2e.WORKSPACE)
+    canonical = workspace / CANONICAL_ENGINE
+    profiled = attribution_engine()
+    commands = engine_build_commands()
+    facts = {
+        "commands": {name: " ".join(argv) for name, argv in commands.items()},
+        "environment_rustflags": {
+            name: os.environ.get(name)
+            for name in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                         "CARGO_BUILD_RUSTFLAGS")
+        },
+        "rustflags_difference": {
+            "canonical": [],
+            "profiled": ["-C", PROFILED_LINK_ARG],
+            "scope": "the df_engine binary crate only, through cargo rustc",
+        },
+        "rust_tree": rust_tree_status(),
+        "git": measurement.git_provenance(),
+        "built": bool(build),
+    }
+    initial = {
+        "clean": facts["rust_tree"]["clean"],
+        "changes": facts["rust_tree"]["changes"],
+        "revision": facts["git"].get("revision"),
+    }
+    facts["source_checks"] = {"before_lease": initial}
+    problems = []
+    if not facts["rust_tree"]["clean"]:
+        problems.append(
+            f"the Rust tree has uncommitted changes {facts['rust_tree']['changes']}; "
+            f"a profiled engine must be built from a recorded revision"
+        )
+    if not build:
+        problems.append(
+            "the engines were not built by this family, so neither is proven to "
+            "be the current tree's"
+        )
+    if not problems:
+        lease = measurement.HostLease(lease_path, run_id="attribution-engine-build")
+        lease.acquire(deadline_ns=time.monotonic_ns() + int(lease_wait_s * 10**9))
+        facts["lease"] = lease.as_json()
+        try:
+            # The lease may have been waited for; the tree may have moved
+            # meanwhile, and the engines must be the recorded source's.
+            held = source_state()
+            facts["source_checks"]["after_lease"] = held
+            problems.extend(
+                f"while waiting for the lease, {problem}"
+                for problem in source_changed(initial, held)
+            )
+            commands_to_run = () if problems else ("canonical", "profiled", "restore")
+            with open(log_dir / ENGINE_BUILD_LOG, "w", encoding="ascii",
+                      errors="replace") as log:
+                for name in commands_to_run:
+                    done = subprocess.run(
+                        commands[name], cwd=str(workspace), stdout=log,
+                        stderr=subprocess.STDOUT, timeout=7200,
+                    )
+                    if done.returncode != 0:
+                        problems.append(f"the {name} build failed with {done.returncode}")
+                        break
+                    if name == "canonical":
+                        facts["canonical_sha256_before"] = measurement.file_digest(canonical)
+                    if name == "profiled":
+                        _ = shutil.copyfile(canonical, profiled)
+                        profiled.chmod(0o755)
+            if commands_to_run:
+                built = source_state()
+                facts["source_checks"]["after_builds"] = built
+                problems.extend(
+                    f"during the builds, {problem}"
+                    for problem in source_changed(initial, built)
+                )
+        finally:
+            lease.release()
+    for role, path in (("canonical", canonical), ("profiled", profiled)):
+        if not path.is_file():
+            problems.append(f"no {role} engine at {path}")
+            continue
+        described = measurement.engine_build(path)
+        described["rustc_vv"] = rustc_version()
+        described["function_symbols"] = function_symbols(path)
+        described["layout"] = unwind_layout(path)
+        facts[role] = described
+    one, other = facts.get("canonical"), facts.get("profiled")
+    if one and other:
+        if facts.get("canonical_sha256_before") not in (None, one["binary_sha256"]):
+            problems.append(
+                "restoring the canonical engine produced a different binary than "
+                "the canonical build"
+            )
+        for key in ("profile", "features", "allocator", "toolchain", "rustc_vv"):
+            if one[key] != other[key]:
+                problems.append(f"the engines differ in {key}: {one[key]} vs {other[key]}")
+        if one["profile"] != "release":
+            problems.append(f"the canonical engine is a {one['profile']} build")
+        if one["function_symbols"] != other["function_symbols"]:
+            problems.append(
+                f"the engines' function symbols differ: {one['function_symbols']} "
+                f"vs {other['function_symbols']}"
+            )
+        if one["binary_sha256"] == other["binary_sha256"]:
+            problems.append("the profiled engine was not relinked")
+        if not other["layout"]["compatible"]:
+            problems.append(
+                f"the profiled engine's executable segments are skewed: "
+                f"{other['layout']['skewed_executable_segments']}"
+            )
+    facts["problems"] = problems
+    facts["valid"] = not problems
+    return facts
+
+
+def perf_binary() -> str:
+    """The perf executable: `SERIES_PERF`, else `perf` on the PATH."""
+    return os.environ.get(PERF_BINARY_ENV) or shutil.which("perf") or "perf"
+
+
+def pinned_argv(argv, cores) -> list:
+    """`argv` confined to `cores` by `taskset`, which execs it in place."""
+    if not cores:
+        return list(argv)
+    return ["taskset", "-c", ",".join(str(core) for core in cores)] + list(argv)
+
+
+def perf_record_argv(perf, pid, output, ctl, ack) -> list:
+    """The one `perf record` command line every profile and preflight uses.
+
+    The events start disabled (`-D -1`) and are switched on and off through
+    the control FIFOs, so the profile covers exactly the input phase.
+    `--sample-cpu` records the CPU of each sample, which a per-process
+    recording otherwise leaves out.
+    """
+    return [
+        str(perf), "record", "-e", PERF_EVENT, "-F", str(PERF_FREQUENCY_HZ),
+        "-g", "--call-graph", PERF_CALL_GRAPH, "--sample-cpu", "-p", str(pid),
+        "-o", str(output), "-D", "-1", "--control", f"fifo:{ctl},{ack}",
+    ]
+
+
+# perf record answers an interrupt by writing its file and then ending
+# itself with that same signal, so both exits mean a complete recording.
+PERF_COMPLETE_EXITS = (0, -signal.SIGINT)
+
+
+def perf_script_argv(perf, data) -> list:
+    """The `perf script` command line that turns a profile into samples."""
+    return [
+        str(perf), "script", "-i", str(data), "-F", PERF_SCRIPT_FIELDS,
+        "--no-inline",
+    ]
+
+
+class PerfRecorder:
+    """One `perf record -p` of one process, driven through control FIFOs.
+
+    `start` attaches with the events disabled, `enable` and `disable`
+    switch them and return when perf has acknowledged, `stop` interrupts
+    perf so it writes its file, and `script` runs `perf script` on it. perf
+    runs confined to the profiler's own cores.
+    """
+
+    def __init__(self, directory, *, cores=(), perf=None):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.perf = perf or perf_binary()
+        self.cores = [int(core) for core in cores]
+        self.data = self.directory / "perf.data"
+        self.log_path = self.directory / "perf.log"
+        self.ctl = self.directory / "perf.ctl"
+        self.ack = self.directory / "perf.ack"
+        self.process = None
+        self.argv = None
+        self.returncode = None
+        self.enabled_ns = None
+        self.disabled_ns = None
+        self._ctl_fd = None
+        self._ack_fd = None
+        self._log = None
+        self.demangler = None
+
+    def start(self, pid):
+        """Attach to `pid` with every event disabled."""
+        for fifo in (self.ctl, self.ack):
+            if fifo.exists():
+                fifo.unlink()
+            os.mkfifo(fifo)
+        # Both ends are opened read-write before perf starts, so neither side
+        # ever blocks opening a FIFO that has no peer yet.
+        self._ctl_fd = os.open(self.ctl, os.O_RDWR | os.O_NONBLOCK)
+        self._ack_fd = os.open(self.ack, os.O_RDWR | os.O_NONBLOCK)
+        self.argv = pinned_argv(
+            perf_record_argv(self.perf, pid, self.data, self.ctl, self.ack), self.cores
+        )
+        self._log = open(self.log_path, "w", encoding="ascii", errors="replace")
+        self.process = subprocess.Popen(
+            self.argv, stdout=self._log, stderr=subprocess.STDOUT
+        )
+        return self
+
+    @property
+    def pid(self):
+        """perf's own PID; `taskset` execs perf, so it is the same process."""
+        return self.process.pid
+
+    def log_tail(self, lines=12) -> str:
+        """The end of perf's own output."""
+        if self._log is not None and not self._log.closed:
+            self._log.flush()
+        try:
+            text = self.log_path.read_text(encoding="ascii", errors="replace")
+        except OSError:
+            return ""
+        return " | ".join(text.strip().splitlines()[-lines:])
+
+    def command(self, verb, deadline_s=PERF_ACK_DEADLINE_S) -> int:
+        """Send one control command and wait for perf's acknowledgement."""
+        if self.process is None:
+            raise AssertionError(f"perf was never started, so it cannot {verb}")
+        _ = os.write(self._ctl_fd, f"{verb}\n".encode("ascii"))
+        received = b""
+
+        def observe():
+            """Whatever perf has acknowledged, or its exit."""
+            nonlocal received
+            code = self.process.poll()
+            if code is not None:
+                return ("exited", code)
+            ready, _, _ = select.select([self._ack_fd], [], [], 0.05)
+            if ready:
+                try:
+                    received += os.read(self._ack_fd, 64)
+                except BlockingIOError:
+                    pass
+            return ("ack", received) if b"ack" in received else ("waiting", received)
+
+        state, value = measurement.wait_until(
+            observe,
+            lambda observed: observed[0] != "waiting",
+            deadline_ns=time.monotonic_ns() + int(deadline_s * 10**9),
+            description=f"perf acknowledging {verb}",
+        )
+        if state == "exited":
+            raise AssertionError(
+                f"perf exited with {value} before acknowledging {verb}: "
+                f"{self.log_tail()}"
+            )
+        return time.monotonic_ns()
+
+    def enable(self):
+        """Start sampling; returns once perf says the events are enabled."""
+        self.enabled_ns = self.command("enable")
+        return self.enabled_ns
+
+    def disable(self):
+        """Stop sampling; returns once perf says the events are disabled."""
+        self.disabled_ns = self.command("disable")
+        return self.disabled_ns
+
+    def stop(self, deadline_s=PERF_STOP_DEADLINE_S) -> int:
+        """Interrupt perf so it finishes its file, and wait for it."""
+        if self.process is None:
+            return None
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGINT)
+        try:
+            self.returncode = self.process.wait(timeout=deadline_s)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.returncode = self.process.wait(timeout=30)
+            raise AssertionError(
+                f"perf did not finish within {deadline_s}s of an interrupt: "
+                f"{self.log_tail()}"
+            )
+        return self.returncode
+
+    def script(self, output, deadline_s=PERF_SCRIPT_DEADLINE_S) -> str:
+        """Run `perf script` on the recorded file and return its text.
+
+        perf demangles legacy Rust symbols but not v0 ones (`_RNv...`), so
+        the text is passed through the demangler when one is installed; the
+        file keeps what the classifier read.
+        """
+        output = Path(output)
+        done = subprocess.run(
+            pinned_argv(perf_script_argv(self.perf, self.data), self.cores),
+            capture_output=True, text=True, errors="replace", timeout=deadline_s,
+        )
+        if done.returncode != 0:
+            raise AssertionError(
+                f"perf script failed with {done.returncode}: {done.stderr[-500:]}"
+            )
+        text = done.stdout
+        demangler = shutil.which(DEMANGLER[0])
+        if demangler:
+            demangled = subprocess.run(
+                [demangler] + list(DEMANGLER[1:]), input=text, capture_output=True,
+                text=True, errors="replace", timeout=deadline_s,
+            )
+            if demangled.returncode != 0:
+                raise AssertionError(
+                    f"{DEMANGLER[0]} failed with {demangled.returncode}"
+                )
+            text = demangled.stdout
+        self.demangler = demangler
+        output.write_text(text.encode("ascii", "replace").decode("ascii"), encoding="ascii")
+        return output.read_text(encoding="ascii")
+
+    def close(self):
+        """Release the FIFOs and perf's log; perf is killed if still alive."""
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.returncode = self.process.wait(timeout=30)
+        for name in ("_ctl_fd", "_ack_fd"):
+            descriptor = getattr(self, name)
+            if descriptor is not None:
+                os.close(descriptor)
+                setattr(self, name, None)
+        if self._log is not None and not self._log.closed:
+            self._log.close()
+
+    def as_json(self) -> dict:
+        """What this recording was, for a result."""
+        # The FIFO argument joins its paths with a colon, which the publish
+        # scrubber leaves alone, so the recording's own directory is
+        # replaced by a token here.
+        directory = str(self.directory)
+        return {
+            "argv": [
+                argument.replace(directory, PERF_DIR_TOKEN) for argument in self.argv
+            ] if self.argv else None,
+            "returncode": self.returncode,
+            "data": measurement.file_entry(self.data) if self.data.is_file() else None,
+            "log_tail": self.log_tail(),
+            "enabled_window_s": (
+                (self.disabled_ns - self.enabled_ns) / 1e9
+                if self.enabled_ns and self.disabled_ns else None
+            ),
+            "demangler": self.demangler,
+        }
+
+
+# What a recording's own directory reads as in a published result.
+PERF_DIR_TOKEN = "<perf_dir>"
+
+
+# The busy child the preflight profiles: it burns CPU until killed.
+PREFLIGHT_BUSY_CODE = (
+    "import time\n"
+    "end = time.monotonic() + 60\n"
+    "while time.monotonic() < end:\n"
+    "    pass\n"
+)
+
+
+def perf_event_paranoid(path="/proc/sys/kernel/perf_event_paranoid"):
+    """The kernel's perf access setting, or None where it cannot be read."""
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def perf_preflight(directory, *, cores=(), perf=None, engine=None) -> dict:
+    """Whether the exact recording an attribution makes works on this host.
+
+    A busy child is profiled with the same command line, control FIFOs and
+    script command a measured run uses. The host can attribute only if perf
+    attaches, acknowledges enable and disable, and `perf script` yields at
+    least one unwound sample. Nothing here needs the host lease: it runs no
+    engine and measures nothing.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    perf = perf or perf_binary()
+    facts = {
+        "perf": perf,
+        "event": PERF_EVENT,
+        "frequency_hz": PERF_FREQUENCY_HZ,
+        "call_graph": PERF_CALL_GRAPH,
+        "perf_event_paranoid": perf_event_paranoid(),
+        "cores": list(cores),
+        "attached": False,
+    }
+    if shutil.which(perf) is None and not Path(perf).is_file():
+        facts["reason"] = f"no perf executable {perf!r} on this host"
+        return facts
+    if engine is not None:
+        if not Path(engine).is_file():
+            facts["reason"] = (
+                f"no profilable engine at {engine}; build it with: "
+                f"{ATTRIBUTION_ENGINE_BUILD}"
+            )
+            return facts
+        facts["engine_layout"] = unwind_layout(engine)
+        if not facts["engine_layout"]["compatible"]:
+            facts["reason"] = (
+                f"{engine} has executable segments whose address differs from "
+                f"their file offset, which perf's unwinder cannot place; relink "
+                f"it with: {ATTRIBUTION_ENGINE_BUILD}"
+            )
+            return facts
+    try:
+        version = subprocess.run(
+            [perf, "--version"], capture_output=True, text=True, timeout=30
+        )
+        facts["version"] = (version.stdout or version.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        facts["reason"] = f"perf --version failed: {error}"
+        return facts
+    busy = subprocess.Popen(pinned_argv([sys.executable, "-c", PREFLIGHT_BUSY_CODE], cores))
+    recorder = PerfRecorder(directory, cores=cores, perf=perf)
+    try:
+        recorder.start(busy.pid)
+        recorder.enable()
+        start = procfs_cpu_ns(busy.pid)
+        _ = measurement.wait_until(
+            lambda: procfs_cpu_ns(busy.pid) - start,
+            lambda burned: burned >= PREFLIGHT_BUSY_NS,
+            deadline_ns=time.monotonic_ns() + PREFLIGHT_DEADLINE_S * 10**9,
+            description="the preflight child burning CPU while perf records it",
+        )
+        recorder.disable()
+        facts["record_returncode"] = recorder.stop()
+        if facts["record_returncode"] not in PERF_COMPLETE_EXITS:
+            raise AssertionError(
+                f"perf record ended with {facts['record_returncode']}: "
+                f"{recorder.log_tail()}"
+            )
+        parsed = parse_perf_script(recorder.script(directory / "perf-script.txt"))
+        samples = parsed["samples"]
+        facts["samples_count"] = len(samples)
+        facts["unwound_samples_count"] = sum(
+            1 for sample in samples if len(sample["frames"]) >= 2
+        )
+        facts["unparsed_lines_count"] = parsed["unparsed_lines_count"]
+        facts["attached"] = facts["unwound_samples_count"] > 0
+        if not facts["attached"]:
+            facts["reason"] = (
+                f"perf recorded {len(samples)} samples of a busy process and "
+                f"none with an unwound call chain"
+            )
+    except (AssertionError, OSError, ValueError, subprocess.SubprocessError) as error:
+        facts["reason"] = f"{type(error).__name__}: {error}"
+    finally:
+        busy.kill()
+        _ = busy.wait(timeout=30)
+        facts["perf_log_tail"] = recorder.log_tail()
+        recorder.close()
+    return facts
+
+
+# --------------------------------------------------------------------------
+# What the engine's threads and flushes did while it was profiled
+# --------------------------------------------------------------------------
+
+
+def procfs_user_system_ns(pid) -> dict:
+    """One process's user and system CPU time, from its tick counters.
+
+    A profile restricted to user space (`cpu-clock:u`, which perf records
+    when the host allows only user-space measurement) is compared with the
+    user time alone; the kernel time it could not see is reported beside
+    it rather than spread over the categories.
+    """
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    tick = 10**9 // os.sysconf("SC_CLK_TCK")
+    return {"user_ns": int(fields[11]) * tick, "system_ns": int(fields[12]) * tick}
+
+
+def thread_times(pid) -> dict:
+    """Each live thread's scheduler times, from `/proc/PID/task/*/schedstat`.
+
+    The first field is the time the thread ran, the second the time it sat
+    runnable on a run queue waiting for a CPU, both in nanoseconds.
+    """
+    threads = {}
+    task = Path(f"/proc/{pid}/task")
+    try:
+        entries = list(task.iterdir())
+    except OSError:
+        return threads
+    for entry in entries:
+        try:
+            fields = (entry / "schedstat").read_text().split()
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        if len(fields) < 3:
+            continue
+        threads[int(entry.name)] = {
+            "comm": comm,
+            "on_cpu_ns": int(fields[0]),
+            "runqueue_wait_ns": int(fields[1]),
+            "timeslices_count": int(fields[2]),
+        }
+    return threads
+
+
+def thread_schedule(before, after, window_ns, worker_tids) -> dict:
+    """How the engine's threads spent one window, and its workers' fractions.
+
+    Every thread alive at the end is listed with the CPU it used and the
+    time it waited for a CPU during the window. For each worker the window
+    is split into on-CPU, run-queue (scheduler) and off-CPU (blocked or
+    idle) fractions, which add up to one.
+    """
+    empty = {"on_cpu_ns": 0, "runqueue_wait_ns": 0, "timeslices_count": 0}
+    threads = []
+    for tid, end in sorted(after.items()):
+        start = before.get(tid, empty)
+        threads.append(
+            {
+                "tid": tid,
+                "comm": end["comm"],
+                "role": "worker" if tid in worker_tids else "other",
+                "on_cpu_s": (end["on_cpu_ns"] - start["on_cpu_ns"]) / 1e9,
+                "runqueue_wait_s": (
+                    end["runqueue_wait_ns"] - start["runqueue_wait_ns"]
+                ) / 1e9,
+                "timeslices_count": end["timeslices_count"] - start["timeslices_count"],
+                "started_in_window": tid not in before,
+            }
+        )
+    workers = {}
+    window_s = window_ns / 1e9
+    for thread in threads:
+        if thread["role"] != "worker" or window_s <= 0:
+            continue
+        on_cpu = thread["on_cpu_s"] / window_s
+        runqueue = thread["runqueue_wait_s"] / window_s
+        workers[str(thread["tid"])] = {
+            "on_cpu_ratio": on_cpu,
+            "runqueue_wait_ratio": runqueue,
+            "off_cpu_ratio": max(0.0, 1.0 - on_cpu - runqueue),
+        }
+    return {
+        "window_s": window_s,
+        "threads": threads,
+        "workers": workers,
+        "other_threads_on_cpu_s": sum(
+            thread["on_cpu_s"] for thread in threads if thread["role"] != "worker"
+        ),
+    }
+
+
+# The exporter's flush wall-time instrument. It is a distribution, which the
+# OTLP export drains every collection; the admin API reads the same
+# accumulator without resetting it, so what it serves is cumulative over the
+# engine's lifetime. A window's flushes are therefore the difference of two
+# readings, never a sum over collections.
+FLUSH_METRIC = "exporter.series_parquet:flush.duration"
+
+
+def flush_reading(document) -> dict:
+    """The cumulative flush wall time and count one telemetry document shows.
+
+    Every worker's single exporter entity is read and the workers are
+    added; a worker with two exporter entities is ambiguous and an error,
+    and a worker whose exporter published no flush instrument yet reads as
+    no flushes, because the instrument exists only once a flush completed.
+    """
+    parsed = measurement.parse_telemetry(document, expected_workers=None)
+    reading = {"sum_s": 0.0, "count": 0, "max_s": 0.0, "workers_count": 0}
+    for key, worker in sorted(parsed["workers"].items()):
+        entities = worker["metrics"].get(FLUSH_METRIC) or {}
+        if len(entities) > 1:
+            raise AssertionError(f"{key} publishes {FLUSH_METRIC} for {sorted(entities)}")
+        if not entities:
+            continue
+        value = next(iter(entities.values()))
+        if not isinstance(value, dict):
+            raise AssertionError(f"{key} reports {FLUSH_METRIC} as {value!r}")
+        count = int(value.get("count") or 0)
+        reading["workers_count"] += 1
+        reading["sum_s"] += float(value.get("sum") or 0.0)
+        reading["count"] += count
+        if count:
+            reading["max_s"] = max(reading["max_s"], float(value.get("max") or 0.0))
+    return reading
+
+
+def flush_window(before, after) -> dict:
+    """The flushes that completed between two cumulative readings."""
+    count = after["count"] - before["count"]
+    wall = after["sum_s"] - before["sum_s"]
+    if count < 0 or wall < -1e-9:
+        raise AssertionError(
+            f"the cumulative flush instrument went backwards: {before} -> {after}"
+        )
+    return {
+        "flush_count": count,
+        "flush_wall_s": max(0.0, wall),
+        # The maximum is cumulative too; it covers this window only when the
+        # window holds the lifetime's first flush, which it does here.
+        "flush_max_s": after["max_s"],
+    }
+
+
+COMMITTED_EVENT = "series_parquet.block.committed"
+
+
+def committed_blocks(log_path) -> int:
+    """How many blocks the engine's own log says it committed."""
+    try:
+        text = Path(log_path).read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return 0
+    return sum(1 for line in text.splitlines() if COMMITTED_EVENT in line)
+
+
+def exporter_counter(engine, name) -> float:
+    """The largest value of one exporter counter the admin API reports now."""
+    values = test_e2e.metric_values(test_e2e.engine_metrics(engine), name)
+    if not values:
+        raise AssertionError(f"the engine reports no exporter metric {name}")
+    return max(values)
+
+
+# --------------------------------------------------------------------------
+# Prebuilt inputs
+# --------------------------------------------------------------------------
+
+# A profile needs seconds of engine CPU, which is millions of records, and
+# building a 1 KiB log record in Python costs more than the engine spends on
+# it. The requests are therefore built once, before any lease, in parallel
+# processes, into three files: the concatenated wire bodies, one
+# (request index, offset, length) entry per request, and one kind byte and
+# raw SHA-256 per record. The sender reads a request back by index; the
+# record ids are regenerated from the workload, exactly as `build_request`
+# forms them.
+PREBUILT_FORMAT = "series-attribution-prebuilt/1"
+_PREBUILT_OFFSET = struct.Struct("<QQI")
+_PREBUILT_DIGEST_BYTES = 33
+PREBUILT_CHUNK_REQUESTS = 128
+
+
+def _build_prebuilt_chunk(payload) -> list:
+    """Build one chunk of requests; runs in a worker process."""
+    workload_fields, indexes = payload
+    workload = measurement.Workload(**workload_fields)
+    built = []
+    for index in indexes:
+        signal_name, wire, rows = measurement.build_request(workload, index)
+        packed = b"".join(
+            bytes([measurement.ALL_KINDS.index(kind)]) + bytes.fromhex(digest)
+            for _record_id, kind, digest in rows
+        )
+        built.append((index, signal_name, wire, packed))
+    return built
+
+
+class PrebuiltRequests:
+    """One signal's requests of one workload, built once, read by index."""
+
+    FILES = ("wire.bin", "offsets.bin", "digests.bin")
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.sidecar = json.loads(
+            (self.directory / "sidecar.json").read_text(encoding="ascii")
+        )
+        if self.sidecar.get("format") != PREBUILT_FORMAT:
+            raise AssertionError(f"{directory} is not a {PREBUILT_FORMAT} input")
+        self.workload = measurement.Workload(**self.sidecar["workload"])
+        self.signal = self.sidecar["signal"]
+        offsets = (self.directory / "offsets.bin").read_bytes()
+        self.entries = {}
+        for ordinal in range(len(offsets) // _PREBUILT_OFFSET.size):
+            index, offset, length = _PREBUILT_OFFSET.unpack_from(
+                offsets, ordinal * _PREBUILT_OFFSET.size
+            )
+            self.entries[index] = (ordinal, offset, length)
+        self.indexes = sorted(self.entries)
+        self._files = []
+        self.wire = self._map("wire.bin")
+        self.digests = self._map("digests.bin")
+
+    def _map(self, name):
+        """A read-only map of one of the input's files."""
+        handle = open(self.directory / name, "rb")
+        self._files.append(handle)
+        if os.fstat(handle.fileno()).st_size == 0:
+            return b""
+        return mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def request(self, index):
+        """Request `index` as `build_request` returns it."""
+        ordinal, offset, length = self.entries[index]
+        wire = bytes(self.wire[offset:offset + length])
+        width = self.workload.records_per_request
+        base = ordinal * width * _PREBUILT_DIGEST_BYTES
+        rows = []
+        for point in range(width):
+            start = base + point * _PREBUILT_DIGEST_BYTES
+            entry = self.digests[start:start + _PREBUILT_DIGEST_BYTES]
+            kind = measurement.ALL_KINDS[entry[0]]
+            rows.append(
+                (
+                    measurement.stable_id(self.workload.seed, index, point, kind),
+                    kind,
+                    bytes(entry[1:]).hex(),
+                )
+            )
+        return self.signal, wire, rows
+
+    def close(self):
+        """Release the maps and files."""
+        for mapped in (self.wire, self.digests):
+            if isinstance(mapped, mmap.mmap):
+                mapped.close()
+        for handle in self._files:
+            handle.close()
+        self._files = []
+
+    def as_json(self) -> dict:
+        """The input as a result records it."""
+        return {
+            key: self.sidecar[key]
+            for key in ("format", "signal", "requests", "records", "wire_bytes",
+                        "files", "workload", "build_s", "processes")
+        }
+
+    @classmethod
+    def build(cls, workload, signal_name, directory, *, processes=None):
+        """Build the input unless an identical one is already there.
+
+        `processes=0` builds in this process, which only the fast contract
+        tests do. Three requests -- the first, the middle and the last --
+        are read back and compared byte for byte with `build_request`.
+        """
+        directory = Path(directory)
+        sidecar_path = directory / "sidecar.json"
+        if sidecar_path.is_file():
+            existing = json.loads(sidecar_path.read_text(encoding="ascii"))
+            if (
+                existing.get("format") == PREBUILT_FORMAT
+                and existing.get("workload") == workload.as_json()
+                and existing.get("signal") == signal_name
+                and all(
+                    measurement.file_entry(directory / name)
+                    == existing["files"].get(name)
+                    for name in cls.FILES
+                )
+            ):
+                return cls(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        indexes = request_indexes(workload, signal_name)
+        chunks = [
+            (workload.as_json(), indexes[start:start + PREBUILT_CHUNK_REQUESTS])
+            for start in range(0, len(indexes), PREBUILT_CHUNK_REQUESTS)
+        ]
+        started = time.monotonic_ns()
+        if processes is None:
+            processes = max(1, len(os.sched_getaffinity(0)))
+        temporary = {name: directory / f"{name}.partial" for name in cls.FILES}
+        offset = 0
+        records = 0
+        with open(temporary["wire.bin"], "wb") as wire, open(
+            temporary["offsets.bin"], "wb"
+        ) as offsets, open(temporary["digests.bin"], "wb") as digests:
+            if processes == 0:
+                results = map(_build_prebuilt_chunk, chunks)
+                pool = None
+            else:
+                pool = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=processes,
+                    mp_context=multiprocessing.get_context("spawn"),
+                )
+                results = pool.map(_build_prebuilt_chunk, chunks)
+            try:
+                for built in results:
+                    for index, actual, body, packed in built:
+                        if actual != signal_name:
+                            raise AssertionError(
+                                f"request {index} is {actual}, not {signal_name}"
+                            )
+                        _ = wire.write(body)
+                        _ = offsets.write(_PREBUILT_OFFSET.pack(index, offset, len(body)))
+                        _ = digests.write(packed)
+                        offset += len(body)
+                        records += len(packed) // _PREBUILT_DIGEST_BYTES
+            finally:
+                if pool is not None:
+                    pool.shutdown()
+        for name, path in temporary.items():
+            os.replace(path, directory / name)
+        sidecar = {
+            "format": PREBUILT_FORMAT,
+            "signal": signal_name,
+            "workload": workload.as_json(),
+            "requests": len(indexes),
+            "records": records,
+            "wire_bytes": offset,
+            "files": {name: measurement.file_entry(directory / name) for name in cls.FILES},
+            "build_s": (time.monotonic_ns() - started) / 1e9,
+            "processes": processes,
+        }
+        _ = measurement.write_json_atomic(sidecar_path, sidecar)
+        prebuilt = cls(directory)
+        for index in sorted({indexes[0], indexes[len(indexes) // 2], indexes[-1]}):
+            if prebuilt.request(index) != measurement.build_request(workload, index):
+                prebuilt.close()
+                raise AssertionError(
+                    f"prebuilt request {index} differs from build_request"
+                )
+        return prebuilt
+
+
+# --------------------------------------------------------------------------
+# The attribution family
+# --------------------------------------------------------------------------
+
+# The acceptance numbers of an attribution family. Each workload needs this
+# many classified samples over its repetitions; the input is sized from the
+# stage family's cost so that it gets them with the margin. The margin
+# covers what the sizing cannot know: the benches' cost is an estimate of
+# the engine's (the first rehearsal measured 5.5 us per log record against
+# 6.6 us predicted), a user-space-only profile cannot see kernel time, and
+# unknown samples do not count.
+ATTRIBUTION_MINIMUM_SAMPLES = 10_000
+ATTRIBUTION_REPETITIONS = 3
+ATTRIBUTION_SAMPLE_MARGIN = 2.0
+
+# The share of the input a repetition's unprofiled control lifetime sends,
+# in whole blocks from the start. It measures the same steady state the
+# profiled lifetime does -- hundreds of blocks -- for perf's overhead, at a
+# third of the cost.
+CONTROL_FRACTION = 1 / 3
+
+# The engine configuration a profiled lifetime runs. An acknowledgement is
+# durable, so a sender's request waits for its block's flush: a block
+# rotates when it holds this many requests, and twice that many are in
+# flight, so one block fills while the previous one flushes. The window
+# interval is the stage family's.
+ATTRIBUTION_BLOCK_REQUESTS = 128
+ATTRIBUTION_IN_FLIGHT = 256
+ATTRIBUTION_INTERVAL_S = 15
+
+# The plan's Stage agreement rule, the binding reconciliation: the sum of
+# the exclusive category CPU and the named residual is compared with the
+# engine CPU the scheduler measured over the same window. A reconciliation
+# error above 10 percent, or unexplained CPU above 20 percent, invalidates
+# the attribution. Unexplained CPU is the named residual (samples no rule
+# matched) plus any measured CPU the samples did not cover.
+STAGE_AGREEMENT_ERROR_LIMIT = 0.10
+UNEXPLAINED_CPU_LIMIT = 0.20
+
+# The band of the DESCRIPTIVE per-stage comparison of engine-attributed
+# costs with isolated bench costs. It is not an acceptance model and gates
+# nothing: the two measure the same code in different contexts -- block
+# sizes, cache state, a shared worker thread. A row outside it must carry a
+# measured explanation from published evidence or say it is unexplained.
+AGREEMENT_BOUNDS = (0.5, 2.0)
+
+# The stage family of record every attribution is reconciled against: the
+# family measured under the campaign pin, by index and hash. The committed
+# index was later rescrubbed of host paths, which changed its bytes but no
+# measured value; both hashes are recorded.
+PINNED_STAGE_FAMILY = {
+    "index": "stages",
+    "measured_in_commit": "42be4c5d3c687a3780c2d0386c494902502bff6d",
+    "sha256_as_measured": (
+        "ede76546c1d1ad0b99267be4417a803b77af8f8ff96920eb090709c245908ced"
+    ),
+    "rescrubbed_in_commit": "bc75f2f6c1feb0290391393455af706951a6690c",
+    "sha256": "e4d4b81218e5babfcb32e2de4a7d7d4ab97cba73c204bf3396a468cc659cb1bd",
+    "affinity": "taskset -c 0-7,16-23",
+}
+
+# The spot family re-measured at the attribution's own source revision, when
+# one has been published.
+SPOT_STAGE_INDEX = "stages-spot"
+
+# Which stage results each attributed cost is reconciled with. A stage's
+# bench cost includes the allocations it makes, so each row compares the
+# attributed exclusive cost with the allocator samples its categories
+# called added back. `total` compares the whole engine with the real
+# engine's noop pipeline plus the cumulative OTLP-to-object-store layer.
+RECONCILIATION_ROWS = (
+    ("conversion", ("conversion",), (("convert", "isolated"),)),
+    ("extraction", ("extraction",), (("extract", "isolated"),)),
+    ("admission_sort_seal_merge", ("buffer", "sort_seal_merge"),
+     (("sort_seal", "isolated"), ("merge", "isolated"))),
+    ("encoding", ("encoding",), (("encode", "isolated"),)),
+    ("upload", ("upload",), (("upload", "async"),)),
+    ("engine_runtime", ("engine_runtime",), (("otlp_noop", "pipeline"),)),
+    ("total", CPU_CATEGORIES, (("otlp_noop", "pipeline"), ("otlp_minio", "async"))),
+)
+
+# The metrics every profiled repetition reports, with the direction each
+# gets worse in.
+ATTRIBUTION_METRIC_DIRECTIONS = dict(
+    {
+        "engine_cpu_ns_per_record": measurement.LOWER_IS_BETTER,
+        "throughput_records_per_s": measurement.HIGHER_IS_BETTER,
+        "control_engine_cpu_ns_per_record": measurement.LOWER_IS_BETTER,
+        "control_throughput_records_per_s": measurement.HIGHER_IS_BETTER,
+        "classified_samples_count": measurement.HIGHER_IS_BETTER,
+        "flush_wall_s": measurement.LOWER_IS_BETTER,
+        "upload_wait_s": measurement.LOWER_IS_BETTER,
+        "peak_rss_bytes": measurement.LOWER_IS_BETTER,
+    },
+    **{
+        f"{name}_cpu_ns_per_record": measurement.LOWER_IS_BETTER
+        for name in CPU_CATEGORIES
+    },
+)
+
+# The metrics whose dispersion across repetitions is a stability gate: the
+# CPU costs. A category below `STABLE_SHARE` of the profile is reported,
+# but its sampling noise is not a stability failure.
+STABLE_SHARE = 0.05
+
+
+def attribution_family_ordinal(report_dir) -> int:
+    """The first attribution family number no published aggregate has used."""
+    directory = measurement.resolve_report_dir(report_dir)
+    highest = 0
+    if Path(directory).is_dir():
+        for path in Path(directory).glob("attribution-*-f[0-9][0-9][0-9].json"):
+            try:
+                highest = max(highest, int(path.stem.rsplit("-f", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return highest + 1
+
+
+def signal_request_count(workload, signal_name) -> int:
+    """How many of `workload`'s requests carry `signal_name`."""
+    metrics = (workload.requests + workload.metrics_every - 1) // workload.metrics_every
+    return metrics if signal_name == "metrics" else workload.requests - metrics
+
+
+def attribution_workload(config_id, cpu_ns_per_record, *, repetitions,
+                         minimum_samples=ATTRIBUTION_MINIMUM_SAMPLES,
+                         records=None) -> measurement.Workload:
+    """The stage family's workload, lengthened until a profile is enough.
+
+    The shape -- records per request, body size, series and signal mix -- is
+    the stage family's, so the two are joined by configuration. Only the
+    request count grows: to the records a profile of `repetitions`
+    lifetimes needs for `minimum_samples` classified samples at
+    `PERF_FREQUENCY_HZ`, with the margin, at `cpu_ns_per_record`, rounded up
+    to whole blocks of the signal's requests.
+    """
+    config = WORKLOAD_CONFIGS[config_id]
+    base = config["workload"]
+    if records is None:
+        if not cpu_ns_per_record or cpu_ns_per_record <= 0:
+            raise AssertionError(
+                f"sizing {config_id} needs a positive reference CPU cost per "
+                f"record, not {cpu_ns_per_record!r}"
+            )
+        cpu_s = (
+            minimum_samples * ATTRIBUTION_SAMPLE_MARGIN
+            / (repetitions * PERF_FREQUENCY_HZ)
+        )
+        records = cpu_s * 1e9 / cpu_ns_per_record
+    blocks = max(1, math.ceil(records / base.records_per_request / ATTRIBUTION_BLOCK_REQUESTS))
+    wanted = blocks * ATTRIBUTION_BLOCK_REQUESTS
+    total = wanted
+    while signal_request_count(dataclasses.replace(base, requests=total), config["signal"]) < wanted:
+        total += 1
+    return dataclasses.replace(base, requests=total)
+
+
+def stage_family_reference(report_dir, index_name, *, expected_sha256=None,
+                           configs=None) -> dict:
+    """One published stage family, as the reconciliation reads it.
+
+    The index is identified by name and hash; its summaries are kept for
+    the workloads and stages the reconciliation joins, with each stage's
+    full metric medians and representations.
+    """
+    path = measurement.resolve_report_dir(report_dir) / f"{index_name}.json"
+    reference = {"index": f"{index_name}.json", "present": path.is_file()}
+    if not path.is_file():
+        return reference
+    entry = measurement.file_entry(path)
+    document = json.loads(path.read_text(encoding="ascii"))
+    wanted = {stage for _label, _categories, stages in RECONCILIATION_ROWS for stage, _ in stages}
+    summaries = {}
+    for summary in document.get("stage_summaries", []):
+        if summary.get("stage") not in wanted or summary.get("compression") != "zstd":
+            continue
+        if configs and summary.get("workload_config_id") not in configs:
+            continue
+        key = f"{summary['stage']}/{summary['mode']}/{summary['workload_config_id']}"
+        summaries[key] = {
+            "metrics": {
+                name: (summary.get("metrics", {}).get(name) or {}).get("median")
+                for name in STAGE_METRICS
+            },
+            "input_representation": summary.get("input_representation"),
+            "output_representation": summary.get("output_representation"),
+            "denominator": summary.get("denominator"),
+            "repetitions": summary.get("repetitions"),
+        }
+    reference.update(
+        {
+            "file": entry,
+            "expected_sha256": expected_sha256,
+            "verified": expected_sha256 is None or entry["sha256"] == expected_sha256,
+            "status": document.get("status"),
+            "git": (document.get("environment") or {}).get("git"),
+            "family_ordinal": document.get("family_ordinal"),
+            "family_scope": document.get("family_scope") or {"kind": "full"},
+            "summaries": summaries,
+        }
+    )
+    return reference
+
+
+def stage_evidence(report_dir, options, configs) -> dict:
+    """The pinned family and, when published, the spot family."""
+    pinned_index = options.get("pinned_index", PINNED_STAGE_FAMILY["index"])
+    pinned_sha = options.get("pinned_sha256", PINNED_STAGE_FAMILY["sha256"])
+    pinned = stage_family_reference(
+        report_dir, pinned_index, expected_sha256=pinned_sha, configs=configs
+    )
+    pinned["pin"] = dict(PINNED_STAGE_FAMILY)
+    spot = stage_family_reference(
+        report_dir, options.get("spot_index", SPOT_STAGE_INDEX), configs=configs
+    )
+    return {"pinned": pinned, "spot": spot}
+
+
+def reference_cpu_ns_per_record(evidence, config_id):
+    """The whole engine's expected cost per record, for sizing a profile.
+
+    The real engine's noop pipeline plus the cumulative OTLP-to-object-store
+    layer, from the pinned family: the named reference, never a
+    supplementary family in its place.
+    """
+    total = 0.0
+    for stage, mode in (("otlp_noop", "pipeline"), ("otlp_minio", "async")):
+        key = f"{stage}/{mode}/{config_id}"
+        value = None
+        for family in ("pinned",):
+            summary = (evidence.get(family) or {}).get("summaries", {}).get(key)
+            if summary and _finite(summary["metrics"].get("cpu_ns_per_record")):
+                value = summary["metrics"]["cpu_ns_per_record"]
+                break
+        if value is None:
+            raise AssertionError(
+                f"no stage family measured {key}; an attribution is sized from it"
+            )
+        total += value
+    return total
+
+
+def store_objects(store, prefix="otel/") -> list:
+    """Every object under `prefix` in the store, with its size."""
+    found = []
+    for page in store.client.get_paginator("list_objects_v2").paginate(
+        Bucket=store.bucket, Prefix=prefix
+    ):
+        for item in page.get("Contents", []):
+            found.append((item["Key"], int(item["Size"])))
+    return found
+
+
+def clear_store(store, prefix="otel/") -> int:
+    """Delete every object under `prefix`, so the next lifetime starts empty."""
+    keys = [key for key, _size in store_objects(store, prefix)]
+    for start in range(0, len(keys), 1000):
+        _ = store.client.delete_objects(
+            Bucket=store.bucket,
+            Delete={"Objects": [{"Key": key} for key in keys[start:start + 1000]]},
+        )
+    if store_objects(store, prefix):
+        raise AssertionError(f"the store still holds objects under {prefix}")
+    return len(keys)
+
+
+def _command():
+    """The command-line module, imported late: it imports this one."""
+    try:
+        from . import measure as command
+    except ImportError:
+        import measure as command
+    return command
+
+
+def attribution_lifetime(label, plan, job, spec, result, run_dir, controls, *,
+                         edge, last, profile) -> dict:
+    """One engine lifetime of a repetition: ready, input, drain, oracle.
+
+    The engine starts on the run's worker core against the pinned object
+    store, the producer sends every prebuilt request exactly once from a
+    window boundary, and the input phase -- first send to last durable
+    acknowledgement -- is the measured window: the engine's CPU and each
+    thread's scheduler times are read at both ends, and a profiled lifetime
+    has perf's events enabled across exactly that window. After the drain
+    proof the engine stops, the store's objects are read back by both
+    readers against the ledger, and the objects and their local copies are
+    deleted.
+    """
+    run_dir = Path(run_dir)
+    prebuilt = plan["inputs"][job["config_id"]]["prebuilt"]
+    workload = prebuilt.workload
+    root = run_dir / f"engine-{label}"
+    root.mkdir(parents=True, exist_ok=True)
+    engine = test_e2e.Engine(
+        root,
+        storage=plan["storage"],
+        overrides={"retry": test_e2e.S3_RETRY},
+        interval=f"{spec.interval_s}s",
+        cores=list(spec.cores),
+        merge=plan["merge"],
+        binary=Path(plan["provenance"]["build"]["binary"]),
+    )
+    # Everything after the engine exists runs under the `finally` that
+    # closes it, so no failure can leave an engine behind on a measured core.
+    phase = None
+    ledger = None
+    recorder = None
+    lifetime = {"label": label, "profiled": profile, "pid": engine.pid,
+                "config_sha256": engine.config_sha256}
+    try:
+        phase = _command().EnginePhase(label, engine, spec, controls, buffered=False)
+        ledger = measurement.Ledger(ledger_path(plan, run_dir, label))
+        _command().record_graph(result, engine, "strict")
+        if last:
+            result["config"]["effective"] = engine.config
+            result["config"]["effective_sha256"] = engine.config_sha256
+            result["config"]["edges"] = [list(edge_) for edge_ in engine.edges]
+            result["ephemeral_values"]["<receiver_listening_addr>"] = (
+                f"127.0.0.1:{engine.grpc_port}"
+            )
+        snapshot = phase.ready(edge)
+        flush_before = flush_reading(test_e2e.engine_metrics(engine))
+        workers = set(measurement.worker_tids(snapshot))
+        if profile:
+            recorder = PerfRecorder(run_dir / "perf", cores=plan["allocation"]["profiler"])
+            _ = recorder.start(engine.pid)
+            controls.register("profiler", recorder.pid, plan["allocation"]["profiler"])
+        producer = measurement.Producer(
+            engine.channel,
+            ledger,
+            workload,
+            cores=plan["allocation"].get("producer", []),
+            timeout_s=spec.producer_timeout_s,
+            max_in_flight=spec.max_in_flight,
+            source=prebuilt.request,
+        )
+        indexes = lifetime_indexes(prebuilt.indexes, profiled=profile)
+        lifetime["request_indexes"] = {
+            "first": indexes[0], "last": indexes[-1], "count": len(indexes),
+        }
+        _ = _command().await_window_start(spec.interval_s)
+        controls.raise_if_invalid()
+        lifetime["peak_rss_was_reset"] = reset_peak_rss(engine.pid)
+        admission_before = exporter_counter(engine, "admission.closed.duration")
+        threads_before = thread_times(engine.pid)
+        split_before = procfs_user_system_ns(engine.pid)
+        cpu_before = procfs_cpu_ns(engine.pid)
+        if recorder is not None:
+            _ = recorder.enable()
+        window_start = time.monotonic_ns()
+        outcome = producer.send(indexes)
+        window_end = time.monotonic_ns()
+        if recorder is not None:
+            _ = recorder.disable()
+        cpu_after = procfs_cpu_ns(engine.pid)
+        split_after = procfs_user_system_ns(engine.pid)
+        threads_after = thread_times(engine.pid)
+        admission_after = exporter_counter(engine, "admission.closed.duration")
+        phase.inputs.append(outcome)
+        controls.raise_if_invalid()
+        _ = phase.drained()
+        lifetime["peak_rss_bytes"] = procfs_peak_rss(engine.pid)
+        # The drain proof saw three empty collections, so every flush of the
+        # input has completed and been collected by now.
+        flush_after = flush_reading(test_e2e.engine_metrics(engine))
+        if last:
+            _ = controls.snapshot(
+                "end",
+                {"engine": (engine.pid, list(spec.cores))},
+                workers=phase.workers,
+                requested_cores=list(spec.cores),
+            )
+        controls.unwatch_workers()
+        if recorder is not None:
+            lifetime["perf_returncode"] = recorder.stop()
+        engine.shutdown(SHUTDOWN_DEADLINE_S)
+        _command().record_event(result, f"{label}_engine_shut_down", str(engine.pid))
+    except BaseException:
+        if ledger is not None:
+            ledger.close()
+        raise
+    finally:
+        controls.unwatch_workers()
+        if phase is not None and phase.sampler is not None:
+            phase.sampler.stop()
+        if recorder is not None:
+            recorder.close()
+        engine.close()
+        if phase is not None:
+            lifetime["phase"] = phase.summary()
+            lifetime["samples"] = [
+                measurement.compact_sample(sample)
+                for sample in (phase.sampler.samples if phase.sampler else [])
+            ]
+    window_ns = window_end - window_start
+    counts = ledger.counts()
+    latencies = ledger.acknowledgement_latencies_s()
+    objects = store_objects(plan["store"])
+    local = run_dir / f"store-{label}"
+    plan["store"].download(local)
+    try:
+        oracle = measurement.run_pinned(
+            plan["oracle_cores"],
+            measurement.read_oracle,
+            local,
+            ledger,
+            require_all=True,
+            healthy=True,
+            workload=workload,
+        )
+    finally:
+        ledger.close()
+        _ = clear_store(plan["store"])
+        # The Parquet copies are reproducible and large; only their hashes
+        # and counts are evidence.
+        shutil.rmtree(local, ignore_errors=True)
+    lifetime["ledger_file"] = retire_ledger(ledger.path)
+    records = counts["records_acked_count"]
+    cpu_ns = cpu_after - cpu_before
+    flush_totals = flush_window(flush_before, flush_after)
+    flush_totals["committed_blocks_count"] = committed_blocks(root / "engine.log")
+    lifetime.update(
+        {
+            "records": records,
+            "requests": len(indexes),
+            "ledger": counts,
+            "outcome": outcome,
+            "window_s": window_ns / 1e9,
+            "engine_cpu_ns": cpu_ns,
+            "engine_user_cpu_ns": split_after["user_ns"] - split_before["user_ns"],
+            "engine_system_cpu_ns": split_after["system_ns"] - split_before["system_ns"],
+            "cpu_ns_per_record": cpu_ns / records if records else None,
+            "throughput_records_per_s": records / (window_ns / 1e9) if window_ns > 0 else None,
+            "ack_latency_p50_s": measurement.percentile(latencies, 0.50) if latencies else None,
+            "ack_latency_p99_s": measurement.percentile(latencies, 0.99) if latencies else None,
+            "schedule": thread_schedule(threads_before, threads_after, window_ns, workers),
+            "admission_closed_s": admission_after - admission_before,
+            "flush": flush_totals,
+            "objects_count": len(objects),
+            "object_bytes": sum(size for _key, size in objects),
+            "output_bytes_per_input_record": (
+                sum(size for _key, size in objects) / records if records else None
+            ),
+            "output_representation": "parquet_objects_in_the_store",
+            "oracle": {
+                key: oracle[key]
+                for key in (
+                    "passed", "part_file_count", "descriptor_identity_count",
+                    "series_cardinality", "actual_row_count", "readers",
+                    "expected_record_count", "missing_record_count",
+                    "unexpected_record_count", "corrupt_record_count",
+                    "multiplicity_histogram", "problems",
+                )
+                if key in oracle
+            },
+            "delivered": bool(
+                oracle["passed"]
+                and counts["requests_acked_count"] == counts["requests_attempted_count"]
+                == len(indexes)
+                and records == len(indexes) * workload.records_per_request
+                and outcome["outcomes"].get(measurement.OUTCOME_PARTIAL, 0) == 0
+            ),
+        }
+    )
+    if recorder is not None:
+        text = recorder.script(run_dir / "perf" / "perf-script.txt")
+        parsed = parse_perf_script(text)
+        lifetime["perf"] = recorder.as_json()
+        lifetime["perf"]["parse"] = {
+            key: parsed[key]
+            for key in ("zero_weight_samples_count", "unparsed_lines_count", "unparsed_lines")
+        }
+        lifetime["profile"] = profile_summary(parsed["samples"])
+        # The CPU the samples can have seen: user time alone when perf was
+        # only allowed user space, all of it otherwise.
+        sampled = (
+            lifetime["engine_user_cpu_ns"]
+            if lifetime["profile"]["user_space_only"] else cpu_ns
+        )
+        lifetime["perf"]["sampled_scope"] = (
+            "user" if lifetime["profile"]["user_space_only"] else "user_and_kernel"
+        )
+        lifetime["perf"]["sampled_cpu_ns"] = sampled
+        lifetime["perf"]["unsampled_kernel_cpu_ns"] = cpu_ns - sampled if sampled else None
+        lifetime["perf"]["sampling_coverage_ratio"] = (
+            lifetime["profile"]["total_weight"] / sampled if sampled > 0 else None
+        )
+    return lifetime
+
+
+def oracle_cores(allocation, sibling_groups) -> list:
+    """Where the read-back runs: the stopped engine's physical cores.
+
+    The oracle starts DuckDB and clickhouse-local, which use every CPU they
+    are given. It runs only after an engine has stopped, so it takes the
+    engine's worker and reserved cores with their SMT siblings, and the
+    build monitor, the harness and the store keep theirs: a starved monitor
+    is a coverage gap, and a coverage gap invalidates the run.
+    """
+    owned = set(allocation.get("engine", [])) | set(allocation.get("engine_reserved", []))
+    cores = set()
+    for group in sibling_groups:
+        if owned & set(group):
+            cores |= set(group)
+    cores |= owned
+    available = set(os.sched_getaffinity(0))
+    return sorted(cores & available) or sorted(available)
+
+
+# Where a lifetime's ledger lives while it is written. The ledger commits
+# every request with full synchronisation, three transactions a request; on
+# a disk that is three fsyncs, and the sender then runs at the disk's fsync
+# rate -- a first full run managed 15,000 records/s with the worker 9
+# percent busy, which is the engine idling, not the engine under load. On
+# the memory file system the same ledger costs nothing. Millions of records
+# make it gigabytes, so it is deleted once the read-back has compared it,
+# and the result keeps its hash, size and counts.
+LEDGER_DIR_ENV = "SERIES_ATTRIBUTION_LEDGER_DIR"
+LEDGER_DEFAULT_PREFIX = "series-attribution-ledgers-"
+
+
+MEMORY_FILESYSTEMS = ("tmpfs", "ramfs")
+MEMORY_FALLBACK = "/dev/shm"
+
+
+def filesystem_of(path, mountinfo="/proc/self/mountinfo") -> dict:
+    """The mount a path lives on and its file system type.
+
+    The longest mount point that contains the path wins, as the kernel
+    resolves it; the path need not exist yet.
+    """
+    target = os.path.realpath(str(path))
+    best = {"mount_point": None, "fstype": None}
+    for line in Path(mountinfo).read_text().splitlines():
+        fields = line.split()
+        if " - " not in line or len(fields) < 5:
+            continue
+        mount_point = fields[4].replace("\\040", " ")
+        fstype = line.split(" - ", 1)[1].split()[0]
+        inside = target == mount_point or target.startswith(mount_point.rstrip("/") + "/")
+        if inside and len(mount_point) >= len(best["mount_point"] or ""):
+            best = {"mount_point": mount_point, "fstype": fstype}
+    return dict(best, path=target)
+
+
+def memory_ledger_dir(requested, *, fallback=MEMORY_FALLBACK,
+                      mountinfo="/proc/self/mountinfo") -> dict:
+    """The ledger directory, proven to be on a memory file system.
+
+    The requested directory is used when it is on tmpfs or ramfs;
+    otherwise `fallback` is, when it is; otherwise the family is refused,
+    because a disk-backed ledger throttles the sender to the disk's fsync
+    rate and the profile then describes an idling engine.
+    """
+    for candidate, used_fallback in ((Path(requested), False),
+                                     (Path(fallback) / Path(requested).name, True)):
+        found = filesystem_of(candidate, mountinfo)
+        if found["fstype"] in MEMORY_FILESYSTEMS:
+            return dict(found, directory=str(candidate), fallback=used_fallback,
+                        requested=str(requested))
+    raise AssertionError(
+        f"neither {requested} ({filesystem_of(requested, mountinfo)['fstype']}) nor "
+        f"{fallback} is on a memory file system; a ledger on disk throttles the "
+        f"sender to its fsync rate. Name a tmpfs with --option ledger_dir=..."
+    )
+
+
+def ledger_path(plan, run_dir, label) -> Path:
+    """The ledger of one lifetime, on the ledger directory of the plan."""
+    directory = Path(plan.get("ledger_dir") or run_dir) / Path(run_dir).name
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"ledger-{label}.sqlite"
+
+
+def retire_ledger(path) -> dict:
+    """The ledger's identity, after which the file and its journal go."""
+    path = Path(path)
+    entry = dict(measurement.file_entry(path), kind="ledger", retention="deleted")
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    return entry
+
+
+def stage_agreement(attributed_ns, residual_ns, measured_ns) -> dict:
+    """The plan's Stage agreement quantities for one profile.
+
+    `attributed_ns` is the sum of every category's sampled CPU, the named
+    residual included; `residual_ns` is the named residual alone;
+    `measured_ns` is what the scheduler says the engine used in the same
+    window. The error is their relative difference; unexplained CPU is the
+    residual plus whatever measured CPU no sample covered.
+    """
+    if not measured_ns or measured_ns <= 0:
+        return {"error_ratio": None, "unexplained_ratio": None}
+    return {
+        "error_ratio": abs(attributed_ns - measured_ns) / measured_ns,
+        "unexplained_ratio": (
+            residual_ns + max(0, measured_ns - attributed_ns)
+        ) / measured_ns,
+    }
+
+
+def lifetime_indexes(indexes, *, profiled) -> list:
+    """The requests one lifetime sends: all of them, or the control's share.
+
+    A control lifetime sends the first `CONTROL_FRACTION` of the input in
+    whole blocks, so every block it seals rotates on its request count just
+    as the profiled lifetime's do.
+    """
+    indexes = list(indexes)
+    if profiled:
+        return indexes
+    blocks = max(1, int(len(indexes) * CONTROL_FRACTION) // ATTRIBUTION_BLOCK_REQUESTS)
+    return indexes[: min(len(indexes), blocks * ATTRIBUTION_BLOCK_REQUESTS)]
+
+
+def _lifetime_check(name, lifetimes, predicate, describe) -> dict:
+    """One hard check passed only when every named lifetime passes it."""
+    failed = [lifetime["label"] for lifetime in lifetimes if not predicate(lifetime)]
+    return measurement.check(
+        name,
+        measurement.CHECK_HARD,
+        measurement.STATUS_FAILED if failed or not lifetimes else measurement.STATUS_PASSED,
+        "; ".join(describe(lifetime) for lifetime in lifetimes)
+        + (f"; failed in {failed}" if failed else ""),
+    )
+
+
+def settle_attribution_child(result, plan, job, lifetimes, run_dir):
+    """The checks, metrics and observations of one repetition."""
+    checks = result["checks"]
+    checks.append(
+        _lifetime_check(
+            "delivery", lifetimes, lambda lifetime: lifetime["delivered"],
+            lambda lifetime: (
+                f"{lifetime['label']}: acked "
+                f"{lifetime['ledger']['requests_acked_count']}/{lifetime['requests']} "
+                f"requests, {lifetime['records']} records, oracle problems "
+                f"{lifetime['oracle'].get('problems')}"
+            ),
+        )
+    )
+    phases = [lifetime["phase"] for lifetime in lifetimes]
+    problems = _command().sample_problems(phases)
+    checks.append(
+        measurement.check(
+            "minimum_samples",
+            measurement.CHECK_HARD,
+            measurement.STATUS_FAILED if problems or not phases else measurement.STATUS_PASSED,
+            "; ".join(problems)
+            or f"{sum(phase['sample_count'] for phase in phases)} samples",
+        )
+    )
+    residual_checks = []
+    for lifetime in lifetimes:
+        peak = max(
+            (sample["process_rss_bytes"] for sample in lifetime["samples"]), default=0
+        )
+        residual_checks.append(
+            measurement.residual_check(lifetime["phase"]["residuals"], peak)
+        )
+    failed = [entry for entry in residual_checks if entry["status"] != measurement.STATUS_PASSED]
+    checks.append(failed[0] if failed else residual_checks[0])
+    for lifetime in lifetimes:
+        flush = lifetime["flush"]
+        checks.append(
+            measurement.check(
+                f"flush_epochs_complete_{lifetime['label']}",
+                measurement.CHECK_MEASURED,
+                measurement.STATUS_PASSED
+                if flush["flush_count"] == flush["committed_blocks_count"]
+                else measurement.STATUS_FAILED,
+                f"telemetry counted {flush['flush_count']} flushes in the "
+                f"lifetime; the engine log committed "
+                f"{flush['committed_blocks_count']} blocks",
+            )
+        )
+    control = lifetimes[0]
+    profiled = next((lifetime for lifetime in lifetimes if lifetime["profiled"]), None)
+    metrics = {
+        "control_engine_cpu_ns_per_record": control["cpu_ns_per_record"],
+        "control_throughput_records_per_s": control["throughput_records_per_s"],
+    }
+    observations = {"lifetimes": lifetimes}
+    resolution = {}
+    if profiled is not None:
+        profile = profiled["profile"]
+        perf = profiled["perf"]
+        coverage = perf["sampling_coverage_ratio"]
+        exclusive = sum(entry["weight"] for entry in profile["categories"].values())
+        agreement = stage_agreement(
+            profile["total_weight"],
+            profile["categories"][UNKNOWN_CATEGORY]["weight"],
+            profiled["engine_cpu_ns"],
+        )
+        for name, passed, detail in (
+            (
+                "perf_recorded",
+                profiled.get("perf_returncode") in PERF_COMPLETE_EXITS
+                and profile["samples_count"] > 0
+                and perf["parse"]["unparsed_lines_count"] == 0,
+                f"perf exited {profiled.get('perf_returncode')}; "
+                f"{profile['samples_count']} samples, "
+                f"{perf['parse']['unparsed_lines_count']} unparsed lines",
+            ),
+            (
+                "stage_agreement_error",
+                agreement["error_ratio"] is not None
+                and agreement["error_ratio"] <= STAGE_AGREEMENT_ERROR_LIMIT,
+                f"exclusive categories plus the named residual hold "
+                f"{profile['total_weight']} ns of the {profiled['engine_cpu_ns']} ns "
+                f"the scheduler measured ({perf['sampled_scope']} sampled): error "
+                f"{agreement['error_ratio']}, limit {STAGE_AGREEMENT_ERROR_LIMIT}",
+            ),
+            (
+                "attribution_exclusive",
+                exclusive == profile["total_weight"],
+                f"categories hold {exclusive} of {profile['total_weight']} ns",
+            ),
+            (
+                "stage_agreement_unexplained",
+                agreement["unexplained_ratio"] is not None
+                and agreement["unexplained_ratio"] <= UNEXPLAINED_CPU_LIMIT,
+                f"unexplained {agreement['unexplained_ratio']} of the measured CPU "
+                f"(named residual and uncovered CPU), limit {UNEXPLAINED_CPU_LIMIT}; "
+                f"heaviest residual "
+                + json.dumps(profile["named_residual"][:3], sort_keys=True),
+            ),
+        ):
+            checks.append(
+                measurement.check(
+                    name,
+                    measurement.CHECK_HARD,
+                    measurement.STATUS_PASSED if passed else measurement.STATUS_FAILED,
+                    detail,
+                )
+            )
+        records = profiled["records"]
+        # The categories divide the CPU the samples could see. Kernel time a
+        # user-space-only profile could not see is reported beside them.
+        cpu_ns = perf["sampled_cpu_ns"]
+        flush_task_s = profile["flush_task_weight"] / 1e9
+        metrics.update(
+            {
+                "engine_cpu_ns_per_record": profiled["cpu_ns_per_record"],
+                "throughput_records_per_s": profiled["throughput_records_per_s"],
+                "classified_samples_count": profile["classified_samples_count"],
+                "flush_wall_s": profiled["flush"]["flush_wall_s"],
+                "upload_wait_s": max(0.0, profiled["flush"]["flush_wall_s"] - flush_task_s),
+                "peak_rss_bytes": profiled["peak_rss_bytes"],
+            }
+        )
+        per_sample = (1e9 / PERF_FREQUENCY_HZ) / records if records else None
+        with_allocator = {}
+        for name in CPU_CATEGORIES:
+            share = profile["categories"][name]["share_ratio"]
+            metrics[f"{name}_cpu_ns_per_record"] = (
+                share * cpu_ns / records if records else None
+            )
+            resolution[f"{name}_cpu_ns_per_record"] = per_sample
+            added = (
+                profile["allocator_callers"][name] / profile["total_weight"]
+                if profile["total_weight"] and name != "allocator" else 0.0
+            )
+            with_allocator[name] = (share + added) * cpu_ns / records if records else None
+        observations["attribution"] = {
+            "categories": profile["categories"],
+            "with_allocator_cpu_ns_per_record": with_allocator,
+            "allocator_callers": profile["allocator_callers"],
+            "named_residual": profile["named_residual"],
+            "flush_task_cpu_s": flush_task_s,
+            "cpu_s_by_logical_cpu": profile["cpu_s_by_logical_cpu"],
+            "cpu_s_by_thread_name": profile["cpu_s_by_thread_name"],
+            "worker_schedule": profiled["schedule"]["workers"],
+            "admission_closed_s": profiled["admission_closed_s"],
+            "sampling_coverage_ratio": coverage,
+            "stage_agreement": agreement,
+            "sampled_scope": perf["sampled_scope"],
+            "unsampled_kernel_cpu_ns_per_record": (
+                perf["unsampled_kernel_cpu_ns"] / records
+                if records and perf["unsampled_kernel_cpu_ns"] is not None else None
+            ),
+            "engine_user_cpu_s": profiled["engine_user_cpu_ns"] / 1e9,
+            "engine_system_cpu_s": profiled["engine_system_cpu_ns"] / 1e9,
+        }
+        observations["profile_overhead"] = {
+            "cpu_per_record_ratio": (
+                profiled["cpu_ns_per_record"] / control["cpu_ns_per_record"] - 1
+                if control["cpu_ns_per_record"] else None
+            ),
+            "throughput_ratio": (
+                1 - profiled["throughput_records_per_s"] / control["throughput_records_per_s"]
+                if control["throughput_records_per_s"] else None
+            ),
+            "window_ratio": (
+                profiled["window_s"] / control["window_s"] - 1 if control["window_s"] else None
+            ),
+        }
+    result["metrics"] = metrics
+    result["metric_directions"] = {
+        name: ATTRIBUTION_METRIC_DIRECTIONS[name] for name in metrics
+    }
+    result["mandatory_metrics"] = sorted(metrics)
+    result["resolution_floor"] = resolution
+    for name, value in metrics.items():
+        if value is None:
+            result["metrics_unavailable"][name] = "no acknowledged input to measure"
+    result["observations"] = observations
+    result["samples"] = [
+        dict(sample, lifetime=lifetime["label"])
+        for lifetime in lifetimes
+        for sample in lifetime.pop("samples")
+    ]
+    result["artifacts"] = [
+        dict(measurement.file_entry(path), kind=kind, retention=str(run_dir))
+        for path, kind in sorted(
+            [(path, "engine_log") for path in Path(run_dir).glob("engine-*/engine.log")]
+            + [(path, "engine_config") for path in Path(run_dir).glob("engine-*/pipeline.yaml")]
+            + [(Path(run_dir) / "perf" / "perf.data", "perf_data"),
+               (Path(run_dir) / "perf" / "perf-script.txt", "perf_script"),
+               (Path(run_dir) / "perf" / "perf.log", "perf_log")]
+        )
+        if path.is_file()
+    ]
+    result["artifacts"].extend(
+        dict(lifetime["ledger_file"], retention=f"deleted after the read-back of {lifetime['label']}")
+        for lifetime in lifetimes if lifetime.get("ledger_file")
+    )
+    result["workload_config_id"] = job["config_id"]
+    result["repetition"] = job["repetition"]
+    result["family_ordinal"] = plan["family_ordinal"]
+    result["status"] = measurement.STATUS_PASSED
+
+
+def attribution_experiment(plan, job, spec, result, run_dir, controls):
+    """One repetition: an unprofiled control lifetime, then a profiled one.
+
+    Both run the same engine configuration, cores, store and prebuilt
+    input, so their difference is perf's own cost. A rehearsal runs the
+    control lifetime alone and records no attribution.
+    """
+    controls.coverage_gaps_hard = True
+    controls.allocate(plan["allocation"])
+    controls.register("harness", os.getpid())
+    if plan.get("store_pid"):
+        controls.register("store", plan["store_pid"], plan["store_cores"])
+    result["environment"]["build"] = plan["provenance"]["build"]
+    result["environment"]["git"] = plan["provenance"]["git"]
+    # The setting is not persistent: a reboot restores the distribution's
+    # default, so each repetition records the value it actually ran under.
+    result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
+    result["environment"]["ledger_filesystem"] = plan.get("ledger_filesystem")
+    result["ephemeral_values"] = dict(plan["ephemeral"])
+    result["config"]["input"] = plan["inputs"][job["config_id"]]["prebuilt"].as_json()
+    labels = ("control", "profiled") if plan["profile"] else ("control",)
+    # A rehearsal's single lifetime is its control.
+    lifetimes = []
+    for position, label in enumerate(labels):
+        lifetimes.append(
+            attribution_lifetime(
+                label, plan, job, spec, result, run_dir, controls,
+                edge="start" if position == 0 else label,
+                last=position == len(labels) - 1,
+                profile=label == "profiled",
+            )
+        )
+    settle_attribution_child(result, plan, job, lifetimes, run_dir)
+
+
+def attribution_child_spec(plan, job) -> measurement.RunSpec:
+    """The immutable inputs of one repetition."""
+    prebuilt = plan["inputs"][job["config_id"]]["prebuilt"]
+    cores = tuple(plan["cores"])
+    return measurement.RunSpec(
+        run_id=measurement.RunSpec.build_run_id(
+            f"attribution-{job['config_id']}", "strict", "minio", cores,
+            ATTRIBUTION_INTERVAL_S, job["ordinal"],
+        ),
+        case="attribution",
+        topology="strict",
+        store="minio",
+        cores=cores,
+        workload=prebuilt.workload,
+        interval_s=ATTRIBUTION_INTERVAL_S,
+        duration_s=1,
+        max_in_flight=ATTRIBUTION_IN_FLIGHT,
+        overrides={
+            "receiver": {"max_concurrent_requests": ATTRIBUTION_IN_FLIGHT},
+            "exporter": {"window": {"max_requests_per_block": ATTRIBUTION_BLOCK_REQUESTS}},
+            "workload_config_id": job["config_id"],
+            "repetition": job["repetition"],
+            "profiled": plan["profile"],
+        },
+    )
+
+
+# How many times one repetition is run again after a concurrent build
+# invalidated it, and how long the host must stay free of builds first.
+BUILD_RETRIES = 3
+QUIET_HOST_S = 60
+
+
+def invalidated_by_build(child) -> bool:
+    """Whether a build seen inside the measured window invalidated a child."""
+    return any(
+        entry["name"] == "no_concurrent_build"
+        and entry["status"] != measurement.STATUS_PASSED
+        for entry in child.get("checks", [])
+    )
+
+
+def wait_for_quiet_host(*, quiet_s=QUIET_HOST_S, deadline_s=600.0, scan=None) -> dict:
+    """Wait until no build has run on the host for `quiet_s` seconds.
+
+    Another agent's compile is not this family's to stop; the repetition it
+    invalidated is run again only once the host has been observed build-free
+    for a whole quiet period, under a deadline.
+    """
+    scan = scan or measurement.build_activity
+    started = time.monotonic_ns()
+    state = {"quiet_since": None, "seen": []}
+
+    def observe():
+        """How long the host has been build-free, in seconds."""
+        builds = scan()
+        now = time.monotonic_ns()
+        if builds:
+            state["quiet_since"] = None
+            state["seen"] = [
+                {key: build.get(key) for key in ("pid", "comm")} for build in builds[:3]
+            ]
+            return 0.0
+        if state["quiet_since"] is None:
+            state["quiet_since"] = now
+        return (now - state["quiet_since"]) / 1e9
+
+    _ = measurement.wait_until(
+        observe,
+        lambda quiet: quiet >= quiet_s,
+        deadline_ns=started + int(deadline_s * 10**9),
+        description=f"{quiet_s}s without a build on the host",
+    )
+    return {
+        "waited_s": (time.monotonic_ns() - started) / 1e9,
+        "quiet_s": quiet_s,
+        "last_builds_seen": state["seen"],
+        "observed_utc": measurement.utc_now(),
+    }
+
+
+def attribution_child_ordinal(*directories) -> int:
+    """The first repetition ordinal no published or local child has used."""
+    highest = 0
+    for directory in directories:
+        directory = measurement.resolve_report_dir(directory)
+        if not Path(directory).is_dir():
+            continue
+        for path in Path(directory).glob("attribution-*-r[0-9][0-9][0-9].json"):
+            try:
+                highest = max(highest, int(path.stem.rsplit("-r", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return highest + 1
+
+
+def run_attribution_child(plan, job, output_dir, report_dir):
+    """One repetition, whose failure is recorded, never raised."""
+    try:  # Imported here: the command line imports this module in turn.
+        from . import measure as command
+    except ImportError:
+        import measure as command
+    spec = attribution_child_spec(plan, job)
+    run_dir = Path(output_dir) / spec.run_id
+
+    def experiment(spec, result, directory, controls):
+        """This repetition's measured body."""
+        attribution_experiment(plan, job, spec, result, directory, controls)
+
+    try:
+        # On a host other measurements share, a repetition may wait its turn
+        # for the lease; it measures nothing until it holds it.
+        result = command.run_case(
+            spec, run_dir, experiment=experiment, report_dir=report_dir, evaluate=False,
+            lease_wait_s=plan.get("lease_wait_s", 0.0),
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as error:  # noqa: BLE001 - recorded in the result
+        sys.stderr.write(f"{spec.run_id}: {type(error).__name__}: {error}\n")
+        result = json.loads((run_dir / f"{spec.run_id}.json").read_text(encoding="ascii"))
+    _ = shutil.copyfile(run_dir / f"{spec.run_id}.json", Path(output_dir) / f"{spec.run_id}.json")
+    result.setdefault("workload_config_id", job["config_id"])
+    result.setdefault("repetition", job["repetition"])
+    result["attempt"] = job.get("attempt", 1)
+    return result
+
+
+def _pooled_profile(children) -> dict:
+    """Every repetition's profile statistics added together."""
+    weights = collections.Counter()
+    counts = collections.Counter()
+    callers = collections.Counter()
+    residual = collections.Counter()
+    for child in children:
+        attribution = (child.get("observations") or {}).get("attribution")
+        if not attribution:
+            continue
+        for name, entry in attribution["categories"].items():
+            weights[name] += entry["weight"]
+            counts[name] += entry["samples_count"]
+        for name, weight in attribution["allocator_callers"].items():
+            callers[name] += weight
+        for entry in attribution["named_residual"]:
+            residual[entry["symbol"]] += entry["weight"]
+    total_weight = sum(weights.values())
+    total_count = sum(counts.values())
+    categories = {}
+    for name in CPU_CATEGORIES:
+        share = weights[name] / total_weight if total_weight else 0.0
+        categories[name] = {
+            "weight": weights[name],
+            "samples_count": counts[name],
+            "share_ratio": share,
+            "share_ci95_ratio": (
+                CONFIDENCE_Z * math.sqrt(share * (1 - share) / total_count)
+                if total_count else None
+            ),
+        }
+    return {
+        "total_weight": total_weight,
+        "samples_count": total_count,
+        "classified_samples_count": total_count - counts[UNKNOWN_CATEGORY],
+        "categories": categories,
+        "allocator_callers": dict(callers),
+        "allocator_callers_share_ratio": {
+            name: weight / total_weight if total_weight else 0.0
+            for name, weight in callers.items()
+        },
+        "named_residual": [
+            {"symbol": symbol, "weight": weight,
+             "share_ratio": weight / total_weight if total_weight else 0.0}
+            for symbol, weight in residual.most_common(10)
+        ],
+    }
+
+
+def aggregate_attribution(children, *, plan, output_dir) -> dict:
+    """One workload's repetitions as a comparable, baseline-evaluated result.
+
+    The metrics are the medians of the repetitions. The profile shares are
+    pooled over every repetition's samples, with their binomial intervals.
+    The Controller baseline policy is applied here, to the family, not to
+    each repetition, and never to a rehearsal.
+    """
+    children = sorted(children, key=lambda child: child["repetition"])
+    first = children[0]
+    config_id = first["workload_config_id"]
+    run_id = (
+        f"attribution-{config_id}-strict-minio-c{len(plan['cores'])}"
+        f"-w{ATTRIBUTION_INTERVAL_S}-f{plan['family_ordinal']:03d}"
+    )
+    result = measurement.new_result(
+        {"run_id": run_id, "case": "attribution"}, artifact_kind="attribution_aggregate"
+    )
+    environment = first.get("environment") or {}
+    result["environment"] = {
+        "start": environment.get("start") or {},
+        "end": (children[-1].get("environment") or {}).get("end") or {},
+        "build": environment.get("build"),
+        "git": environment.get("git") or {},
+        "core_allocation": environment.get("core_allocation"),
+        "machine_identity_sha256": environment.get("machine_identity_sha256"),
+        "children": [child["run_id"] for child in children],
+    }
+    if result["environment"]["start"] and result["environment"]["end"]:
+        result["environment"]["match"] = measurement.environment_match(
+            result["environment"]["start"], result["environment"]["end"]
+        )
+    for edge in ("start", "end"):
+        if not result["environment"][edge]:
+            result["environment"][edge] = measurement.environment_snapshot(
+                {"harness": os.getpid()}
+            )
+            result["environment"][edge]["fallback"] = (
+                "no repetition recorded this edge; this is the harness process only"
+            )
+    result["config"] = first.get("config") or {"requested": {}, "effective": {}}
+    result["workload"] = first.get("workload") or {}
+    result["workload_schedule"] = first.get("workload_schedule") or {}
+    result["ephemeral_values"] = first.get("ephemeral_values") or {}
+    result["run_dir"] = str(output_dir)
+    result["workload_config_id"] = config_id
+    names = sorted(
+        set.intersection(*[set(child.get("metrics") or {}) for child in children])
+    ) if children else []
+    by_metric = {
+        name: [
+            child["metrics"][name] for child in children
+            if _finite((child.get("metrics") or {}).get(name))
+        ]
+        for name in names
+    }
+    result["metrics"] = {
+        name: (median(values) if values else None) for name, values in by_metric.items()
+    }
+    for name, value in result["metrics"].items():
+        if value is None:
+            result["metrics_unavailable"][name] = "no repetition measured it"
+    result["metric_directions"] = {
+        name: ATTRIBUTION_METRIC_DIRECTIONS[name] for name in result["metrics"]
+    }
+    result["mandatory_metrics"] = sorted(result["metrics"])
+    floors = collections.defaultdict(list)
+    for child in children:
+        for name, value in (child.get("resolution_floor") or {}).items():
+            if _finite(value):
+                floors[name].append(value)
+    result["resolution_floor"] = {
+        name: max(values) for name, values in floors.items() if name in result["metrics"]
+    }
+    pooled = _pooled_profile(children)
+    stable = ["engine_cpu_ns_per_record", "control_engine_cpu_ns_per_record"] + [
+        f"{name}_cpu_ns_per_record"
+        for name in CPU_CATEGORIES
+        if pooled["categories"][name]["share_ratio"] >= STABLE_SHARE
+    ]
+    unstable = sorted(
+        name for name in stable
+        if name in by_metric and (
+            not by_metric[name] or coefficient_of_variation(by_metric[name]) > MAXIMUM_CV
+        )
+    )
+    checks = derived_checks(children)
+    wanted = set(range(1, plan["repetitions"] + 1))
+    present = {child.get("repetition") for child in children}
+    missing = sorted(wanted - present)
+    checks.append(
+        measurement.check(
+            "repetitions_complete",
+            measurement.CHECK_HARD,
+            measurement.STATUS_FAILED if missing else measurement.STATUS_PASSED,
+            f"repetitions {missing} have no valid run" if missing
+            else f"all {len(wanted)} repetitions measured",
+        )
+    )
+    for name in ("rss_reconciliation",) + (
+        ("perf_recorded", "stage_agreement_error", "attribution_exclusive",
+         "stage_agreement_unexplained") if plan["profile"] else ()
+    ):
+        failed = [
+            child["run_id"] for child in children
+            if not any(
+                entry["name"] == name and entry["status"] == measurement.STATUS_PASSED
+                for entry in child.get("checks", [])
+            )
+        ]
+        checks.append(
+            measurement.check(
+                name,
+                measurement.CHECK_HARD,
+                measurement.STATUS_FAILED if failed else measurement.STATUS_PASSED,
+                f"not passed in {failed}" if failed
+                else f"passed in all {len(children)} repetitions",
+            )
+        )
+    checks.append(
+        measurement.check(
+            "repetition_stability",
+            measurement.CHECK_HARD,
+            measurement.STATUS_FAILED
+            if unstable or len(children) < plan["repetitions"]
+            else measurement.STATUS_PASSED,
+            f"{len(children)} repetitions; coefficients of variation "
+            + json.dumps(
+                {
+                    name: round(coefficient_of_variation(by_metric[name]), 4)
+                    for name in stable if by_metric.get(name)
+                },
+                sort_keys=True,
+            )
+            + (f"; over {MAXIMUM_CV:.0%} in {unstable}" if unstable else ""),
+        )
+    )
+    if plan["profile"]:
+        checks.append(
+            measurement.check(
+                "classified_samples_sufficient",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED
+                if pooled["classified_samples_count"] >= plan["minimum_samples"]
+                else measurement.STATUS_FAILED,
+                f"{pooled['classified_samples_count']} classified samples over "
+                f"{len(children)} repetitions, {plan['minimum_samples']} required; "
+                f"lengthen the profile with --option cpu_ns_per_record=... or "
+                f"--option records=... if short",
+            )
+        )
+        # The reference the family is reconciled against must be the one
+        # named by hash before anything this family measured can become a
+        # baseline: every binding gate is decided before the policy runs.
+        pinned = (plan.get("evidence") or {}).get("pinned") or {}
+        checks.append(
+            measurement.check(
+                "reference_family_verified",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED
+                if pinned.get("present") and pinned.get("verified")
+                else measurement.STATUS_FAILED,
+                f"{pinned.get('index')}: present {pinned.get('present')}, sha256 "
+                f"{(pinned.get('file') or {}).get('sha256')}, expected "
+                f"{pinned.get('expected_sha256')}",
+            )
+        )
+    result["checks"] = checks
+    overheads = [
+        (child.get("observations") or {}).get("profile_overhead") or {}
+        for child in children
+    ]
+    result["observations"] = {
+        "repetitions": [
+            {
+                "repetition": child["repetition"],
+                "run_id": child["run_id"],
+                "status": child["status"],
+                "metrics": child["metrics"],
+            }
+            for child in children
+        ],
+        "dispersion": {
+            name: {
+                "median": median(values) if values else None,
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+                "coefficient_of_variation": coefficient_of_variation(values),
+            }
+            for name, values in sorted(by_metric.items())
+        },
+        "pooled_profile": pooled,
+        "stage_agreement": {
+            "error_limit": STAGE_AGREEMENT_ERROR_LIMIT,
+            "unexplained_limit": UNEXPLAINED_CPU_LIMIT,
+            "repetitions": [
+                (
+                    ((child.get("observations") or {}).get("attribution") or {})
+                    .get("stage_agreement")
+                )
+                for child in children
+            ],
+        },
+        "profile_overhead": {
+            key: median(values) if values else None
+            for key in ("cpu_per_record_ratio", "throughput_ratio", "window_ratio")
+            for values in [[entry[key] for entry in overheads if _finite(entry.get(key))]]
+        },
+    }
+    result["run_files"] = [
+        measurement.file_entry(Path(output_dir) / f"{child['run_id']}.json")
+        for child in children
+    ]
+    result["status"] = (
+        measurement.STATUS_PASSED
+        if all(entry["status"] == measurement.STATUS_PASSED for entry in checks)
+        else measurement.STATUS_FAILED
+    )
+    if plan["profile"]:
+        try:
+            decision = measurement.evaluate_baseline(result)
+            if decision["action"] == "created":
+                candidate = result.pop("baseline_candidate")
+                path = measurement.write_published_json(
+                    Path(output_dir) / decision["baseline_name"], candidate
+                )
+                result["baseline_files"].append(measurement.file_entry(path))
+        except AssertionError as error:
+            result["status"] = measurement.STATUS_FAILED
+            measurement.record_event(result, "baseline_policy_failed", str(error))
+            result["checks"].append(
+                measurement.check(
+                    "baseline_policy", measurement.CHECK_HARD,
+                    measurement.STATUS_FAILED, str(error),
+                )
+            )
+    result.pop("baseline_candidate", None)
+    _ = measurement.write_result(Path(output_dir) / f"{run_id}.json", result)
+    return result
+
+
+def _family_summary(evidence, family, key):
+    """One family's summary of one stage key, or None."""
+    return ((evidence.get(family) or {}).get("summaries") or {}).get(key)
+
+
+def _passed(result, name) -> bool:
+    """Whether a result recorded the named check and every copy passed."""
+    recorded = [entry for entry in result.get("checks", []) if entry["name"] == name]
+    return bool(recorded) and all(
+        entry["status"] == measurement.STATUS_PASSED for entry in recorded
+    )
+
+
+# The checks that make up the plan's binding Stage agreement rule for one
+# workload's aggregate, beside the verified reference and exclusivity.
+BINDING_RECONCILIATION_CHECKS = (
+    "attribution_exclusive",
+    "stage_agreement_error",
+    "stage_agreement_unexplained",
+    "reference_family_verified",
+)
+
+
+def reconcile_attribution(aggregates, evidence) -> dict:
+    """The binding reconciliation, and the descriptive stage comparison.
+
+    Binding, a hard gate: the plan's Stage agreement rule. In every
+    repetition of every workload, exclusive category CPU plus the named
+    residual must be within `STAGE_AGREEMENT_ERROR_LIMIT` of the measured
+    engine CPU, and unexplained CPU within `UNEXPLAINED_CPU_LIMIT`; the
+    profile must be exclusive, and the pinned stage family must be the one
+    named by hash.
+
+    Descriptive, never a gate: each attributed stage cost against its
+    isolated bench cost in the pinned family, the reference, with the spot
+    family reported beside it as supplementary evidence and never
+    substituted. A row outside `AGREEMENT_BOUNDS` is explained only by
+    published measurement -- the supplementary family bringing the same
+    row into the band -- or is marked unexplained. Byte rates are listed per
+    stage with their own output representation and never added across
+    stages.
+    """
+    problems = []
+    pinned = evidence.get("pinned") or {}
+    spot = evidence.get("spot") or {}
+    if not pinned.get("present"):
+        problems.append(f"the pinned stage family {pinned.get('index')} is not published")
+    elif not pinned.get("verified"):
+        problems.append(
+            f"the pinned stage family {pinned['index']} hashes to "
+            f"{pinned['file']['sha256']}, not {pinned.get('expected_sha256')}"
+        )
+    low, high = AGREEMENT_BOUNDS
+    workloads = {}
+    for aggregate in aggregates:
+        config_id = aggregate["workload_config_id"]
+        metrics = aggregate.get("metrics") or {}
+        failed = [
+            name for name in BINDING_RECONCILIATION_CHECKS if not _passed(aggregate, name)
+        ]
+        if failed:
+            problems.append(f"{config_id}: binding checks not passed: {failed}")
+        pooled = (aggregate.get("observations") or {}).get("pooled_profile") or {}
+        agreement = (aggregate.get("observations") or {}).get("stage_agreement") or {}
+        engine = metrics.get("engine_cpu_ns_per_record")
+        rows = []
+        for label, categories, stages in RECONCILIATION_ROWS:
+            if label == "total":
+                attributed = engine
+                with_allocator = engine
+            else:
+                attributed = sum(
+                    metrics.get(f"{name}_cpu_ns_per_record") or 0.0 for name in categories
+                )
+                added = sum(
+                    (pooled.get("allocator_callers_share_ratio") or {}).get(name, 0.0)
+                    for name in categories
+                )
+                with_allocator = attributed + added * engine if _finite(engine) else None
+            joined = []
+            reference = 0.0
+            supplementary = 0.0
+            complete = True
+            spot_complete = bool(spot.get("present"))
+            for stage, mode in stages:
+                key = f"{stage}/{mode}/{config_id}"
+                summary = _family_summary(evidence, "pinned", key)
+                extra = _family_summary(evidence, "spot", key)
+                if summary is None:
+                    complete = False
+                    problems.append(f"{config_id}: the pinned family has no {key}")
+                    continue
+                if summary.get("denominator") != DENOMINATOR:
+                    problems.append(f"{key} divides by {summary.get('denominator')!r}")
+                cost = summary["metrics"].get("cpu_ns_per_record")
+                reference += cost if _finite(cost) else 0.0
+                extra_cost = (extra or {}).get("metrics", {}).get("cpu_ns_per_record")
+                if _finite(extra_cost):
+                    supplementary += extra_cost
+                else:
+                    spot_complete = False
+                joined.append(
+                    {
+                        "stage": stage,
+                        "mode": mode,
+                        "reference": "pinned",
+                        "metrics": summary["metrics"],
+                        "supplementary_spot_cpu_ns_per_record": extra_cost,
+                        "input_representation": summary.get("input_representation"),
+                        "output_representation": summary.get("output_representation"),
+                        "denominator": summary.get("denominator"),
+                    }
+                )
+            ratio = (
+                with_allocator / reference
+                if complete and reference and _finite(with_allocator) else None
+            )
+            spot_ratio = (
+                with_allocator / supplementary
+                if spot_complete and supplementary and _finite(with_allocator) else None
+            )
+            if ratio is None:
+                verdict, explanation = "not_measured", None
+            elif low <= ratio <= high:
+                verdict, explanation = "within_band", None
+            elif spot_ratio is not None and low <= spot_ratio <= high:
+                verdict = "outside_band"
+                explanation = {
+                    "status": "explained",
+                    "evidence": {
+                        "index": spot.get("index"),
+                        "sha256": (spot.get("file") or {}).get("sha256"),
+                        "git": spot.get("git"),
+                    },
+                    "detail": (
+                        f"the supplementary stage family, measured at a later "
+                        f"revision, gives a ratio of {spot_ratio:.3f}, inside the "
+                        f"band: the stage's own cost changed after the pinned "
+                        f"family was measured"
+                    ),
+                }
+            else:
+                verdict = "outside_band"
+                explanation = {
+                    "status": "unexplained",
+                    "detail": (
+                        "no published measurement brings this row into the band"
+                        + (
+                            f"; the supplementary family gives {spot_ratio:.3f}"
+                            if spot_ratio is not None
+                            else "; the supplementary family did not measure it"
+                        )
+                    ),
+                }
+            rows.append(
+                {
+                    "row": label,
+                    "attribution_categories": list(categories),
+                    "attributed_exclusive_cpu_ns_per_record": attributed,
+                    "attributed_with_allocator_cpu_ns_per_record": with_allocator,
+                    "share_ratio": sum(
+                        (pooled.get("categories") or {}).get(name, {}).get("share_ratio", 0.0)
+                        for name in categories
+                    ),
+                    "stages": joined,
+                    "reference_cpu_ns_per_record": reference if complete else None,
+                    "ratio_to_reference": ratio,
+                    "supplementary_spot_cpu_ns_per_record": (
+                        supplementary if spot_complete else None
+                    ),
+                    "ratio_to_supplementary": spot_ratio,
+                    "verdict": verdict,
+                    "explanation": explanation,
+                }
+            )
+        workloads[config_id] = {
+            "binding": {
+                "checks": {
+                    name: _passed(aggregate, name) for name in BINDING_RECONCILIATION_CHECKS
+                },
+                "repetitions": agreement.get("repetitions"),
+                "error_limit": STAGE_AGREEMENT_ERROR_LIMIT,
+                "unexplained_limit": UNEXPLAINED_CPU_LIMIT,
+            },
+            "engine_cpu_ns_per_record": engine,
+            "upload_wait_s": metrics.get("upload_wait_s"),
+            "flush_wall_s": metrics.get("flush_wall_s"),
+            "descriptive_stage_comparison": rows,
+        }
+    return {
+        "valid": not problems and bool(aggregates),
+        "problems": problems,
+        "binding_rule": (
+            "the plan's Stage agreement row: exclusive category CPU plus the "
+            "named residual against the measured engine CPU; an error above "
+            f"{STAGE_AGREEMENT_ERROR_LIMIT:.0%} or unexplained CPU above "
+            f"{UNEXPLAINED_CPU_LIMIT:.0%} invalidates the attribution"
+        ),
+        "descriptive_stage_comparison": {
+            "gating": False,
+            "reference": "pinned",
+            "supplementary": "spot",
+            "agreement_bounds": list(AGREEMENT_BOUNDS),
+            "note": (
+                "engine-attributed stage costs against isolated bench costs; "
+                "descriptive only, not an acceptance model"
+            ),
+        },
+        "references": {
+            family: {
+                key: value for key, value in (evidence.get(family) or {}).items()
+                if key != "summaries"
+            }
+            for family in ("pinned", "spot")
+        },
+        "spot_revision_matches": (
+            bool(spot.get("present"))
+            and (spot.get("git") or {}).get("revision")
+            == (next(iter(aggregates), {}).get("environment", {}).get("git") or {}).get("revision")
+        ),
+        "denominator": DENOMINATOR,
+        "byte_rates": (
+            "each stage row carries its own output_bytes_per_input_record with "
+            "its output representation; no byte rate is added across stages"
+        ),
+        "workloads": workloads,
+    }
+
+
+def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir,
+                        started, *, preflight, invalidated=()) -> dict:
+    """Write `attribution.json` over every repetition and aggregate.
+
+    A host where perf cannot attach publishes the index with the preflight's
+    evidence, no repetitions and the mandatory acceptance marked incomplete;
+    a rehearsal publishes nowhere but its own directory.
+    """
+    output_dir = Path(output_dir)
+    result = measurement.new_result(
+        {"run_id": "attribution", "case": "attribution"}, artifact_kind="index"
+    )
+    result["environment"]["start"] = measurement.environment_snapshot(
+        {"harness": os.getpid()}
+    )
+    result["environment"]["core_allocation"] = plan["allocation"]
+    result["environment"]["git"] = plan.get("git")
+    result["environment"]["build"] = (plan.get("provenance") or {}).get("build")
+    result["environment"]["host_at_start"] = plan.get("host_at_start")
+    result["environment"]["host_at_end"] = host_neighbours(exclude=(os.getpid(),))
+    result["family_ordinal"] = plan["family_ordinal"]
+    result["environment"]["perf_event_paranoid"] = perf_event_paranoid()
+    result["environment"]["ledger_filesystem"] = plan.get("ledger_filesystem")
+    result["preflight"] = preflight
+    result["classification"] = classification_rules()
+    result["perf"] = {
+        "record_argv": perf_record_argv(
+            "perf", "<engine_pid>", "<run_dir>/perf/perf.data",
+            "<run_dir>/perf/perf.ctl", "<run_dir>/perf/perf.ack",
+        ),
+        "script_argv": perf_script_argv("perf", "<run_dir>/perf/perf.data"),
+        "event": PERF_EVENT,
+        "frequency_hz": PERF_FREQUENCY_HZ,
+        "call_graph": PERF_CALL_GRAPH,
+        "weight": "the cpu-clock sample period, in nanoseconds of CPU",
+        "window": (
+            "events are enabled after the start snapshot and the window "
+            "boundary, immediately before the first request, and disabled "
+            "immediately after the last durable acknowledgement"
+        ),
+        "minimum_classified_samples_per_workload": plan["minimum_samples"],
+    }
+    result["workloads"] = {
+        config_id: {
+            "stage_workload": WORKLOAD_CONFIGS[config_id]["workload"].as_json(),
+            "sizing_cpu_ns_per_record": entry.get("sizing_cpu_ns_per_record"),
+            "input": entry["prebuilt"].as_json() if entry.get("prebuilt") else None,
+        }
+        for config_id, entry in plan["inputs"].items()
+    }
+    result["engine_configuration"] = {
+        "block_requests": ATTRIBUTION_BLOCK_REQUESTS,
+        "in_flight_requests": ATTRIBUTION_IN_FLIGHT,
+        "window_interval_s": ATTRIBUTION_INTERVAL_S,
+        "store": STORE_KIND,
+        "roles": [list(role) for role in measurement.CASE_ROLES["attribution"]],
+    }
+    checks = result["checks"]
+    attached = bool(preflight.get("attached"))
+    rehearsal = not plan["profile"]
+    if not rehearsal:
+        checks.append(
+            measurement.check(
+                "perf_attached",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED if attached else measurement.STATUS_FAILED,
+                "perf attached to a busy process and unwound its samples"
+                if attached else preflight.get("reason", "perf could not attach"),
+            )
+        )
+    for aggregate in aggregates:
+        checks.append(
+            measurement.check(
+                f"child_{aggregate['run_id']}",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED
+                if aggregate["status"] == measurement.STATUS_PASSED
+                else measurement.STATUS_FAILED,
+                f"{aggregate['run_id']}: {aggregate['status']}; failed "
+                + json.dumps(
+                    sorted(
+                        entry["name"] for entry in aggregate["checks"]
+                        if entry["status"] != measurement.STATUS_PASSED
+                    )
+                ),
+            )
+        )
+    if plan["profile"] and attached:
+        measured = {aggregate["workload_config_id"] for aggregate in aggregates}
+        for config_id in plan["inputs"]:
+            if config_id not in measured:
+                checks.append(
+                    measurement.check(
+                        f"workload_measured_{config_id}",
+                        measurement.CHECK_HARD,
+                        measurement.STATUS_FAILED,
+                        f"{config_id} has no valid repetition to aggregate; "
+                        f"every attempt is listed in invalidated_children",
+                    )
+                )
+    reconciliation = reconcile_attribution(aggregates, plan["evidence"])
+    result["reconciliation"] = reconciliation
+    if aggregates and not rehearsal:
+        checks.append(
+            measurement.check(
+                "reconciliation_valid",
+                measurement.CHECK_HARD,
+                measurement.STATUS_PASSED if reconciliation["valid"]
+                else measurement.STATUS_FAILED,
+                "; ".join(reconciliation["problems"][:5])
+                or reconciliation["binding_rule"] + ": held in every workload",
+            )
+        )
+    result["metrics"] = {
+        "children_count": len(children),
+        "children_passed_count": sum(
+            1 for child in children if child["status"] == measurement.STATUS_PASSED
+        ),
+        "aggregates_count": len(aggregates),
+        "aggregates_passed_count": sum(
+            1 for aggregate in aggregates
+            if aggregate["status"] == measurement.STATUS_PASSED
+        ),
+        "classified_samples_count": sum(
+            ((aggregate.get("observations") or {}).get("pooled_profile") or {}).get(
+                "classified_samples_count", 0
+            )
+            for aggregate in aggregates
+        ),
+        "repetitions_count": plan["repetitions"],
+        "workloads_count": len(plan["inputs"]),
+    }
+    result["mandatory_metrics"] = sorted(result["metrics"])
+    result["children"] = [
+        {
+            "run_id": child["run_id"],
+            "status": child["status"],
+            "workload_config_id": child.get("workload_config_id"),
+            "repetition": child.get("repetition"),
+            "metrics": child["metrics"],
+            "failed_checks": sorted(
+                entry["name"] for entry in child["checks"]
+                if entry["status"] != measurement.STATUS_PASSED
+            ),
+        }
+        for child in children
+    ]
+    invalidated = list(invalidated)
+    # Repetitions a concurrent build invalidated stay evidence -- published,
+    # hashed and named -- but no aggregate reads them.
+    result["invalidated_children"] = [
+        {
+            "run_id": child["run_id"],
+            "workload_config_id": child.get("workload_config_id"),
+            "repetition": child.get("repetition"),
+            "failed_checks": sorted(
+                entry["name"] for entry in child["checks"]
+                if entry["status"] != measurement.STATUS_PASSED
+            ),
+        }
+        for child in invalidated
+    ]
+    result["quiet_host_waits"] = plan.get("quiet_waits", [])
+    result["run_files"] = [
+        measurement.file_entry(output_dir / f"{document['run_id']}.json")
+        for document in list(children) + invalidated + list(aggregates)
+    ]
+    result["baseline_files"] = [
+        entry for aggregate in aggregates for entry in aggregate["baseline_files"]
+    ]
+    previous = measurement.archive_published_index("attribution.json", output_dir, report_dir)
+    result["child_indexes"] = [previous] if previous else []
+    passed = bool(checks) and all(
+        entry["status"] == measurement.STATUS_PASSED for entry in checks
+    )
+    if rehearsal:
+        result["status"] = measurement.STATUS_SKIPPED
+        result["acceptance"] = {
+            "mandatory": "incomplete",
+            "reason": "a rehearsal runs unprofiled lifetimes only and is never published",
+        }
+    elif not attached:
+        result["status"] = measurement.STATUS_SKIPPED
+        result["acceptance"] = {
+            "mandatory": "incomplete",
+            "reason": (
+                "perf could not attach on this host, so the attribution run was "
+                "skipped; it stays incomplete until it is run on a host that "
+                "permits perf_event_open for this user. "
+                + preflight.get("reason", "")
+            ),
+        }
+    else:
+        result["status"] = measurement.STATUS_PASSED if passed else measurement.STATUS_FAILED
+        result["acceptance"] = {
+            "mandatory": "complete" if passed else "failed",
+            "reason": "every hard check passed" if passed else "a hard check failed",
+        }
+    result["environment"]["end"] = measurement.environment_snapshot(
+        {"harness": os.getpid()}
+    )
+    result["environment"]["match"] = measurement.environment_match(
+        result["environment"]["start"], result["environment"]["end"]
+    )
+    result["elapsed_s"] = (time.monotonic_ns() - started) / 1e9
+    written = measurement.write_result(output_dir / "attribution.json", result)
+    _ = measurement.publish_result_tree(written, report_dir)
+    return result
+
+
+def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
+                    **options) -> dict:
+    """Implement `measure attribution`: profile the real engine, reconcile.
+
+    Before any lease: the perf preflight, the build provenance, the stage
+    evidence, the prebuilt inputs and the pinned object store. Then, for each
+    workload and repetition, one child under the host controls with a
+    control lifetime and a profiled lifetime; then one aggregate per
+    workload and `attribution.json`. A host where perf cannot attach skips
+    every repetition and publishes the index with acceptance incomplete.
+
+    `rehearsal=true` runs the control lifetimes alone into `output_dir`,
+    publishing nothing, to prove the harness and the sizing on a host that
+    cannot profile yet.
+    """
+    try:
+        from . import measure as command
+    except ImportError:
+        import measure as command
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic_ns()
+    rehearsal = bool(options.get("rehearsal", False))
+    # The stage evidence is always read from the report directory; a
+    # rehearsal only publishes somewhere else.
+    evidence_dir = report_dir
+    if rehearsal:
+        report_dir = output_dir
+    configs = list(options.get("configs") or PRIMARY_CONFIGS)
+    unknown = sorted(set(configs) - set(PRIMARY_CONFIGS))
+    if unknown:
+        raise AssertionError(
+            f"attribution joins the stage family's primary workloads "
+            f"{list(PRIMARY_CONFIGS)}, not {unknown}"
+        )
+    repetitions = int(options.get("repetitions", ATTRIBUTION_REPETITIONS))
+    topology = measurement.core_topology()
+    allocation = measurement.role_allocation(
+        topology["sibling_groups"], sorted(os.sched_getaffinity(0)), spec.cores,
+        roles=measurement.CASE_ROLES["attribution"],
+    )
+    plan = {
+        "profile": not rehearsal,
+        "repetitions": repetitions,
+        "lease_wait_s": float(options.get("lease_wait_s", 0.0)),
+        "ledger_filesystem": memory_ledger_dir(
+            options.get("ledger_dir") or os.environ.get(LEDGER_DIR_ENV)
+            or Path("/tmp") / f"{LEDGER_DEFAULT_PREFIX}{os.getpid()}"
+        ),
+        "minimum_samples": int(options.get("minimum_samples", ATTRIBUTION_MINIMUM_SAMPLES)),
+        "allocation": allocation,
+        "oracle_cores": oracle_cores(allocation, topology["sibling_groups"]),
+        "cores": list(spec.cores),
+        "family_ordinal": attribution_family_ordinal(report_dir),
+        "evidence": stage_evidence(evidence_dir, options, configs),
+        "git": measurement.git_provenance(),
+        "host_at_start": host_neighbours(exclude=(os.getpid(),)),
+        "inputs": {config_id: {} for config_id in configs},
+    }
+    # A directory of this run's own inside the chosen one, so the cleanup
+    # at the end can never remove anything it did not create.
+    plan["ledger_dir"] = str(
+        Path(plan["ledger_filesystem"]["directory"]) / f"attribution-run-{os.getpid()}"
+    )
+    if rehearsal:
+        preflight = {"attached": False, "rehearsal": True,
+                     "reason": "a rehearsal does not profile"}
+    else:
+        # The engines are built and proven one engine before perf is tried:
+        # a profile of an engine that is not the canonical one describes
+        # nothing this family may claim.
+        engines = prepare_profiled_engine(
+            output_dir / "engines", lease_wait_s=plan["lease_wait_s"],
+        )
+        if not engines["valid"]:
+            preflight = {
+                "attached": False,
+                "perf_event_paranoid": perf_event_paranoid(),
+                "engine_provenance": engines,
+                "reason": "the profiled engine is not proven to be the canonical "
+                "release engine: " + "; ".join(engines["problems"]),
+            }
+        else:
+            preflight = perf_preflight(
+                output_dir / "preflight", cores=allocation["profiler"],
+                engine=attribution_engine(),
+            )
+            preflight["engine_provenance"] = engines
+        if not preflight["attached"]:
+            return publish_attribution(
+                spec, plan, [], [], output_dir, report_dir, started, preflight=preflight
+            )
+    if rehearsal:
+        plan["provenance"] = command.prepare_build()
+    else:
+        build = dict(engines["profiled"])
+        build["canonical"] = engines["canonical"]
+        build["rustflags_difference"] = engines["rustflags_difference"]
+        build["build_commands"] = engines["commands"]
+        build["identical_function_symbols"] = True
+        plan["provenance"] = {"build": build, "git": engines["git"]}
+    plan["merge"] = command.engine_merge(
+        dataclasses.replace(
+            spec,
+            overrides={
+                "receiver": {"max_concurrent_requests": ATTRIBUTION_IN_FLIGHT},
+                "exporter": {"window": {"max_requests_per_block": ATTRIBUTION_BLOCK_REQUESTS}},
+            },
+        )
+    )
+    # A rehearsal is sized like the profiled family it stands in for.
+    sizing_repetitions = repetitions if not rehearsal else ATTRIBUTION_REPETITIONS
+    for config_id in configs:
+        sizing = options.get("cpu_ns_per_record") or reference_cpu_ns_per_record(
+            plan["evidence"], config_id
+        )
+        workload = attribution_workload(
+            config_id, sizing, repetitions=sizing_repetitions,
+            minimum_samples=plan["minimum_samples"], records=options.get("records"),
+        )
+        plan["inputs"][config_id] = {
+            "sizing_cpu_ns_per_record": sizing,
+            "prebuilt": PrebuiltRequests.build(
+                workload, WORKLOAD_CONFIGS[config_id]["signal"],
+                output_dir / "inputs" / f"{config_id}-{workload.requests}",
+            ),
+        }
+    children = []
+    invalidated = []
+    plan["quiet_waits"] = []
+    store = test_e2e.DockerStore(STORE_KIND)
+    try:
+        _ = store.__enter__()
+        plan["store"] = store
+        plan["storage"] = dict(store.storage)
+        plan["store_pid"] = container_pid(store.container)
+        plan["store_cores"] = allocation.get("store", [])
+        plan["store_pinned"] = pin_container(store.container, plan["store_cores"])
+        plan["ephemeral"] = {"<store_endpoint>": store.endpoint}
+        ordinals = iter(range(attribution_child_ordinal(report_dir, output_dir), 10**6))
+        for config_id in configs:
+            for repetition in range(1, repetitions + 1):
+                for attempt in range(1, BUILD_RETRIES + 2):
+                    job = {
+                        "config_id": config_id,
+                        "repetition": repetition,
+                        "ordinal": next(ordinals),
+                        "attempt": attempt,
+                    }
+                    # Starting beside a running build would only produce an
+                    # invalidated repetition; the host is let settle first.
+                    if measurement.build_activity():
+                        plan["quiet_waits"].append(
+                            wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
+                        )
+                    child = run_attribution_child(plan, job, output_dir, report_dir)
+                    if not invalidated_by_build(child):
+                        children.append(child)
+                        break
+                    # A compiler inside the measured window invalidates the
+                    # repetition: it is kept as evidence, never aggregated, and
+                    # the repetition runs again once the host is quiet. When
+                    # the retries run out it stays missing, and the aggregate's
+                    # completeness gate says so.
+                    invalidated.append(child)
+                    if attempt > BUILD_RETRIES:
+                        break
+                    plan["quiet_waits"].append(
+                        wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
+                    )
+    finally:
+        store.__exit__(None, None, None)
+        # A lifetime that failed before its read-back leaves its ledger.
+        shutil.rmtree(plan["ledger_dir"], ignore_errors=True)
+        # The default parent is this run's own too; a directory the caller
+        # named is left as it was found.
+        parent = Path(plan["ledger_dir"]).parent
+        if parent.name == f"{LEDGER_DEFAULT_PREFIX}{os.getpid()}":
+            shutil.rmtree(parent, ignore_errors=True)
+        for entry in plan["inputs"].values():
+            if entry.get("prebuilt") is not None:
+                entry["prebuilt"].close()
+    aggregates = []
+    for config_id in configs:
+        members = [child for child in children if child.get("workload_config_id") == config_id]
+        if members:
+            aggregates.append(aggregate_attribution(members, plan=plan, output_dir=output_dir))
+    return publish_attribution(
+        spec, plan, children, aggregates, output_dir, report_dir, started,
+        preflight=preflight, invalidated=invalidated,
+    )
+
+
+def attribution_spec(**options) -> measurement.RunSpec:
+    """The family's own spec: one worker core and the first primary workload."""
+    try:
+        from . import measure as command
+    except ImportError:
+        import measure as command
+    cores = tuple(options.get("cores") or command.default_engine_cores(1))
+    return measurement.RunSpec(
+        run_id="attribution",
+        case="attribution",
+        topology="strict",
+        store=STORE_KIND,
+        cores=cores,
+        workload=WORKLOAD_CONFIGS[PRIMARY_CONFIGS[0]]["workload"],
+        interval_s=ATTRIBUTION_INTERVAL_S,
+        duration_s=1,
+        max_in_flight=ATTRIBUTION_IN_FLIGHT,
+        overrides={
+            "family": "attribution",
+            "receiver": {"max_concurrent_requests": ATTRIBUTION_IN_FLIGHT},
+        },
     )

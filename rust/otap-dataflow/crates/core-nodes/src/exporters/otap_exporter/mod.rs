@@ -2947,8 +2947,9 @@ mod tests {
     }
 
     /// Scenario: a logs request whose OTLP protobuf framing is broken reaches
-    /// the exporter, with no destination listening.
-    /// Guarantees: it is nacked permanently, naming the malformed body,
+    /// the exporter, with no destination listening, then one whose top-level
+    /// framing is intact but whose nested `ResourceLogs` is damaged.
+    /// Guarantees: each is nacked permanently, naming the malformed body,
     /// before any stream is used, so a damaged request is never converted
     /// into an empty batch and acknowledged as exported.
     #[test]
@@ -3004,28 +3005,34 @@ mod tests {
                     .await;
             });
             tokio::join!(local_set, async {
-                // Field 1, length-delimited, with the length missing.
-                let damaged =
-                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(vec![0x0a].into());
-                let pdata = OtapPdata::new_default(damaged.into()).test_subscribe_to(
-                    Interests::ACKS | Interests::NACKS,
-                    calldata_with_id(41),
-                    0,
-                );
-                pdata_tx.send(pdata).await.expect("send pdata");
-                let nack = match timeout(Duration::from_secs(5), pipeline_completion_msg_rx.recv())
-                    .await
-                    .expect("a completion for the malformed body")
-                {
-                    Ok(PipelineCompletionMsg::DeliverNack { nack }) => nack,
-                    Ok(PipelineCompletionMsg::DeliverAck { .. }) => {
-                        panic!("a malformed body must not be acknowledged")
-                    }
-                    Err(_) => panic!("pipeline result channel closed"),
-                };
-                assert!(nack.permanent, "{nack:?}");
-                assert!(nack.reason.contains("malformed OTLP"), "{}", nack.reason);
-                assert_eq!(calldata_id(&nack.refused), 41);
+                // Field 1, length-delimited, with the length missing: once in
+                // the request itself and once inside a one-byte
+                // `ResourceLogs`, which the lazy conversion reads as zero
+                // rows.
+                for (id, body) in [(41, vec![0x0a]), (42, vec![0x0a, 0x01, 0x0a])] {
+                    let damaged =
+                        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                    let pdata = OtapPdata::new_default(damaged.into()).test_subscribe_to(
+                        Interests::ACKS | Interests::NACKS,
+                        calldata_with_id(id),
+                        0,
+                    );
+                    pdata_tx.send(pdata).await.expect("send pdata");
+                    let nack =
+                        match timeout(Duration::from_secs(5), pipeline_completion_msg_rx.recv())
+                            .await
+                            .expect("a completion for the malformed body")
+                        {
+                            Ok(PipelineCompletionMsg::DeliverNack { nack }) => nack,
+                            Ok(PipelineCompletionMsg::DeliverAck { .. }) => {
+                                panic!("a malformed body must not be acknowledged")
+                            }
+                            Err(_) => panic!("pipeline result channel closed"),
+                        };
+                    assert!(nack.permanent, "{nack:?}");
+                    assert!(nack.reason.contains("malformed OTLP"), "{}", nack.reason);
+                    assert_eq!(calldata_id(&nack.refused), id);
+                }
                 control_sender
                     .send(NodeControlMsg::Shutdown {
                         deadline: Instant::now().add(Duration::from_millis(10)),

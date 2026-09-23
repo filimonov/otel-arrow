@@ -774,6 +774,109 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+## Running behind durable_buffer
+
+The shipped buffered topology places `processor:durable_buffer` between the
+receiver and this exporter. It changes what a successful response to the
+producer means, how backpressure reaches the producer, how fresh the data in
+the object store is, and how the process scales across cores. This section
+states those effects so that an operator can size, monitor and alert on them.
+
+### What the producer's OK means
+
+Without the buffer, the producer is acknowledged only after the block holding
+its request is durable in the object store. With the buffer, the producer is
+acknowledged as soon as the request is written to the buffer's local WAL. The
+exporter's own acknowledgement then goes to the buffer, not to the producer.
+An OK therefore means "durable on this host's WAL", not "readable in the lake".
+
+Backpressure becomes two-stage. When the object store slows down, this
+exporter stops admitting new blocks, the buffer keeps the pending bundles on
+disk and retries them, and the producer notices nothing until the WAL reaches
+its size cap. From then on, with `size_cap_policy: backpressure`, new requests
+receive a retryable refusal (UNAVAILABLE for OTLP/gRPC). The producer is
+refused and must retry; it is not held inside a request.
+
+### Losses the producer never sees
+
+Everything that happens after the WAL acknowledgement is invisible to the
+producer:
+
+- A permanent refusal by this exporter (a damaged OTLP body, a request larger
+  than a block can hold, an unsupported signal or point kind) makes the buffer
+  drop that bundle. It is counted in the buffer's
+  `resolved{outcome="permanently_rejected"}`; without the buffer the same
+  request would have received a permanent refusal the producer could act on.
+- `size_cap_policy: drop_oldest` evicts acknowledged data when the WAL is full.
+- `max_age` expires acknowledged data older than the configured age.
+
+Alert on each of these counters. The first can be removed by validating
+requests before the WAL acknowledges them, which is planned but not
+implemented.
+
+### Freshness
+
+There is no strict upper bound on the time from a producer's send to the
+values file being visible in the object store. In the healthy state, with no
+backlog, the delay is roughly the buffer's segment finalisation (up to 1 s by
+default), its poll interval (100 ms), the wait for this exporter's window to
+end (up to `window.interval`), and the flush and upload of the block. With a
+15 s window that is about 16 s plus the write time, not 15 s. Producer-side
+batching adds to it. During an object-store outage the delay is unbounded:
+`flush_retry_deadline` bounds one series of attempts for one block, after
+which the buffer retries later; it does not bound the time to visibility.
+
+Monitor freshness directly: this exporter's `oldest_unacked.age` covers the
+blocks it holds, and the buffer's queue age and WAL fill cover the rest. An
+end-to-end "age of the oldest accepted but unwritten record" metric is planned.
+
+### Several cores: independent shards
+
+The engine runs one independent copy of the pipeline per configured core. With
+four cores there are four receivers, four durable buffers and four exporters.
+There is no shared WAL and no work stealing between them:
+
+- Each buffer opens its own directory `<path>/core_<core_id>` and retries only
+  its own bundles.
+- `retention_size_cap` is divided between the cores: 10 GiB on four cores
+  gives each buffer about 2.5 GiB. One overloaded core starts refusing even
+  while the other cores' directories have room. `max_in_flight`, by contrast,
+  applies to each buffer separately, and this exporter's memory budgets are
+  per worker and add up across cores.
+- Receivers share their port through SO_REUSEPORT where available. That
+  spreads connections, not requests or bytes; one long-lived busy connection
+  can load a single WAL. Monitor the maximum fill and queue age across cores,
+  not only the process-wide sum.
+- There is no global order. Bundles of one series can reach different
+  exporters, and a retried bundle can land after newer data. Each worker has
+  its own descriptor cache, so repeated series rows across workers are
+  expected; readers deduplicate them as the format describes. File names do
+  not collide: each exporter uses its own random `boot_id` and local sequence.
+
+### Several processes or pods
+
+Give every process its own physical buffer directory, for example a separate
+volume per instance. The same `path` string is only acceptable when it points
+to different file systems. Two live processes sharing one `<path>/core_<n>` are
+not a supported configuration: the WAL does not take an exclusive lock on its
+directory. This also applies to an old and a new pipeline instance overlapping
+during a live reconfiguration. Several processes may write to the same bucket;
+their random `boot_id`s keep their files apart.
+
+### Changing the core count
+
+A new worker opens only the directory of its own core id; nothing moves a
+queue from a core that no longer exists to another one, and a changed core
+count also changes each core's share of `retention_size_cap`. Scale a buffered
+deployment by stopping intake and draining the old shards first, or by an
+explicit WAL migration, never by editing the core count alone. Keep the old
+`core_<id>` directories available until they are empty.
+
+The durable buffer's own module documentation still lists `RoundRobin`,
+`Random` and `LeastLoaded` dispatch policies; the current configuration offers
+`one_of` and `broadcast`. Do not rely on that table for an even distribution
+across cores.
+
 ## Reading and schema changes
 
 Use DuckDB 1.1 or newer. Values rows reference repeated series descriptors, so
@@ -1098,10 +1201,11 @@ become null; a negative converted timestamp becomes null and increments
   so a duplicate key inside either goes undetected. Duplicate-key validation
   covers only the lists this writer decodes: resource, scope, the log
   record's own attributes and a supported data point's attributes.
-- Only an OTLP body's top-level protobuf framing is validated before
-  conversion, because the shared byte views decode lazily. Corruption inside
-  a nested message is not validated and surfaces as missing fields rather
-  than as a refusal.
+- An OTLP body's protobuf framing is validated before conversion, because
+  the shared byte views decode lazily, and the check follows the OTLP schema
+  into every nested message, so damage at any depth refuses the whole
+  request. It checks framing and wire types only: string fields are not
+  checked for UTF-8 there.
 - Dictionary-encoded OTAP Arrow columns are read through their dictionary,
   never expanded first. Every attribute key and value is charged as it is
   read: one longer than `ingress.max_row_bytes`, or an attribute table whose
@@ -1110,8 +1214,11 @@ become null; a negative converted timestamp becomes null and increments
   memory before the budgets apply.
 - The OTLP receiver hands this exporter the raw request bytes, and the
   shared conversion to Arrow encodes nested map and array attribute values
-  with a recursive encoder that has no depth limit of its own. Deep nesting is
-  refused by `ingress.max_nesting_depth` only after that conversion.
+  with a recursive encoder that has no depth limit of its own. The framing
+  check above refuses nesting deeper than 256 levels, the largest accepted
+  `ingress.max_nesting_depth`, before that conversion; nesting between the
+  configured limit and 256 is refused by `ingress.max_nesting_depth` only
+  after it.
 
 ### Format and storage limits in v1
 
@@ -1145,6 +1252,59 @@ become null; a negative converted timestamp becomes null and increments
 - Finalizing a values dataset flushes whatever is still buffered into one
   further run bounded by `run_target_bytes`, so the transient at seal time can
   reach `(V + 1) * run_target_bytes` for V buffered runs.
+
+### High-cardinality point attributes
+
+A series identity is the complete set of resource, scope, metric and point
+attributes, as OpenTelemetry defines a stream. A point attribute that is unique
+per point, such as a request id, a trace id or a user id, therefore makes one
+series per point: the `series` dataset grows as fast as `values` and the
+descriptor cache stops hitting. The exporter cannot drop a varying attribute
+from the identity without merging streams that the producer reported as
+distinct, so remove or bucket such attributes upstream, in the SDK with Views
+or in the pipeline. The exporter has no series-to-points ratio signal yet;
+`series_cache.misses` rising with the point rate is the nearest indicator.
+
+Deleting the attribute with `processor:attribute` in front of this exporter
+works and is covered end to end:
+
+```yaml
+processor:
+  type: processor:attribute
+  config:
+    apply_to: ["signal"]
+    actions:
+      - {action: delete, key: request.id}
+```
+
+Two streams that differ only in the deleted attribute arrive with the same
+identity. They get one `series_id` and one descriptor, written once per
+partition and worker, and their points are stored as separate `values` rows
+under that `series_id`, even when the timestamps are equal. Nothing is refused,
+deduplicated or merged. Whether the collapsed rows still mean something
+depends on the point kind:
+
+- Delta sums and delta histograms stay correct. A reader sums the rows:
+  `value_int` or `value_double`, `count`, `sum` and the bucket counts element
+  by element give exactly the totals of the original streams.
+- Cumulative sums and cumulative histograms become wrong. Each row is one
+  stream's running total, and the totals of different streams interleave under
+  one `series_id` with nothing to tell them apart. A reader taking the latest
+  value picks one stream arbitrarily, and a rate over consecutive rows sees
+  false resets. Summing rows that share one timestamp happens to give the
+  combined total, but streams rarely report at the same instant and reset
+  independently, so that does not generalize.
+- Gauges become ambiguous. The collapsed series holds several samples for one
+  instant and no rule for combining them; last, mean and maximum are all
+  plausible and the files do not say which was meant.
+
+The `hash` action keeps the cardinality and only obscures the value. Spatial
+aggregation, dropping attributes and merging the colliding streams with a
+temporality-correct function (per-stream cumulative totals with reset
+handling, summed deltas, a chosen function for gauges), is not available in
+otap-dataflow today: `processor:temporal_reaggregation` aggregates over time
+only. Until such a processor exists, delete only attributes of delta metrics,
+or aggregate cumulative metrics and gauges in the SDK.
 
 ### Operational limits
 

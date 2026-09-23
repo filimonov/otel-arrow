@@ -39,6 +39,15 @@ python3 -m crates.validation.tests.series_parquet.measure run \
 SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure \
   stages --output-dir /tmp/series-stages
 
+# The fault-tool contracts, then the disposable fault tools' preflight:
+# signed S3 through NGINX and both Toxiproxy routes, DNS/firewall/capture
+# probes, the capability split and the first activations, on MinIO and
+# RustFS. Provision the images first (Fault tools, below).
+python3 -m unittest crates.validation.tests.series_parquet.test_failures -v
+SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure fault-preflight \
+  --output-dir /tmp/series-fault-preflight
+
 # Stage one published evidence tree by exact file name, before a commit.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
   --index ../../docs/superpowers/reports/series-parquet-measurement/harness-contracts.json
@@ -85,6 +94,101 @@ keeps the `dhat-heap.json` it writes. `stages` takes
 `--option configs='["logs-1k-stable"]'`, `--option stages='["extract"]'` and
 `--option repetitions=3`.
 
+A filtered `stages` run is a spot family. It must publish under an index of
+its own, `--option index_name=stages-spot`, so it can never replace
+`stages.json`, the family of record, and its coverage checks cover the
+stages and workloads it asked for.
+
+`attribution` profiles the real engine with perf and reconciles its CPU
+shares with the stage families:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure attribution \
+  --output-dir /tmp/series-attribution
+```
+
+It needs Docker with the MinIO image, a `perf` that may attach to this
+user's processes (`kernel.perf_event_paranoid` of 2 or lower, or
+`CAP_PERFMON`), `c++filt` from binutils for Rust's v0 symbols, and a clean
+Rust tree. The workspace's default linker, lld, places the executable
+segment 4 KiB above its file offset, and perf's libdw unwinder, which
+derives the module base from the file offset, then ends every stack after
+its first frame. So the family builds its own profiled engine,
+`target/release/df_engine-perf`, before any measured window and holding the
+host lease so no one else's measurement overlaps the compile:
+
+```bash
+cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer          # the canonical engine
+cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer -- \
+  -C link-arg=-Wl,-z,separate-loadable-segments          # relink only
+cp target/release/df_engine target/release/df_engine-perf
+cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer          # restores df_engine
+```
+
+It then proves the two binaries one engine. Both record their revision,
+profile, features, allocator, `rustc -vV`, hash, segment layout and the
+exact flag difference. Their sorted `(size, demangled name)` function
+symbols from `nm --defined-only --size-sort -C` must be identical, and the
+profiled layout must be one perf can unwind. Any mismatch refuses the family
+with the reason. The perf preflight then records a busy process with the
+exact command line a measured run uses. When the engine is not proven or
+perf cannot attach, no repetition runs, `attribution.json` is published with
+status `skipped`, a failed `perf_attached` check and the preflight's
+evidence, the mandatory acceptance stays incomplete, and the command exits
+3. Every index and repetition records the `perf_event_paranoid` it ran
+under, since the setting does not survive a reboot.
+
+Each of the stage family's two primary workloads is prebuilt once, before
+any lease, and lengthened from the pinned family's costs until three
+repetitions give at least 10,000 classified samples at 199 Hz. Each
+repetition runs an unprofiled control lifetime and a profiled one on the
+same cores and store: blocks rotate every 128 requests with 256 in flight.
+The profiled lifetime records `perf record -e cpu-clock -F 199 -g
+--call-graph dwarf --sample-cpu -p ENGINE_PID`, with the events enabled
+through control FIFOs across exactly the input phase, first request to last
+durable acknowledgement. Every sample is assigned once by its innermost
+production frame (`performance.classify_cpu`; the rules are recorded in the
+index). The flush wall time that is not flush-task CPU is reported as
+`upload_wait_s`, outside the CPU shares.
+
+The binding reconciliation is the plan's Stage agreement rule, a hard gate
+in every repetition and aggregate. Exclusive category CPU plus the named
+residual is compared with the engine CPU the scheduler measured; an error
+above 10 percent, or unexplained CPU (residual plus uncovered CPU) above 20
+percent, invalidates the attribution. An aggregate also requires the pinned
+stage family to verify by hash. A baseline is written only after every one of
+these gates has passed. The per-stage comparison of attributed costs with
+isolated bench costs is descriptive and gates nothing. Its reference is the
+pinned family, with the spot family beside it as supplementary evidence and
+never substituted. A row outside the 0.5 to 2 band is explained only when the
+published spot family brings it into the band, and is otherwise marked
+unexplained.
+
+`--option rehearsal=true` runs the control lifetimes alone into the output
+directory and publishes nothing; `--option records=...`,
+`cpu_ns_per_record=...`, `repetitions=...` and `configs=[...]` adjust the
+family. Each lifetime's ledger is written on a memory file system, checked
+in `/proc/self/mountinfo` and recorded: `/tmp` by default, `--option
+ledger_dir=...` or `SERIES_ATTRIBUTION_LEDGER_DIR` name another, and a
+directory that is not tmpfs falls back to `/dev/shm`, or the family is
+refused. On a disk the ledger's per-request fsyncs throttle the sender to the
+disk's commit rate. It is deleted after the read-back and its hash is kept.
+`--option lease_wait_s=...` lets the engine build and each repetition wait
+that long for the host lease another measurement holds, instead of being
+refused. A repetition whose measured window saw a compiler -- another
+agent's build is not this family's to stop -- is kept in the index as
+`invalidated_children`, never aggregated, and run again under a new ordinal
+once the host has been build-free for a minute, at most three times.
+
+`fault-preflight` takes `--option stores=["minio"]` to probe one store and
+`--option lease_wait_s=...` (default four hours) to wait for the host lease.
+It exits 0 when every probe passed, 1 when a required probe failed and 3 when
+optional fault tools were missing or failed a probe, after cleanup.
+
 `memory` (`SERIES_MEASURE_LONG=1`) measures the real engine's memory in
 pairs: each pair launches a control engine whose exporter is the noop
 exporter and then the measured strict or buffered engine, fresh, on the same
@@ -111,8 +215,7 @@ SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure 
   memory --output-dir /tmp/series-memory
 ```
 
-The remaining subcommands (`attribution`,
-`capacity`, `soak`, `fault-preflight`, `failures`, `buffered`,
+The remaining subcommands (`capacity`, `soak`, `failures`, `buffered`,
 `remediate`, `report`) are named here so the command line is one contract;
 each is implemented by its own task.
 
@@ -122,16 +225,99 @@ each is implemented by its own task.
 | --- | --- |
 | `DF_ENGINE` | The engine binary to run. The fixture suite defaults to `target/debug/df_engine`; measured cases default to `target/release/df_engine` and refuse any non-release profile. |
 | `SERIES_REQUIRE_DOCKER` | `1` makes missing images and Docker a failure rather than a skip. |
-| `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling a failure rather than a skip. |
+| `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling, or any failed fault-tool probe (UDP/TCP DNS, xt_bpf, capture, capabilities, S3 route), a failure rather than a skip. |
+| `SERIES_FAULT_TOOLS_IMAGE`, `SERIES_TOXIPROXY_IMAGE` | The fault-tools and Toxiproxy images. Default `series-measure-fault-tools:local` and `ghcr.io/shopify/toxiproxy:2.12.0`. |
+| `SERIES_FAULT_LEASE_WAIT_S` | How long the live rig test waits for the host lease. Default 3600. |
 | `SERIES_MEASURE_LONG` | `1` opts in to throughput sweeps, profiled memory runs, the soak and long failure runs. |
 | `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-parquet-host-measurement.lock`, shared by every checkout and launcher on the host. |
 | `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series-parquet,aws,durable-buffer` and `jemalloc`. |
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
+| `SERIES_PERF` | The perf executable an attribution records with. Defaults to `perf` on the PATH. |
+| `SERIES_ATTRIBUTION_ENGINE` | The engine an attribution profiles. Defaults to `target/release/df_engine-perf`. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
 Python dependencies are pinned in `requirements.txt` and, with hashes, in
 `requirements.lock.txt`; install with `pip install --require-hashes -r
 requirements.lock.txt`.
+
+## Fault tools
+
+`faults.py` builds one disposable rig per run around an existing
+`DockerStore`:
+
+```text
+engine --127.0.0.1:19000--> nginx --19001 general--> toxiproxy --> store
+                                  \--19002 values--/
+```
+
+A private bridge network (unique name, labelled `series-fault-run=<id>`)
+carries the store under the alias `store`. The fault-tools container is the
+namespace owner: it runs NGINX with `fault-nginx.conf` and is the only
+container started with `--cap-add=NET_ADMIN`. Toxiproxy and the engine join
+its namespace with `--network container:OWNER`, so the proxies' loopback
+listeners are real and every DNS, firewall and capture rule installed with
+`docker exec` in the owner applies to the engine's own traffic. Nothing uses
+`--privileged`, host networking, host firewall rules or module loading. The
+owner publishes NGINX, the Toxiproxy API and the engine's gRPC and admin
+ports on host loopback only. Every container starts from the inspected image
+id, never the mutable tag. The engine must be a release build (the harness's
+own profile rule; anything else is refused before launch) and its hash is
+recorded; it runs as the invoking user with the binary and the repository
+mounted read-only and its run and buffer directories read-write, after `ldd`
+inside the image proved its shared libraries resolve; `docker inspect` gives
+its host PID. Tool containers and the engine inherit the harness's CPU
+affinity through `--cpuset-cpus`, so a harness under `taskset` confines them
+too. A container is recorded only once Docker wrote its id to a cidfile, and
+is removed by that id. Teardown runs independent stages -- retry of any
+fault whose recovery failed, namespace rules, proxies, control file,
+artifacts, containers, store attachment, network, leftover check -- each of
+which runs whatever an earlier one raised, an interrupt included (re-raised
+at the end). Artifacts (access log, captures, dnsmasq log) stay under the
+rig's root.
+
+Registered faults: `slow` adds the upstream `bandwidth` (rate 256 KB/s) and
+downstream `latency` (1500 ms) toxics to both proxies; `http503` creates the
+control file NGINX answers 503 for; `store_outage` stops the store container
+and recovers the same container, repointing both proxies if its address
+changed. Any activation or recovery error after preflight is a failure, and
+a fault whose recovery failed stays active so the teardown retries it.
+
+Provision once, outside any measurement lease, from `rust/otap-dataflow`:
+
+```bash
+docker pull ghcr.io/shopify/toxiproxy:2.12.0
+docker pull ubuntu:24.04
+docker build -t series-measure-fault-tools:local \
+  --build-arg BASE=ubuntu@sha256:<digest docker pull printed> \
+  -f crates/validation/tests/series_parquet/fault-tools.Dockerfile \
+  crates/validation/tests/series_parquet
+```
+
+Nothing in the harness pulls or builds these images. `fault-preflight`
+records their ids, repository digests and the tools image's package
+versions, then, under the host lease, per store: signed PUT/HEAD/GET/DELETE
+and a multipart completion through each backend, route isolation (disabling
+one proxy breaks exactly its keys), the containerized release engine
+exporting through both backends, the capability split read from each
+container's configuration and `/proc/PID/status`, UDP and TCP DNS blocking
+(exact port-53 DROP rule, bounded `dig` timeout, positive counter, exact
+deletion, resolution restored), the `xt_bpf` ACK-only drop (bytecode from
+`tcpdump -ddd -y RAW`; a signed PUT through the route stalls under the rule,
+and the probe requires dropped ACKs, a non-empty capture and at least one
+retransmission, then after the exact deletion a signed PUT with a 2xx
+status and its bytes read back), a signed transfer captured and read back
+with tshark, the three activations, and the restored state. Every command's
+argv, exit status, output and duration is kept in `fault-preflight.json`,
+with the fault-class coverage those probes decide, per store: a class is
+available for a store only when that store's own probes passed, and
+available overall only when it is available for every store (the stores
+themselves start from their inspected image id, `DockerStore(kind,
+by_image_id=True)`; the legacy suite keeps the tag). `disconnect_reset` and
+`dropped_completion_response` stay unavailable until Task 11 adds their
+direct probes with negative controls; the coverage names what each must
+show.
+A failed `xt_bpf` probe names the host fix (`sudo modprobe xt_bpf`); the
+harness never runs it.
 
 ## What a measurement is allowed to claim
 
