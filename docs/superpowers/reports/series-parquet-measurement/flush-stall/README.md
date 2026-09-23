@@ -10,6 +10,25 @@ fixtures, each with 3 uncancelled and 20 cancelled writes, under
   step per budget across runs and columns).
 - `*-input-sidecar.json`, `*-bench-config.json`: the harness input and the
   bench configuration each run read.
-- `files-before.sha256`, `files-final.sha256`: SHA-256 of every Parquet
-  file each build wrote for the same input; they are identical.
-- `probe-binaries.sha256`: the three bench executables.
+- `files-before.sha256`: SHA-256 of every Parquet file written by the
+  library at fcceef306, the pre-task source (probe source of a223a4d25 +
+  fcceef306). Reproduced byte for byte by the round-1 before build.
+- `files-final.sha256`: the same for the library at 75732cafd.
+- `files-head-545c9f038.sha256`: the same for the library at 545c9f038,
+  after review fix round 1.
+- All three manifests are identical. They show that the output is the same
+  before and after the change, on these four inputs. The unit test
+  `sliced_merge_matches_the_unsliced_merge_and_a_stable_sort` shows
+  something else: that the current merge's output does not depend on its
+  step budget.
+- `probe-binaries.sha256`: the three bench executables of the first round.
+
+Review fix round 1 re-ran the comparison with the fixed probe. The probe
+times the flush's observation of a cancellation at the sink's first clock
+reading, where it takes the cleanup deadline, and makes 7 uncancelled and
+20 cancelled writes per fixture.
+
+- `*-round1-before.json`: library at fcceef306 with the probe source of
+  545c9f038, its workspace reading disabled (the old sink has none).
+- `*-round1-head.json`: library and probe at 545c9f038.
+- `probe-binaries-round1.sha256`: the two executables.

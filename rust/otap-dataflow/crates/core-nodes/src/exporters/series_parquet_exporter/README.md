@@ -1375,7 +1375,8 @@ or aggregate cumulative metrics and gauges in the SDK.
   the file are encoding one chunk, bounded by `sorting.merge_chunk_bytes`,
   and closing one row group, bounded by `parquet.row_group_bytes`. At the
   defaults, on the largest block the default budgets admit, the longest step
-  measured 22 to 25 ms, and a cancellation was observed within 16 to 22 ms.
+  measured 20 to 24 ms, and the flush acted on a cancellation within 17 to
+  22 ms of it.
   Moving the flush off the core is future work.
 
 ## Related Docs
