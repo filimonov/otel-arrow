@@ -181,13 +181,6 @@ struct Startup {
     num_cores: usize,
 }
 
-/// The grace the engine grants a signal-driven shutdown (SIGINT, SIGTERM).
-///
-/// A worker whose worst-case shutdown -- one window, then a flush and its
-/// abort for each of the two blocks -- does not fit it is cut off before it
-/// can decide what it holds.
-const SIGNAL_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Physical memory of the host, in bytes, where the platform reports it.
 fn physical_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -196,14 +189,11 @@ fn physical_memory_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Emit the start event and the configuration warnings a worker can judge
-/// at start-up.
+/// Emit the start event, and a warning when every core's memory budget
+/// together exceeds physical memory.
 ///
 /// One event carries everything an operator needs to find this worker's
 /// files -- writer id, boot id, storage -- and the budget it runs under.
-/// The warnings are conditions that do not stop the node but predict a
-/// failure: every core's budget together exceeding physical memory, and a
-/// worst-case shutdown longer than the signal shutdown grace.
 fn announce(worker: &worker::Worker, startup: &Startup) {
     let budget = worker.budget_bytes();
     let total = budget.saturating_mul(startup.num_cores as u64);
@@ -226,24 +216,6 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
             physical_memory_bytes = physical,
             message = "every worker's memory budget together exceeds physical memory; lower \
                        the block and ingress budgets or run on fewer cores"
-        );
-    }
-    let window = &worker.cfg.window;
-    let bound = window.interval.saturating_add(
-        window
-            .flush_retry_deadline
-            .saturating_add(worker.cfg.lake.upload.abort_timeout)
-            .saturating_mul(2),
-    );
-    if bound > SIGNAL_SHUTDOWN_GRACE {
-        otel_warn!(
-            "series_parquet.shutdown.grace_exceeded",
-            shutdown_bound = ?bound,
-            signal_grace = ?SIGNAL_SHUTDOWN_GRACE,
-            message = "window.interval + 2 * (window.flush_retry_deadline + \
-                       upload.abort_timeout) exceeds the signal shutdown grace; a SIGTERM may \
-                       cut off the last flush, so shut down through the admin API with a \
-                       longer timeout"
         );
     }
 }

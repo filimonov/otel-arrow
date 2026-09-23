@@ -255,6 +255,9 @@ pub(super) struct Worker {
     seq: u64,
     /// What will have asked for the next rotation.
     pub(super) reason: FlushReason,
+    /// How long the last write attempt that returned took, which judges the
+    /// first attempt of a flush sealed after shutdown (see `FlushJob::new`).
+    last_attempt: Option<std::time::Duration>,
     /// Largest completion token the worker has held, for capacity reporting.
     pub(super) token_high_water: usize,
     /// How many times the worker has scanned its state for telemetry.
@@ -337,6 +340,7 @@ impl Worker {
             sink,
             seq: 1,
             reason: FlushReason::Time,
+            last_attempt: None,
             token_high_water: size_of::<AckToken>(),
             samples: 0,
             refusals: RefusalLog::default(),
@@ -770,14 +774,19 @@ impl Worker {
         }
         let next = self.new_active();
         let old = std::mem::replace(&mut self.active, next);
-        self.flushing = Some(FlushJob::new(
+        let job = FlushJob::new(
             old.data,
             old.tokens,
             self.sink.clone(),
             old.emitted,
             self.cfg.window.flush_retry_deadline,
             self.cfg.lake.upload.abort_timeout,
-        ));
+            self.last_attempt,
+        );
+        if let Some(deadline) = self.deadline {
+            job.cut_to(deadline);
+        }
+        self.flushing = Some(job);
     }
 
     /// The outcome a block whose flush did not succeed must be reported as.
@@ -822,6 +831,9 @@ impl Worker {
         let mut reason: Option<Rc<str>> = None;
         let outcome = match &done {
             Ok(finished) => {
+                if finished.took.is_some() {
+                    self.last_attempt = finished.took;
+                }
                 if let Some(metrics) = &mut self.metrics {
                     metrics
                         .worker
@@ -890,7 +902,21 @@ impl Worker {
                             message = "Block failed before durable completion"
                         );
                         reason = Some(Rc::from(BlockWriteFailed(error).to_string()));
-                        self.failed_outcome()
+                        // Out of the time shutdown left it, whether at the
+                        // latched deadline or because no retry could finish
+                        // before it.
+                        let cut = job.cut_by_shutdown()
+                            && matches!(
+                                error,
+                                lake::Error::Transient(
+                                    lake::TransientError::DeadlineExceeded { .. }
+                                )
+                            );
+                        if cut {
+                            Outcome::Shutdown
+                        } else {
+                            self.failed_outcome()
+                        }
                     }
                 }
             }
@@ -1144,7 +1170,10 @@ impl Worker {
         }
     }
 
-    /// Latch a shutdown deadline and ask for the ACTIVE block to be sealed.
+    /// Latch a shutdown deadline: the FLUSHING block's retries are cut to
+    /// it, and the ACTIVE block is sealed as soon as the flush slot frees,
+    /// without waiting for its window, and flushed under the same cut (see
+    /// `FlushJob::cut_to`).
     ///
     /// The earliest deadline wins, so a second, tighter shutdown cannot extend
     /// the first.
@@ -1154,7 +1183,11 @@ impl Worker {
         if let Some(pending) = self.pending.take() {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
-        self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+        let latched = self.deadline.map_or(deadline, |old| old.min(deadline));
+        self.deadline = Some(latched);
+        if let Some(job) = &self.flushing {
+            job.cut_to(latched);
+        }
         self.reason = FlushReason::Shutdown;
         self.rotation_requested = true;
     }

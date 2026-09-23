@@ -441,12 +441,10 @@ async fn decisions_are_recorded_in_the_shared_export_metrics() {
     assert_eq!(exports("logs", "success"), None, "nothing was acked");
 }
 
-/// Scenario: a worker starts with a configuration whose worst-case shutdown
-/// is longer than the signal shutdown grace, on more cores than any host has
-/// memory for, and then with a configuration that fits both.
+/// Scenario: a worker starts on more cores than any host has memory for, and
+/// then a second one on a single core.
 /// Guarantees: the start event carries writer id, boot id and storage, and
-/// each predicted failure is its own WARN naming the numbers it compared,
-/// emitted only when the condition holds.
+/// the oversubscribed budget is a WARN emitted only when the condition holds.
 #[tokio::test(flavor = "current_thread")]
 async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     let events = capture();
@@ -482,32 +480,17 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
         assert_eq!(warned.len(), 1, "a million cores oversubscribe any host");
         assert_eq!(warned[0].level, tracing::Level::WARN);
     }
-    // The test configuration's window, flush deadline and abort bound.
-    let window = &worker.cfg.window;
-    let bound =
-        window.interval + 2 * (window.flush_retry_deadline + worker.cfg.lake.upload.abort_timeout);
-    assert_eq!(
-        events.named("series_parquet.shutdown.grace_exceeded").len(),
-        usize::from(bound > Duration::from_secs(60)),
-    );
 
     let (handler, _rx) = effects(8);
-    let mut fits = worker_config();
-    fits.window.interval = Duration::from_secs(1);
-    fits.window.flush_retry_deadline = Duration::from_secs(10);
-    fits.lake.upload.abort_timeout = Duration::from_secs(5);
     let small = Worker::new(
-        fits,
+        worker_config(),
         Arc::new(object_store::memory::InMemory::new()),
         wall,
         handler,
     );
-    let before = (
-        events
-            .named("series_parquet.memory_budget.oversubscribed")
-            .len(),
-        events.named("series_parquet.shutdown.grace_exceeded").len(),
-    );
+    let before = events
+        .named("series_parquet.memory_budget.oversubscribed")
+        .len();
     super::super::announce(
         &small,
         &super::super::Startup {
@@ -517,14 +500,11 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     );
     assert_eq!(events.named("series_parquet.start").len(), 2);
     assert_eq!(
-        (
-            events
-                .named("series_parquet.memory_budget.oversubscribed")
-                .len(),
-            events.named("series_parquet.shutdown.grace_exceeded").len(),
-        ),
+        events
+            .named("series_parquet.memory_budget.oversubscribed")
+            .len(),
         before,
-        "a worker that fits both bounds warns about neither"
+        "one core's budget fits the host"
     );
 }
 

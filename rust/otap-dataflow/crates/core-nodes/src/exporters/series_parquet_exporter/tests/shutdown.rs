@@ -468,6 +468,258 @@ async fn shutdown_commits_both_blocks_before_deadline() {
         .await;
 }
 
+/// A node whose first block (requests 1 to 4) is FLUSHING against `store`'s
+/// fault and whose ACTIVE block holds request 5, run for `before` and then
+/// sent a Shutdown granting `grace`, with the upstream sender dropped so the
+/// engine releases it. Returns the node, its completions and the deadline.
+async fn shutdown_while_both_blocks_wait(
+    store: &Arc<FaultStore>,
+    sim: &clock::SimClock,
+    before: Duration,
+    grace: Duration,
+) -> (
+    tokio::task::JoinHandle<
+        Result<
+            otel_arrow_dfe_engine::terminal_state::TerminalState,
+            otel_arrow_dfe_engine::error::Error,
+        >,
+    >,
+    PipelineCompletionMsgReceiver<OtapPdata>,
+    mpsc::Sender<NodeControlMsg<OtapPdata>>,
+    std::time::Instant,
+) {
+    let (handler, mut rx) = effects(16);
+    let (pdata_tx, control_tx, inbox) = inbox(8);
+    let node = tokio::task::spawn_local(super::super::run(
+        worker_config(),
+        store.clone(),
+        Arc::new(lake::clock::TestWallClock::new(0)),
+        inbox,
+        handler,
+        None,
+    ));
+    // Four requests fill a block, so the node rotates it at once.
+    for id in 1..=4 {
+        pdata_tx
+            .send_async(logs_pdata_from(id))
+            .await
+            .expect("a request of the first block enqueues");
+    }
+    until("the first block's write reaches the store", || {
+        !store
+            .hooks()
+            .entered_at
+            .lock()
+            .expect("entered_at lock")
+            .is_empty()
+    })
+    .await;
+    pdata_tx
+        .send_async(logs_pdata_from(5))
+        .await
+        .expect("the request of the second block enqueues");
+    marker(&pdata_tx, &mut rx, 99).await;
+    step_for(sim, before).await;
+    let deadline = clock::now() + grace;
+    control_tx
+        .send_async(NodeControlMsg::Shutdown {
+            deadline,
+            reason: "terminate".to_owned(),
+        })
+        .await
+        .expect("the shutdown enqueues");
+    drop(pdata_tx);
+    (node, rx, control_tx, deadline)
+}
+
+/// Step the simulated clock until five completions have arrived and the node
+/// has returned, or `until` has passed; each completion with the instant it
+/// was received.
+async fn completions_until(
+    sim: &clock::SimClock,
+    rx: &mut PipelineCompletionMsgReceiver<OtapPdata>,
+    node: &tokio::task::JoinHandle<
+        Result<
+            otel_arrow_dfe_engine::terminal_state::TerminalState,
+            otel_arrow_dfe_engine::error::Error,
+        >,
+    >,
+    until: std::time::Instant,
+) -> Vec<(std::time::Instant, PipelineCompletionMsg<OtapPdata>)> {
+    let mut got = Vec::new();
+    while clock::now() < until && !(got.len() == 5 && node.is_finished()) {
+        step_for(sim, Duration::from_millis(100)).await;
+        while let Ok(message) = rx.try_recv() {
+            got.push((clock::now(), message));
+        }
+    }
+    got
+}
+
+/// Scenario: the first block's store fails for 23 s, long enough for its
+/// retry backoff to have grown to ten seconds, while a second block waits
+/// ACTIVE; a terminate then grants a 60 s grace, and the store heals 32 s into
+/// it, before the first block's own retry deadline.
+/// Guarantees: once shutdown latches the backoff drops to its minimum, so the
+/// first block is retried and written right after the store heals, the
+/// ACTIVE block is then sealed and written without waiting for its window,
+/// and all five requests are acknowledged before the grace ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::Series);
+            let (node, mut rx, control_tx, deadline) = shutdown_while_both_blocks_wait(
+                &store,
+                &sim,
+                Duration::from_secs(23),
+                Duration::from_secs(60),
+            )
+            .await;
+            // A ten-second backoff would next retry at about 52.6 s and then
+            // hit the block's own 60 s deadline; this is between the two.
+            step_for(&sim, Duration::from_secs(32)).await;
+            store.hooks().set(Fault::None);
+
+            let got = completions_until(&sim, &mut rx, &node, deadline).await;
+            let mut acked: Vec<usize> = got
+                .into_iter()
+                .map(|(_, message)| match message {
+                    PipelineCompletionMsg::DeliverAck { ack } => ack
+                        .accepted
+                        .into_parts()
+                        .0
+                        .source_node()
+                        .expect("a routed request"),
+                    other => panic!("expected an ack, got {other:?}"),
+                })
+                .collect();
+            acked.sort_unstable();
+            assert_eq!(acked, vec![1, 2, 3, 4, 5], "both blocks are acknowledged");
+            assert!(clock::now() < deadline, "the drain ends inside the grace");
+            let _ = node
+                .await
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: the same two blocks, but the store never heals and the grace,
+/// 30 s, ends before the first block's own retry deadline.
+/// Guarantees: every request of both blocks is nacked as a retryable
+/// `NodeShutdown` at the latched deadline, not before it, and no write reaches
+/// the store at or after the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::Series);
+            let (node, mut rx, control_tx, deadline) = shutdown_while_both_blocks_wait(
+                &store,
+                &sim,
+                Duration::from_secs(23),
+                Duration::from_secs(30),
+            )
+            .await;
+
+            let got =
+                completions_until(&sim, &mut rx, &node, deadline + Duration::from_secs(10)).await;
+            assert_eq!(got.len(), 5, "every request is decided");
+            for (at, message) in got {
+                assert!(at >= deadline, "nacked at the deadline, not before it");
+                match message {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(!nack.permanent);
+                        assert_eq!(nack.cause, NackCause::NodeShutdown);
+                    }
+                    other => panic!("expected a nack, got {other:?}"),
+                }
+            }
+            let entered = store
+                .hooks()
+                .entered_at
+                .lock()
+                .expect("entered_at lock")
+                .clone();
+            assert!(
+                entered.len() > 10,
+                "the block was retried until the deadline"
+            );
+            assert!(
+                entered.iter().all(|at| *at < deadline),
+                "no attempt starts at or after the deadline"
+            );
+            let _ = node
+                .await
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: every write takes 20 s to fail, and a terminate granting 30 s
+/// latches one second into the first block's first attempt.
+/// Guarantees: no attempt starts that the last one says cannot finish by the
+/// deadline: neither the first block's retry nor the ACTIVE block's first
+/// attempt is started, both blocks are nacked as retryable `NodeShutdown`
+/// right after the one attempt fails, and the node returns before the grace
+/// ends instead of waiting for it.
+#[tokio::test(flavor = "current_thread")]
+async fn no_attempt_starts_that_cannot_finish_by_the_deadline() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::SlowFail);
+            let (node, mut rx, control_tx, deadline) = shutdown_while_both_blocks_wait(
+                &store,
+                &sim,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+            )
+            .await;
+
+            let got = completions_until(&sim, &mut rx, &node, deadline).await;
+            assert_eq!(got.len(), 5, "every request is decided before the deadline");
+            for (_, message) in got {
+                match message {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(!nack.permanent);
+                        assert_eq!(nack.cause, NackCause::NodeShutdown);
+                    }
+                    other => panic!("expected a nack, got {other:?}"),
+                }
+            }
+            assert_eq!(
+                store
+                    .hooks()
+                    .entered_at
+                    .lock()
+                    .expect("entered_at lock")
+                    .len(),
+                1,
+                "only the attempt already running when shutdown latched"
+            );
+            assert!(node.is_finished(), "the node returns inside the grace");
+            let _ = node
+                .await
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            drop(control_tx);
+        })
+        .await;
+}
+
 /// Scenario: shutdown latches a 60 s deadline while a block's write is
 /// parked, the node learns it from a force-drained request, and upstream drops
 /// its pdata sender while the node is taking a control message; the clock then

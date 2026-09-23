@@ -538,6 +538,8 @@ pub(super) struct Faults {
     /// Raised as each write reaches the injection point, so a test can wait
     /// for a flush to have started rather than guess that it has.
     pub(super) entered: tokio::sync::Notify,
+    /// Engine-clock instant at which each write reached the injection point.
+    pub(super) entered_at: std::sync::Mutex<Vec<std::time::Instant>>,
     /// Releases one parked write under [`Fault::Park`].
     pub(super) release: tokio::sync::Notify,
     /// Writes currently parked inside the store under [`Fault::Park`].
@@ -604,6 +606,10 @@ impl Faults {
 
     /// Announce a write and apply the active injection to it.
     async fn before(&self, path: &object_store::path::Path) -> object_store::Result<()> {
+        self.entered_at
+            .lock()
+            .expect("entered_at lock")
+            .push(clock::now());
         self.entered.notify_one();
         let mode = self.mode();
         if mode == Fault::Park {
@@ -751,6 +757,23 @@ pub(super) fn ticking_windows(
             sim.advance(Duration::from_secs(1));
         }
     }))
+}
+
+/// Advance `sim` by `total` in 100 ms steps, giving every task on the
+/// runtime several turns after each step.
+///
+/// Stepping from the test, rather than from a [`Ticker`], lets the test act
+/// at a chosen simulated instant.
+pub(super) async fn step_for(sim: &clock::SimClock, total: Duration) {
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < total {
+        sim.advance(step);
+        elapsed += step;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 /// Start advancing `sim` by `step` on every turn of the current runtime.

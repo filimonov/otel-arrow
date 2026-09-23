@@ -225,50 +225,58 @@ returns HTTP 504, outstanding requests are nacked as retryable, and their
 producers have to resend. The end-to-end suite exercises exactly this with a
 600s window against a 20s deadline.
 
-Size the deadline for the two blocks that can be in flight, not for one. The
-FLUSHING block must finish and release the slot before the ACTIVE block can be
-sealed, the slot stays held through the abandoned write's
-`upload.abort_timeout` cleanup, and the ACTIVE block's own retry deadline is
-taken when it is sealed, which is after all of that. The two retry windows are
-therefore sequential rather than overlapping, and one
-`window.flush_retry_deadline` is not a safe ceiling. The conservative bound is:
+### The drain
 
-```text
-window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) + notification margin
-```
+Until the exporter is handed its shutdown deadline, every block keeps its own
+retry deadline, `window.flush_retry_deadline` from the moment it was sealed.
+Once the deadline is latched, the exporter finishes only what it already
+holds, inside that deadline:
 
-With the defaults that is 15s + 2 * (60s + 5s) = 145s plus the notification
-margin, which fits the admin API's 180s timeout below and does not fit the 60s
-that a SIGINT or SIGTERM grants. Note which term dominates: twice the flush
-retry deadline is 130s of that 145s, so lowering `flush_retry_deadline` buys
-far more shutdown headroom than lowering `window.interval` does. Keep
-`window.interval` a small fraction of the deadline anyway, for the reason
-above.
+- The parked request, if there is one, is nacked as retryable at once,
+  because no block will be opened for it.
+- The FLUSHING block keeps retrying, but its deadline becomes the earlier of
+  its own and the shutdown deadline, the backoff between attempts drops to its
+  200ms minimum, and a retry starts only if the last attempt that returned
+  would have finished before the deadline.
+- The ACTIVE block is sealed as soon as the flush slot frees, without waiting
+  for its window, and is written under the same rules; its first attempt is
+  judged by how long the previous block's last attempt took.
+- A request force-drained after the latch is refused with a retryable
+  `NodeShutdown` nack, so a full completion channel cannot stall the drain.
+- Whatever cannot finish is nacked as retryable with `NodeShutdown`: a block
+  as soon as no attempt can finish in time, and everything still held at the
+  deadline itself. Each of those decisions is attempted once, and one the
+  completion channel will not take is counted as a delivery failure; its
+  producer sees its own timeout and retries.
+
+The node returns as soon as it holds nothing, and at the latest
+`upload.abort_timeout` after the deadline, which is the bound on unwinding an
+abandoned write. The drain therefore fits any deadline: a short one nacks more
+and a long one commits more, and no setting has to be sized against it.
+Committed blocks are never re-exported merely because a notification could not
+be delivered.
 
 ### Granting a deadline
 
-Engine signal shutdown (SIGINT, SIGTERM) currently grants 60s and is not
-configurable. The admin shutdown operation takes its own timeout, and its
-default is also 60s, so ask for more explicitly:
+Engine signal shutdown (SIGINT, SIGTERM) grants 60s and is not configurable.
+The admin shutdown operation takes its own timeout, and its default is also
+60s, so ask for more explicitly when a longer drain should commit more:
 
 ```bash
 curl -X POST 'http://127.0.0.1:8080/api/v1/groups/shutdown?wait=true&timeout_secs=180'
 ```
 
 There is no pipeline YAML shutdown-deadline key. Supervisors must allow the
-drain plus `upload.abort_timeout` of cleanup.
+deadline plus `upload.abort_timeout`.
 
-An orderly shutdown runs in a fixed order: the parked request is nacked the
-moment the deadline is latched, because nothing will open a block for it; the
-outstanding FLUSHING block is finished, so a block that still reaches storage
-is acknowledged rather than refused; and only then is the ACTIVE block rotated
-and flushed. A request force-drained after the latch is refused immediately
-with a retryable `NodeShutdown` nack rather than being parked, so a full
-completion channel cannot stall the drain. At the deadline each remaining
-decision is attempted once, and whatever the completion channel will not take
-is counted as a delivery failure and released: the producer sees its own
-timeout and retries. Committed blocks are never re-exported merely because a
-notification could not be delivered.
+On Kubernetes the kubelet sends SIGTERM and kills the container once
+`terminationGracePeriodSeconds` has passed, 30s by default, which is shorter
+than the engine's 60s. Set `terminationGracePeriodSeconds` to at least the
+engine's 60s plus `upload.abort_timeout` and a margin, for example 75. For a
+longer drain, add a `preStop` hook that calls the admin shutdown operation
+with the timeout you want and set `terminationGracePeriodSeconds` above that
+timeout plus `upload.abort_timeout`: the grace period starts before the hook
+runs, so it has to cover the hook too.
 
 ## Configuration
 
@@ -947,7 +955,6 @@ window interval means the destination, not the producers, is the limit.
 | --- | --- | --- |
 | `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
 | `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
-| `series_parquet.shutdown.grace_exceeded` | WARN | At start, when `window.interval + 2 * (window.flush_retry_deadline + upload.abort_timeout)` exceeds the 60s signal shutdown grace. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt, with the file name and object count. |
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt, with the error. |
@@ -959,10 +966,6 @@ window interval means the destination, not the producers, is the limit.
 | `series_parquet.shutdown` | INFO | The Shutdown control message arrived. |
 | `series_parquet.shutdown.deadline_exceeded` | WARN | The shutdown deadline decided what was still held. |
 | `series_parquet.shutdown.complete` | INFO | The worker ended: `accepted`, `acked`, `nacked`, `abandoned`, `deadline_exceeded`, `duration`. |
-
-With the defaults, 15s + 2 * (60s + 5s) = 145s exceeds the 60s grace, so a
-default worker warns at start. Stop it through the admin API with a longer
-timeout, as described under shutdown above, or lower the flush deadline.
 
 ### Reading the process residual
 

@@ -18,6 +18,9 @@
 //! attempt are identical and a retry overwrites whatever a failed attempt left
 //! behind rather than adding a second copy of the same rows.
 //!
+//! Shutdown can only bring that deadline forward, to the latched shutdown
+//! deadline (see [`Limit`]).
+//!
 //! The deadline decides the producer immediately. The block's requests are
 //! told the write failed as soon as the deadline passes, over a oneshot
 //! channel, while the task stays behind to cancel the write and give the sink
@@ -73,6 +76,59 @@ pub(super) fn deadline_at(base: Instant, delta: Duration) -> Instant {
         .unwrap_or(base)
 }
 
+/// The instant one flush must be decided by, shared by the job and its task.
+///
+/// It is the block's own retry deadline until shutdown latches; from then on
+/// it is the earlier of that and the latched deadline, the backoff between
+/// attempts drops to its minimum, and an attempt starts only if the last
+/// attempt that returned would have finished before the deadline. Moving it
+/// wakes the task, which re-reads it before every attempt and every wait.
+struct Limit {
+    /// The block's own retry deadline, taken when it was sealed.
+    own: Instant,
+    /// The latched shutdown deadline, once [`FlushJob::cut_to`] has set it.
+    shutdown: Cell<Option<Instant>>,
+    /// How long the last attempt that returned took, the flush's own or,
+    /// before its first, the previous flush's.
+    took: Cell<Option<Duration>>,
+    /// Wakes the task when the shutdown deadline is set or moved.
+    moved: tokio::sync::Notify,
+}
+
+impl Limit {
+    /// The instant the flush must be decided by.
+    fn at(&self) -> Instant {
+        self.shutdown
+            .get()
+            .map_or(self.own, |cut| cut.min(self.own))
+    }
+
+    /// Whether the latched shutdown deadline, not the block's own, is the
+    /// one that applies.
+    fn cut_by_shutdown(&self) -> bool {
+        self.shutdown.get().is_some_and(|cut| cut <= self.own)
+    }
+
+    /// The wait before the next retry, which shutdown drops to its minimum.
+    fn backoff(&self, delay: Duration) -> Duration {
+        if self.shutdown.get().is_some() {
+            FIRST_BACKOFF
+        } else {
+            delay
+        }
+    }
+
+    /// Whether an attempt started at `now` cannot finish by the deadline,
+    /// judged after shutdown by how long the last attempt took.
+    fn cannot_finish(&self, now: Instant) -> bool {
+        self.shutdown.get().is_some()
+            && self
+                .took
+                .get()
+                .is_some_and(|took| deadline_at(now, took) > self.at())
+    }
+}
+
 /// A flush that has resolved, with the block it was writing.
 pub(super) struct FlushDone {
     /// The sealed block, handed back so its descriptors and partition are
@@ -86,14 +142,18 @@ pub(super) struct FlushDone {
     pub(super) result: lake::Result<lake::sink::FlushReport>,
     /// Write attempts this flush made, including the one that resolved it.
     pub(super) attempts: u64,
+    /// How long the last attempt that returned took, if one did.
+    pub(super) took: Option<Duration>,
 }
 
-/// Write one sealed block, retrying storage failures until `deadline`.
+/// Write one sealed block, retrying storage failures until the deadline
+/// `limit` holds.
 ///
 /// The write is polled before the cancellation and the deadline: a write that
 /// has finished by the poll in which the deadline also expires is a success
 /// whose files exist, and nacking it would tell the producer to resend rows
-/// that are already durable.
+/// that are already durable. No attempt starts at or after the deadline, and
+/// after shutdown none starts that the last attempt says cannot finish by it.
 ///
 /// The result is published over `result_tx` the moment it is known. The task
 /// returns only once it has released everything it owns: on the deadline path
@@ -104,7 +164,7 @@ async fn write_until(
     sink: Rc<lake::sink::Sink>,
     data: Rc<lake::buffer::Block>,
     cancel: CancellationToken,
-    deadline: Instant,
+    limit: Rc<Limit>,
     abort_timeout: Duration,
     result_tx: tokio::sync::oneshot::Sender<FlushDone>,
     started_attempts: Rc<Cell<u64>>,
@@ -114,22 +174,21 @@ async fn write_until(
     // The failure of the last attempt, so the deadline reports what the
     // destination actually said rather than the fact that time ran out.
     let mut last: Option<lake::Error> = None;
+    let done = |attempts, result| FlushDone {
+        data: Rc::clone(&data),
+        attempts,
+        result,
+        took: limit.took.get(),
+    };
     loop {
         if cancel.is_cancelled() {
             let error = last.take().unwrap_or(lake::Error::cancelled(None));
-            let _ = result_tx.send(FlushDone {
-                data: Rc::clone(&data),
-                attempts,
-                result: Err(error),
-            });
+            let _ = result_tx.send(done(attempts, Err(error)));
             return;
         }
-        if clock::now() >= deadline {
-            let _ = result_tx.send(FlushDone {
-                data: Rc::clone(&data),
-                attempts,
-                result: Err(expired(attempts, last.take())),
-            });
+        let now = clock::now();
+        if now >= limit.at() || limit.cannot_finish(now) {
+            let _ = result_tx.send(done(attempts, Err(expired(attempts, last.take()))));
             return;
         }
         attempts += 1;
@@ -171,28 +230,35 @@ async fn write_until(
         // without cancelling the job itself, whose token also serves the
         // owner's drop.
         let attempt_cancel = cancel.child_token();
+        let started = clock::now();
         let write = sink.write_block(&data, &attempt_cancel);
         tokio::pin!(write);
-        let result = tokio::select! {
-            biased;
-            result = &mut write => Ok(result),
-            () = cancel.cancelled() => Err(last
-                .take()
-                .unwrap_or(lake::Error::cancelled(None))),
-            () = clock::sleep_until(deadline) => Err(expired(attempts, last.take())),
+        // Re-armed whenever shutdown moves the deadline, without dropping the
+        // write in flight.
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut write => break Ok(result),
+                () = cancel.cancelled() => break Err(last
+                    .take()
+                    .unwrap_or(lake::Error::cancelled(None))),
+                () = clock::sleep_until(limit.at()) => break Err(expired(attempts, last.take())),
+                () = limit.moved.notified() => {}
+            }
         };
         let result = match result {
-            Ok(result) => result,
+            Ok(result) => {
+                limit
+                    .took
+                    .set(Some(clock::now().saturating_duration_since(started)));
+                result
+            }
             Err(decided) => {
                 // Publish the producer decision before awaiting any cleanup. This
                 // task independently owns the block, the sink handle and the
                 // pinned write future, so the owner is free to release the block's
                 // completions while the attempt is still unwinding.
-                let _ = result_tx.send(FlushDone {
-                    data: Rc::clone(&data),
-                    attempts,
-                    result: Err(decided),
-                });
+                let _ = result_tx.send(done(attempts, Err(decided)));
                 attempt_cancel.cancel();
                 let cleanup_deadline = deadline_at(clock::now(), abort_timeout);
                 tokio::select! {
@@ -215,33 +281,30 @@ async fn write_until(
         }
         match result {
             Ok(report) => {
-                let _ = result_tx.send(FlushDone {
-                    data: Rc::clone(&data),
-                    attempts,
-                    result: Ok(report),
-                });
+                let _ = result_tx.send(done(attempts, Ok(report)));
                 return;
             }
             Err(error)
-                if error.is_retryable() && clock::now() < deadline && !cancel.is_cancelled() =>
+                if error.is_retryable() && clock::now() < limit.at() && !cancel.is_cancelled() =>
             {
                 last = Some(error);
                 // Never past the deadline: the wait itself must not outlive
-                // the bound the block was given.
-                let wake = deadline_at(clock::now(), delay).min(deadline);
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {}
-                    () = clock::sleep_until(wake) => {}
+                // the bound the block was given. Re-armed when shutdown moves
+                // the deadline or drops the backoff.
+                let waiting_since = clock::now();
+                loop {
+                    let wake = deadline_at(waiting_since, limit.backoff(delay)).min(limit.at());
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => break,
+                        () = clock::sleep_until(wake) => break,
+                        () = limit.moved.notified() => {}
+                    }
                 }
                 delay = delay.saturating_mul(2).min(MAX_BACKOFF);
             }
             Err(error) => {
-                let _ = result_tx.send(FlushDone {
-                    data: Rc::clone(&data),
-                    attempts,
-                    result: Err(error),
-                });
+                let _ = result_tx.send(done(attempts, Err(error)));
                 return;
             }
         }
@@ -303,6 +366,8 @@ pub(super) struct FlushJob {
     pub(super) window_start_secs: i64,
     /// The sealed block's per-worker sequence, for the commit log.
     pub(super) seq: u64,
+    /// The deadline the task retries until, which shutdown can bring forward.
+    limit: Rc<Limit>,
 }
 
 impl FlushJob {
@@ -312,7 +377,9 @@ impl FlushJob {
     /// The block must already be sealed; the sink refuses an unsealed one and
     /// that refusal is reported as a retryable failure like any other. The
     /// retry deadline is absolute from this point, so a destination that fails
-    /// slowly cannot extend it.
+    /// slowly cannot extend it. `took` is how long the last attempt of the
+    /// previous flush took, which judges this flush's first attempt once
+    /// shutdown has cut its deadline.
     pub(super) fn new(
         data: lake::buffer::Block,
         tokens: Vec<AckToken>,
@@ -320,6 +387,7 @@ impl FlushJob {
         emitted: [u64; 3],
         retry_deadline: Duration,
         abort_timeout: Duration,
+        took: Option<Duration>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let bytes = data.bytes;
@@ -328,11 +396,17 @@ impl FlushJob {
         let attempts = Rc::new(Cell::new(0));
         let started = clock::now();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let limit = Rc::new(Limit {
+            own: deadline_at(started, retry_deadline),
+            shutdown: Cell::new(None),
+            took: Cell::new(took),
+            moved: tokio::sync::Notify::new(),
+        });
         let handle = tokio::task::spawn_local(write_until(
             sink,
             Rc::new(data),
             cancel.clone(),
-            deadline_at(started, retry_deadline),
+            Rc::clone(&limit),
             abort_timeout,
             result_tx,
             Rc::clone(&attempts),
@@ -348,7 +422,27 @@ impl FlushJob {
             attempts,
             window_start_secs,
             seq,
+            limit,
         }
+    }
+
+    /// Bring the flush's deadline forward to the latched shutdown deadline
+    /// (see [`Limit`]). The earliest deadline wins, so a later one never
+    /// extends it.
+    pub(super) fn cut_to(&self, deadline: Instant) {
+        let cut = self
+            .limit
+            .shutdown
+            .get()
+            .map_or(deadline, |old| old.min(deadline));
+        self.limit.shutdown.set(Some(cut));
+        self.limit.moved.notify_one();
+    }
+
+    /// Whether the latched shutdown deadline, not the block's own retry
+    /// deadline, is the one this flush runs until.
+    pub(super) fn cut_by_shutdown(&self) -> bool {
+        self.limit.cut_by_shutdown()
     }
 
     /// Wait for the flush to be decided.
