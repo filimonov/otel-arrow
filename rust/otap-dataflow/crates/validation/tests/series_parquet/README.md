@@ -248,7 +248,11 @@ retransmission, then after the exact deletion a signed PUT with a 2xx
 status and its bytes read back), a signed transfer captured and read back
 with tshark, the three activations, and the restored state. Every command's
 argv, exit status, output and duration is kept in `fault-preflight.json`,
-with the fault-class coverage those probes decide. `disconnect_reset` and
+with the fault-class coverage those probes decide, per store: a class is
+available for a store only when that store's own probes passed, and
+available overall only when it is available for every store (the stores
+themselves start from their inspected image id, `DockerStore(kind,
+by_image_id=True)`; the legacy suite keeps the tag). `disconnect_reset` and
 `dropped_completion_response` stay unavailable until Task 11 adds their
 direct probes with negative controls; the coverage names what each must
 show.

@@ -139,6 +139,37 @@ class ProbeVerdicts(unittest.TestCase):
                     self.assertTrue(classes[name]["deferred_probes"])
             self.assertEqual(classes["tcp_ack_loss"]["status"], "available")
 
+    # Scenario: the RustFS rig fails before any probe ran, while every MinIO
+    # probe passed.
+    # Guarantees: availability is per store -- every RustFS class is
+    # unavailable, every MinIO class that its probes decide stays available,
+    # and no class is available overall on MinIO's evidence alone.
+    def test_failed_store_rig_is_not_covered_by_the_other_store(self):
+        probes = [{"name": name, "store": "minio", "passed": True}
+                  for name in faults.PREFLIGHT_PROBES]
+        probes.append({"name": "rustfs rig", "store": "rustfs", "passed": False})
+        classes = faults.coverage(probes, required=False, stores=["minio", "rustfs"])
+        for name, entry in classes.items():
+            with self.subTest(name=name):
+                self.assertEqual(entry["status"], "unavailable")
+                self.assertEqual(entry["stores"]["rustfs"]["status"], "unavailable")
+                self.assertEqual(entry["consequence"], "skipped before traffic")
+        for name in ("slow", "http503", "store_outage", "tcp_ack_loss",
+                     "dns_nxdomain_timeout", "containerized_engine"):
+            self.assertEqual(classes[name]["stores"]["minio"]["status"], "available", name)
+        self.assertIn("xt_bpf", classes["tcp_ack_loss"]["stores"]["rustfs"]["missing_probes"])
+
+    # Scenario: a store named by the preflight produced no probe at all.
+    # Guarantees: an explicitly listed store without evidence is unavailable.
+    def test_listed_store_without_probes_is_unavailable(self):
+        probes = [{"name": name, "store": "minio", "passed": True}
+                  for name in faults.PREFLIGHT_PROBES]
+        classes = faults.coverage(probes, required=True, stores=["minio", "rustfs"])
+        self.assertEqual(classes["slow"]["stores"]["rustfs"]["status"], "unavailable")
+        self.assertEqual(classes["slow"]["consequence"], "fails the lane")
+        only_minio = faults.coverage(probes, required=True, stores=["minio"])
+        self.assertEqual(only_minio["slow"]["status"], "available")
+
     # Scenario: a preflight never ran the DNS probes at all.
     # Guarantees: an absent probe makes its classes unavailable; absence is
     # never read as success.
@@ -686,6 +717,44 @@ class Provenance(unittest.TestCase):
         self.assertEqual(calls[1], ["docker", "rm", "--force", "--volumes", "ldd-id"])
 
 
+class StoreImage(unittest.TestCase):
+    """Which image the store container is started from."""
+
+    def started_image(self, **options):
+        """The image argument `docker run` got for a store with `options`."""
+        store = test_e2e.DockerStore("minio", **options)
+        started = []
+
+        def inspect(argv, **_kwargs):
+            return mock.Mock(returncode=0, stdout="sha256:" + "c" * 64 + "\n")
+
+        with mock.patch.object(test_e2e, "require_docker_image",
+                               return_value="minio/minio:tag"), \
+                mock.patch.object(test_e2e.subprocess, "run", side_effect=inspect), \
+                mock.patch.object(test_e2e.DockerStore, "start_container",
+                                  side_effect=lambda image: started.append(image)
+                                  or (_ for _ in ()).throw(RuntimeError("stop"))), \
+                mock.patch.object(test_e2e.DockerStore, "remove"):
+            with self.assertRaisesRegex(RuntimeError, "stop"):
+                store.__enter__()
+        return store, started
+
+    # Scenario: the fault preflight starts its store while the tag could move.
+    # Guarantees: an opted-in store runs the inspected image id and records
+    # both the tag and the id.
+    def test_opted_in_store_starts_from_the_image_id(self):
+        store, started = self.started_image(by_image_id=True)
+        self.assertEqual(started, ["sha256:" + "c" * 64])
+        self.assertEqual((store.image, store.image_id), ("minio/minio:tag", "sha256:" + "c" * 64))
+
+    # Scenario: the legacy end-to-end suite starts its stores.
+    # Guarantees: without the option nothing changes -- the tag is used.
+    def test_legacy_store_keeps_the_tag(self):
+        store, started = self.started_image()
+        self.assertEqual(started, ["minio/minio:tag"])
+        self.assertIsNone(store.image_id)
+
+
 class AckLossVerdict(unittest.TestCase):
     """When the xt_bpf ACK-loss probe may pass."""
 
@@ -817,12 +886,13 @@ class LiveRigSlice(unittest.TestCase):
         lease =measurement.HostLease(run_id="fault-rig-live")
         lease.acquire(deadline_ns=time.monotonic_ns() + int(lease_wait_s() * 10**9))
         self.addCleanup(lease.release)
-        with test_e2e.DockerStore("minio") as store:
+        with test_e2e.DockerStore("minio", by_image_id=True) as store:
             rig = faults.FaultRig(store, root)
             with rig:
                 self.assertEqual(rig.storage["s3"]["endpoint"], "http://127.0.0.1:19000")
                 self.assertTrue(all(probe["passed"] for probe in rig.probes))
                 rig.assert_clean()
+                self.assertEqual(rig.evidence()["store"]["running_image_id"], store.image_id)
             self.assertTrue(rig.cleanup_report["clean"], rig.cleanup_report)
             self.assertIsNone(store.network_address(rig.network_id))
 

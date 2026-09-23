@@ -209,36 +209,64 @@ DEFERRED_PROBES = {
 }
 
 
-def coverage(probes, *, required: bool) -> dict:
-    """Each fault class's availability from the probes that decide it.
+def _consequence(failed, missing, deferred, *, required) -> str:
+    """What a lane does with one class, from why it is or is not available."""
+    if not failed and not missing:
+        return "runs"
+    if deferred and not failed and sorted(missing) == sorted(deferred):
+        return "not probed yet: " + "; ".join(
+            DEFERRED_PROBES[name] for name in sorted(set(deferred))
+        )
+    return "fails the lane" if required else "skipped before traffic"
 
-    A class is `available` when all its probes passed on every store the
-    preflight covered. Otherwise it is `unavailable` with the failed probes
-    named, and `consequence` says what a lane does with it: a required lane
-    fails, an optional one skips the class before any traffic.
+
+def coverage(probes, *, required: bool, stores=None) -> dict:
+    """Each fault class's availability, per store and over all of them.
+
+    A class is available for a store only when every probe it needs ran
+    against that store's own rig and passed; a probe of no store (the image
+    check) counts for every store. A store whose rig failed before its
+    probes ran therefore has every class unavailable, whatever another
+    store showed. The class as a whole is `available` only when it is
+    available for every store in `stores` (by default every store a probe
+    names); `consequence` says what a lane does with it: a required lane
+    fails, an optional one skips the class before any traffic, and a class
+    whose only gap is a direct probe a later task owns says so.
     """
+    if stores is None:
+        stores = sorted({probe.get("store") for probe in probes
+                         if probe.get("store") is not None}) or [None]
     classes = {}
     for fault, needed in sorted(FAULT_CLASS_PROBES.items()):
-        failed = sorted(
-            {
-                f"{probe.get('store')}: {probe['name']}"
-                for probe in probes
-                if probe["name"] in needed and probe.get("passed") is not True
+        per_store = {}
+        for store in stores:
+            own = [probe for probe in probes
+                   if probe.get("store") in (store, None)]
+            failed = sorted({probe["name"] for probe in own
+                             if probe["name"] in needed and probe.get("passed") is not True})
+            missing = sorted(set(needed) - {probe["name"] for probe in own})
+            deferred = sorted(name for name in missing if name in DEFERRED_PROBES)
+            per_store[str(store)] = {
+                "status": "available" if not failed and not missing else "unavailable",
+                "failed_probes": failed,
+                "missing_probes": missing,
+                "deferred_probes": deferred,
+                "consequence": _consequence(failed, missing, deferred, required=required),
             }
-        )
-        missing = sorted(set(needed) - {probe["name"] for probe in probes})
-        deferred = sorted(name for name in missing if name in DEFERRED_PROBES)
-        available = not failed and not missing
+        failed = sorted({f"{store}: {name}" for store, entry in per_store.items()
+                         for name in entry["failed_probes"]})
+        missing = sorted({name for entry in per_store.values()
+                          for name in entry["missing_probes"]})
+        deferred = sorted({name for entry in per_store.values()
+                           for name in entry["deferred_probes"]})
+        available = all(entry["status"] == "available" for entry in per_store.values())
         if available:
             consequence = "runs"
-        elif deferred and not failed and missing == deferred:
-            consequence = "not probed yet: " + "; ".join(
-                DEFERRED_PROBES[name] for name in deferred
-            )
-        elif required:
-            consequence = "fails the lane"
+        elif all(entry["status"] == "available" or entry["consequence"].startswith(
+                "not probed yet") for entry in per_store.values()):
+            consequence = _consequence([], deferred, deferred, required=required)
         else:
-            consequence = "skipped before traffic"
+            consequence = "fails the lane" if required else "skipped before traffic"
         classes[fault] = {
             "probes": list(needed),
             "status": "available" if available else "unavailable",
@@ -246,6 +274,7 @@ def coverage(probes, *, required: bool) -> dict:
             "missing_probes": missing,
             "deferred_probes": deferred,
             "consequence": consequence,
+            "stores": per_store,
         }
     return classes
 
@@ -1069,6 +1098,10 @@ class FaultRig:
         self.store_ip = self.store.network_address(self.network_id)
         if not self.store_ip:
             raise AssertionError("the store has no address on the rig network")
+        # The image the store container really runs, whatever it was
+        # started from.
+        self.store_running_image = (_docker_json(
+            ["inspect", "--format", "{{json .Image}}", self.store.container]) or None)
         self._start_owner()
         name = f"series-fault-{self.run_id}-toxiproxy"
         ident, done = self._run_container("toxiproxy", name, lambda cidfile: toxiproxy_argv(
@@ -1440,7 +1473,10 @@ class FaultRig:
             "run_id": self.run_id,
             "network": {"name": self.network_name, "id": self.network_id},
             "store": {"kind": self.store.kind, "container": self.store.name,
-                      "address": self.store_ip, "port": STORE_PORT, "alias": STORE_ALIAS},
+                      "address": self.store_ip, "port": STORE_PORT, "alias": STORE_ALIAS,
+                      "image": getattr(self.store, "image", None),
+                      "image_id": getattr(self.store, "image_id", None),
+                      "running_image_id": getattr(self, "store_running_image", None)},
             "images": self.images,
             "toxiproxy_version": getattr(self, "toxiproxy_version", None),
             "toxic_units": TOXIC_UNITS,
@@ -2293,7 +2329,7 @@ PREFLIGHT_STORES = ("minio", "rustfs")
 def _store_preflight(kind, root, probes_out, rigs_out):
     """Every preflight probe against one store kind, in its own rig."""
     try:
-        with test_e2e.DockerStore(kind) as store:
+        with test_e2e.DockerStore(kind, by_image_id=True) as store:
             rig = FaultRig(store, root / kind, probes=())
             try:
                 with rig:
@@ -2386,7 +2422,7 @@ def preflight_fault_tools(required: bool, *, output_dir=None, report_dir=None,
         result["environment"]["kernel_modules"] = loaded_modules()
     result["probes"] = probes
     result["rigs"] = rigs
-    result["coverage"] = coverage(probes, required=required)
+    result["coverage"] = coverage(probes, required=required, stores=list(stores))
     result["toxiproxy"] = {"image": TOXIPROXY_IMAGE, "version": TOXIPROXY_VERSION,
                            "units": TOXIC_UNITS}
     for probe in probes:

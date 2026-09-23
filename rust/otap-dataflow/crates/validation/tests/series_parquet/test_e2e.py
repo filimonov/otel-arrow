@@ -1754,8 +1754,14 @@ class DockerStore:
     nothing across a restart.
     """
 
-    def __init__(self, kind):
+    def __init__(self, kind, *, by_image_id=False):
         self.kind = kind
+        # With `by_image_id` the container starts from the image id the tag
+        # resolved to when inspected, so a tag moved in between cannot change
+        # what runs. The legacy suite keeps starting from the tag.
+        self.by_image_id = by_image_id
+        self.image = None
+        self.image_id = None
         self.name = "series-e2e-" + uuid.uuid4().hex
         self.container = None
         self.bucket = "series-test"
@@ -1809,6 +1815,16 @@ class DockerStore:
 
     def __enter__(self):
         image = require_docker_image(self.kind)
+        self.image = image
+        if self.by_image_id:
+            inspected = subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+                capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S,
+            )
+            self.image_id = inspected.stdout.strip() or None
+            if inspected.returncode or not self.image_id:
+                unavailable(f"the {self.kind} image {image} could not be inspected")
+            image = self.image_id
         try:
             self.start_container(image)
             mapping = subprocess.check_output(
