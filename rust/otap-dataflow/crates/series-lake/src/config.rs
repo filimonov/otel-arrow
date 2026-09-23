@@ -375,6 +375,23 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 pub const PARTITION_KEYS: [&str; 5] = ["v", "signal", "dataset", "date", "hour"];
 
 impl LakeConfig {
+    /// The fixed bytes a block charges per series row beyond twice the
+    /// descriptor's extracted estimate, pending entry included.
+    ///
+    /// This is the per-series term of the worst-case block cost of a request,
+    /// `2 * extracted + token + series * series_row_fixed_bytes`, where
+    /// `extracted` is what extraction charged the request and `series` the
+    /// number of distinct series it carries. Validation covers the `2 *
+    /// extracted` term only (see [`LakeConfig::validate`]); the rest is
+    /// decided per request by `Block::reserve`.
+    #[must_use]
+    pub fn series_row_fixed_bytes(&self, signal: crate::canonical::Signal) -> usize {
+        let ds = crate::schema::Dataset::series_of(signal);
+        let metric = usize::from(signal == crate::canonical::Signal::Metrics) * 6;
+        let columns = 10 + metric + crate::schema::denorm_columns(ds, self).len();
+        2 * 64 * columns + 8 + self.ingress.pending_series_entry_bytes
+    }
+
     /// Validate cross-field constraints (spec sections 5.2, 6.2, 7.4).
     ///
     /// Rules enforced: `writer_id` is non-empty and made of `[A-Za-z0-9_.]`
@@ -443,8 +460,15 @@ impl LakeConfig {
         // extraction charged them (`DescriptorRow::series_row_bytes`), so a
         // block of exactly `max_extracted_bytes` could refuse permanently a
         // request extraction accepted. Twice the extraction budget covers that
-        // inflation; the fixed per-series overhead on top of it is decided by
-        // `Block::reserve` against the request's worst case.
+        // inflation. It does not cover the fixed per-series term of
+        // `series_row_fixed_bytes`, which this check cannot bound: it grows
+        // with the number of series in a request, and extraction bounds that
+        // number only through each descriptor's own estimate, so any factor
+        // large enough for a request of many tiny series would refuse the
+        // default configuration. A request whose worst case
+        // `2 * extracted + token + series * series_row_fixed_bytes` exceeds
+        // `max_block_bytes` is refused as too large, consistently, by
+        // `Block::reserve`.
         if self.ingress.max_block_bytes / 2 < self.ingress.max_extracted_bytes {
             return Err(Error::invalid(
                 "max_block_bytes must be at least twice max_extracted_bytes, because a \

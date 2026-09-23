@@ -126,6 +126,18 @@ restart or a cache eviction, and never admitted to one block after being
 permanently refused by another. A request that fits the worst case but not
 the space left in the ACTIVE block waits for the next block instead.
 
+The worst case of a request is `2 * E + T + S * F`, where E is what extraction
+charged it, T its completion token, S the number of distinct series it carries
+and F the fixed cost of one series row: 1352 bytes for logs and 2120 bytes for
+metrics, plus 128 bytes per denormalized series column. Startup validation
+covers only the `2 * E` term, by requiring `window.max_block_bytes` to be at
+least twice `ingress.max_extracted_bytes`. The `S * F` term grows with the
+number of series, which extraction bounds only through each series' own
+estimate, so no startup factor could cover it without refusing the defaults.
+A request of many small series can therefore pass `ingress.max_extracted_bytes`
+and still be refused as too large for the block; the refusal names
+`window.max_block_bytes` and is the same on every attempt.
+
 ### Give a producer attempt more than one window
 
 A timeout below `window.interval` does not make a request fail. It makes

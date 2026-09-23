@@ -1056,6 +1056,61 @@ mod tests {
         }
     }
 
+    /// Scenario: logs requests of one and of many series, extracted with and
+    /// without denormalized series columns, are measured against the
+    /// documented worst-case block cost of a request.
+    /// Guarantees: what `reserve` charges a request in the worst case -- its
+    /// values, its token, and every descriptor as a series row plus its
+    /// pending entry -- never exceeds `2 * extracted + token + descriptors *
+    /// LakeConfig::series_row_fixed_bytes`, where `extracted` is what
+    /// extraction charged the same request, and each series row costs exactly
+    /// twice its estimate net of the decoded attribute trees plus that fixed
+    /// term. The formula documented at the
+    /// `max_block_bytes` rule and in the README is therefore a true bound,
+    /// and it changes only together with this test.
+    #[test]
+    fn the_documented_worst_case_block_cost_bounds_every_request() {
+        let mut denormalized = LakeConfig::default();
+        denormalized.logs.denormalize = vec![crate::config::Denormalize {
+            path: "resource.host.id".into(),
+            column: "host".into(),
+            ty: crate::config::DenormType::String,
+        }];
+        for cfg in [LakeConfig::default(), denormalized] {
+            let fixed = cfg.series_row_fixed_bytes(crate::canonical::Signal::Logs);
+            let columns = 10 + crate::schema::denorm_columns(Dataset::LogsSeries, &cfg).len();
+            assert_eq!(
+                fixed,
+                2 * 64 * columns + 8 + cfg.ingress.pending_series_entry_bytes
+            );
+            for (host, n) in [("one", 1), ("many", 64)] {
+                let e = extracted(&cfg, host, n);
+                let token = 16;
+                let charged: usize =
+                    e.pinned_bytes + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
+                let worst = e.pinned_bytes
+                    + token
+                    + e.descriptors
+                        .iter()
+                        .map(|d| d.series_row_bytes() + cfg.ingress.pending_series_entry_bytes)
+                        .sum::<usize>();
+                let bound = 2 * charged + token + e.descriptors.len() * fixed;
+                assert!(worst <= bound, "{host}: worst {worst} > bound {bound}");
+                // Each row's charge is exactly twice its estimate net of the
+                // decoded trees admission drops, plus the fixed term.
+                for d in &e.descriptors {
+                    let decoded = crate::extract::kv_bytes(&d.descriptor.resource_attrs)
+                        + crate::extract::kv_bytes(&d.descriptor.scope_attrs)
+                        + crate::extract::kv_bytes(&d.descriptor.attrs);
+                    assert_eq!(
+                        d.series_row_bytes() + cfg.ingress.pending_series_entry_bytes,
+                        2 * (d.approx_bytes - decoded) + fixed
+                    );
+                }
+            }
+        }
+    }
+
     /// Scenario: a block already holding `max_requests_per_block` tokens.
     /// Guarantees: the next reservation is refused with `TooManyRequests` and the block is unchanged.
     #[test]
