@@ -323,6 +323,57 @@ pub fn from_storage_type_with_retry(
     from_storage_type_with_retry_and_token_provider(storage, retry, None)
 }
 
+/// The bearer token provider `storage` needs, taken from a node's bound
+/// capabilities, or `None` for a backend that obtains no bearer token.
+///
+/// Shared by every exporter that writes through an object store, so the
+/// capability requirement and its configuration error are the same for all
+/// of them.
+pub fn required_token_provider(
+    storage: &StorageType,
+    capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<Option<Box<dyn BearerTokenProvider>>, otel_arrow_dfe_config::error::Error> {
+    if !storage.requires_bearer_token_provider() {
+        return Ok(None);
+    }
+    capabilities
+        .require_shared::<otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider>()
+        .map(Some)
+        .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: e.to_string(),
+        })
+}
+
+/// Build the object store an exporter writes through, reported as that
+/// exporter's configuration error when it cannot be built.
+///
+/// Retry settings apply only to cloud backends; given for local file
+/// storage they are validated and otherwise ignored, which is logged once
+/// here as `object_store.retry_ignored_for_file_storage` so every exporter
+/// reports it under one event name.
+pub fn exporter_store(
+    exporter: otel_arrow_dfe_engine::node::NodeId,
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+) -> Result<Arc<dyn ObjectStore>, otel_arrow_dfe_engine::error::Error> {
+    if retry.is_some() && matches!(storage, StorageType::File { .. }) {
+        otel_arrow_dfe_telemetry::otel_warn!(
+            "object_store.retry_ignored_for_file_storage",
+            exporter = %exporter.name,
+            message = "retry settings are not applied to local file storage (invalid values are still rejected)"
+        );
+    }
+    from_storage_type_with_retry_and_token_provider(storage, retry, token_provider).map_err(|e| {
+        otel_arrow_dfe_engine::error::Error::ExporterError {
+            exporter,
+            kind: otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration,
+            error: format!("error initializing object store {e}"),
+            source_detail: otel_arrow_dfe_engine::error::format_error_sources(&e),
+        }
+    })
+}
+
 /// Fetch an object store and use the supplied bearer token provider for Azure storage.
 pub fn from_storage_type_with_retry_and_token_provider(
     storage: &StorageType,
@@ -422,6 +473,50 @@ mod test {
     use url::Url;
 
     use super::*;
+
+    /// Scenario: an exporter resolves the token provider for local file
+    /// storage with no capability bound, then builds its store once with a
+    /// usable root and once with a root that does not exist.
+    /// Guarantees: file storage needs no bearer token capability, a usable
+    /// store is returned, and a store that cannot be built is reported as
+    /// that exporter's configuration error naming the object store, which
+    /// is the one mapping every object-store exporter shares.
+    #[test]
+    fn exporter_store_wiring_is_shared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = StorageType::File {
+            base_uri: dir.path().to_string_lossy().into_owned(),
+        };
+        let capabilities = otel_arrow_dfe_engine::capability::registry::Capabilities::empty();
+        assert!(
+            required_token_provider(&storage, &capabilities)
+                .expect("file storage needs no capability")
+                .is_none()
+        );
+        let id = || otel_arrow_dfe_engine::node::NodeId {
+            index: 0,
+            name: "exporter".into(),
+        };
+        assert!(exporter_store(id(), &storage, None, None).is_ok());
+
+        let broken = StorageType::File {
+            base_uri: dir.path().join("missing").to_string_lossy().into_owned(),
+        };
+        match exporter_store(id(), &broken, None, None) {
+            Err(otel_arrow_dfe_engine::error::Error::ExporterError { kind, error, .. }) => {
+                assert_eq!(
+                    kind,
+                    otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration
+                );
+                assert!(
+                    error.starts_with("error initializing object store"),
+                    "{error}"
+                );
+            }
+            Err(other) => panic!("expected an exporter configuration error, got {other}"),
+            Ok(_) => panic!("a missing root cannot be opened"),
+        }
+    }
 
     #[test]
     fn retry_options_deserialize_duration_strings() {

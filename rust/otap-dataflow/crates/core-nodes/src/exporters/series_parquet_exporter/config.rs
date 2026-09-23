@@ -273,9 +273,6 @@ impl TryFrom<RawConfig> for Config {
             .checked_mul(2)
             .ok_or("request count overflows notification capacity")?;
         lake.validate().map_err(|e| e.to_string())?;
-        if let Some(retry) = &raw.retry {
-            retry.validate().map_err(|e| e.to_string())?;
-        }
         check_retry_deadline(
             !matches!(raw.storage, StorageType::File { .. }),
             raw.retry.as_ref(),

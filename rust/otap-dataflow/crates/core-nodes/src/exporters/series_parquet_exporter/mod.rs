@@ -33,11 +33,10 @@ use async_trait::async_trait;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
 use otel_arrow_dfe_engine::ExporterFactory;
-use otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_engine::control::NodeControlMsg;
-use otel_arrow_dfe_engine::error::{Error, ExporterErrorKind, format_error_sources};
+use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
@@ -90,15 +89,10 @@ pub static SERIES_PARQUET: ExporterFactory<OtapPdata> = ExporterFactory {
         let mut exporter = SeriesParquet::new(config);
         exporter.metrics = Some(metrics::Metrics::register(&pipeline, &exporter.config.lake));
         exporter.num_cores = pipeline.num_cores();
-        if exporter.config.storage.requires_bearer_token_provider() {
-            exporter.token_provider = Some(
-                capabilities
-                    .require_shared::<BearerTokenProvider>()
-                    .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                        error: e.to_string(),
-                    })?,
-            );
-        }
+        exporter.token_provider = otel_arrow_dfe_otap::object_store::required_token_provider(
+            &exporter.config.storage,
+            capabilities,
+        )?;
         Ok(ExporterWrapper::local(
             exporter,
             node,
@@ -153,24 +147,12 @@ impl Exporter<OtapPdata> for SeriesParquet {
         inbox: ExporterInbox<OtapPdata>,
         effects: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
-        if self.config.retry.is_some() && matches!(&self.config.storage, StorageType::File { .. }) {
-            otel_warn!(
-                "series_parquet.retry_ignored_for_file_storage",
-                message = "retry settings are not applied to local file storage"
-            );
-        }
-        let store =
-            otel_arrow_dfe_otap::object_store::from_storage_type_with_retry_and_token_provider(
-                &self.config.storage,
-                self.config.retry.as_ref(),
-                self.token_provider.take(),
-            )
-            .map_err(|e| Error::ExporterError {
-                exporter: effects.exporter_id(),
-                kind: ExporterErrorKind::Configuration,
-                error: format!("error initializing object store {e}"),
-                source_detail: format_error_sources(&e),
-            })?;
+        let store = otel_arrow_dfe_otap::object_store::exporter_store(
+            effects.exporter_id(),
+            &self.config.storage,
+            self.config.retry.as_ref(),
+            self.token_provider.take(),
+        )?;
         #[cfg(test)]
         let store = self.store_override.take().unwrap_or(store);
         let storage = storage_kind(&self.config.storage);
