@@ -44,13 +44,14 @@ byte-unit.workspace = true
 # The sink wraps the object store it writes through (see `sink::CreationWatch`).
 async-trait.workspace = true
 futures.workspace = true
+# The Parquet writer hands the sink's upload its buffers as `Bytes`.
+bytes.workspace = true
 
 [dev-dependencies]
 otel-arrow-dfe-pdata = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile.workspace = true
-bytes.workspace = true
 cpu-time.workspace = true
 criterion.workspace = true
 dhat.workspace = true

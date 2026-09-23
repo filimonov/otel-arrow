@@ -114,6 +114,12 @@ pub(super) struct WorkerMetrics {
     /// Bytes the worker is accounted as holding right now.
     #[metric(name = "memory.accounted", unit = "By")]
     pub memory_accounted_bytes: Gauge<u64>,
+    /// Bytes the write in progress holds beside its block and merge keys:
+    /// the merge chunk, the Parquet encoder's in-progress row group and the
+    /// upload bytes the store has not acknowledged. Included in
+    /// `memory.accounted`.
+    #[metric(name = "flush.workspace", unit = "By")]
+    pub flush_workspace_bytes: Gauge<u64>,
 }
 
 /// Why a block was sealed.
@@ -564,6 +570,7 @@ mod tests {
                 ("timestamp.out_of_range", "{timestamp}"),
                 ("memory.budget", "By"),
                 ("memory.accounted", "By"),
+                ("flush.workspace", "By"),
             ],
             &[],
         );

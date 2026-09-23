@@ -5901,3 +5901,63 @@ async fn a_committed_block_names_its_window_sequence_and_path() {
         })
         .await;
 }
+
+/// Scenario: a block is rotated into a flush whose first file write is held
+/// at the store gate, and telemetry is sampled while it is held and again
+/// once the flush has completed.
+/// Guarantees: while the write is held the sink reports the bytes the
+/// upload still holds, the worker publishes them as `flush.workspace` and
+/// charges them in `memory.accounted` beside the ACTIVE and FLUSHING
+/// blocks; once the flush has completed the workspace is zero again.
+#[tokio::test(flavor = "current_thread")]
+async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let (handler, _rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let store = Arc::new(GatedStore {
+                inner: Arc::new(object_store::memory::InMemory::new()),
+                gate: Arc::clone(&gate),
+                entered: Arc::clone(&entered),
+            });
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            worker.metrics = Some(super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+            worker.admit(logs_pdata());
+            worker.rotate();
+            until("the first file write reaches the gate", || {
+                entered.load(std::sync::atomic::Ordering::SeqCst) > 0
+            })
+            .await;
+            worker.sample_metrics();
+            let held = worker.sink.flush_workspace_bytes();
+            assert!(held > 0, "the upload holds the file being written");
+            let metrics = worker.metrics.as_ref().expect("registered");
+            assert_eq!(metrics.worker.flush_workspace_bytes.get(), held as u64);
+            let flushing = metrics.worker.flushing_bytes.get();
+            assert!(flushing > 0, "the block is FLUSHING");
+            assert!(
+                metrics.worker.memory_accounted_bytes.get()
+                    >= metrics.worker.active_bytes.get() + flushing + held as u64,
+                "memory.accounted charges the flush workspace"
+            );
+            gate.add_permits(1 << 20);
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a flush is running")
+                .finish()
+                .await;
+            worker.complete(done);
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("registered");
+            assert_eq!(metrics.worker.flush_workspace_bytes.get(), 0);
+            assert_eq!(worker.sink.flush_workspace_bytes(), 0);
+        })
+        .await;
+}

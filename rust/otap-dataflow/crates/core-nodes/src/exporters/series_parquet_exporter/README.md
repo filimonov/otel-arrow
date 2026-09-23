@@ -1051,6 +1051,7 @@ Unlabelled worker state and totals:
 | `timestamp.out_of_range` | `{timestamp}` | Point timestamps outside the representable range. |
 | `memory.budget` | `By` | Bytes the configuration allows this worker to hold. |
 | `memory.accounted` | `By` | Bytes the worker is accounted as holding now. |
+| `flush.workspace` | `By` | Bytes the write in progress holds beside its block and merge keys: the merge chunk, the Parquet encoder's in-progress row group and the upload bytes the store has not acknowledged. Included in `memory.accounted`. |
 
 Labelled sets, each with one closed enumeration:
 
@@ -1124,7 +1125,14 @@ timeout, as described under shutdown above, or lower the flush deadline.
 `memory.accounted` reports the retained exporter data and the measured
 token allocations, including the cache-entry estimate, and, while a block
 flushes, the encoded sort keys its merge holds for the table being written
-(one key per row of that table, released when the table is written).
+(one key per row of that table, released when the table is written) and the
+write's live workspace, also published alone as `flush.workspace`: the merge
+chunk being produced, the Parquet encoder's in-progress row group, and the
+upload bytes the store has not acknowledged yet. An upload part is a slice of
+the row-group buffer the encoder handed over and keeps all of it allocated,
+so each such buffer is counted whole until its last byte has landed. The
+flush returns to the worker's loop between bounded steps, so a sample taken
+during a flush reads what the write holds at that moment.
 `memory.budget` reports the configured retained and workspace allowance.
 
 The engine additionally publishes one process-scoped gauge under the same

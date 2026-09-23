@@ -14,10 +14,12 @@ use arrow::datatypes::Int64Type;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use parquet::arrow::async_writer::ParquetObjectWriter;
+use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
+use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::{KeyValue, SortingColumn};
@@ -110,6 +112,7 @@ pub struct Sink {
     naming: FileNaming,
     clock: SinkClock,
     merge_keys: MergeKeys,
+    workspace: FlushWorkspace,
 }
 
 /// The encoded sort keys the table being written keeps resident.
@@ -147,6 +150,246 @@ impl MergeKeysHeld<'_> {
 impl Drop for MergeKeysHeld<'_> {
     fn drop(&mut self) {
         self.0.current.store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+/// The live flush workspace of the table being written.
+///
+/// The merge and encoder terms are published by the write loop at every
+/// step; the upload term is read from the table's ledger when asked, so a
+/// part that lands between two steps is released at once.
+#[derive(Debug, Default)]
+struct FlushWorkspace {
+    merge: AtomicUsize,
+    encoder: AtomicUsize,
+    upload: std::sync::Mutex<Option<Arc<UploadLedger>>>,
+    high_water: AtomicUsize,
+}
+
+impl FlushWorkspace {
+    /// Start accounting one table write, whose upload is `ledger`.
+    fn begin(&self, ledger: Arc<UploadLedger>) -> FlushWorkspaceHeld<'_> {
+        *self
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ledger);
+        FlushWorkspaceHeld(self)
+    }
+
+    fn bytes(&self) -> usize {
+        let upload = self
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |ledger| ledger.live());
+        let bytes = self.merge.load(AtomicOrdering::Relaxed)
+            + self.encoder.load(AtomicOrdering::Relaxed)
+            + upload;
+        let _ = self.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+        bytes
+    }
+}
+
+/// Clears the flush workspace when a table write ends, however it ends.
+struct FlushWorkspaceHeld<'a>(&'a FlushWorkspace);
+
+impl FlushWorkspaceHeld<'_> {
+    /// Publish what the merge and the encoder hold at this step.
+    fn set(&self, merge: usize, encoder: usize) {
+        self.0.merge.store(merge, AtomicOrdering::Relaxed);
+        self.0.encoder.store(encoder, AtomicOrdering::Relaxed);
+        let _ = self.0.bytes();
+    }
+}
+
+impl Drop for FlushWorkspaceHeld<'_> {
+    fn drop(&mut self) {
+        self.0.merge.store(0, AtomicOrdering::Relaxed);
+        self.0.encoder.store(0, AtomicOrdering::Relaxed);
+        *self
+            .0
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// The upload bytes one table write holds: what the encoder handed the
+/// buffered upload that the store has not acknowledged yet.
+///
+/// The encoder hands over one buffer per row group; the buffered upload cuts
+/// parts out of that byte stream as slices, without copying, so a buffer
+/// stays allocated until every part cut from it has landed. The ledger keeps
+/// the stream offsets of both and counts each buffer whole until the parts
+/// before its end have all landed. A part that lands before an earlier one
+/// releases nothing until the earlier one lands too, which overstates the
+/// live bytes by at most the parts in flight, never understates them.
+#[derive(Debug, Default)]
+struct UploadLedger {
+    state: std::sync::Mutex<LedgerState>,
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
+    /// Handed buffers not yet released: stream end offset and length.
+    buffers: std::collections::VecDeque<(u64, usize)>,
+    /// Bytes handed so far: the stream offset of the next buffer.
+    handed: u64,
+    /// Parts started and not yet folded into `landed`, by start offset:
+    /// end offset and whether the part has landed.
+    parts: std::collections::BTreeMap<u64, (u64, bool)>,
+    /// Stream offset of the next part.
+    next_part: u64,
+    /// Every byte before this offset has landed.
+    landed: u64,
+    /// Sum of the lengths in `buffers`.
+    live: usize,
+}
+
+impl LedgerState {
+    /// Fold landed parts into the landed prefix and release the buffers it
+    /// covers.
+    fn advance(&mut self) {
+        while let Some((&start, &(end, true))) = self.parts.first_key_value() {
+            let _ = self.parts.remove(&start);
+            self.landed = self.landed.max(end);
+        }
+        while let Some(&(end, len)) = self.buffers.front() {
+            if end > self.landed {
+                break;
+            }
+            let _ = self.buffers.pop_front();
+            self.live -= len;
+        }
+    }
+}
+
+impl UploadLedger {
+    fn state(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The encoder handed the upload a buffer of `len` bytes.
+    fn handed(&self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut state = self.state();
+        state.handed += len as u64;
+        let end = state.handed;
+        state.buffers.push_back((end, len));
+        state.live += len;
+    }
+
+    /// A multipart part of `len` bytes was started; returns its start
+    /// offset, which [`UploadLedger::part_landed`] takes.
+    fn part_started(&self, len: usize) -> u64 {
+        let mut state = self.state();
+        let start = state.next_part;
+        state.next_part += len as u64;
+        let _ = state.parts.insert(start, (start + len as u64, false));
+        start
+    }
+
+    /// The part starting at `start` landed, or was dropped with its payload.
+    fn part_landed(&self, start: u64) {
+        let mut state = self.state();
+        if let Some(part) = state.parts.get_mut(&start) {
+            part.1 = true;
+        }
+        state.advance();
+    }
+
+    /// A single-request put of everything handed so far landed, or was
+    /// dropped with its payload.
+    fn put_landed(&self) {
+        let mut state = self.state();
+        state.landed = state.handed;
+        state.advance();
+    }
+
+    /// Bytes the upload holds right now.
+    fn live(&self) -> usize {
+        self.state().live
+    }
+}
+
+/// Marks a part landed when its upload future completes or is dropped.
+struct PartLanded {
+    ledger: Arc<UploadLedger>,
+    start: u64,
+}
+
+impl Drop for PartLanded {
+    fn drop(&mut self) {
+        self.ledger.part_landed(self.start);
+    }
+}
+
+/// Marks a single-request put landed when it completes or is dropped.
+struct PutLanded(Arc<UploadLedger>);
+
+impl Drop for PutLanded {
+    fn drop(&mut self) {
+        self.0.put_landed();
+    }
+}
+
+/// A multipart upload whose parts are entered in the table's ledger.
+#[derive(Debug)]
+struct LedgeredUpload {
+    inner: Box<dyn object_store::MultipartUpload>,
+    ledger: Arc<UploadLedger>,
+}
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for LedgeredUpload {
+    fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+        let landed = PartLanded {
+            start: self.ledger.part_started(data.content_length()),
+            ledger: Arc::clone(&self.ledger),
+        };
+        let part = self.inner.put_part(data);
+        Box::pin(async move {
+            let _landed = landed;
+            part.await
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
+}
+
+/// The encoder's side of one table's upload: every buffer it hands over is
+/// entered in the table's ledger.
+struct LedgeredWriter {
+    inner: ParquetObjectWriter,
+    ledger: Arc<UploadLedger>,
+}
+
+impl LedgeredWriter {
+    /// The buffered upload, for an abort.
+    fn into_buf_writer(self) -> BufWriter {
+        self.inner.into_inner()
+    }
+}
+
+impl AsyncFileWriter for LedgeredWriter {
+    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        self.ledger.handed(bs.len());
+        self.inner.write(bs)
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        self.inner.complete()
     }
 }
 
@@ -194,6 +437,8 @@ struct CreationWatch {
     inner: Arc<dyn ObjectStore>,
     creating: AtomicUsize,
     settled: tokio::sync::Notify,
+    /// Where the table's upload bytes are entered.
+    ledger: Arc<UploadLedger>,
 }
 
 /// Counts one multipart creation for as long as it is in flight.
@@ -210,11 +455,12 @@ impl Drop for Creating<'_> {
 }
 
 impl CreationWatch {
-    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+    fn new(inner: Arc<dyn ObjectStore>, ledger: Arc<UploadLedger>) -> Self {
         Self {
             inner,
             creating: AtomicUsize::new(0),
             settled: tokio::sync::Notify::new(),
+            ledger,
         }
     }
 
@@ -253,6 +499,7 @@ impl ObjectStore for CreationWatch {
         payload: object_store::PutPayload,
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
+        let _landed = PutLanded(Arc::clone(&self.ledger));
         self.inner.put_opts(location, payload, options).await
     }
 
@@ -265,7 +512,11 @@ impl ObjectStore for CreationWatch {
             .creating
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _creating = Creating(self);
-        self.inner.put_multipart_opts(location, options).await
+        let inner = self.inner.put_multipart_opts(location, options).await?;
+        Ok(Box::new(LedgeredUpload {
+            inner,
+            ledger: Arc::clone(&self.ledger),
+        }))
     }
 
     async fn get_opts(
@@ -406,6 +657,7 @@ impl Sink {
             naming,
             clock: SinkClock::default(),
             merge_keys: MergeKeys::default(),
+            workspace: FlushWorkspace::default(),
         }
     }
 
@@ -422,6 +674,30 @@ impl Sink {
     #[must_use]
     pub fn merge_key_high_water_bytes(&self) -> usize {
         self.merge_keys.high_water.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Heap the table being written holds beside its block and its merge
+    /// keys, right now.
+    ///
+    /// Three terms: the chunk the merge is producing or has just produced,
+    /// the Parquet encoder's in-progress row group, and the upload bytes the
+    /// store has not acknowledged yet -- the buffered part and the parts in
+    /// flight, each buffer the encoder handed over counted whole until its
+    /// last byte has landed, because a part is a slice of that buffer and
+    /// keeps all of it alive. Zero between tables and outside a write. A
+    /// block's owner adds it to what it accounts for while the block
+    /// flushes.
+    #[must_use]
+    pub fn flush_workspace_bytes(&self) -> usize {
+        self.workspace.bytes()
+    }
+
+    /// The most `flush_workspace_bytes` seen at any step of any table write
+    /// of this sink.
+    #[must_use]
+    pub fn flush_workspace_high_water_bytes(&self) -> usize {
+        let _ = self.workspace.bytes();
+        self.workspace.high_water.load(AtomicOrdering::Relaxed)
     }
 
     /// The same sink, bounding its cleanup on `clock` instead of tokio time.
@@ -480,10 +756,10 @@ impl Sink {
     /// task. Returns why the abort did not succeed, or `None` when it did.
     async fn abort_upload(
         &self,
-        writer: AsyncArrowWriter<ParquetObjectWriter>,
+        writer: AsyncArrowWriter<LedgeredWriter>,
         deadline: Instant,
     ) -> Option<String> {
-        let mut buf: BufWriter = writer.into_inner().into_inner();
+        let mut buf: BufWriter = writer.into_inner().into_buf_writer();
         tokio::select! {
             biased;
             aborted = buf.abort() => aborted.err().map(|e| e.to_string()),
@@ -600,15 +876,22 @@ impl Sink {
                 window_start_secs,
             )))
             .build();
-        let watch = Arc::new(CreationWatch::new(self.store.clone()));
+        let ledger = Arc::new(UploadLedger::default());
+        let watch = Arc::new(CreationWatch::new(self.store.clone(), Arc::clone(&ledger)));
         let buf = BufWriter::with_capacity(
             Arc::clone(&watch) as Arc<dyn ObjectStore>,
             path.clone(),
             self.cfg.upload.part_bytes,
         )
         .with_max_concurrency(self.cfg.upload.concurrency);
-        let object_writer = ParquetObjectWriter::from_buf_writer(buf);
+        let object_writer = LedgeredWriter {
+            inner: ParquetObjectWriter::from_buf_writer(buf),
+            ledger: Arc::clone(&ledger),
+        };
         let mut writer = AsyncArrowWriter::try_new(object_writer, schema, Some(props))?;
+        // Held until this function returns: the merge chunk, the encoder and
+        // the upload are the table's own, and none outlives its write.
+        let workspace = self.workspace.begin(ledger);
 
         // Phase 1: the writer is writable. Every await races the token, and every
         // failure aborts the multipart upload.
@@ -671,13 +954,21 @@ impl Sink {
             }
             let chunk = match merge.step() {
                 Ok(MergeStep::Done) => break,
-                Ok(MergeStep::Progress) => continue,
+                Ok(MergeStep::Progress) => {
+                    workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+                    continue;
+                }
                 Ok(MergeStep::Chunk(c)) => c,
                 Err(e) => {
                     failure = Some(e);
                     break;
                 }
             };
+            workspace.set(
+                merge.chunk_workspace_bytes()
+                    + record_batch_pinned_bytes(&chunk, &mut CountedAllocations::default()),
+                writer.memory_size(),
+            );
             // Encoding one chunk is a stretch of its own, bounded by
             // `merge_chunk_bytes`; it does not follow the step that produced
             // the chunk without a return to the runtime in between.
@@ -695,6 +986,7 @@ impl Sink {
             }
             rows += chunk.num_rows();
             drop(chunk);
+            workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
             if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
                 || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
             {
@@ -712,9 +1004,11 @@ impl Sink {
                     failure = Some(e);
                     break;
                 }
+                workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
             }
         }
         drop(merged);
+        workspace.set(0, writer.memory_size());
         if let Some(cause) = failure {
             let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
             let abort_error = self.abort_upload(writer, deadline).await;
@@ -2201,5 +2495,189 @@ mod tests {
             built < full / 2,
             "{built} of {full} merge-key bytes were encoded before the cancellation was seen"
         );
+    }
+
+    /// Scenario: two 10-byte buffers are handed to the upload and cut into
+    /// an 8-byte part, a second 8-byte part and a 4-byte remainder, and the
+    /// second part lands before the first.
+    /// Guarantees: a buffer is released only once every byte before its end
+    /// has landed, so the out-of-order landing releases nothing, the first
+    /// part's landing releases the first buffer only -- the second is still
+    /// pinned by the remainder -- and a single-request put releases
+    /// everything handed before it.
+    #[test]
+    fn the_upload_ledger_releases_a_buffer_when_its_last_byte_lands() {
+        let ledger = UploadLedger::default();
+        ledger.handed(10);
+        ledger.handed(10);
+        assert_eq!(ledger.live(), 20);
+        let first = ledger.part_started(8);
+        let second = ledger.part_started(8);
+        ledger.part_landed(second);
+        assert_eq!(
+            ledger.live(),
+            20,
+            "an out-of-order landing releases nothing"
+        );
+        ledger.part_landed(first);
+        assert_eq!(
+            ledger.live(),
+            10,
+            "bytes 0..16 landed: the first buffer is free"
+        );
+        let rest = ledger.part_started(4);
+        ledger.part_landed(rest);
+        assert_eq!(ledger.live(), 0);
+        ledger.handed(7);
+        assert_eq!(ledger.live(), 7);
+        ledger.put_landed();
+        assert_eq!(ledger.live(), 0);
+    }
+
+    /// An `ObjectStore` whose multipart parts wait for a permit before they
+    /// are uploaded, announcing each part as it is handed over.
+    #[derive(Debug)]
+    struct GatedParts {
+        inner: Arc<dyn ObjectStore>,
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: Arc<Notify>,
+    }
+
+    #[derive(Debug)]
+    struct GatedUpload {
+        inner: Box<dyn MultipartUpload>,
+        gate: Arc<tokio::sync::Semaphore>,
+        entered: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for GatedUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let part = self.inner.put_part(data);
+            let gate = Arc::clone(&self.gate);
+            self.entered.notify_one();
+            Box::pin(async move {
+                let permit = gate.acquire().await.expect("the gate is never closed");
+                drop(permit);
+                part.await
+            })
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.inner.abort().await
+        }
+    }
+
+    impl std::fmt::Display for GatedParts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GatedParts({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for GatedParts {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            let inner = self.inner.put_multipart_opts(location, options).await?;
+            Ok(Box::new(GatedUpload {
+                inner,
+                gate: Arc::clone(&self.gate),
+                entered: Arc::clone(&self.entered),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Scenario: a values file larger than one 5 MiB part is written with
+    /// one part in flight at a time, and the store holds the first part
+    /// until the test releases it.
+    /// Guarantees: while the part is held the sink reports a flush
+    /// workspace of at least the part's 5 MiB, because the part's buffer is
+    /// still allocated; once the write has returned it reports zero, and its
+    /// high-water mark keeps the peak.
+    #[tokio::test]
+    async fn the_sink_publishes_the_upload_bytes_a_part_in_flight_holds() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(Notify::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(GatedParts {
+            inner: local(&dir),
+            gate: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
+        });
+        let cfg = upload_config();
+        let b = sealed_upload_block(&cfg);
+        let sink = Sink::new(store, cfg.clone(), FileNaming::new("w"));
+        assert_eq!(sink.flush_workspace_bytes(), 0);
+        let token = CancellationToken::new();
+        let write = sink.write_block(&b, &token);
+        let observe = async {
+            entered.notified().await;
+            let held = sink.flush_workspace_bytes();
+            gate.add_permits(1 << 20);
+            held
+        };
+        let (got, held) = tokio::join!(write, observe);
+        let _ = got.expect("write");
+        assert!(
+            held >= cfg.upload.part_bytes,
+            "{held} workspace bytes while a {} byte part was in flight",
+            cfg.upload.part_bytes
+        );
+        assert_eq!(sink.flush_workspace_bytes(), 0, "no table is being written");
+        assert!(sink.flush_workspace_high_water_bytes() >= held);
     }
 }

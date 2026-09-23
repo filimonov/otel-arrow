@@ -622,6 +622,10 @@ def sample_terms(sample, control=None) -> dict:
         "limiter_resident_bytes": telemetry["jemalloc_resident_bytes"],
         "tracked_heap_bytes": tracked,
         "accounted_bytes": accounted,
+        # Inside `accounted` already: the write in progress's merge chunk,
+        # encoder buffers and unacknowledged upload bytes. None for an
+        # engine whose worker does not publish it.
+        "flush_workspace_bytes": exporter.get("flush.workspace"),
         "budget_bytes": exporter.get("memory.budget"),
         "file_backed_bytes": (
             smaps.get("binary_file_bytes", 0) + smaps.get("file_file_bytes", 0)
@@ -677,7 +681,7 @@ def summarize(values) -> dict:
 PHASE_TERMS = (
     "rss_bytes", "heap_resident_bytes", "jemalloc_resident_bytes",
     "jemalloc_allocated_bytes", "jemalloc_metadata_bytes", "limiter_resident_bytes",
-    "tracked_heap_bytes", "accounted_bytes", "file_backed_bytes",
+    "tracked_heap_bytes", "accounted_bytes", "flush_workspace_bytes", "file_backed_bytes",
     "thread_stack_bytes", "non_heap_bytes", "allocator_retention_bytes",
     "allocator_resident_overstatement_bytes", "untracked_heap_bytes",
     "tracked_minus_accounted_bytes", "allocated_minus_accounted_bytes",
@@ -1525,11 +1529,10 @@ def _median(table, phase, name):
 
 
 # The ledger's workspace term. The ledger may subtract only a workspace
-# measured in the same run and present at the sample; no such in-run
-# measurement of the flush workspace exists (the worker publishes none, and
-# a stage profile of another fixture is not this run), so the term is zero
-# and whatever the flush holds stays in the residual, where the frozen
-# tolerance judges it.
+# measured in the same run and present at the sample. An engine whose worker
+# publishes no `flush.workspace` gives no such measurement (a stage profile
+# of another fixture is not this run), so the term is zero and whatever the
+# flush holds stays in the residual, where the frozen tolerance judges it.
 NO_WORKSPACE_TERM = {
     "bytes": 0,
     "provenance": (
@@ -1537,6 +1540,29 @@ NO_WORKSPACE_TERM = {
         "zero; a flush's transient heap stays inside the residual"
     ),
 }
+
+# An engine whose worker publishes `flush.workspace` measures the flush
+# workspace in the run itself, at every sample, and charges it inside
+# `memory.accounted`, which the ledger subtracts already. The separate term
+# is therefore zero: subtracting it again would count it twice.
+IN_RUN_WORKSPACE_TERM = {
+    "bytes": 0,
+    "provenance": (
+        "the worker publishes its live flush workspace as flush.workspace and "
+        "charges it inside memory.accounted at every sample, so the ledger "
+        "subtracts it through memory.accounted and adds no separate term"
+    ),
+}
+
+
+def workspace_term(samples) -> dict:
+    """The ledger's workspace term for one lifetime's samples."""
+    published = any(
+        ((sample.get("telemetry") or {}).get("exporter") or {}).get("flush.workspace")
+        is not None
+        for sample in samples
+    )
+    return IN_RUN_WORKSPACE_TERM if published else NO_WORKSPACE_TERM
 
 
 def ledger_check(entries, peak_rss) -> dict:
@@ -1613,12 +1639,13 @@ def settle_pair(result, spec, lifetimes, oracle, counts, latencies, control_coun
     # live heap neither the exporter accounts for nor the paired control
     # holds is unexplained. Every sample of the measured traffic counts.
     peak_rss = max((sample["rss_bytes"] or 0 for sample in samples), default=0)
-    workspace = NO_WORKSPACE_TERM
+    workspace = workspace_term(samples)
     ledger_residuals = [
         {
             "monotonic_ns": sample["monotonic_ns"],
             "phase": sample["phase"],
             "flush_interval": flushing(sample),
+            "flush_workspace_bytes": terms.get("flush_workspace_bytes"),
             "residual_without_workspace_bytes": terms["unexplained_bytes"],
             "residual_bytes": terms["unexplained_bytes"],
         }
@@ -1661,6 +1688,7 @@ def settle_pair(result, spec, lifetimes, oracle, counts, latencies, control_coun
         ),
         "measured_peak_tracked_heap_bytes": _peak(samples, "tracked_heap_bytes"),
         "measured_peak_accounted_bytes": _peak(samples, "accounted_bytes"),
+        "measured_peak_flush_workspace_bytes": _peak(samples, "flush_workspace_bytes"),
         "control_idle_rss_bytes": _median(control_table, "idle", "rss_bytes"),
         "control_peak_rss_bytes": control_peak,
         "exporter_peak_rss_delta_bytes": (

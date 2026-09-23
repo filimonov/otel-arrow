@@ -407,7 +407,7 @@ pub(super) struct Worker {
     /// Source of wall-clock time for window alignment and seal stamps.
     wall: Arc<dyn WallClock>,
     /// Shared with each flush task for the duration of its write.
-    sink: Rc<lake::sink::Sink>,
+    pub(super) sink: Rc<lake::sink::Sink>,
     /// Per-worker block sequence, used in file names.
     seq: u64,
     /// What will have asked for the next rotation.
@@ -1182,9 +1182,10 @@ impl Worker {
     /// asked rather than the state it was in when something last happened.
     ///
     /// The accounted total is exactly what the worker retains: the ACTIVE
-    /// block, the FLUSHING block, the one parked request, the completions the
-    /// notifier holds, the bounded descriptor cache, and the spare capacity of
-    /// the two token vectors. The budget is the same shape derived from
+    /// block, the FLUSHING block with its merge keys and its live flush
+    /// workspace, the one parked request, the completions the notifier
+    /// holds, the bounded descriptor cache, and the spare capacity of the two
+    /// token vectors. The budget is the same shape derived from
     /// configuration, plus the sort, merge, writer, upload and conversion
     /// workspaces a flush may allocate. Those workspace terms are engineering
     /// reservations rather than measurements; validating them empirically is
@@ -1232,9 +1233,14 @@ impl Worker {
         // every row of the table it is writing, for as long as that table's
         // write lasts; the sink reports those bytes and they are charged here.
         let merge_keys = self.sink.merge_key_bytes();
+        // And its merge chunk, encoder buffers and unacknowledged upload
+        // bytes, read live: the write returns to this loop between bounded
+        // steps, so a sample taken during a flush sees what it holds now.
+        let workspace = self.sink.flush_workspace_bytes();
         let accounted = self.active.data.bytes as u64
             + flushing as u64
             + merge_keys as u64
+            + workspace as u64
             + pending as u64
             + cache
             + self.notify.bytes() as u64
@@ -1307,6 +1313,7 @@ impl Worker {
                 now.saturating_duration_since(received).as_secs_f64()
             }));
             metrics.worker.memory_accounted_bytes.set(accounted);
+            metrics.worker.flush_workspace_bytes.set(workspace as u64);
             metrics.worker.memory_budget_bytes.set(budget);
         }
     }

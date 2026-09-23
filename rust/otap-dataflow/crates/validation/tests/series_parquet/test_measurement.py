@@ -4712,6 +4712,39 @@ class MemoryContracts(unittest.TestCase):
             memory.ledger_check(entries, 100 * mib)["status"], measurement.STATUS_FAILED
         )
 
+    # Scenario: samples of an engine whose worker publishes its live flush
+    # workspace as `flush.workspace`, one of them taken during a flush, and
+    # samples of an older engine that publishes none.
+    # Guarantees: each sample records the workspace it saw; the ledger names
+    # the in-run term when the run published one -- already inside
+    # `memory.accounted`, so it is not subtracted twice and the residual is
+    # unchanged -- and keeps the zero term with its provenance otherwise.
+    def test_the_ledger_uses_the_in_run_flush_workspace_when_published(self):
+        def sample(exporter):
+            return {
+                "rss_bytes": 1000, "anonymous_bytes": 700,
+                "smaps": {"rss_total_bytes": 1000, "anonymous_other_bytes": 600,
+                          "binary_file_bytes": 250, "file_file_bytes": 50,
+                          "thread_stack_bytes": 100},
+                "jemalloc": {"allocated_bytes": 250, "resident_bytes": 650,
+                             "metadata_bytes": 40},
+                "telemetry": {"jemalloc_resident_bytes": 640, "tracked_heap_bytes": 300,
+                              "exporter": exporter},
+            }
+        flushing = sample({"memory.accounted": 160, "flush.workspace": 40})
+        quiet = sample({"memory.accounted": 120, "flush.workspace": 0})
+        older = sample({"memory.accounted": 120})
+        terms = memory.sample_terms(flushing, control=100)
+        self.assertEqual(terms["flush_workspace_bytes"], 40)
+        self.assertEqual(terms["unexplained_bytes"], 250 - 160 - 100)
+        self.assertIsNone(memory.sample_terms(older, control=100)["flush_workspace_bytes"])
+        term = memory.workspace_term([quiet, flushing])
+        self.assertEqual(term, memory.IN_RUN_WORKSPACE_TERM)
+        self.assertEqual(term["bytes"], 0)
+        self.assertIn("flush.workspace", term["provenance"])
+        self.assertIn("memory.accounted", term["provenance"])
+        self.assertEqual(memory.workspace_term([older]), memory.NO_WORKSPACE_TERM)
+
     # Scenario: a published pair whose measured lifetime pairs accounted
     # bytes 3 MiB apart at most, whose control heap strays 2 MiB from its
     # load median, and whose allocator prints move 1 MiB apart at most.

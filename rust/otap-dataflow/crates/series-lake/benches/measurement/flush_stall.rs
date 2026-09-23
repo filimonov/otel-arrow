@@ -302,16 +302,11 @@ struct Observed {
     result: std::result::Result<(), String>,
 }
 
-/// The sink's live flush workspace, when this build of the sink reports one.
-///
-/// Resolved at compile time through `FLUSH_WORKSPACE`, so the same probe
-/// source measures a sink that predates the accounting.
+/// The sink's live flush workspace: merge chunk, encoder buffers and the
+/// upload bytes the store has not acknowledged.
 fn workspace_of(sink: &Sink) -> Option<usize> {
-    FLUSH_WORKSPACE.map(|read| read(sink))
+    Some(sink.flush_workspace_bytes())
 }
-
-/// Reads the sink's live flush workspace; `None` when the sink has none.
-const FLUSH_WORKSPACE: Option<fn(&Sink) -> usize> = None;
 
 /// Write `block` once, with the ticker beside it.
 fn write_once(
