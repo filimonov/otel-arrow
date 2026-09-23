@@ -5353,6 +5353,75 @@ def attribution_child_spec(plan, job) -> measurement.RunSpec:
     )
 
 
+# How many times one repetition is run again after a concurrent build
+# invalidated it, and how long the host must stay free of builds first.
+BUILD_RETRIES = 3
+QUIET_HOST_S = 60
+
+
+def invalidated_by_build(child) -> bool:
+    """Whether a build seen inside the measured window invalidated a child."""
+    return any(
+        entry["name"] == "no_concurrent_build"
+        and entry["status"] != measurement.STATUS_PASSED
+        for entry in child.get("checks", [])
+    )
+
+
+def wait_for_quiet_host(*, quiet_s=QUIET_HOST_S, deadline_s=600.0, scan=None) -> dict:
+    """Wait until no build has run on the host for `quiet_s` seconds.
+
+    Another agent's compile is not this family's to stop; the repetition it
+    invalidated is run again only once the host has been observed build-free
+    for a whole quiet period, under a deadline.
+    """
+    scan = scan or measurement.build_activity
+    started = time.monotonic_ns()
+    state = {"quiet_since": None, "seen": []}
+
+    def observe():
+        """How long the host has been build-free, in seconds."""
+        builds = scan()
+        now = time.monotonic_ns()
+        if builds:
+            state["quiet_since"] = None
+            state["seen"] = [
+                {key: build.get(key) for key in ("pid", "comm")} for build in builds[:3]
+            ]
+            return 0.0
+        if state["quiet_since"] is None:
+            state["quiet_since"] = now
+        return (now - state["quiet_since"]) / 1e9
+
+    _ = measurement.wait_until(
+        observe,
+        lambda quiet: quiet >= quiet_s,
+        deadline_ns=started + int(deadline_s * 10**9),
+        description=f"{quiet_s}s without a build on the host",
+    )
+    return {
+        "waited_s": (time.monotonic_ns() - started) / 1e9,
+        "quiet_s": quiet_s,
+        "last_builds_seen": state["seen"],
+        "observed_utc": measurement.utc_now(),
+    }
+
+
+def attribution_child_ordinal(*directories) -> int:
+    """The first repetition ordinal no published or local child has used."""
+    highest = 0
+    for directory in directories:
+        directory = measurement.resolve_report_dir(directory)
+        if not Path(directory).is_dir():
+            continue
+        for path in Path(directory).glob("attribution-*-r[0-9][0-9][0-9].json"):
+            try:
+                highest = max(highest, int(path.stem.rsplit("-r", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return highest + 1
+
+
 def run_attribution_child(plan, job, output_dir, report_dir):
     """One repetition, whose failure is recorded, never raised."""
     try:  # Imported here: the command line imports this module in turn.
@@ -5381,6 +5450,7 @@ def run_attribution_child(plan, job, output_dir, report_dir):
     _ = shutil.copyfile(run_dir / f"{spec.run_id}.json", Path(output_dir) / f"{spec.run_id}.json")
     result.setdefault("workload_config_id", job["config_id"])
     result.setdefault("repetition", job["repetition"])
+    result["attempt"] = job.get("attempt", 1)
     return result
 
 
@@ -5892,7 +5962,7 @@ def reconcile_attribution(aggregates, evidence) -> dict:
 
 
 def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir,
-                        started, *, preflight) -> dict:
+                        started, *, preflight, invalidated=()) -> dict:
     """Write `attribution.json` over every repetition and aggregate.
 
     A host where perf cannot attach publishes the index with the preflight's
@@ -6025,9 +6095,25 @@ def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir
         }
         for child in children
     ]
+    invalidated = list(invalidated)
+    # Repetitions a concurrent build invalidated stay evidence -- published,
+    # hashed and named -- but no aggregate reads them.
+    result["invalidated_children"] = [
+        {
+            "run_id": child["run_id"],
+            "workload_config_id": child.get("workload_config_id"),
+            "repetition": child.get("repetition"),
+            "failed_checks": sorted(
+                entry["name"] for entry in child["checks"]
+                if entry["status"] != measurement.STATUS_PASSED
+            ),
+        }
+        for child in invalidated
+    ]
+    result["quiet_host_waits"] = plan.get("quiet_waits", [])
     result["run_files"] = [
         measurement.file_entry(output_dir / f"{document['run_id']}.json")
-        for document in children + aggregates
+        for document in list(children) + invalidated + list(aggregates)
     ]
     result["baseline_files"] = [
         entry for aggregate in aggregates for entry in aggregate["baseline_files"]
@@ -6200,6 +6286,8 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
             ),
         }
     children = []
+    invalidated = []
+    plan["quiet_waits"] = []
     store = test_e2e.DockerStore(STORE_KIND)
     try:
         _ = store.__enter__()
@@ -6209,14 +6297,33 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         plan["store_cores"] = allocation.get("store", [])
         plan["store_pinned"] = pin_container(store.container, plan["store_cores"])
         plan["ephemeral"] = {"<store_endpoint>": store.endpoint}
+        ordinals = iter(range(attribution_child_ordinal(report_dir, output_dir), 10**6))
         for config_id in configs:
             for repetition in range(1, repetitions + 1):
-                job = {
-                    "config_id": config_id,
-                    "repetition": repetition,
-                    "ordinal": (plan["family_ordinal"] - 1) * repetitions + repetition,
-                }
-                children.append(run_attribution_child(plan, job, output_dir, report_dir))
+                for attempt in range(1, BUILD_RETRIES + 2):
+                    job = {
+                        "config_id": config_id,
+                        "repetition": repetition,
+                        "ordinal": next(ordinals),
+                        "attempt": attempt,
+                    }
+                    # Starting beside a running build would only produce an
+                    # invalidated repetition; the host is let settle first.
+                    if measurement.build_activity():
+                        plan["quiet_waits"].append(
+                            wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
+                        )
+                    child = run_attribution_child(plan, job, output_dir, report_dir)
+                    if not invalidated_by_build(child) or attempt > BUILD_RETRIES:
+                        children.append(child)
+                        break
+                    # A compiler inside the measured window invalidates the
+                    # repetition: it is kept as evidence, never aggregated, and
+                    # the repetition runs again once the host is quiet.
+                    invalidated.append(child)
+                    plan["quiet_waits"].append(
+                        wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
+                    )
     finally:
         store.__exit__(None, None, None)
         # A lifetime that failed before its read-back leaves its ledger.
@@ -6231,7 +6338,7 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
             aggregates.append(aggregate_attribution(members, plan=plan, output_dir=output_dir))
     return publish_attribution(
         spec, plan, children, aggregates, output_dir, report_dir, started,
-        preflight=preflight,
+        preflight=preflight, invalidated=invalidated,
     )
 
 

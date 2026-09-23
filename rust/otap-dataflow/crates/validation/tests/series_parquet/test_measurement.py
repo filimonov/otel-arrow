@@ -5296,6 +5296,36 @@ class AttributionContracts(unittest.TestCase):
         self.assertEqual(closed, [True])
         controls.unwatch_workers.assert_called()
 
+    # Scenario: another agent's compile invalidates a repetition: the host
+    # shows a build for two scans and then none, and earlier children with
+    # ordinals up to 6 are published in two directories.
+    # Guarantees: only a failed no_concurrent_build marks a child as
+    # invalidated by a build; the family waits until the host has been
+    # build-free for a whole quiet period before running it again; and the
+    # rerun takes an ordinal no published child has used.
+    def test_a_build_invalidated_repetition_is_rerun_on_a_quiet_host(self):
+        failed = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        other = {"checks": [measurement.check(
+            "rss_reconciliation", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        self.assertTrue(performance.invalidated_by_build(failed))
+        self.assertFalse(performance.invalidated_by_build(other))
+        scans = iter([[{"pid": 7, "comm": "cargo"}]] * 2 + [[]] * 1000)
+        waited = performance.wait_for_quiet_host(
+            quiet_s=0.2, deadline_s=30, scan=lambda: next(scans)
+        )
+        self.assertGreaterEqual(waited["waited_s"], 0.2)
+        self.assertEqual(waited["last_builds_seen"], [{"pid": 7, "comm": "cargo"}])
+        with self.assertRaisesRegex(AssertionError, "without a build"):
+            _ = performance.wait_for_quiet_host(
+                quiet_s=5, deadline_s=0.3, scan=lambda: [{"pid": 8, "comm": "rustc"}]
+            )
+        report = temporary_directory(self)
+        local = temporary_directory(self)
+        (report / "attribution-logs-1k-stable-strict-minio-c1-w15-r003.json").write_text("{}")
+        (local / "attribution-metrics-mixed-strict-minio-c1-w15-r006.json").write_text("{}")
+        self.assertEqual(performance.attribution_child_ordinal(report, local), 7)
+
     # Scenario: a stages family is asked for a filtered set of stages or
     # workloads, or the complete set under another name.
     # Guarantees: a filtered family must publish under its own index and is

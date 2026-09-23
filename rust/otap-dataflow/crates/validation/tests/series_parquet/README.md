@@ -170,7 +170,10 @@ refused. On a disk the ledger's per-request fsyncs throttle the sender to the
 disk's commit rate. It is deleted after the read-back and its hash is kept.
 `--option lease_wait_s=...` lets the engine build and each repetition wait
 that long for the host lease another measurement holds, instead of being
-refused.
+refused. A repetition whose measured window saw a compiler -- another
+agent's build is not this family's to stop -- is kept in the index as
+`invalidated_children`, never aggregated, and run again under a new ordinal
+once the host has been build-free for a minute, at most three times.
 
 The remaining subcommands (`capacity`, `memory`, `soak`, `fault-preflight`,
 `failures`, `buffered`, `remediate`, `report`) are named here so the command
