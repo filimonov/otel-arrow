@@ -1315,6 +1315,9 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 **Amendment (compaction contract, 2026-09-23):** every S3 fault run in this task also checks the partition lateness bound: no object may become visible in partition hour H later than L = window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) after the end of H. Record, per run, the latest visibility time of any object in each hour relative to that hour's end (HEAD/LIST timestamps from the store, not the writer's clock), and report every violation as a finding for Task 12.
 
+
+**Amendment (S3 compatibility note, 2026-09-23):** (a) one case per real store (MinIO, RustFS) writes a file above `upload.part_bytes` and asserts from the server trace that CreateMultipartUpload, UploadPart and CompleteMultipartUpload ran, so the multipart path is exercised on a real store and not only on the fault store; (b) after every S3 fault case and every hard-kill case of Task 10, list the bucket's incomplete multipart uploads and compare with the expected count (zero, or the uploads the scenario is known to orphan); an unexpected orphan is a Task 12 finding.
+
 ### Task 10: Graceful process restart and ungraceful hard kill
 
 **Expected wall-clock cost:** 8-15 minutes for both stores/topologies and kill phases; fast controller tests under one second.
