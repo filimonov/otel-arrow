@@ -252,7 +252,7 @@ OTLP/gRPC receiver writing a local series/values Parquet lake:
 - Receives OTLP logs on `127.0.0.1:4317` with `wait_for_result: true`
 - Writes series and values Parquet datasets under `/tmp/series-parquet`
 
-Requires a binary built with `--features series_parquet`. Create the base
+Requires a binary built with `--features series-parquet`. Create the base
 directory before starting. An OK OTLP response means the request's rows are
 already durable, so clients should retry timeouts and transient failures and
 tolerate duplicates. Only logs are accepted; metrics and traces are refused.
@@ -265,7 +265,7 @@ The same pipeline writing to an S3-compatible object store:
 - Writes the series and values datasets under `s3://series-test/otel`
 - Retries object-store operations with an explicit backoff schedule
 
-Requires a binary built with `--features series_parquet,aws` and an existing
+Requires a binary built with `--features series-parquet,aws` and an existing
 bucket. The static credentials are local test credentials for a MinIO or
 RustFS container; production deployments use the shared AWS auth provider
 configuration.

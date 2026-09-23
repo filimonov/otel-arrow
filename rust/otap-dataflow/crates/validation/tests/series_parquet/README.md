@@ -70,7 +70,7 @@ invalidates it:
 cargo bench -p otel-arrow-dfe-series-lake --bench measurement --bench layered --no-run
 cargo bench -p otel-arrow-dfe-series-lake --bench measurement --no-run --features bench-heap
 cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
-  --features series_parquet,aws,durable-buffer
+  --features series-parquet,aws,durable-buffer
 cargo build --profile profiling --no-default-features -p otel-arrow-dfe \
   --bin df_engine --features core-nodes,crypto-ring,dhat-heap
 ```
@@ -98,7 +98,7 @@ each is implemented by its own task.
 | `SERIES_REQUIRE_FAULT_TOOLS` | `1` makes missing fault tooling a failure rather than a skip. |
 | `SERIES_MEASURE_LONG` | `1` opts in to throughput sweeps, profiled memory runs, the soak and long failure runs. |
 | `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-parquet-host-measurement.lock`, shared by every checkout and launcher on the host. |
-| `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series_parquet,aws,durable-buffer` and `jemalloc`. |
+| `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series-parquet,aws,durable-buffer` and `jemalloc`. |
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
@@ -225,7 +225,7 @@ directory.
 ## Reproducing a measurement
 
 1. Build the release engine with the features the case needs:
-   `cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series_parquet,aws,durable-buffer`.
+   `cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer`.
    The fixture suite additionally needs the same command without `--release`.
 2. Read the run's `environment` block. Match the machine, the core
    allocation and the build profile, or expect a new baseline rather than a

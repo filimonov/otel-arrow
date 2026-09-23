@@ -1786,11 +1786,11 @@ fn the_factory_creates_file_storage_without_a_capability() {
         .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
         .with_node_context(
             "series".into(),
-            super::SERIES_PARQUET_URN.into(),
+            super::SERIES_PARQUET_EXPORTER_URN.into(),
             otel_arrow_dfe_config::node::NodeKind::Exporter,
             std::collections::HashMap::new(),
         );
-    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_EXPORTER_URN);
     node_config.config = serde_json::json!({
         "storage": {"file": {"base_uri": dir.path().to_str().expect("utf-8 path")}}
     });
@@ -1821,11 +1821,11 @@ fn the_factory_creates_s3_storage_without_a_token_provider() {
         .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
         .with_node_context(
             "series".into(),
-            super::SERIES_PARQUET_URN.into(),
+            super::SERIES_PARQUET_EXPORTER_URN.into(),
             otel_arrow_dfe_config::node::NodeKind::Exporter,
             std::collections::HashMap::new(),
         );
-    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_EXPORTER_URN);
     node_config.config = serde_json::json!({
         "storage": s3_storage(),
         "retry": {"retry_timeout": "30s"}
@@ -1860,11 +1860,11 @@ fn the_factory_refuses_azure_storage_without_a_token_provider() {
         .pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0)
         .with_node_context(
             "series".into(),
-            super::SERIES_PARQUET_URN.into(),
+            super::SERIES_PARQUET_EXPORTER_URN.into(),
             otel_arrow_dfe_config::node::NodeKind::Exporter,
             std::collections::HashMap::new(),
         );
-    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_URN);
+    let mut node_config = NodeUserConfig::new_exporter_config(super::SERIES_PARQUET_EXPORTER_URN);
     node_config.config = serde_json::json!({
         "storage": {"azure": {
             "base_uri": "https://mystorageaccount.blob.core.windows.net/container"

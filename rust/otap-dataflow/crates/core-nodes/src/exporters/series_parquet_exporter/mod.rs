@@ -50,10 +50,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Registered component identifier.
-pub const SERIES_PARQUET_URN: &str = "urn:otel:exporter:series_parquet";
+pub const SERIES_PARQUET_EXPORTER_URN: &str = "urn:otel:exporter:series_parquet";
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
-    urn = SERIES_PARQUET_URN,
+    urn = SERIES_PARQUET_EXPORTER_URN,
     target = "otel.exporter.series_parquet",
 );
 
@@ -75,7 +75,7 @@ mod worker;
 #[otel_arrow_dfe_engine::component_inventory(category = Exporter)]
 #[distributed_slice(OTAP_EXPORTER_FACTORIES)]
 pub static SERIES_PARQUET: ExporterFactory<OtapPdata> = ExporterFactory {
-    name: SERIES_PARQUET_URN,
+    name: SERIES_PARQUET_EXPORTER_URN,
     create: |pipeline: PipelineContext,
              node: NodeId,
              node_config: Arc<NodeUserConfig>,

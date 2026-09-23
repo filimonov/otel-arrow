@@ -2673,7 +2673,7 @@ def engine_build(binary) -> dict:
     Cargo does not record the feature set inside the binary, so the features
     and allocator are the ones the build step declared through
     `SERIES_ENGINE_FEATURES` and `SERIES_ENGINE_ALLOCATOR`, defaulting to the
-    documented `series_parquet,aws,durable-buffer` build on the workspace's
+    documented `series-parquet,aws,durable-buffer` build on the workspace's
     default jemalloc allocator. The binary hash is provenance, outside the
     fingerprint.
     """
@@ -2691,7 +2691,7 @@ def engine_build(binary) -> dict:
     return {
         "profile": profile,
         "features": os.environ.get(
-            "SERIES_ENGINE_FEATURES", "default,series_parquet,aws,durable-buffer"
+            "SERIES_ENGINE_FEATURES", "default,series-parquet,aws,durable-buffer"
         ),
         "allocator": os.environ.get("SERIES_ENGINE_ALLOCATOR", "jemalloc"),
         "toolchain": toolchain,

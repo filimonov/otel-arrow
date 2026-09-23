@@ -3,7 +3,7 @@
 ## Metadata
 
 - Type: `exporter:series_parquet` (`urn:otel:exporter:series_parquet`)
-- Feature gate: `series_parquet`; add `aws` for S3-compatible storage
+- Feature gate: `series-parquet` (opt-in, not in `core-exporters`); add `aws` for S3-compatible storage
 - Metric scope: `exporter.series_parquet`
 - Stability: Experimental
 
@@ -78,7 +78,7 @@ Use `configs/series-parquet-local.yaml` for a local destination and
 `rust/otap-dataflow` workspace:
 
 ```bash
-cargo build -p otel-arrow-dfe --bin df_engine --features series_parquet,aws
+cargo build -p otel-arrow-dfe --bin df_engine --features series-parquet,aws
 mkdir -p /tmp/series-parquet
 ./target/debug/df_engine --config configs/series-parquet-local.yaml --validate-and-exit
 ./target/debug/df_engine --config configs/series-parquet-local.yaml --http-admin-bind 127.0.0.1:8080

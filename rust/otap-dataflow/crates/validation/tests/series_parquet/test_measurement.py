@@ -1110,7 +1110,7 @@ def measured_result(**overrides) -> dict:
                 "core_allocation": {"engine": [0], "producer": [2, 3]},
                 "build": {
                     "profile": "release",
-                    "features": "series_parquet",
+                    "features": "series-parquet",
                     "allocator": "system",
                     "toolchain": "1.88",
                 },
@@ -1849,7 +1849,7 @@ class CommandContracts(unittest.TestCase):
             )
             result["environment"]["build"] = {
                 "profile": "debug",
-                "features": "series_parquet",
+                "features": "series-parquet",
                 "allocator": "jemalloc",
                 "toolchain": "rustc-test",
                 "binary_sha256": "0" * 64,

@@ -99,7 +99,6 @@ core-exporters = [
     "otap",
     "otlp",
     "parquet",
-    "series_parquet",
     "topic",
 ]
 
@@ -132,7 +131,8 @@ parquet = [
     "dep:object_store",
     "dep:parquet",
 ]
-series_parquet = [
+# Opt-in: not part of `core-exporters`.
+series-parquet = [
     "dep:object_store",
     "dep:parquet",
     "dep:otel-arrow-dfe-series-lake",

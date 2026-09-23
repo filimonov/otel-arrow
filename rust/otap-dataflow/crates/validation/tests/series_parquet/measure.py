@@ -422,7 +422,7 @@ def prepare_build() -> dict:
         raise AssertionError(
             f"no engine binary at {binary}; build the release engine with "
             f"cargo build --release --locked -p otel-arrow-dfe --bin df_engine "
-            f"--features series_parquet,aws,durable-buffer"
+            f"--features series-parquet,aws,durable-buffer"
         )
     build = measurement.engine_build(binary)
     if build["profile"] != MEASURED_PROFILE:

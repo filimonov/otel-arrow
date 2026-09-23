@@ -2409,7 +2409,7 @@ def engine_binaries() -> dict:
     )
     for binary, how in (
         (release, "cargo build --release --locked -p otel-arrow-dfe --bin df_engine "
-                  "--features series_parquet,aws,durable-buffer"),
+                  "--features series-parquet,aws,durable-buffer"),
         (profiled, "cargo build --profile profiling --no-default-features -p "
                    "otel-arrow-dfe --bin df_engine --features "
                    "core-nodes,crypto-ring,dhat-heap"),
