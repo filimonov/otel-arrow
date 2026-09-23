@@ -5326,6 +5326,145 @@ class AttributionContracts(unittest.TestCase):
         (local / "attribution-metrics-mixed-strict-minio-c1-w15-r006.json").write_text("{}")
         self.assertEqual(performance.attribution_child_ordinal(report, local), 7)
 
+    # Scenario: the family runs one workload of two repetitions; the first
+    # repetition's run is valid, and every attempt at the second -- the first
+    # run and all three reruns -- is invalidated by a concurrent build.
+    # Guarantees: all four invalidated attempts are published as invalidated
+    # and none reaches the aggregate, which sees the valid repetition alone;
+    # the exhausted repetition is simply missing.
+    def test_exhausted_build_retries_aggregate_nothing_invalidated(self):
+        invalid = {"checks": [measurement.check(
+            "no_concurrent_build", measurement.CHECK_HARD, measurement.STATUS_FAILED)]}
+        runs = []
+
+        def run_child(plan, job, output_dir, report_dir):
+            runs.append(job)
+            child = dict(
+                {"checks": []} if job["repetition"] == 1 else invalid,
+                run_id=f"attribution-metrics-mixed-r{job['ordinal']:03d}",
+                repetition=job["repetition"],
+                workload_config_id=job["config_id"],
+            )
+            return child
+
+        aggregated = []
+
+        def aggregate(members, *, plan, output_dir):
+            aggregated.extend(members)
+            return {"workload_config_id": members[0]["workload_config_id"],
+                    "run_id": "agg", "status": measurement.STATUS_FAILED,
+                    "checks": [], "baseline_files": []}
+
+        published = {}
+
+        def publish(spec, plan, children, aggregates, output_dir, report_dir,
+                    started, *, preflight, invalidated=()):
+            published.update(children=children, aggregates=aggregates,
+                             invalidated=list(invalidated))
+            return {"status": "failed"}
+
+        store = mock.MagicMock(storage={"s3": {}}, endpoint="http://x", container="c")
+        store.__enter__.return_value = store
+        prebuilt = mock.Mock(workload=Workload(), close=mock.Mock())
+        engines = {"valid": True, "problems": [], "profiled": {"binary": "b"},
+                   "canonical": {}, "rustflags_difference": {}, "commands": {},
+                   "git": {"revision": "r"}}
+        allocation = {"engine_observability": [0], "engine": [1],
+                      "engine_reserved": [2, 3, 4], "producer": [5], "store": [6],
+                      "profiler": [7]}
+        spec = performance.attribution_spec(cores=[1])
+        with mock.patch.object(measurement, "role_allocation", return_value=allocation), \
+                mock.patch.object(performance, "prepare_profiled_engine", return_value=engines), \
+                mock.patch.object(performance, "perf_preflight", return_value={"attached": True}), \
+                mock.patch.object(performance.PrebuiltRequests, "build", return_value=prebuilt), \
+                mock.patch.object(measurement.test_e2e, "DockerStore", return_value=store), \
+                mock.patch.object(performance, "container_pid", return_value=1), \
+                mock.patch.object(performance, "pin_container", return_value=True), \
+                mock.patch.object(measurement, "build_activity", return_value=[]), \
+                mock.patch.object(performance, "wait_for_quiet_host", return_value={}), \
+                mock.patch.object(performance, "run_attribution_child", side_effect=run_child), \
+                mock.patch.object(performance, "aggregate_attribution", side_effect=aggregate), \
+                mock.patch.object(performance, "publish_attribution", side_effect=publish):
+            _ = performance.run_attribution(
+                spec, temporary_directory(self), report_dir=temporary_directory(self),
+                configs=["metrics-mixed"], repetitions=2, cpu_ns_per_record=1000.0,
+            )
+        self.assertEqual([job["repetition"] for job in runs], [1, 2, 2, 2, 2])
+        self.assertEqual([job["attempt"] for job in runs if job["repetition"] == 2],
+                         [1, 2, 3, 4])
+        self.assertEqual(len({job["ordinal"] for job in runs}), 5)
+        self.assertEqual(len(published["invalidated"]), 4)
+        self.assertEqual([child["repetition"] for child in aggregated], [1])
+        invalid_ids = {child["run_id"] for child in published["invalidated"]}
+        self.assertFalse(invalid_ids & {child["run_id"] for child in aggregated})
+        self.assertFalse(invalid_ids & {child["run_id"] for child in published["children"]})
+
+    # Scenario: a workload's aggregate is built from repetitions 1 and 3 of
+    # three, repetition 2 having no valid run.
+    # Guarantees: completeness is a hard gate that names the missing
+    # repetition, and no baseline is written.
+    def test_a_missing_repetition_fails_completeness(self):
+        output = temporary_directory(self)
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 1,
+                "cores": [1], "family_ordinal": 1,
+                "evidence": {"pinned": {"index": "stages.json", "present": True,
+                                        "verified": True}}}
+        children = [self.child(index, 6000) for index in (1, 3)]
+        for child in children:
+            _ = measurement.write_result(output / f"{child['run_id']}.json", child)
+        aggregate = performance.aggregate_attribution(children, plan=plan, output_dir=output)
+        checks = {entry["name"]: entry for entry in aggregate["checks"]}
+        self.assertEqual(checks["repetitions_complete"]["status"], measurement.STATUS_FAILED)
+        self.assertIn("[2]", checks["repetitions_complete"]["detail"])
+        self.assertEqual(aggregate["baseline_files"], [])
+
+    # Scenario: the Rust tree is clean when the engine build starts waiting
+    # for the lease, but has an edit once the lease is held; and in another
+    # run the revision moves while the builds run.
+    # Guarantees: the source is re-checked after the lease and after the
+    # builds; a change in either window refuses the engines, and a tree that
+    # changed while waiting is never built.
+    def test_a_tree_that_moves_around_the_build_is_refused(self):
+        clean = {"clean": True, "changes": [], "revision": "r"}
+        with mock.patch.object(performance, "source_state",
+                               return_value={"clean": False, "changes": [" M a.rs"],
+                                             "revision": "r"}):
+            waited, commands = self.engine_proof()
+        self.assertFalse(waited["valid"])
+        self.assertIn("while waiting for the lease", " ".join(waited["problems"]))
+        self.assertEqual(commands, [])
+        with mock.patch.object(performance, "source_state",
+                               side_effect=[clean, dict(clean, revision="s")]):
+            moved, commands = self.engine_proof()
+        self.assertFalse(moved["valid"])
+        self.assertIn("during the builds, the revision moved", " ".join(moved["problems"]))
+        self.assertEqual(len(commands), 3)
+
+    # Scenario: a git repository whose rust/ directory has one committed file
+    # and one untracked .rs file.
+    # Guarantees: the untracked source makes the tree unclean, since it can
+    # be compiled in, and it is named.
+    def test_an_untracked_rust_file_makes_the_tree_unclean(self):
+        root = temporary_directory(self)
+        (root / "rust").mkdir()
+        (root / "rust" / "lib.rs").write_text("pub fn a() {}\n")
+
+        def git(*arguments):
+            return subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *arguments],
+                cwd=root, capture_output=True, text=True, check=True,
+            )
+
+        _ = git("init", "-q")
+        _ = git("add", "rust/lib.rs")
+        _ = git("commit", "-q", "-m", "init")
+        with mock.patch.object(measurement, "REPO_ROOT", root):
+            self.assertTrue(performance.rust_tree_status()["clean"])
+            (root / "rust" / "new.rs").write_text("pub fn b() {}\n")
+            status = performance.rust_tree_status()
+        self.assertFalse(status["clean"])
+        self.assertIn("?? rust/new.rs", status["changes"])
+
     # Scenario: a stages family is asked for a filtered set of stages or
     # workloads, or the complete set under another name.
     # Guarantees: a filtered family must publish under its own index and is

@@ -3602,9 +3602,14 @@ def engine_build_commands() -> dict:
 
 
 def rust_tree_status() -> dict:
-    """Whether the Rust workspace has uncommitted changes to tracked files."""
+    """Whether the Rust tree has any change: tracked, or an untracked file.
+
+    An untracked source file can be compiled in -- a new module, a build
+    script input -- so it makes the tree as unrecorded as an edit does;
+    ignored build output does not appear here.
+    """
     done = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no", "--", "rust/otap-dataflow"],
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", "rust"],
         capture_output=True, text=True, timeout=60, cwd=str(measurement.REPO_ROOT),
     )
     changes = [line for line in done.stdout.splitlines() if line.strip()]
@@ -3651,6 +3656,28 @@ def rustc_version() -> str:
     return done.stdout.strip()
 
 
+def source_state() -> dict:
+    """The Rust tree's cleanliness and the checked-out revision, now."""
+    tree = rust_tree_status()
+    return {
+        "clean": tree["clean"],
+        "changes": tree["changes"],
+        "revision": measurement.git_provenance().get("revision"),
+    }
+
+
+def source_changed(before, after) -> list:
+    """Why the source two states describe is not the same clean source."""
+    problems = []
+    if not after["clean"]:
+        problems.append(f"the Rust tree has changes {after['changes']}")
+    if after["revision"] != before["revision"]:
+        problems.append(
+            f"the revision moved from {before['revision']} to {after['revision']}"
+        )
+    return problems
+
+
 def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
                             lease_path=None) -> dict:
     """Build both engines from the current tree and prove them one engine.
@@ -3687,6 +3714,12 @@ def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
         "git": measurement.git_provenance(),
         "built": bool(build),
     }
+    initial = {
+        "clean": facts["rust_tree"]["clean"],
+        "changes": facts["rust_tree"]["changes"],
+        "revision": facts["git"].get("revision"),
+    }
+    facts["source_checks"] = {"before_lease": initial}
     problems = []
     if not facts["rust_tree"]["clean"]:
         problems.append(
@@ -3703,9 +3736,18 @@ def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
         lease.acquire(deadline_ns=time.monotonic_ns() + int(lease_wait_s * 10**9))
         facts["lease"] = lease.as_json()
         try:
+            # The lease may have been waited for; the tree may have moved
+            # meanwhile, and the engines must be the recorded source's.
+            held = source_state()
+            facts["source_checks"]["after_lease"] = held
+            problems.extend(
+                f"while waiting for the lease, {problem}"
+                for problem in source_changed(initial, held)
+            )
+            commands_to_run = () if problems else ("canonical", "profiled", "restore")
             with open(log_dir / ENGINE_BUILD_LOG, "w", encoding="ascii",
                       errors="replace") as log:
-                for name in ("canonical", "profiled", "restore"):
+                for name in commands_to_run:
                     done = subprocess.run(
                         commands[name], cwd=str(workspace), stdout=log,
                         stderr=subprocess.STDOUT, timeout=7200,
@@ -3718,6 +3760,13 @@ def prepare_profiled_engine(log_dir, *, build=True, lease_wait_s=0.0,
                     if name == "profiled":
                         _ = shutil.copyfile(canonical, profiled)
                         profiled.chmod(0o755)
+            if commands_to_run:
+                built = source_state()
+                facts["source_checks"]["after_builds"] = built
+                problems.extend(
+                    f"during the builds, {problem}"
+                    for problem in source_changed(initial, built)
+                )
         finally:
             lease.release()
     for role, path in (("canonical", canonical), ("profiled", profiled)):
@@ -5591,6 +5640,18 @@ def aggregate_attribution(children, *, plan, output_dir) -> dict:
         )
     )
     checks = derived_checks(children)
+    wanted = set(range(1, plan["repetitions"] + 1))
+    present = {child.get("repetition") for child in children}
+    missing = sorted(wanted - present)
+    checks.append(
+        measurement.check(
+            "repetitions_complete",
+            measurement.CHECK_HARD,
+            measurement.STATUS_FAILED if missing else measurement.STATUS_PASSED,
+            f"repetitions {missing} have no valid run" if missing
+            else f"all {len(wanted)} repetitions measured",
+        )
+    )
     for name in ("rss_reconciliation",) + (
         ("perf_recorded", "stage_agreement_error", "attribution_exclusive",
          "stage_agreement_unexplained") if plan["profile"] else ()
@@ -6049,6 +6110,19 @@ def publish_attribution(spec, plan, children, aggregates, output_dir, report_dir
                 ),
             )
         )
+    if plan["profile"] and attached:
+        measured = {aggregate["workload_config_id"] for aggregate in aggregates}
+        for config_id in plan["inputs"]:
+            if config_id not in measured:
+                checks.append(
+                    measurement.check(
+                        f"workload_measured_{config_id}",
+                        measurement.CHECK_HARD,
+                        measurement.STATUS_FAILED,
+                        f"{config_id} has no valid repetition to aggregate; "
+                        f"every attempt is listed in invalidated_children",
+                    )
+                )
     reconciliation = reconcile_attribution(aggregates, plan["evidence"])
     result["reconciliation"] = reconciliation
     if aggregates and not rehearsal:
@@ -6315,13 +6389,17 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
                             wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
                         )
                     child = run_attribution_child(plan, job, output_dir, report_dir)
-                    if not invalidated_by_build(child) or attempt > BUILD_RETRIES:
+                    if not invalidated_by_build(child):
                         children.append(child)
                         break
                     # A compiler inside the measured window invalidates the
                     # repetition: it is kept as evidence, never aggregated, and
-                    # the repetition runs again once the host is quiet.
+                    # the repetition runs again once the host is quiet. When
+                    # the retries run out it stays missing, and the aggregate's
+                    # completeness gate says so.
                     invalidated.append(child)
+                    if attempt > BUILD_RETRIES:
+                        break
                     plan["quiet_waits"].append(
                         wait_for_quiet_host(deadline_s=max(plan["lease_wait_s"], 600.0))
                     )
