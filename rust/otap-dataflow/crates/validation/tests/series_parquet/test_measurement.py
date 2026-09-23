@@ -4744,11 +4744,105 @@ class MemoryContracts(unittest.TestCase):
         found = memory.pair_uncertainty(child)
         unexplained = found["load_unexplained_median_bytes"]
         self.assertEqual(unexplained["control_heap_max_bytes"], 2 * mib)
-        self.assertEqual(unexplained["allocated_between_prints_max_bytes"], 1 * mib)
+        self.assertEqual(unexplained["allocated_interval_movement_max_bytes"], 1 * mib)
         self.assertEqual(unexplained["bound_bytes"], (3 + 2 + 1) * mib)
         self.assertLessEqual(unexplained["estimate_bytes"], unexplained["bound_bytes"])
         self.assertEqual(found["exporter_peak_rss_delta_bytes"]["bound_bytes"], 10 * mib)
         self.assertIn("estimate", found["labels"]["estimate_bytes"])
+
+
+    # Scenario: a measured lifetime whose samples each carry one allocator
+    # print, rising 1 MiB, then 5 MiB, then back to 2 MiB, followed by a
+    # sample whose three prints climb 0, 2 and 4 MiB above the previous one,
+    # a sample that printed nothing, and a control print in between that
+    # belongs to the other lifetime.
+    # Guarantees: movement is measured over the lifetime's whole print
+    # stream, so a change between the last print of one sample and the first
+    # print of the next counts; a multi-print interval counts its whole range,
+    # not only adjacent steps; a silent sample spans to the next print; and
+    # the other lifetime's prints are ignored.
+    def test_allocator_movement_spans_the_whole_print_stream(self):
+        mib = 1024 * 1024
+
+        def sample(lifetime, *values):
+            """One compact sample with its printed allocated values."""
+            return {"lifetime": lifetime,
+                    "jemalloc_printed": [{"allocated_bytes": v * mib} for v in values]}
+
+        samples = [
+            sample("measured", 1), sample("measured", 5), sample("control", 50),
+            sample("measured", 2), sample("measured", 2, 4, 6), sample("measured"),
+            sample("measured", 3),
+        ]
+        moves = memory.ledger_interval_movement(samples, "measured")
+        # Stream 1, 5, 2, 2, 4, 6, 3 MiB: every interval runs from the previous
+        # sample's last print to the next sample's first one.
+        self.assertEqual(moves, [4 * mib, 4 * mib, 3 * mib, 4 * mib, 3 * mib, 3 * mib])
+        # Adjacent steps inside the three-print sample are 2 MiB; its interval
+        # moved 4 MiB (2 -> 6), and the silent sample spans 6 -> 3.
+        self.assertNotIn(48 * mib, moves)
+
+    # Scenario: a report directory holding one family index, its aggregate
+    # and two pairs, one of whose recorded ledger residuals reaches 40 MiB.
+    # Guarantees: reaggregate re-judges the pairs with no workspace term,
+    # names every file it read -- index, aggregate and both pairs -- in its
+    # manifest with its hash, publishes a new document under the given run id
+    # and leaves every source file unchanged.
+    def test_reaggregate_names_every_file_it_reads(self):
+        report = temporary_directory(self)
+        out = temporary_directory(self)
+        mib = 1024 * 1024
+        snapshot = {
+            "cpu_model": "cpu", "logical_core_count": 2, "physical_core_count": 1,
+            "ram_bytes": 1, "kernel": "k", "load_average_1_5_15": [0, 0, 0],
+            "thread_affinity": {},
+        }
+
+        def pair(run_id, peak):
+            """One published pair with its per-sample ledger residuals."""
+            document = {
+                "run_id": run_id,
+                "environment": {"start": snapshot, "end": snapshot},
+                "metrics": {"exporter_peak_rss_delta_bytes": 30 * mib,
+                            "load_unexplained_median_bytes": 2 * mib},
+                "observations": {
+                    "ledger_residuals": [
+                        {"monotonic_ns": i, "phase": "load", "flush_interval": False,
+                         "residual_without_workspace_bytes": value,
+                         "residual_bytes": value - 30 * mib}
+                        for i, value in enumerate((1 * mib, peak))
+                    ],
+                    "lifetimes": [],
+                },
+                "samples": [{"lifetime": "measured", "rss_bytes": 100 * mib}],
+            }
+            path = report / f"{run_id}.json"
+            path.write_text(json.dumps(document))
+            return path
+
+        children = [pair("fam-strict-local-c1-w1-r001", 40 * mib),
+                    pair("fam-strict-local-c1-w1-r002", 3 * mib)]
+        aggregate = report / "fam-f001.json"
+        aggregate.write_text(json.dumps({
+            "run_id": "fam-f001",
+            "run_files": [measurement.file_entry(path) for path in children],
+            "checks": [measurement.check(
+                "pair_stability", measurement.CHECK_HARD, measurement.STATUS_PASSED)],
+        }))
+        index = report / "fam.json"
+        index.write_text(json.dumps({"run_files": [measurement.file_entry(aggregate)]}))
+        before = {path.name: measurement.file_digest(path) for path in report.iterdir()}
+        result = memory.reaggregate(["fam"], out, report_dir=report, run_id="fam-reagg-t1")
+        manifest = {entry["name"]: entry["sha256"] for entry in result["run_files"]}
+        self.assertEqual(set(manifest), set(before))
+        for name, digest in before.items():
+            self.assertEqual(manifest[name], digest)
+            self.assertEqual(measurement.file_digest(report / name), digest)
+        family = result["observations"]["families"][0]
+        gates = [entry["ledger_gate"]["status"] for entry in family["pairs"]]
+        self.assertEqual(gates, [measurement.STATUS_FAILED, measurement.STATUS_PASSED])
+        self.assertFalse(family["family_passes_under_corrected_ledger"])
+        self.assertTrue((report / "fam-reagg-t1.json").is_file())
 
 
 if __name__ == "__main__":

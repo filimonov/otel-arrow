@@ -2728,6 +2728,38 @@ def _spread_stats(values) -> dict:
     }
 
 
+def ledger_interval_movement(samples, lifetime) -> list:
+    """How far allocated can move within each interval one ledger sample spans.
+
+    A ledger sample pairs its RSS with the latest allocator print and with
+    accounted bytes up to one collection -- one sampling interval -- old.
+    Over the lifetime's complete chronological print stream, the interval a
+    sample spans runs from the last print of the previous sample, through
+    every print of this sample, to the first print after it; the movement of
+    that interval is the range of allocated over those prints. A sample that
+    printed nothing spans from the last earlier print to the next later one.
+    """
+    stream = []
+    last_index = []
+    for sample in samples:
+        if sample.get("lifetime") != lifetime:
+            continue
+        stream.extend(
+            entry["allocated_bytes"] for entry in sample.get("jemalloc_printed") or []
+        )
+        last_index.append(len(stream) - 1)
+    moves = []
+    previous = -1
+    for last in last_index:
+        start = max(previous, 0)
+        end = min(last + 1, len(stream) - 1)
+        window = stream[start:end + 1]
+        if len(window) > 1:
+            moves.append(max(window) - min(window))
+        previous = last
+    return moves
+
+
 def pair_uncertainty(child) -> dict:
     """How far a pair's paired quantities can be off, from both lifetimes.
 
@@ -2740,8 +2772,9 @@ def pair_uncertainty(child) -> dict:
     * control heap: how far the control's allocated heap strays from the
       phase median the ledger subtracts;
     * allocator statistics timing: how old the latest allocator print is
-      when a sample reads it, and how much allocated moves between two
-      consecutive prints.
+      when a sample reads it, and how far allocated moves within the whole
+      interval each ledger sample spans, over the lifetime's complete print
+      stream (`ledger_interval_movement`).
 
     `bound_bytes` adds the maxima and is a bound only over what was sampled
     (a transient between two observations can exceed it);
@@ -2772,13 +2805,7 @@ def pair_uncertainty(child) -> dict:
         sample.get("jemalloc_age_ns") for sample in samples
         if sample.get("lifetime") == "measured"
     )
-    moves = []
-    for sample in samples:
-        if sample.get("lifetime") != "measured":
-            continue
-        printed = [entry["allocated_bytes"] for entry in sample.get("jemalloc_printed") or []]
-        moves.extend(abs(b - a) for a, b in zip(printed, printed[1:]))
-    between_prints = _spread_stats(moves)
+    between_prints = _spread_stats(ledger_interval_movement(samples, "measured"))
 
     def total(*parts):
         """The sum of the available parts, None when all are absent."""
@@ -2790,16 +2817,16 @@ def pair_uncertainty(child) -> dict:
         "accounted_pairing_p95_bytes": pairing("measured", "accounted_bytes", "p95_change_bytes"),
         "control_heap_max_bytes": control["max_bytes"],
         "control_heap_p95_bytes": control["p95_bytes"],
-        "allocated_between_prints_max_bytes": between_prints["max_bytes"],
-        "allocated_between_prints_p95_bytes": between_prints["p95_bytes"],
+        "allocated_interval_movement_max_bytes": between_prints["max_bytes"],
+        "allocated_interval_movement_p95_bytes": between_prints["p95_bytes"],
     }
     unexplained["bound_bytes"] = total(
         unexplained["accounted_pairing_max_bytes"], unexplained["control_heap_max_bytes"],
-        unexplained["allocated_between_prints_max_bytes"],
+        unexplained["allocated_interval_movement_max_bytes"],
     )
     unexplained["estimate_bytes"] = total(
         unexplained["accounted_pairing_p95_bytes"], unexplained["control_heap_p95_bytes"],
-        unexplained["allocated_between_prints_p95_bytes"],
+        unexplained["allocated_interval_movement_p95_bytes"],
     )
     delta = {
         "measured_rss_pairing_max_bytes": pairing("measured", "rss_bytes", "max_change_bytes"),
@@ -2831,7 +2858,8 @@ def pair_uncertainty(child) -> dict:
 # --------------------------------------------------------------------------
 
 
-def reaggregate(index_names, output_dir, report_dir=None) -> dict:
+def reaggregate(index_names, output_dir, report_dir=None,
+                run_id="memory-ledger-reaggregation-r1") -> dict:
     """Re-judge published families from their committed pair results.
 
     For each named index the family aggregate and its pairs are read back
@@ -2854,6 +2882,7 @@ def reaggregate(index_names, output_dir, report_dir=None) -> dict:
         if re.search(r"-f\d{3}$", name):
             aggregate_entry = {"name": f"{name}.json"}
         else:
+            files.append(measurement.file_entry(report / f"{name}.json"))
             index = json.loads((report / f"{name}.json").read_text(encoding="ascii"))
             aggregate_entry = next(
                 entry for entry in index["run_files"]
@@ -2918,7 +2947,6 @@ def reaggregate(index_names, output_dir, report_dir=None) -> dict:
             and all(entry["consistent"] for entry in signs.values()),
             "pairs": pairs,
         })
-    run_id = "memory-ledger-reaggregation-r1"
     result = measurement.new_result({"run_id": run_id, "case": "memory-reaggregation"},
                                     artifact_kind="memory_reaggregation")
     result["environment"] = {
