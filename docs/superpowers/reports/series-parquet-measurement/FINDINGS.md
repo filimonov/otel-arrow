@@ -1,0 +1,818 @@
+# series_parquet measurement campaign: findings
+
+This document states what the measurement campaign has established so far
+about the series_parquet exporter. It covers Tasks 3, 4, 6 and 3i of the
+plan `docs/superpowers/plans/2026-09-22-series-parquet-measurement.md`, and
+lists what the other finished tasks established. Every number comes from a
+task report or from a committed JSON file in this directory.
+
+All evidence paths below are relative to this directory,
+`docs/superpowers/reports/series-parquet-measurement/`, unless they start
+with `docs/`. The task reports are in `campaign/reports/`. The controller's
+rulings are in `campaign/ledger.md`.
+
+## The exporter
+
+series_parquet is an exporter node of the otap-dataflow engine
+(`df_engine`). It receives OTLP (OpenTelemetry Protocol) logs and metrics.
+Each request is converted to OTAP (OpenTelemetry Arrow Protocol) Arrow
+records. Extraction then splits every record into a series descriptor,
+identified by a hash called `series_id`, and a values row. A series cache
+remembers descriptors already written, so a known series is not written
+again. Rows are admitted into an in-memory block. When the block is sealed,
+its runs are sorted and merged, encoded as Parquet with ZSTD (Zstandard)
+compression, and written as a series file and a values file to an object
+store: S3 (here MinIO) or the local file system. A request is acknowledged
+only after its rows are stored.
+
+The stage names used below follow that path: `convert`, `extract`,
+`sort_seal`, `merge`, `encode`, `upload` or `local_write`, and `sink`, which
+is merge plus encode plus store for one sealed block.
+
+## Conditions common to all runs
+
+| Item | Value |
+| --- | --- |
+| Host | AMD Ryzen 9 9950X, 16 physical cores, 32 logical CPUs |
+| SMT siblings | logical CPU i and i+16 share one physical core |
+| Pin | `taskset -c 0-7,16-23`, physical cores 0-7 with both SMT threads |
+| Other load | a TLA+ model checker (TLC) session pinned to 8-15,24-31, 8 workers, nice 10 |
+| Engine builds | `release` with jemalloc; `profiling` with the DHAT heap profiler |
+| Bench builds | profile `bench` (release plus fat LTO); a timing build on the system allocator and a heap build with the `bench-heap` feature |
+| Host lease | an exclusive file lock; a measured run holds it for its whole window |
+| Build monitor | a run is invalidated if cargo, rustc, cc1 or ld runs inside a measured window |
+| Snapshots | every child records the host at start and end: load, affinity, heaviest other processes |
+
+SMT means simultaneous multithreading. The pin exists because a TLC thread
+on the SMT sibling of a bench core slowed the Task 3 benches by 8 to 47
+percent. The ledger ruling of 2026-09-22 23:3x makes the pin mandatory for
+every measured launch. Timings taken before the pin are not comparable with
+timings taken under it. Counts, verdicts and correctness results from before
+the pin still stand.
+
+Each role gets its own physical core, and SMT siblings are never shared
+between roles. A publishable run needs at least 8 physical cores. The
+allocation is per case, so a case claims only the roles it runs.
+
+Baseline policy (ledger ruling R-T1, plan "Controller baseline policy"):
+
+- The first valid run of a fingerprint writes an immutable baseline.
+- The fingerprint covers machine, core allocation, effective configuration,
+  workload and build profile.
+- A later run with the same fingerprint fails if it regresses by more than
+  25 percent.
+- A different fingerprint writes a new baseline instead of comparing.
+- Correctness, measurement validity and the unexplained memory residual are
+  hard checks on every run, whatever the baseline says.
+- An aggregate of three repetitions is refused, and writes no baseline, if a
+  primary metric has a coefficient of variation (CV) above 0.15.
+
+A refused aggregate is kept as evidence. It is never rerun until green. Its
+cause goes to Task 12, the plan's contingency task for bounded fixes.
+Architectural causes go to plan 4, `docs/superpowers/plans/2026-09-23-plan-4-backlog.md`.
+
+The rename of the build feature to `series-parquet` in Task 3c changed every
+build fingerprint. Later tasks therefore compare with the Task 3 family by
+explicit reference and hash, not by fingerprint match.
+
+## Task 3: stage benchmarks
+
+### Question
+
+What does each stage cost per record, on one core, in CPU time, wall time,
+allocation, memory and output size? The plan's acceptance for Task 3: every
+registered stage with its full metric set, Criterion distributions,
+conversion and encoder expansion, equivalence counts and three repetitions,
+with failure on wrong output, hidden timed work, too few samples, unstable
+repetitions, a hard residual check or a regression.
+
+### Method
+
+- Two bench targets in `crates/series-lake`: `measurement`, one process per
+  stage, repetition and profile; and `layered`, cumulative Criterion groups.
+- Every stage calls production code. Only the measured operation is inside
+  the timer. Setup, such as warming the series cache or building a `Sink`,
+  is done before it.
+- A timing process takes at least 30 samples and one second of measured
+  work. A heap process runs under DHAT and reports allocation and workspace.
+- The Criterion ladder is cumulative: `otlp_noop`, `otlp_convert`,
+  `otlp_extract_hash`, `otlp_sort`, `otlp_parquet_local`,
+  `otlp_parquet_zstd`. `otlp_minio` runs the same ladder through the real
+  `Sink` into a pinned MinIO container.
+- `otlp_noop` in mode `pipeline` is a real engine with the noop exporter,
+  driven by the Python producer.
+- Every rate is per logical upstream record: log records or metric points.
+- The encoder used for diagnosis is checked against the real `Sink` output:
+  schema, values, row groups and per-column codec, statistics and dictionary.
+
+Workloads:
+
+| Id | Signal | Requests | Records | Series | Input bytes |
+| --- | --- | --- | --- | --- | --- |
+| logs-1k-stable | logs, 1 KiB bodies | 200 | 20,000 | 100 | 21,638,200 |
+| metrics-mixed | gauges, sums, histograms | 150 | 15,000 | 600 | 908,550 |
+| logs-8k-churn-wide | logs, wide sort key, new series every request | 120 | 6,000 | 120 | 49,504,920 |
+| logs-512k-near-limit | logs, 512 KiB bodies | 24 | 96 | 10 | 50,339,640 |
+
+The committed family ran at revision 9d4fd4ad5 and was committed in
+42be4c5d3, under the pin, on 2026-09-22 from 23:52 for 795 s. Stages family
+roles: observability core 0, bench core 1, engine reservation 2-4, producer
+5-6, store 7.
+
+| Result | Value |
+| --- | --- |
+| Children | 312 of 312 passed |
+| Aggregates | 102 of 104 passed |
+| Baselines written | 102 |
+| Registered stage results | 138 |
+| Index status | failed, on two aggregates, as designed |
+
+### Results: isolated stages
+
+CPU ns per record, median of three repetitions, from `stages.json`. Encode
+and sink rows use ZSTD unless marked.
+
+| Stage | logs-1k-stable | metrics-mixed | logs-8k-churn-wide | logs-512k-near-limit |
+| --- | --- | --- | --- | --- |
+| convert | 389.1 | 505.3 | not run | not run |
+| extract | 1,114.9 | 1,367.9 | 2,190.8 | 66,305.6 |
+| sort_seal | 473.2 | 350.8 | 2,333.6 | 78,795.2 |
+| merge | 136.8 | 104.7 | 3,389.9 | 13,968.4 |
+| encode, none | 1,090.3 | 166.9 | 4,769.8 | 283,879.0 |
+| encode, zstd | 1,913.5 | 225.5 | 8,474.6 | 563,986.5 |
+| sink, local store | 2,250.9 | 353.0 | 14,484.4 | 718,202.7 |
+
+### Results: cumulative ladder and store stages
+
+Medians from `stages.json`. The ladder rows are Criterion groups.
+
+| Stage | logs CPU ns/record | logs wall ns/record | metrics CPU ns/record | metrics wall ns/record |
+| --- | --- | --- | --- | --- |
+| otlp_convert | 392.6 | 396.2 | 499.4 | 508.6 |
+| otlp_extract_hash | 1,482.4 | 1,481.8 | 1,870.8 | 1,885.7 |
+| otlp_sort | 2,314.9 | 2,269.5 | 2,424.8 | 2,800.6 |
+| otlp_parquet_local | 3,442.9 | 3,472.0 | 2,644.0 | 2,669.0 |
+| otlp_parquet_zstd | 4,247.4 | 4,269.0 | 2,695.1 | 2,685.2 |
+| otlp_minio | 4,842.5 | 8,038.0 | 2,993.1 | 4,116.5 |
+| upload, pre-encoded bytes | 402.2 | 5,384.6 | 15.9 | 1,060.1 |
+| local_write, pre-encoded bytes | 108.9 | 108.9 | 2.6 | 2.6 |
+| otlp_noop, pipeline | 1,738.4 | 121,193.3 | 312.2 | 6,346.2 |
+
+`otlp_minio` runs at 206,506 records/s/core on logs-1k-stable and 334,104 on
+metrics-mixed. The gap between its wall and CPU time is store wait that the
+CPU clock does not see. The Criterion `otlp_noop` floor is 0.02 ns/record.
+
+### Results: memory and output size, logs-1k-stable
+
+Medians from `stages.json`. Workspace is what DHAT saw the stage allocate
+above its fixtures. MiB values are converted from bytes.
+
+| Stage | Allocated B/record | Peak workspace MiB | Peak RSS MiB | Output B/record | Output form |
+| --- | --- | --- | --- | --- | --- |
+| convert | 5,175.5 | 40.2 | 78.5 | 1,997.0 | Arrow records |
+| extract | 9,797.1 | 49.6 | 81.7 | 2,505.2 | extracted rows |
+| sort_seal | 2,690.9 | 26.0 | 109.6 | 1,159.1 | sealed block |
+| merge | 1,346.7 | 17.0 | 145.0 | 1,168.7 | merged chunks |
+| encode, none | 7,162.3 | 51.8 | 142.9 | 1,065.1 | Parquet bytes |
+| encode, zstd | 8,727.8 | 34.6 | 152.7 | 755.3 | Parquet bytes |
+| sink | 10,077.2 | 35.2 | 217.9 | 755.3 | stored objects |
+
+RSS is resident set size. The largest workspaces are on the large fixtures:
+
+| Stage | Workload | Allocated B/record | Peak workspace MiB | Peak RSS MiB |
+| --- | --- | --- | --- | --- |
+| sink | logs-8k-churn-wide | 95,180.9 | 153.2 | 332.3 |
+| sink | logs-512k-near-limit | 4,137,306.4 | 106.6 | 263.6 |
+| encode, none | logs-512k-near-limit | 3,489,247.2 | 140.6 | 252.6 |
+| encode, zstd | logs-8k-churn-wide | 69,465.9 | 104.6 | 287.9 |
+
+### Conclusions
+
+- Encoding is the most expensive stage for logs. Extraction is the most
+  expensive for metrics.
+- ZSTD Parquet is 755 B per 1 KiB log record. Uncompressed Parquet is
+  1,065 B, so ZSTD is 1.41 times smaller.
+- ZSTD encoding costs about 1.8 times the CPU of uncompressed encoding on
+  logs-1k-stable. This is a simple ratio of 1,913.5 to 1,090.3.
+- Conversion expands a 1 KiB wire record to 1,997 bytes of Arrow, about 1.85
+  times the wire record.
+- The whole path to MinIO costs 4,842.5 CPU ns per logs record on one core.
+  As a simple ratio, 1M records/s would need about 4.8 cores of this work
+  for logs-1k-stable. Task 5 measures the real figure under fan-in.
+- The pipeline baseline's CPU is an order-of-magnitude calibration only. Its
+  input window is about 0.1 s on metrics-mixed, where the engine spends about
+  5 ms of CPU, so one stray millisecond is a fifth of the measurement. Its
+  wall time measures the Python producer, not the engine. Ledger ruling:
+  "dose problem, not a clock problem".
+- `records_per_s_per_core` of `upload` and `local_write` is a per-record
+  rate over pre-encoded input. These stages pay per object. Their results
+  carry object and byte rates, which are the right rates to use.
+- Completion of a store stage means the store reported the object written
+  and the bench read it back. It is not a power-loss durability claim, since
+  `object_store` does not fsync its local backend.
+
+### Why these numbers are trusted
+
+The committed family is the fourth attempt. Each earlier one is superseded.
+
+| Family | Commit | Host | Status |
+| --- | --- | --- | --- |
+| first run | 5c7c49e98 | quiet, unpinned | superseded by fix round 1: setup was inside timers |
+| fix round 1 | b0a397f8d | quiet, unpinned | superseded: Criterion retries read stale data |
+| fix round 2 | 4f8ff1257 | loaded, TLC on SMT siblings | superseded: 95 provisional baselines, 8 to 47 percent slow |
+| fix round 3 | 42be4c5d3 | pinned | the family of record |
+
+Seven of the nine refusals of the loaded family vanished under the pin. That
+supports the attribution of the slowdown to host load. The pinned medians
+are still about 5 percent above the quiet host of fix round 1, and the most
+memory-bound rows are 10 to 29 percent above it. Encode on logs-1k-stable is
++18.8 percent. TLC on the other eight cores shares the package's memory
+controller and power budget. That is a plausible cause, not a proven one.
+The baselines of record therefore encode "TLC running on the other half of
+the package". A quiet-host run will look faster against them.
+
+Fix round 3 found that the series cache and `Sink` teardown were timed. A
+scratch program put that teardown at 0.04 to 0.3 percent of a stage, at most
+1.4 ns/record. The committed numbers carry this defect, but it is far inside
+run-to-run spread.
+
+### Deferred
+
+| Item | Where | Reason |
+| --- | --- | --- |
+| encode logs-1k-stable zstd timing: peak RSS CV 0.21, CPU CV 0.09 | Task 12 | third sighting of a first-repetition RSS high; investigate allocator growth or run order, not a rerun |
+| upload logs-1k-stable zstd timing: wall CV 0.21, CPU CV 0.01 | Task 12 | store-bound wall variance, seen before TLC started |
+| pipeline baseline CPU window | Task 12 | enlarge the dose to several seconds of engine CPU; do not change the clock or the rule |
+| committed index says setup starts rustc once; it starts it five times, each only for `--version` | recorded, not corrected | no tool re-aggregates an immutable family |
+| quiet-host re-measurement of the family | Task 12 | the baselines encode a half-loaded package |
+
+### Evidence
+
+- `stages.json`: the index, 46 stage summaries, 138 stage results, 102
+  baselines.
+- `stages-encode-isolated-logs-1k-stable-zstd-timing-f001.json` and
+  `stages-upload-async-logs-1k-stable-zstd-timing-f001.json`: the two
+  refused aggregates.
+- `stages-otlp_noop-pipeline-metrics-mixed-zstd-pipeline-f001.json`: the
+  pipeline baseline aggregate.
+- `campaign/reports/task-3-report.md`: fix rounds 1 to 3 and the tables of
+  all families.
+
+## Task 4: CPU attribution per record
+
+### Question
+
+Where does the engine spend its CPU per record, measured directly in the
+running engine, and does that agree with the stage benches? The plan's
+acceptance: exclusive sample shares, CPU per record, upload wait, the
+unknown residual, profile overhead and three repetitions, with failure on
+double counting, fewer than 10,000 classified samples, missing perf data or
+an invalid reconciliation.
+
+### Method
+
+- `perf record -e cpu-clock -F 199 -g --call-graph dwarf` on the engine,
+  enabled only from the first request to the last durable acknowledgement.
+  perf runs on its own profiler core.
+- Each sample is assigned exactly once. The innermost frame that matches a
+  production namespace decides it. Runtime libraries such as Tokio decide a
+  sample only when no production frame is on its stack.
+- Each repetition runs an unprofiled control lifetime and a profiled
+  lifetime of the same release engine, with a pinned MinIO, blocks of 128
+  requests and 256 requests in flight.
+- Binding reconciliation, the plan's stage agreement row: exclusive CPU plus
+  the named residual must be within 10 percent of the measured engine CPU,
+  and unexplained CPU at most 20 percent. This is a hard gate in every
+  repetition.
+- The per-stage comparison with the Task 3 family is descriptive and does
+  not gate. Its reference is the pinned `stages.json`, verified by hash. The
+  spot family `stages-spot.json`, measured at 936ace03a after the Task 3c
+  memo, is shown beside it.
+- The profiled binary is `df_engine-perf`: the same objects relinked with
+  `-z separate-loadable-segments`, because lld's segment layout stops perf's
+  unwinder after one frame. Both binaries list the same 191,989 functions
+  with the same symbol digest.
+
+Conditions: family f002 at revision 865b7dfc7, under the pin,
+`perf_event_paranoid` 1, 3 repetitions per workload, ledgers on tmpfs. One
+logs repetition was invalidated by another agent's rustc and rerun as r005.
+
+### Results
+
+Engine totals, f002 aggregate medians:
+
+| Metric | logs-1k-stable | metrics-mixed |
+| --- | --- | --- |
+| Engine CPU ns/record, profiled | 5,345.2 | 2,452.6 |
+| Engine CPU ns/record, control | 5,449.8 | 2,465.7 |
+| Throughput, records/s, profiled | 104,087 | 225,370 |
+| Classified samples, 3 repetitions | 16,518 | 14,818 |
+| Stage agreement error per repetition | 0.19 / 0.26 / 0.26% | 0.30 / 0.30 / 0.23% |
+| Unexplained CPU per repetition | 1.6 / 1.7 / 1.5% | 0.4 / 0.4 / 0.4% |
+| Profile overhead, CPU per record | -1.9% | +0.1% |
+| Flush wall s | 35.2 | 18.7 |
+| Upload wait s, flush wall not spent on flush CPU | 24.7 | 14.5 |
+| Peak RSS bytes | 150,446,080 | 113,094,656 |
+| Aggregate status | failed, `rss_reconciliation` only | passed, baseline written |
+
+Exclusive CPU shares, pooled over 3 repetitions, 95 percent binomial
+interval, with the aggregate median in ns per record:
+
+| Category | logs share | logs ns/record | metrics share | metrics ns/record |
+| --- | --- | --- | --- | --- |
+| encoding | 33.0% +-0.7 | 1,749.4 | 11.3% +-0.5 | 276.9 |
+| extraction | 16.8% +-0.6 | 911.8 | 24.7% +-0.7 | 615.5 |
+| allocator | 12.6% +-0.5 | 682.4 | 15.0% +-0.6 | 368.9 |
+| engine_runtime | 11.9% +-0.5 | 632.9 | 13.4% +-0.5 | 330.4 |
+| sort_seal_merge | 10.7% +-0.5 | 574.6 | 12.9% +-0.5 | 327.6 |
+| conversion | 7.5% +-0.4 | 382.7 | 19.8% +-0.6 | 488.2 |
+| upload | 5.9% +-0.4 | 322.4 | 1.2% +-0.2 | 33.3 |
+| buffer, admission | 0.3% +-0.1 | 18.8 | 1.5% +-0.2 | 39.3 |
+| unknown | 1.4% +-0.2 | 75.2 | 0.1% +-0.1 | 2.5 |
+
+Descriptive comparison with the stage benches, CPU ns per record. The
+attributed cost includes the allocator samples each row's stages called.
+
+| Row | Workload | Attributed | Pinned bench | Ratio | Spot bench | Ratio | Verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| conversion | logs | 447.6 | 389.1 | 1.15 | 383.1 | 1.17 | in band |
+| extraction | logs | 1,200.7 | 1,114.9 | 1.08 | 1,203.1 | 1.00 | in band |
+| admission, sort_seal, merge | logs | 624.3 | 610.0 | 1.02 | 602.2 | 1.04 | in band |
+| encoding | logs | 1,786.5 | 1,913.5 | 0.93 | 1,633.1 | 1.09 | in band |
+| upload | logs | 379.2 | 402.2 | 0.94 | 405.2 | 0.94 | in band |
+| engine_runtime | logs | 730.9 | 1,738.4 | 0.42 | none | none | unexplained |
+| total | logs | 5,345.2 | 6,580.9 | 0.81 | none | none | in band |
+| conversion | metrics | 569.4 | 505.4 | 1.13 | 506.4 | 1.12 | in band |
+| extraction | metrics | 777.2 | 1,367.9 | 0.57 | 791.1 | 0.98 | in band |
+| admission, sort_seal, merge | metrics | 417.0 | 455.6 | 0.92 | 486.0 | 0.86 | in band |
+| encoding | metrics | 307.8 | 225.6 | 1.36 | 226.0 | 1.36 | in band |
+| upload | metrics | 36.1 | 15.9 | 2.27 | 14.2 | 2.54 | unexplained |
+| engine_runtime | metrics | 369.8 | 312.2 | 1.18 | none | none | in band |
+| total | metrics | 2,452.6 | 3,305.3 | 0.74 | none | none | in band |
+
+The band is 0.5 to 2. The engine_runtime reference is the pipeline baseline
+of Task 3, and the total reference is that baseline plus `otlp_minio`.
+
+### Conclusions
+
+- The attribution is valid. Exclusive CPU plus the named residual matches
+  the engine's scheduler CPU to within 0.3 percent in every repetition.
+- Encoding is a third of logs CPU. For metrics, extraction is 24.7 percent
+  and conversion 19.8 percent.
+- The allocator is 12.6 to 15.0 percent of CPU. Extraction is its largest
+  caller: 5.1 percent of logs CPU and 6.0 percent of metrics CPU in family
+  f001.
+- The Task 3c metrics memo is visible. Metrics extraction is 0.57 of the
+  pre-memo pinned bench and 0.98 of the post-memo spot bench.
+- The engine worker is about half busy. The Python sender and the durable
+  acknowledgement pipeline bound the rate, not the engine. In f001 the
+  worker was on-CPU 0.44 of the time for logs and 0.52 for metrics.
+- perf's own cost is below repetition noise.
+- Two descriptive rows are outside the band and marked unexplained. Logs
+  engine_runtime is 0.42 of the pipeline baseline, whose CPU is itself only
+  a calibration. Metrics upload is 36 against 16 ns/record, on 1.2 percent
+  of the profile.
+- `attribution.json` is failed. The only failing gate is the logs
+  `rss_reconciliation`: its residual peaks at 48 to 65 MB against a 33.5 MB
+  tolerance in every repetition of f001. Task 6 explains most of it.
+
+### Deferred
+
+| Item | Where | Reason |
+| --- | --- | --- |
+| logs attribution baseline | after the memory ledger fix, Task 12 | blocked by the logs `rss_reconciliation` gate |
+| cheap wins: per-column writer properties, S3 unsigned payload over TLS, builder reuse | Task 5a | user decision 2026-09-23 |
+| fixed-width sort keys, extraction straight from OTLP bytes | plan 4 | larger changes |
+| any later perf task | needs the same relinked engine | lld layout breaks unwinding |
+
+### Evidence
+
+- `attribution.json`: the f002 index, with the binding and descriptive
+  reconciliation.
+- `attribution-logs-1k-stable-strict-minio-c1-w15-f002.json` and
+  `attribution-metrics-mixed-strict-minio-c1-w15-f002.json`: the aggregates.
+- `baseline-attribution-10b18890c3147099.json`: the metrics baseline.
+- `attribution-e137b294fdec.json`: the superseded f001 index.
+- `stages-spot.json`: the spot family at 936ace03a.
+- `campaign/reports/task-4-report.md`.
+
+## Task 6: memory model
+
+### Question
+
+What makes up the engine's RSS, how does it relate to the exporter's own
+accounting, and why did the logs RSS gate of Task 4 fail? The plan's
+acceptance: RSS, accounted and budget curves, named transients, residual
+magnitude and uncertainty, with failure on any hard gate, an unstable
+paired baseline or an unexplained residual above tolerance.
+
+### Method
+
+- A pair is two fresh release engines on the same cores and workload: a
+  control with the noop exporter, and the measured strict or buffered
+  engine.
+- Workloads: `harness-rate`, 1,275 requests of 100 records of 1 KiB at 50
+  requests/s, every fifth request metrics; and `logs-high-rate`, the Task 4
+  shape, 9,025 logs requests, 256 in flight, 128-request blocks, MinIO,
+  about 108k records/s.
+- Phases: warmup, settle 11 s, idle, load, drain, decay 11 s, retained.
+- A 100 ms sampler reads telemetry, `/proc/PID/smaps` and jemalloc's own
+  totals. The jemalloc totals are printed after every 4 MiB of allocation,
+  which makes them a synchronous view of flush transients.
+- RSS is split into non-heap, allocator retention, and jemalloc allocated,
+  the live heap. The parts add up.
+- Ledger gate: the residual left after subtracting accounted bytes, the
+  control's live heap, non-heap and retention must stay within the frozen
+  33.5 MB tolerance.
+- At least 3 valid pairs per family. A family fails if a primary metric
+  spreads by more than 15 percent. Seven pairs invalidated by other agents'
+  compilers were rerun and excluded.
+- Source: worktree at 936ace03a, commits 73b8aeb59 to d32e543b3, then fix
+  rounds 1 and 2. All runs under the pin with the lease.
+
+### Results: the RSS split
+
+Medians of 3 pairs, [min, max], background_thread off.
+
+| Term | strict, harness-rate | strict, logs-high-rate |
+| --- | --- | --- |
+| RSS peak | 100.3 MB [97.6, 103.6] | 146.1 MB [136.6, 147.2] |
+| non-heap | 48.4 MB | 49.8 MB |
+| of which file-backed | 43.2 MB | 44.8 MB |
+| allocator retention | 30.4 MB [29.9, 32.0] | 41.3 MB [40.9, 45.6] |
+| jemalloc allocated, peak | 25.6 MB [25.1, 26.6] | 58.3 MB [57.8, 58.8] |
+| exporter accounted, peak | 11.5 MB [10.8, 11.7] | 29.5 MB |
+| control live heap | 6.1 MB | 5.8 MB |
+| paired RSS delta | 36.4 MB [33.9, 43.0] | 69.8 MB [62.9, 69.8] |
+
+- About half the RSS is non-heap, mostly the binary's file-backed pages.
+- In the high-rate shape, about 14 MB of live heap is beyond accounted: 256
+  requests in flight in the receiver, converted and not yet admitted, plus
+  the flush that is always running.
+- After drain and decay the live heap returns to 6.5 MB, the same as idle.
+- Buffered, harness-rate: RSS peak 104.7 MB. The buffer adds about 1.2 MB of
+  live heap and about 2.4 MB of file-backed WAL (write-ahead log) mapping.
+
+### Results: the Task 4 logs residual explained
+
+The harness's 1 s gauge residual splits exactly into sampling skew,
+allocator retention growth and heap the tracked counters missed.
+
+| Family | 1 s gauge peak | Sampling skew | Retention growth | Heap not tracked | 100 ms gauge peak |
+| --- | --- | --- | --- | --- | --- |
+| strict, background_thread off | 22.2-24.1 MB | 5.2-5.6 | 24.9-25.5 | -6.4 to -8.5 | 16.9-18.5 |
+| strict, logs-high-rate | 44.0 / 55.1 / 62.2 MB | 31.6-32.0 | 14.3-27.3 | -3.8 to +8.3 | 12.4-30.2 |
+| buffered | 17.5-23.1 MB | 5.5-10.9 | 25.4-31.5 | -17.1 to -18.7 | 6.7-13.2 |
+| strict, new default binary | 16.3-21.0 MB | 4.3-6.3 | 15.6-22.9 | -3.6 to -8.1 | 12.0-14.8 |
+
+- The Task 4 failure reproduces at 44 to 62 MB.
+- Sampling skew is about 32 MB, 51 to 72 percent of the residual. Blocks
+  turn over every 0.14 s, faster than a 1 s gauge can follow.
+- Allocator retention growth is 14 to 27 MB.
+- The uncharged heap term is small, -4 to +8 MB.
+
+### Results: the two accounting hypotheses
+
+Merge keys were resident and never charged. Confirmed.
+
+| Fixture | Block | Merge keys at the peak table | Ratio |
+| --- | --- | --- | --- |
+| logs-1k-stable | 23.2 MB | 0.68 MB | 0.029 |
+| metrics-mixed | 2.9 MB | 0.51 MB | 0.173 |
+| logs-512k-near-limit | 50.3 MB | 0.004 MB | 0.0001 |
+| logs-8k-churn-wide, body sort key | 50.0 MB | 51.0 MB | 1.020 |
+
+The keys are now charged in `memory.accounted` (73b8aeb59, bounded for the
+merge's whole life in a9835728e). With a wide custom sort key they equal the
+whole block.
+
+Values builders keep 1024-row capacity per request. Confirmed, as
+over-charging, not as a residual. A logs request of 1 record pins 117,156 B
+beyond its rows, 102 times its row bytes. The charge lasts until the run
+seals. 4,096 one-record requests would be charged about 480 MB for about
+5 MB of rows.
+
+### Results: series row cost against the reserved F
+
+F is the per-series reservation the block charges before admission.
+
+| Signal | F | Full charge per series | Real block heap per series, N >= 1000 |
+| --- | --- | --- | --- |
+| logs | 1352 | 1964 | 342-365 |
+| metrics | 2120 | 2868 | 405-428 |
+
+F alone is about 4.0 times the real cost for logs and 5.2 times for metrics.
+The first series of a block costs 19 to 22 KB of fixed structures. The
+review ruled that these numbers exclude variable-width keys, fragmentation,
+tokens and merge keys, so they cannot alone justify lowering F. F was not
+changed.
+
+### Results: verdicts after the ledger correction
+
+Fix round 1 set the ledger's flush workspace term to zero, because no
+in-run measurement existed. Ledger residual maximum per pair, tolerance
+33.5 MB:
+
+| Family | Ledger max per pair | Ledger gate | Pair stability | Passes every rule |
+| --- | --- | --- | --- | --- |
+| memory-strict f001, background_thread off | 8.6 / 4.5 / 6.6 MB | pass | fail | no |
+| memory-strict f002, new default binary | 7.6 / 8.1 / 7.7 MB | pass | fail, control peak 20% | no |
+| memory-strict-logs-high-rate f001 | 38.2 / 33.4 / 36.2 MB | fail | fail | no |
+| memory-buffered f001 | 6.2 / 10.8 / 6.9 MB | pass | fail | no |
+| memory-strict-bgthread f001 | 8.4 / 9.1 / 4.3 MB | pass | pass | yes, baseline written |
+| memory-strict-logs-high-rate-bgthread f001 | 37.6 / 46.7 / 45.6 MB | fail | fail | no |
+| memory-buffered-bgthread f001 | 8.7 / 8.7 / 6.6 MB | pass | fail | no |
+
+Pair uncertainty, recomputed in fix round 2 over the full allocator print
+stream (r2):
+
+| Family | Unexplained-heap bound, sum of maxima | Estimate, sum of p95 | Allocator movement max |
+| --- | --- | --- | --- |
+| strict | 30.8-33.6 MB | 16.1-19.3 MB | 17.9-20.7 MB |
+| buffered | 32.4-35.0 MB | 16.3-19.0 MB | 19.8-22.7 MB |
+| logs high-rate | 72.3-83.4 MB | 56.0-61.6 MB | 50.2-51.7 MB |
+
+### Conclusions
+
+- The memory model closes at small blocks. In strict and buffered families
+  the ledger stays at 4.3 to 10.8 MB against 33.5 MB.
+- It does not close in the logs high-rate shape. That excess is the subject
+  of Task 3i below.
+- jemalloc without its background thread makes quiet-phase RSS unstable.
+  Decay only progresses while the process allocates. The spread is all
+  allocator retention, 8.8 to 30.5 MB.
+- With `background_thread:true` the measured engine's quiet-RSS spread fell
+  from 15-34 percent to 1.4-6.6 percent. By user decision this is now the
+  default of `df_engine` on Linux gnu builds (f64cd11af, 4928e04f6).
+- On the new default binary the measured engine is stable, but the noop
+  control's peak RSS still spreads by 20.2 percent after its short bursts.
+  So there is no strict baseline at the new default fingerprint yet.
+- The pipeline `memory.usage` counter keeps bytes freed on other threads.
+  With local storage it drifts to +137 MB in strict and +273 MB in
+  buffered, against 6.5 MB of real live heap. With MinIO it drifts only
+  +0.7 MB. This is an engine defect that can mask a positive residual.
+- `process.memory.usage.bytes` refreshes every 5 s whatever `check_interval`
+  says, and jemalloc `stats.resident` overstates the heap by 11 to 13 MB.
+- The in-process heap profile at `/debug/pprof/heap` is unusable for
+  attribution. Its first dump makes the symbolizer hold about 266 MB.
+- With `dirty_decay_ms:0, muzzy_decay_ms:0` retention falls to 2.6 to
+  4.0 MB while allocated stays 13.4 MB. That confirms the split.
+
+### Deferred
+
+| Item | Where | Reason |
+| --- | --- | --- |
+| heap term of `rss_reconciliation` from jemalloc allocated | Task 12 | engine `memory.usage` drifts |
+| whether the noop control's peak RSS belongs in the stability set | Task 12, with written rationale before any rerun | the rule was pre-registered |
+| a reservation term for merge keys of about one block, or wide-key validation at startup | Task 12 | keys are not bounded by the merge target M |
+| `shrink_to_fit` of values builders | Task 12 | it breaks an extraction budget test; fix and test must change together |
+| `ingress.max_series_per_request` derived from measured F | Task 12 | user approved option A on 2026-09-23 |
+| buffer heap and WAL split, backlog and replay | Task 13 | moved in fix round 1 |
+| upload concurrency 1 versus 2 burst | Task 5 | moved in fix round 1 |
+| engine accounting placement, umbrella finding 8 | plan 4 | architectural |
+
+### Evidence
+
+- `memory-strict.json` (f002) with child index `memory-strict-3e6a81525f11.json`
+  (f001, probes and series cost), and `memory-strict-f001.json`,
+  `memory-strict-f002.json`.
+- `memory-strict-logs-high-rate.json`, `memory-buffered.json`.
+- `memory-strict-bgthread.json`, `memory-strict-logs-high-rate-bgthread-f001.json`,
+  `memory-buffered-bgthread.json`.
+- `baseline-memory-strict-bgthread-30f46f91e7de52d4.json`: the one baseline.
+- `memory-strict-decay0-strict-local-c1-w1-r001.json`: the decay0 check.
+- `memory-ledger-reaggregation-r1.json` and `memory-ledger-reaggregation-r2.json`:
+  the re-judged verdicts and the recomputed uncertainty.
+- `stages-sink-async-logs-1k-stable-zstd-heap-f001.json`: the 36.9 MB sink
+  workspace the first ledger borrowed.
+- `campaign/reports/task-6-report.md`.
+
+## Task 3i: flush stall, cancellation, flush workspace, exemplars (provisional, fix round 2 pending)
+
+The figures in this section are provisional. Task 3i is in its second
+review fix round. The open items are listed under "Deferred".
+
+### Question
+
+A flush runs on the same core as ingest. How long can it keep the node loop
+from running, and how long does a cancel or shutdown take to be seen? Can
+the work be cut into bounded slices without changing a single output byte?
+And does the ledger close once the flush workspace is accounted?
+
+### Method
+
+- A new probe, `measurement --flush-stall`, builds the largest block the
+  default configuration admits and writes it with `Sink::write_block` on a
+  current-thread runtime into a local file store.
+- A ticker task on the same runtime stands in for the node loop. The longest
+  gap between two ticks is the longest stretch the loop could not run.
+- 20 cancelled writes per fixture, signalled at evenly spaced fractions of
+  the write. "Observed" is signal to the sink's first clock reading after
+  the cancel.
+- Before is the library at fcceef306. After is 545c9f038, after review fix
+  round 1. 7 uncancelled and 20 cancelled writes per fixture, under the pin
+  with the lease, on release bench binaries.
+
+| Fixture | Requests admitted | Block charged | Values rows |
+| --- | --- | --- | --- |
+| logs-1k-stable | 2096 | 242.7 MB | 209,600 |
+| metrics-mixed | 3716 | 69.2 MB | 371,600 |
+| logs-8k-churn-wide, body sort key | 813 | 338.9 MB | 40,650 |
+| logs-512k-near-limit | 236 | 495.1 MB | 944 |
+
+### Results: stall and cancellation
+
+| Fixture | Longest stretch, before -> after | Worst observation | Median observation |
+| --- | --- | --- | --- |
+| logs-1k-stable | 49.1 -> 23.9 ms | 44.7 -> 20.4 ms | 19.6 -> 8.4 ms |
+| metrics-mixed | 34.2 -> 21.1 ms | 28.5 -> 21.6 ms | 9.7 -> 5.6 ms |
+| logs-8k-churn-wide | 63.4 -> 21.4 ms | 56.3 -> 17.2 ms | 6.1 -> 5.7 ms |
+| logs-512k-near-limit | 33.0 -> 20.4 ms | 30.6 -> 19.9 ms | 6.4 -> 6.7 ms |
+
+Whole-flush process CPU, median of 7:
+
+| Fixture | Before | After |
+| --- | --- | --- |
+| logs-1k-stable | 458.8 ms | 468.9 ms |
+| metrics-mixed | 133.9 ms | 137.1 ms |
+| logs-8k-churn-wide | 579.3 ms | 592.0 ms |
+| logs-512k-near-limit | 604.0 ms | 599.9 ms |
+
+- All 8 output files, 8 KB to 369 MB, have identical SHA-256 before and
+  after. The goldens pass unchanged.
+- CPU moves by -0.7 to +2.4 percent, with overlapping ranges.
+- Two steps cannot be sliced without changing bytes: one chunk write,
+  bounded by `sorting.merge_chunk_bytes`, and one row-group close, bounded
+  by `parquet.row_group_bytes`. Each is about 20 to 25 ms at the defaults.
+  They are now the longest stretch.
+
+### Results: flush workspace
+
+The sink now publishes its live flush workspace as `flush.workspace`, and
+`memory.accounted` includes it. It has three terms: the merge chunk being
+produced, the encoder's in-progress row group, and upload buffers not yet
+landed.
+
+| Where | Peak flush workspace |
+| --- | --- |
+| probe, logs-1k-stable 243 MB block | 166.0 MB |
+| probe, logs-8k-churn-wide | 164.9 MB |
+| probe, logs-512k-near-limit | 161.7 MB |
+| probe, metrics-mixed | 33.1 MB |
+| engine, logs high-rate, 13 MB blocks | 20.6 MB |
+
+A large table holds roughly encoder plus one row group plus one chunk:
+about 64 + 64 + 16 MB at the defaults. The tail of each row group, shorter
+than one part, waits in the buffered writer and pins the whole previous
+row-group buffer.
+
+### Results: logs high-rate ledger re-judged
+
+Release engine at da4df0228 plus 1acdb648e, under the pin. Ledger residual
+maximum per pair, tolerance 33.5 MB:
+
+| Family | Task 6 | Task 3i | Gate per pair |
+| --- | --- | --- | --- |
+| background_thread off, now nobgthread f001 | 38.2 / 33.4 / 36.2 MB | 31.0 / 46.5 / 28.9 MB | pass / fail / pass |
+| background_thread on, now bgthread f002 | 37.6 / 46.7 / 45.6 MB | 43.6 / 37.0 / 33.7 MB | fail / fail / fail |
+
+- The ledger still does not pass: 2 of 6 pairs pass, and neither family.
+- Every positive excursion but one is the first sample of a flush. The
+  allocator print already shows the flush's allocation, while the telemetry
+  answer still reads `flush.workspace` 0.
+- Every negative excursion, -32 to -33 MB, is the mirror at a flush's last
+  sample.
+- The one other excursion, +46.5 MB with no flush running, is the burst of
+  256 in-flight requests in the receiver.
+- Inside flushes the ledger now closes. The load median of the residual is
+  -4.7 MB with the thread off and -2.1 MB with it on.
+- Both families still fail pair stability, on the noop control's RSS only,
+  with a control idle spread of 30 to 33 percent.
+
+### Results: CPU per record
+
+Spot family `stages-spot-task3i.json`, f004 at 75732cafd, CPU ns/record,
+median of 3, against `stages.json`:
+
+| Stage | Workload | f004 | stages.json | Ratio |
+| --- | --- | --- | --- | --- |
+| sink | logs-1k-stable | 2274.8 | 2250.9 | 1.011 |
+| sink | metrics-mixed | 396.0 | 353.0 | 1.122 |
+| sink | logs-8k-churn-wide | 13042 | 14484 | 0.900 |
+| sink | logs-512k-near-limit | 675138 | 718203 | 0.940 |
+| encode zstd | logs-1k-stable | 1612.4 | 1913.5 | 0.843 |
+| encode zstd | metrics-mixed | 222.3 | 225.5 | 0.986 |
+
+A like-for-like comparison on sink metrics-mixed, pre-task build against
+HEAD in 5 alternating rounds, gave 378.9 against 390.2 ns/record. So this
+task adds 3.0 percent on the smallest block. About 9 of the 12 points
+against `stages.json` predate the task. perf did not attribute the 3
+percent to the changed code.
+
+### Results: loss contract
+
+- `metrics.exemplars` alone decides. Unset or `drop` keeps the points and
+  counts the exemplars in `dropped.exemplars`. Only an explicit `reject`
+  refuses the request, as a permanent nack.
+- `logs.exemplars` is refused at startup.
+- The README section "What this exporter does not keep" lists every
+  intentional loss, what is kept instead and how it shows. Examples:
+  traces, exponential histograms and summaries, exemplars, attribute value
+  types, zero or out-of-range timestamps, and arrival order.
+
+### Conclusions
+
+- Bounded slices cut the longest flush stretch to 20.4 to 23.9 ms on every
+  fixture. The wide sort key case drops from 63.4 to 21.4 ms.
+- Cancellation is now seen within one stretch plus a step boundary.
+- Output bytes are unchanged, so no format or golden moved.
+- The flush workspace is now measured and charged. Task 6's verdict "the
+  flush workspace takes the ledger past tolerance" is superseded.
+- What still exceeds tolerance is one-sample pairing skew between a 100 ms
+  telemetry answer and an allocator print at a flush's edge. Closing it
+  needs synchronous pairing or a tolerance aware of workspace change, not
+  another term.
+
+### Deferred
+
+| Item | Where | Reason |
+| --- | --- | --- |
+| final range of a sliced column concatenates the whole column in one step | Task 3i fix round 2 | review found item 1 partial |
+| `resident_key_bytes` omits per-run owned keys and heap capacity during the build | Task 3i fix round 2 | review finding |
+| synchronous pairing of telemetry and allocator prints | Task 12 | the remaining ledger excess |
+| raw jemalloc heap dumps symbolized offline | Task 12, first item | attribute the ledger excess, the 160 MB workspace and the counter drift |
+| copy the row-group tail, about 64 MB less per large table | Task 12 | bounded fix |
+| +3 percent sink CPU on the small metrics block | Task 12 | not attributed by perf |
+| the two unsliced steps | plan 4, the off-core shared writer | slicing them changes files |
+
+### Evidence
+
+- `flush-stall/README.md` and `flush-stall/*-round1-before.json`,
+  `flush-stall/*-round1-head.json`: the final before and after probe runs.
+- `flush-stall/files-before.sha256`, `flush-stall/files-final.sha256`,
+  `flush-stall/files-head-545c9f038.sha256`: the byte-identity manifests.
+- `memory-strict-logs-high-rate-nobgthread.json` and
+  `memory-strict-logs-high-rate-bgthread-f002.json`: the re-judged families.
+- `stages-spot-task3i.json` (f004) with child `stages-spot-task3i-3a76ac8067b3.json`
+  (f003).
+- `campaign/reports/task-3i-report.md`.
+
+## Other tasks
+
+- Task 1, harness and result contract: found that a worker that does not
+  answer a collection reports every gauge as zero. A liveness marker fixed
+  the drain proof. Missed collections were a start-up race, 1 of 395
+  epochs, not deferral under load. See `campaign/reports/task-1-report.md`.
+- Task 2, launchers and host controls: made release engines mandatory for
+  measured runs and kept `rss_reconciliation` hard with its frozen
+  tolerance. Found a durable-buffer replay of 5000 acknowledged records
+  after a graceful restart, routed to Task 12. See
+  `campaign/reports/task-2-report.md`.
+- Task 3b, exporter correctness under faults: 23 commits. Store outages now
+  surface as deadline outcomes with their last error. Internal errors are
+  retryable. Shutdown drains are no longer cut short by Tokio's cooperative
+  budget. A backward clock step no longer stalls rotation. See
+  `campaign/reports/task-3b-report.md`.
+- Task 3c, throughput path and hygiene: the metrics memo is now keyed on
+  content. A single extract run on metrics-mixed went from 1357.5 to
+  919.7 ns/record. The later spot family measured 791.1 ns/record. Also the
+  opt-in `series-parquet` feature, semantic metric names and scrubbed JSON.
+  See `campaign/reports/task-3c-report.md`.
+- Task 3d, format batch: format revision 2 with a crate-owned fingerprint
+  vocabulary, native Parquet `SortingColumn` metadata that stops at the
+  first float key, and OTLP-JSON spellings. No series id changed. See
+  `campaign/reports/task-3d-report.md`.
+- Task 3g, damaged OTLP bodies: a schema-aware recursive framing check now
+  refuses damage that was acknowledged before. It also fixed a pre-existing
+  panic in the OTLP to OTAP encoder and several pdata view misreads. Final
+  cost: 5.4 to 6.7 us per logs-1k-stable request, 19 percent of conversion.
+  See `campaign/reports/task-3g-report.md`.
+- Task 3h, attribute collapse: `processor:attribute` deleting a
+  high-cardinality attribute collapses streams correctly for delta sums and
+  histograms. A cumulative pair is stored as two rows under one series,
+  which is wrong for latest-value reads. See `campaign/reports/task-3h-report.md`.
+- Task 8, fault tools: all 28 probes pass on MinIO and RustFS in required
+  mode. Six fault classes are available. `disconnect_reset` and
+  `dropped_completion_response` wait for Task 11 probes. See
+  `campaign/reports/task-8-report.md`.
+
+## Open questions
+
+| Question | Current state | Resolved in |
+| --- | --- | --- |
+| Does the high-rate memory ledger close? | 2 of 6 pairs pass; excess is pairing skew at flush edges | Task 12: raw jemalloc dumps, then synchronous pairing |
+| Engine `memory.usage` drift on local storage | +137 MB strict, +273 MB buffered | Task 12: heap term from jemalloc allocated; upstream engine bug |
+| Is the noop control's RSS a stability metric? | it fails pair stability in every family but memory-strict-bgthread, up to 33 percent spread | Task 12, rationale written before one rerun |
+| No strict memory baseline at the new default fingerprint | only the `MALLOC_CONF` variant has one | Task 12, after the control decision |
+| Logs attribution baseline | blocked by `rss_reconciliation` | after the ledger fix, Task 12 |
+| Pipeline baseline CPU dose | 0.1 s window, calibration only | Task 12 |
+| encode logs-1k-stable peak RSS, first repetition high | third sighting, CV 0.21 | Task 12 |
+| upload logs-1k-stable wall CV 0.21 | store-bound | Task 12 |
+| Logs engine_runtime 0.42 and metrics upload 2.27 of their bench references | marked unexplained; the first explanation was withdrawn | no task named in the reports |
+| Stage baselines encode a half-loaded package | TLC paused on 2026-09-23 13:5x; later runs see a quieter host | Task 12 re-measurement; caveat carried to Task 14 |
+| Wide sort keys equal the whole block | charged, but no reservation term | Task 12 |
+| Values builder over-charge | 102 times the row bytes for a 1-record request | Task 12 |
+| Defaults admit request shapes that are permanently refused | about 215k new metric series per request at the defaults | Task 12 `max_series_per_request`; Task 5 high-cardinality shape |
+| Unanswered collections at saturating load | measured only under the outage test | Task 5 |
+| Task 3i open review items | column concat, key figure | Task 3i fix round 2 |
+| Cores needed for 1M records/s | about 4.8 cores of logs stage CPU, by simple ratio | Task 5 |
