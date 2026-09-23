@@ -40,6 +40,8 @@ priority where stated.
 
 ## Other deferred items
 
+- Refactoring folded into the shared writer (fourth review, 2026-09-23): the worker state machine behind a narrow event API (on_pdata, on_window, on_flush_done, on_cleanup_done, on_shutdown, one private after_slot_freed, futures out instead of fields, metrics and accounting injected at construction); the notifier as a plain VecDeque of (token, outcome) with one live-token counter and a real await-until-deadline drain; and the LakeWriter facade { offer, seal, commit(FlushReport), abort } with LakeConfig::workspace_bytes() next to the allocating code and private Block fields.
+
 - Oversize requests: option B, separate `target_block_bytes` (rotation, file
   size) from `max_block_bytes` (memory cap); option C, split an oversize
   request across blocks with a multi-block token.
