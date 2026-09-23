@@ -73,3 +73,17 @@ priority where stated.
 - Upstream: decide core-nodes vs contrib-nodes placement with the maintainers; pdata CBOR encoder recursion limit; PR split; Python lane under
   tools/; history rewrite before the upstream PR (user decision).
 - Metric sets grouping (3f item 10, deferred): reviewer proposed at most three sets (none; {signal,dataset}; {error.type}); folding would drop labels of flushes{reason}, series.emitted{reason}, dropped.unsupported{kind}, dropped.exemplars{signal}, denormalize.type_mismatch{column,registration}; also worker 'acks' duplicates ExporterExportMetrics outcome=success. Decide with the shared-writer telemetry redesign or at upstream PR time.
+
+## S3 compatibility review (user note, 2026-09-23)
+
+Source: docs/superpowers/s3-compatitibility.md (in Russian). The user asked to look at it, not to follow it blindly. Controller assessment per point:
+
+- Multipart path in E2E: valid. Only `test_short_client_waits_duplicate_rather_than_lose` sets `part_bytes: 5MiB` with 8 MiB blocks, and nothing checks that a file actually crossed a part boundary; the rest of E2E likely writes single PUTs. Cheapest fix: one E2E case per store with a file above `part_bytes`, asserting the multipart calls in the server trace (MinIO `mc admin trace`). Candidate for plan 3 Task 9 rather than plan 4.
+- Complete retried after it succeeded (`NoSuchUpload`): already covered by the planned dropped-completion probe (Task 9) and the late-commit log and counter (Task 3j, major 11). Nothing new beyond checking the answer per store.
+- Orphaned multipart uploads after SIGKILL or an abort timeout: valid and cheap. Tasks 9 and 10 should list incomplete uploads after each scenario and expect zero or a known number. Also consider a startup check or README warning when the bucket has no abort-incomplete-multipart lifecycle rule.
+- Store-specific error codes (SlowDown, 503, RequestTimeout, TLS reset): partly covered by the Task 8 fault rig on real MinIO/RustFS; add 5xx during UploadPart and on Complete if the rig can inject per-operation.
+- Upper bound on `part_bytes` (5 GiB per part, 10,000 parts): trivial validation, take it with the next config change.
+- Versioned buckets and object lock: frozen names plus retries create versions; one README line.
+- Not exposed: `unsigned_payload` (sometimes needed behind proxies; Task 5a already measures unsigned payload on TLS), `checksum_algorithm`, S3 Express. Expose `unsigned_payload` only if Task 5a shows a gain or a user needs it.
+- Store matrix: a `workflow_dispatch` lane on real AWS S3 with secrets is the useful one; Ceph RGW, Garage and SeaweedFS in Docker are cheap additions; R2, B2 and GCS XML interop only on request. Azurite remains the plan 3 gate.
+- The note's conclusion, that "tested on S3-compatible stores" should not be claimed before the multipart and completion points are checked, is adopted for the final report wording.
