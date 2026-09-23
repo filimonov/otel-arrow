@@ -1743,4 +1743,269 @@ mod tests {
             Err(Error::OtlpNestingTooDeep { .. })
         ));
     }
+
+    /// Every (message, field) pair a message of type `message` in `buf`
+    /// sets, nested messages included.
+    fn set_fields(buf: &[u8], message: Message, found: &mut Vec<(Message, u64)>) {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            if !found.contains(&(message, field_num)) {
+                found.push((message, field_num));
+            }
+            if let Kind::Message(child) = message.field(field_num).kind {
+                set_fields(&buf[start..end], child, found);
+            }
+            pos = end;
+        }
+    }
+
+    /// Scenario: every field number from 1 to 63 of every message reachable
+    /// from the three request roots through the schema table, compared with
+    /// the fields the fully populated prost-built requests set.
+    /// Guarantees: the table knows exactly the fields the prost-generated
+    /// types encode -- none is missing and none is invented -- so every
+    /// table entry's wire type is exercised by `a_fully_populated_request_passes`,
+    /// and every singular slot, a oneof's shared one included, fits the
+    /// 64-bit mask of the walk.
+    #[test]
+    fn the_schema_table_matches_the_prost_types() {
+        let mut messages = vec![
+            Message::ExportLogsServiceRequest,
+            Message::ExportMetricsServiceRequest,
+            Message::ExportTraceServiceRequest,
+        ];
+        let mut known = Vec::new();
+        let mut i = 0;
+        while i < messages.len() {
+            let message = messages[i];
+            for num in 1..64 {
+                let field = message.field(num);
+                if let Some(singular) = field.singular {
+                    let slot = singular.oneof.unwrap_or(num);
+                    assert!(slot < 64, "{message:?}.{num}");
+                    assert!(
+                        matches!(message.field(slot).singular, Some(s) if s.name == singular.name),
+                        "{message:?}.{num}: slot {slot} is not a member of its oneof"
+                    );
+                }
+                match field.kind {
+                    Kind::Unknown => {}
+                    Kind::Message(child) => {
+                        known.push((message, num));
+                        if !messages.contains(&child) {
+                            messages.push(child);
+                        }
+                    }
+                    Kind::Scalar(_) | Kind::Packed(_) => known.push((message, num)),
+                }
+            }
+            i += 1;
+        }
+        let mut set = Vec::new();
+        for (root, body) in requests() {
+            set_fields(&body, root, &mut set);
+        }
+        let sort = |pairs: &mut Vec<(Message, u64)>| {
+            pairs.sort_by_key(|(message, num)| (message.name(), *num));
+        };
+        sort(&mut known);
+        sort(&mut set);
+        assert_eq!(known, set);
+    }
+
+    /// Whether prost decodes `body` as the request type `root` names, or the
+    /// decode error if it does not.
+    fn prost_decode(root: Message, body: &[u8]) -> Result<(), prost::DecodeError> {
+        match root {
+            Message::ExportLogsServiceRequest => ExportLogsServiceRequest::decode(body).map(drop),
+            Message::ExportMetricsServiceRequest => {
+                ExportMetricsServiceRequest::decode(body).map(drop)
+            }
+            Message::ExportTraceServiceRequest => ExportTraceServiceRequest::decode(body).map(drop),
+            other => unreachable!("{other:?} is not a request root"),
+        }
+    }
+
+    /// One edit of a fixture body: overwrite, insert or delete the byte at an
+    /// index, or cut the body there.
+    #[derive(Clone, Copy, Debug)]
+    enum Edit {
+        Set(proptest::sample::Index, u8),
+        Insert(proptest::sample::Index, u8),
+        Delete(proptest::sample::Index),
+        Cut(proptest::sample::Index),
+    }
+
+    fn edit() -> impl proptest::strategy::Strategy<Value = Edit> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (any::<proptest::sample::Index>(), any::<u8>()).prop_map(|(i, b)| Edit::Set(i, b)),
+            (any::<proptest::sample::Index>(), any::<u8>()).prop_map(|(i, b)| Edit::Insert(i, b)),
+            any::<proptest::sample::Index>().prop_map(Edit::Delete),
+            any::<proptest::sample::Index>().prop_map(Edit::Cut),
+        ]
+    }
+
+    fn apply(body: &mut Vec<u8>, edit: Edit) {
+        if body.is_empty() && !matches!(edit, Edit::Insert(..)) {
+            return;
+        }
+        match edit {
+            Edit::Set(i, b) => {
+                let i = i.index(body.len());
+                body[i] = b;
+            }
+            Edit::Insert(i, b) => body.insert(i.index(body.len() + 1), b),
+            Edit::Delete(i) => {
+                let _ = body.remove(i.index(body.len()));
+            }
+            Edit::Cut(i) => body.truncate(i.index(body.len())),
+        }
+    }
+
+    /// The number of length-delimited fields in `buf`, a message of type
+    /// `message`, nested ones included, or `None` if a frame on the way is
+    /// broken.
+    fn len_fields(buf: &[u8], message: Message) -> Option<usize> {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).ok()?;
+            let (start, end) = value_range(buf, wire_type, next).ok()?;
+            if wire_type == LEN {
+                count += 1;
+                if let Kind::Message(child) = message.field(field_num).kind {
+                    count += len_fields(&buf[start..end], child)?;
+                }
+            }
+            pos = end;
+        }
+        Some(count)
+    }
+
+    /// Re-encode `buf`, a message of type `message`, with `edit` applied to
+    /// the payload of the `target`-th length-delimited field in pre-order and
+    /// every enclosing length prefix rewritten to match, so the edit lands
+    /// inside a well-framed field at any depth.
+    fn edit_nested(
+        buf: &[u8],
+        message: Message,
+        target: &mut Option<usize>,
+        edit: Edit,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            if wire_type != LEN {
+                out.extend_from_slice(&buf[pos..end]);
+                pos = end;
+                continue;
+            }
+            let payload = match *target {
+                Some(0) => {
+                    *target = None;
+                    let mut payload = buf[start..end].to_vec();
+                    apply(&mut payload, edit);
+                    payload
+                }
+                Some(n) => {
+                    *target = Some(n - 1);
+                    match message.field(field_num).kind {
+                        Kind::Message(child) => edit_nested(&buf[start..end], child, target, edit),
+                        _ => buf[start..end].to_vec(),
+                    }
+                }
+                None => buf[start..end].to_vec(),
+            };
+            out.extend(len_field(field_num as u32, &payload));
+            pos = end;
+        }
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Scenario: a fully populated logs, metrics or traces request with one
+        /// to three random byte edits (overwrite, insert, delete, cut), each
+        /// applied to the whole body or inside one length-delimited field at
+        /// any depth with the enclosing lengths rewritten, checked under both
+        /// policies and decoded by prost.
+        /// Guarantees: under `RepeatedSingular::Accept` the validator agrees
+        /// with prost: it accepts a body exactly when prost decodes it, except
+        /// that prost also refuses a string that is not UTF-8, which the
+        /// validator leaves to the conversion; and `Refuse` accepts nothing
+        /// `Accept` refuses.
+        #[test]
+        fn the_validator_agrees_with_prost_on_edited_bodies(
+            signal in 0usize..3,
+            edits in proptest::collection::vec(
+                (proptest::prelude::any::<proptest::sample::Index>(), edit()),
+                1..4,
+            ),
+        ) {
+            let (root, mut body) = requests()[signal].clone();
+            for (target, edit) in edits {
+                // Position 0 is the whole body; position i edits the i-th
+                // length-delimited field. Bodies an earlier edit broke are
+                // edited whole.
+                let fields = len_fields(&body, root).unwrap_or(0);
+                match target.index(fields + 1) {
+                    0 => apply(&mut body, edit),
+                    i => body = edit_nested(&body, root, &mut Some(i - 1), edit),
+                }
+            }
+            let accepted = validate_request(&body, root, RepeatedSingular::Accept);
+            let refused = validate_request(&body, root, RepeatedSingular::Refuse);
+            match prost_decode(root, &body) {
+                Ok(()) => proptest::prop_assert!(accepted.is_ok(), "{accepted:?}"),
+                Err(error) if error.to_string().contains("not UTF-8") => {}
+                Err(error) => proptest::prop_assert!(accepted.is_err(), "prost: {error}"),
+            }
+            if refused.is_ok() {
+                proptest::prop_assert!(accepted.is_ok());
+            }
+        }
+    }
+
+    /// Scenario: a logs, a metrics and a traces payload whose one nested
+    /// `Resource*` message is `0a 01 0a` -- a field tag with no length --
+    /// the same payloads empty, and a payload of Arrow records.
+    /// Guarantees: `OtapPayload::validate_otlp_framing` refuses each damaged
+    /// body naming the damaged message, under both policies, and passes the
+    /// empty bodies and the Arrow records, which have no wire framing.
+    #[test]
+    fn the_payload_check_refuses_damage_and_passes_arrow_records() {
+        use crate::OtapPayload;
+        use crate::OtlpProtoBytes;
+        use crate::otap::{Logs, OtapArrowRecords};
+        use otel_arrow_dfe_config::SignalType;
+
+        for repeated in [RepeatedSingular::Accept, RepeatedSingular::Refuse] {
+            for (signal, message) in [
+                (SignalType::Logs, "ResourceLogs"),
+                (SignalType::Metrics, "ResourceMetrics"),
+                (SignalType::Traces, "ResourceSpans"),
+            ] {
+                let damaged = OtapPayload::from(OtlpProtoBytes::new_from_bytes(
+                    signal,
+                    vec![0x0a, 0x01, 0x0a],
+                ));
+                match damaged.validate_otlp_framing(repeated) {
+                    Err(Error::InvalidOtlpWireFormat { message: named, .. }) => {
+                        assert_eq!(named, message, "{signal:?}")
+                    }
+                    other => panic!("{signal:?}: expected a framing error, got {other:?}"),
+                }
+                let empty = OtapPayload::from(OtlpProtoBytes::empty(signal));
+                assert!(empty.validate_otlp_framing(repeated).is_ok(), "{signal:?}");
+            }
+            let records = OtapPayload::from(OtapArrowRecords::Logs(Logs::default()));
+            assert!(records.validate_otlp_framing(repeated).is_ok());
+        }
+    }
 }
