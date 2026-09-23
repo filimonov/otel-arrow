@@ -666,6 +666,38 @@ descriptor became visible before the values file. A reader that lists values
 files first and series files second therefore always finds descriptors for
 what it read.
 
+## Partition lateness bound (contract for compactors)
+
+A partition hour is taken from a block's `window_start`, the ingest time of
+its window, never from event timestamps. A request that is refused and later
+retried is admitted again into a new window, so it lands in the partition of
+its new ingest time, not in the old one. The only writes into an hour H that
+can still happen after H has ended come from blocks whose window started
+inside H and whose flush is still retrying. Their last attempt ends no later
+than
+
+```text
+L = window.interval + flush_retry_deadline + upload.abort_timeout
+```
+
+after the end of H (80 s with the defaults). A compactor that closes hour H
+must therefore wait at least L after the end of H before it lists the hour.
+
+The bound is enforced by the writer's own deadlines, which means it holds for
+every write the writer completes or abandons itself. It does NOT hold when the
+object store completes a multipart upload whose completion response was lost:
+the writer has given up, but the store may still publish the object later.
+Until writers publish a per-writer seal marker for each hour (planned), a
+compactor cannot tell that case apart from an hour that is complete, and a
+compacted hour may miss such an object. Readers that do not compact are not
+affected.
+
+To help queries prune without a join, popular resource and log attributes can
+be materialised as columns with `denormalize` (for example
+`k8s.namespace.name`, `k8s.pod.name`, `deployment.environment.name`,
+`host.name`). Page statistics and the page index are written for the sort-key
+columns.
+
 ## Limitations of version 1
 
 Descriptors become bounded series runs during request admission. Final sealing

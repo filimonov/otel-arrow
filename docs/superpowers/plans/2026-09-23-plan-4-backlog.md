@@ -20,7 +20,7 @@ priority where stated.
    item 1), keeping the ACTIVE + FLUSHING memory bound. Task 5 measures the
    admission-closed duration first. User decision 2026-09-23: do it together
    with item 1.
-3. **Compactor** (spec 10.2). One file set per window per worker means
+3. **Compactor** (spec 10.2), shaped by docs/superpowers/compaction-and-format-chat.md: one hourly high-watermark object instead of per-file manifests (readers use compacted files at or below the watermark and raw files above it, never both for one hour); per-writer seal markers `_sealed/hour=H/writer=<writer_id>/<boot_id>` written only after every PUT of that writer for H has resolved (success or confirmed abort; an unknown outcome is resolved by HEAD first), and the compactor closes H only when all live writers have sealed it; re-sort on compaction (metrics/values by metric_name, series_id, time; logs/values time-first, to be decided from queries); page index everywhere and Bloom filters on series_id (and trace/span ids for logs) in compacted files only; several compacted files per hour above a target size; GC of raw files after a grace period, decoupled from the compactor. Originally: One file set per window per worker means
    thousands of small files per hour at 15 s and 32 cores. A stateless
    `series-lake-compactor` with a Quickwit-style policy over the existing
    compaction scope.
@@ -37,6 +37,7 @@ priority where stated.
    - Path to v2: what may change without a new `v=`, and how a reader learns
      the version from the footer, not only from the path.
    - Remove `parquet.compression` until a second codec exists.
+   - `metric_type`, `temporality` and `is_monotonic` duplicated into metrics/values (dictionary/RLE makes them nearly free), so a values file is self-describing without the join to series.
 
 ## Other deferred items
 
