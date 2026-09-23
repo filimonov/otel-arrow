@@ -369,35 +369,46 @@ impl MergeBuild {
         !self.sorted || self.run >= self.runs.len()
     }
 
-    /// Encode the next slice of sort keys. Returns whether every key is now
-    /// encoded; a complete build does nothing.
+    /// Encode the next keys, one slice per run or part of a run, until the
+    /// step's budget of rows and encoded bytes is spent. Returns whether
+    /// every key is now encoded; a complete build does nothing.
+    ///
+    /// Many small runs, such as a series table's, share one step, so a small
+    /// table is not charged a return to the runtime per run.
     ///
     /// # Errors
     ///
     /// Returns the Arrow failure of encoding a slice.
     pub fn step(&mut self) -> Result<bool> {
-        if self.is_complete() {
-            return Ok(true);
-        }
-        let converter = self
-            .converter
-            .as_ref()
-            .ok_or_else(|| Error::internal("sorted merge without a converter"))?;
-        let run = &self.runs[self.run];
-        let average = (self.encoded_rows > 0).then(|| self.encoded_bytes / self.encoded_rows);
-        let rows = self
-            .budget
-            .key_slice_rows(average)
-            .min(run.num_rows() - self.offset);
-        let slice = run.slice(self.offset, rows);
-        let encoded = key_rows(&slice, &self.spec, converter)?;
-        self.encoded_bytes += encoded.lengths().sum::<usize>();
-        self.encoded_rows += rows;
-        self.keys[self.run].push(encoded);
-        self.offset += rows;
-        if self.offset >= run.num_rows() {
-            self.run += 1;
-            self.offset = 0;
+        let (mut rows_done, mut bytes_done) = (0usize, 0usize);
+        while !self.is_complete()
+            && rows_done < self.budget.rows
+            && bytes_done < self.budget.key_bytes
+        {
+            let converter = self
+                .converter
+                .as_ref()
+                .ok_or_else(|| Error::internal("sorted merge without a converter"))?;
+            let run = &self.runs[self.run];
+            let average = (self.encoded_rows > 0).then(|| self.encoded_bytes / self.encoded_rows);
+            let rows = self
+                .budget
+                .key_slice_rows(average)
+                .min(self.budget.rows - rows_done)
+                .min(run.num_rows() - self.offset);
+            let slice = run.slice(self.offset, rows);
+            let encoded = key_rows(&slice, &self.spec, converter)?;
+            let bytes = encoded.lengths().sum::<usize>();
+            self.encoded_bytes += bytes;
+            self.encoded_rows += rows;
+            rows_done += rows;
+            bytes_done += bytes;
+            self.keys[self.run].push(encoded);
+            self.offset += rows;
+            if self.offset >= run.num_rows() {
+                self.run += 1;
+                self.offset = 0;
+            }
         }
         Ok(self.is_complete())
     }
@@ -481,11 +492,11 @@ pub enum MergeStep {
 /// `max_row_bytes` per row, and `max_row_bytes <= run_target_bytes / 4` is
 /// validated at startup. Exact byte-driven chunking is a plan 3 follow-up.
 ///
-/// A chunk can be produced in bounded steps through [`MergeIter::step`]:
-/// heap pops in slices of at most [`MERGE_STEP_ROWS`] rows and
-/// [`MERGE_STEP_KEY_BYTES`] copied key bytes, then one output column per
-/// step. `next()` runs the same steps back to back, so both produce exactly
-/// the same chunks.
+/// A chunk can be produced in bounded steps through [`MergeIter::step`]: a
+/// step pops heap rows and interleaves output columns until it has done
+/// about [`MERGE_STEP_ROWS`] rows of work or copied
+/// [`MERGE_STEP_KEY_BYTES`] of keys. `next()` runs the same steps back to
+/// back, so both produce exactly the same chunks.
 pub struct MergeIter {
     runs: Vec<RecordBatch>,
     schema: SchemaRef,
@@ -575,32 +586,44 @@ impl MergeIter {
             self.next_run += 1;
             return Ok(MergeStep::Chunk(run.clone()));
         }
-        if self.columns.is_empty() {
-            if !self.popped_enough() {
-                self.pop_slice();
-                return Ok(if self.pending.is_empty() {
-                    MergeStep::Done
-                } else {
-                    MergeStep::Progress
-                });
+        // One step pops rows and interleaves columns until it has done its
+        // budget's worth: a popped row counts one, an interleaved column
+        // counts the chunk's rows. A small chunk is then produced in a
+        // single step, and a large one never in more than a budget per step.
+        let mut work = 0usize;
+        let mut copied = 0usize;
+        loop {
+            if self.columns.is_empty() && !self.popped_enough() {
+                let (rows, bytes) = self.pop_slice(self.budget.rows - work);
+                work += rows;
+                copied += bytes;
+                if self.pending.is_empty() {
+                    return Ok(MergeStep::Done);
+                }
+                if work >= self.budget.rows || copied >= self.budget.key_bytes {
+                    return Ok(MergeStep::Progress);
+                }
+                continue;
             }
             if self.pending.is_empty() {
                 return Ok(MergeStep::Done);
             }
+            let c = self.columns.len();
+            let arrays: Vec<&dyn Array> = self.runs.iter().map(|r| r.column(c).as_ref()).collect();
+            self.columns.push(interleave(&arrays, &self.pending)?);
+            work += self.pending.len();
+            if self.columns.len() == self.schema.fields().len() {
+                let columns = std::mem::take(&mut self.columns);
+                self.pending.clear();
+                return Ok(MergeStep::Chunk(RecordBatch::try_new(
+                    self.schema.clone(),
+                    columns,
+                )?));
+            }
+            if work >= self.budget.rows {
+                return Ok(MergeStep::Progress);
+            }
         }
-        // Interleave one column per step.
-        let c = self.columns.len();
-        let arrays: Vec<&dyn Array> = self.runs.iter().map(|r| r.column(c).as_ref()).collect();
-        self.columns.push(interleave(&arrays, &self.pending)?);
-        if self.columns.len() < self.schema.fields().len() {
-            return Ok(MergeStep::Progress);
-        }
-        let columns = std::mem::take(&mut self.columns);
-        self.pending.clear();
-        Ok(MergeStep::Chunk(RecordBatch::try_new(
-            self.schema.clone(),
-            columns,
-        )?))
     }
 
     /// Whether the rows popped so far complete a chunk: the chunk's row
@@ -609,14 +632,16 @@ impl MergeIter {
         self.pending.len() >= self.rows_per_chunk || self.heap.is_empty()
     }
 
-    /// Pop the next slice of rows of the chunk being produced.
-    fn pop_slice(&mut self) {
+    /// Pop at most `max_rows` more rows of the chunk being produced, and at
+    /// most about the budget's key bytes; returns the rows popped and the
+    /// key bytes copied.
+    fn pop_slice(&mut self, max_rows: usize) -> (usize, usize) {
         if self.pending.capacity() == 0 {
             self.pending.reserve_exact(self.rows_per_chunk);
         }
         let mut rows = 0usize;
         let mut copied = 0usize;
-        while rows < self.budget.rows && copied < self.budget.key_bytes {
+        while rows < max_rows && copied < self.budget.key_bytes {
             let Some(item) = self.heap.pop() else { break };
             self.pending.push((item.run, item.idx));
             rows += 1;
@@ -641,6 +666,7 @@ impl MergeIter {
                 break;
             }
         }
+        (rows, copied)
     }
 }
 
@@ -1419,7 +1445,7 @@ mod tests {
             }
             if rows <= 16 {
                 assert!(build_steps > runs.len(), "{build_steps} key slices");
-                assert!(steps > chunks.len() * 4, "{steps} merge steps");
+                assert!(steps > chunks.len() * 2, "{steps} merge steps");
             }
         }
     }
@@ -1465,5 +1491,28 @@ mod tests {
             }
         }
         assert_eq!(chunks, 1);
+    }
+
+    /// Scenario: 100 one-row runs, the shape of a series table, merged with
+    /// the default budget.
+    /// Guarantees: a step carries work across runs and columns until its
+    /// budget is spent, so all 100 runs' keys are encoded in one step and
+    /// the whole chunk is popped and interleaved in one more: a small table
+    /// costs its caller two returns to the runtime, not one per run and per
+    /// column.
+    #[test]
+    fn a_small_merge_takes_one_step_per_phase() {
+        let runs: Vec<RecordBatch> = (0..100)
+            .map(|i| batch_tagged(vec![Some(100 - i)], vec![0.0], vec!["t"]))
+            .collect();
+        let mut build = MergeBuild::new(runs, &spec(), 1 << 20).expect("build");
+        assert!(build.step().expect("keys"), "every key in one step");
+        let mut merge = build.finish().expect("finish");
+        let MergeStep::Chunk(chunk) = merge.step().expect("step") else {
+            panic!("the whole chunk in one step");
+        };
+        assert_eq!(chunk.num_rows(), 100);
+        assert_eq!(keys_of(&chunk)[0], Some(1));
+        assert!(matches!(merge.step().expect("step"), MergeStep::Done));
     }
 }

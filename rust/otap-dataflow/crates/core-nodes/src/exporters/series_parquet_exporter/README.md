@@ -1364,10 +1364,10 @@ or aggregate cumulative metrics and gauges in the SDK.
 - A flush runs on the worker's own core, beside the loop that admits
   requests, delivers acks and nacks, answers telemetry and watches the
   shutdown deadline. It works in bounded steps and returns to that loop
-  between every two: merge keys are encoded and merge rows popped in slices
-  of at most 8,192 rows and about 1 MiB of key bytes, the chunk is assembled
-  one column at a time, and producing, encoding and flushing a chunk each get
-  a poll of their own. The two steps that cannot be sliced without changing
+  between every two: a step encodes merge keys, pops merge rows or
+  assembles the chunk's columns until it has done about 8,192 rows of work
+  or 1 MiB of key bytes, and producing, encoding and flushing a chunk each
+  get a poll of their own. The two steps that cannot be sliced without changing
   the file are encoding one chunk, bounded by `sorting.merge_chunk_bytes`,
   and closing one row group, bounded by `parquet.row_group_bytes`. At the
   defaults, on the largest block the default budgets admit, the longest step

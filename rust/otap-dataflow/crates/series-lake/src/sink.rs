@@ -2411,11 +2411,12 @@ mod tests {
     /// to an in-memory store that is ready the instant it is asked, while a
     /// ticker task on the same current-thread runtime counts how often the
     /// runtime schedules it.
-    /// Guarantees: the write returns to the runtime between bounded slices of
-    /// its work -- merge-key slices, heap-pop slices of at most
-    /// `MERGE_STEP_ROWS` rows, one interleaved column at a time, and between
-    /// producing a chunk, encoding it and flushing its row group -- so the
-    /// ticker runs at least once per pop slice and once per output column.
+    /// Guarantees: the write returns to the runtime between bounded steps of
+    /// its work -- merge-key slices and heap-pop slices of at most
+    /// `MERGE_STEP_ROWS` rows, interleaved columns of that much work each,
+    /// and between producing a chunk, encoding it and flushing its row
+    /// group -- so with a 30,000-row chunk the ticker runs at least once per
+    /// pop slice and once per output column.
     /// A write that yields only between chunks lets it run a handful of times.
     #[tokio::test]
     async fn the_write_returns_to_the_runtime_between_bounded_slices() {
