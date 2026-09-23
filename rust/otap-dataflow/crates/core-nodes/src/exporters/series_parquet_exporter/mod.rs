@@ -42,8 +42,8 @@ use otel_arrow_dfe_engine::local::exporter::{EffectHandler, Exporter};
 use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
-use otel_arrow_dfe_otap::{OTAP_EXPORTER_FACTORIES, object_store::StorageType};
 use otel_arrow_dfe_series_lake as lake;
 use std::sync::Arc;
 use std::time::Instant;
@@ -156,7 +156,7 @@ impl Exporter<OtapPdata> for SeriesParquet {
         )?;
         #[cfg(test)]
         let store = self.store_override.take().unwrap_or(store);
-        let storage = storage_kind(&self.config.storage);
+        let storage = self.config.storage.kind().to_owned();
         run_announced(
             self.config.clone(),
             store,
@@ -170,24 +170,6 @@ impl Exporter<OtapPdata> for SeriesParquet {
             },
         )
         .await
-    }
-}
-
-/// The name of a storage backend, for the start event.
-///
-/// The cloud variants are compiled in by features of the `otap` crate, which
-/// this crate cannot name in a `cfg`, so they are named by their variant: the
-/// leading identifier of the `Debug` rendering, never the fields after it,
-/// which may hold credentials.
-fn storage_kind(storage: &StorageType) -> String {
-    match storage {
-        StorageType::File { .. } => "file".to_owned(),
-        #[allow(unreachable_patterns)]
-        other => format!("{other:?}")
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .to_ascii_lowercase(),
     }
 }
 

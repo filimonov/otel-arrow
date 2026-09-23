@@ -223,6 +223,20 @@ pub enum StorageType {
 }
 
 impl StorageType {
+    /// The backend's name, for logs: `file`, `azure` or `s3`.
+    ///
+    /// Never any of the variant's fields, which may name credentials.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            #[cfg(feature = "azure")]
+            Self::Azure { .. } => "azure",
+            #[cfg(feature = "aws")]
+            Self::S3 { .. } => "s3",
+        }
+    }
+
     /// Whether this storage backend obtains credentials from a bearer token capability.
     #[must_use]
     pub const fn requires_bearer_token_provider(&self) -> bool {
@@ -824,6 +838,39 @@ mod test {
         let base_uri = tmp.path().to_str().unwrap().to_string();
         let storage = StorageType::File { base_uri };
         assert!(from_storage_type(&storage).is_ok());
+    }
+
+    /// Scenario: each storage backend compiled in is asked for its name.
+    /// Guarantees: the name is the lowercase backend (`file`, `azure`, `s3`)
+    /// and never carries a field of the variant, so a start event can name
+    /// the backend without risking a credential in the log.
+    #[test]
+    fn each_storage_backend_names_its_kind() {
+        let file = StorageType::File {
+            base_uri: "/tmp/secret-path".to_string(),
+        };
+        assert_eq!(file.kind(), "file");
+
+        #[cfg(feature = "azure")]
+        {
+            let azure = StorageType::Azure {
+                base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            };
+            assert_eq!(azure.kind(), "azure");
+        }
+
+        #[cfg(feature = "aws")]
+        {
+            let s3 = StorageType::S3 {
+                base_uri: "s3://my-bucket/telemetry".to_string(),
+                region: None,
+                endpoint: None,
+                allow_http: None,
+                virtual_hosted_style_request: None,
+                auth: cloud_auth::aws::AuthMethod::Default,
+            };
+            assert_eq!(s3.kind(), "s3");
+        }
     }
 
     /// Scenario: Each supported storage backend is asked whether it needs a bearer token capability.
