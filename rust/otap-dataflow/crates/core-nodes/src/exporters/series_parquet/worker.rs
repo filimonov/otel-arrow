@@ -81,6 +81,28 @@ const FIXED_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 /// Shortest interval between two per-request refusal WARN lines.
 const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// One refusal WARN as a test observes it: the outcome, the signal, and the
+/// setting, observed size and limit of a size refusal.
+#[cfg(test)]
+pub(super) type LoggedRefusal = (
+    Outcome,
+    otel_arrow_dfe_config::SignalType,
+    Option<(&'static str, Option<usize>, usize)>,
+);
+
+#[cfg(test)]
+thread_local! {
+    /// The refusal WARNs written on this thread.
+    static LOGGED_REFUSALS: std::cell::RefCell<Vec<LoggedRefusal>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take the refusal WARNs written on this thread since the last call.
+#[cfg(test)]
+pub(super) fn take_logged_refusals() -> Vec<LoggedRefusal> {
+    LOGGED_REFUSALS.with(|logged| std::mem::take(&mut *logged.borrow_mut()))
+}
+
 /// Rate limit of the per-request refusal WARN.
 ///
 /// A producer that keeps sending a request this node refuses would otherwise
@@ -128,23 +150,33 @@ pub(super) enum Failure {
     Retryable(lake::Error),
 }
 
-/// Where in admission a request failed.
-///
-/// It decides which budget a size refusal names: the lake reports every size
-/// refusal as the same `RequestTooLarge`, and the phase is what tells the
-/// logical request budget, the extraction budgets and the block budget apart.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Stage {
-    /// The logical request size, measured before conversion; `None` when the
-    /// payload could not report one.
-    Request(Option<usize>),
-    /// The signal check, the framing check, conversion and extraction.
-    Extract,
-    /// Reservation against a block, and admission after it.
-    Block,
+/// What a size budget measures, and the setting that configures it.
+fn budget_names(budget: lake::SizeBudget) -> (&'static str, &'static str) {
+    match budget {
+        lake::SizeBudget::Request => ("request", "ingress.max_request_bytes"),
+        lake::SizeBudget::Extracted => ("extracted request", "ingress.max_extracted_bytes"),
+        lake::SizeBudget::Row => ("extracted row", "ingress.max_row_bytes"),
+        lake::SizeBudget::Cell => ("attribute value", "ingress.max_row_bytes"),
+        lake::SizeBudget::Table => ("decoded attribute table", "ingress.max_extracted_bytes"),
+        lake::SizeBudget::Block => (
+            "worst case in one block, every series written with the request,",
+            "window.max_block_bytes",
+        ),
+    }
 }
 
 impl Failure {
+    /// The size budget a size refusal exceeded: the setting, the observed
+    /// size when known, and the limit.
+    pub(super) fn excess(&self) -> Option<(&'static str, Option<usize>, usize)> {
+        match self {
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(
+                excess,
+            ))) => Some((budget_names(excess.budget).1, excess.observed, excess.limit)),
+            _ => None,
+        }
+    }
+
     /// Classify an error by its type: only a lake refusal is permanent.
     pub(super) fn classify(error: lake::Error) -> Self {
         match error {
@@ -171,7 +203,7 @@ impl Failure {
     /// neither is a client error.
     pub(super) fn outcome(&self) -> Outcome {
         match self {
-            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)) => {
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(_))) => {
                 Outcome::TooLarge
             }
             Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(_))) => {
@@ -194,32 +226,21 @@ impl Failure {
     /// Any text taken from the error itself is [`sanitized`], because an
     /// error can quote request content and the reason travels back to the
     /// producer.
-    pub(super) fn sentence(&self, stage: Stage, cfg: &Config) -> String {
-        let limits = &cfg.lake.ingress;
+    pub(super) fn sentence(&self) -> String {
         match self {
-            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)) => {
-                match stage {
-                    Stage::Request(Some(bytes)) => format!(
-                        "request of {bytes} bytes exceeds ingress.max_request_bytes \
-                         ({} bytes); split the batch upstream or raise the limit",
-                        limits.max_request_bytes
+            Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(
+                excess,
+            ))) => {
+                let (what, setting) = budget_names(excess.budget);
+                let limit = excess.limit;
+                match excess.observed {
+                    Some(observed) => format!(
+                        "{what} of {observed} bytes exceeds {setting} ({limit} bytes); split \
+                         the batch upstream or raise the limit"
                     ),
-                    Stage::Request(None) => format!(
-                        "request size could not be measured against \
-                         ingress.max_request_bytes ({} bytes); split the batch upstream",
-                        limits.max_request_bytes
-                    ),
-                    Stage::Extract => format!(
-                        "request exceeds ingress.max_extracted_bytes ({} bytes), or one of \
-                         its rows or attribute values exceeds ingress.max_row_bytes ({} \
-                         bytes), once extracted; split the batch upstream or raise the limits",
-                        limits.max_extracted_bytes, limits.max_row_bytes
-                    ),
-                    Stage::Block => format!(
-                        "request needs more than window.max_block_bytes ({} bytes) when every \
-                         series it carries is written with it; split the batch upstream or \
-                         raise window.max_block_bytes",
-                        cfg.window.max_block_bytes
+                    None => format!(
+                        "{what} could not be measured against {setting} ({limit} bytes); \
+                         split the batch upstream"
                     ),
                 }
             }
@@ -306,9 +327,8 @@ pub(super) struct Pending {
 pub(super) enum Prepared {
     /// The request's rows, ready to be offered to a block.
     Ready(Pending),
-    /// The request failed and its completion is still owed; the stage says
-    /// which budget a size refusal names.
-    Failed(AckToken, Failure, Stage),
+    /// The request failed and its completion is still owed.
+    Failed(AckToken, Failure),
 }
 
 /// The ACTIVE and FLUSHING pair of one exporter instance.
@@ -464,7 +484,9 @@ impl Worker {
     /// not be told to change them.
     fn reservation_failure(error: lake::Error) -> Failure {
         match error {
-            lake::Error::Refused(lake::RefuseReason::RequestTooLarge) => Failure::Permanent(error),
+            lake::Error::Refused(lake::RefuseReason::RequestTooLarge(_)) => {
+                Failure::Permanent(error)
+            }
             // A block-scoped refusal from an empty block, or anything else
             // `reserve` returns, is a broken invariant rather than a verdict
             // on the request.
@@ -495,8 +517,13 @@ impl Worker {
         if !bytes.is_some_and(|n| n <= self.cfg.lake.ingress.max_request_bytes) {
             return Prepared::Failed(
                 token,
-                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)),
-                Stage::Request(bytes),
+                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge(
+                    lake::Excess {
+                        budget: lake::SizeBudget::Request,
+                        observed: bytes,
+                        limit: self.cfg.lake.ingress.max_request_bytes,
+                    },
+                ))),
             );
         }
         // Logs and metrics share one admission path; traces have no lake
@@ -510,15 +537,14 @@ impl Worker {
                 Failure::Permanent(lake::Error::Refused(lake::RefuseReason::Unsupported(
                     "traces".into(),
                 ))),
-                Stage::Extract,
             );
         }
         if let Err(failure) = Self::check_wire_format(&payload) {
-            return Prepared::Failed(token, failure, Stage::Extract);
+            return Prepared::Failed(token, failure);
         }
         let extracted = match self.extract(payload) {
             Ok(extracted) => extracted,
-            Err(failure) => return Prepared::Failed(token, failure, Stage::Extract),
+            Err(failure) => return Prepared::Failed(token, failure),
         };
         Prepared::Ready(Pending {
             extracted,
@@ -588,9 +614,9 @@ impl Worker {
                 }
                 self.offer(pending);
             }
-            Prepared::Failed(token, failure, stage) => {
+            Prepared::Failed(token, failure) => {
                 self.token_high_water = self.token_high_water.max(token.bytes());
-                self.refuse(token, &failure, stage);
+                self.refuse(token, &failure);
             }
         }
     }
@@ -645,11 +671,7 @@ impl Worker {
             Err(error) => {
                 // The reservation refused before the block was touched, so
                 // only this request is affected.
-                self.refuse(
-                    pending.token,
-                    &Self::reservation_failure(error),
-                    Stage::Block,
-                );
+                self.refuse(pending.token, &Self::reservation_failure(error));
                 return;
             }
         };
@@ -692,7 +714,7 @@ impl Worker {
                 // A failed admission leaves the block partially updated by
                 // contract, so the whole ACTIVE block is failed rather than
                 // written.
-                self.refuse(pending.token, &Failure::Retryable(error), Stage::Block);
+                self.refuse(pending.token, &Failure::Retryable(error));
                 self.fail_active(Outcome::Storage);
             }
         }
@@ -729,21 +751,33 @@ impl Worker {
     ///
     /// The error value is dropped with the payload, so it is logged here while
     /// the detail still exists; the completion carries the outcome and the
-    /// reason sentence. The line names the signal and carries the sentence,
-    /// which states the size against the limit where the stage knows it, and
-    /// it is rate limited (see [`RefusalLog`]).
-    fn refuse(&mut self, token: AckToken, failure: &Failure, stage: Stage) {
+    /// reason sentence. The line names the signal and, for a size refusal,
+    /// the setting that refused it, the observed size and the limit; it is
+    /// rate limited (see [`RefusalLog`]).
+    fn refuse(&mut self, token: AckToken, failure: &Failure) {
         let outcome = failure.outcome();
-        let sentence = failure.sentence(stage, &self.cfg);
+        let sentence = failure.sentence();
         if let Some(suppressed) = self.refusals.admit(clock::now()) {
+            let excess = failure.excess();
+            let (setting, observed, limit) = match excess {
+                Some((setting, observed, limit)) => (setting, observed, Some(limit)),
+                None => ("", None, None),
+            };
             otel_warn!(
                 "series_parquet.request_failed",
                 outcome = outcome.reason(),
                 signal = ?token.signal(),
+                limit_setting = setting,
+                observed_bytes = ?observed,
+                limit_bytes = ?limit,
                 reason = %sentence,
                 error = %failure.error(),
                 suppressed = suppressed
             );
+            #[cfg(test)]
+            LOGGED_REFUSALS.with(|logged| {
+                logged.borrow_mut().push((outcome, token.signal(), excess));
+            });
         }
         self.notify.push_with(token, outcome, Some(sentence.into()));
     }

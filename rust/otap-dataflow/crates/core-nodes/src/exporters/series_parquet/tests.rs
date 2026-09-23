@@ -552,7 +552,7 @@ async fn the_deadline_decides_every_outstanding_request() {
 #[test]
 fn each_failure_class_maps_to_its_outcome() {
     assert_eq!(
-        Failure::Permanent(lake::Error::Refused(lake::RefuseReason::RequestTooLarge)).outcome(),
+        Failure::Permanent(lake::Error::too_large(lake::SizeBudget::Row, 2, 1)).outcome(),
         Outcome::TooLarge
     );
     assert_eq!(
@@ -590,14 +590,13 @@ fn each_failure_class_maps_to_its_outcome() {
 /// exporter bug and an operator can still see what went wrong.
 #[tokio::test(flavor = "current_thread")]
 async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
-    let cfg = worker_config();
     let failure = Failure::classify(lake::Error::internal(
         "column/builder mismatch for Str(None)\nsecond line",
     ));
     assert!(matches!(failure, Failure::Retryable(_)));
     assert_eq!(failure.outcome(), Outcome::Internal);
     assert!(!failure.outcome().refused());
-    let sentence = failure.sentence(super::worker::Stage::Extract, &cfg);
+    let sentence = failure.sentence();
     assert!(
         sentence.contains("column/builder mismatch for Str(None) second line"),
         "the detail is kept, on one line: {sentence}"
@@ -1546,6 +1545,69 @@ async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
             assert!(worker.accept(), "admission stays open across the boundary");
         })
         .await;
+}
+
+/// Scenario: one request is refused by the extraction budget and, on a second
+/// worker, one by the block budget.
+/// Guarantees: each refusal WARN names the setting that refused it, the size
+/// observed against it and the limit, and the reason sentence the producer is
+/// told states the same size and limit, at both stages, so an operator can
+/// see how far over which budget a producer is without reproducing the
+/// request.
+#[tokio::test(flavor = "current_thread")]
+async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
+    let _ = super::worker::take_logged_refusals();
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let store = Arc::new(object_store::memory::InMemory::new());
+
+    let (handler, mut rx) = effects(4);
+    let mut extract = Worker::new(
+        worker_config(),
+        store.clone(),
+        Arc::clone(&wall) as _,
+        handler,
+    );
+    extract.cfg.lake.ingress.max_extracted_bytes = 100;
+    extract.admit(logs_pdata());
+    let logged = super::worker::take_logged_refusals();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let (outcome, signal, excess) = logged[0];
+    assert_eq!(outcome, Outcome::TooLarge);
+    assert_eq!(signal, SignalType::Logs);
+    let (setting, observed, limit) = excess.expect("a size refusal");
+    assert_eq!(setting, "ingress.max_extracted_bytes");
+    assert_eq!(limit, 100);
+    let observed = observed.expect("extraction measured the request");
+    assert!(observed > 100, "{observed}");
+    extract
+        .notify
+        .next()
+        .await
+        .expect("the refusal is delivered");
+    match rx.recv().await.expect("a nack") {
+        PipelineCompletionMsg::DeliverNack { nack } => assert!(
+            nack.reason.contains(&format!(
+                "extracted request of {observed} bytes exceeds ingress.max_extracted_bytes \
+                 (100 bytes)"
+            )),
+            "reason: {}",
+            nack.reason
+        ),
+        other => panic!("expected a nack, got {other:?}"),
+    }
+
+    let (handler, _rx) = effects(4);
+    let mut cfg = worker_config();
+    cfg.window.max_block_bytes = 1;
+    cfg.lake.ingress.max_block_bytes = 1;
+    let mut block = Worker::new(cfg, store, wall, handler);
+    block.admit(logs_pdata());
+    let logged = super::worker::take_logged_refusals();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let (setting, observed, limit) = logged[0].2.expect("a size refusal");
+    assert_eq!(setting, "window.max_block_bytes");
+    assert_eq!(limit, 1);
+    assert!(observed.is_some_and(|n| n > 1), "{observed:?}");
 }
 
 /// Scenario: refusals arrive in a burst, then after a pause of the log

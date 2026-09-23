@@ -19,4 +19,4 @@ pub mod sink;
 pub mod sort;
 pub mod value;
 
-pub use error::{Error, RefuseReason, Result};
+pub use error::{Error, Excess, RefuseReason, Result, SizeBudget};

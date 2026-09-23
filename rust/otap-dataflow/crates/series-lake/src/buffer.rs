@@ -387,7 +387,11 @@ impl<T> Block<T> {
             .map(|d| d.series_row_bytes() + limits.pending_series_entry_bytes)
             .fold(fixed, usize::saturating_add);
         if worst > limits.max_block_bytes {
-            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+            return Err(Error::too_large(
+                crate::error::SizeBudget::Block,
+                worst,
+                limits.max_block_bytes,
+            ));
         }
         let mut bytes = fixed;
         let mut new_series = Vec::new();
@@ -999,7 +1003,7 @@ mod tests {
         let e = extracted(&LakeConfig::default(), "h", 4);
         assert!(matches!(
             block.reserve(&e, &mut cache, 16, &cfg),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
         assert_eq!(block.bytes, 0);
         assert_eq!(block.request_count(), 0);
@@ -1047,7 +1051,10 @@ mod tests {
                         );
                     } else {
                         assert!(
-                            matches!(outcome, Err(Error::Refused(RefuseReason::RequestTooLarge))),
+                            matches!(
+                                outcome,
+                                Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
+                            ),
                             "limit {limit}, reemit {reemit}: {outcome:?}"
                         );
                     }

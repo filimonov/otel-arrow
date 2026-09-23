@@ -742,7 +742,7 @@ mod tests {
         let records = encode_metrics(&d);
         assert!(matches!(
             extract_metrics(&records, &small, &mut budget),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 

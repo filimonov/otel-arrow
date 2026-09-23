@@ -3,11 +3,53 @@
 
 //! Error types shared by the crate.
 
+/// The size budget a too-large request exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeBudget {
+    /// The logical request size (`ingress.max_request_bytes`).
+    Request,
+    /// The extracted output of the request (`ingress.max_extracted_bytes`).
+    Extracted,
+    /// One values or series row (`ingress.max_row_bytes`).
+    Row,
+    /// One attribute key or value, or one CBOR cell (`ingress.max_row_bytes`).
+    Cell,
+    /// The decoded content of one attribute table
+    /// (`ingress.max_extracted_bytes`).
+    Table,
+    /// The request's worst case in one block (`max_block_bytes`).
+    Block,
+}
+
+/// How far a too-large request exceeded which budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Excess {
+    /// The budget that refused the request.
+    pub budget: SizeBudget,
+    /// The size measured against it, when the refusing check knew it.
+    pub observed: Option<usize>,
+    /// The configured limit.
+    pub limit: usize,
+}
+
+impl Excess {
+    /// A refusal of `observed` bytes against `limit` for `budget`.
+    #[must_use]
+    pub fn new(budget: SizeBudget, observed: usize, limit: usize) -> Self {
+        Self {
+            budget,
+            observed: Some(observed),
+            limit,
+        }
+    }
+}
+
 /// Why a request is permanently refused (spec section 8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
-    /// The request itself, its extracted output or one of its rows exceeds a budget.
-    RequestTooLarge,
+    /// The request itself, its extracted output or one of its rows exceeds a
+    /// budget; the excess says which, by how much.
+    RequestTooLarge(Excess),
     /// The active block cannot take this request; the caller rotates and retries.
     BlockFull,
     /// The active block already holds `max_requests_per_block` tokens.
@@ -77,6 +119,14 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    /// Shorthand for a size refusal of `observed` bytes against `limit`.
+    #[must_use]
+    pub fn too_large(budget: SizeBudget, observed: usize, limit: usize) -> Self {
+        Error::Refused(RefuseReason::RequestTooLarge(Excess::new(
+            budget, observed, limit,
+        )))
+    }
+
     /// Shorthand for an invalid-content refusal.
     pub fn invalid(msg: impl Into<String>) -> Self {
         Error::Refused(RefuseReason::Invalid(msg.into()))

@@ -420,7 +420,7 @@ mod tests {
         let mut records = encode_logs(&logs_data());
         assert!(matches!(
             extract(&mut records, &cfg),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 
@@ -460,7 +460,7 @@ mod tests {
         let mut records = encode_logs(&data);
         assert!(matches!(
             extract(&mut records, &cfg),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 
@@ -473,7 +473,7 @@ mod tests {
         let mut records = encode_logs(&logs_data());
         assert!(matches!(
             extract(&mut records, &cfg),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 
@@ -622,7 +622,7 @@ mod tests {
         let mut records = encode_logs(&logs_data());
         assert!(matches!(
             extract(&mut records, &tight),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 

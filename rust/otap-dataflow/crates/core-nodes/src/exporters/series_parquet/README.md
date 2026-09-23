@@ -117,7 +117,10 @@ the limit`. Any error detail it quotes is cut to 256 bytes and kept on one
 line. The short machine form of the outcome is the `reason` label of the
 `nacks` metric. Refusals are also logged at WARN as
 `series_parquet.request_failed` with the signal and the same sentence, at most
-one line per second; the next line reports how many were left out.
+one line per second; the next line reports how many were left out. A size
+refusal also carries `limit_setting`, `observed_bytes` and `limit_bytes`,
+whichever budget refused it: the request, its extracted output, one row or
+attribute value, its decoded attribute table, or its worst case in a block.
 
 A request refused for `window.max_block_bytes` is judged on its worst case,
 as if every series it carries were new to the block, whatever the descriptor

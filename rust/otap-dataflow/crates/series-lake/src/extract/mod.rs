@@ -182,7 +182,11 @@ impl Budget {
     /// running total past `max_extracted_bytes`.
     pub(crate) fn charge_row(&mut self, bytes: usize) -> Result<()> {
         if bytes > self.max_row {
-            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+            return Err(Error::too_large(
+                crate::error::SizeBudget::Row,
+                bytes,
+                self.max_row,
+            ));
         }
         self.charge(bytes)
     }
@@ -191,7 +195,11 @@ impl Budget {
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
         self.used = self.used.saturating_add(bytes);
         if self.used > self.limit {
-            return Err(Error::Refused(RefuseReason::RequestTooLarge));
+            return Err(Error::too_large(
+                crate::error::SizeBudget::Extracted,
+                self.used,
+                self.limit,
+            ));
         }
         Ok(())
     }

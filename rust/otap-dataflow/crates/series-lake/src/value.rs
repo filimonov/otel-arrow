@@ -4,7 +4,7 @@
 //! Owned attribute value tree, CBOR decoding of the OTAP `ser` column and the
 //! `render_v1` storage rendering (spec section 5.1).
 
-use crate::error::{Error, RefuseReason, Result};
+use crate::error::{Error, Result};
 
 /// Limits applied while decoding one CBOR `ser` cell (spec section 5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,11 @@ pub enum Value {
 /// a duplicate key or excessive nesting as invalid content.
 pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
     if bytes.len() > limits.max_cell_bytes {
-        return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        return Err(Error::too_large(
+            crate::error::SizeBudget::Cell,
+            bytes.len(),
+            limits.max_cell_bytes,
+        ));
     }
     // One recursion level per container, plus one so that a payload exactly at
     // `max_depth` is settled by the conversion below rather than by the parser:
@@ -214,6 +218,7 @@ pub fn value_bytes(v: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RefuseReason;
 
     /// Scenario: a CBOR map with unsorted keys and nested array is decoded.
     /// Guarantees: keys come out sorted by raw bytes and nesting is preserved.
@@ -257,7 +262,7 @@ mod tests {
         assert!(buf.len() > 4096);
         assert!(matches!(
             decode_cbor(&buf, DecodeLimits::new(32, 1024)),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
         // The same payload decodes once the cell fits the limit.
         assert!(decode_cbor(&buf, DecodeLimits::new(32, buf.len())).is_ok());

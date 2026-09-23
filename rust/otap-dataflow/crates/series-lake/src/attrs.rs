@@ -19,7 +19,7 @@ use otel_arrow_dfe_pdata::schema::consts::{
     ATTRIBUTE_STR, ATTRIBUTE_TYPE, PARENT_ID,
 };
 
-use crate::error::{Error, RefuseReason, Result};
+use crate::error::{Error, Result};
 use crate::value::{DecodeLimits, Value, decode_cbor, sort_kvlist, value_bytes};
 
 /// Attributes of one OTAP attribute batch, grouped by parent id.
@@ -116,7 +116,11 @@ pub(crate) fn int_cell(a: &ArrayRef, row: usize) -> Option<i64> {
 /// by many rows must not be copied once per row first.
 fn cell_fits(len: usize, limits: DecodeLimits) -> Result<()> {
     if len > limits.max_cell_bytes {
-        return Err(Error::Refused(RefuseReason::RequestTooLarge));
+        return Err(Error::too_large(
+            crate::error::SizeBudget::Cell,
+            len,
+            limits.max_cell_bytes,
+        ));
     }
     Ok(())
 }
@@ -273,7 +277,11 @@ impl AttrTable {
             let value = any.value_at(row, limits)?;
             total = total.saturating_add(payload_bytes(&value));
             if total > limits.max_table_bytes {
-                return Err(Error::Refused(RefuseReason::RequestTooLarge));
+                return Err(Error::too_large(
+                    crate::error::SizeBudget::Table,
+                    total,
+                    limits.max_table_bytes,
+                ));
             }
             groups.entry(parent_id).or_default().push((key, value));
         }
@@ -463,7 +471,7 @@ mod tests {
         let limits = DecodeLimits::new(32, 1 << 20).with_table_bytes(32 << 20);
         assert!(matches!(
             AttrTable::from_batch(&batch, limits),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 
@@ -480,7 +488,7 @@ mod tests {
         let limits = DecodeLimits::new(32, 1 << 20).with_table_bytes(32 << 20);
         assert!(matches!(
             AttrTable::from_batch(&batch, limits),
-            Err(Error::Refused(RefuseReason::RequestTooLarge))
+            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
     }
 
