@@ -840,18 +840,16 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The process-wide test subscriber behind [`capture`].
+/// The layer behind [`capture`], installed once over the global registry.
 ///
-/// Installed once, globally, rather than per test: a per-test scoped
-/// subscriber races the global callsite cache, because a callsite that a
-/// concurrently running test registers first is cached as uninteresting to a
-/// subscriber it did not see yet. Every callsite is registered here as
-/// `sometimes`, so `enabled` is asked per event, and it records only on a
-/// thread that holds a [`Capture`] -- which is what keeps parallel tests out
-/// of each other's records.
-pub(super) struct GlobalCapture;
+/// A per-test scoped subscriber would race the global callsite cache: a
+/// callsite another test registers first is cached as uninteresting to a
+/// subscriber that did not exist yet. So every callsite is `sometimes`,
+/// `enabled` is asked per event, and it records only on a thread that holds a
+/// [`Capture`], which keeps parallel tests out of each other's records.
+struct CaptureLayer;
 
-impl tracing::Subscriber for GlobalCapture {
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
     fn register_callsite(
         &self,
         _metadata: &'static tracing::Metadata<'static>,
@@ -859,21 +857,21 @@ impl tracing::Subscriber for GlobalCapture {
         tracing::subscriber::Interest::sometimes()
     }
 
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
         CAPTURED
             .try_with(|captured| captured.try_borrow().is_ok_and(|c| c.is_some()))
             .unwrap_or(false)
     }
 
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         struct Fields(std::collections::BTreeMap<String, FieldValue>);
         impl tracing::field::Visit for Fields {
             fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
@@ -918,10 +916,6 @@ impl tracing::Subscriber for GlobalCapture {
             }
         });
     }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 /// Records the events of the current thread for as long as it lives.
@@ -952,7 +946,8 @@ impl Drop for Capture {
 pub(super) fn capture() -> Capture {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     let _ = INSTALLED.get_or_init(|| {
-        tracing::subscriber::set_global_default(GlobalCapture)
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(CaptureLayer))
             .expect("no other global subscriber in this test binary");
     });
     // Callsites registered by other tests before the install are re-asked,
