@@ -87,3 +87,11 @@ Source: docs/superpowers/s3-compatitibility.md (in Russian). The user asked to l
 - Not exposed: `unsigned_payload` (sometimes needed behind proxies; Task 5a already measures unsigned payload on TLS), `checksum_algorithm`, S3 Express. Expose `unsigned_payload` only if Task 5a shows a gain or a user needs it.
 - Store matrix: a `workflow_dispatch` lane on real AWS S3 with secrets is the useful one; Ceph RGW, Garage and SeaweedFS in Docker are cheap additions; R2, B2 and GCS XML interop only on request. Azurite remains the plan 3 gate.
 - The note's conclusion, that "tested on S3-compatible stores" should not be claimed before the multipart and completion points are checked, is adopted for the final report wording.
+
+## Complexity review of 2026-09-24 (deferred by user decision)
+
+Source and triage: docs/superpowers/complexity-review-2026-09-24.md.
+- Worker owns its state: intent-level methods (`rotation_ready`, `rotate_and_resume`, `refuse_forced`, `cleaned`) and futures for the select, private fields, one notifier-credit calculation; `drive` down to about 60 lines. Do it with the worker state machine and the shared writer.
+- One config form: lake sections equal the user sections, `Error::Config` in lake, delete the exporter mirror structs and the duplicated validation rules (deslop B9).
+- Sink write stack: merge `PutLanded` into `PartLanded`; one gauge type with a drop guard for merge keys and flush workspace; drop the `ParquetObjectWriter` layer if the shared writer keeps this stack.
+- `Outcome` with `derive(AttributeEnum)` and `Outcome::ALL` instead of the hand table.
