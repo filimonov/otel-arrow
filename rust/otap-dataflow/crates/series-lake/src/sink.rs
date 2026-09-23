@@ -609,7 +609,8 @@ impl Sink {
         let mut cleanup: Option<Instant> = None;
         let mut merged = merge_runs(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
         // Held until this function returns, which is when `merged` and the
-        // keys it encoded are dropped.
+        // keys it encoded are dropped. The value is a bound for the merge's
+        // whole life, so taking it once never under-charges a later chunk.
         let _keys = self.merge_keys.hold(merged.resident_key_bytes());
         loop {
             // Yield before every chunk. `AsyncArrowWriter::write` usually

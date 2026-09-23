@@ -241,6 +241,9 @@ pub struct MergeIter {
     /// Sorted mode: encoded keys per run, plus the merge heap.
     keys: Vec<Rows>,
     heap: BinaryHeap<HeapItem>,
+    /// The longest encoded key of any row of any run: the most one heap
+    /// entry's owned key row can ever hold.
+    longest_key: usize,
     rows_per_chunk: usize,
     /// Unsorted mode: index of the next run to hand out unchanged.
     next_run: usize,
@@ -248,23 +251,35 @@ pub struct MergeIter {
 }
 
 impl MergeIter {
-    /// Heap bytes the merge holds beside its input runs.
+    /// Heap bytes the merge holds beside its input runs, as a bound that
+    /// holds for the iterator's whole life.
     ///
     /// Every run's encoded sort keys, allocated when the merge is built and
     /// released only when the iterator is dropped, plus the merge heap and
-    /// the key row each heap entry owns. The runs themselves are not
-    /// counted: the block they came from already accounts for them. Zero in
-    /// unsorted mode, which encodes no keys.
+    /// the key row each heap entry owns. The owned rows change as the merge
+    /// advances and variable-width keys differ in length, so each of the at
+    /// most one entry per run is charged the longest key of any row: the
+    /// value never falls below what is resident at any point of the merge,
+    /// however far it has advanced. The runs themselves are not counted:
+    /// the block they came from already accounts for them. Zero in unsorted
+    /// mode, which encodes no keys.
     #[must_use]
     pub fn resident_key_bytes(&self) -> usize {
         let keys = self.keys.iter().map(Rows::size).sum::<usize>();
-        let heap = self.heap.capacity() * size_of::<HeapItem>()
+        let entries = self.heap.capacity().max(self.keys.len());
+        keys + entries * size_of::<HeapItem>() + self.keys.len() * self.longest_key
+    }
+
+    /// What the owned key rows and the merge heap hold right now (tests).
+    #[cfg(test)]
+    fn resident_key_bytes_now(&self) -> usize {
+        self.keys.iter().map(Rows::size).sum::<usize>()
+            + self.heap.capacity() * size_of::<HeapItem>()
             + self
                 .heap
                 .iter()
                 .map(|item| item.row.as_ref().as_ref().len())
-                .sum::<usize>();
-        keys + heap
+                .sum::<usize>()
     }
 
     fn interleave(&self, pending: &[(usize, usize)]) -> Result<RecordBatch> {
@@ -327,6 +342,7 @@ pub fn merge_runs(
             schema: Arc::new(Schema::empty()),
             keys: Vec::new(),
             heap: BinaryHeap::new(),
+            longest_key: 0,
             rows_per_chunk: 1,
             next_run: 0,
             sorted: false,
@@ -347,6 +363,7 @@ pub fn merge_runs(
             schema,
             keys: Vec::new(),
             heap: BinaryHeap::new(),
+            longest_key: 0,
             rows_per_chunk: 1,
             next_run: 0,
             sorted: false,
@@ -366,11 +383,13 @@ pub fn merge_runs(
         });
     }
     let rows_per_chunk = (chunk_bytes / avg_row_bytes(&runs)).max(1);
+    let longest_key = keys.iter().flat_map(Rows::lengths).max().unwrap_or(0);
     Ok(MergeIter {
         runs,
         schema,
         keys,
         heap,
+        longest_key,
         rows_per_chunk,
         next_run: 0,
         sorted: true,
@@ -879,6 +898,48 @@ mod tests {
         assert_eq!(rows, 5);
         let unsorted = merge_runs(vec![r1, r2], &SortSpec::new(vec![]), 1).expect("merge");
         assert_eq!(unsorted.resident_key_bytes(), 0);
+    }
+
+    /// Scenario: two runs keyed by a string whose values grow from one byte
+    /// to several hundred bytes as the merge advances, consumed one row at a
+    /// time.
+    /// Guarantees: the reported resident key bytes, taken once when the merge
+    /// is built, are never below what the merge actually holds at any later
+    /// point, although every owned heap row is replaced by a longer one.
+    #[test]
+    fn resident_key_bytes_bound_keys_that_grow_during_the_merge() {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
+        let run = |width_step: usize, tag: char| {
+            let values: Vec<String> = (0..20)
+                .map(|i| format!("{:03}{}", i, tag.to_string().repeat(1 + i * width_step)))
+                .collect();
+            let array: ArrayRef = Arc::new(StringArray::from(values));
+            RecordBatch::try_new(schema.clone(), vec![array]).expect("batch")
+        };
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        let mut merge = merge_runs(vec![run(20, 'a'), run(30, 'b')], &spec, 1).expect("merge");
+        let reported = merge.resident_key_bytes();
+        let first = merge.resident_key_bytes_now();
+        let mut largest = first;
+        while let Some(chunk) = merge.next() {
+            let _ = chunk.expect("chunk");
+            let now = merge.resident_key_bytes_now();
+            largest = largest.max(now);
+            assert!(
+                now <= reported,
+                "{now} resident bytes above the reported {reported}"
+            );
+            assert_eq!(
+                merge.resident_key_bytes(),
+                reported,
+                "the bound does not move"
+            );
+        }
+        assert!(largest > first, "the owned key rows grew during the merge");
     }
 
     /// Scenario: an empty spec (sorting disabled).
