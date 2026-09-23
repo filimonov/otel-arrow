@@ -13,8 +13,9 @@
 #
 # The static credentials are read from the environment
 # (SERIES_S3_ACCESS_KEY_ID, SERIES_S3_SECRET_ACCESS_KEY), which must name the
-# credentials of a local MinIO or RustFS container on the loopback endpoint;
-# startup fails when either is unset. Production deployments use the shared
+# credentials of a local MinIO or RustFS container on the loopback endpoint.
+# An unset variable leaves that credential empty, which the store refuses at
+# the first write; the file itself never carries a credential. Production deployments use the shared
 # AWS auth provider configuration instead of static credentials.
 #
 # Admission is sized for 100k records/s on the one core, sent as requests of
@@ -74,8 +75,8 @@ groups:
                   virtual_hosted_style_request: false
                   auth:
                     type: static_credentials
-                    access_key_id: ${env:SERIES_S3_ACCESS_KEY_ID}
-                    secret_access_key: ${env:SERIES_S3_SECRET_ACCESS_KEY}
+                    access_key_id: "${env:SERIES_S3_ACCESS_KEY_ID:-}"
+                    secret_access_key: "${env:SERIES_S3_SECRET_ACCESS_KEY:-}"
               retry:
                 max_retries: 5
                 init_backoff: 200ms
