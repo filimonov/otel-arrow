@@ -1,0 +1,821 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The write loop of one table: bounded steps, cancellation and the
+//! multipart abort, with the accounting of what the write holds.
+
+use super::properties::{native_sorting_columns, time_range};
+use super::{FlushReport, Sink};
+
+use crate::buffer::{Block, SortedTableBuffer};
+use crate::error::{Error, Result, TransientError};
+use crate::schema::dataset_schema;
+use crate::sort::{MergeBuild, MergeIter, MergeStep};
+use arrow::record_batch::RecordBatch;
+use futures::future::BoxFuture;
+use object_store::ObjectStore;
+use object_store::buffered::BufWriter;
+use object_store::path::Path;
+use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
+use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+/// The encoded sort keys the table being written keeps resident.
+///
+/// A sorted table's merge encodes the key of every row of every run up
+/// front and holds them until the merge iterator is dropped, beside the
+/// block the rows come from. That is heap the block's own accounting does
+/// not include, so the sink publishes it for its owner to charge.
+#[derive(Debug, Default)]
+pub(super) struct MergeKeys {
+    pub(super) current: AtomicUsize,
+    pub(super) high_water: AtomicUsize,
+}
+
+impl MergeKeys {
+    /// Record `bytes` as resident until the returned guard is dropped.
+    pub(super) fn hold(&self, bytes: usize) -> MergeKeysHeld<'_> {
+        self.current.store(bytes, AtomicOrdering::Relaxed);
+        let _ = self.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+        MergeKeysHeld(self)
+    }
+}
+
+/// Clears the resident merge keys when a table write ends, however it ends.
+pub(super) struct MergeKeysHeld<'a>(&'a MergeKeys);
+
+impl MergeKeysHeld<'_> {
+    /// Record `bytes` as what the table's merge now holds.
+    pub(super) fn set(&self, bytes: usize) {
+        self.0.current.store(bytes, AtomicOrdering::Relaxed);
+        let _ = self.0.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+    }
+}
+
+impl Drop for MergeKeysHeld<'_> {
+    fn drop(&mut self) {
+        self.0.current.store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+/// The live flush workspace of the table being written.
+///
+/// The merge and encoder terms are published by the write loop at every
+/// step; the upload term is read from the table's ledger when asked, so a
+/// part that lands between two steps is released at once.
+#[derive(Debug, Default)]
+pub(super) struct FlushWorkspace {
+    pub(super) merge: AtomicUsize,
+    pub(super) encoder: AtomicUsize,
+    pub(super) upload: std::sync::Mutex<Option<Arc<UploadLedger>>>,
+    pub(super) high_water: AtomicUsize,
+}
+
+impl FlushWorkspace {
+    /// Start accounting one table write, whose upload is `ledger`.
+    pub(super) fn begin(&self, ledger: Arc<UploadLedger>) -> FlushWorkspaceHeld<'_> {
+        *self
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ledger);
+        FlushWorkspaceHeld(self)
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        let upload = self
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |ledger| ledger.live());
+        let bytes = self.merge.load(AtomicOrdering::Relaxed)
+            + self.encoder.load(AtomicOrdering::Relaxed)
+            + upload;
+        let _ = self.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
+        bytes
+    }
+}
+
+/// Clears the flush workspace when a table write ends, however it ends.
+pub(super) struct FlushWorkspaceHeld<'a>(&'a FlushWorkspace);
+
+impl FlushWorkspaceHeld<'_> {
+    /// Publish what the merge and the encoder hold at this step.
+    pub(super) fn set(&self, merge: usize, encoder: usize) {
+        self.0.merge.store(merge, AtomicOrdering::Relaxed);
+        self.0.encoder.store(encoder, AtomicOrdering::Relaxed);
+        let _ = self.0.bytes();
+    }
+}
+
+impl Drop for FlushWorkspaceHeld<'_> {
+    fn drop(&mut self) {
+        self.0.merge.store(0, AtomicOrdering::Relaxed);
+        self.0.encoder.store(0, AtomicOrdering::Relaxed);
+        *self
+            .0
+            .upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// The upload bytes one table write holds: what the encoder handed the
+/// buffered upload that the store has not acknowledged yet.
+///
+/// The encoder hands over one buffer per row group; the buffered upload cuts
+/// parts out of that byte stream as slices, without copying, so a buffer
+/// stays allocated until every part cut from it has landed. The ledger keeps
+/// the stream range of every buffer and of every part, and releases a
+/// buffer as soon as all of its bytes have landed, in whatever order the
+/// parts land: a stalled early part keeps only the buffers it overlaps
+/// charged, never the ones later parts have finished.
+#[derive(Debug, Default)]
+pub(super) struct UploadLedger {
+    pub(super) state: std::sync::Mutex<LedgerState>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct LedgerState {
+    /// Handed buffers not yet released, by stream start offset: stream end
+    /// offset, length, and the bytes of it that have not landed.
+    pub(super) buffers: std::collections::BTreeMap<u64, (u64, usize, usize)>,
+    /// Bytes handed so far: the stream offset of the next buffer.
+    pub(super) handed: u64,
+    /// Stream offset of the next part.
+    pub(super) next_part: u64,
+    /// Sum of the lengths of the buffers not yet released.
+    pub(super) live: usize,
+}
+
+/// The stream range `[start, end)` of one multipart part.
+pub(super) type PartSpan = (u64, u64);
+
+impl LedgerState {
+    /// The bytes `[start, end)` of the stream landed: take them off every
+    /// buffer they overlap and release each buffer none of whose bytes is
+    /// still outstanding.
+    pub(super) fn land(&mut self, start: u64, end: u64) {
+        let overlapping: Vec<u64> = self
+            .buffers
+            .range(..end)
+            .rev()
+            .take_while(|(_, (buffer_end, _, _))| *buffer_end > start)
+            .map(|(buffer_start, _)| *buffer_start)
+            .collect();
+        for buffer_start in overlapping {
+            let Some(entry) = self.buffers.get_mut(&buffer_start) else {
+                continue;
+            };
+            let overlap = entry.0.min(end) - buffer_start.max(start);
+            entry.2 = entry.2.saturating_sub(overlap as usize);
+            if entry.2 == 0 {
+                let len = entry.1;
+                let _ = self.buffers.remove(&buffer_start);
+                self.live -= len;
+            }
+        }
+    }
+}
+
+impl UploadLedger {
+    pub(super) fn state(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The encoder handed the upload a buffer of `len` bytes.
+    pub(super) fn handed(&self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut state = self.state();
+        let start = state.handed;
+        state.handed += len as u64;
+        let end = state.handed;
+        let _ = state.buffers.insert(start, (end, len, len));
+        state.live += len;
+    }
+
+    /// A multipart part of `len` bytes was started; returns its stream
+    /// range, which [`UploadLedger::part_landed`] takes.
+    pub(super) fn part_started(&self, len: usize) -> PartSpan {
+        let mut state = self.state();
+        let start = state.next_part;
+        state.next_part += len as u64;
+        (start, state.next_part)
+    }
+
+    /// The part `span` landed, or was dropped with its payload.
+    pub(super) fn part_landed(&self, span: PartSpan) {
+        self.state().land(span.0, span.1);
+    }
+
+    /// A single-request put of everything handed so far landed, or was
+    /// dropped with its payload.
+    pub(super) fn put_landed(&self) {
+        let mut state = self.state();
+        let handed = state.handed;
+        state.land(0, handed);
+    }
+
+    /// Bytes the upload holds right now.
+    pub(super) fn live(&self) -> usize {
+        self.state().live
+    }
+}
+
+/// Marks a part landed when its upload future completes or is dropped.
+pub(super) struct PartLanded {
+    pub(super) ledger: Arc<UploadLedger>,
+    pub(super) span: PartSpan,
+}
+
+impl Drop for PartLanded {
+    fn drop(&mut self) {
+        self.ledger.part_landed(self.span);
+    }
+}
+
+/// Marks a single-request put landed when it completes or is dropped.
+pub(super) struct PutLanded(Arc<UploadLedger>);
+
+impl Drop for PutLanded {
+    fn drop(&mut self) {
+        self.0.put_landed();
+    }
+}
+
+/// A multipart upload whose parts are entered in the table's ledger.
+#[derive(Debug)]
+pub(super) struct LedgeredUpload {
+    pub(super) inner: Box<dyn object_store::MultipartUpload>,
+    pub(super) ledger: Arc<UploadLedger>,
+}
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for LedgeredUpload {
+    fn put_part(&mut self, data: object_store::PutPayload) -> object_store::UploadPart {
+        let landed = PartLanded {
+            span: self.ledger.part_started(data.content_length()),
+            ledger: Arc::clone(&self.ledger),
+        };
+        let part = self.inner.put_part(data);
+        Box::pin(async move {
+            let _landed = landed;
+            part.await
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
+}
+
+/// The encoder's side of one table's upload: every buffer it hands over is
+/// entered in the table's ledger.
+pub(super) struct LedgeredWriter {
+    pub(super) inner: ParquetObjectWriter,
+    pub(super) ledger: Arc<UploadLedger>,
+}
+
+impl LedgeredWriter {
+    /// The buffered upload, for an abort.
+    pub(super) fn into_buf_writer(self) -> BufWriter {
+        self.inner.into_inner()
+    }
+}
+
+impl AsyncFileWriter for LedgeredWriter {
+    fn write(&mut self, bs: bytes::Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        self.ledger.handed(bs.len());
+        self.inner.write(bs)
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        self.inner.complete()
+    }
+}
+
+/// Heap the merge's work on `chunk` holds beside the block: what producing
+/// it pins, plus the chunk itself when the merge allocated it.
+///
+/// With sorting disabled a chunk is one of the block's own runs, whose
+/// buffers the block already accounts for, so it adds nothing.
+pub(super) fn chunk_charge(merge: &MergeIter, chunk: &RecordBatch) -> usize {
+    merge.chunk_workspace_bytes()
+        + if merge.allocates_chunks() {
+            record_batch_pinned_bytes(chunk, &mut CountedAllocations::default())
+        } else {
+            0
+        }
+}
+
+/// The store one table is written through: the sink's own store, counting
+/// the multipart uploads it is creating.
+///
+/// `BufWriter::abort` can only abort an upload whose creation has finished;
+/// while it is still being created there is nothing to abort, and dropping the
+/// creation leaves an upload at the store that no abort is ever sent for. The
+/// count is what lets a cancelled write wait for exactly that creation, and
+/// for nothing else it may be blocked on.
+#[derive(Debug)]
+pub(super) struct CreationWatch {
+    pub(super) inner: Arc<dyn ObjectStore>,
+    pub(super) creating: AtomicUsize,
+    pub(super) settled: tokio::sync::Notify,
+    /// Where the table's upload bytes are entered.
+    pub(super) ledger: Arc<UploadLedger>,
+}
+
+/// Counts one multipart creation for as long as it is in flight.
+pub(super) struct Creating<'a>(&'a CreationWatch);
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .creating
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.settled.notify_waiters();
+    }
+}
+
+impl CreationWatch {
+    pub(super) fn new(inner: Arc<dyn ObjectStore>, ledger: Arc<UploadLedger>) -> Self {
+        Self {
+            inner,
+            creating: AtomicUsize::new(0),
+            settled: tokio::sync::Notify::new(),
+            ledger,
+        }
+    }
+
+    /// Whether a multipart upload is being created right now.
+    pub(super) fn creating(&self) -> bool {
+        self.creating.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// Resolves once no multipart upload is being created.
+    pub(super) async fn settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a creation that ends between
+            // the check and the wait still wakes it.
+            let _ = notified.as_mut().enable();
+            if !self.creating() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl std::fmt::Display for CreationWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for CreationWatch {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        let _landed = PutLanded(Arc::clone(&self.ledger));
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        let _ = self
+            .creating
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _creating = Creating(self);
+        let inner = self.inner.put_multipart_opts(location, options).await?;
+        Ok(Box::new(LedgeredUpload {
+            inner,
+            ledger: Arc::clone(&self.ledger),
+        }))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// `base + delta`, saturated at a year out rather than panicking on overflow.
+pub(super) fn deadline_after(base: Instant, delta: Duration) -> Instant {
+    base.checked_add(delta)
+        .or_else(|| base.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+        .unwrap_or(base)
+}
+
+impl Sink {
+    /// Best-effort abort of a still-writable upload, by `deadline`.
+    ///
+    /// Bounded, on the sink's clock, so a wedged store cannot block the flush
+    /// task. Returns why the abort did not succeed, or `None` when it did.
+    pub(super) async fn abort_upload(
+        &self,
+        writer: AsyncArrowWriter<LedgeredWriter>,
+        deadline: Instant,
+    ) -> Option<String> {
+        let mut buf: BufWriter = writer.into_inner().into_buf_writer();
+        tokio::select! {
+            biased;
+            aborted = buf.abort() => aborted.err().map(|e| e.to_string()),
+            () = (self.clock.sleep_until)(deadline) => Some(format!(
+                "abort timed out after {:?}",
+                self.cfg.upload.abort_timeout
+            )),
+        }
+    }
+
+    /// Run one writable-phase writer step, racing `cancel`.
+    ///
+    /// A step that is creating the multipart upload when the token fires is
+    /// not dropped at once: `BufWriter::abort` has nothing to abort until that
+    /// creation has finished, so dropping it would leave an upload at the
+    /// store with no abort ever sent for it. The step keeps being driven until
+    /// the creation has finished or the cleanup deadline -- taken once, at the
+    /// first cancellation, and shared with the abort that follows -- passes. A
+    /// step blocked on anything else, such as a part that does not land, is
+    /// dropped at once so the abort starts with the whole allowance. The step
+    /// reports `Cancelled` either way.
+    pub(super) async fn step(
+        &self,
+        op: impl Future<Output = parquet::errors::Result<()>>,
+        watch: &CreationWatch,
+        cancel: &CancellationToken,
+        cleanup: &mut Option<Instant>,
+    ) -> Result<()> {
+        tokio::pin!(op);
+        // The token is polled first: once it has fired, the step is not
+        // driven again, so a writer step that would have made more progress
+        // on this poll does not run before the cancellation is acted on.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            result = &mut op => return result.map_err(Error::from),
+        }
+        let deadline = *cleanup.get_or_insert_with(|| self.cleanup_deadline());
+        if !watch.creating() {
+            return Err(Error::cancelled(None));
+        }
+        tokio::select! {
+            biased;
+            _ = &mut op => Err(Error::cancelled(None)),
+            () = watch.settled() => Err(Error::cancelled(None)),
+            () = (self.clock.sleep_until)(deadline) => Err(Error::cancelled(Some(format!(
+                "the write in flight did not finish within {:?}, so a multipart upload \
+                 it was creating may be left to the bucket lifecycle rule",
+                self.cfg.upload.abort_timeout
+            )))),
+        }
+    }
+
+    /// The cancellation a table write has just observed at one of its step
+    /// boundaries.
+    ///
+    /// The cleanup deadline is taken here, where the token is seen, rather
+    /// than after the write has released its merge, so dropping a large
+    /// merge is spent out of the abort's allowance instead of postponing
+    /// the start of it.
+    pub(super) fn cancelled_here(&self, cleanup: &mut Option<Instant>) -> Error {
+        let _ = cleanup.get_or_insert_with(|| self.cleanup_deadline());
+        Error::cancelled(None)
+    }
+
+    /// The instant the cleanup of a failed or cancelled write must end by.
+    pub(super) fn cleanup_deadline(&self) -> Instant {
+        deadline_after((self.clock.now)(), self.cfg.upload.abort_timeout)
+    }
+
+    /// Attach the outcome of the cleanup abort to the failure that triggered it.
+    ///
+    /// A cancellation that already carries a cleanup failure keeps it: the
+    /// abort that follows cannot see what the unsettled write left behind.
+    pub(super) fn with_abort(cause: Error, abort_error: Option<String>) -> Error {
+        match (cause, abort_error) {
+            (
+                Error::Transient(TransientError::Cancelled {
+                    abort_error: earlier,
+                }),
+                abort_error,
+            ) => Error::cancelled(earlier.or(abort_error)),
+            (cause, None) => cause,
+            (cause, Some(abort_error)) => Error::Transient(TransientError::AbortFailed {
+                source: Box::new(cause),
+                abort_error,
+            }),
+        }
+    }
+
+    pub(super) async fn write_table(
+        &self,
+        table: &SortedTableBuffer,
+        path: &Path,
+        seq: u64,
+        window_start_secs: i64,
+        cancel: &CancellationToken,
+    ) -> Result<usize> {
+        let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
+        let total_rows: usize = runs.iter().map(RecordBatch::num_rows).sum();
+        // A series table has no `time_unix_nano` column, so the scan would be
+        // pure overhead and the metadata keys it feeds are values-only anyway.
+        let range = if table.dataset().is_series() {
+            (None, None)
+        } else {
+            time_range(&runs)
+        };
+        let schema = dataset_schema(table.dataset(), &self.cfg);
+        let sorting = native_sorting_columns(table.spec(), &schema)?;
+        // Spec 5.4 asks for ZSTD, statistics and dictionary encoding explicitly
+        // rather than by relying on arrow-rs defaults. An unlimited row count
+        // disables the row-count-based split so that the byte-driven flush below
+        // owns row group boundaries.
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(true)
+            .set_max_row_group_row_count(None)
+            .set_sorting_columns(sorting)
+            .set_key_value_metadata(Some(self.file_metadata(
+                table,
+                total_rows,
+                range,
+                seq,
+                window_start_secs,
+            )))
+            .build();
+        let ledger = Arc::new(UploadLedger::default());
+        let watch = Arc::new(CreationWatch::new(self.store.clone(), Arc::clone(&ledger)));
+        let buf = BufWriter::with_capacity(
+            Arc::clone(&watch) as Arc<dyn ObjectStore>,
+            path.clone(),
+            self.cfg.upload.part_bytes,
+        )
+        .with_max_concurrency(self.cfg.upload.concurrency);
+        let object_writer = LedgeredWriter {
+            inner: ParquetObjectWriter::from_buf_writer(buf),
+            ledger: Arc::clone(&ledger),
+        };
+        let mut writer = AsyncArrowWriter::try_new(object_writer, schema, Some(props))?;
+        // Held until this function returns: the merge chunk, the encoder and
+        // the upload are the table's own, and none outlives its write.
+        let workspace = self.workspace.begin(ledger);
+
+        // Phase 1: the writer is writable. Every await races the token, and every
+        // failure aborts the multipart upload.
+        let mut rows = 0usize;
+        let mut failure: Option<Error> = None;
+        let mut cleanup: Option<Instant> = None;
+        // The whole write is a sequence of bounded steps with a return to the
+        // runtime and a cancellation check between every two of them. The
+        // table's task shares its thread with the node loop that admits
+        // requests, delivers acks and nacks, answers telemetry and watches the
+        // shutdown deadline, so a step is the longest that loop can be kept
+        // waiting. Nothing about the steps reaches the file: the chunks, their
+        // order and the writer calls are the same as an unsliced write makes.
+        //
+        // `AsyncArrowWriter::write` usually completes synchronously, and so
+        // does a buffered upload whose store is ready, which is why every
+        // step yields explicitly rather than relying on the store to suspend.
+        let mut build = MergeBuild::new(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        // Held until this function returns, which is when the keys are
+        // dropped. Raised as the keys are encoded, then set once to the
+        // merge's bound for its whole life, so no later chunk is
+        // under-charged.
+        let keys = self.merge_keys.hold(0);
+        // Step 1: encode the merge keys, one bounded slice at a time.
+        loop {
+            match build.step() {
+                Ok(true) => break,
+                Ok(false) => keys.set(build.resident_key_bytes()),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(self.cancelled_here(&mut cleanup));
+                break;
+            }
+        }
+        let mut merged = match failure {
+            Some(_) => None,
+            None => match build.finish() {
+                Ok(merged) => Some(merged),
+                Err(e) => {
+                    failure = Some(e);
+                    None
+                }
+            },
+        };
+        if let Some(merged) = &merged {
+            keys.set(merged.resident_key_bytes());
+        }
+        // Step 2: produce, encode and flush the chunks, one bounded step at a
+        // time.
+        while let Some(merge) = merged.as_mut() {
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(self.cancelled_here(&mut cleanup));
+                break;
+            }
+            let chunk = match merge.step() {
+                MergeStep::Done => break,
+                MergeStep::Progress => {
+                    workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+                    continue;
+                }
+                MergeStep::Chunk(c) => c,
+                MergeStep::Ready => {
+                    // Build the chunk's columns in bounded steps of their
+                    // own, returning to the runtime between every two.
+                    let built = {
+                        let mut builder = merge.chunk_builder();
+                        loop {
+                            match builder.step() {
+                                Ok(true) => break builder.finish(),
+                                Ok(false) => {}
+                                Err(e) => break Err(e),
+                            }
+                            workspace.set(
+                                merge.chunk_workspace_bytes() + builder.workspace_bytes(),
+                                writer.memory_size(),
+                            );
+                            tokio::task::yield_now().await;
+                            if cancel.is_cancelled() {
+                                break Err(self.cancelled_here(&mut cleanup));
+                            }
+                        }
+                    };
+                    match built {
+                        Ok(chunk) => {
+                            merge.chunk_taken();
+                            chunk
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
+            };
+            workspace.set(chunk_charge(merge, &chunk), writer.memory_size());
+            // Encoding one chunk is a stretch of its own, bounded by
+            // `merge_chunk_bytes`; it does not follow the step that produced
+            // the chunk without a return to the runtime in between.
+            tokio::task::yield_now().await;
+            if cancel.is_cancelled() {
+                failure = Some(self.cancelled_here(&mut cleanup));
+                break;
+            }
+            let step = self
+                .step(writer.write(&chunk), &watch, cancel, &mut cleanup)
+                .await;
+            if let Err(e) = step {
+                failure = Some(e);
+                break;
+            }
+            rows += chunk.num_rows();
+            drop(chunk);
+            workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+            if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
+                || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
+            {
+                // Closing a row group is the other stretch, bounded by
+                // `row_group_bytes`, and it too runs in a poll of its own.
+                tokio::task::yield_now().await;
+                if cancel.is_cancelled() {
+                    failure = Some(self.cancelled_here(&mut cleanup));
+                    break;
+                }
+                let step = self
+                    .step(writer.flush(), &watch, cancel, &mut cleanup)
+                    .await;
+                if let Err(e) = step {
+                    failure = Some(e);
+                    break;
+                }
+                workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+            }
+        }
+        drop(merged);
+        workspace.set(0, writer.memory_size());
+        if let Some(cause) = failure {
+            let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
+            let abort_error = self.abort_upload(writer, deadline).await;
+            return Err(Self::with_abort(cause, abort_error));
+        }
+        if cancel.is_cancelled() {
+            let abort_error = self.abort_upload(writer, self.cleanup_deadline()).await;
+            return Err(Error::cancelled(abort_error));
+        }
+
+        // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
+        // down; `BufWriter::abort` panics once shutdown has started, so nothing is
+        // aborted from here on. A partial multipart upload left by a cancellation
+        // in this phase is reclaimed by the bucket's multipart lifecycle rule
+        // (spec 5.3), not by this crate.
+        let finish = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(Error::cancelled(None)),
+            r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
+        };
+        finish?;
+        Ok(rows)
+    }
+
+    /// Write every non-empty table of a sealed block, series datasets first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransientError::Cancelled`] when `cancel` fires, and the underlying
+    /// Arrow, Parquet or object store failure otherwise.
+    pub async fn write_block(
+        &self,
+        block: &Block,
+        cancel: &CancellationToken,
+    ) -> Result<FlushReport> {
+        // Series rows exist from admission onwards, but they carry a
+        // placeholder `emitted_at` of zero until the block's stamp transaction
+        // commits. Writing an unsealed block would therefore publish unstamped
+        // data. This is a runtime check, not a debug assertion: the files would
+        // be just as wrong in a release build.
+        if !block.is_sealed() {
+            return Err(Error::internal("unsealed block"));
+        }
+        if cancel.is_cancelled() {
+            return Err(Error::cancelled(None));
+        }
+        let mut report = FlushReport::default();
+        for (table, path) in block
+            .tables()
+            .filter(|table| !table.is_empty())
+            .zip(self.planned_paths(block))
+        {
+            let rows = self
+                .write_table(table, &path, block.seq, block.window_start_secs, cancel)
+                .await?;
+            report.files.push((table.dataset(), path, rows));
+        }
+        Ok(report)
+    }
+}
