@@ -1369,16 +1369,18 @@ or aggregate cumulative metrics and gauges in the SDK.
   requests, delivers acks and nacks, answers telemetry and watches the
   shutdown deadline. It works in bounded steps and returns to that loop
   between every two. A step encodes merge keys, pops merge rows or copies
-  rows into the chunk's columns until it has done about 8,192 rows of work
-  or 1 MiB of key bytes. The columns are sized up front and filled in
-  place, so finishing one copies nothing more. Producing, encoding and
-  flushing a chunk each get a poll of their own. The two steps that cannot
-  be sliced without changing the file are encoding one chunk, bounded by
+  the chunk's values until it has done about 8,192 elements of work, where
+  a row counts one and each list item or map entry one more, or 1 MiB of
+  key bytes. Every column buffer, list and map children included, is sized
+  up front and filled in place, so nothing is reallocated inside a step and
+  finishing a column copies nothing more. Producing, encoding and flushing
+  a chunk each get a poll of their own. The two steps that cannot be sliced
+  without changing the file are encoding one chunk, bounded by
   `sorting.merge_chunk_bytes`, and closing one row group, bounded by
   `parquet.row_group_bytes`. At the defaults, on the largest block the
-  default budgets admit, the longest step measured 19 to 24 ms (28 ms once,
-  on a cold first write), and the flush acted on a cancellation within 13
-  to 21 ms of it. Moving the flush off the core is future work.
+  default budgets admit, the longest step measured 18 to 25 ms, and the
+  flush acted on a cancellation within 12 to 22 ms of it. Moving the flush
+  off the core is future work.
 
 ## Related Docs
 

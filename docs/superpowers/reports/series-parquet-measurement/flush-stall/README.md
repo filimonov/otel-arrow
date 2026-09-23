@@ -21,7 +21,9 @@ fixtures, each with 3 uncancelled and 20 cancelled writes, under
   after review fix round 1.
 - `files-head-8d5be48eb.sha256`: the same for the library at 8d5be48eb,
   after review fix round 2 (columns built in place).
-- All four manifests are identical. They show that the output is the same
+- `files-head-8f5dddc4a.sha256`: the same for the library at 8f5dddc4a,
+  after review fix round 3 (element budget, every buffer presized).
+- All five manifests are identical. They show that the output is the same
   before and after the change, on these four inputs. The unit test
   `sliced_merge_matches_the_unsliced_merge_and_a_stable_sort` shows
   something else: that the current merge's output does not depend on its
@@ -42,3 +44,7 @@ Review fix round 2 re-ran the changed build only; the before side stays
 round 1's. `*-round2-head.json` is the library and probe at 8d5be48eb,
 with 7 uncancelled and 20 cancelled writes per fixture.
 `probe-binaries-round2.sha256` is its executable.
+
+Review fix round 3 re-ran the changed build only. `*-round3-head.json` is
+the library and probe at 8f5dddc4a, with 7 uncancelled and 20 cancelled
+writes per fixture. `probe-binaries-round3.sha256` is its executable.
