@@ -15,6 +15,7 @@ use otel_arrow_dfe_engine::control::NackCause;
 use otel_arrow_dfe_series_lake as lake;
 use otel_arrow_dfe_telemetry::attributes::AttributeEnum;
 use otel_arrow_dfe_telemetry_macros::AttributeEnum;
+use std::fmt::{self, Display, Formatter};
 
 /// How a request was decided, in the form the sender is told about it.
 ///
@@ -209,69 +210,141 @@ impl Outcome {
     /// was refused or failed, against which limit, and what to do about it.
     ///
     /// Chosen by the error's outcome, so the sentence always agrees with the
-    /// nack it travels on. Any text taken from the error itself is
-    /// [`sanitized`], because an error can quote request content and the
-    /// reason travels back to the producer.
+    /// nack it travels on; each sentence is one of the small [`Display`]
+    /// structs below. Any text taken from the error itself is [`sanitized`],
+    /// because an error can quote request content and the reason travels back
+    /// to the producer.
     pub(super) fn explain(error: &lake::Error) -> String {
-        match (Self::of(error), error) {
-            (_, lake::Error::Refused(lake::RefuseReason::RequestTooLarge(excess))) => {
-                let (what, setting) = budget_names(excess.budget);
-                let limit = excess.limit;
-                match excess.observed {
-                    Some(observed) => format!(
-                        "{what} of {observed} bytes exceeds {setting} ({limit} bytes); split \
-                         the batch upstream or raise the limit"
-                    ),
-                    None => format!(
-                        "{what} could not be measured against {setting} ({limit} bytes); \
-                         split the batch upstream"
-                    ),
-                }
+        match error {
+            lake::Error::Refused(lake::RefuseReason::RequestTooLarge(excess)) => {
+                TooLarge(excess).to_string()
             }
-            (_, lake::Error::Refused(lake::RefuseReason::Unsupported(what)))
-                if what == "traces" =>
-            {
-                "traces are not stored by series_parquet; route traces to another exporter"
-                    .to_owned()
+            lake::Error::Refused(lake::RefuseReason::Unsupported(what)) => {
+                NotStored(what).to_string()
             }
-            (_, lake::Error::Refused(lake::RefuseReason::Unsupported(what)))
-                if what == "exemplars" =>
-            {
+            lake::Error::Refused(lake::RefuseReason::TooDeep(limit)) => TooDeep(*limit).to_string(),
+            lake::Error::Refused(lake::RefuseReason::Invalid(detail)) => {
+                InvalidContent(detail).to_string()
+            }
+            error if Self::of(error) == Self::Storage => StorageFailed(error).to_string(),
+            error => InternalFailure(error).to_string(),
+        }
+    }
+}
+
+/// A size refusal: the budget, the measured size when known, and the limit.
+struct TooLarge<'a>(&'a lake::Excess);
+
+impl Display for TooLarge<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let (what, setting) = budget_names(self.0.budget);
+        let limit = self.0.limit;
+        match self.0.observed {
+            Some(observed) => write!(
+                f,
+                "{what} of {observed} bytes exceeds {setting} ({limit} bytes); split the batch \
+                 upstream or raise the limit"
+            ),
+            None => write!(
+                f,
+                "{what} could not be measured against {setting} ({limit} bytes); split the \
+                 batch upstream"
+            ),
+        }
+    }
+}
+
+/// Content no dataset stores: traces, exemplars under `metrics.exemplars:
+/// reject`, or a metric point kind under `unsupported: reject`.
+struct NotStored<'a>(&'a str);
+
+impl Display for NotStored<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            "traces" => f.write_str(
+                "traces are not stored by series_parquet; route traces to another exporter",
+            ),
+            "exemplars" => f.write_str(
                 "exemplars are not stored by series_parquet, and metrics.exemplars: reject \
                  refuses a request that carries them; set metrics.exemplars: drop (the \
                  default) to store the points without their exemplars, or route the request \
-                 to another exporter"
-                    .to_owned()
-            }
-            (_, lake::Error::Refused(lake::RefuseReason::Unsupported(what))) => {
-                format!(
-                    "{} metric points are not stored by series_parquet under unsupported: \
-                     reject; set unsupported: drop to keep the supported points, or route \
-                     them to another exporter",
-                    sanitized(what)
-                )
-            }
-            (_, lake::Error::Refused(lake::RefuseReason::TooDeep(limit))) => {
-                format!(
-                    "a nested value exceeds ingress.max_nesting_depth ({limit}); flatten it in \
-                     the producer or raise the limit"
-                )
-            }
-            (_, lake::Error::Refused(lake::RefuseReason::Invalid(detail))) => {
-                format!(
-                    "invalid request content: {}; fix the producer",
-                    sanitized(detail)
-                )
-            }
-            (Self::Storage, error) => format!(
-                "object storage failed: {}; retry the request",
-                sanitized(&error.to_string())
+                 to another exporter",
             ),
-            (_, error) => format!(
-                "series_parquet internal error: {}; the request is not at fault, retry it",
-                sanitized(&error.to_string())
+            kind => write!(
+                f,
+                "{} metric points are not stored by series_parquet under unsupported: reject; \
+                 set unsupported: drop to keep the supported points, or route them to another \
+                 exporter",
+                sanitized(kind)
             ),
         }
+    }
+}
+
+/// A value nested deeper than `ingress.max_nesting_depth`, the limit carried.
+struct TooDeep(usize);
+
+impl Display for TooDeep {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a nested value exceeds ingress.max_nesting_depth ({}); flatten it in the producer \
+             or raise the limit",
+            self.0
+        )
+    }
+}
+
+/// Malformed request content, with the rule it broke.
+struct InvalidContent<'a>(&'a str);
+
+impl Display for InvalidContent<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid request content: {}; fix the producer",
+            sanitized(self.0)
+        )
+    }
+}
+
+/// A storage failure while handling one request.
+struct StorageFailed<'a>(&'a lake::Error);
+
+impl Display for StorageFailed<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "object storage failed: {}; retry the request",
+            sanitized(&self.0.to_string())
+        )
+    }
+}
+
+/// A failure of this exporter while handling one request.
+struct InternalFailure<'a>(&'a lake::Error);
+
+impl Display for InternalFailure<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "series_parquet internal error: {}; the request is not at fault, retry it",
+            sanitized(&self.0.to_string())
+        )
+    }
+}
+
+/// The failed write of a whole block, told to every request it held.
+pub(super) struct BlockWriteFailed<'a>(pub(super) &'a lake::Error);
+
+impl Display for BlockWriteFailed<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "writing the block holding this request to object storage failed: {}; retry the \
+             request",
+            sanitized(&self.0.to_string())
+        )
     }
 }
 
@@ -446,32 +519,105 @@ mod tests {
         assert_eq!(Outcome::Ack.label(), "ack");
     }
 
-    /// Scenario: the reason sentence is built for a size refusal, a storage
-    /// failure and an internal failure whose detail spans two lines.
-    /// Guarantees: the sentence follows the outcome -- a size refusal names
-    /// the setting and both sizes, a storage failure says to retry, an
-    /// internal failure says the request is not at fault -- and a detail taken
-    /// from the error stays on one line.
+    /// Scenario: the reason sentence is built for one error of every shape a
+    /// sender can be told about: each size budget, with and without a
+    /// measured size; traces, exemplars and an unsupported point kind; excess
+    /// nesting; invalid content spanning two lines; a storage failure; an
+    /// internal failure; a block-scoped refusal that reached a sender; and a
+    /// failed block write.
+    /// Guarantees: every sentence is byte for byte the one producers have
+    /// been told so far, so moving how sentences are built never changes the
+    /// status message a producer logs, and a detail taken from the error stays
+    /// on one line.
     #[test]
-    fn the_sentence_follows_the_outcome() {
+    fn every_reason_sentence_is_unchanged() {
+        let sized = |budget, observed| {
+            lake::Error::Refused(lake::RefuseReason::RequestTooLarge(lake::Excess {
+                budget,
+                observed,
+                limit: 5,
+            }))
+        };
+        let refused = |reason| lake::Error::Refused(reason);
+        let cases = [
+            (
+                sized(lake::SizeBudget::Request, Some(10)),
+                "request of 10 bytes exceeds ingress.max_request_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                sized(lake::SizeBudget::Request, None),
+                "request could not be measured against ingress.max_request_bytes (5 bytes); split the batch upstream",
+            ),
+            (
+                sized(lake::SizeBudget::Extracted, Some(10)),
+                "extracted request of 10 bytes exceeds ingress.max_extracted_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                sized(lake::SizeBudget::Row, Some(10)),
+                "extracted row of 10 bytes exceeds ingress.max_row_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                sized(lake::SizeBudget::Cell, Some(10)),
+                "attribute value of 10 bytes exceeds ingress.max_row_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                sized(lake::SizeBudget::Table, Some(10)),
+                "decoded attribute table of 10 bytes exceeds ingress.max_extracted_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                sized(lake::SizeBudget::Block, Some(10)),
+                "worst case in one block, every series written with the request, of 10 bytes exceeds window.max_block_bytes (5 bytes); split the batch upstream or raise the limit",
+            ),
+            (
+                refused(lake::RefuseReason::Unsupported("traces".into())),
+                "traces are not stored by series_parquet; route traces to another exporter",
+            ),
+            (
+                refused(lake::RefuseReason::Unsupported("exemplars".into())),
+                "exemplars are not stored by series_parquet, and metrics.exemplars: reject refuses a request that carries them; set metrics.exemplars: drop (the default) to store the points without their exemplars, or route the request to another exporter",
+            ),
+            (
+                refused(lake::RefuseReason::Unsupported("Summary".into())),
+                "Summary metric points are not stored by series_parquet under unsupported: reject; set unsupported: drop to keep the supported points, or route them to another exporter",
+            ),
+            (
+                refused(lake::RefuseReason::TooDeep(8)),
+                "a nested value exceeds ingress.max_nesting_depth (8); flatten it in the producer or raise the limit",
+            ),
+            (
+                lake::Error::invalid("duplicate\nkey"),
+                "invalid request content: duplicate key; fix the producer",
+            ),
+            (
+                lake::Error::cancelled(None),
+                "object storage failed: cancelled; retry the request",
+            ),
+            (
+                lake::Error::Transient(lake::TransientError::DeadlineExceeded {
+                    attempts: 2,
+                    last: None,
+                }),
+                "object storage failed: flush retry deadline exceeded after 2 attempt(s); no attempt returned before the deadline; retry the request",
+            ),
+            (
+                lake::Error::internal("a\nb"),
+                "series_parquet internal error: internal: a b; the request is not at fault, retry it",
+            ),
+            (
+                refused(lake::RefuseReason::BlockFull),
+                "series_parquet internal error: refused: BlockFull; the request is not at fault, retry it",
+            ),
+            (
+                refused(lake::RefuseReason::TooManyRequests),
+                "series_parquet internal error: refused: TooManyRequests; the request is not at fault, retry it",
+            ),
+        ];
+        for (error, sentence) in &cases {
+            assert_eq!(Outcome::explain(error), *sentence, "{error:?}");
+        }
         assert_eq!(
-            Outcome::explain(&lake::Error::too_large(lake::SizeBudget::Row, 2, 1)),
-            "extracted row of 2 bytes exceeds ingress.max_row_bytes (1 bytes); split the \
-             batch upstream or raise the limit"
-        );
-        assert!(
-            Outcome::explain(&lake::Error::cancelled(None))
-                .starts_with("object storage failed: cancelled; retry")
-        );
-        assert_eq!(
-            Outcome::explain(&lake::Error::internal("a\nb")),
-            "series_parquet internal error: internal: a b; the request is not at fault, \
-             retry it"
-        );
-        assert_eq!(
-            Outcome::explain(&lake::Error::Refused(lake::RefuseReason::BlockFull)),
-            "series_parquet internal error: refused: BlockFull; the request is not at \
-             fault, retry it"
+            BlockWriteFailed(&lake::Error::cancelled(None)).to_string(),
+            "writing the block holding this request to object storage failed: cancelled; retry the request"
         );
     }
 }
