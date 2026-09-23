@@ -9,12 +9,12 @@ pub mod metrics;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder,
+    Array, ArrayBuilder, ArrayRef, AsArray, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder,
     Float64Builder, Int32Builder, Int64Builder, ListArray, ListBuilder, MapBuilder, StringBuilder,
-    StructArray, TimestampMicrosecondBuilder,
+    StructArray, TimestampMicrosecondBuilder, make_builder,
 };
 use arrow::datatypes::{
-    DataType, Float64Type, SchemaRef, TimeUnit, TimestampNanosecondType, UInt16Type, UInt32Type,
+    DataType, Float64Type, SchemaRef, TimestampNanosecondType, UInt16Type, UInt32Type,
 };
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
@@ -400,108 +400,144 @@ pub(crate) struct ValuesRow {
     pub approx_bytes: usize,
 }
 
-enum AnyBuilder {
-    Str(StringBuilder),
-    Int(Int64Builder),
-    Int32(Int32Builder),
-    Double(Float64Builder),
-    Bool(BooleanBuilder),
-    TsUs(TimestampMicrosecondBuilder),
-    Fixed(FixedSizeBinaryBuilder),
-    Map(MapBuilder<StringBuilder, StringBuilder>),
-    ListI64(ListBuilder<Int64Builder>),
-    ListF64(ListBuilder<Float64Builder>),
-    Bytes(BinaryBuilder),
+/// Rows a column builder starts with room for: Arrow's own default, which
+/// the per-kind builders of `make_builder` would otherwise not share.
+const BUILDER_ROWS: usize = 1024;
+
+/// A builder for one column of a dataset schema.
+///
+/// `make_builder` picks the builder from the schema's type, nested field
+/// names and nullability included, so a finished column always has exactly
+/// the schema's type.
+fn builder_for(dt: &DataType) -> Box<dyn ArrayBuilder> {
+    make_builder(dt, BUILDER_ROWS)
 }
 
-fn builder_for(dt: &DataType) -> Result<AnyBuilder> {
-    Ok(match dt {
-        DataType::Utf8 => AnyBuilder::Str(StringBuilder::new()),
-        DataType::Int64 => AnyBuilder::Int(Int64Builder::new()),
-        DataType::Int32 => AnyBuilder::Int32(Int32Builder::new()),
-        DataType::Float64 => AnyBuilder::Double(Float64Builder::new()),
-        DataType::Boolean => AnyBuilder::Bool(BooleanBuilder::new()),
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            AnyBuilder::TsUs(TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()))
-        }
-        DataType::FixedSizeBinary(n) => AnyBuilder::Fixed(FixedSizeBinaryBuilder::new(*n)),
-        DataType::Map(_, _) => AnyBuilder::Map(MapBuilder::new(
-            None,
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )),
-        DataType::List(f) if f.data_type() == &DataType::Int64 => {
-            AnyBuilder::ListI64(ListBuilder::new(Int64Builder::new()).with_field(f.clone()))
-        }
-        DataType::List(f) => {
-            AnyBuilder::ListF64(ListBuilder::new(Float64Builder::new()).with_field(f.clone()))
-        }
-        DataType::Binary => AnyBuilder::Bytes(BinaryBuilder::new()),
-        other => return Err(Error::internal(format!("unsupported builder type {other}"))),
-    })
+/// The builder `builder` really is, when it is a `B`.
+fn typed<B: 'static>(builder: &mut dyn ArrayBuilder) -> Option<&mut B> {
+    builder.as_any_mut().downcast_mut::<B>()
 }
 
-fn append(b: &mut AnyBuilder, c: &Col) -> Result<()> {
-    match (b, c) {
-        (AnyBuilder::Str(b), Col::Str(v)) => b.append_option(v.as_deref()),
-        (AnyBuilder::Int(b), Col::Int(v)) => b.append_option(*v),
-        (AnyBuilder::Int32(b), Col::Int32(v)) => b.append_option(*v),
-        (AnyBuilder::Double(b), Col::Double(v)) => b.append_option(*v),
-        (AnyBuilder::Bool(b), Col::Bool(v)) => b.append_option(*v),
-        (AnyBuilder::TsUs(b), Col::TsUs(v)) => b.append_option(*v),
-        (AnyBuilder::Fixed(b), Col::Fixed(v)) => match v {
-            Some(bytes) => b.append_value(bytes)?,
-            None => b.append_null(),
-        },
-        (AnyBuilder::Map(b), Col::Map(entries)) => {
-            for (k, v) in entries {
-                b.keys().append_value(k);
-                b.values().append_option(v.as_deref());
+/// Append one cell to the builder of its column.
+///
+/// A cell whose type is not the builder's is a writer invariant broken
+/// rather than anything a request can cause: rows are built in dataset
+/// schema order.
+fn append(builder: &mut dyn ArrayBuilder, c: &Col) -> Result<()> {
+    let appended = match c {
+        Col::Str(v) => match typed::<StringBuilder>(builder) {
+            Some(b) => {
+                b.append_option(v.as_deref());
+                true
             }
-            b.append(true)?;
+            // Denormalized columns arrive as Col::Str(None) when absent,
+            // whatever their type.
+            None if v.is_none() => append_null_denorm(builder),
+            None => false,
+        },
+        Col::Int(v) => typed::<Int64Builder>(builder)
+            .map(|b| b.append_option(*v))
+            .is_some(),
+        Col::Int32(v) => typed::<Int32Builder>(builder)
+            .map(|b| b.append_option(*v))
+            .is_some(),
+        Col::Double(v) => typed::<Float64Builder>(builder)
+            .map(|b| b.append_option(*v))
+            .is_some(),
+        Col::Bool(v) => typed::<BooleanBuilder>(builder)
+            .map(|b| b.append_option(*v))
+            .is_some(),
+        Col::TsUs(v) => typed::<TimestampMicrosecondBuilder>(builder)
+            .map(|b| b.append_option(*v))
+            .is_some(),
+        Col::Fixed(v) => match typed::<FixedSizeBinaryBuilder>(builder) {
+            Some(b) => {
+                match v {
+                    Some(bytes) => b.append_value(bytes)?,
+                    None => b.append_null(),
+                }
+                true
+            }
+            None => false,
+        },
+        Col::Map(entries) => match typed::<DynMapBuilder>(builder) {
+            Some(b) => {
+                let (keys, values) = b.entries();
+                let (Some(keys), Some(values)) =
+                    (typed::<StringBuilder>(keys), typed::<StringBuilder>(values))
+                else {
+                    return Err(Error::internal("map column is not Map<Utf8, Utf8>"));
+                };
+                for (k, v) in entries {
+                    keys.append_value(k);
+                    values.append_option(v.as_deref());
+                }
+                b.append(true)?;
+                true
+            }
+            None => false,
+        },
+        Col::ListI64(items) => {
+            append_list::<Int64Builder, _>(builder, items.as_deref(), |b, items| {
+                b.append_slice(items);
+            })?
         }
-        (AnyBuilder::ListI64(b), Col::ListI64(items)) => match items {
-            Some(items) => {
-                b.values().append_slice(items);
-                b.append(true);
-            }
-            None => b.append_null(),
-        },
-        (AnyBuilder::ListF64(b), Col::ListF64(items)) => match items {
-            Some(items) => {
-                b.values().append_slice(items);
-                b.append(true);
-            }
-            None => b.append_null(),
-        },
-        (AnyBuilder::Bytes(b), Col::Bytes(v)) => b.append_value(v),
-        // Denormalized columns arrive as Col::Str(None) when absent, whatever their type.
-        (AnyBuilder::Int(b), Col::Str(None)) => b.append_null(),
-        (AnyBuilder::Double(b), Col::Str(None)) => b.append_null(),
-        (AnyBuilder::Bool(b), Col::Str(None)) => b.append_null(),
-        (_, c) => {
-            return Err(Error::internal(format!(
-                "column/builder mismatch for {c:?}"
-            )));
+        Col::ListF64(items) => {
+            append_list::<Float64Builder, _>(builder, items.as_deref(), |b, items| {
+                b.append_slice(items);
+            })?
         }
+        Col::Bytes(v) => typed::<BinaryBuilder>(builder)
+            .map(|b| b.append_value(v))
+            .is_some(),
+    };
+    if appended {
+        Ok(())
+    } else {
+        Err(Error::internal(format!(
+            "column/builder mismatch for {c:?}"
+        )))
     }
-    Ok(())
 }
 
-fn finish(b: &mut AnyBuilder) -> ArrayRef {
-    match b {
-        AnyBuilder::Str(b) => Arc::new(b.finish()),
-        AnyBuilder::Int(b) => Arc::new(b.finish()),
-        AnyBuilder::Int32(b) => Arc::new(b.finish()),
-        AnyBuilder::Double(b) => Arc::new(b.finish()),
-        AnyBuilder::Bool(b) => Arc::new(b.finish()),
-        AnyBuilder::TsUs(b) => Arc::new(b.finish()),
-        AnyBuilder::Fixed(b) => Arc::new(b.finish()),
-        AnyBuilder::Map(b) => Arc::new(b.finish()),
-        AnyBuilder::ListI64(b) => Arc::new(b.finish()),
-        AnyBuilder::ListF64(b) => Arc::new(b.finish()),
-        AnyBuilder::Bytes(b) => Arc::new(b.finish()),
+/// The `Map` builder `make_builder` returns.
+type DynMapBuilder = MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>;
+
+/// Append a null to a typed denormalized column; false for any other builder.
+fn append_null_denorm(builder: &mut dyn ArrayBuilder) -> bool {
+    if let Some(b) = typed::<Int64Builder>(builder) {
+        b.append_null();
+    } else if let Some(b) = typed::<Float64Builder>(builder) {
+        b.append_null();
+    } else if let Some(b) = typed::<BooleanBuilder>(builder) {
+        b.append_null();
+    } else {
+        return false;
     }
+    true
+}
+
+/// Append one list cell, `None` a null list, to a list builder whose values
+/// are `B`; false when the builder is not one.
+fn append_list<B: 'static, T>(
+    builder: &mut dyn ArrayBuilder,
+    items: Option<&[T]>,
+    fill: impl FnOnce(&mut B, &[T]),
+) -> Result<bool> {
+    let Some(list) = typed::<ListBuilder<Box<dyn ArrayBuilder>>>(builder) else {
+        return Ok(false);
+    };
+    match items {
+        Some(items) => {
+            let Some(values) = typed::<B>(list.values()) else {
+                return Ok(false);
+            };
+            fill(values, items);
+            list.append(true);
+        }
+        None => list.append_null(),
+    }
+    Ok(true)
 }
 
 /// Accumulates rows of one dataset into slices of at most `run_target_bytes`.
@@ -512,7 +548,7 @@ fn finish(b: &mut AnyBuilder) -> ArrayRef {
 /// every dataset of the request shares.
 pub(crate) struct RowSink {
     schema: SchemaRef,
-    builders: Vec<AnyBuilder>,
+    builders: Vec<Box<dyn ArrayBuilder>>,
     slice_bytes: usize,
     rows_in_slice: usize,
     batches: Vec<RecordBatch>,
@@ -529,7 +565,7 @@ impl RowSink {
             .fields()
             .iter()
             .map(|f| builder_for(f.data_type()))
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
         Ok(Self {
             schema,
             builders,
@@ -553,7 +589,7 @@ impl RowSink {
             self.seal(budget)?;
         }
         for (b, c) in self.builders.iter_mut().zip(&row.cols) {
-            append(b, c)?;
+            append(b.as_mut(), c)?;
         }
         self.slice_bytes += row.approx_bytes;
         self.rows_in_slice += 1;
@@ -564,7 +600,7 @@ impl RowSink {
         if self.rows_in_slice == 0 {
             return Ok(());
         }
-        let cols: Vec<ArrayRef> = self.builders.iter_mut().map(finish).collect();
+        let cols: Vec<ArrayRef> = self.builders.iter_mut().map(|b| b.finish()).collect();
         let batch = RecordBatch::try_new(self.schema.clone(), cols)?;
         let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
         self.pinned += pinned;
@@ -826,11 +862,11 @@ pub fn series_batch(
     cfg: &LakeConfig,
 ) -> Result<RecordBatch> {
     let schema = dataset_schema(ds, cfg);
-    let mut builders = schema
+    let mut builders: Vec<Box<dyn ArrayBuilder>> = schema
         .fields()
         .iter()
         .map(|f| builder_for(f.data_type()))
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
     for r in rows {
         let d = &r.descriptor;
         let mut cols: Vec<Col> = vec![
@@ -861,7 +897,7 @@ pub fn series_batch(
         }
         cols.extend(r.denorm.iter().cloned().map(Col::from));
         for (b, c) in builders.iter_mut().zip(&cols) {
-            append(b, c)?;
+            append(b.as_mut(), c)?;
         }
     }
     // The builders start with room for 1024 rows. A request-sized batch is
@@ -873,7 +909,7 @@ pub fn series_batch(
     let arrays: Vec<ArrayRef> = builders
         .iter_mut()
         .map(|builder| {
-            let mut array = finish(builder);
+            let mut array = builder.finish();
             array.shrink_to_fit();
             array
         })
