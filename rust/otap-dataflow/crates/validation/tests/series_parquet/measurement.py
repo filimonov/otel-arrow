@@ -3338,37 +3338,47 @@ def write_json_atomic(path, document) -> Path:
 
 
 # Keys whose string value is a credential. A published document keeps the key,
-# so its shape is unchanged, and carries this token instead of the value.
-CREDENTIAL_KEYS = frozenset(
-    {
-        "access_key_id",
-        "secret_access_key",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "session_token",
-        "password",
-    }
+# so its shape is unchanged, and carries this token instead of the value. A
+# bare `key` is deliberately not matched: the harness publishes worker, label
+# and baseline identifiers under `key`, and none of them is a secret.
+CREDENTIAL_KEY = re.compile(
+    r"(?i)(secret|password|passwd|token|credential|api_?key|access_?key|"
+    r"private_?key|secret_?key|key_?id|root_?user)"
 )
 REDACTED = "<redacted>"
 REPO_TOKEN = "<repo>"
 HOME_TOKEN = "<home>"
+HOST_PATH_TOKEN = "<host-path>"
 # `NAME=value` arguments whose value is a credential, as a container command
-# line passes them.
+# line or an environment dump passes them.
 CREDENTIAL_ASSIGNMENT = re.compile(
-    r"\b([A-Z0-9_]*(?:PASSWORD|SECRET|SECRET_KEY|ACCESS_KEY|TOKEN)[A-Z0-9_]*)=[^\s\"']+"
+    r"\b([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|ACCESS_KEY|SECRET_KEY|KEY_ID|ROOT_USER)"
+    r"[A-Z0-9_]*)=([^\s\"',;]+)"
+)
+# An absolute path under a directory that names the host, its users or its
+# scratch space. Everything up to the final component is replaced, so the
+# file a path named stays recognisable and the value is stable across hosts.
+HOST_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.:/-])/(?:home|Users|root|srv|tmp|var|opt|mnt|data|run|media)"
+    r"(?:/[^\s\"',;:/]+)*/?"
 )
 
 
 def scrub_published(value, *, repo_root=None, home=None):
     """A copy of one document with host paths and credentials removed.
 
-    Every document the harness writes for publication passes through here:
-    the repository root becomes `<repo>` and the user's home directory
-    `<home>` wherever either appears in a string, a credential-named key
-    keeps its key with a `<redacted>` value, and a `NAME=value` credential
-    assignment keeps its name. The run directory token and the declared
-    ephemeral tokens are applied earlier, for fingerprints; this is the last
-    step before a file is written, so nothing a fingerprint hashed changes.
+    Every document the harness writes for publication passes through here.
+    The repository root becomes `<repo>` and the user's home directory
+    `<home>` wherever either appears; any other absolute path under a host,
+    user or scratch directory (`/home`, `/tmp`, `/var`, `/srv`, `/opt`,
+    `/mnt`, `/data`, ...) keeps only its final component behind
+    `<host-path>/`. A credential-named key keeps its key with a `<redacted>`
+    value, a `NAME=value` credential assignment keeps its name, and every
+    credential value found either way is then removed wherever else it
+    appears in the document, a log tail or a command line included. The run
+    directory token and the declared ephemeral tokens are applied earlier,
+    for fingerprints; this is the last step before a file is written, so
+    nothing a fingerprint hashed changes.
     """
     roots = []
     for root, token in (
@@ -3384,12 +3394,37 @@ def scrub_published(value, *, repo_root=None, home=None):
     # Longest first, so the repository inside the home directory is named as
     # the repository.
     roots.sort(key=lambda pair: len(pair[0]), reverse=True)
+    secrets = set()
+
+    def collect(item, key=None):
+        """Every credential value in the document, by key or assignment."""
+        if isinstance(item, dict):
+            for name, child in item.items():
+                collect(child, name)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child)
+        elif isinstance(item, str):
+            if key is not None and CREDENTIAL_KEY.search(str(key)) and item:
+                secrets.add(item)
+            for match in CREDENTIAL_ASSIGNMENT.finditer(item):
+                secrets.add(match.group(2))
+
+    def host_path(match):
+        """One host path, reduced to its final component."""
+        path = match.group(0).rstrip("/")
+        tail = path.rsplit("/", 1)[-1]
+        return f"{HOST_PATH_TOKEN}/{tail}" if tail else HOST_PATH_TOKEN
 
     def text_of(item):
-        """One string with every host prefix and credential replaced."""
+        """One string with every host path and credential replaced."""
+        item = CREDENTIAL_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={REDACTED}", item)
+        for secret in sorted(secrets, key=len, reverse=True):
+            if secret != REDACTED and len(secret) >= 4:
+                item = item.replace(secret, REDACTED)
         for root, token in roots:
             item = item.replace(root, token)
-        return CREDENTIAL_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={REDACTED}", item)
+        return HOST_PATH.sub(host_path, item)
 
     def rewrite(item, key=None):
         """Rewrite one node of the document."""
@@ -3398,11 +3433,12 @@ def scrub_published(value, *, repo_root=None, home=None):
         if isinstance(item, (list, tuple)):
             return [rewrite(child) for child in item]
         if isinstance(item, str):
-            if key is not None and key.lower() in CREDENTIAL_KEYS and item:
+            if key is not None and CREDENTIAL_KEY.search(str(key)) and item:
                 return REDACTED
             return text_of(item)
         return item
 
+    collect(value)
     return rewrite(value)
 
 

@@ -4051,24 +4051,34 @@ class HarnessHygieneContracts(unittest.TestCase):
     """Task 3c harness minors and publication scrubbing."""
 
     # Scenario: a document carries the repository root, the home directory,
-    # S3 static credentials, a container credential assignment and an
-    # ordinary path outside both roots.
+    # paths under /srv, /tmp and /var, S3 static credentials, container and
+    # AWS credential assignments, the same secret quoted inside a log line,
+    # and ordinary identifiers under a bare `key` and a URL path.
     # Guarantees: the written copy names the repository and home as tokens,
-    # redacts every credential value while keeping its key and variable
-    # name, leaves every other string exactly as it was, and never touches
-    # the caller's own document.
+    # reduces every other host path to its final component, redacts every
+    # credential value -- user names included -- wherever it appears while
+    # keeping its key and variable name, leaves identifiers and URLs intact,
+    # and never touches the caller's own document.
     def test_published_documents_carry_no_host_paths_or_credentials(self):
         document = {
             "binary": "/home/alice/src/otel-arrow/rust/otap-dataflow/target/x",
             "log": "/home/alice/notes.txt",
             "other": "/srv/data/file",
+            "run_dir": "/tmp/series-launcher/run-1/engine.log",
+            "spool": "cwd=/var/lib/docker/overlay2/abc/merged",
+            "endpoint": "http://127.0.0.1:9000/api/v1/readyz",
+            "base_uri": "s3://series-test/otel",
+            "key": "default/main/0/0",
             "auth": {
                 "type": "static_credentials",
                 "access_key_id": "series-test-access",
                 "secret_access_key": "series-test-secret-12345",
             },
             "argv": ["docker", "run", "-e", "MINIO_ROOT_PASSWORD=hunter2",
-                     "-e", "RUSTFS_SECRET_KEY=abc", "-e", "MINIO_ROOT_USER=u"],
+                     "-e", "RUSTFS_SECRET_KEY=abcdef", "-e", "MINIO_ROOT_USER=minioadmin",
+                     "-e", "AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+                     "-e", "AWS_SECRET_ACCESS_KEY=wJalrEXAMPLE"],
+            "tail": "signing with series-test-secret-12345 for minioadmin failed",
             "count": 3,
         }
         original = json.loads(json.dumps(document))
@@ -4078,16 +4088,26 @@ class HarnessHygieneContracts(unittest.TestCase):
         self.assertEqual(document, original, "the input is not modified")
         self.assertEqual(scrubbed["binary"], "<repo>/rust/otap-dataflow/target/x")
         self.assertEqual(scrubbed["log"], "<home>/notes.txt")
-        self.assertEqual(scrubbed["other"], "/srv/data/file")
+        self.assertEqual(scrubbed["other"], "<host-path>/file")
+        self.assertEqual(scrubbed["run_dir"], "<host-path>/engine.log")
+        self.assertEqual(scrubbed["spool"], "cwd=<host-path>/merged")
+        self.assertEqual(scrubbed["endpoint"], document["endpoint"])
+        self.assertEqual(scrubbed["base_uri"], document["base_uri"])
+        self.assertEqual(scrubbed["key"], "default/main/0/0")
         self.assertEqual(scrubbed["auth"]["type"], "static_credentials")
         self.assertEqual(scrubbed["auth"]["access_key_id"], "<redacted>")
         self.assertEqual(scrubbed["auth"]["secret_access_key"], "<redacted>")
-        self.assertIn("MINIO_ROOT_PASSWORD=<redacted>", scrubbed["argv"])
-        self.assertIn("RUSTFS_SECRET_KEY=<redacted>", scrubbed["argv"])
-        self.assertIn("MINIO_ROOT_USER=u", scrubbed["argv"])
+        for name in ("MINIO_ROOT_PASSWORD", "RUSTFS_SECRET_KEY", "MINIO_ROOT_USER",
+                     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            self.assertIn(f"{name}=<redacted>", scrubbed["argv"])
+        self.assertEqual(
+            scrubbed["tail"], "signing with <redacted> for <redacted> failed"
+        )
         self.assertEqual(scrubbed["count"], 3)
         text = json.dumps(scrubbed)
-        for leaked in ("/home/alice", "hunter2", "series-test-secret-12345"):
+        for leaked in ("/home/", "/srv/", "/tmp/", "/var/", "hunter2", "abcdef",
+                       "minioadmin", "AKIAEXAMPLE", "wJalrEXAMPLE",
+                       "series-test-access", "series-test-secret-12345"):
             self.assertNotIn(leaked, text)
 
     # Scenario: a result is written through `write_result` from a document
