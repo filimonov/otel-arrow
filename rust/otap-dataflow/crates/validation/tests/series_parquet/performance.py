@@ -441,7 +441,7 @@ def write_stage_input(workload, signal, path) -> dict:
 def lake_config(**overrides) -> dict:
     """The exporter's effective lake configuration, with named overrides."""
     config = {
-        "writer_id": "local-1",
+        "writer_id": "local_1",
         "producer_id_attribute": "host.id",
         "window_interval": "15s",
         "ingress": {

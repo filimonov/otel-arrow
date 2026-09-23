@@ -2107,6 +2107,20 @@ def stored_bodies(store, directory, name):
     return target, [row[0] for row in rows]
 
 
+# The store retry every S3 engine runs with. The exporter refuses a cloud
+# store whose `retry.retry_timeout` -- 3 minutes when the section is omitted
+# -- is not strictly below `window.flush_retry_deadline` (60 s by default),
+# because one write attempt would otherwise keep retrying inside the store
+# past the block's deadline.
+S3_RETRY = {
+    "max_retries": 3,
+    "init_backoff": "200ms",
+    "max_backoff": "2s",
+    "backoff_base": 2.0,
+    "retry_timeout": "20s",
+}
+
+
 class DockerSlice(unittest.TestCase):
     """Grafana Alloy and a real S3 object store in containers."""
 
@@ -2114,7 +2128,9 @@ class DockerSlice(unittest.TestCase):
         """Run the Alloy file-tail topology against one object store."""
         require_clickhouse()
         with DockerStore(kind) as store, tempfile.TemporaryDirectory() as directory:
-            with Engine(directory, storage=store.storage) as engine:
+            with Engine(
+                directory, storage=store.storage, overrides={"retry": S3_RETRY}
+            ) as engine:
                 ids = [f"{kind}-alloy-{i}" for i in range(12)]
                 metric_ids = [f"{kind}-metric-{i}" for i in range(6)]
                 with AlloyProducer(directory, engine) as alloy:
@@ -2171,7 +2187,9 @@ class DockerSlice(unittest.TestCase):
                     "init_backoff": "200ms",
                     "max_backoff": "1s",
                     "backoff_base": 2.0,
-                    "retry_timeout": "5s",
+                    # Strictly below the 5 s flush deadline, which the
+                    # exporter requires of a cloud store.
+                    "retry_timeout": "2s",
                 },
             }
             with Engine(
@@ -2239,6 +2257,7 @@ class DockerSlice(unittest.TestCase):
             # follow stay in an open block that nothing can flush.
             overrides = {
                 "window": {"interval": "600s", "max_requests_per_block": 3},
+                "retry": S3_RETRY,
             }
             acked = [f"restart-acked-{i}" for i in range(3)]
             lost = [f"restart-inflight-{i}" for i in range(2)]
@@ -2290,7 +2309,9 @@ class DockerSlice(unittest.TestCase):
             # The second engine rotates on its window instead: the resent
             # bodies are fewer than a block, so only the window can seal them.
             with Engine(
-                second, storage=store.storage, overrides={"window": {"interval": "1s"}}
+                second,
+                storage=store.storage,
+                overrides={"window": {"interval": "1s"}, "retry": S3_RETRY},
             ) as engine:
                 try:
                     retries = sum(
