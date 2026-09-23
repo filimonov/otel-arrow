@@ -678,14 +678,17 @@ its window, never from event timestamps. A request that is refused and later
 retried is admitted again into a new window, so it lands in the partition of
 its new ingest time, not in the old one. The only writes into an hour H that
 can still happen after H has ended come from blocks whose window started
-inside H and whose flush is still retrying. Their last attempt ends no later
-than
+inside H and whose flush is still retrying. A writer flushes one block at a
+time: a block whose window has closed waits until the previous block's flush,
+including its retries and its abort, has finished, and only then starts its
+own. The two retry windows are therefore sequential, and the last attempt of a
+block started inside H ends no later than
 
 ```text
-L = window.interval + flush_retry_deadline + upload.abort_timeout
+L = window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)
 ```
 
-after the end of H (80 s with the defaults). A compactor that closes hour H
+after the end of H (145 s with the defaults: 15 s + 2 * (60 s + 5 s)). A compactor that closes hour H
 must therefore wait at least L after the end of H before it lists the hour.
 
 The bound is enforced by the writer's own deadlines, which means it holds for

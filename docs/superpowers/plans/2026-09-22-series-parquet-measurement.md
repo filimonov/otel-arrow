@@ -1290,7 +1290,7 @@ git commit -m "chore: measure series recovery from real S3 faults" -m "Co-Author
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
-**Amendment (compaction contract, 2026-09-23):** every S3 fault run in this task also checks the partition lateness bound: no object may become visible in partition hour H later than L = window.interval + flush_retry_deadline + upload.abort_timeout after the end of H. Record, per run, the latest visibility time of any object in each hour relative to that hour's end (HEAD/LIST timestamps from the store, not the writer's clock), and report every violation as a finding for Task 12.
+**Amendment (compaction contract, 2026-09-23):** every S3 fault run in this task also checks the partition lateness bound: no object may become visible in partition hour H later than L = window.interval + 2 * (flush_retry_deadline + upload.abort_timeout) after the end of H. Record, per run, the latest visibility time of any object in each hour relative to that hour's end (HEAD/LIST timestamps from the store, not the writer's clock), and report every violation as a finding for Task 12.
 
 ### Task 10: Graceful process restart and ungraceful hard kill
 
