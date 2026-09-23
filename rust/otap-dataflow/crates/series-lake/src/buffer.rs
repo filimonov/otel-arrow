@@ -367,8 +367,8 @@ impl Block {
     /// already committed in this block's partition is suppressed. With `reemit`
     /// true, a descriptor is reserved again even when the cache already reports
     /// it committed here, as long as this block does not already carry it --
-    /// the case a byte-triggered rotation inside one aligned window needs (spec
-    /// 7.4): the new block starts a new partition-cache suppression window of
+    /// the case a byte-triggered rotation inside one aligned window needs (the
+    /// series_parquet exporter README, "Overview"): the new block starts a new partition-cache suppression window of
     /// its own only once its descriptors are written, so its series rows must
     /// be re-emitted rather than assumed present from the block it replaced.
     /// The cache itself is never disabled or cleared; only this one reservation
