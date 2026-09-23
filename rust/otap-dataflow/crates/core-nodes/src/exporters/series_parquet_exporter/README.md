@@ -372,9 +372,8 @@ loopback listener, and MinIO publishes an ephemeral loopback-only S3 port. The
 engine YAML is generated from `configs/series-parquet-local.yaml` with S3
 storage settings equivalent to `configs/series-parquet-s3.yaml`, an explicit
 one-core allocation and `wait_for_result: true`. The test helpers write the
-exact launched YAML into `SERIES_REFERENCE_DIR/pipeline.yaml` and remove only
-their own containers afterwards. This example keeps the downloaded Parquet
-files for the two-reader check below.
+exact launched YAML as `pipeline.yaml` in the test's working directory and
+remove only their own containers afterwards.
 
 The complete River configuration is `configs/series-parquet.alloy`, shared
 with the normal and the outage end-to-end tests. `/input` is the mounted
@@ -591,188 +590,25 @@ is `1`; a startup or reader failure always fails. The mandatory
 `series-parquet-e2e` workflow provisions the selected images and runs both
 stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
 
+This deployment runs as `DockerSlice.test_minio` in
+[`test_e2e.py`](../../../../validation/tests/series_parquet/test_e2e.py)
+(`test_rustfs` is the same against RustFS). It writes 12 known lines through
+Alloy and six metrics requests over OTLP gRPC, downloads the objects, and runs
+DuckDB and native `clickhouse-local`, or `docker exec` in the selected local
+ClickHouse image, over the same files. Both readers must return every body with
+its `e2e.source` attribute, agree on the row counts, and preserve them through
+the latest-descriptor join. Native ClickHouse is preferred at
+`/usr/bin/clickhouse-local`; `SERIES_CLICKHOUSE_LOCAL` selects another
+executable. Missing both reader routes skips locally; a reader that is present
+but cannot execute the query fails.
+
 From `rust/otap-dataflow`, after the feature-enabled build above:
 
 ```bash
 python3 -m venv /tmp/series-parquet-venv
 /tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
-export SERIES_REFERENCE_DIR="$(mktemp -d /tmp/series-reference.XXXXXX)"
-PYTHONPATH=crates/validation/tests/series_parquet /tmp/series-parquet-venv/bin/python - <<'PY'
-import os
-from pathlib import Path
-from test_e2e import AlloyProducer, DockerStore, Engine, require_clickhouse, wait_for_alloy
-
-require_clickhouse()
-root = Path(os.environ["SERIES_REFERENCE_DIR"])
-ids = [f"reference-alloy-{i}" for i in range(12)]
-with DockerStore("minio") as store, Engine(root, storage=store.storage) as engine:
-    with AlloyProducer(root, engine) as alloy:
-        alloy.write(ids)
-        wait_for_alloy(store, root, ids)
-    engine.shutdown(seconds=180)
-    store.download(root / "downloaded")
-print(root / "pipeline.yaml")
-print(root / "downloaded")
-PY
-```
-
-Save the verification below as `/tmp/series-reference-readers.py` and run it
-with `/tmp/series-parquet-venv/bin/python /tmp/series-reference-readers.py -v`
-in the same terminal. It independently runs DuckDB and native
-`clickhouse-local`, or `docker exec` in the selected local ClickHouse image,
-checks all 12 bodies and their `e2e.source` attributes, and proves that the
-latest-descriptor join preserves the row count. Native ClickHouse is preferred
-at `/usr/bin/clickhouse-local`; `SERIES_CLICKHOUSE_LOCAL` selects another
-executable. Missing both reader routes skips locally; a reader that is present
-but cannot execute the query fails.
-
-```python
-# Copyright The OpenTelemetry Authors
-# SPDX-License-Identifier: Apache-2.0
-import contextlib
-import json
-import os
-from pathlib import Path
-import shutil
-import subprocess
-import unittest
-import uuid
-import duckdb
-
-
-def reader_unavailable(reason):
-    if os.environ.get("SERIES_REQUIRE_DOCKER") == "1":
-        raise AssertionError(reason)
-    raise unittest.SkipTest(reason)
-
-
-@contextlib.contextmanager
-def reference_clickhouse(root):
-    binary = os.environ.get("SERIES_CLICKHOUSE_LOCAL", "/usr/bin/clickhouse-local")
-    if not (Path(binary).is_file() and os.access(binary, os.X_OK)):
-        binary = (
-            shutil.which("clickhouse-local")
-            if "SERIES_CLICKHOUSE_LOCAL" not in os.environ
-            else None
-        )
-    container = None
-    try:
-        if binary:
-            command = [binary]
-        else:
-            if not shutil.which("docker"):
-                reader_unavailable("Neither clickhouse-local nor Docker is available")
-            try:
-                probe = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
-            except subprocess.TimeoutExpired:
-                reader_unavailable("ClickHouse fallback Docker daemon did not respond")
-            if probe.returncode:
-                reader_unavailable("ClickHouse fallback Docker daemon is unavailable")
-            image = os.environ.get(
-                "SERIES_CLICKHOUSE_IMAGE", "clickhouse/clickhouse-server:26.7.4"
-            )
-            if subprocess.run(
-                ["docker", "image", "inspect", image], capture_output=True, timeout=10
-            ).returncode:
-                reader_unavailable(f"Local ClickHouse image is absent: {image}")
-            container = subprocess.check_output(
-                [
-                    "docker", "run", "--pull=never", "--detach", "--network", "none",
-                    "--name", "series-reference-reader-" + uuid.uuid4().hex,
-                    "--user", f"{os.getuid()}:{os.getgid()}",
-                    "--mount", f"type=bind,src={root},dst=/data,readonly",
-                    "--entrypoint", "/bin/sleep", image, "infinity",
-                ],
-                text=True,
-                timeout=30,
-            ).strip()
-            command = [
-                "docker", "exec", "--workdir", "/data", container, "clickhouse", "local",
-            ]
-
-        def query(sql):
-            result = subprocess.run(
-                command
-                + [
-                    "--query",
-                    sql + " FORMAT JSONCompactEachRow",
-                    "--output_format_json_quote_64bit_integers=0",
-                ],
-                cwd=root,
-                text=True,
-                capture_output=True,
-                check=True,
-                timeout=30,
-            )
-            return [tuple(json.loads(line)) for line in result.stdout.splitlines() if line.strip()]
-
-        yield query
-    finally:
-        if container:
-            subprocess.run(
-                ["docker", "rm", "--force", "--volumes", container],
-                capture_output=True,
-                check=False,
-                timeout=20,
-            )
-
-
-class ReferenceReaders(unittest.TestCase):
-    # Scenario: Docker Alloy delivers 12 known file lines through df_engine
-    # into MinIO Parquet.
-    # Guarantees: both readers preserve latest-descriptor join counts and
-    # return every expected body and attribute.
-    def test_latest_descriptor_join_and_bodies(self):
-        root = (Path(os.environ["SERIES_REFERENCE_DIR"]) / "downloaded").resolve()
-        values = "v=1/signal=logs/dataset=values/**/*.parquet"
-        series = "v=1/signal=logs/dataset=series/**/*.parquet"
-        expected = sorted((f"reference-alloy-{i}", "alloy-file") for i in range(12))
-        with duckdb.connect() as db, reference_clickhouse(root) as clickhouse:
-            duck_rows = sorted(
-                db.execute(
-                    """
-                WITH canonical AS (
-                    SELECT * FROM read_parquet(?, union_by_name=true, filename=true)
-                    QUALIFY row_number() OVER (
-                        PARTITION BY series_id ORDER BY emitted_at DESC, filename DESC) = 1
-                )
-                SELECT v.body, coalesce(v.attrs['e2e.source'], '')
-                FROM read_parquet(?, union_by_name=true) v
-                INNER JOIN canonical s ON v.series_id = s.series_id
-            """,
-                    [str(root / series), str(root / values)],
-                ).fetchall()
-            )
-            ch_rows = sorted(
-                clickhouse(
-                    f"""
-                WITH canonical AS (
-                    SELECT * FROM (
-                        SELECT *, row_number() OVER (
-                            PARTITION BY series_id ORDER BY emitted_at DESC, _path DESC) AS rank
-                        FROM file('{series}', 'Parquet')
-                    ) WHERE rank = 1
-                )
-                SELECT v.body, coalesce(v.attrs['e2e.source'], '')
-                FROM file('{values}', 'Parquet') AS v
-                INNER JOIN canonical AS s ON v.series_id = s.series_id
-            """
-                )
-            )
-            duck_count = db.execute(
-                "SELECT count(*) FROM read_parquet(?)", [str(root / values)]
-            ).fetchone()[0]
-            ch_count = int(clickhouse(f"SELECT count(*) FROM file('{values}', 'Parquet')")[0][0])
-            self.assertEqual(duck_count, 12)
-            self.assertEqual(ch_count, duck_count)
-            self.assertEqual(len(ch_rows), ch_count)
-            self.assertEqual(len(duck_rows), duck_count)
-            self.assertEqual(ch_rows, duck_rows)
-            self.assertEqual(duck_rows, expected)
-
-
-if __name__ == "__main__":
-    unittest.main()
+SERIES_REQUIRE_DOCKER=1 /tmp/series-parquet-venv/bin/python -m unittest -v \
+  crates.validation.tests.series_parquet.test_e2e.DockerSlice.test_minio
 ```
 
 ## Running behind durable_buffer

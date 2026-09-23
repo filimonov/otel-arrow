@@ -44,7 +44,7 @@ impl Excess {
     }
 }
 
-/// Why a request is permanently refused (spec section 8).
+/// Why a request is permanently refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
     /// The request itself, its extracted output or one of its rows exceeds a

@@ -132,7 +132,8 @@ pub enum WakeOutcome {
     },
 }
 
-/// Aligned window boundary arithmetic (spec section 6.4).
+/// Aligned window boundary arithmetic: the `window_start` of FORMAT.md
+/// section 4.
 #[derive(Debug, Clone)]
 pub struct WindowClock {
     interval_secs: i64,

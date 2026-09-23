@@ -182,7 +182,7 @@ pub(super) struct OwnedBlock {
     ///
     /// True only for the block that replaces one sealed by a byte or request
     /// threshold inside the same aligned window: that block's descriptors are
-    /// not durable yet, so this one cannot assume them (spec 7.4).
+    /// not durable yet, so this one cannot assume them (README.md, "Overview").
     pub(super) reemit: bool,
     /// Descriptor rows admitted to this block, per [`EmitReason`] position.
     ///
@@ -395,7 +395,7 @@ impl Worker {
         // handed back, so the token keeps only the routing frames: the payload
         // is taken out here and the inbound credentials and the claims derived
         // from them are dropped inside `split`, rather than staying resident
-        // for the duration of the write (spec section 7).
+        // for the duration of the write.
         let (token, mut payload) = AckToken::split(data);
         // `num_bytes` is an estimate of the wire representation, so the budget
         // is also enforced on the measured extracted output inside `extract`.

@@ -3,8 +3,8 @@
 
 //! Series/values normalization and Parquet sink for OTAP telemetry.
 //!
-//! See `docs/FORMAT.md` for the storage format and the design spec at the
-//! repository root for the architecture.
+//! See `docs/FORMAT.md` for the storage format and `README.md` for the
+//! modules, the producer id contract and the limits of version 1.
 
 pub mod attrs;
 pub mod buffer;

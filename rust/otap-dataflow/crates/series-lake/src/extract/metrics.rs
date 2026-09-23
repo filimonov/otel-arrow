@@ -1,12 +1,12 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Metrics extraction: number and histogram points (spec section 5.1).
+//! Metrics extraction: number and histogram points (FORMAT.md section 2).
 //!
 //! Both point kinds write into the single `metrics/values` dataset through one
 //! [`RowSink`], each leaving the other kind's columns null. The point kind is
 //! not stored in the row: readers take it from `metric_type` in the series
-//! descriptor through the join of spec section 5.5.
+//! descriptor through the join of FORMAT.md section 6.
 
 use std::collections::{HashMap, HashSet};
 
@@ -578,7 +578,7 @@ pub(crate) fn extract_metrics(
         }
     }
 
-    // Exemplars are not part of the v1 format (spec 5.1). An explicit
+    // Exemplars are not part of the v1 format (FORMAT.md section 2). An explicit
     // `metrics.exemplars: reject` refuses a request whose stored points carry
     // any; otherwise, the default, the rows are counted as dropped. An exemplar of an exponential histogram point goes
     // with that point, which the drop policy has already discarded, so it is
@@ -606,7 +606,7 @@ pub(crate) fn extract_metrics(
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let mut values = Vec::new();
     let mut pinned_bytes = 0;
-    // Number and histogram points share one dataset (spec 5.1), so they share
+    // Number and histogram points share one dataset (FORMAT.md section 2), so they share
     // one sink; each kind writes the other's columns as null.
     let mut sink = RowSink::new(Dataset::MetricsValues, cfg)?;
 
@@ -1337,7 +1337,7 @@ mod tests {
     /// point count each, dropped together in one request.
     /// Guarantees: the two per-kind counters split the aggregate exactly by
     /// kind rather than merging or double counting, so the domain stays
-    /// closed to the two unsupported point kinds (spec 5.1).
+    /// closed to the two unsupported point kinds (FORMAT.md section 2).
     #[test]
     fn exp_histogram_and_summary_drops_are_split_by_kind() {
         let md = data(vec![

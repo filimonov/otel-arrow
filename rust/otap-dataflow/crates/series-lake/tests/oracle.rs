@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reference-oracle property test (spec section 9.1).
+//! Reference-oracle property test (README.md, "Testing").
 //!
 //! The oracle computes the expected output independently of `extract`: it builds
 //! [`Descriptor`]s straight from the generated OTLP input and hashes them with

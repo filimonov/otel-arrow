@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Owned attribute value tree, CBOR decoding of the OTAP `ser` column and the
-//! `render_v1` storage rendering (spec section 5.1).
+//! `render_v1` storage rendering (FORMAT.md section 2).
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use crate::error::{Error, RefuseReason, Result};
 
-/// Limits applied while decoding one CBOR `ser` cell (spec section 5.1).
+/// Limits applied while decoding one CBOR `ser` cell (FORMAT.md section 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
     /// Maximum nesting depth of the decoded value.
@@ -387,7 +387,7 @@ mod tests {
     }
 
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.
-    /// Guarantees: the JSON mapping of spec section 5.1 is produced exactly.
+    /// Guarantees: the JSON mapping of FORMAT.md section 2 is produced exactly.
     #[test]
     fn render_v1_mapping() {
         let v = Value::KvList(vec![

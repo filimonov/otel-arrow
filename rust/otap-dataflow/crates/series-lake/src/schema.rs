@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Output datasets and their Arrow schemas (spec section 5.1).
+//! Output datasets and their Arrow schemas (FORMAT.md section 2).
 
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ pub enum Dataset {
     ///
     /// Number and histogram points share one schema: the per-kind columns are
     /// nullable and the point kind is read from the series descriptor's
-    /// `metric_type` through the join readers already perform (spec 5.1).
+    /// `metric_type` through the join readers already perform (FORMAT.md section 2).
     MetricsValues,
 }
 
@@ -428,7 +428,7 @@ mod tests {
     }
 
     /// Scenario: default config, every dataset.
-    /// Guarantees: the intrinsic column lists of spec section 5.1 are produced in order.
+    /// Guarantees: the intrinsic column lists of FORMAT.md section 2 are produced in order.
     #[test]
     fn intrinsic_columns_match_spec() {
         let cfg = LakeConfig::default();

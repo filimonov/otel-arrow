@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fuzz-style property tests for the canonical encoder and CBOR decoder (spec section 9.3).
+//! Fuzz-style property tests for the canonical encoder and CBOR decoder (FORMAT.md section 1).
 
 use otel_arrow_dfe_series_lake::canonical::{Descriptor, Signal, canonical_bytes, series_id};
 use otel_arrow_dfe_series_lake::value::{DecodeLimits, Value, decode_cbor, sort_kvlist};

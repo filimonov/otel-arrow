@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fuzz-style property tests for extraction (spec section 9.3).
+//! Fuzz-style property tests for extraction (FORMAT.md sections 1 and 2).
 //!
 //! The generators cover every `AnyValue` variant, including the unset value,
 //! empty strings and byte strings, both zeros, subnormals, the integer extremes
@@ -473,7 +473,7 @@ fn default_valued_attribute_differs_from_an_unset_or_absent_one() {
 /// Scenario: the two signed zeros as an attribute value, through the real extraction
 /// path rather than the canonical encoder alone.
 /// Guarantees: they share one series id, because the sign of a zero cannot survive OTAP
-/// transport and the canonical encoding normalizes -0.0 to +0.0 (spec section 4).
+/// transport and the canonical encoding normalizes -0.0 to +0.0 (FORMAT.md section 1).
 #[test]
 fn both_signed_zeros_share_one_identity() {
     assert_eq!(

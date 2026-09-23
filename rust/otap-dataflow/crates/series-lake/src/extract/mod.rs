@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Extraction of descriptors and values from OTAP records (spec section 6.2 step 4).
+//! Extraction of descriptors and values from OTAP records (FORMAT.md
+//! sections 1 to 3).
 
 pub mod logs;
 pub mod metrics;
@@ -138,8 +139,8 @@ pub struct ExtractStats {
     pub dropped_summary: u64,
     /// Mismatches keyed only by configured physical column name.
     ///
-    /// Bounded by the number of configured denormalize columns (spec 6.2 step
-    /// 4 fixes that set at startup), never by request content: the key is
+    /// Bounded by the number of configured denormalize columns (the
+    /// configuration fixes that set at startup), never by request content: the key is
     /// always one of `cfg.logs.denormalize`/`cfg.metrics.denormalize`'s
     /// `column` names, so no attacker-controlled label can grow this map.
     pub denorm_type_mismatch_by_column: std::collections::BTreeMap<String, u64>,
@@ -175,8 +176,8 @@ pub struct Extracted {
 /// Extract descriptors and values from one OTAP request.
 ///
 /// Takes `&mut` because OTAP attribute batches carry quasi-delta encoded
-/// `parent_id` columns: spec section 6.2 step 3 requires
-/// `decode_transport_optimized_ids` before any `parent_id` is read. Decoding is
+/// `parent_id` columns, which `decode_transport_optimized_ids` must decode
+/// before any `parent_id` is read. Decoding is
 /// idempotent, so a request whose ids are already plain is unaffected.
 ///
 /// `cfg.ingress.max_extracted_bytes` is enforced on the measured extracted
@@ -201,7 +202,7 @@ pub fn extract(records: &mut OtapArrowRecords, cfg: &LakeConfig) -> Result<Extra
     }
 }
 
-/// The single byte accountant of one request (spec section 6.2 step 4).
+/// The single byte accountant of one request.
 ///
 /// One `Budget` is created in [`extract`] and threaded through every descriptor
 /// row and every values row, so that a request with many small datasets cannot
@@ -284,7 +285,8 @@ pub(crate) fn denorm_bytes(v: &Option<DenormValue>) -> usize {
     }
 }
 
-/// Spec 5.1 timestamp rule on the converted `i64` nanoseconds.
+/// The timestamp rule of FORMAT.md section 2, on the converted `i64`
+/// nanoseconds.
 pub(crate) fn timestamp_pair(ns: i64, stats: &mut ExtractStats) -> (Option<i64>, Option<i64>) {
     if ns == 0 {
         (None, None)
@@ -543,8 +545,8 @@ fn append_list<B: 'static, T>(
 /// Accumulates rows of one dataset into slices of at most `run_target_bytes`.
 ///
 /// The slice is sealed *before* appending a row that would take it past
-/// `run_target_bytes`, so a sealed slice never exceeds the target (spec 6.2
-/// step 4). Row and request limits are enforced by the shared [`Budget`], which
+/// `run_target_bytes`, so a sealed slice never exceeds the target. Row and
+/// request limits are enforced by the shared [`Budget`], which
 /// every dataset of the request shares.
 pub(crate) struct RowSink {
     schema: SchemaRef,

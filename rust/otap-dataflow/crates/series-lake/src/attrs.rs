@@ -331,7 +331,7 @@ fn payload_bytes(value: &Value) -> usize {
 ///
 /// The column is read through its dictionary, when it has one, rather than
 /// cast. A null `parent_id` is malformed input, not parent 0: refuse it
-/// rather than silently attributing the row to the first parent (spec 9.3).
+/// rather than silently attributing the row to the first parent.
 fn read_parent_ids(batch: &RecordBatch) -> Result<Vec<u32>> {
     let col = batch
         .column_by_name(PARENT_ID)

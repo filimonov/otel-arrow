@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Canonical encoding v1 and series identity (spec section 4).
+//! Canonical encoding v1 and series identity (FORMAT.md section 1).
 
 use std::sync::Arc;
 
@@ -333,7 +333,7 @@ mod tests {
 
     /// Scenario: negative zero and positive zero as attribute values.
     /// Guarantees: both hash identically. The sign of a zero does not survive
-    /// OTAP conversion, so it must not reach the identity (spec section 4).
+    /// OTAP conversion, so it must not reach the identity (FORMAT.md section 1).
     #[test]
     fn negative_zero_is_canonicalized() {
         let mut a = logs_desc();

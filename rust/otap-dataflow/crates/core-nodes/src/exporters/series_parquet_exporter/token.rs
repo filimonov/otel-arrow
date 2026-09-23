@@ -50,7 +50,7 @@ impl AckToken {
     ///
     /// The transport headers and the authorization claims derived from them
     /// are dropped here rather than staying resident for as long as the
-    /// exporter holds the token (spec section 7).
+    /// exporter holds the token.
     pub(super) fn split(data: OtapPdata) -> (Self, OtapPayload) {
         let (mut context, payload) = data.into_parts();
         let _ = context.take_transport_headers();

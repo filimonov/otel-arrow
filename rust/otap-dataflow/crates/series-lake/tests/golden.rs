@@ -154,7 +154,7 @@ fn golden_vectors_match() {
 /// series id, so the sign of a zero never reaches the identity. OTAP drops a
 /// value column whose entries are all zero, so the sign does not survive
 /// conversion and an identity that depended on it would change with request
-/// batching (spec section 4).
+/// batching (FORMAT.md section 1).
 #[test]
 fn zero_sign_does_not_change_identity() {
     let raw = include_str!("golden/canonical_v1.json");

@@ -272,7 +272,7 @@ fn deviating_vectors() -> Vec<String> {
 /// run through the real extraction path.
 /// Guarantees: the converted representation produces exactly the `series_id` the
 /// independent Python generator recorded, for every vector, so conversion is
-/// identity preserving (spec sections 4 and 9.1).
+/// identity preserving (FORMAT.md section 1; README.md, "Testing").
 #[test]
 fn all_golden_vectors_survive_otlp_to_otap_conversion() {
     assert_eq!(

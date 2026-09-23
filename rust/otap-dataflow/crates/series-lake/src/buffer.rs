@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sorted run buffers and the ACTIVE/FLUSHING block (spec sections 6.1 to 6.3).
+//! Sorted run buffers and the ACTIVE/FLUSHING block (series_parquet exporter
+//! README, "Memory model").
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -330,7 +331,7 @@ impl Block {
         }
     }
 
-    /// Compute what admitting `extracted` would add (spec section 6.2 step 5).
+    /// Compute what admitting `extracted` would add.
     ///
     /// Refuses before touching anything:
     /// * `RequestTooLarge` when the request's worst case -- every descriptor
@@ -422,8 +423,7 @@ impl Block {
         })
     }
 
-    /// Admit a reserved request, materializing series rows with a zero stamp
-    /// (spec section 6.2 step 6).
+    /// Admit a reserved request, materializing series rows with a zero stamp.
     ///
     /// Descriptor rows become Arrow series rows here, in bounded sorted runs,
     /// with `emitted_at` left at zero until the block seals. Values batches
@@ -505,7 +505,7 @@ impl Block {
     /// swaps succeed.
     ///
     /// Idempotent: a flush retry re-seals the same block and keeps the first
-    /// stamp, so the file bytes are identical across attempts (spec 5.3).
+    /// stamp, so the file bytes are identical across attempts (FORMAT.md section 4).
     ///
     /// All or nothing. Every replacement batch is prepared before any retained
     /// batch is touched, so a failure leaves every batch, the accounting and the

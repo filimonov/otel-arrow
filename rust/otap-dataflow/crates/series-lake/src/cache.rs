@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bounded LRU of series ids to the partition their descriptor was last
-//! committed to. Losing entries only causes descriptor re-emission
-//! (spec invariant 3).
+//! committed to. The cache is an optimization, never correctness state:
+//! losing entries only causes descriptor re-emission.
 
 use std::num::NonZeroUsize;
 

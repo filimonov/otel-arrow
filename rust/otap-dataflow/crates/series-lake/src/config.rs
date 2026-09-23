@@ -1,7 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Format configuration types (spec section 7.4, crate-relevant subset).
+//! Format configuration types: the lake subset of the series_parquet
+//! exporter's configuration (its README, "Configuration").
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -240,7 +241,7 @@ impl Default for SignalConfig {
     }
 }
 
-/// Request budgets (spec section 6.2).
+/// Request budgets (series_parquet exporter README, "Configuration").
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IngressLimits {
@@ -261,12 +262,12 @@ pub struct IngressLimits {
     pub max_row_bytes: usize,
     /// Nested value depth limit.
     pub max_nesting_depth: usize,
-    /// Retained-bytes limit of one block (spec section 6.1).
+    /// Retained-bytes limit of one block.
     #[serde(deserialize_with = "byte_size")]
     pub max_block_bytes: usize,
-    /// Ack tokens (requests) one block may hold (spec section 6.1).
+    /// Ack tokens (requests) one block may hold.
     pub max_requests_per_block: usize,
-    /// Fixed bytes charged per `pending_series` entry (spec section 6.1).
+    /// Fixed bytes charged per `pending_series` entry.
     #[serde(deserialize_with = "byte_size")]
     pub pending_series_entry_bytes: usize,
 }
@@ -318,7 +319,7 @@ pub struct UploadConfig {
     pub part_bytes: usize,
     /// In-flight parts.
     pub concurrency: usize,
-    /// Upper bound on a best-effort multipart abort (spec section 6.5).
+    /// Upper bound on a best-effort multipart abort.
     #[serde(with = "humantime_serde")]
     pub abort_timeout: Duration,
 }
@@ -467,7 +468,8 @@ impl LakeConfig {
         2 * 64 * columns + 8 + self.ingress.pending_series_entry_bytes
     }
 
-    /// Validate cross-field constraints (spec sections 5.2, 6.2, 7.4).
+    /// Validate cross-field constraints (FORMAT.md section 3 for the
+    /// denormalization rules).
     ///
     /// Rules enforced: `writer_id` is non-empty and made of `[A-Za-z0-9_.]`
     /// only (it is interpolated into the file-name segment of
