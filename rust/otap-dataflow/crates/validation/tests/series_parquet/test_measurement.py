@@ -4110,6 +4110,83 @@ class HarnessHygieneContracts(unittest.TestCase):
                        "series-test-access", "series-test-secret-12345"):
             self.assertNotIn(leaked, text)
 
+    # Scenario: host paths written as `file://` URLs, a remote URL whose path
+    # merely looks like a host path, and a one-letter MinIO user name that a
+    # log line also quotes beside words containing the same letter.
+    # Guarantees: the `scheme://` form loses its host path like a bare path,
+    # a remote authority's path and a name that only starts like a root are
+    # kept, a second scrub changes nothing, and a short credential is removed
+    # wherever it stands as a whole token while every other word is intact.
+    def test_url_paths_and_short_credentials_are_scrubbed(self):
+        document = {
+            "store": "file:///tmp/secret/objects",
+            "home": "file:///home/alice/lake",
+            "remote": "http://example.com/tmp/page",
+            "tmpdir": "/tmp/tmpabc123",
+            "nested": "/tmp/run/data",
+            "lookalike": "/tmpfs-is-not-a-root",
+            "argv": ["-e", "MINIO_ROOT_USER=u", "-e", "MINIO_ROOT_PASSWORD=p"],
+            "tail": "user u signed in, ubuntu saw u's p key; up",
+        }
+        scrubbed = measurement.scrub_published(
+            document, repo_root="/nowhere/repo", home="/nowhere/home"
+        )
+        self.assertEqual(scrubbed["store"], "file://<host-path>/objects")
+        self.assertEqual(scrubbed["home"], "file://<host-path>/lake")
+        self.assertEqual(scrubbed["remote"], document["remote"])
+        self.assertEqual(scrubbed["tmpdir"], "<host-path>/tmpabc123")
+        self.assertEqual(scrubbed["nested"], "<host-path>/data")
+        self.assertEqual(scrubbed["lookalike"], "/tmpfs-is-not-a-root")
+        self.assertEqual(
+            measurement.scrub_published(
+                scrubbed, repo_root="/nowhere/repo", home="/nowhere/home"
+            ),
+            scrubbed,
+            "the scrub is idempotent, so publication can verify it",
+        )
+        self.assertIn("MINIO_ROOT_USER=<redacted>", scrubbed["argv"])
+        self.assertEqual(
+            scrubbed["tail"],
+            "user <redacted> signed in, ubuntu saw <redacted>'s <redacted> key; up",
+        )
+
+    # Scenario: a published tree -- an index and one child result -- was
+    # written before the scrub and carries a /tmp path and a credential; it
+    # is offered for publication, then rescrubbed in place, then offered
+    # again.
+    # Guarantees: publication refuses the unscrubbed tree; `rescrub_tree`
+    # removes the path and the credential from both files, recomputes the
+    # child's hash and size in the index so the tree verifies, reports both
+    # files as changed, and the rescrubbed tree then publishes.
+    def test_a_published_tree_is_rescrubbed_hash_consistently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "artifacts"
+            report = Path(directory) / "report"
+            child = measurement.write_json_atomic(
+                root / "child.json",
+                {"log": "/tmp/series-launcher/legacy-e2e.log",
+                 "auth": {"secret_access_key": "series-test-secret-12345"}},
+            )
+            index = measurement.write_json_atomic(
+                root / "index.json",
+                {"legacy": {"log": "/tmp/series-launcher/legacy-e2e.log"},
+                 "run_files": [measurement.file_entry(child)]},
+            )
+            with self.assertRaisesRegex(AssertionError, "host path or a credential"):
+                measurement.publish_result_tree(index, report)
+            changed = measurement.rescrub_tree(index)
+            self.assertEqual(sorted(changed), ["child.json", "index.json"])
+            for path in (child, index):
+                text = path.read_text(encoding="ascii")
+                self.assertNotIn("/tmp/", text)
+                self.assertNotIn("series-test-secret-12345", text)
+            entry = json.loads(index.read_text(encoding="ascii"))["run_files"][0]
+            self.assertEqual(entry["sha256"], measurement.file_digest(child))
+            self.assertEqual(entry["size_bytes"], child.stat().st_size)
+            published = measurement.publish_result_tree(index, report)
+            self.assertTrue(published.is_file())
+            self.assertEqual(measurement.rescrub_tree(published), [])
+
     # Scenario: a result is written through `write_result` from a document
     # holding this host's real repository path and a static secret.
     # Guarantees: the file on disk holds neither, so no published result

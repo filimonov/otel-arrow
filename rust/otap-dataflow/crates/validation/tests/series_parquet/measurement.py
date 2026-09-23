@@ -3358,10 +3358,18 @@ CREDENTIAL_ASSIGNMENT = re.compile(
 # An absolute path under a directory that names the host, its users or its
 # scratch space. Everything up to the final component is replaced, so the
 # file a path named stays recognisable and the value is stable across hosts.
+#
+# A path is taken where it starts a token, and also right after a URL's
+# `scheme://`, so `file:///tmp/x` loses its host path too; a URL whose
+# authority names a remote host (`http://host/tmp/x`) is left alone.
 HOST_PATH = re.compile(
-    r"(?<![A-Za-z0-9_.:/-])/(?:home|Users|root|srv|tmp|var|opt|mnt|data|run|media)"
+    r"(?:(?<=://)|(?<![A-Za-z0-9_.:/>-]))"
+    r"/(?:home|Users|root|srv|tmp|var|opt|mnt|data|run|media)"
+    r"(?=/|$|[\s\"',;])"
     r"(?:/[^\s\"',;:/]+)*/?"
 )
+# Word characters for the token boundary of a short credential value.
+WORD_CHAR = r"A-Za-z0-9_"
 
 
 def scrub_published(value, *, repo_root=None, home=None):
@@ -3420,8 +3428,19 @@ def scrub_published(value, *, repo_root=None, home=None):
         """One string with every host path and credential replaced."""
         item = CREDENTIAL_ASSIGNMENT.sub(lambda m: f"{m.group(1)}={REDACTED}", item)
         for secret in sorted(secrets, key=len, reverse=True):
-            if secret != REDACTED and len(secret) >= 4:
+            if secret == REDACTED:
+                continue
+            if len(secret) >= 4:
                 item = item.replace(secret, REDACTED)
+            else:
+                # A short value is removed only as a whole token, so a
+                # one-letter user name is scrubbed from a log line without
+                # shredding every word that contains the letter.
+                item = re.sub(
+                    rf"(?<![{WORD_CHAR}]){re.escape(secret)}(?![{WORD_CHAR}])",
+                    REDACTED,
+                    item,
+                )
         for root, token in roots:
             item = item.replace(root, token)
         return HOST_PATH.sub(host_path, item)
@@ -4476,6 +4495,17 @@ def publish_result_tree(index_path, report_dir=None) -> Path:
     index_path = Path(index_path)
     report_dir = resolve_report_dir(report_dir)
     entries = enumerate_tree(index_path, fallback=report_dir)
+    # Every published file is checked here, not only the ones this run
+    # wrote: an advancing index enumerates the index it replaces, and that
+    # older evidence may predate the scrub. Nothing that still carries a
+    # host path or a credential is published.
+    for name, source in entries:
+        document = json.loads(source.read_text(encoding="ascii"))
+        if scrub_published(document) != document:
+            raise AssertionError(
+                f"{source} still carries a host path or a credential; scrub "
+                f"it with `measure rescrub --index` before publishing"
+            )
     report_dir.mkdir(parents=True, exist_ok=True)
     for name, source in entries:
         destination = report_dir / name
@@ -4505,6 +4535,38 @@ def publish_result_tree(index_path, report_dir=None) -> Path:
                 )
         _ = shutil.copyfile(source, destination)
     return report_dir / index_path.name
+
+
+def rescrub_tree(index_path) -> list:
+    """Scrub one published evidence tree in place, keeping it hash-consistent.
+
+    The tree's hashes are verified first, as for publication. Every file is
+    then rewritten through `scrub_published`, children before the documents
+    that reference them, and each reference's `sha256` and `size_bytes` is
+    recomputed from the rewritten child, so the index and its children stay
+    consistent. The tree is verified again at the end. Returns the names of
+    the files whose content changed.
+    """
+    index_path = Path(index_path)
+    entries = enumerate_tree(index_path)
+    paths = dict(entries)
+    changed = []
+    # Enumeration names a parent before its children, so the reverse order
+    # rewrites every child before any document that hashes it.
+    for name, path in reversed(entries):
+        before = path.read_bytes()
+        document = scrub_published(json.loads(before.decode("ascii")))
+        for field in ("run_files", "baseline_files", "child_indexes"):
+            for entry in document.get(field, []) or []:
+                if isinstance(entry, dict) and entry.get("name") in paths:
+                    child = paths[entry["name"]]
+                    entry["sha256"] = file_digest(child)
+                    entry["size_bytes"] = child.stat().st_size
+        _ = write_json_atomic(path, document)
+        if path.read_bytes() != before:
+            changed.append(name)
+    _ = enumerate_tree(index_path)
+    return changed
 
 
 def archive_published_index(index_name, output_dir, report_dir=None):

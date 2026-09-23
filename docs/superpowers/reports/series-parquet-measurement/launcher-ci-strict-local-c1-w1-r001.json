@@ -4,21 +4,21 @@
     {
       "kind": "engine_log",
       "name": "engine.log",
-      "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-strict-local-c1-w1-r001",
       "sha256": "dfbe32ce6b5dcaaff36b449bf8e0c24a19b57fdd7bacdfd431d2c07dc5db26e6",
       "size_bytes": 4656
     },
     {
       "kind": "engine_config",
       "name": "pipeline.yaml",
-      "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-strict-local-c1-w1-r001",
       "sha256": "e7f236957444466bba46c5c680b5932dbbfc75ef9093e40b71c6c007589f24b1",
       "size_bytes": 2559
     },
     {
       "kind": "ledger",
       "name": "ledger.sqlite",
-      "retention": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-strict-local-c1-w1-r001",
       "sha256": "b5c5df3d380bb29860bcf35ead40231f72c31f495ccb375987f6f3befbf2eb73",
       "size_bytes": 3325952
     }
@@ -78,7 +78,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
       "kind": "hard",
       "name": "host_lease_held",
       "status": "passed"
@@ -192,7 +192,7 @@
                     },
                     "storage": {
                       "file": {
-                        "base_uri": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001/engine-1/data"
+                        "base_uri": "<host-path>/data"
                       }
                     },
                     "unsupported": "reject",
@@ -274,7 +274,7 @@
   "environment": {
     "build": {
       "allocator": "jemalloc",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/df_engine",
+      "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
       "binary_sha256": "2b678bcb6715cb7dfeee683a724aa484a618685f25644bd3f180e81984f674f5",
       "binary_size_bytes": 762526208,
       "features": "default,series_parquet,aws,durable-buffer",
@@ -1190,7 +1190,7 @@
     "lease": {
       "acquired_utc": "2026-09-22T16:41:54Z",
       "owner": "3599249-4bc1849c85b341e4b9ac818e05b60f13",
-      "path": "/tmp/series-parquet-host-measurement.lock",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
       "pid": 3599249,
       "released_utc": "2026-09-22T16:42:01Z",
       "run_id": "launcher-ci-strict-local-c1-w1-r001"
@@ -2360,7 +2360,7 @@
     ]
   },
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
-  "run_dir": "/tmp/series-launcher/launcher-ci-strict-local-c1-w1-r001",
+  "run_dir": "<host-path>/launcher-ci-strict-local-c1-w1-r001",
   "run_files": [],
   "run_id": "launcher-ci-strict-local-c1-w1-r001",
   "samples": [

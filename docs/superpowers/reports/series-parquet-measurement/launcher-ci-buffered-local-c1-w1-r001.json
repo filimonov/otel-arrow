@@ -4,35 +4,35 @@
     {
       "kind": "engine_log",
       "name": "engine.log",
-      "retention": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
       "sha256": "6994474f4f46370b62024368370aee8191623e5a1b307c04f0776125db61753d",
       "size_bytes": 7678
     },
     {
       "kind": "engine_config",
       "name": "pipeline.yaml",
-      "retention": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
       "sha256": "424e647749ad08d57c2ea4d81f0d1b8af3440086f194452dee6cbcf757150214",
       "size_bytes": 2925
     },
     {
       "kind": "engine_log",
       "name": "engine.log",
-      "retention": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
       "sha256": "594d974e1d0780255007fc3b86e9a4b6239715c0fc40c428af609d82cf1ec2e2",
       "size_bytes": 8067
     },
     {
       "kind": "engine_config",
       "name": "pipeline.yaml",
-      "retention": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
       "sha256": "3ccf8026ff4e9cb3a755fb082d8a8aba8c1edfd67d011b97b7d7a025a5d73341",
       "size_bytes": 2925
     },
     {
       "kind": "ledger",
       "name": "ledger.sqlite",
-      "retention": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+      "retention": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
       "sha256": "a7f8ea4b0aa2bfc8492d067b315d5f5148b3d6de96d178fa424cbf02e6b1d361",
       "size_bytes": 4096000
     }
@@ -62,7 +62,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer -> /tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer; per-core directories ['core_1']",
+      "detail": "<host-path>/buffer -> <host-path>/buffer; per-core directories ['core_1']",
       "kind": "hard",
       "name": "buffer_path_retained",
       "status": "passed"
@@ -104,7 +104,7 @@
       "status": "passed"
     },
     {
-      "detail": "/tmp/series-parquet-host-measurement.lock",
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
       "kind": "hard",
       "name": "host_lease_held",
       "status": "passed"
@@ -171,7 +171,7 @@
                   "config": {
                     "max_age": null,
                     "otlp_handling": "pass_through",
-                    "path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer",
+                    "path": "<host-path>/buffer",
                     "retention_size_cap": "1GiB",
                     "size_cap_policy": "backpressure"
                   },
@@ -236,7 +236,7 @@
                     },
                     "storage": {
                       "file": {
-                        "base_uri": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/engine-1/data"
+                        "base_uri": "<host-path>/data"
                       }
                     },
                     "unsupported": "reject",
@@ -323,7 +323,7 @@
                   "config": {
                     "max_age": null,
                     "otlp_handling": "pass_through",
-                    "path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer",
+                    "path": "<host-path>/buffer",
                     "retention_size_cap": "1GiB",
                     "size_cap_policy": "backpressure"
                   },
@@ -388,7 +388,7 @@
                     },
                     "storage": {
                       "file": {
-                        "base_uri": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/engine-1/data"
+                        "base_uri": "<host-path>/data"
                       }
                     },
                     "unsupported": "reject",
@@ -470,7 +470,7 @@
   "environment": {
     "build": {
       "allocator": "jemalloc",
-      "binary": "/home/mfilimonov/workspace/otel-arrow/rust/otap-dataflow/target/release/df_engine",
+      "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
       "binary_sha256": "2b678bcb6715cb7dfeee683a724aa484a618685f25644bd3f180e81984f674f5",
       "binary_size_bytes": 762526208,
       "features": "default,series_parquet,aws,durable-buffer",
@@ -2242,7 +2242,7 @@
     "lease": {
       "acquired_utc": "2026-09-22T16:42:01Z",
       "owner": "3599249-57607a9d71bc41709675b1211a2a26ea",
-      "path": "/tmp/series-parquet-host-measurement.lock",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
       "pid": 3599249,
       "released_utc": "2026-09-22T16:42:07Z",
       "run_id": "launcher-ci-buffered-local-c1-w1-r001"
@@ -3215,7 +3215,7 @@
         "answered_epochs_by_worker": {
           "default/main/core1": 3
         },
-        "buffer_path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer",
+        "buffer_path": "<host-path>/buffer",
         "config_sha256": "424e647749ad08d57c2ea4d81f0d1b8af3440086f194452dee6cbcf757150214",
         "cores": [
           1
@@ -3319,7 +3319,7 @@
         "answered_epochs_by_worker": {
           "default/main/core1": 3
         },
-        "buffer_path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer",
+        "buffer_path": "<host-path>/buffer",
         "config_sha256": "3ccf8026ff4e9cb3a755fb082d8a8aba8c1edfd67d011b97b7d7a025a5d73341",
         "cores": [
           1
@@ -3454,7 +3454,7 @@
       "device": 50,
       "exists": true,
       "inode": 506667,
-      "path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer"
+      "path": "<host-path>/buffer"
     },
     "buffer_before": {
       "cores": {
@@ -3473,13 +3473,13 @@
       "device": 50,
       "exists": true,
       "inode": 506667,
-      "path": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001/buffer"
+      "path": "<host-path>/buffer"
     },
     "pid": 3625850,
     "previous_pid": 3625762
   },
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
-  "run_dir": "/tmp/series-launcher/launcher-ci-buffered-local-c1-w1-r001",
+  "run_dir": "<host-path>/launcher-ci-buffered-local-c1-w1-r001",
   "run_files": [],
   "run_id": "launcher-ci-buffered-local-c1-w1-r001",
   "samples": [

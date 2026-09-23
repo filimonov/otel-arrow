@@ -1292,6 +1292,11 @@ def build_parser() -> argparse.ArgumentParser:
         "stage-results", help="git add one published evidence tree"
     )
     _ = stage.add_argument("--index", required=True, type=Path)
+    rescrub = sub.add_parser(
+        "rescrub",
+        help="scrub one published evidence tree in place and re-hash it",
+    )
+    _ = rescrub.add_argument("--index", required=True, type=Path)
     for name in PLANNED_COMMANDS:
         planned = sub.add_parser(
             name, help=f"{name}: implemented by a later task of this plan"
@@ -1313,6 +1318,10 @@ def main(argv=None) -> int:
             "SERIES_MEASURE_LONG=1 to opt in\n"
         )
         return 2
+    if arguments.command == "rescrub":
+        for name in measurement.rescrub_tree(arguments.index):
+            sys.stderr.write(f"rescrubbed {name}\n")
+        return 0
     if arguments.command == "stage-results":
         measurement.stage_run_files(arguments.index)
         return 0
