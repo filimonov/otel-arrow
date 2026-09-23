@@ -149,6 +149,8 @@ dev-tools = []
 
 [dev-dependencies]
 arrow-ipc.workspace = true
+# The series_parquet tests capture the WARN events a failure must emit.
+tracing = { workspace = true, features = ["std"] }
 serde_yaml.workspace = true
 arrow-schema.workspace = true
 fluke-hpack.workspace = true

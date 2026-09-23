@@ -319,37 +319,15 @@ async fn write_until(
 
 /// Log one failed write attempt at WARN, retried or not.
 ///
-/// The only place the per-attempt WARN is emitted. Test builds also record
-/// what was logged, per thread, because a test cannot observe tracing events
-/// reliably while other tests run beside it.
+/// The only place the per-attempt WARN is emitted.
 fn log_failed_attempt(attempt: u64, file: &str, error: &lake::Error) {
-    let retryable = retryable(error);
     otel_warn!(
         "series_parquet.flush_attempt_failed",
         attempt = attempt,
         file = file,
-        retryable = retryable,
+        retryable = retryable(error),
         error = %error
     );
-    #[cfg(test)]
-    LOGGED_ATTEMPTS.with(|logged| {
-        logged
-            .borrow_mut()
-            .push((attempt, retryable, error.to_string()));
-    });
-}
-
-#[cfg(test)]
-thread_local! {
-    /// The attempts [`log_failed_attempt`] logged on this thread.
-    static LOGGED_ATTEMPTS: std::cell::RefCell<Vec<(u64, bool, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Take the attempts logged on this thread since the last call.
-#[cfg(test)]
-pub(super) fn take_logged_attempts() -> Vec<(u64, bool, String)> {
-    LOGGED_ATTEMPTS.with(|logged| std::mem::take(&mut *logged.borrow_mut()))
 }
 
 /// The outcome of a flush whose retry deadline expired.

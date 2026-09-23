@@ -81,28 +81,6 @@ const FIXED_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
 /// Shortest interval between two per-request refusal WARN lines.
 const REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// One refusal WARN as a test observes it: the outcome, the signal, and the
-/// setting, observed size and limit of a size refusal.
-#[cfg(test)]
-pub(super) type LoggedRefusal = (
-    Outcome,
-    otel_arrow_dfe_config::SignalType,
-    Option<(&'static str, Option<usize>, usize)>,
-);
-
-#[cfg(test)]
-thread_local! {
-    /// The refusal WARNs written on this thread.
-    static LOGGED_REFUSALS: std::cell::RefCell<Vec<LoggedRefusal>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Take the refusal WARNs written on this thread since the last call.
-#[cfg(test)]
-pub(super) fn take_logged_refusals() -> Vec<LoggedRefusal> {
-    LOGGED_REFUSALS.with(|logged| std::mem::take(&mut *logged.borrow_mut()))
-}
-
 /// Rate limit of the per-request refusal WARN.
 ///
 /// A producer that keeps sending a request this node refuses would otherwise
@@ -758,26 +736,26 @@ impl Worker {
         let outcome = failure.outcome();
         let sentence = failure.sentence();
         if let Some(suppressed) = self.refusals.admit(clock::now()) {
+            // Sizes are recorded as numbers, and an absent one is not
+            // recorded at all, so telemetry never has to parse them back out
+            // of a string.
             let excess = failure.excess();
-            let (setting, observed, limit) = match excess {
-                Some((setting, observed, limit)) => (setting, observed, Some(limit)),
-                None => ("", None, None),
-            };
+            let setting = excess.map(|(setting, _, _)| setting);
+            let observed = excess
+                .and_then(|(_, observed, _)| observed)
+                .map(|n| n as u64);
+            let limit = excess.map(|(_, _, limit)| limit as u64);
             otel_warn!(
                 "series_parquet.request_failed",
                 outcome = outcome.reason(),
                 signal = ?token.signal(),
                 limit_setting = setting,
-                observed_bytes = ?observed,
-                limit_bytes = ?limit,
+                observed_bytes = observed,
+                limit_bytes = limit,
                 reason = %sentence,
                 error = %failure.error(),
                 suppressed = suppressed
             );
-            #[cfg(test)]
-            LOGGED_REFUSALS.with(|logged| {
-                logged.borrow_mut().push((outcome, token.signal(), excess));
-            });
         }
         self.notify.push_with(token, outcome, Some(sentence.into()));
     }

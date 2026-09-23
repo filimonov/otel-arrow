@@ -1549,14 +1549,23 @@ async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
 
 /// Scenario: one request is refused by the extraction budget and, on a second
 /// worker, one by the block budget.
-/// Guarantees: each refusal WARN names the setting that refused it, the size
-/// observed against it and the limit, and the reason sentence the producer is
-/// told states the same size and limit, at both stages, so an operator can
-/// see how far over which budget a producer is without reproducing the
-/// request.
+/// Guarantees: each refusal is logged at WARN as
+/// `series_parquet.request_failed`, with the setting that refused it, the
+/// size observed against it and the limit as numbers, and the reason sentence
+/// the producer is told states the same size and limit, at both stages, so an
+/// operator can see how far over which budget a producer is without
+/// reproducing the request.
 #[tokio::test(flavor = "current_thread")]
 async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
-    let _ = super::worker::take_logged_refusals();
+    let events = capture();
+    /// The one refusal WARN logged since `before` events were recorded.
+    fn refusal(events: &Capture, before: usize) -> CapturedEvent {
+        let logged = events.named("series_parquet.request_failed");
+        assert_eq!(logged.len(), before + 1, "{logged:?}");
+        let event = logged[before].clone();
+        assert_eq!(event.level, tracing::Level::WARN);
+        event
+    }
     let wall = Arc::new(lake::clock::TestWallClock::new(0));
     let store = Arc::new(object_store::memory::InMemory::new());
 
@@ -1569,15 +1578,18 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     );
     extract.cfg.lake.ingress.max_extracted_bytes = 100;
     extract.admit(logs_pdata());
-    let logged = super::worker::take_logged_refusals();
-    assert_eq!(logged.len(), 1, "{logged:?}");
-    let (outcome, signal, excess) = logged[0];
-    assert_eq!(outcome, Outcome::TooLarge);
-    assert_eq!(signal, SignalType::Logs);
-    let (setting, observed, limit) = excess.expect("a size refusal");
-    assert_eq!(setting, "ingress.max_extracted_bytes");
-    assert_eq!(limit, 100);
-    let observed = observed.expect("extraction measured the request");
+    let event = refusal(&events, 0);
+    let field = |name: &str| event.fields.get(name).cloned();
+    assert_eq!(field("outcome"), Some(FieldValue::Str("too_large".into())));
+    assert_eq!(field("signal"), Some(FieldValue::Debug("Logs".into())));
+    assert_eq!(
+        field("limit_setting"),
+        Some(FieldValue::Str("ingress.max_extracted_bytes".into()))
+    );
+    assert_eq!(field("limit_bytes"), Some(FieldValue::U64(100)));
+    let Some(FieldValue::U64(observed)) = field("observed_bytes") else {
+        panic!("observed_bytes is a number: {event:?}");
+    };
     assert!(observed > 100, "{observed}");
     extract
         .notify
@@ -1602,12 +1614,18 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     cfg.lake.ingress.max_block_bytes = 1;
     let mut block = Worker::new(cfg, store, wall, handler);
     block.admit(logs_pdata());
-    let logged = super::worker::take_logged_refusals();
-    assert_eq!(logged.len(), 1, "{logged:?}");
-    let (setting, observed, limit) = logged[0].2.expect("a size refusal");
-    assert_eq!(setting, "window.max_block_bytes");
-    assert_eq!(limit, 1);
-    assert!(observed.is_some_and(|n| n > 1), "{observed:?}");
+    let event = refusal(&events, 1);
+    let field = |name: &str| event.fields.get(name).cloned();
+    assert_eq!(
+        field("limit_setting"),
+        Some(FieldValue::Str("window.max_block_bytes".into()))
+    );
+    assert_eq!(field("limit_bytes"), Some(FieldValue::U64(1)));
+    assert!(
+        matches!(field("observed_bytes"), Some(FieldValue::U64(n)) if n > 1),
+        "{event:?}"
+    );
+    drop(events);
 }
 
 /// Scenario: refusals arrive in a burst, then after a pause of the log
@@ -3656,9 +3674,11 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
 /// attempt in `flush.retries`, and nacks the block retryably with the
 /// destination's last error in the reason, so an outage is visible to the
 /// producer and to the operator with its cause rather than as a bare
-/// "cancelled" with zero retries.
+/// "cancelled" with zero retries. Each of the two attempts that returned is
+/// logged at WARN as retryable with its attempt number and the store's error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
+    let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
             let sim = clock::SimClock::new();
@@ -3726,6 +3746,27 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             drop(ticker);
         })
         .await;
+    let logged = events.named("series_parquet.flush_attempt_failed");
+    assert_eq!(
+        logged.len(),
+        2,
+        "two attempts returned a failure: {logged:?}"
+    );
+    for (index, event) in logged.iter().enumerate() {
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            event.fields.get("attempt"),
+            Some(&FieldValue::U64(index as u64 + 1))
+        );
+        assert_eq!(event.fields.get("retryable"), Some(&FieldValue::Bool(true)));
+        assert!(
+            event
+                .fields
+                .get("error")
+                .is_some_and(|error| error.text().contains("injected store failure")),
+            "{event:?}"
+        );
+    }
 }
 
 /// Scenario: an encoding bug and a storage I/O error arrive as the same lake
@@ -3776,6 +3817,163 @@ fn retry_classifier_distinguishes_encoding_from_storage() {
     )));
 }
 
+/// A recorded tracing field value, keeping the type it was recorded with.
+#[derive(Debug, Clone, PartialEq)]
+enum FieldValue {
+    U64(u64),
+    I64(i64),
+    Bool(bool),
+    Str(String),
+    /// A value recorded through `Debug` or `Display` (`?x` or `%x`).
+    Debug(String),
+}
+
+impl FieldValue {
+    /// The text of a string, debug or display value.
+    fn text(&self) -> &str {
+        match self {
+            FieldValue::Str(s) | FieldValue::Debug(s) => s,
+            _ => "",
+        }
+    }
+}
+
+/// One event recorded by [`capture`]: its level, name and typed fields.
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    level: tracing::Level,
+    name: String,
+    fields: std::collections::BTreeMap<String, FieldValue>,
+}
+
+std::thread_local! {
+    /// Events recorded on this thread while a [`Capture`] is alive.
+    static CAPTURED: std::cell::RefCell<Option<Vec<CapturedEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The process-wide test subscriber behind [`capture`].
+///
+/// Installed once, globally, rather than per test: a per-test scoped
+/// subscriber races the global callsite cache, because a callsite that a
+/// concurrently running test registers first is cached as uninteresting to a
+/// subscriber it did not see yet. Every callsite is registered here as
+/// `sometimes`, so `enabled` is asked per event, and it records only on a
+/// thread that holds a [`Capture`] -- which is what keeps parallel tests out
+/// of each other's records.
+struct GlobalCapture;
+
+impl tracing::Subscriber for GlobalCapture {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        CAPTURED
+            .try_with(|captured| captured.try_borrow().is_ok_and(|c| c.is_some()))
+            .unwrap_or(false)
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(std::collections::BTreeMap<String, FieldValue>);
+        impl tracing::field::Visit for Fields {
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                let _ = self
+                    .0
+                    .insert(field.name().to_owned(), FieldValue::U64(value));
+            }
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                let _ = self
+                    .0
+                    .insert(field.name().to_owned(), FieldValue::I64(value));
+            }
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                let _ = self
+                    .0
+                    .insert(field.name().to_owned(), FieldValue::Bool(value));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let _ = self
+                    .0
+                    .insert(field.name().to_owned(), FieldValue::Str(value.to_owned()));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = self.0.insert(
+                    field.name().to_owned(),
+                    FieldValue::Debug(format!("{value:?}")),
+                );
+            }
+        }
+        let mut fields = Fields(std::collections::BTreeMap::new());
+        event.record(&mut fields);
+        let recorded = CapturedEvent {
+            level: *event.metadata().level(),
+            name: event.metadata().name().to_owned(),
+            fields: fields.0,
+        };
+        let _ = CAPTURED.try_with(|captured| {
+            if let Ok(mut captured) = captured.try_borrow_mut()
+                && let Some(events) = captured.as_mut()
+            {
+                events.push(recorded);
+            }
+        });
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Records the events of the current thread for as long as it lives.
+struct Capture;
+
+impl Capture {
+    /// Every event recorded so far with this name.
+    fn named(&self, name: &str) -> Vec<CapturedEvent> {
+        CAPTURED.with(|captured| {
+            captured
+                .borrow()
+                .iter()
+                .flatten()
+                .filter(|event| event.name == name)
+                .cloned()
+                .collect()
+        })
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        CAPTURED.with(|captured| *captured.borrow_mut() = None);
+    }
+}
+
+/// Start recording this thread's events through the global test subscriber.
+fn capture() -> Capture {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let _ = INSTALLED.get_or_init(|| {
+        tracing::subscriber::set_global_default(GlobalCapture)
+            .expect("no other global subscriber in this test binary");
+    });
+    // Callsites registered by other tests before the install are re-asked,
+    // and now answer `sometimes`.
+    tracing::callsite::rebuild_interest_cache();
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    Capture
+}
+
 /// Scenario: every write is refused as `PermissionDenied` under a
 /// sixty-second flush deadline.
 /// Guarantees: the block fails on its first attempt instead of being retried
@@ -3820,15 +4018,12 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
 /// Guarantees: the failed attempt still goes through the per-attempt WARN
 /// (`series_parquet.flush_attempt_failed`) with its attempt number and the
 /// store's error, exactly as a retried failure does, so every failed attempt
-/// leaves a per-attempt trace and not only the block-level ERROR. The WARN is
-/// observed through the test record its one emitting helper keeps, because a
-/// tracing subscriber installed per test races the global callsite cache
-/// against the tests running beside it.
+/// leaves a per-attempt trace and not only the block-level ERROR.
 #[tokio::test(flavor = "current_thread")]
 async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
+    let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
-            let _ = super::flush::take_logged_attempts();
             let store = Arc::new(FaultStore::default());
             store
                 .mode
@@ -3845,14 +4040,25 @@ async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
                 .finish()
                 .await;
             assert_eq!(done.as_ref().expect("the flush resolves").attempts, 1);
-            let logged = super::flush::take_logged_attempts();
-            assert_eq!(logged.len(), 1, "one failed attempt, one WARN: {logged:?}");
-            let (attempt, retryable, error) = &logged[0];
-            assert_eq!(*attempt, 1);
-            assert!(!retryable, "a refused credential is not retryable");
-            assert!(error.contains("access denied"), "{error}");
         })
         .await;
+    let logged = events.named("series_parquet.flush_attempt_failed");
+    assert_eq!(logged.len(), 1, "one failed attempt, one WARN: {logged:?}");
+    let event = &logged[0];
+    assert_eq!(event.level, tracing::Level::WARN);
+    assert_eq!(event.fields.get("attempt"), Some(&FieldValue::U64(1)));
+    assert_eq!(
+        event.fields.get("retryable"),
+        Some(&FieldValue::Bool(false)),
+        "a refused credential is not retryable"
+    );
+    assert!(
+        event
+            .fields
+            .get("error")
+            .is_some_and(|error| error.text().contains("access denied")),
+        "{event:?}"
+    );
 }
 
 /// Scenario: the last object of a block is written in the same engine-clock
