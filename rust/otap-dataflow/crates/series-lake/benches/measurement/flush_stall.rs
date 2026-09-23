@@ -28,8 +28,12 @@
 //! 4. Cancellation reaction: the same write again, with a signal instant at
 //!    evenly spaced fractions of the uncancelled write. The ticker cancels
 //!    the token at its first tick at or after the instant, as the node loop
-//!    would at its first turn after a shutdown deadline passed; the latency
-//!    is from the signal instant to the write returning cancelled.
+//!    would at its first turn after a shutdown deadline passed. The flush is
+//!    timed where it acts on the cancellation: the sink reads its clock only
+//!    to take the cleanup deadline of a cancelled or failed write, so the
+//!    probe gives the sink a clock that records its first reading. A
+//!    cancellation seen while the file is being finalized takes no deadline;
+//!    it returns at once, and the return is its observation.
 //!
 //! With `--dump DIR`, the files of the first uncancelled write are written
 //! there with a fixed file identity, so two builds can be compared byte for
@@ -54,7 +58,7 @@ use otel_arrow_dfe_series_lake::cache::SeriesCache;
 use otel_arrow_dfe_series_lake::error::{Error as LakeError, RefuseReason};
 use otel_arrow_dfe_series_lake::extract::extract;
 use otel_arrow_dfe_series_lake::schema::dataset_schema;
-use otel_arrow_dfe_series_lake::sink::{FileNaming, Sink};
+use otel_arrow_dfe_series_lake::sink::{FileNaming, Sink, SinkClock};
 use otel_arrow_dfe_series_lake::sort::merge_runs;
 use parquet::arrow::ArrowWriter;
 use serde::Serialize;
@@ -120,10 +124,11 @@ pub struct CancelRun {
     /// When the ticker got to cancel the token, after the signal: how long
     /// the node loop would have waited to see it.
     pub ticker_delay_ns: u128,
-    /// From the signal to the first poll of the write after the token was
-    /// cancelled, where the sink checks the token: when the flush observes
-    /// the signal.
+    /// From the signal to the sink acting on the cancellation: its first
+    /// clock reading, or its return when it read no clock.
     pub observe_latency_ns: u128,
+    /// `clock` or `return`: what the observation instant is.
+    pub observed_by: &'static str,
     /// From the signal to the write returning, its abort included.
     pub latency_ns: u128,
     /// Whether the write returned cancelled; false when it finished first.
@@ -263,10 +268,6 @@ struct PollTimer<F> {
     inner: Pin<Box<F>>,
     polls: Rc<Cell<usize>>,
     longest: Rc<Cell<Duration>>,
-    /// When the ticker cancelled the token, and the start of the first poll
-    /// after that.
-    cancelled_at: Rc<Cell<Option<Instant>>>,
-    observed_at: Rc<Cell<Option<Instant>>>,
 }
 
 impl<F: Future> Future for PollTimer<F> {
@@ -274,9 +275,6 @@ impl<F: Future> Future for PollTimer<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let started = Instant::now();
-        if self.cancelled_at.get().is_some() && self.observed_at.get().is_none() {
-            self.observed_at.set(Some(started));
-        }
         let out = self.inner.as_mut().poll(cx);
         let took = started.elapsed();
         self.polls.set(self.polls.get() + 1);
@@ -302,6 +300,23 @@ struct Observed {
     result: std::result::Result<(), String>,
 }
 
+thread_local! {
+    /// The first reading of the sink's clock in the current write.
+    static SINK_CLOCK_READ: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The sink's clock in the probe: the real one, recording its first
+/// reading, which is where the sink acts on a cancellation.
+fn recording_now() -> Instant {
+    let now = Instant::now();
+    SINK_CLOCK_READ.with(|read| {
+        if read.get().is_none() {
+            read.set(Some(now));
+        }
+    });
+    now
+}
+
 /// The sink's live flush workspace: merge chunk, encoder buffers and the
 /// upload bytes the store has not acknowledged.
 fn workspace_of(sink: &Sink) -> Option<usize> {
@@ -320,7 +335,13 @@ fn write_once(
         writer_id: cfg.lake.writer_id.clone(),
         boot_id: "flushstall".into(),
     };
-    let sink = Rc::new(Sink::new(store, cfg.lake.clone(), naming));
+    SINK_CLOCK_READ.with(|read| read.set(None));
+    let sink = Rc::new(
+        Sink::new(store, cfg.lake.clone(), naming).with_clock(SinkClock {
+            now: recording_now,
+            sleep_until: |at| Box::pin(tokio::time::sleep_until(at.into())),
+        }),
+    );
     let local = tokio::task::LocalSet::new();
     local.block_on(runtime, async {
         let cancel = CancellationToken::new();
@@ -360,7 +381,6 @@ fn write_once(
                 }
             })
         };
-        let observed_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
         let longest = Rc::new(Cell::new(Duration::ZERO));
         let cpu = cpu_time::ProcessTime::now();
@@ -368,8 +388,6 @@ fn write_once(
             inner: Box::pin(sink.write_block(block, &cancel)),
             polls: Rc::clone(&polls),
             longest: Rc::clone(&longest),
-            cancelled_at: Rc::clone(&cancelled_at),
-            observed_at: Rc::clone(&observed_at),
         };
         let result = write.await;
         let returned = Instant::now();
@@ -385,7 +403,7 @@ fn write_once(
             max_poll: longest.get(),
             max_workspace: max_workspace.get(),
             cancelled_at: cancelled_at.get(),
-            observed_at: observed_at.get(),
+            observed_at: SINK_CLOCK_READ.with(Cell::get),
             started,
             returned,
             result: result.map(|_report| ()).map_err(|e| e.to_string()),
@@ -566,7 +584,14 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
                 .map_or(0, |at| at.saturating_duration_since(signal).as_nanos()),
             observe_latency_ns: observed
                 .observed_at
-                .map_or(0, |at| at.saturating_duration_since(signal).as_nanos()),
+                .unwrap_or(observed.returned)
+                .saturating_duration_since(signal)
+                .as_nanos(),
+            observed_by: if observed.observed_at.is_some() {
+                "clock"
+            } else {
+                "return"
+            },
             latency_ns: observed
                 .returned
                 .saturating_duration_since(signal)

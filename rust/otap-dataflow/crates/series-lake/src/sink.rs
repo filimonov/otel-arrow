@@ -807,10 +807,13 @@ impl Sink {
         cleanup: &mut Option<Instant>,
     ) -> Result<()> {
         tokio::pin!(op);
+        // The token is polled first: once it has fired, the step is not
+        // driven again, so a writer step that would have made more progress
+        // on this poll does not run before the cancellation is acted on.
         tokio::select! {
             biased;
-            result = &mut op => return result.map_err(Error::from),
             () = cancel.cancelled() => {}
+            result = &mut op => return result.map_err(Error::from),
         }
         let deadline = *cleanup.get_or_insert_with(|| self.cleanup_deadline());
         if !watch.creating() {
@@ -2733,5 +2736,36 @@ mod tests {
         );
         assert_eq!(sink.flush_workspace_bytes(), 0, "no table is being written");
         assert!(sink.flush_workspace_high_water_bytes() >= held);
+    }
+
+    /// Scenario: a writer step is handed an operation that would complete
+    /// on its first poll, with a token that has already fired.
+    /// Guarantees: the step reports Cancelled without polling the operation
+    /// at all, so once the cancellation is there no further writer work runs
+    /// before it is acted on.
+    #[tokio::test]
+    async fn a_step_whose_token_has_fired_is_not_driven_again() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let sink = Sink::new(
+            Arc::clone(&store),
+            LakeConfig::default(),
+            FileNaming::new("w"),
+        );
+        let watch = CreationWatch::new(store, Arc::new(UploadLedger::default()));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let polled = std::cell::Cell::new(0);
+        let op = std::future::poll_fn(|_| {
+            polled.set(polled.get() + 1);
+            std::task::Poll::Ready(Ok(()))
+        });
+        let mut cleanup = None;
+        let got = sink.step(op, &watch, &cancel, &mut cleanup).await;
+        assert!(matches!(got, Err(Error::Cancelled { .. })), "got {got:?}");
+        assert_eq!(
+            polled.get(),
+            0,
+            "the operation was polled after the cancellation"
+        );
     }
 }
