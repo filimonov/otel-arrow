@@ -39,7 +39,7 @@ Fix: Narrow `paths` to the series crates and validation dir. Key the group per r
 **3. `schema_fingerprint` hashes Arrow's `Display` text; FORMAT.md documents a different rendering**
 Risk score: 72. Sources: seats 7a, 12.
 Files: `crates/series-lake/src/schema.rs:230-238`; `docs/FORMAT.md:325-337`.
-Evidence: arrow-schema 58.4 renders `Timestamp(µs, "UTC")` and `Map("entries": non-null Struct(...), unsorted)`; FORMAT.md says `Timestamp(Microsecond, Some("UTC"))`. Seat 7a recomputed the logs_values fingerprint in Python: the Display form matches the golden value, the documented form does not. Top-level nullability is not hashed.
+Evidence: arrow-schema 58.4 renders `Timestamp(us, "UTC")` and `Map("entries": non-null Struct(...), unsorted)`; FORMAT.md says `Timestamp(Microsecond, Some("UTC"))`. Seat 7a recomputed the logs_values fingerprint in Python: the Display form matches the golden value, the documented form does not. Top-level nullability is not hashed.
 Impact: The fingerprint is a persisted compaction-scope key. No third-party writer can reproduce it, and a routine arrow bump silently splits every lake's scope. Cheap to fix before first release, needs a migration rule after.
 Fix: Render a crate-owned versioned type vocabulary; pin golden fingerprints for all four datasets plus one denormalized schema; have gen_golden.py compute them independently.
 
@@ -89,7 +89,7 @@ Risk score: 65 (medium confidence). Sources: seats 5, 8.
 Files: `configs/series-parquet-s3.yaml:49` (max_concurrent_requests 128); `worker.rs:262`.
 Evidence: Hold time is about half a 15 s window plus flush. 128 slots at ~8 s gives ~16 requests/s. Committed baselines show 5-10k records/s while stage CPU allows 250-380k/s per core. Nothing exposes `accept == false` as a metric.
 Impact: The stated acceptance number (100k-1M records/s from dozens to hundreds of producers) cannot be reached with the shipped configs, and the bottleneck shows up as receiver RESOURCE_EXHAUSTED, not exporter metrics.
-Fix: Document and gate on `in_flight = rate × (interval/2 + flush) / records_per_request`; size the configs from it; add an admission-closed gauge; run one launcher case with concurrency raised to separate producer from receiver limits.
+Fix: Document and gate on `in_flight = rate x (interval/2 + flush) / records_per_request`; size the configs from it; add an admission-closed gauge; run one launcher case with concurrency raised to separate producer from receiver limits.
 
 **11. Backward wall-clock step stalls time-based rotation, and therefore all acks, for the length of the step**
 Risk score: 45. Source: seat 15.
@@ -134,7 +134,7 @@ Fix: Exit 0 with a skip message when inputs are absent, or keep the benches out 
 ## Minor issues / improvements
 - Cancel during multipart creation leaves an orphaned upload and reports `abort_error: None` (`sink.rs:277-307`, object_store `buffered.rs:334-372`). Seats 10, 13. Let a started `put` finish bounded by `abort_timeout`, then abort.
 - Retry-deadline and write completion in the same poll nacks a durable block (`flush.rs:190-218`); flush.rs:31-33 claim "never leaves a completed file" is false. Seats 15, 13. Poll the write before the deadline branch; count late successes.
-- `VecDeque::with_capacity(2×max_requests_per_block)` and `LruCache::new(max_entries)` pre-allocate from unbounded config; a "disable the limit" value aborts at start (`token.rs:167`, `cache.rs:35`, `config.rs:166-171`). Seats 7b, 13. Cap or allocate lazily; use saturating math in budget.
+- `VecDeque::with_capacity(2xmax_requests_per_block)` and `LruCache::new(max_entries)` pre-allocate from unbounded config; a "disable the limit" value aborts at start (`token.rs:167`, `cache.rs:35`, `config.rs:166-171`). Seats 7b, 13. Cap or allocate lazily; use saturating math in budget.
 - Rotate/resume in the flush-done arm is dead code and its comment describes an ordering enforced elsewhere (`mod.rs:282-298`, `worker.rs:641, 796`). Seats 7b, 10, 15. Remove and add `debug_assert!(cleaning.is_none())` in `complete()`.
 - Every `object_store::Error` variant is retried until the deadline, including PermissionDenied and NotFound (`flush.rs:94-116`). Seat 7b.
 - Per-request WARN on refusals is unthrottled and carries no producer context (`worker.rs:577-586`). Seats 1, 4, 8. Downgrade or rate-limit; include signal, size vs limit.
@@ -199,7 +199,7 @@ Squash the ~40 fix-on-fix commits into their feature commits first, then:
 - Entry points reviewed: pdata (normal and force-drained), window wake, flush result, cleanup join, requested rotation, notifier delivery, Shutdown with deadline (future, past, synthetic), CollectTelemetry, inbox error, deadline branch and abandon phases 0-2.
 - Transitions reviewed: prepare/offer/park/resume, reserve/admit and admit failure, rotate (empty, seal failure, sealed to FlushJob), complete (Ok, Err, RecvError) into cleaning, abandon.
 - Fault categories checked: store failure per phase, retry deadline mid-upload, non-retryable encode error, task panic, full or closed completion channel, closed inbox, timer firing while busy, missed windows, clock steps both ways, deadline in the past, parked request, FLUSHING block, empty ACTIVE at shutdown, oversize request, N = 1, full cache, coop budget exhaustion.
-- Invariants that held: cache marked only on success against the block's own partition, in block order; each admitted token reaches exactly one push or one counted failure; ≤2 blocks + ≤1 parked; parked-first ordering via `accept()`; seal is all-or-nothing; notifier assert cannot fire; flush-task panics are contained.
+- Invariants that held: cache marked only on success against the block's own partition, in block order; each admitted token reaches exactly one push or one counted failure; <=2 blocks + <=1 parked; parked-first ordering via `accept()`; seal is all-or-nothing; notifier assert cannot fire; flush-task panics are contained.
 - Deferred / not covered: sort/merge internals beyond allocation review, metrics.rs schema tests, engine controller routing of completions to the OTLP receiver, running any build, test, bench or the harness (static review only).
 - Main assumptions: single-threaded local runtime per pipeline (verified in runtime_pipeline.rs); tokio 1.53.1 and object_store 0.13.2 as locked.
 
