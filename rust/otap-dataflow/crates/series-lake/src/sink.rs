@@ -982,13 +982,13 @@ impl Sink {
                 break;
             }
             let chunk = match merge.step() {
-                Ok(MergeStep::Done) => break,
-                Ok(MergeStep::Progress) => {
+                MergeStep::Done => break,
+                MergeStep::Progress => {
                     workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
                     continue;
                 }
-                Ok(MergeStep::Chunk(c)) => c,
-                Ok(MergeStep::Ready) => {
+                MergeStep::Chunk(c) => c,
+                MergeStep::Ready => {
                     // Build the chunk's columns in bounded steps of their
                     // own, returning to the runtime between every two.
                     let built = {
@@ -1019,10 +1019,6 @@ impl Sink {
                             break;
                         }
                     }
-                }
-                Err(e) => {
-                    failure = Some(e);
-                    break;
                 }
             };
             workspace.set(chunk_charge(merge, &chunk), writer.memory_size());
@@ -2615,20 +2611,7 @@ mod tests {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
         for (spec, owned) in [(table.spec().clone(), true), (SortSpec::new(vec![]), false)] {
             let mut merge = merge_runs(runs.clone(), &spec, 1 << 20).expect("merge");
-            let chunk = loop {
-                match merge.step().expect("step") {
-                    MergeStep::Chunk(chunk) => break chunk,
-                    MergeStep::Ready => {
-                        let mut builder = merge.chunk_builder();
-                        while !builder.step().expect("build") {}
-                        let chunk = builder.finish().expect("chunk");
-                        merge.chunk_taken();
-                        break chunk;
-                    }
-                    MergeStep::Progress => {}
-                    MergeStep::Done => panic!("no chunk"),
-                }
-            };
+            let chunk = merge.next().expect("a chunk").expect("chunk");
             let pinned = record_batch_pinned_bytes(&chunk, &mut CountedAllocations::default());
             let charged = chunk_charge(&merge, &chunk);
             if owned {

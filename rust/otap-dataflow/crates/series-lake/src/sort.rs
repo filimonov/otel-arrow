@@ -522,6 +522,7 @@ impl MergeBuild {
             sources: self.sources,
             ranges: Vec::new(),
             pending_rows: 0,
+            #[cfg(test)]
             last_step_rows: 0,
         })
     }
@@ -585,6 +586,7 @@ pub struct MergeIter {
     ranges: Vec<(usize, usize, usize)>,
     pending_rows: usize,
     /// Rows the last step popped.
+    #[cfg(test)]
     last_step_rows: usize,
 }
 
@@ -677,19 +679,15 @@ impl MergeIter {
     /// Do one bounded step of producing the next chunk: pop at most the
     /// budget's rows, announce the chunk once all of its rows are popped,
     /// or, with sorting disabled, hand out the next run.
-    ///
-    /// # Errors
-    ///
-    /// Never, today; the signature leaves room for a failing step.
-    pub fn step(&mut self) -> Result<MergeStep> {
+    pub fn step(&mut self) -> MergeStep {
         if !self.sorted {
             // Unsorted mode: hand out the runs in arrival order, unchanged. No
             // concatenation, so no second copy of the dataset is ever built.
             let Some(run) = self.runs.get(self.next_run) else {
-                return Ok(MergeStep::Done);
+                return MergeStep::Done;
             };
             self.next_run += 1;
-            return Ok(MergeStep::Chunk(run.clone()));
+            return MergeStep::Chunk(run.clone());
         }
         let mut work = 0usize;
         let mut copied = 0usize;
@@ -708,8 +706,11 @@ impl MergeIter {
             work += rows;
             copied += bytes;
         };
-        self.last_step_rows = work;
-        Ok(result)
+        #[cfg(test)]
+        {
+            self.last_step_rows = work;
+        }
+        result
     }
 
     /// Whether the rows popped so far complete a chunk: the chunk's row
@@ -1329,8 +1330,8 @@ impl Iterator for MergeIter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.step() {
-                Ok(MergeStep::Progress) => {}
-                Ok(MergeStep::Ready) => {
+                MergeStep::Progress => {}
+                MergeStep::Ready => {
                     let chunk = {
                         let mut builder = self.chunk_builder();
                         loop {
@@ -1344,9 +1345,8 @@ impl Iterator for MergeIter {
                     self.chunk_taken();
                     return Some(chunk);
                 }
-                Ok(MergeStep::Chunk(chunk)) => return Some(Ok(chunk)),
-                Ok(MergeStep::Done) => return None,
-                Err(e) => return Some(Err(e)),
+                MergeStep::Chunk(chunk) => return Some(Ok(chunk)),
+                MergeStep::Done => return None,
             }
         }
     }
@@ -1485,6 +1485,29 @@ mod tests {
             .expect("merge")
             .collect::<Result<_>>()
             .expect("chunks")
+    }
+
+    /// Every chunk of `merge`, stepped one step at a time, and the merge and
+    /// builder steps it took.
+    fn drain(merge: &mut MergeIter) -> (Vec<RecordBatch>, usize) {
+        let mut chunks = Vec::new();
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            match merge.step() {
+                MergeStep::Progress => {}
+                MergeStep::Ready => {
+                    let mut builder = merge.chunk_builder();
+                    while !builder.step().expect("build step") {
+                        steps += 1;
+                    }
+                    chunks.push(builder.finish().expect("chunk"));
+                    merge.chunk_taken();
+                }
+                MergeStep::Chunk(chunk) => chunks.push(chunk),
+                MergeStep::Done => return (chunks, steps),
+            }
+        }
     }
 
     fn concat(chunks: &[RecordBatch]) -> RecordBatch {
@@ -2086,24 +2109,7 @@ mod tests {
                 resident = build.resident_key_bytes();
             }
             let mut merge = build.finish().expect("finish").with_budget(rows, key_bytes);
-            let mut chunks = Vec::new();
-            let mut steps = 0usize;
-            loop {
-                steps += 1;
-                match merge.step().expect("step") {
-                    MergeStep::Progress => {}
-                    MergeStep::Ready => {
-                        let mut builder = merge.chunk_builder();
-                        while !builder.step().expect("build step") {
-                            steps += 1;
-                        }
-                        chunks.push(builder.finish().expect("chunk"));
-                        merge.chunk_taken();
-                    }
-                    MergeStep::Chunk(chunk) => chunks.push(chunk),
-                    MergeStep::Done => break,
-                }
-            }
+            let (chunks, steps) = drain(&mut merge);
             assert_eq!(
                 chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
                 unsliced
@@ -2248,7 +2254,7 @@ mod tests {
         let mut chunks = Vec::new();
         let mut copied = 0usize;
         loop {
-            match merge.step().expect("step") {
+            match merge.step() {
                 MergeStep::Progress => assert!(merge.last_step_rows <= 8),
                 MergeStep::Ready => {
                     assert!(merge.last_step_rows <= 8);
@@ -2299,7 +2305,7 @@ mod tests {
         let mut merge = merge_runs(runs, &spec, 1 << 30)
             .expect("merge")
             .with_budget(8, 1 << 20);
-        while !matches!(merge.step().expect("step"), MergeStep::Ready) {}
+        while !matches!(merge.step(), MergeStep::Ready) {}
         let mut builder = merge.chunk_builder();
         let mut charged: Vec<Option<usize>> = Vec::new();
         loop {
@@ -2401,7 +2407,7 @@ mod tests {
         let mut merge = merge_runs(runs, &spec, 1 << 30)
             .expect("merge")
             .with_offset_limit(16);
-        while !matches!(merge.step().expect("step"), MergeStep::Ready) {}
+        while !matches!(merge.step(), MergeStep::Ready) {}
         let mut builder = merge.chunk_builder();
         let err = loop {
             match builder.step() {
@@ -2484,7 +2490,7 @@ mod tests {
         assert!(build.step().expect("keys"), "every key in one step");
         let mut merge = build.finish().expect("finish");
         assert!(
-            matches!(merge.step().expect("step"), MergeStep::Ready),
+            matches!(merge.step(), MergeStep::Ready),
             "every row popped in one step"
         );
         let mut builder = merge.chunk_builder();
@@ -2493,7 +2499,7 @@ mod tests {
         merge.chunk_taken();
         assert_eq!(chunk.num_rows(), 100);
         assert_eq!(keys_of(&chunk)[0], Some(1));
-        assert!(matches!(merge.step().expect("step"), MergeStep::Done));
+        assert!(matches!(merge.step(), MergeStep::Done));
     }
 
     /// Scenario: every column of the four lake datasets, with a denormalized
