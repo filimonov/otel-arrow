@@ -4,45 +4,66 @@ name: Series Parquet E2E
 on:
   pull_request:
     paths:
-      - "rust/otap-dataflow/**"
+      - "rust/otap-dataflow/crates/series-lake/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet_exporter/**"
+      - "rust/otap-dataflow/crates/validation/tests/series_parquet/**"
       - ".github/workflows/series-parquet-e2e.yml"
   push:
     branches: [main]
     paths:
-      - "rust/otap-dataflow/**"
+      - "rust/otap-dataflow/crates/series-lake/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet_exporter/**"
+      - "rust/otap-dataflow/crates/validation/tests/series_parquet/**"
       - ".github/workflows/series-parquet-e2e.yml"
   workflow_dispatch:
 permissions:
   contents: read
+
+# One run per pull request or ref; a new commit cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SERIES_REQUIRE_DOCKER: "1"
+  SERIES_MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
+  SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
+  SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
+  SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
+  SERIES_ENGINE_FEATURES: default,series-parquet,aws,durable-buffer
+  SERIES_ARTIFACT_DIR: /tmp/series-parquet-artifacts/tests
+
 jobs:
+  # The functional lane: the debug engine against real object stores, Alloy,
+  # DuckDB and ClickHouse, the harness contracts, and the measurement bench's
+  # self-test. Nothing here is a measurement.
   writer-reader-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # One measurement at a time per physical host: jobs that could share a
-    # runner host queue behind each other instead of measuring concurrently.
-    # The in-run host lease enforces the same rule on any machine.
-    concurrency:
-      group: series-parquet-host-measurement
-      cancel-in-progress: false
     defaults:
       run:
         working-directory: rust/otap-dataflow
-    env:
-      SERIES_REQUIRE_DOCKER: "1"
-      SERIES_MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
-      SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
-      SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
-      SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
-      SERIES_ENGINE_FEATURES: default,series-parquet,aws,durable-buffer
-      SERIES_ARTIFACT_DIR: /tmp/series-parquet-artifacts/tests
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          save-if: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift /usr/local/.ghcup
+          sudo rm -rf /usr/local/julia* /usr/local/lib/android /usr/local/share/chromium
+          sudo rm -rf /opt/microsoft /opt/google /opt/az /usr/local/share/powershell
       - name: Install native build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler pkg-config libssl-dev clang cmake
-      - name: Install the repository Rust toolchain
-        run: rustup show active-toolchain
       - name: Provision local object-store and reader images
         run: |
           docker info
@@ -53,14 +74,8 @@ jobs:
         run: |
           python3 -m venv /tmp/series-parquet-venv
           /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
-      # Build and provisioning finish before any step takes the host
-      # measurement lease, so a measured step never runs beside a compiler.
       - name: Build the real engine
         run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
-      # Measured cases refuse any build but release; the fixture suite above
-      # keeps the debug build.
-      - name: Build the release engine for measurement
-        run: cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
       - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
@@ -69,10 +84,57 @@ jobs:
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
           python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
-      # The strict and buffered launcher smokes with the same oracle. A hosted
-      # runner is not a publishable measurement host, so nothing is published
-      # and no baseline is evaluated; delivery, graph, restart and affinity
-      # must still pass, and every validity check is recorded as observed.
+      # The stage bench's own checks, run through the test profile so no
+      # optimized build is needed.
+      - name: Measurement bench self-test
+        run: cargo test --locked -p otel-arrow-dfe-series-lake --features bench-harness --bench measurement -- --self-test
+      - name: Retain test results and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: series-parquet-e2e
+          path: /tmp/series-parquet-artifacts
+          if-no-files-found: warn
+
+  # The strict and buffered launcher smokes need the release engine and are
+  # timing-sensitive, so they run on request only. A hosted runner is not a
+  # publishable measurement host: nothing is published and no baseline is
+  # evaluated; delivery, graph, restart and affinity must still pass.
+  launcher-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust/otap-dataflow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          save-if: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift /usr/local/.ghcup
+          sudo rm -rf /usr/local/julia* /usr/local/lib/android /usr/local/share/chromium
+          sudo rm -rf /opt/microsoft /opt/google /opt/az /usr/local/share/powershell
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev clang cmake
+      - name: Install producer and DuckDB dependencies
+        run: |
+          python3 -m venv /tmp/series-parquet-venv
+          /tmp/series-parquet-venv/bin/pip install -r crates/validation/tests/series_parquet/requirements.txt
+      # Built before any step takes the host measurement lease, so a measured
+      # step never runs beside a compiler.
+      - name: Build the release engine for measurement
+        run: cargo build --release --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
       - name: Strict and buffered launcher smokes
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
@@ -81,7 +143,7 @@ jobs:
             --option publish=false --option legacy_tests=false
       - name: Retain measurement results and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: series-parquet-measurement
           path: /tmp/series-parquet-artifacts
