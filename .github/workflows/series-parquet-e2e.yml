@@ -41,10 +41,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   SERIES_REQUIRE_DOCKER: "1"
-  SERIES_MINIO_IMAGE: minio/minio:RELEASE.2025-04-22T22-12-26Z
-  SERIES_RUSTFS_IMAGE: rustfs/rustfs:1.0.0-rc.3
-  SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server:26.7.4
-  SERIES_ALLOY_IMAGE: grafana/alloy:v1.19.2
+  SERIES_MINIO_IMAGE: minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e # RELEASE.2025-04-22T22-12-26Z
+  SERIES_RUSTFS_IMAGE: rustfs/rustfs@sha256:800cf3f352a0a27e3275ca854a51f0027975d7acc7a0d52089a35bcc9fcbf0b5 # 1.0.0-rc.3
+  SERIES_CLICKHOUSE_IMAGE: clickhouse/clickhouse-server@sha256:5a94a6cc2005af20844c31aa49906d55c3c48b0e0fb9f29bf0d6c29e52692f3a # 26.7.4
+  SERIES_ALLOY_IMAGE: grafana/alloy@sha256:b8ec653c44235fbe910879145dac3597d66b0aaecf60bcbbe82580767771a839 # v1.19.2
   SERIES_ENGINE_FEATURES: default,series-parquet,aws,durable-buffer
   SERIES_ARTIFACT_DIR: /tmp/series-parquet-artifacts/tests
 
