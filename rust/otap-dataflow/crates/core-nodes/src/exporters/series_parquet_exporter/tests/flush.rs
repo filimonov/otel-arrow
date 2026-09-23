@@ -83,10 +83,8 @@ async fn values_retry_reuses_paths_and_bytes() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_VALUES_ONCE, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::ValuesOnce);
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let (handler, mut rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
@@ -131,7 +129,7 @@ async fn values_retry_reuses_paths_and_bytes() {
             );
             assert_eq!(metrics.worker.flush_cancelled.get(), 0);
 
-            let writes = store.writes.lock().expect("writes lock");
+            let writes = store.hooks().writes.lock().expect("writes lock");
             assert_eq!(writes.len(), 4, "two files, one of them written twice");
             assert_eq!(writes[0], writes[2], "the series file is rewritten as-is");
             assert_eq!(writes[1], writes[3], "the values file is rewritten as-is");
@@ -149,10 +147,8 @@ async fn failed_descriptor_does_not_poison_cache() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_SERIES, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Series);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(30);
             let (handler, mut rx) = effects(4);
@@ -193,9 +189,7 @@ async fn failed_descriptor_does_not_poison_cache() {
             );
             drain_cleanup(&mut worker).await;
 
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.hooks().set(Fault::None);
             worker.admit(logs_pdata());
             assert!(
                 worker.active.data.pending_series.contains(&id),
@@ -225,10 +219,8 @@ async fn overlapping_series_and_eviction_preserve_partition_coverage() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(3_599_000_000_000));
             let mut cfg = worker_config();
@@ -244,7 +236,7 @@ async fn overlapping_series_and_eviction_preserve_partition_coverage() {
                 .next()
                 .expect("the request carries a descriptor");
             worker.rotate();
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
 
             wall.set(3_600_000_000_000);
             worker.admit(logs_pdata());
@@ -254,10 +246,8 @@ async fn overlapping_series_and_eviction_preserve_partition_coverage() {
             );
             worker.cache.touch([99; 16]);
 
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
-            store.release.notify_one();
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_one();
             let done = worker
                 .flushing
                 .as_mut()
@@ -296,10 +286,8 @@ async fn same_window_overlap_keeps_both_descriptors() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(worker_config(), store.clone(), wall, handler);
@@ -313,7 +301,7 @@ async fn same_window_overlap_keeps_both_descriptors() {
                 .next()
                 .expect("the request carries a descriptor");
             worker.rotate();
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
 
             worker.admit(logs_pdata());
             assert!(
@@ -333,10 +321,8 @@ async fn same_window_overlap_keeps_both_descriptors() {
             let partition = worker.active.data.partition;
             assert!(!worker.cache.is_committed(&id, partition));
 
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
-            store.release.notify_one();
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_one();
             let done = worker
                 .flushing
                 .as_mut()
@@ -382,10 +368,8 @@ async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(20);
@@ -395,7 +379,7 @@ async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
 
             worker.admit(logs_pdata());
             worker.rotate();
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
 
             // Only the retry deadline has elapsed. The write is still parked
             // in the store, so a decision that arrives now cannot have waited
@@ -429,9 +413,7 @@ async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
             sim.advance(Duration::from_secs(2));
             job.cleanup().await.expect("the cleanup is bounded");
 
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
+            store.hooks().set(Fault::None);
             worker.rotate();
             assert!(
                 worker.flushing.is_some(),
@@ -455,10 +437,8 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, mut rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(20);
@@ -471,7 +451,7 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
 
             worker.admit(logs_pdata());
             worker.rotate();
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
             sim.advance(Duration::from_millis(20));
             let done = worker
                 .flushing
@@ -538,10 +518,8 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_SLOW_FAIL, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::SlowFail);
             let (handler, mut rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_secs(60);
@@ -678,10 +656,8 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_DENIED, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Denied);
             let (handler, _rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_secs(60);
@@ -717,10 +693,8 @@ async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
     let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_DENIED, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Denied);
             let (handler, _rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(worker_config(), store, wall, handler);
@@ -765,10 +739,8 @@ async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(20);
@@ -780,10 +752,10 @@ async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
             // The series object parks first and is released well before the
             // deadline; then the values object parks, and is released in the
             // same step as the deadline.
-            store.entered.notified().await;
-            store.release.notify_one();
-            store.entered.notified().await;
-            store.release.notify_one();
+            store.hooks().entered.notified().await;
+            store.hooks().release.notify_one();
+            store.hooks().entered.notified().await;
+            store.hooks().release.notify_one();
             sim.advance(Duration::from_millis(20));
             let done = worker
                 .flushing
@@ -814,10 +786,8 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_MULTIPART_WEDGE, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::MultipartWedge);
             let (handler, _rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(20);
@@ -842,7 +812,7 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             worker.admit(bulk_logs_pdata(20_000));
             worker.rotate();
             until("the wedged upload takes a part", || {
-                store.parts.load(std::sync::atomic::Ordering::SeqCst) > 0
+                store.hooks().parts.load(SeqCst) > 0
             })
             .await;
 
@@ -872,7 +842,7 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             assert!(worker.flushing.is_none(), "no second write is started");
             assert!(worker.cleaning.is_some(), "the slot is still occupied");
             until("the wedged upload is aborted", || {
-                store.aborts.load(std::sync::atomic::Ordering::SeqCst) > 0
+                store.hooks().aborts.load(SeqCst) > 0
             })
             .await;
 
@@ -889,7 +859,7 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
                 1,
             );
             assert!(
-                store.inner.head(&path).await.is_err(),
+                store.inner().head(&path).await.is_err(),
                 "a wedged upload never completes an object"
             );
         })

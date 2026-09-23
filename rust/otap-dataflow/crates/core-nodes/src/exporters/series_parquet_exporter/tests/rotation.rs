@@ -161,10 +161,8 @@ async fn wall_clock_drift_rotates_at_the_monotonic_bound_then_at_the_boundary() 
 async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(worker_config(), store, Arc::clone(&wall) as _, handler);
@@ -311,13 +309,15 @@ async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let inner = Arc::new(object_store::memory::InMemory::new());
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let store = Arc::new(GatedStore {
-                inner: Arc::clone(&inner),
-                gate: Arc::clone(&gate),
-                entered: Arc::clone(&entered),
-            });
-            let writes = || entered.load(std::sync::atomic::Ordering::SeqCst);
+            let entered = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(HookStore::new(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>,
+                GatedStore {
+                    gate: Arc::clone(&gate),
+                    entered: Arc::clone(&entered),
+                },
+            ));
+            let writes = || entered.load(SeqCst);
 
             // One slot in each channel, so handing a message over is itself
             // the proof that the node has taken the previous one.
@@ -441,13 +441,15 @@ async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let inner = Arc::new(object_store::memory::InMemory::new());
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let store = Arc::new(GatedStore {
-                inner: Arc::clone(&inner),
-                gate: Arc::clone(&gate),
-                entered: Arc::clone(&entered),
-            });
-            let writes = || entered.load(std::sync::atomic::Ordering::SeqCst);
+            let entered = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(HookStore::new(
+                Arc::clone(&inner) as Arc<dyn ObjectStore>,
+                GatedStore {
+                    gate: Arc::clone(&gate),
+                    entered: Arc::clone(&entered),
+                },
+            ));
+            let writes = || entered.load(SeqCst);
 
             let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<OtapPdata>>::new(1);
             let (pdata_tx, pdata_rx) = mpsc::Channel::<OtapPdata>::new(1);

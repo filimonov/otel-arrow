@@ -13,11 +13,14 @@ pub(super) use super::super::token::{AckToken, Notifier};
 
 pub(super) use super::super::worker::{Prepared, Worker};
 
-pub(super) use futures::stream::BoxStream;
+pub(super) use otel_arrow_dfe_series_lake::hook_store::{HookGuard, HookStore, StoreHooks};
+
+pub(super) use std::sync::atomic::AtomicUsize;
+
+pub(super) use std::sync::atomic::Ordering::SeqCst;
 
 pub(super) use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
+    MultipartUpload, ObjectStore, ObjectStoreExt, PutPayload, PutResult, UploadPart,
 };
 
 pub(super) use otel_arrow_dfe_channel::mpsc;
@@ -332,7 +335,7 @@ pub(super) fn logs_pdata_from(source: usize) -> OtapPdata {
     OtapPdata::new(context, logs_payload())
 }
 
-/// An object store whose writes park until a test opens its gate.
+/// Store hooks whose writes park until a test opens their gate.
 ///
 /// This is what keeps a block FLUSHING for as long as a test needs: no write
 /// can resolve while the gate holds no permit, so the worker's one flush slot
@@ -341,15 +344,13 @@ pub(super) fn logs_pdata_from(source: usize) -> OtapPdata {
 /// that took it has passed.
 #[derive(Debug)]
 pub(super) struct GatedStore {
-    /// The store that actually holds the objects.
-    pub(super) inner: Arc<object_store::memory::InMemory>,
     /// Permits to write; empty until the test releases the parked flush.
     pub(super) gate: Arc<tokio::sync::Semaphore>,
     /// Writes that have reached the gate, counted before they park on it.
     ///
     /// This is the signal that a flush has actually started: a test waits for
     /// it instead of guessing that the node has got that far.
-    pub(super) entered: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) entered: Arc<AtomicUsize>,
 }
 
 impl GatedStore {
@@ -358,77 +359,29 @@ impl GatedStore {
     /// The count is raised before the wait, so a test observing it knows the
     /// write is parked rather than still to come.
     pub(super) async fn pass(&self) {
-        let _ = self
-            .entered
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.entered.fetch_add(1, SeqCst);
         let permit = self.gate.acquire().await.expect("the gate is never closed");
         drop(permit);
     }
 }
 
-impl std::fmt::Display for GatedStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GatedStore({})", self.inner)
-    }
-}
-
 #[async_trait::async_trait]
-impl ObjectStore for GatedStore {
-    async fn put_opts(
+impl StoreHooks for GatedStore {
+    async fn before_put(
         &self,
-        location: &object_store::path::Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+        _location: &object_store::path::Path,
+        _payload: &PutPayload,
+    ) -> object_store::Result<Option<HookGuard>> {
         self.pass().await;
-        self.inner.put_opts(location, payload, options).await
+        Ok(None)
     }
 
-    async fn put_multipart_opts(
+    async fn before_multipart(
         &self,
-        location: &object_store::path::Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        _location: &object_store::path::Path,
+    ) -> object_store::Result<Option<HookGuard>> {
         self.pass().await;
-        self.inner.put_multipart_opts(location, options).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &object_store::path::Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<object_store::path::Path>>,
-    ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        Ok(None)
     }
 }
 
@@ -524,35 +477,34 @@ pub(super) fn terminal_value(
     panic!("no terminal snapshot carries {name} with {labels:?}")
 }
 
-/// Injection mode: every request passes through to the inner store.
-pub(super) const FAULT_NONE: u8 = 0;
+/// Which failure a [`FaultStore`] injects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Fault {
+    /// Every request passes through to the inner store.
+    #[default]
+    None,
+    /// Every write of a `series` dataset file fails.
+    Series,
+    /// The first write of a `values` dataset file fails, and the store heals
+    /// itself in the same step so the retry succeeds.
+    ValuesOnce,
+    /// Every write parks until the test releases it.
+    Park,
+    /// A `values` multipart upload is initiated and then wedges: its parts
+    /// never land and its abort never returns, while everything else passes
+    /// through.
+    MultipartWedge,
+    /// Every write spends [`SLOW_FAILURE`] of engine-clock time and then
+    /// fails, the way a cloud store's own retry loop answers a request once
+    /// its `retry_timeout` is spent.
+    SlowFail,
+    /// Every write is refused as `PermissionDenied`, the way a store answers
+    /// credentials it does not accept.
+    Denied,
+}
 
-/// Injection mode: every write of a `series` dataset file fails.
-pub(super) const FAULT_SERIES: u8 = 1;
-
-/// Injection mode: the first write of a `values` dataset file fails, and the
-/// store heals itself in the same step so the retry succeeds.
-pub(super) const FAULT_VALUES_ONCE: u8 = 2;
-
-/// Injection mode: every write parks until the test releases it.
-pub(super) const FAULT_PARK: u8 = 3;
-
-/// Injection mode: a `values` multipart upload is initiated and then wedges --
-/// its parts never land and its abort never returns -- while everything else
-/// passes through.
-pub(super) const FAULT_MULTIPART_WEDGE: u8 = 5;
-
-/// Injection mode: every write spends [`SLOW_FAILURE`] of engine-clock time
-/// and then fails, the way a cloud store's own retry loop answers a request
-/// once its `retry_timeout` is spent.
-pub(super) const FAULT_SLOW_FAIL: u8 = 6;
-
-/// How long one write takes to fail under [`FAULT_SLOW_FAIL`].
+/// How long one write takes to fail under [`Fault::SlowFail`].
 pub(super) const SLOW_FAILURE: Duration = Duration::from_secs(20);
-
-/// Injection mode: every write is refused as `PermissionDenied`, the way a
-/// store answers credentials it does not accept.
-pub(super) const FAULT_DENIED: u8 = 7;
 
 /// An object store that injects failures at the two entry points a Parquet
 /// write actually uses: a small single-shot PUT and the initiation of a
@@ -566,28 +518,37 @@ pub(super) const FAULT_DENIED: u8 = 7;
 /// the bytes and the path of a failed attempt with those of the retry that
 /// followed it, which is the observable form of "retries reuse frozen file
 /// names and byte-identical objects".
+pub(super) type FaultStore = HookStore<Faults>;
+
+/// A [`FaultStore`] over a fresh in-memory store, injecting nothing yet.
+pub(super) fn fault_store() -> Arc<FaultStore> {
+    Arc::new(HookStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        Faults::default(),
+    ))
+}
+
+/// The hooks of a [`FaultStore`], and what they recorded.
 #[derive(Debug, Default)]
-pub(super) struct FaultStore {
-    /// The store that actually holds whatever is allowed through.
-    pub(super) inner: object_store::memory::InMemory,
-    /// The active injection mode, one of the `FAULT_*` constants.
-    pub(super) mode: std::sync::atomic::AtomicU8,
+pub(super) struct Faults {
+    /// The active injection.
+    mode: std::sync::Mutex<Fault>,
     /// Path and payload of every PUT, including the ones that then failed.
     pub(super) writes: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Raised as each write reaches the injection point, so a test can wait
     /// for a flush to have started rather than guess that it has.
     pub(super) entered: tokio::sync::Notify,
-    /// Releases one parked write under `FAULT_PARK`.
+    /// Releases one parked write under [`Fault::Park`].
     pub(super) release: tokio::sync::Notify,
-    /// Writes currently parked inside the store under `FAULT_PARK`.
-    pub(super) parked: std::sync::atomic::AtomicUsize,
+    /// Writes currently parked inside the store under [`Fault::Park`].
+    pub(super) parked: AtomicUsize,
     /// Parked writes whose future was dropped rather than released, which is
     /// what a cancelled node has to produce.
-    pub(super) parked_drops: std::sync::atomic::AtomicUsize,
+    pub(super) parked_drops: AtomicUsize,
     /// Parts handed to a wedged multipart upload.
-    pub(super) parts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) parts: Arc<AtomicUsize>,
     /// Aborts attempted against a wedged multipart upload.
-    pub(super) aborts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) aborts: Arc<AtomicUsize>,
 }
 
 /// A real multipart upload that is initiated and then never progresses.
@@ -603,15 +564,15 @@ pub(super) struct WedgedUpload {
     /// released when this one is dropped.
     pub(super) _inner: Box<dyn MultipartUpload>,
     /// Parts handed to this upload, shared with the store the test holds.
-    pub(super) parts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) parts: Arc<AtomicUsize>,
     /// Aborts attempted against this upload.
-    pub(super) aborts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) aborts: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for WedgedUpload {
     fn put_part(&mut self, _data: PutPayload) -> UploadPart {
-        let _ = self.parts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.parts.fetch_add(1, SeqCst);
         // Parked rather than delivered: the writer must still be in the phase
         // where the sink aborts a failed upload when the deadline arrives. A
         // part that lands immediately lets the writer reach the finalizing
@@ -625,25 +586,27 @@ impl MultipartUpload for WedgedUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        let _ = self
-            .aborts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.aborts.fetch_add(1, SeqCst);
         std::future::pending().await
     }
 }
 
-impl std::fmt::Display for FaultStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("series fault store")
+impl Faults {
+    /// Inject `fault` from now on.
+    pub(super) fn set(&self, fault: Fault) {
+        *self.mode.lock().expect("mode lock") = fault;
     }
-}
 
-impl FaultStore {
-    /// Announce a write and apply the active injection mode to it.
-    pub(super) async fn before(&self, path: &object_store::path::Path) -> object_store::Result<()> {
+    /// The active injection.
+    fn mode(&self) -> Fault {
+        *self.mode.lock().expect("mode lock")
+    }
+
+    /// Announce a write and apply the active injection to it.
+    async fn before(&self, path: &object_store::path::Path) -> object_store::Result<()> {
         self.entered.notify_one();
-        let mode = self.mode.load(std::sync::atomic::Ordering::SeqCst);
-        if mode == FAULT_PARK {
+        let mode = self.mode();
+        if mode == Fault::Park {
             /// Accounts for one parked write for as long as its future lives.
             ///
             /// A write that is released decrements the live count only; one
@@ -652,23 +615,21 @@ impl FaultStore {
             /// the write rather than leaking it".
             struct Parked<'a> {
                 /// Writes still parked.
-                live: &'a std::sync::atomic::AtomicUsize,
+                live: &'a AtomicUsize,
                 /// Parked writes whose future was dropped.
-                drops: &'a std::sync::atomic::AtomicUsize,
+                drops: &'a AtomicUsize,
                 /// Whether the park ended by release rather than by a drop.
                 released: bool,
             }
             impl Drop for Parked<'_> {
                 fn drop(&mut self) {
-                    let _ = self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = self.live.fetch_sub(1, SeqCst);
                     if !self.released {
-                        let _ = self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = self.drops.fetch_add(1, SeqCst);
                     }
                 }
             }
-            let _ = self
-                .parked
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.parked.fetch_add(1, SeqCst);
             let mut guard = Parked {
                 live: &self.parked,
                 drops: &self.parked_drops,
@@ -677,30 +638,19 @@ impl FaultStore {
             self.release.notified().await;
             guard.released = true;
         }
-        if mode == FAULT_SLOW_FAIL {
+        if mode == Fault::SlowFail {
             clock::sleep(SLOW_FAILURE).await;
         }
-        if mode == FAULT_DENIED {
+        if mode == Fault::Denied {
             return Err(object_store::Error::PermissionDenied {
                 path: path.to_string(),
                 source: "injected: access denied".into(),
             });
         }
         let path = path.as_ref();
-        let fail = mode == 4
-            || mode == FAULT_SLOW_FAIL
-            || (mode == FAULT_SERIES && path.contains("dataset=series/"))
-            || (mode == FAULT_VALUES_ONCE
-                && path.contains("dataset=values/")
-                && self
-                    .mode
-                    .compare_exchange(
-                        FAULT_VALUES_ONCE,
-                        FAULT_NONE,
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                    )
-                    .is_ok());
+        let fail = mode == Fault::SlowFail
+            || (mode == Fault::Series && path.contains("dataset=series/"))
+            || (path.contains("dataset=values/") && self.heal_values_once());
         if fail {
             return Err(object_store::Error::Generic {
                 store: "series-test",
@@ -709,80 +659,55 @@ impl FaultStore {
         }
         Ok(())
     }
+
+    /// Whether [`Fault::ValuesOnce`] is active, healing it in the same step.
+    fn heal_values_once(&self) -> bool {
+        let mut mode = self.mode.lock().expect("mode lock");
+        if *mode != Fault::ValuesOnce {
+            return false;
+        }
+        *mode = Fault::None;
+        true
+    }
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for FaultStore {
-    async fn put_opts(
+impl StoreHooks for Faults {
+    async fn before_put(
         &self,
         path: &object_store::path::Path,
-        payload: PutPayload,
-        options: PutOptions,
-    ) -> object_store::Result<PutResult> {
+        payload: &PutPayload,
+    ) -> object_store::Result<Option<HookGuard>> {
         let bytes = payload.iter().flat_map(|b| b.iter().copied()).collect();
         self.writes
             .lock()
             .expect("writes lock")
             .push((path.to_string(), bytes));
         self.before(path).await?;
-        self.inner.put_opts(path, payload, options).await
+        Ok(None)
     }
 
-    async fn put_multipart_opts(
+    async fn before_multipart(
         &self,
         path: &object_store::path::Path,
-        options: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+    ) -> object_store::Result<Option<HookGuard>> {
         self.before(path).await?;
-        let inner = self.inner.put_multipart_opts(path, options).await?;
-        if self.mode.load(std::sync::atomic::Ordering::SeqCst) == FAULT_MULTIPART_WEDGE
-            && path.as_ref().contains("dataset=values/")
-        {
-            return Ok(Box::new(WedgedUpload {
-                _inner: inner,
+        Ok(None)
+    }
+
+    fn wrap_upload(
+        &self,
+        path: &object_store::path::Path,
+        upload: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        if self.mode() == Fault::MultipartWedge && path.as_ref().contains("dataset=values/") {
+            return Box::new(WedgedUpload {
+                _inner: upload,
                 parts: Arc::clone(&self.parts),
                 aborts: Arc::clone(&self.aborts),
-            }));
+            });
         }
-        Ok(inner)
-    }
-
-    async fn get_opts(
-        &self,
-        path: &object_store::path::Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(path, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        paths: BoxStream<'static, object_store::Result<object_store::path::Path>>,
-    ) -> BoxStream<'static, object_store::Result<object_store::path::Path>> {
-        self.inner.delete_stream(paths)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-        options: CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
+        upload
     }
 }
 

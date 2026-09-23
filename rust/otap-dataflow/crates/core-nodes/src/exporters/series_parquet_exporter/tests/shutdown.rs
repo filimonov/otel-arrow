@@ -160,10 +160,8 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_MULTIPART_WEDGE, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::MultipartWedge);
             let (handler, mut rx) = effects(8);
             let mut cfg = worker_config();
             cfg.lake.upload.abort_timeout = Duration::from_secs(1);
@@ -176,7 +174,7 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
             worker.admit(bulk_logs_pdata(20_000));
             worker.rotate();
             until("the wedged upload takes a part", || {
-                store.parts.load(std::sync::atomic::Ordering::SeqCst) > 0
+                store.hooks().parts.load(SeqCst) > 0
             })
             .await;
             worker.shutdown(clock::now());
@@ -204,7 +202,7 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
                 // channel, and the write has not yet been able to observe the
                 // cancellation, whose store-visible effect is the abort.
                 assert_eq!(
-                    store.aborts.load(std::sync::atomic::Ordering::SeqCst),
+                    store.hooks().aborts.load(SeqCst),
                     0,
                     "the write is cancelled only after the decision is delivered"
                 );
@@ -229,7 +227,7 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
                     );
                 }
                 assert!(
-                    store.aborts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                    store.hooks().aborts.load(SeqCst) > 0,
                     "the abandoned upload is aborted rather than dropped"
                 );
 
@@ -311,10 +309,8 @@ async fn deadline_nacks_both_blocks_and_pending() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, mut rx) = effects(16);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut cfg = worker_config();
@@ -324,7 +320,7 @@ async fn deadline_nacks_both_blocks_and_pending() {
             // FLUSHING: one request, rotated into a write that never returns.
             worker.admit(logs_pdata());
             worker.rotate();
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
             // ACTIVE: one request in the block that is still open.
             worker.admit(logs_pdata());
             // Parked: a request whose admission window is later than the one
@@ -379,10 +375,8 @@ async fn deadline_nacks_both_blocks_and_pending() {
 async fn shutdown_commits_both_blocks_before_deadline() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, mut rx) = effects(8);
             let (pdata_tx, control_tx, inbox) = inbox(8);
             let cfg = worker_config();
@@ -405,7 +399,7 @@ async fn shutdown_commits_both_blocks_before_deadline() {
                     .await
                     .expect("a request of the first block enqueues");
             }
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
             // The fifth joins the block that replaced it; the flush slot is
             // busy, so that block is still ACTIVE when shutdown arrives.
             pdata_tx
@@ -430,10 +424,8 @@ async fn shutdown_commits_both_blocks_before_deadline() {
             drop(pdata_tx);
             // Storage heals, so both blocks can reach object storage inside
             // the deadline.
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
-            store.release.notify_waiters();
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_waiters();
 
             for _ in 0..5 {
                 assert!(
@@ -462,6 +454,7 @@ async fn shutdown_commits_both_blocks_before_deadline() {
             // One values file per block: the block shutdown found flushing and
             // the block it then rotated and flushed itself.
             let written: Vec<String> = store
+                .hooks()
                 .writes
                 .lock()
                 .expect("writes lock")
@@ -489,10 +482,8 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, mut rx) = effects(8);
             let (pdata_tx, control_tx, inbox) = inbox(8);
             let node = tokio::task::spawn_local(super::super::run(
@@ -512,7 +503,7 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
                     .await
                     .expect("a request of the block enqueues");
             }
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
 
             control_tx
                 .send_async(NodeControlMsg::Shutdown {
@@ -549,10 +540,8 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
             for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
-            store.release.notify_waiters();
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_waiters();
 
             for _ in 0..4 {
                 assert!(
@@ -585,10 +574,8 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
 async fn dropping_start_cancels_flush_task() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, _rx) = effects(2);
             let (pdata_tx, control_tx, inbox) = inbox(2);
             let mut cfg = startable_config(1);
@@ -601,9 +588,9 @@ async fn dropping_start_cancels_flush_task() {
                 .send_async(logs_pdata())
                 .await
                 .expect("the request enqueues");
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
             assert_eq!(
-                store.parked.load(std::sync::atomic::Ordering::SeqCst),
+                store.hooks().parked.load(SeqCst),
                 1,
                 "the write is parked inside the store"
             );
@@ -614,12 +601,11 @@ async fn dropping_start_cancels_flush_task() {
                 Ok(_) => panic!("start was not aborted"),
             }
             until("the cancelled node releases the store", || {
-                Arc::strong_count(&store) == 1
-                    && store.parked.load(std::sync::atomic::Ordering::SeqCst) == 0
+                Arc::strong_count(&store) == 1 && store.hooks().parked.load(SeqCst) == 0
             })
             .await;
             assert_eq!(
-                store.parked_drops.load(std::sync::atomic::Ordering::SeqCst),
+                store.hooks().parked_drops.load(SeqCst),
                 1,
                 "the parked write future was dropped rather than leaked"
             );
@@ -657,10 +643,8 @@ async fn saturated_inbox_shutdown_stays_bounded() {
             cfg.lake.upload.abort_timeout = Duration::from_millis(100);
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let metrics = super::super::metrics::Metrics::register(&context, &cfg.lake);
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
 
             for _ in 0..32 {
                 pdata_tx
@@ -732,10 +716,8 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
             prime.push(token, Outcome::Ack);
             prime.next().await.expect("the completion channel fills");
 
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut cfg = worker_config();
             cfg.lake.upload.abort_timeout = Duration::from_millis(100);
@@ -759,7 +741,7 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
                 .send_async(logs_pdata())
                 .await
                 .expect("the request enqueues");
-            store.entered.notified().await;
+            store.hooks().entered.notified().await;
 
             let (samples, reporter) =
                 otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(64);
@@ -879,10 +861,8 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
-            let store = Arc::new(FaultStore::default());
-            store
-                .mode
-                .store(FAULT_PARK, std::sync::atomic::Ordering::SeqCst);
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
             let (handler, mut rx) = effects(4);
             let (pdata_tx, control_tx, inbox) = inbox(2);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
@@ -908,11 +888,9 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
             // to completion. The loop has not been created yet, so nothing can
             // take the result it publishes: that is the state the deadline
             // branch has to be able to win.
-            store.entered.notified().await;
-            store
-                .mode
-                .store(FAULT_NONE, std::sync::atomic::Ordering::SeqCst);
-            store.release.notify_waiters();
+            store.hooks().entered.notified().await;
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_waiters();
             until("the flush publishes its result", || {
                 worker
                     .flushing

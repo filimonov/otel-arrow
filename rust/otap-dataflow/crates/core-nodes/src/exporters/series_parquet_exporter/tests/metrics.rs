@@ -543,12 +543,14 @@ async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
             let (handler, _rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let store = Arc::new(GatedStore {
-                inner: Arc::new(object_store::memory::InMemory::new()),
-                gate: Arc::clone(&gate),
-                entered: Arc::clone(&entered),
-            });
+            let entered = Arc::new(AtomicUsize::new(0));
+            let store = Arc::new(HookStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                GatedStore {
+                    gate: Arc::clone(&gate),
+                    entered: Arc::clone(&entered),
+                },
+            ));
             let mut worker = Worker::new(worker_config(), store, wall, handler);
             worker.metrics = Some(super::super::metrics::Metrics::register(
                 &context,
@@ -557,7 +559,7 @@ async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
             worker.admit(logs_pdata());
             worker.rotate();
             until("the first file write reaches the gate", || {
-                entered.load(std::sync::atomic::Ordering::SeqCst) > 0
+                entered.load(SeqCst) > 0
             })
             .await;
             worker.sample_metrics();
