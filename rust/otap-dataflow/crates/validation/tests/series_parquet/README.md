@@ -137,7 +137,11 @@ are recorded in the index). The flush wall time that is not flush-task CPU
 is reported as `upload_wait_s`, outside the CPU shares. `--option
 rehearsal=true` runs the control lifetimes alone into the output directory
 and publishes nothing; `--option records=...`, `cpu_ns_per_record=...`,
-`repetitions=...` and `configs=[...]` adjust the family, and `--option
+`repetitions=...` and `configs=[...]` adjust the family. Each lifetime's
+ledger is written on `/tmp` (`--option ledger_dir=...` or
+`SERIES_ATTRIBUTION_LEDGER_DIR` name another memory file system): on a disk
+its per-request fsyncs throttle the sender to the disk's commit rate. It is
+deleted after the read-back and its hash is kept. `--option
 lease_wait_s=...` lets each repetition wait that long for the host lease
 another measurement holds, instead of being refused.
 

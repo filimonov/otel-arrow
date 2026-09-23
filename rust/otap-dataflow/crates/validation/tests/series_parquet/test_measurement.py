@@ -4752,6 +4752,25 @@ class AttributionContracts(unittest.TestCase):
                 [1, 2, 3, 4, 17, 18, 19, 20],
             )
 
+    # Scenario: a lifetime's ledger is written under the plan's ledger
+    # directory, with its journal, and then retired.
+    # Guarantees: each repetition's ledgers are kept apart by run id, and
+    # retiring one records its name, hash and size before the file and its
+    # journal are deleted.
+    def test_a_retired_ledger_keeps_its_identity(self):
+        root = temporary_directory(self)
+        plan = {"ledger_dir": str(root / "ledgers")}
+        path = performance.ledger_path(plan, root / "attribution-x-r001", "control")
+        self.assertEqual(path.parent, root / "ledgers" / "attribution-x-r001")
+        ledger = Ledger(path)
+        _ = ledger.add_request(1, "logs", b"wire", [("id", "log", "h")], send_ns=1)
+        ledger.close()
+        digest = measurement.file_digest(path)
+        entry = performance.retire_ledger(path)
+        self.assertEqual((entry["name"], entry["sha256"]), ("ledger-control.sqlite", digest))
+        self.assertEqual(entry["retention"], "deleted")
+        self.assertFalse(list(path.parent.iterdir()))
+
     # Scenario: two telemetry documents of one worker, before and after a
     # window with two flushes, the admin API serving the flush instrument
     # cumulatively.

@@ -4579,7 +4579,7 @@ def attribution_lifetime(label, plan, job, spec, result, run_dir, controls, *,
                 "config_sha256": engine.config_sha256}
     try:
         phase = _command().EnginePhase(label, engine, spec, controls, buffered=False)
-        ledger = measurement.Ledger(run_dir / f"ledger-{label}.sqlite")
+        ledger = measurement.Ledger(ledger_path(plan, run_dir, label))
         _command().record_graph(result, engine, "strict")
         if last:
             result["config"]["effective"] = engine.config
@@ -4684,6 +4684,7 @@ def attribution_lifetime(label, plan, job, spec, result, run_dir, controls, *,
         # The Parquet copies are reproducible and large; only their hashes
         # and counts are evidence.
         shutil.rmtree(local, ignore_errors=True)
+    lifetime["ledger_file"] = retire_ledger(ledger.path)
     records = counts["records_acked_count"]
     cpu_ns = cpu_after - cpu_before
     flush_totals = flush_window(flush_before, flush_after)
@@ -4774,6 +4775,35 @@ def oracle_cores(allocation, sibling_groups) -> list:
     cores |= owned
     available = set(os.sched_getaffinity(0))
     return sorted(cores & available) or sorted(available)
+
+
+# Where a lifetime's ledger lives while it is written. The ledger commits
+# every request with full synchronisation, three transactions a request; on
+# a disk that is three fsyncs, and the sender then runs at the disk's fsync
+# rate -- a first full run managed 15,000 records/s with the worker 9
+# percent busy, which is the engine idling, not the engine under load. On
+# the memory file system the same ledger costs nothing. Millions of records
+# make it gigabytes, so it is deleted once the read-back has compared it,
+# and the result keeps its hash, size and counts.
+LEDGER_DIR_ENV = "SERIES_ATTRIBUTION_LEDGER_DIR"
+
+
+def ledger_path(plan, run_dir, label) -> Path:
+    """The ledger of one lifetime, on the ledger directory of the plan."""
+    directory = Path(plan.get("ledger_dir") or run_dir) / Path(run_dir).name
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"ledger-{label}.sqlite"
+
+
+def retire_ledger(path) -> dict:
+    """The ledger's identity, after which the file and its journal go."""
+    path = Path(path)
+    entry = dict(measurement.file_entry(path), kind="ledger", retention="deleted")
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
+    return entry
 
 
 def lifetime_indexes(indexes, *, profiled) -> list:
@@ -4984,13 +5014,16 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
         for path, kind in sorted(
             [(path, "engine_log") for path in Path(run_dir).glob("engine-*/engine.log")]
             + [(path, "engine_config") for path in Path(run_dir).glob("engine-*/pipeline.yaml")]
-            + [(path, "ledger") for path in Path(run_dir).glob("ledger-*.sqlite")]
             + [(Path(run_dir) / "perf" / "perf.data", "perf_data"),
                (Path(run_dir) / "perf" / "perf-script.txt", "perf_script"),
                (Path(run_dir) / "perf" / "perf.log", "perf_log")]
         )
         if path.is_file()
     ]
+    result["artifacts"].extend(
+        dict(lifetime["ledger_file"], retention=f"deleted after the read-back of {lifetime['label']}")
+        for lifetime in lifetimes if lifetime.get("ledger_file")
+    )
     result["workload_config_id"] = job["config_id"]
     result["repetition"] = job["repetition"]
     result["family_ordinal"] = plan["family_ordinal"]
@@ -5710,6 +5743,10 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         "profile": not rehearsal,
         "repetitions": repetitions,
         "lease_wait_s": float(options.get("lease_wait_s", 0.0)),
+        "ledger_dir": str(
+            options.get("ledger_dir") or os.environ.get(LEDGER_DIR_ENV)
+            or Path("/tmp") / f"series-attribution-ledgers-{os.getpid()}"
+        ),
         "minimum_samples": int(options.get("minimum_samples", ATTRIBUTION_MINIMUM_SAMPLES)),
         "allocation": allocation,
         "oracle_cores": oracle_cores(allocation, topology["sibling_groups"]),
@@ -5791,6 +5828,8 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
                 children.append(run_attribution_child(plan, job, output_dir, report_dir))
     finally:
         store.__exit__(None, None, None)
+        # A lifetime that failed before its read-back leaves its ledger.
+        shutil.rmtree(plan["ledger_dir"], ignore_errors=True)
         for entry in plan["inputs"].values():
             if entry.get("prebuilt") is not None:
                 entry["prebuilt"].close()
