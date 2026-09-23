@@ -1209,9 +1209,13 @@ where it cannot.
 | `dropped_attributes_count` of a resource, a scope, a log record or a point | Nothing: no dataset has a column for it. | Documented; no counter |
 | Arrival order | Values rows are sorted by `values_sort`; rows whose sort keys are equal keep no defined order. | Documented |
 
-Nothing is deduplicated. At-least-once delivery can store a row twice when
-a producer retries after its request's block was written but before the
-ack reached it; readers deduplicate if they need to.
+Values rows are never deduplicated. At-least-once delivery can store a row
+twice when a producer retries after its request's block was written but
+before the ack reached it; readers deduplicate values if they need to.
+Series descriptors are deduplicated: a series is written once per block,
+and not again in a partition where the descriptor cache holds it as
+committed. An eviction, a new partition or a rotation inside one window
+writes it again, and `series.emitted{reason}` counts each such row.
 
 ## Limits
 
