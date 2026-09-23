@@ -984,11 +984,12 @@ mod test {
             });
     }
 
-    /// Scenario: a logs request whose OTLP protobuf framing is cut short
-    /// reaches the exporter, followed by a valid logs batch.
-    /// Guarantees: the damaged request is refused rather than converted into
-    /// an empty batch, the exporter keeps running, and only the valid
-    /// batch's rows are written.
+    /// Scenario: two logs requests whose OTLP protobuf framing is broken --
+    /// one at the top level, one only inside an attribute value of its third
+    /// log record -- reach the exporter, followed by a valid logs batch.
+    /// Guarantees: each damaged request is refused rather than converted into
+    /// an empty or partial batch, the exporter keeps running, and only the
+    /// valid batch's rows are written.
     #[test]
     fn a_malformed_otlp_body_is_not_written() {
         let test_runtime = TestRuntime::<OtapPdata>::new();
@@ -1014,19 +1015,30 @@ mod test {
             .set_exporter(exporter)
             .run_test(move |ctx| {
                 Box::pin(async move {
-                    // Three well-formed records, then a field tag whose
-                    // length is missing: the lazy conversion alone would
-                    // still read the three records.
-                    let mut body = prost::Message::encode_to_vec(
+                    // Three records, the last with a string attribute. The
+                    // lazy conversion alone would still read the three
+                    // records from either damaged copy: one with a field tag
+                    // whose length is missing after the request's only
+                    // `ResourceLogs`, one whose attribute value declares two
+                    // bytes more than it holds, where only a walk into the
+                    // nested messages sees it.
+                    let record = |attributes| otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord {
+                        time_unix_nano: 1,
+                        attributes,
+                        ..Default::default()
+                    };
+                    let attribute = KeyValue {
+                        key: "k".into(),
+                        value: Some(AnyValue::new_string("abc")),
+                    };
+                    let whole = prost::Message::encode_to_vec(
                         &otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest {
                             resource_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ResourceLogs {
                                 scope_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ScopeLogs {
                                     log_records: vec![
-                                        otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord {
-                                            time_unix_nano: 1,
-                                            ..Default::default()
-                                        };
-                                        3
+                                        record(vec![]),
+                                        record(vec![]),
+                                        record(vec![attribute]),
                                     ],
                                     ..Default::default()
                                 }],
@@ -1034,12 +1046,22 @@ mod test {
                             }],
                         },
                     );
-                    body.push(0x0a);
-                    let damaged =
-                        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
-                    ctx.send_pdata(OtapPdata::new_default(damaged.into()))
-                        .await
-                        .expect("send the damaged request");
+                    let mut outer = whole.clone();
+                    outer.push(0x0a);
+                    let mut inner = whole;
+                    let value = [0x0a, 0x03, b'a', b'b', b'c'];
+                    let at = inner
+                        .windows(value.len())
+                        .position(|window| window == value)
+                        .expect("the encoded attribute value");
+                    inner[at + 1] = 0x05;
+                    for body in [outer, inner] {
+                        let damaged =
+                            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                        ctx.send_pdata(OtapPdata::new_default(damaged.into()))
+                            .await
+                            .expect("send the damaged request");
+                    }
                     let mut consumer = Consumer::default();
                     let otap_batch = consumer
                         .consume_bar(&mut fixtures::create_simple_logs_arrow_record_batches(

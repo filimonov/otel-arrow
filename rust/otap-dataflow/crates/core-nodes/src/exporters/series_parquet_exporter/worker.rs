@@ -18,14 +18,16 @@
 //! admission instead of opening another ACTIVE block, so the memory a worker
 //! can hold is bounded by the two blocks and the completions in flight.
 //!
-//! An OTLP request is checked for top-level protobuf wire framing before it is
+//! An OTLP request is checked for protobuf wire framing before it is
 //! converted, because the shared byte views decode lazily and report no error
 //! for a damaged body: without the check a truncated request would become a
-//! request carrying no rows and be acknowledged as stored. Only the top level
-//! is validated -- field tags and the bounds of each length-delimited field.
-//! Nested content is still read lazily and is not validated here; corruption
-//! inside a submessage surfaces as missing or empty fields rather than a
-//! refusal. Covering that is deferred to the chaos tests of plan 3.
+//! request carrying fewer rows than it holds, or none, and be acknowledged as
+//! stored. The check follows the OTLP schema into every nested message --
+//! resource, scope, record or metric, data point, exemplar, attribute and
+//! value -- so damage at any depth refuses the whole request; strings are not
+//! checked for UTF-8 there. Nesting deeper than any accepted
+//! `ingress.max_nesting_depth` is refused by the same walk, before the
+//! conversion's recursive value encoder runs.
 //!
 //! Logs and metrics are admitted through the same state machine and the same
 //! single extraction call; traces have no lake schema and are refused on the
@@ -64,6 +66,13 @@ use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
+
+// The framing walk bounds value nesting on its own; it must never refuse a
+// body that the deepest accepted `ingress.max_nesting_depth` would accept.
+const _: () = assert!(
+    lake::config::MAX_NESTING_DEPTH
+        <= otel_arrow_dfe_pdata::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH
+);
 
 /// Bytes charged per bounded descriptor cache entry.
 ///
@@ -587,7 +596,9 @@ impl Worker {
                 ))),
             );
         }
-        if let Err(failure) = Self::check_wire_format(&payload) {
+        if let Err(failure) =
+            Self::check_wire_format(&payload, self.cfg.lake.ingress.max_nesting_depth)
+        {
             return Prepared::Failed(token, failure);
         }
         let extracted = match self.extract(payload) {
@@ -601,19 +612,22 @@ impl Worker {
         })
     }
 
-    /// Refuse an OTLP body whose top-level protobuf framing is broken.
+    /// Refuse an OTLP body whose protobuf framing is broken at any depth.
     ///
     /// The shared OTLP byte views are deliberately non-validating: the
     /// conversion this node performs reads them lazily and reports no error for
     /// a truncated or corrupt body, so without this check a damaged request
-    /// would be converted into a request carrying no rows and acknowledged as
-    /// if it had been stored. The framing walk is a single linear pass over the
-    /// buffer with no allocation, and only the top level is checked -- see the
-    /// module documentation for what that does and does not cover.
+    /// would be converted into a request carrying fewer rows than it holds, or
+    /// none, and acknowledged as if it had been stored. The framing walk
+    /// follows the OTLP schema into every nested message in one linear pass
+    /// with no allocation -- see the module documentation for what that covers.
+    /// A body nesting values deeper than the walk's own bound is deeper than
+    /// any `ingress.max_nesting_depth` too, so it is refused as that limit
+    /// refuses it, `max_nesting_depth` being the configured one.
     ///
     /// A payload that already holds Arrow records has no wire framing to check;
     /// it is validated by the conversion and the extraction instead.
-    fn check_wire_format(payload: &OtapPayload) -> Result<(), Failure> {
+    fn check_wire_format(payload: &OtapPayload, max_nesting_depth: usize) -> Result<(), Failure> {
         let PayloadData::OtlpBytes(bytes) = payload.data() else {
             return Ok(());
         };
@@ -624,10 +638,13 @@ impl Worker {
             // there is no body to walk here.
             OtlpProtoBytes::ExportTracesRequest(_) => return Ok(()),
         };
-        bytes.validate_framing().map_err(|error| {
-            Failure::Permanent(lake::Error::invalid(format!(
+        bytes.validate_framing().map_err(|error| match error {
+            otel_arrow_dfe_pdata::error::Error::OtlpNestingTooDeep { .. } => Failure::Permanent(
+                lake::Error::Refused(lake::RefuseReason::TooDeep(max_nesting_depth)),
+            ),
+            error => Failure::Permanent(lake::Error::invalid(format!(
                 "malformed OTLP {signal} body: {error}"
-            )))
+            ))),
         })
     }
 

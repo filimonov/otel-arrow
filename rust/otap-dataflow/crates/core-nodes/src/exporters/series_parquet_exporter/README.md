@@ -1087,10 +1087,11 @@ become null; a negative converted timestamp becomes null and increments
   so a duplicate key inside either goes undetected. Duplicate-key validation
   covers only the lists this writer decodes: resource, scope, the log
   record's own attributes and a supported data point's attributes.
-- Only an OTLP body's top-level protobuf framing is validated before
-  conversion, because the shared byte views decode lazily. Corruption inside
-  a nested message is not validated and surfaces as missing fields rather
-  than as a refusal.
+- An OTLP body's protobuf framing is validated before conversion, because
+  the shared byte views decode lazily, and the check follows the OTLP schema
+  into every nested message, so damage at any depth refuses the whole
+  request. It checks framing and wire types only: string fields are not
+  checked for UTF-8 there.
 - Dictionary-encoded OTAP Arrow columns are read through their dictionary,
   never expanded first. Every attribute key and value is charged as it is
   read: one longer than `ingress.max_row_bytes`, or an attribute table whose
@@ -1099,8 +1100,11 @@ become null; a negative converted timestamp becomes null and increments
   memory before the budgets apply.
 - The OTLP receiver hands this exporter the raw request bytes, and the
   shared conversion to Arrow encodes nested map and array attribute values
-  with a recursive encoder that has no depth limit of its own. Deep nesting is
-  refused by `ingress.max_nesting_depth` only after that conversion.
+  with a recursive encoder that has no depth limit of its own. The framing
+  check above refuses nesting deeper than 256 levels, the largest accepted
+  `ingress.max_nesting_depth`, before that conversion; nesting between the
+  configured limit and 256 is refused by `ingress.max_nesting_depth` only
+  after it.
 
 ### Format and storage limits in v1
 

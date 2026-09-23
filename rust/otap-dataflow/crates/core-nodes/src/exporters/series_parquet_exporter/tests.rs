@@ -1107,6 +1107,124 @@ async fn a_malformed_otlp_metrics_body_is_refused_atomically() {
         .await;
 }
 
+/// Scenario: a logs and a metrics request whose top-level framing is intact
+/// but whose first nested message is damaged -- `[0x0a, 0x01, 0x0a]`, a
+/// one-byte `ResourceLogs` / `ResourceMetrics` holding a field tag with no
+/// length -- which the lazy conversion reads as a request of zero rows.
+/// Guarantees: each is nacked permanently as `Refused` with a reason naming
+/// the malformed body and the damaged message, never acknowledged as a
+/// request with nothing to store, and the ACTIVE block is untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn a_body_damaged_inside_a_nested_message_is_refused_not_acked() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(4);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            let damaged = bytes::Bytes::from_static(&[0x0A, 0x01, 0x0A]);
+            for (payload, message) in [
+                (
+                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(damaged.clone()),
+                    "ResourceLogs",
+                ),
+                (
+                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(damaged.clone()),
+                    "ResourceMetrics",
+                ),
+            ] {
+                let mut context = Context::default();
+                context.set_source_node(7);
+                worker.admit(OtapPdata::new(context, payload.into()));
+                assert!(worker.active.data.is_empty());
+                assert!(worker.active.tokens.is_empty());
+                assert!(worker.pending.is_none());
+
+                assert!(worker.notify.next().await.is_ok());
+                match rx.recv().await.expect("a refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(nack.permanent);
+                        assert_eq!(nack.cause, NackCause::Refused);
+                        assert!(
+                            nack.reason
+                                .starts_with("invalid request content: malformed OTLP"),
+                            "reason: {}",
+                            nack.reason
+                        );
+                        assert!(nack.reason.contains(message), "reason: {}", nack.reason);
+                    }
+                    other => panic!("expected a framing refusal, got {other:?}"),
+                }
+            }
+        })
+        .await;
+}
+
+/// Scenario: OTLP logs requests whose record body nests arrays exactly at the
+/// framing walk's bound of 256 levels and one level beyond it, under the
+/// default `ingress.max_nesting_depth` of 32.
+/// Guarantees: the walk passes the first and stops the second before any
+/// conversion, and both are refused alike as exceeding the configured
+/// `ingress.max_nesting_depth`, so the layer that notices the depth never
+/// changes the reason the sender reads.
+#[tokio::test(flavor = "current_thread")]
+async fn nesting_beyond_the_framing_bound_is_refused_as_too_deep() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, ArrayValue, any_value};
+    use otel_arrow_dfe_pdata::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH;
+
+    let body = |levels: usize| {
+        let mut value = AnyValue {
+            value: Some(any_value::Value::StringValue("leaf".to_owned())),
+        };
+        for _ in 0..levels {
+            value = AnyValue {
+                value: Some(any_value::Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        let request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_789_960_500_000_000_000,
+                        body: Some(value),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(encoded(&request).into())
+    };
+    let cfg = worker_config();
+    let limit = cfg.lake.ingress.max_nesting_depth;
+    assert!(limit < MAX_ANY_VALUE_NESTING_DEPTH);
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (handler, _rx) = effects(2);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let worker = Worker::new(cfg, store, wall, handler);
+    for levels in [MAX_ANY_VALUE_NESTING_DEPTH, MAX_ANY_VALUE_NESTING_DEPTH + 1] {
+        let payload = body(levels);
+        assert_eq!(
+            payload.validate_framing().is_ok(),
+            levels == MAX_ANY_VALUE_NESTING_DEPTH,
+            "{levels} levels"
+        );
+        let mut context = Context::default();
+        context.set_source_node(7);
+        match worker.prepare(OtapPdata::new(context, payload.into())) {
+            Prepared::Failed(
+                _,
+                Failure::Permanent(lake::Error::Refused(lake::RefuseReason::TooDeep(refused))),
+            ) => assert_eq!(refused, limit, "{levels} levels"),
+            Prepared::Failed(_, other) => panic!("{levels} levels: refused as {other:?}"),
+            Prepared::Ready(_) => panic!("{levels} levels were admitted"),
+        }
+    }
+}
+
 /// Scenario: one metrics request carries a supported gauge point next to an
 /// unsupported summary point, under the default `unsupported: reject`.
 /// Guarantees: the whole request is refused as one permanent `unsupported`
