@@ -1039,9 +1039,10 @@ at workspace, not at retained block data.
 On Linux the engine starts jemalloc with its background purging thread (the
 startup line `INFO memory allocator jemalloc, background_thread on` says so).
 Without it, freed pages go back to the kernel only while the process keeps
-allocating, so a quiet engine's RSS varied by up to 23 percent between
-identical runs; with it, by at most 6.6 percent. `MALLOC_CONF` overrides the
-setting.
+allocating, so the quiet RSS of identical engines spread by up to 23 percent
+between runs; with it, the exporter engine's quiet RSS spread by 1.4 to 6.6
+percent. Retention right after an allocation burst still varies by several
+MiB. `MALLOC_CONF` overrides the setting.
 
 Per worker, let B be `window.max_block_bytes`, E
 `ingress.max_extracted_bytes`, C the configured
