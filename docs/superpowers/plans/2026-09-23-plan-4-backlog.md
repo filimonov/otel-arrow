@@ -72,3 +72,4 @@ priority where stated.
   helper); DuckDB/ClickHouse actually using native SortingColumn.
 - Upstream: decide core-nodes vs contrib-nodes placement with the maintainers; pdata CBOR encoder recursion limit; PR split; Python lane under
   tools/; history rewrite before the upstream PR (user decision).
+- Metric sets grouping (3f item 10, deferred): reviewer proposed at most three sets (none; {signal,dataset}; {error.type}); folding would drop labels of flushes{reason}, series.emitted{reason}, dropped.unsupported{kind}, dropped.exemplars{signal}, denormalize.type_mismatch{column,registration}; also worker 'acks' duplicates ExporterExportMetrics outcome=success. Decide with the shared-writer telemetry redesign or at upstream PR time.
