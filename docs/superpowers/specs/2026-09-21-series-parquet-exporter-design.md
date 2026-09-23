@@ -1256,12 +1256,12 @@ notify.queued, notify.failures
 oldest_unacked_seconds
 dropped_unsupported{kind}, denormalize.type_mismatch{column},
 timestamp.out_of_range
-memory.budget_bytes, memory.accounted_bytes
+memory.budget, memory.accounted
 ```
 
 Process-scoped, reported once per process: `memory.unaccounted_rss_bytes` =
 process RSS (sampled the same way the memory limiter samples it) minus the
-sum of `memory.accounted_bytes` over all exporter workers. The residual also
+sum of `memory.accounted` over all exporter workers. The residual also
 includes the durable buffer and other nodes in the same process; their
 memory must be accounted for separately before attributing growth to Arrow,
 the allocator or `object_store`. The README states the exporter memory bound
@@ -1512,8 +1512,8 @@ against `LocalFileSystem`, then MinIO, then metrics. Runs in CI.
 
 One storage-outage-and-recovery scenario on the strict end-to-end topology:
 the store becomes unreachable for longer than `flush_retry_deadline` while
-producers keep sending, then recovers. Assertions: `block.active_bytes` and
-`block.flushing_bytes` never exceed their limits, exporter RSS stays within
+producers keep sending, then recovers. Assertions: `block.active` and
+`block.flushing` never exceed their limits, exporter RSS stays within
 the documented bound, producers receive retryable nacks or timeouts, and
 after recovery `oldest_unacked_seconds` returns to baseline with no
 acknowledged data missing. This scenario also runs as a short PR-tier soak

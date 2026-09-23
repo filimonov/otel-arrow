@@ -928,9 +928,9 @@ Unlabelled worker state and totals:
 | `series_cache.hits` | `{lookup}` | Lookups that found a committed descriptor. |
 | `series_cache.misses` | `{lookup}` | Lookups that did not. |
 | `series_cache.evictions` | `{entry}` | Entries dropped because the bound was reached. |
-| `block.active_bytes` | `By` | Bytes the ACTIVE block has charged. |
-| `block.flushing_bytes` | `By` | Bytes the FLUSHING block charged when it was sealed. |
-| `block.pending_bytes` | `By` | Bytes the one parked request retains. |
+| `block.active` | `By` | Bytes the ACTIVE block has charged. |
+| `block.flushing` | `By` | Bytes the FLUSHING block charged when it was sealed. |
+| `block.pending` | `By` | Bytes the one parked request retains. |
 | `block.requests_pending` | `{request}` | Requests the worker still owes a decision. |
 | `block.pending_slot_occupied` | `{slot}` | Whether the single parking slot is occupied. |
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
@@ -939,15 +939,15 @@ Unlabelled worker state and totals:
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
-| `notify.token_bytes` | `By` | Bytes the undelivered completions retain. |
+| `notify.token_size` | `By` | Bytes the undelivered completions retain. |
 | `notify.failures` | `{request}` | Completions the engine would not accept. |
 | `oldest_unacked.age` | `s` | Age of the oldest completion the worker still owes. |
 | `admission.closed` | `{state}` | 1 while the node is not taking requests from its input channel. |
 | `admission.closures` | `{closure}` | Times admission went from open to closed. |
 | `admission.closed.duration` | `s` | Total time admission has been closed. |
 | `timestamp.out_of_range` | `{timestamp}` | Point timestamps outside the representable range. |
-| `memory.budget_bytes` | `By` | Bytes the configuration allows this worker to hold. |
-| `memory.accounted_bytes` | `By` | Bytes the worker is accounted as holding now. |
+| `memory.budget` | `By` | Bytes the configuration allows this worker to hold. |
+| `memory.accounted` | `By` | Bytes the worker is accounted as holding now. |
 
 Labelled sets, each with one closed enumeration:
 
@@ -998,7 +998,7 @@ window interval means the destination, not the producers, is the limit.
 | Event | Level | When |
 | --- | --- | --- |
 | `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
-| `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget_bytes` times the engine's cores exceeds physical memory. |
+| `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
 | `series_parquet.shutdown.grace_exceeded` | WARN | At start, when `window.interval + 2 * (window.flush_retry_deadline + upload.abort_timeout)` exceeds the 60s signal shutdown grace. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt, with the file name and object count. |
@@ -1018,8 +1018,8 @@ timeout, as described under shutdown above, or lower the flush deadline.
 
 ### Reading the process residual
 
-`memory.accounted_bytes` reports the retained exporter data and the measured
-token allocations, including the cache-entry estimate. `memory.budget_bytes`
+`memory.accounted` reports the retained exporter data and the measured
+token allocations, including the cache-entry estimate. `memory.budget`
 reports the configured retained and workspace allowance.
 
 The engine additionally publishes one process-scoped gauge under the same
@@ -1029,7 +1029,7 @@ encoding scratch and allocator overhead appear in this residual, so a non-zero
 value is expected. It is published once per process, only while at least one
 registered exporter worker exists, and it reuses the engine monitor's single
 RSS sample. Watch its trend as well as its absolute value: a residual that
-grows while `memory.accounted_bytes` is flat points at allocator retention or
+grows while `memory.accounted` is flat points at allocator retention or
 at workspace, not at retained block data.
 
 ### Memory model

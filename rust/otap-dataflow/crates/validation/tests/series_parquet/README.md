@@ -131,7 +131,7 @@ each of them once.
   more than one entity of a worker is an error, never a zero.
 - **Liveness.** Presence is not enough. A snapshot the exporter did not
   answer carries its metric names with every value zero, which looks exactly
-  like a drained worker. `memory.budget_bytes` is computed from
+  like a drained worker. `memory.budget` is computed from
   configuration constants and is never zero while the worker is alive, so it
   is the marker: a worker whose budget reads zero is not an observation. Its
   epoch resets the empty streak, because an unobserved epoch may have been

@@ -120,24 +120,24 @@ MINIMUM_PHYSICAL_CORES = 8
 # Exporter gauges a measured sample must contain for every worker. A missing
 # or non-numeric gauge is an error, never a zero.
 REQUIRED_EXPORTER_GAUGES = (
-    "block.active_bytes",
-    "block.flushing_bytes",
-    "block.pending_bytes",
+    "block.active",
+    "block.flushing",
+    "block.pending",
     "block.requests_pending",
     "block.pending_slot_occupied",
     "notify.queued",
-    "notify.token_bytes",
+    "notify.token_size",
     "series_cache.entries",
-    "memory.accounted_bytes",
-    "memory.budget_bytes",
+    "memory.accounted",
+    "memory.budget",
     "oldest_unacked.age",
 )
 
 # Gauges that must all read zero before a worker counts as drained.
 EXPORTER_EMPTY_GAUGES = (
-    "block.active_bytes",
-    "block.flushing_bytes",
-    "block.pending_bytes",
+    "block.active",
+    "block.flushing",
+    "block.pending",
     "block.requests_pending",
     "notify.queued",
 )
@@ -160,7 +160,7 @@ DRAIN_EMPTY_EPOCHS = 3
 # constants, so it is strictly positive whenever the worker sampled itself;
 # a worker that did not answer reports every gauge as zero, which is
 # indistinguishable from a drained worker unless this marker is checked.
-LIVENESS_GAUGE = "memory.budget_bytes"
+LIVENESS_GAUGE = "memory.budget"
 
 # A run file name is a plain file name in the report directory. Nothing else
 # may be staged or published by name.
@@ -2574,7 +2574,7 @@ def _memory_terms(sample) -> dict:
         "anonymous_bytes": procfs["smaps_anonymous_bytes"],
         "file_bytes": procfs["smaps_rss_bytes"] - procfs["smaps_anonymous_bytes"],
         "accounted_bytes": sum(
-            worker["gauges"]["memory.accounted_bytes"] for worker in workers
+            worker["gauges"]["memory.accounted"] for worker in workers
         ),
         "heap_bytes": sum(worker["pipeline_memory_usage_bytes"] for worker in workers),
     }

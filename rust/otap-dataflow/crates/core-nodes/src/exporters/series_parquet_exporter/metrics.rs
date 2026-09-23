@@ -45,14 +45,14 @@ pub(super) struct WorkerMetrics {
     #[metric(name = "series_cache.evictions", unit = "{entry}")]
     pub cache_evictions: ObserveCounter<u64>,
     /// Bytes the ACTIVE block has charged.
-    #[metric(name = "block.active_bytes", unit = "By")]
+    #[metric(name = "block.active", unit = "By")]
     pub active_bytes: Gauge<u64>,
     /// Bytes the FLUSHING block charged when it was sealed.
-    #[metric(name = "block.flushing_bytes", unit = "By")]
+    #[metric(name = "block.flushing", unit = "By")]
     pub flushing_bytes: Gauge<u64>,
     /// Bytes the one parked request retains: its extracted rows, its
     /// descriptors and its completion token.
-    #[metric(name = "block.pending_bytes", unit = "By")]
+    #[metric(name = "block.pending", unit = "By")]
     pub pending_bytes: Gauge<u64>,
     /// Requests the worker still owes a decision, wherever they sit.
     #[metric(name = "block.requests_pending", unit = "{request}")]
@@ -80,7 +80,7 @@ pub(super) struct WorkerMetrics {
     pub notify_queued: Gauge<u64>,
     /// Bytes the undelivered completions retain: queue storage, each token's
     /// external routing buffers, and the one in-flight send's future.
-    #[metric(name = "notify.token_bytes", unit = "By")]
+    #[metric(name = "notify.token_size", unit = "By")]
     pub notify_token_bytes: Gauge<u64>,
     /// Completions the engine would not accept.
     #[metric(name = "notify.failures", unit = "{request}")]
@@ -109,10 +109,10 @@ pub(super) struct WorkerMetrics {
     #[metric(name = "timestamp.out_of_range", unit = "{timestamp}")]
     pub timestamp_out_of_range: Counter<u64>,
     /// Bytes the worker's configuration allows it to hold.
-    #[metric(name = "memory.budget_bytes", unit = "By")]
+    #[metric(name = "memory.budget", unit = "By")]
     pub memory_budget_bytes: Gauge<u64>,
     /// Bytes the worker is accounted as holding right now.
-    #[metric(name = "memory.accounted_bytes", unit = "By")]
+    #[metric(name = "memory.accounted", unit = "By")]
     pub memory_accounted_bytes: Gauge<u64>,
 }
 
@@ -455,14 +455,61 @@ mod tests {
     use super::*;
     use otel_arrow_dfe_series_lake::config::{DenormType, Denormalize};
 
+    /// Unit words the semantic-conventions guide keeps out of metric names:
+    /// the unit is metadata, never part of the name.
+    const UNIT_WORDS: [&str; 10] = [
+        "bytes", "byte", "seconds", "second", "secs", "ms", "ns", "us", "count", "total",
+    ];
+
+    /// Panic if any dot or underscore separated word of `name` is a unit.
+    fn assert_no_unit_in_name(name: &str) {
+        for word in name.split(['.', '_']) {
+            assert!(
+                !UNIT_WORDS.contains(&word),
+                "metric name {name:?} carries the unit word {word:?}"
+            );
+        }
+    }
+
+    /// Scenario: the unit-word check is given names in the guide's form and
+    /// names carrying a unit.
+    /// Guarantees: the check that every exporter metric passes below rejects
+    /// `_bytes`, `_seconds` and `_count` suffixes, so a unit can never slip
+    /// back into a name unnoticed.
+    #[test]
+    fn a_unit_in_a_metric_name_is_rejected() {
+        for name in [
+            "block.active",
+            "notify.token_size",
+            "oldest_unacked.age",
+            "flushes",
+        ] {
+            assert_no_unit_in_name(name);
+        }
+        for name in [
+            "block.active_bytes",
+            "oldest_unacked_seconds",
+            "flush.count",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| assert_no_unit_in_name(name)).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
+
     /// Assert one snapshot's descriptor name, its ordered metric names and
-    /// units, and the measurement labels its bucket decodes to.
+    /// units, and the measurement labels its bucket decodes to; no metric
+    /// name may carry a unit word.
     fn assert_schema(
         snapshot: &MetricSetSnapshot,
         fields: &[(&str, &str)],
         labels: &[(&str, &str)],
     ) {
         assert_eq!(snapshot.descriptor().name, "exporter.series_parquet");
+        for metric in snapshot.descriptor().metrics {
+            assert_no_unit_in_name(metric.name);
+        }
         let actual: Vec<_> = snapshot
             .descriptor()
             .metrics
@@ -497,9 +544,9 @@ mod tests {
                 ("series_cache.hits", "{lookup}"),
                 ("series_cache.misses", "{lookup}"),
                 ("series_cache.evictions", "{entry}"),
-                ("block.active_bytes", "By"),
-                ("block.flushing_bytes", "By"),
-                ("block.pending_bytes", "By"),
+                ("block.active", "By"),
+                ("block.flushing", "By"),
+                ("block.pending", "By"),
                 ("block.requests_pending", "{request}"),
                 ("block.pending_slot_occupied", "{slot}"),
                 ("flush.duration", "s"),
@@ -508,15 +555,15 @@ mod tests {
                 ("flush.cancelled", "{flush}"),
                 ("acks", "{message}"),
                 ("notify.queued", "{request}"),
-                ("notify.token_bytes", "By"),
+                ("notify.token_size", "By"),
                 ("notify.failures", "{request}"),
                 ("oldest_unacked.age", "s"),
                 ("admission.closed", "{state}"),
                 ("admission.closures", "{closure}"),
                 ("admission.closed.duration", "s"),
                 ("timestamp.out_of_range", "{timestamp}"),
-                ("memory.budget_bytes", "By"),
-                ("memory.accounted_bytes", "By"),
+                ("memory.budget", "By"),
+                ("memory.accounted", "By"),
             ],
             &[],
         );

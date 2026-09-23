@@ -2783,7 +2783,7 @@ class ReconciliationContracts(unittest.TestCase):
                 "w": {
                     "pipeline_memory_usage_bytes": heap,
                     "gauges": {
-                        "memory.accounted_bytes": accounted,
+                        "memory.accounted": accounted,
                         measurement.LIVENESS_GAUGE: 1 if reported else 0,
                     },
                 }
@@ -3126,18 +3126,18 @@ class SnapshotReadingContracts(unittest.TestCase):
     # `default=0` made impossible.
     def test_absent_and_zero_are_distinguishable(self):
         absent = exporter_snapshot({"acks": 3})
-        zero = exporter_snapshot({"memory.budget_bytes": 0})
+        zero = exporter_snapshot({"memory.budget": 0})
         self.assertFalse(
-            measurement.test_e2e.metric_present(absent, "memory.budget_bytes")
+            measurement.test_e2e.metric_present(absent, "memory.budget")
         )
         self.assertTrue(
-            measurement.test_e2e.metric_present(zero, "memory.budget_bytes")
+            measurement.test_e2e.metric_present(zero, "memory.budget")
         )
         self.assertEqual(
-            measurement.test_e2e.metric_values(absent, "memory.budget_bytes"), []
+            measurement.test_e2e.metric_values(absent, "memory.budget"), []
         )
         self.assertEqual(
-            measurement.test_e2e.metric_values(zero, "memory.budget_bytes"), [0]
+            measurement.test_e2e.metric_values(zero, "memory.budget"), [0]
         )
 
     # Scenario: a caller that asserts on a value reads a metric the snapshot
@@ -3146,12 +3146,12 @@ class SnapshotReadingContracts(unittest.TestCase):
     # silently receiving a zero.
     def test_a_required_metric_must_be_present(self):
         absent = exporter_snapshot({"acks": 3})
-        with self.assertRaisesRegex(AssertionError, "memory.budget_bytes"):
-            _ = measurement.test_e2e.metric_max(absent, "memory.budget_bytes")
+        with self.assertRaisesRegex(AssertionError, "memory.budget"):
+            _ = measurement.test_e2e.metric_max(absent, "memory.budget")
         self.assertEqual(
             measurement.test_e2e.metric_max(
-                exporter_snapshot({"memory.budget_bytes": 0}),
-                "memory.budget_bytes",
+                exporter_snapshot({"memory.budget": 0}),
+                "memory.budget",
             ),
             0,
         )
@@ -3176,7 +3176,7 @@ class SnapshotReadingContracts(unittest.TestCase):
         absent = exporter_snapshot({"acks": 3})
         with self.assertRaises(AssertionError):
             self.assertLessEqual(
-                measurement.test_e2e.metric_max(absent, "block.active_bytes"),
+                measurement.test_e2e.metric_max(absent, "block.active"),
                 8 << 20,
             )
 
@@ -3187,10 +3187,10 @@ class SnapshotReadingContracts(unittest.TestCase):
     # never zero while the worker is alive.
     def test_zero_budget_marks_a_snapshot_the_exporter_did_not_answer(self):
         quiet = exporter_snapshot(
-            {"memory.budget_bytes": 0, "memory.accounted_bytes": 0}
+            {"memory.budget": 0, "memory.accounted": 0}
         )
         live = exporter_snapshot(
-            {"memory.budget_bytes": 1637851136, "memory.accounted_bytes": 983168}
+            {"memory.budget": 1637851136, "memory.accounted": 983168}
         )
         self.assertFalse(measurement.test_e2e.exporter_reported(quiet))
         self.assertTrue(measurement.test_e2e.exporter_reported(live))
@@ -4207,17 +4207,17 @@ class HarnessHygieneContracts(unittest.TestCase):
         e2e = measurement.test_e2e
         engine = object.__new__(e2e.Engine)
         snapshot = {"metric_sets": [{"name": e2e.EXPORTER_METRIC_SET, "metrics": [
-            {"name": "block.active_bytes", "value": 7},
+            {"name": "block.active", "value": 7},
         ]}]}
         with mock.patch.object(e2e, "engine_metrics", return_value=snapshot):
             self.assertEqual(
-                engine.exporter_gauges("block.active_bytes", "block.flushing_bytes"),
-                {"block.active_bytes": 7, "block.flushing_bytes": None},
+                engine.exporter_gauges("block.active", "block.flushing"),
+                {"block.active": 7, "block.flushing": None},
             )
         with mock.patch.object(e2e, "engine_metrics", side_effect=OSError("down")):
             self.assertEqual(
-                engine.exporter_gauges("block.active_bytes"),
-                {"block.active_bytes": None},
+                engine.exporter_gauges("block.active"),
+                {"block.active": None},
             )
 
     # Scenario: the wall clock reads 3.7 s into a 5 s window.

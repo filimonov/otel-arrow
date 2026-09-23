@@ -990,7 +990,7 @@ class ShutdownSlice(unittest.TestCase):
                 gauges = {}
                 while time.monotonic() < deadline:
                     gauges = engine.exporter_gauges(
-                        "block.flushing_bytes", "block.active_bytes"
+                        "block.flushing", "block.active"
                     )
                     if all(
                         value is not None and value > 0 for value in gauges.values()
@@ -2732,14 +2732,14 @@ def metric_max(document, name, *, default=REQUIRED, metric_set=EXPORTER_METRIC_S
 def exporter_reported(document):
     """Whether the exporter's own sample is in this snapshot.
 
-    `memory.budget_bytes` is computed in `worker.rs::sample_metrics` from
+    `memory.budget` is computed in `worker.rs::sample_metrics` from
     configuration constants -- the sort, merge, writer, upload and conversion
     reservations -- so it is strictly positive whenever the worker samples
     itself. A snapshot in which it is absent, or present and zero, therefore
     does not carry that worker's sample.
 
     Both shapes have been observed. Under outage load one snapshot in a run
-    carried the exporter metric set, with `memory.budget_bytes` among its
+    carried the exporter metric set, with `memory.budget` among its
     metric names, reporting zero; the worker had not answered the collection
     that snapshot was built from. Which engine path produces that is not
     settled here, and this check does not depend on it.
@@ -2749,7 +2749,7 @@ def exporter_reported(document):
     none can distinguish "the exporter is empty" from "the exporter did not
     report".
     """
-    return metric_max(document, "memory.budget_bytes", default=0) > 0
+    return metric_max(document, "memory.budget", default=0) > 0
 
 
 def rss_bytes(pid):
@@ -3220,16 +3220,16 @@ class OutageSlice(unittest.TestCase):
                 )
                 for document, rss in samples:
                     self.assertLessEqual(
-                        metric_max(document, "block.active_bytes"), 8 << 20
+                        metric_max(document, "block.active"), 8 << 20
                     )
                     self.assertLessEqual(
-                        metric_max(document, "block.flushing_bytes"), 8 << 20
+                        metric_max(document, "block.flushing"), 8 << 20
                     )
                     self.assertLessEqual(
                         metric_max(document, "block.pending_slot_occupied"), 1
                     )
                     self.assertLessEqual(metric_max(document, "notify.queued"), 16)
-                    budget = metric_max(document, "memory.budget_bytes")
+                    budget = metric_max(document, "memory.budget")
                     self.assertGreater(
                         budget, 0, "missing budget telemetry is a failure"
                     )
