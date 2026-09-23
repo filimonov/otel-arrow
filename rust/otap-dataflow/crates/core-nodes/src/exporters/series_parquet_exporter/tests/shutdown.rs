@@ -279,7 +279,7 @@ async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
 
             let (handler, mut rx) = effects(1);
             let mut notify = Notifier::new(handler, 2);
-            notify.force_shutdown(data);
+            notify.force_shutdown(data, 0);
             assert_eq!(
                 notify.failures(),
                 0,
@@ -631,9 +631,7 @@ async fn saturated_inbox_shutdown_stays_bounded() {
             let (handler, _completion_rx) = effects(1);
             // One delivered completion is enough to fill the channel, so every
             // decision the node takes from here on cannot be handed over.
-            // Two slots, because the last one of a notifier is reserved for a
-            // shutdown outcome and this priming completion is a normal one.
-            let mut prime = Notifier::new(handler.clone(), 2);
+            let mut prime = Notifier::new(handler.clone(), 1);
             let (token, payload) = AckToken::split(empty_pdata());
             drop(payload);
             prime.push(token, Outcome::Ack);
@@ -693,6 +691,110 @@ async fn saturated_inbox_shutdown_stays_bounded() {
         .await;
 }
 
+/// A worker whose one request (id 1) is FLUSHING in a parked write, with
+/// shutdown latched and three requests (ids 2 to 4) force-drained into a
+/// completion channel that has room for one message and is never read.
+///
+/// One request per block makes the notifier's capacity two, so the flushing
+/// block's completion and two force-drained refusals are more than it holds.
+async fn force_drained_past_a_held_block(
+    store: &Arc<FaultStore>,
+) -> (Worker, PipelineCompletionMsgReceiver<OtapPdata>) {
+    store.hooks().set(Fault::Park);
+    let (handler, rx) = effects(1);
+    let mut cfg = worker_config_with_requests(1);
+    cfg.lake.upload.abort_timeout = Duration::from_millis(100);
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+    worker.admit(logs_pdata_from(1));
+    worker.rotate();
+    store.hooks().entered.notified().await;
+    worker.shutdown(clock::now() + Duration::from_secs(30));
+    for id in 2..=4 {
+        worker.force_shutdown(logs_pdata_from(id));
+    }
+    (worker, rx)
+}
+
+/// Scenario: one request is FLUSHING in a parked write, three requests are
+/// force-drained after shutdown while the completion channel has room for
+/// one and nobody reads it, and the write is then released.
+/// Guarantees: the refusal that does not fit beside the held block is
+/// attempted once and counted instead of queued, so the flushing block's ack
+/// still has a slot: no panic, the block is acknowledged, and each of the four
+/// requests is decided exactly once.
+#[tokio::test(flavor = "current_thread")]
+async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = fault_store();
+            let (mut worker, mut rx) = force_drained_past_a_held_block(&store).await;
+            assert_eq!(
+                worker.notify.failures(),
+                1,
+                "the refusal that does not fit is attempted once and counted"
+            );
+
+            store.hooks().set(Fault::None);
+            store.hooks().release.notify_waiters();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("the block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            drain_cleanup(&mut worker).await;
+
+            // The channel took refusal 2; refusal 3 waits in the send slot and
+            // the ack of request 1 behind it.
+            expect_shutdown_nack(&mut rx).await;
+            worker.notify.next().await.expect("refusal 3 is sent");
+            expect_shutdown_nack(&mut rx).await;
+            worker.notify.next().await.expect("the ack is sent");
+            assert_eq!(expect_ack(&mut rx).await, Some(1));
+            assert!(rx.try_recv().is_err(), "no request is decided twice");
+            let outcomes = worker.notify.outcomes();
+            assert_eq!(outcomes[Outcome::Shutdown as usize], 3);
+            assert_eq!(outcomes[Outcome::Ack as usize], 1);
+            assert_eq!(outcomes.iter().sum::<u64>(), 4);
+            assert!(worker.is_idle());
+        })
+        .await;
+}
+
+/// Scenario: the same held block and force-drained requests, but the
+/// shutdown deadline fires while the write is still parked.
+/// Guarantees: the deadline decides the flushing block without a panic,
+/// every completion the channel cannot take is counted as a delivery failure,
+/// and each of the four requests is decided exactly once.
+#[tokio::test(flavor = "current_thread")]
+async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            let (mut worker, mut rx) = force_drained_past_a_held_block(&store).await;
+
+            let _ticker = ticking(&sim, Duration::from_millis(50));
+            worker.abandon().await;
+
+            expect_shutdown_nack(&mut rx).await;
+            assert!(rx.try_recv().is_err(), "no request is decided twice");
+            let outcomes = worker.notify.outcomes();
+            assert_eq!(outcomes[Outcome::Shutdown as usize], 4);
+            assert_eq!(outcomes.iter().sum::<u64>(), 4);
+            assert_eq!(
+                worker.notify.failures(),
+                3,
+                "one delivered, three counted: every decision is accounted for"
+            );
+            assert!(worker.is_idle());
+        })
+        .await;
+}
+
 /// Scenario: window boundaries keep arriving while the one flush slot is held
 /// by a write that never returns and the completion channel is already full,
 /// and a telemetry control message and then a shutdown are sent into that.
@@ -708,9 +810,7 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
             let _clock_guard = sim.install();
             let (pdata_tx, control_tx, inbox) = inbox(4);
             let (handler, _completion_rx) = effects(1);
-            // Two slots, because the last one of a notifier is reserved for a
-            // shutdown outcome and this priming completion is a normal one.
-            let mut prime = Notifier::new(handler.clone(), 2);
+            let mut prime = Notifier::new(handler.clone(), 1);
             let (token, payload) = AckToken::split(empty_pdata());
             drop(payload);
             prime.push(token, Outcome::Ack);

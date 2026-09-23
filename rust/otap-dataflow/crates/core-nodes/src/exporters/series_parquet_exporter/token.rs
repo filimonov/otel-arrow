@@ -125,7 +125,8 @@ pub(super) struct Notifier {
     queue: VecDeque<Queued>,
     /// The one completion currently being sent, if any.
     sending: Option<Sending>,
-    /// Maximum number of live completions, queued plus sending.
+    /// Maximum number of live completions: queued, sending, and held by a
+    /// block or the parking slot until they are pushed here.
     capacity: usize,
     /// Count of completions pushed, per [`Outcome`].
     outcomes: [u64; OUTCOMES],
@@ -233,44 +234,39 @@ impl Notifier {
         self.token_high_water
     }
 
-    /// Whether one more normal completion may be queued, given the number of
+    /// Whether one more request may be admitted, given the number of
     /// completions the caller already owes.
     ///
-    /// `live` counts every token that will eventually reach this queue, not
-    /// only the ones already in it: a token held by a block is a completion
-    /// the notifier has yet to be handed. False once the only slot left is the
-    /// last one, so the worker stops admitting rather than spending the slot
-    /// [`Notifier::force_shutdown`] queues a refusal in when the completion
-    /// channel is full.
+    /// `live` counts every completion the worker owes wherever it sits: here,
+    /// or held by a block or the parking slot until it is pushed. Admission
+    /// stops one short of `capacity`, so a saturated worker still has a slot
+    /// for the first request [`Notifier::force_shutdown`] refuses.
     pub(super) fn has_credit(&self, live: usize) -> bool {
         live + 1 < self.capacity
     }
 
     /// Queue one decided request.
     ///
-    /// The caller reserves the credit before it admits the request, so a push
-    /// that would exceed the bound is a worker bug rather than a runtime
-    /// condition. The bound is checked after the insertion, not before it: a
-    /// normal outcome may take the notifier up to `capacity - 1` live
-    /// completions, and the last slot is kept for a shutdown outcome: the
-    /// shutdown decision of a completion the worker already holds, or a
-    /// force-drained refusal queued by [`Notifier::force_shutdown`].
+    /// The worker owes at most `capacity` completions, counted while a block
+    /// or the parking slot still held this one, so moving it here keeps the
+    /// queue within its bound. A push past the bound is attempted once
+    /// instead, exactly as [`Notifier::force_shutdown`] treats a refusal that
+    /// does not fit.
     pub(super) fn push(&mut self, token: AckToken, outcome: Outcome) {
         self.push_with(token, outcome, None);
     }
 
     /// Queue one decided request with the reason sentence its sender is told.
     ///
-    /// `None` falls back to [`Outcome::sentence`]. The credit rule is the one
+    /// `None` falls back to [`Outcome::sentence`]. The bound is the one
     /// [`Notifier::push`] documents.
     pub(super) fn push_with(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
-        let reserved = usize::from(outcome != Outcome::Shutdown);
-        assert!(
-            self.len() + 1 + reserved <= self.capacity,
-            "worker must reserve completion credit"
-        );
         self.decided(&token, outcome);
-        self.queue.push_back((token, outcome, reason));
+        if self.len() < self.capacity {
+            self.queue.push_back((token, outcome, reason));
+        } else {
+            self.deliver_now(token, outcome, reason);
+        }
     }
 
     /// The engine call one decided completion is delivered by.
@@ -357,22 +353,27 @@ impl Notifier {
     /// Refuse one force-drained request with a retryable `NodeShutdown` nack.
     ///
     /// Called after shutdown is latched, possibly many times within one poll
-    /// of the node. With the send slot free and nothing queued ahead, the send
-    /// is started and polled once, and one that cannot finish yet stays in the
-    /// slot rather than being dropped. Otherwise the refusal waits in the queue
-    /// behind the others, which the node keeps serving until its deadline. The
-    /// queue is bounded: normal completions stop one short of `capacity`
-    /// (see [`Notifier::has_credit`]), so a saturated node still has at least
-    /// one slot for a refusal here. Only past `capacity` is a refusal attempted
-    /// once and, if the channel is full, counted as a delivery failure and
-    /// released, so force-drain never grows memory without bound and never
-    /// stalls on a full completion channel.
-    pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
+    /// of the node. `held` is the number of completions the caller still owes
+    /// outside the notifier, in a block or the parking slot, each of which
+    /// will be pushed here later. The refusal takes a slot only while it and
+    /// every held completion fit in `capacity`: with the send slot free and
+    /// nothing queued ahead, the send is started and polled once, and one that
+    /// cannot finish yet stays in the slot; otherwise the refusal waits in the
+    /// queue, which the node keeps serving until its deadline. A refusal that
+    /// does not fit is attempted once and, if the channel is full, counted as
+    /// a delivery failure and released, so force-drain never takes the credit
+    /// a held block needs, never grows memory without bound and never stalls
+    /// on a full completion channel.
+    pub(super) fn force_shutdown(&mut self, data: OtapPdata, held: usize) {
         use futures::FutureExt;
 
         let (token, payload) = AckToken::split(data);
         drop(payload);
         self.decided(&token, Outcome::Shutdown);
+        if self.len() + held >= self.capacity {
+            self.deliver_now(token, Outcome::Shutdown, None);
+            return;
+        }
         if self.sending.is_none() && self.queue.is_empty() {
             self.install(token, Outcome::Shutdown, None);
             let sending = self.sending.as_mut().expect("send was installed");
@@ -384,18 +385,14 @@ impl Notifier {
             }
             return;
         }
-        if self.len() < self.capacity {
-            self.queue.push_back((token, Outcome::Shutdown, None));
-            return;
-        }
-        self.deliver_now(token, Outcome::Shutdown, None);
+        self.queue.push_back((token, Outcome::Shutdown, None));
     }
 
     /// Attempt one completion immediately, counting a send that would block.
     ///
-    /// Used only on the paths that must not park a token: a force-drained
-    /// request past the queue bound and the completions abandoned once the
-    /// shutdown deadline has elapsed. The token is released either way, so the
+    /// Used only on the paths that must not park a token: a completion past
+    /// the queue bound and the completions abandoned once the shutdown
+    /// deadline has elapsed. The token is released either way, so the
     /// request ends decided or counted as a delivery failure, never silently
     /// dropped. The attempt is outside the cooperative budget, so a full
     /// completion channel is the only reason it can fail to be taken.
@@ -566,19 +563,19 @@ mod tests {
         let (handler, mut rx) = effects(1);
         let mut notify = Notifier::new(handler, 1);
 
-        notify.force_shutdown(empty_pdata());
+        notify.force_shutdown(empty_pdata(), 0);
         assert_eq!(notify.failures(), 0);
         assert!(notify.is_empty());
 
         // The channel now holds the first refusal, so the second cannot be
         // handed over without blocking: it keeps the send slot.
-        notify.force_shutdown(empty_pdata());
+        notify.force_shutdown(empty_pdata(), 0);
         assert_eq!(notify.failures(), 0);
         assert_eq!(notify.len(), 1);
 
         // The notifier is at its bound of one, so the third is attempted
         // once, finds the channel full and is counted.
-        notify.force_shutdown(empty_pdata());
+        notify.force_shutdown(empty_pdata(), 0);
         assert_eq!(notify.failures(), 1);
         assert_eq!(notify.len(), 1);
         assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 3);
@@ -639,7 +636,7 @@ mod tests {
         let (handler, mut rx) = effects(N);
         let mut notify = Notifier::new(handler, 8);
         for _ in 0..N {
-            notify.force_shutdown(empty_pdata());
+            notify.force_shutdown(empty_pdata(), 0);
         }
         assert_eq!(notify.failures(), 0);
         let mut delivered = 0;
@@ -722,16 +719,18 @@ mod tests {
         assert_eq!(notify.oldest(), Some(blocked_received));
     }
 
-    /// Scenario: normal completions are queued until the notifier is one slot
-    /// from its capacity, and a force-drained request is then decided.
-    /// Guarantees: normal outcomes stop at `capacity - 1` live completions and
-    /// the last slot stays usable by a shutdown outcome, so the node always
-    /// keeps the credit it needs to decide one force-drained request.
+    /// Scenario: normal completions are queued until admission would leave
+    /// the notifier one slot from its capacity, and a force-drained request is
+    /// then refused, and a second one after it.
+    /// Guarantees: admission stops at `capacity - 1` live completions and the
+    /// last slot takes the first force-drained refusal; the second, which no
+    /// longer fits, is attempted once and delivered at once rather than
+    /// queued past the bound.
     #[tokio::test(flavor = "current_thread")]
-    async fn the_last_completion_slot_is_reserved_for_shutdown() {
+    async fn the_last_completion_slot_is_left_for_a_forced_refusal() {
         // Capacity 4 stands for 2N with N = 2; the cap on normal live
         // completions is therefore 3.
-        let (handler, _rx) = effects(1);
+        let (handler, mut rx) = effects(1);
         let mut notify = Notifier::new(handler, 4);
 
         for _ in 0..3 {
@@ -743,29 +742,39 @@ mod tests {
         assert_eq!(notify.len(), 3);
         assert!(!notify.has_credit(notify.len()));
 
-        let (token, payload) = AckToken::split(empty_pdata());
-        drop(payload);
-        notify.push(token, Outcome::Shutdown);
-        assert_eq!(notify.len(), 4);
-        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 1);
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.len(), 4, "the last slot takes the refusal");
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.len(), 4, "a refusal past the bound is not queued");
+        assert_eq!(notify.failures(), 0, "the channel had room for it");
+        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 2);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PipelineCompletionMsg::DeliverNack { .. })
+        ));
     }
 
-    /// Scenario: a normal completion is pushed while the only free slot is the
-    /// one reserved for a forced drain.
-    /// Guarantees: the push panics rather than silently spending the reserved
-    /// credit, so the bound is a checked worker contract.
+    /// Scenario: completions are pushed past the notifier's bound, first while
+    /// the completion channel has room for one and then while it is full.
+    /// Guarantees: a push past the bound never panics and never grows the
+    /// queue: it is delivered at once when the channel takes it and counted as
+    /// a delivery failure when it does not, so a credit miscount cannot drop
+    /// every held completion with a panicking worker.
     #[tokio::test(flavor = "current_thread")]
-    #[should_panic(expected = "worker must reserve completion credit")]
-    async fn a_normal_completion_cannot_take_the_reserved_slot() {
-        let (handler, _rx) = effects(1);
-        let mut notify = Notifier::new(handler, 2);
-
-        let (first, payload) = AckToken::split(empty_pdata());
-        drop(payload);
-        notify.push(first, Outcome::Ack);
-
-        let (second, payload) = AckToken::split(empty_pdata());
-        drop(payload);
-        notify.push(second, Outcome::Ack);
+    async fn a_push_past_the_bound_is_delivered_at_once_not_asserted() {
+        let (handler, mut rx) = effects(1);
+        let mut notify = Notifier::new(handler, 1);
+        for outcome in [Outcome::Ack, Outcome::Shutdown, Outcome::Storage] {
+            let (token, payload) = AckToken::split(empty_pdata());
+            drop(payload);
+            notify.push(token, outcome);
+        }
+        assert_eq!(notify.len(), 1, "only the first push is queued");
+        assert_eq!(notify.failures(), 1, "the third found the channel full");
+        assert_eq!(notify.outcomes().iter().sum::<u64>(), 3);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PipelineCompletionMsg::DeliverNack { .. })
+        ));
     }
 }

@@ -352,13 +352,25 @@ impl Worker {
     /// Completions the worker still owes, wherever they currently sit.
     ///
     /// A token moves from the ACTIVE block to the FLUSHING one and from there
-    /// into the notifier, so the bound that keeps the notifier from
-    /// overflowing has to count all three places at once.
+    /// into the notifier, so the notifier's bound counts every place at once.
     pub(super) fn live_tokens(&self) -> usize {
+        self.held_tokens() + self.notify.len()
+    }
+
+    /// Completions held by a block or the parking slot, which the notifier
+    /// has yet to be handed.
+    fn held_tokens(&self) -> usize {
         self.active.tokens.len()
             + self.flushing.as_ref().map_or(0, |job| job.tokens.len())
-            + self.notify.len()
             + usize::from(self.pending.is_some())
+    }
+
+    /// Refuse one request force-drained after shutdown was latched, without
+    /// taking the credit a held completion needs (see
+    /// [`Notifier::force_shutdown`]).
+    pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
+        let held = self.held_tokens();
+        self.notify.force_shutdown(data, held);
     }
 
     /// Whether one more request may be admitted.

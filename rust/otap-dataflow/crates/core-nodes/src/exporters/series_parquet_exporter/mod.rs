@@ -259,9 +259,9 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
 /// a third block. Once shutdown has been latched the node keeps taking
 /// force-drained pdata and refuses each one with a retryable `NodeShutdown`
 /// nack: sent at once when the completion channel has room, and otherwise
-/// queued in the notifier, which the loop keeps serving until the deadline.
-/// Normal completions never take the notifier's last slot, so a saturated
-/// node can still queue at least one such refusal.
+/// queued in the notifier, which the loop keeps serving until the deadline,
+/// as long as it leaves room for every completion the blocks still hold (see
+/// `Notifier::force_shutdown`).
 #[cfg(test)]
 async fn run(
     cfg: config::Config,
@@ -458,7 +458,7 @@ async fn drive(
                             // Force-drained: the node is past admission, so the
                             // request is refused immediately rather than parked.
                             worker.shutdown(d);
-                            worker.notify.force_shutdown(data);
+                            worker.force_shutdown(data);
                         } else {
                             worker.admit(data);
                         }

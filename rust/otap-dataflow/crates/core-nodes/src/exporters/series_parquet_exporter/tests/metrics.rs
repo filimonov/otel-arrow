@@ -415,7 +415,7 @@ async fn decisions_are_recorded_in_the_shared_export_metrics() {
     traces.set_source_node(7);
     worker.admit(OtapPdata::new(traces, traces_payload()));
     worker.shutdown(clock::now() + Duration::from_secs(30));
-    worker.notify.force_shutdown(logs_pdata());
+    worker.force_shutdown(logs_pdata());
 
     let snapshots = worker.metric_snapshots();
     let exports = |signal: &str, outcome: &str| {
