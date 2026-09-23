@@ -587,10 +587,11 @@ stream (r2):
   workspace the first ledger borrowed.
 - `campaign/reports/task-6-report.md`.
 
-## Task 3i: flush stall, cancellation, flush workspace, exemplars (provisional, fix round 2 pending)
+## Task 3i: flush stall, cancellation, flush workspace, exemplars
 
-The figures in this section are provisional. Task 3i is in its second
-review fix round. The open items are listed under "Deferred".
+Closed after three review fix rounds. The final code is 8f5dddc4a. Its
+probe run is the "round 3" row below; earlier rounds are kept to show how
+the bound was reached.
 
 ### Question
 
@@ -609,9 +610,14 @@ And does the ledger close once the flush workspace is accounted?
 - 20 cancelled writes per fixture, signalled at evenly spaced fractions of
   the write. "Observed" is signal to the sink's first clock reading after
   the cancel.
-- Before is the library at fcceef306. After is 545c9f038, after review fix
-  round 1. 7 uncancelled and 20 cancelled writes per fixture, under the pin
-  with the lease, on release bench binaries.
+- Before is the library at fcceef306. The final build is 8f5dddc4a, after
+  review fix round 3. 7 uncancelled and 20 cancelled writes per fixture,
+  under the pin with the lease, on release bench binaries. Every fixture
+  runs with the default `max_requests_per_block` of 4096, so the series
+  table merges one run per admitted request (236 to 3716 runs).
+- The final builder copies at most 8,192 elements per step, where a row
+  counts one and each list item or map entry one more, into buffers sized
+  before the first copy. Completing a column is a freeze.
 
 | Fixture | Requests admitted | Block charged | Values rows |
 | --- | --- | --- | --- |
@@ -622,25 +628,38 @@ And does the ledger close once the flush workspace is accounted?
 
 ### Results: stall and cancellation
 
-| Fixture | Longest stretch, before -> after | Worst observation | Median observation |
+Longest stretch per write, worst over 7 writes:
+
+| Fixture | Before | Round 1 | Round 3, final |
 | --- | --- | --- | --- |
-| logs-1k-stable | 49.1 -> 23.9 ms | 44.7 -> 20.4 ms | 19.6 -> 8.4 ms |
-| metrics-mixed | 34.2 -> 21.1 ms | 28.5 -> 21.6 ms | 9.7 -> 5.6 ms |
-| logs-8k-churn-wide | 63.4 -> 21.4 ms | 56.3 -> 17.2 ms | 6.1 -> 5.7 ms |
-| logs-512k-near-limit | 33.0 -> 20.4 ms | 30.6 -> 19.9 ms | 6.4 -> 6.7 ms |
+| logs-1k-stable | 49.1 ms | 23.9 ms | 22.7 to 25.4 ms |
+| metrics-mixed | 34.2 ms | 21.1 ms | 20.0 to 20.8 ms |
+| logs-8k-churn-wide | 63.4 ms | 21.4 ms | 17.8 to 19.4 ms |
+| logs-512k-near-limit | 33.0 ms | 20.4 ms | 18.7 to 22.2 ms |
+
+Worst cancel observation over 20 cancelled writes:
+
+| Fixture | Before | Round 3, final |
+| --- | --- | --- |
+| logs-1k-stable | 44.7 ms | 21.7 ms |
+| metrics-mixed | 28.5 ms | 13.8 ms |
+| logs-8k-churn-wide | 56.3 ms | 13.8 ms |
+| logs-512k-near-limit | 30.6 ms | 11.6 ms |
 
 Whole-flush process CPU, median of 7:
 
-| Fixture | Before | After |
+| Fixture | Before | Round 3, final |
 | --- | --- | --- |
-| logs-1k-stable | 458.8 ms | 468.9 ms |
-| metrics-mixed | 133.9 ms | 137.1 ms |
-| logs-8k-churn-wide | 579.3 ms | 592.0 ms |
-| logs-512k-near-limit | 604.0 ms | 599.9 ms |
+| logs-1k-stable | 459 ms | 441 ms |
+| metrics-mixed | 133.9 ms | 139.1 ms |
+| logs-8k-churn-wide | 579 ms | 493 ms |
+| logs-512k-near-limit | 604 ms | 590 ms |
 
 - All 8 output files, 8 KB to 369 MB, have identical SHA-256 before and
-  after. The goldens pass unchanged.
-- CPU moves by -0.7 to +2.4 percent, with overlapping ranges.
+  after every round. The goldens pass unchanged.
+- The final builder is cheaper on the logs fixtures, because it copies runs
+  of consecutive rows instead of one row at a time. metrics-mixed moves by
+  +3.9 percent with overlapping ranges.
 - Two steps cannot be sliced without changing bytes: one chunk write,
   bounded by `sorting.merge_chunk_bytes`, and one row-group close, bounded
   by `parquet.row_group_bytes`. Each is about 20 to 25 ms at the defaults.
@@ -737,8 +756,9 @@ percent to the changed code.
 
 | Item | Where | Reason |
 | --- | --- | --- |
-| final range of a sliced column concatenates the whole column in one step | Task 3i fix round 2 | review found item 1 partial |
-| `resident_key_bytes` omits per-run owned keys and heap capacity during the build | Task 3i fix round 2 | review finding |
+| column allocation builds per-source bookkeeping for every run in one step | Task 12 | bounded by `max_requests_per_block`; inside the measured 18-25 ms at the default 4096 |
+| the charge omits the per-source bookkeeping of the column builders | Task 12 | size it with the jemalloc heap dumps, then add a per-run term |
+| the fallback path for types the lake never uses is neither step-bounded nor panic-free | slice S4 | narrow the documented promise to the lake's column types |
 | synchronous pairing of telemetry and allocator prints | Task 12 | the remaining ledger excess |
 | raw jemalloc heap dumps symbolized offline | Task 12, first item | attribute the ledger excess, the 160 MB workspace and the counter drift |
 | copy the row-group tail, about 64 MB less per large table | Task 12 | bounded fix |
@@ -747,10 +767,10 @@ percent to the changed code.
 
 ### Evidence
 
-- `flush-stall/README.md` and `flush-stall/*-round1-before.json`,
-  `flush-stall/*-round1-head.json`: the final before and after probe runs.
-- `flush-stall/files-before.sha256`, `flush-stall/files-final.sha256`,
-  `flush-stall/files-head-545c9f038.sha256`: the byte-identity manifests.
+- `flush-stall/README.md`, `flush-stall/*-round1-before.json` (before) and
+  `flush-stall/*-round3-head.json` (final): the probe runs.
+- `flush-stall/files-before.sha256` and `flush-stall/files-head-8f5dddc4a.sha256`:
+  the byte-identity manifests of the first and the final build.
 - `memory-strict-logs-high-rate-nobgthread.json` and
   `memory-strict-logs-high-rate-bgthread-f002.json`: the re-judged families.
 - `stages-spot-task3i.json` (f004) with child `stages-spot-task3i-3a76ac8067b3.json`
@@ -814,5 +834,5 @@ percent to the changed code.
 | Values builder over-charge | 102 times the row bytes for a 1-record request | Task 12 |
 | Defaults admit request shapes that are permanently refused | about 215k new metric series per request at the defaults | Task 12 `max_series_per_request`; Task 5 high-cardinality shape |
 | Unanswered collections at saturating load | measured only under the outage test | Task 5 |
-| Task 3i open review items | column concat, key figure | Task 3i fix round 2 |
+| Per-run bookkeeping of the chunk builders | not charged; allocated in one step per column | Task 12 (heap dumps, then a per-run term) |
 | Cores needed for 1M records/s | about 4.8 cores of logs stage CPU, by simple ratio | Task 5 |

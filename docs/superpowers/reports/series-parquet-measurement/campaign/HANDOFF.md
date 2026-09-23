@@ -20,7 +20,10 @@ Read this first, then `progress.md` in this directory (the ledger, append-only),
 ## Process that must continue
 
 - Subagent-driven: one implementer per task, fresh agent, opus for judgment-heavy tasks. Review every task, then fix rounds until clean. Stop the agent when its task closes.
-- At every task close: add or update its section in docs/superpowers/reports/series-parquet-measurement/FINDINGS.md, then refresh the committed snapshot in docs/superpowers/reports/series-parquet-measurement/campaign/ (ledger.md, reports/, briefs/, HANDOFF.md) and commit both.
+- Gate policy (user decision 2026-09-23): during implementation and fix rounds implementers run only focused checks (unit/integration tests and clippy of the crates they touched, plus byte identity where output must not change). Full gates (`cargo xtask check`, E2E, measurement re-runs) run once, after the task review approves; a failure there is one more small fix round. Carry this in every dispatch.
+- Writing rules: every implementer dispatch includes .superpowers/sdd/2026-09-22-series-parquet-measurement/writing-rules.md (read it before writing code, comments or docs).
+- Review suggestions that touch a hot path (extraction, conversion, encoding, sort/merge, upload) are assessed for cost before they enter a brief, and enter only with a measurement condition ("keep only if the stage spot-measurement shows no regression beyond noise"). Lesson of the Task 3f make_builder commit, reverted 919c1d24f.
+- At every task close: add or update its section in docs/superpowers/reports/series-parquet-measurement/FINDINGS.md, then run .superpowers/sdd/2026-09-22-series-parquet-measurement/refresh-snapshot.sh (copies ledger, reports, briefs, HANDOFF into docs/superpowers/reports/series-parquet-measurement/campaign/ with host paths scrubbed) and commit both.
 - Reviews run through codex, not Claude subagents, to save tokens: `codex exec -m gpt-5.6-sol --sandbox read-only -C <repo> - < prompt.txt > out.txt` in the background, prompt on stdin.
 - Re-verify every review finding against current HEAD before dispatching a fix round. Reviews go stale fast here.
 - Commit trailers: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` and a `Claude-Session:` line with the NEW session's URL.

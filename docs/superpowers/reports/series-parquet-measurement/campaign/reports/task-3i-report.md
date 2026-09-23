@@ -29,6 +29,9 @@ In history order:
 | 07b3a5206 | fix round 2, item 2: the build's live key figure includes the heap and every run's owned key. |
 | 8d5be48eb | fix round 2, item 1: chunk columns built in place by a `ChunkBuilder` over `MutableArrayData`, at most a step's budget copied per step. |
 | f8867b32b | evidence: flush-stall on the changed build; README step description and figures. |
+| 92c4a35f3 | evidence: the flush-stall bench configurations scrubbed of host paths. |
+| 8f5dddc4a | fix round 3: chunk steps budgeted in copied elements, every buffer presized and charged as allocated, dictionaries and offset overflow fail cleanly. |
+| 5b717a528 | evidence: flush-stall on the round-3 build; README figures. |
 
 ## 1. Measure first: the flush-stall probe
 
@@ -563,4 +566,82 @@ writes per fixture. The before side stays round 1's.
 - Tests: series-lake 166 lib plus fuzz, golden, round trip and oracle;
   core-nodes `series_parquet` 99; clippy `-D warnings` clean.
 
-@@GATES3@@
+Final gates at f8867b32b, under the lease:
+
+- `cargo xtask check`: "All tests passed successfully", exit 0, first
+  attempt.
+- E2E: 19 tests OK in 151 s, none skipped. It ran with
+  `SERIES_REQUIRE_DOCKER=1` under `taskset -c 0-7,16-23`, on the debug
+  engine rebuilt at HEAD.
+
+## Fix round 3
+
+The re-review confirmed both round-2 items and found three points in the
+chunk builder (8f5dddc4a, one commit because all three live in one
+rewritten builder).
+
+1. **Budget in copied elements.**
+   - A step's budget is `MERGE_STEP_ROWS` elements: a row counts one, each
+     list item or map entry one more.
+   - A range is split where its elements would pass the remaining budget.
+     A row larger than the whole budget is copied alone, in a step that
+     has copied nothing else; a row is bounded by `ingress.max_row_bytes`.
+   - Lists and maps are assembled from their own offsets, validity and
+     presized children. arrow 58.4's `MutableArrayData` panics on struct
+     capacities, so it cannot presize a map's entries.
+   - The charge test found one hidden reallocation: extending a string
+     array reserves one offset more than it writes, so an offsets buffer
+     presized exactly, at a multiple of 64 bytes, was reallocated by its
+     last extend. String and binary builders are now created one row
+     larger.
+   - No buffer of an exporter column type grows inside a step.
+2. **Workspace charged as allocated.**
+   - Each column is charged its buffers' capacities, children and
+     validity included, from the moment they are allocated.
+   - `the_builder_charges_what_its_buffers_allocate` compares the charge
+     with the completed column's real buffer capacities. They match
+     exactly for the Int64, map, list and nullable-string columns.
+3. **No panics on dictionaries or offset overflow.**
+   - Presized totals are checked against the i32 offset limit before any
+     copy and return an `ArrowError`. The test lowers the limit to 16
+     bytes.
+   - A dictionary column, or any type no lake dataset uses, is
+     interleaved whole in one step as before. Differing dictionaries
+     merge, and 200 values under Int8 keys are an error.
+     `every_lake_column_is_built_in_bounded_steps` pins that no lake
+     column takes that path.
+
+The per-step test derives the elements copied from the builder's own
+buffer lengths before and after each step, over runs with map, list and
+string columns. It checks that every row, item and entry is copied
+exactly once.
+
+Changed build (probe 8f5dddc4a, 7 uncancelled and 20 cancelled writes per
+fixture):
+
+| Fixture | Longest stretch per write | Worst observation | CPU median, before to after |
+| --- | --- | --- | --- |
+| logs-1k-stable | 22.7 to 25.4 ms | 21.7 ms | 458.8 to 441.1 ms |
+| metrics-mixed | 20.0 to 20.8 ms | 13.8 ms | 133.9 to 139.1 ms (+3.9 percent, ranges overlap) |
+| logs-8k-churn-wide | 17.8 to 19.4 ms | 13.8 ms | 579.3 to 492.9 ms |
+| logs-512k-near-limit | 18.7 to 22.2 ms | 11.6 ms | 604.0 to 589.6 ms |
+
+- All 8 files are byte-identical to the committed pre-task manifest
+  (`flush-stall/files-head-8f5dddc4a.sha256`).
+- Tests: series-lake 170 lib plus fuzz, golden, round trip and oracle;
+  core-nodes `series_parquet` 99; clippy `-D warnings` clean.
+
+Gates at 5b717a528 (code at 8f5dddc4a), under the lease:
+
+- E2E: 19 tests OK in 150 s, none skipped, `SERIES_REQUIRE_DOCKER=1`
+  under `taskset -c 0-7,16-23`.
+- `cargo xtask check` failed on a test this task does not touch:
+  `otel-arrow-dfe-core-nodes exporters::otlp_grpc_exporter::tests::test_otlp_exporter`
+  panicked with `AddrInUse`, because its test server's port was taken on
+  the host. There is no diff under `otlp_grpc_exporter` in
+  0dd988914..HEAD, and the test passed 3 of 3 alone. Per the lead's
+  ruling, xtask was not rerun whole; the series-lake suite (170 lib plus
+  integration) and core-nodes `series_parquet` (99) were rerun and pass.
+- The lead ruled that the final gates (probe, xtask check, E2E) run once
+  more after the re-review approves; the figures above come from the probe
+  run made before that ruling.
