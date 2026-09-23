@@ -269,18 +269,34 @@ The format is intentionally lossy for attribute value types; identity
 hashing, `identity_bytes` and denormalized columns keep types. One recursive
 rendering `render_v1(value) -> JSON value` is defined: string to JSON
 string; int to JSON number; finite double to JSON number (shortest
-round-trip); non-finite double to the JSON strings `"NaN"`, `"inf"`,
-`"-inf"`; bool to JSON bool; bytes to a JSON string of lowercase hex; unset
-to JSON null; array to JSON array; kvlist to JSON object with keys sorted.
-Two entry points use it:
+round-trip); non-finite double to the JSON strings `"NaN"` (any NaN,
+whatever its sign or payload), `"Infinity"` and `"-Infinity"`; bool to JSON
+bool; bytes to a JSON string of standard base64 with padding (RFC 4648
+section 4, alphabet `A-Z a-z 0-9 + /`, `=` padding, no line breaks); unset
+to JSON null; array to JSON array; kvlist to JSON object with keys sorted
+by raw key bytes. Two entry points use it:
 
 - Attribute map value: for a top-level string the raw string; for a
   top-level unset the SQL null; for any other top-level value the compact
-  JSON serialization of `render_v1` (so an int is `42`, bytes `ab12` are
-  the JSON string `"ab12"` with its quotes, a double NaN is `"NaN"`).
+  JSON serialization of `render_v1` (so an int is `42`, bytes `0xab 0x12`
+  are the JSON string `"qxI="` with its quotes, a double NaN is `"NaN"` and
+  a positive infinity `"Infinity"`).
 - Log body: for a string body the raw string; for an unset body the SQL
   null; otherwise the compact JSON serialization of `render_v1` (so a bytes
-  body is the JSON string `"ab12"`, quotes included, never bare hex).
+  body is the JSON string `"qxI="`, quotes included, never bare base64).
+
+The non-finite and bytes spellings are those of the workspace's OTLP JSON
+encoder (`crates/pdata/src/otlp/json/common.rs`), so a reader that already
+decodes OTLP JSON decodes them the same way. `render_v1` is nevertheless
+not OTLP JSON: a value is not wrapped in an `AnyValue` object such as
+`{"intValue": "42"}`, integers are JSON numbers rather than strings, and a
+kvlist is a JSON object rather than a list of key/value objects. Golden
+vectors for both entry points, including every base64 padding length, are
+in `../tests/golden/render_v1.json`.
+
+`render_v1` never feeds the series identity: section 1 hashes the typed
+canonical encoding, so changing a spelling here changes stored strings but
+no `identity_bytes` and no `series_id`.
 
 An empty attribute list is an empty map, never null.
 
@@ -647,9 +663,9 @@ first successful seal timestamp remains fixed across flush retries.
   the `attrs` map. The identity encoding is not lossy; `series_id`
   distinguishes them. A bytes value, whether it is an attribute map cell, a
   log body, or nested inside an array or kvlist, always renders as a
-  quoted JSON string of lowercase hex (e.g. `"ab12"`), never bare hex; a
-  dedicated `body_bytes BINARY` column for the log body is deferred to a
-  later format version.
+  quoted JSON string of padded standard base64 (e.g. `"qxI="`), never bare
+  base64; a dedicated `body_bytes BINARY` column for the log body is
+  deferred to a later format version.
 - A cancellation (for example, exporter shutdown) that lands after a file's
   Parquet finalization has begun cannot abort that file's in-flight
   multipart upload; `BufWriter::abort` is only safe before finalization

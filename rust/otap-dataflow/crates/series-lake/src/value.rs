@@ -4,6 +4,9 @@
 //! Owned attribute value tree, CBOR decoding of the OTAP `ser` column and the
 //! `render_v1` storage rendering (spec section 5.1).
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
 use crate::error::{Error, RefuseReason, Result};
 
 /// Limits applied while decoding one CBOR `ser` cell (spec section 5.1).
@@ -162,13 +165,20 @@ pub fn sort_kvlist(list: &mut [(String, Value)]) -> Result<()> {
     Ok(())
 }
 
-/// The `render_v1` recursive rendering of spec section 5.1.
+/// The `render_v1` recursive rendering of FORMAT.md section 2.
+///
+/// Non-finite doubles and bytes use the spellings of the workspace's OTLP JSON
+/// encoder (`otel_arrow_dfe_pdata::otlp::json`): `"NaN"`, `"Infinity"` and
+/// `"-Infinity"`, and padded standard base64 for bytes, so a reader that
+/// knows OTLP JSON reads them the same way here. The rendering as a whole is
+/// not OTLP JSON: a value is not wrapped in an `AnyValue` object, integers are
+/// JSON numbers, and kvlists are JSON objects with sorted keys.
 pub fn render_v1(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Null => J::Null,
         Value::Str(s) => J::String(s.clone()),
-        Value::Bytes(b) => J::String(hex::encode(b)),
+        Value::Bytes(b) => J::String(BASE64_STANDARD.encode(b)),
         Value::Int(i) => J::from(*i),
         Value::Double(d) => render_double(*d),
         Value::Bool(b) => J::Bool(*b),
@@ -186,9 +196,9 @@ fn render_double(d: f64) -> serde_json::Value {
     if d.is_nan() {
         serde_json::Value::String("NaN".into())
     } else if d == f64::INFINITY {
-        serde_json::Value::String("inf".into())
+        serde_json::Value::String("Infinity".into())
     } else if d == f64::NEG_INFINITY {
-        serde_json::Value::String("-inf".into())
+        serde_json::Value::String("-Infinity".into())
     } else {
         // serde_json renders finite f64 with the shortest round-trip form.
         serde_json::Number::from_f64(d).map_or(serde_json::Value::Null, serde_json::Value::Number)
@@ -392,7 +402,7 @@ mod tests {
         let json = serde_json::to_string(&render_v1(&v)).expect("json");
         assert_eq!(
             json,
-            r#"{"b":"ab12","d":"NaN","e":1.5,"i":42,"n":null,"s":"x","t":true}"#
+            r#"{"b":"qxI=","d":"NaN","e":1.5,"i":42,"n":null,"s":"x","t":true}"#
         );
     }
 
@@ -408,11 +418,11 @@ mod tests {
         assert_eq!(map_string(&Value::Int(42)).as_deref(), Some("42"));
         assert_eq!(
             map_string(&Value::Bytes(vec![0xab])).as_deref(),
-            Some("\"ab\"")
+            Some("\"qw==\"")
         );
         assert_eq!(
             map_string(&Value::Double(f64::INFINITY)).as_deref(),
-            Some("\"inf\"")
+            Some("\"Infinity\"")
         );
         assert_eq!(
             body_string(&Value::Str("hello".into())).as_deref(),

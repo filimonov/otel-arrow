@@ -589,7 +589,8 @@ impl RowSink {
 /// the rendered cell retains.
 ///
 /// Rendering, not the decoded value tree, decides how large the stored cell is:
-/// `render_v1` hex-encodes a bytes value (doubling its length) and JSON-escapes
+/// `render_v1` base64-encodes a bytes value (four characters per three bytes)
+/// and JSON-escapes
 /// strings (which can expand them several-fold). Charging the tree's size would
 /// therefore admit a row whose stored form is far past `max_row_bytes`, which no
 /// later recount can undo. The caller charges the returned size.
@@ -608,7 +609,7 @@ pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
 /// Bytes a sorted attribute list occupies once rendered into a map cell.
 ///
 /// Measured by rendering, because the expansion is serde_json's escaping and
-/// `render_v1`'s hex encoding and cannot be predicted from the value tree. Used
+/// `render_v1`'s base64 encoding and cannot be predicted from the value tree. Used
 /// where the cell itself is built later (a descriptor is rendered when its
 /// request is admitted) and only its size is needed now.
 pub(crate) fn rendered_kv_bytes(list: &[(String, Value)]) -> usize {
@@ -924,7 +925,7 @@ pub(crate) fn descriptor_row(
     // The identity attribute list is counted twice on purpose: extraction
     // temporarily retains both the decoded tree and its future rendered series
     // row; admission drops the tree. The rendered map cell
-    // (`rendered_kv_bytes`) can be much larger than the tree, through hex
+    // (`rendered_kv_bytes`) can be much larger than the tree, through base64
     // encoding and JSON escaping. The resource and scope trees are shared by
     // the request's rows and charged once, by `SharedLists`; each row still
     // renders its own copy of them.
@@ -1078,13 +1079,13 @@ mod tests {
     }
 
     /// Scenario: an attribute list holding a bytes value, which `render_v1`
-    /// hex-encodes, and a nested value whose strings are full of characters
+    /// base64-encodes, and a nested value whose strings are full of characters
     /// JSON must escape.
     /// Guarantees: the rendered size counts both expansions, exceeds the
     /// decoded tree size `kv_bytes` reports, and agrees exactly with the cell
     /// [`map_cell`] builds -- so the two ways a row is charged cannot drift.
     #[test]
-    fn rendered_bytes_count_hex_encoding_and_json_escaping() {
+    fn rendered_bytes_count_base64_encoding_and_json_escaping() {
         let list = vec![
             ("b".to_string(), Value::Bytes(vec![0xFF; 100])),
             (
@@ -1101,9 +1102,10 @@ mod tests {
         match cell {
             Col::Map(entries) => {
                 assert_eq!(entries.len(), 2);
-                // 100 bytes become 200 hex digits inside a pair of JSON quotes.
-                let hex = entries[0].1.as_deref().expect("rendered bytes cell");
-                assert_eq!(hex.len(), 202);
+                // 100 bytes become 136 base64 characters (34 padded groups of
+                // four) inside a pair of JSON quotes.
+                let b64 = entries[0].1.as_deref().expect("rendered bytes cell");
+                assert_eq!(b64.len(), 138);
                 // Every one of the 200 escaped characters becomes two.
                 let nested = entries[1].1.as_deref().expect("rendered nested cell");
                 assert!(nested.len() > 400);

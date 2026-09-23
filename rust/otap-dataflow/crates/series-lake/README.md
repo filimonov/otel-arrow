@@ -57,8 +57,10 @@ first successful seal timestamp remains fixed across flush retries.
   record's own attributes, and a supported data point's attributes.
 - `attrs` maps are lossy: values are rendered to strings, so a string `"42"`
   and an integer `42` look the same in the map. They are still different
-  series. Bytes values render as lowercase hex; a dedicated `body_bytes`
-  binary column for the log body is deferred to a later format version.
+  series. Bytes values render as padded standard base64 and non-finite
+  doubles as `"NaN"`, `"Infinity"` and `"-Infinity"`, as in OTLP JSON; a
+  dedicated `body_bytes` binary column for the log body is deferred to a
+  later format version.
 - A cancellation that lands after a file's Parquet finalization has begun
   (for example, exporter shutdown) can leave an orphaned multipart upload;
   it is reclaimed by a bucket lifecycle rule, not by this crate.

@@ -171,9 +171,9 @@ pub(crate) fn extract_logs(
         // Charge everything the row actually retains, in the form it is stored
         // in: fixed cells, the rendered body, the rendered residual attribute
         // map, the denormalized strings and the projected producer id. The map
-        // and the body are charged their rendered `String::len()`, because hex
-        // encoding and JSON escaping can make the stored cell several times the
-        // size of the decoded value tree.
+        // and the body are charged their rendered `String::len()`, because
+        // base64 encoding and JSON escaping can make the stored cell several
+        // times the size of the decoded value tree.
         let (residual_cell, residual_bytes) = map_cell(&residual);
         let mut approx = 16 + 8 * 6 + 24 + 8;
         approx += body_str.as_ref().map_or(0, String::len);
@@ -436,15 +436,15 @@ mod tests {
         ));
     }
 
-    /// Scenario: one log record carries a 600 KiB bytes attribute. The decoded
-    /// value tree is well under the default 1 MiB row limit, but `render_v1`
-    /// hex-encodes bytes, so the stored map cell is over 1.2 MiB.
+    /// Scenario: one log record carries a 900 KiB bytes attribute. The decoded
+    /// value tree is under the default 1 MiB row limit, but `render_v1`
+    /// base64-encodes bytes, so the stored map cell is 1.2 MiB.
     /// Guarantees: the row limit is applied to the rendered cell, so the request
     /// is refused instead of being admitted on a tree-sized estimate that the
     /// stored row then exceeds.
     #[test]
-    fn a_bytes_attribute_is_charged_its_rendered_hex_size() {
-        const RAW: usize = 600 << 10;
+    fn a_bytes_attribute_is_charged_its_rendered_base64_size() {
+        const RAW: usize = 900 << 10;
         let cfg = LakeConfig::default();
         // The premise of the test: the tree fits the limit, the rendering does not.
         let attr = vec![("blob".to_string(), Value::Bytes(vec![0xABu8; RAW]))];

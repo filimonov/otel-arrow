@@ -1107,8 +1107,8 @@ become null; a negative converted timestamp becomes null and increments
 - `attrs` maps are lossy for readers: values are rendered to strings, so a
   string `"42"` and an integer `42` look the same in the map, although they
   remain different series. Bytes values render as a quoted JSON string of
-  lowercase hex; a dedicated `body_bytes` binary column for the log body is
-  deferred to a later format version.
+  padded standard base64, as in OTLP JSON; a dedicated `body_bytes` binary
+  column for the log body is deferred to a later format version.
 - A histogram `sum` of exactly zero cannot be told apart from an absent sum
   after an OTAP round trip, because the transport omits a column whose every
   entry in a request is the type default. The same holds for any optional
