@@ -774,6 +774,75 @@ fn a_bare_cargo_bench_run_skips() -> Result<()> {
 ///
 /// # Errors
 /// Returns the first failed check or error.
+// Scenario: the merge stage's fixture is built from a sealed logs block
+// and from a sealed metrics block, and the extract stage's fixture from
+// one-record logs requests.
+// Guarantees: the merge fixture reports the sort keys its merge keeps
+// resident beside the block -- nonzero, below the block's own pinned bytes
+// for the default two-column keys, and consistent between the peak table
+// and the total -- and the extract fixture reports that a one-row request
+// pins far more values bytes than its row occupies, so the two memory
+// terms Task 6 measures are observed on the production path rather than
+// estimated.
+fn memory_terms_are_reported(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root.join("store"))?;
+    for input in fixture_inputs(root)? {
+        let stage = Stage::new(
+            StageName::Merge,
+            bench_config(root),
+            input.clone(),
+            stages::zstd(),
+            true,
+        )?;
+        let observation = stage.observe(&stage.run(stage.prepare()?)?)?;
+        let keys = observation
+            .extra
+            .get("merge_keys")
+            .ok_or("the merge fixture reports no merge_keys")?;
+        let number = |name: &str| {
+            keys.get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        let total = number("resident_key_bytes_total");
+        let peak = number("resident_key_bytes_peak_table");
+        let pinned = number("block_pinned_bytes");
+        ensure(
+            total > 0 && peak > 0 && peak <= total && total < pinned,
+            format!("{:?}: merge keys {keys}", input.sidecar.signal),
+        )?;
+    }
+    let small: Vec<Bytes> = (0..8).map(|r| logs_request(r, 1, 300)).collect();
+    let path = root.join("small-logs.otlp");
+    write_input(&path, Signal::Logs, &small, 8, LOGGERS)?;
+    let stage = Stage::new(
+        StageName::Extract,
+        bench_config(root),
+        stages::read_input(&path)?,
+        stages::zstd(),
+        true,
+    )?;
+    let observation = stage.observe(&stage.run(stage.prepare()?)?)?;
+    let capacity = observation
+        .extra
+        .get("values_capacity")
+        .ok_or("the extract fixture reports no values_capacity")?;
+    let number = |name: &str| {
+        capacity
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    ensure(
+        number("requests") == 8
+            && number("values_rows") == 8
+            && number("values_pinned_bytes") > 4 * number("values_logical_bytes")
+            && number("capacity_overhead_bytes_per_request_median") > 0,
+        format!("one-record requests: values capacity {capacity}"),
+    )?;
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let holder = tempfile::tempdir()?;
     let root = holder.path();
@@ -787,5 +856,6 @@ pub fn run() -> Result<()> {
     a_heavier_fixture_does_not_move_the_measurement(root)?;
     criterion_artifacts_are_read_per_attempt(root)?;
     store_stages_record_completion_semantics(root)?;
+    memory_terms_are_reported(root)?;
     Ok(())
 }

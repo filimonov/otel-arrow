@@ -10,6 +10,8 @@
 //!             [--handshake]
 //! measurement --self-test
 //! measurement --describe
+//! measurement --series-cost --signal logs|metrics --series N
+//!             [--denormalize] --output PATH
 //! ```
 //!
 //! Built only with the `bench-harness` feature. Run with no measurement
@@ -33,6 +35,8 @@
 //! writes `SERIES_STAGE_DONE` after its output file and waits for stdin to
 //! close, so that the harness can snapshot the live process at both edges.
 
+#[path = "measurement/series_cost.rs"]
+mod series_cost;
 #[path = "measurement/stages.rs"]
 mod stages;
 #[path = "measurement/tests.rs"]
@@ -93,11 +97,20 @@ struct Args {
     handshake: bool,
 }
 
+/// One point of the per-series cost measurement.
+struct SeriesCostArgs {
+    signal: stages::Signal,
+    series: usize,
+    denormalize: bool,
+    output: PathBuf,
+}
+
 /// What the command line asked for.
 enum Command {
     SelfTest,
     Describe,
     Measure(Box<Args>),
+    SeriesCost(SeriesCostArgs),
     /// Run with no measurement arguments at all, as a workspace-wide
     /// `cargo bench` runs every bench: there is nothing to measure.
     Skip,
@@ -137,6 +150,8 @@ fn describe() -> Description {
 fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut handshake = false;
+    let mut series_cost = false;
+    let mut denormalize = false;
     let mut arguments = arguments.into_iter();
     while let Some(flag) = arguments.next() {
         match flag.as_str() {
@@ -145,8 +160,10 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
             // `cargo bench` passes `--bench` to every harness-less target.
             "--bench" => {}
             "--handshake" => handshake = true,
+            "--series-cost" => series_cost = true,
+            "--denormalize" => denormalize = true,
             "--stage" | "--input" | "--config" | "--output" | "--iterations" | "--profile"
-            | "--compression" => {
+            | "--compression" | "--signal" | "--series" => {
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -163,6 +180,19 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
             .remove(name)
             .ok_or_else(|| format!("{name} is required"))
     };
+    if series_cost {
+        let signal = match take("--signal")?.as_str() {
+            "logs" => stages::Signal::Logs,
+            "metrics" => stages::Signal::Metrics,
+            other => return Err(format!("--signal is logs or metrics, not {other}").into()),
+        };
+        return Ok(Command::SeriesCost(SeriesCostArgs {
+            signal,
+            series: take("--series")?.parse()?,
+            denormalize,
+            output: PathBuf::from(take("--output")?),
+        }));
+    }
     let stage = StageName::parse(&take("--stage")?)?;
     let input = PathBuf::from(take("--input")?);
     let config = PathBuf::from(take("--config")?);
@@ -510,6 +540,34 @@ fn measure_heap(stage: &Stage, args: &Args, report: &mut Report) -> Result<()> {
     Ok(())
 }
 
+/// One point of the per-series cost measurement, written as JSON.
+///
+/// In the DHAT build the whole measurement runs under a profiler, so the
+/// block's and the cache's heap are measured; the timing build reports the
+/// Arrow and reservation figures only.
+fn series_cost(args: &SeriesCostArgs) -> Result<()> {
+    #[cfg(feature = "bench-heap")]
+    let profiler = dhat::Profiler::builder().testing().build();
+    #[cfg(feature = "bench-heap")]
+    let heap = || {
+        let stats = dhat::HeapStats::get();
+        Some(series_cost::HeapNow {
+            curr_bytes: stats.curr_bytes as u64,
+            max_bytes: stats.max_bytes as u64,
+        })
+    };
+    #[cfg(not(feature = "bench-heap"))]
+    let heap = || None;
+    let mut point = series_cost::series_cost(args.signal, args.series, args.denormalize, &heap)?;
+    #[cfg(feature = "bench-heap")]
+    drop(profiler);
+    if let Some(object) = point.as_object_mut() {
+        let _ = object.insert("allocator".into(), describe().allocator.into());
+    }
+    std::fs::write(&args.output, serde_json::to_vec_pretty(&point)?)?;
+    Ok(())
+}
+
 #[cfg(not(feature = "bench-heap"))]
 fn measure_heap(_stage: &Stage, _args: &Args, _report: &mut Report) -> Result<()> {
     Err("the heap profile needs the executable built with --features bench-heap".into())
@@ -525,6 +583,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Command::Measure(args) => args,
+        Command::SeriesCost(args) => return series_cost(&args),
         Command::Skip => {
             writeln!(
                 std::io::stderr(),

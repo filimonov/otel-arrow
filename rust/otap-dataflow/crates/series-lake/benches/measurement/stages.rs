@@ -29,7 +29,9 @@ use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use otel_arrow_dfe_otap::object_store::StorageType;
-use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
+use otel_arrow_dfe_pdata::otap::memory::{
+    CountedAllocations, record_batch_logical_bytes, record_batch_pinned_bytes,
+};
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake::buffer::Block;
 use otel_arrow_dfe_series_lake::cache::SeriesCache;
@@ -1305,7 +1307,11 @@ impl Stage {
                 self.fixture_checks
                     .extend(verify_merge(&block, &self.cfg.lake)?);
                 self.record_merged_bytes(&block)?;
+                self.record_merge_keys(&block)?;
                 self.block = Some(block);
+            }
+            StageName::Extract => {
+                self.record_values_capacity()?;
             }
             StageName::OtlpSort => {
                 let block = self.sealed_block()?;
@@ -1863,6 +1869,119 @@ impl Stage {
 
     /// Record the merged chunks' pinned bytes, which a consumed merge does
     /// not retain, as a fixture measurement.
+    /// Record the sort keys each table's merge keeps resident beside the
+    /// block, and the table's own pinned bytes.
+    ///
+    /// The sink merges one table at a time and the keys of a table live
+    /// until its merge iterator is dropped, so the largest table's keys are
+    /// the peak this term adds to a flush; the sum is what the whole block
+    /// would add if every table were merged at once.
+    fn record_merge_keys(&mut self, block: &Block<()>) -> Result<()> {
+        let mut tables = Vec::new();
+        let mut total_keys = 0usize;
+        let mut total_pinned = 0usize;
+        let mut peak_keys = 0usize;
+        let mut peak_table_pinned = 0usize;
+        let mut seen = CountedAllocations::default();
+        for table in block.tables().filter(|table| !table.is_empty()) {
+            let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
+            let pinned = runs
+                .iter()
+                .map(|run| record_batch_pinned_bytes(run, &mut seen))
+                .sum::<usize>();
+            let run_count = runs.len();
+            let merge = merge_runs(runs, table.spec(), self.cfg.lake.sorting.merge_chunk_bytes)?;
+            let keys = merge.resident_key_bytes();
+            total_keys += keys;
+            total_pinned += pinned;
+            if keys > peak_keys {
+                peak_keys = keys;
+                peak_table_pinned = pinned;
+            }
+            tables.push(serde_json::json!({
+                "dataset": table.dataset().name(),
+                "rows": table.rows(),
+                "runs": run_count,
+                "pinned_bytes": pinned,
+                "resident_key_bytes": keys,
+            }));
+        }
+        let ratio = |keys: usize, pinned: usize| {
+            if pinned == 0 {
+                serde_json::Value::Null
+            } else {
+                (keys as f64 / pinned as f64).into()
+            }
+        };
+        let summary = serde_json::json!({
+            "tables": tables,
+            "block_pinned_bytes": total_pinned,
+            "resident_key_bytes_total": total_keys,
+            "resident_key_bytes_peak_table": peak_keys,
+            "peak_table_pinned_bytes": peak_table_pinned,
+            "total_ratio": ratio(total_keys, total_pinned),
+            "peak_over_block_ratio": ratio(peak_keys, total_pinned),
+        });
+        let _ = self.fixture_extra.insert("merge_keys".into(), summary);
+        Ok(())
+    }
+
+    /// Record, per request, the values bytes extraction pins against the
+    /// bytes the rows actually occupy.
+    ///
+    /// A values builder starts with room for 1024 rows and the extracted
+    /// batch keeps that capacity, so a request of a few rows pins far more
+    /// than its rows. Both are Arrow buffer sizes: pinned is the deduplicated
+    /// capacity the block is charged, logical the used length of the same
+    /// buffers.
+    fn record_values_capacity(&mut self) -> Result<()> {
+        let extracted = convert_extract(self.wire(), &self.cfg.lake)?;
+        let mut requests = Vec::with_capacity(extracted.len());
+        let mut pinned_total = 0usize;
+        let mut logical_total = 0usize;
+        let mut rows_total = 0usize;
+        for request in &extracted {
+            let mut logical = 0usize;
+            let mut rows = 0usize;
+            let mut batches = 0usize;
+            for (_, dataset_batches) in &request.values {
+                for batch in dataset_batches {
+                    logical += record_batch_logical_bytes(batch)?;
+                    rows += batch.num_rows();
+                    batches += 1;
+                }
+            }
+            pinned_total += request.pinned_bytes;
+            logical_total += logical;
+            rows_total += rows;
+            requests.push((request.pinned_bytes, logical, rows, batches));
+        }
+        let mut overheads: Vec<usize> = requests
+            .iter()
+            .map(|(pinned, logical, _, _)| pinned.saturating_sub(*logical))
+            .collect();
+        overheads.sort_unstable();
+        let median = overheads.get(overheads.len() / 2).copied().unwrap_or(0);
+        let largest = overheads.last().copied().unwrap_or(0);
+        let summary = serde_json::json!({
+            "requests": requests.len(),
+            "values_rows": rows_total,
+            "values_batches": requests.iter().map(|entry| entry.3).sum::<usize>(),
+            "values_pinned_bytes": pinned_total,
+            "values_logical_bytes": logical_total,
+            "capacity_overhead_bytes": pinned_total.saturating_sub(logical_total),
+            "capacity_overhead_bytes_per_request_median": median,
+            "capacity_overhead_bytes_per_request_max": largest,
+            "pinned_over_logical_ratio": if logical_total == 0 {
+                serde_json::Value::Null
+            } else {
+                (pinned_total as f64 / logical_total as f64).into()
+            },
+        });
+        let _ = self.fixture_extra.insert("values_capacity".into(), summary);
+        Ok(())
+    }
+
     fn record_merged_bytes(&mut self, block: &Block<()>) -> Result<()> {
         let mut seen = CountedAllocations::default();
         let mut bytes = 0usize;
