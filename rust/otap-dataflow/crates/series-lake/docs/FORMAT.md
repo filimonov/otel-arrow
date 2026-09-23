@@ -547,6 +547,33 @@ itself is out of scope for this crate: v1 only writes new files (any number
 of writer processes may run concurrently) and never merges or rewrites
 existing ones.
 
+Native sort metadata: every row group of a file whose `sort_key` is not
+`none` also carries Parquet's standard `sorting_columns` row-group field, so
+generic readers (DataFusion, DuckDB, ClickHouse) can use the order without
+knowing this format. It holds one `SortingColumn` per key, with
+`descending` and `nulls_first` taken from the key, for the longest prefix of
+`sort_key` whose columns are top-level primitive columns. A list column ends
+the prefix, because no single leaf order describes a sorted list, and a
+prefix that would be empty writes no field at all. `column_idx` counts
+Parquet leaf columns, not top-level columns: a `MAP` column has two leaves,
+so every column after one is shifted. Series files always carry
+`series_id` (leaf 0) ascending; values files under the default sort carry
+`series_id` (leaf 0) and `time_unix_nano` (leaf 3), both ascending. The
+`sort_key` key/value stays the complete, authoritative description of the
+order and is what the compaction scope above uses. For a `DOUBLE` key the
+writer orders `-0.0` and `+0.0` as equal and every NaN after `+Infinity`
+ascending; a reader that relies on the native field for a double column
+must accept that order.
+
+The native field is part of the Parquet footer, not a key/value, so it has
+no name of its own. The key/value keeps the name `sort_key` rather than
+pdata's `sort_columns` (`crates/pdata/src/schema/consts.rs`, constant
+`metadata::SORT_COLUMNS`): that constant names Arrow schema metadata on
+OTAP record batches, has no writer in the workspace and no defined value
+grammar, while `sort_key` is a Parquet file key with the grammar defined
+here, including order and null placement. Sharing the name would imply a
+shared grammar that does not exist.
+
 ## 6. Reading the data
 
 Because descriptors repeat (eviction, new partition, restart, several

@@ -10,24 +10,25 @@ use std::time::{Duration, Instant};
 
 use arrow::array::AsArray;
 use arrow::datatypes::Int64Type;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::ParquetObjectWriter;
+use parquet::arrow::{ArrowSchemaConverter, AsyncArrowWriter};
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::metadata::KeyValue;
+use parquet::file::metadata::{KeyValue, SortingColumn};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio_util::sync::CancellationToken;
 
 use crate::buffer::{Block, SortedTableBuffer};
 use crate::clock::PartitionId;
-use crate::config::LakeConfig;
+use crate::config::{LakeConfig, Nulls, SortOrder};
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, dataset_schema, schema_fingerprint};
-use crate::sort::merge_runs;
+use crate::sort::{SortSpec, merge_runs};
 
 /// Window length assumed when the configured interval does not fit in `i64`.
 const DEFAULT_WINDOW_SECS: i64 = 15;
@@ -296,6 +297,48 @@ fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
     (lo, hi)
 }
 
+/// Parquet's native `SortingColumn` list for a file sorted by `spec`.
+///
+/// The list is written into every row group beside the `sort_key` key/value
+/// (FORMAT.md section 5), so readers that understand the standard field --
+/// DataFusion, DuckDB, ClickHouse -- can use the order without knowing this
+/// format. `column_idx` is the index of the column among the Parquet leaf
+/// columns, not the Arrow field index: a map column has two leaves and a list
+/// column one, so every column after a map shifts by one.
+///
+/// A `SortingColumn` can only describe a leaf column, and the list is
+/// lexicographic, so it holds the longest prefix of `spec` whose columns are
+/// top-level primitive columns and stops at the first key that is not (a list
+/// column, which the row converter can sort as a whole but no leaf order
+/// describes). `None` when that prefix is empty, including when sorting is
+/// disabled.
+///
+/// # Errors
+/// Returns the Parquet error when the schema cannot be converted, which
+/// cannot happen for a dataset schema the writer itself accepts.
+pub fn native_sorting_columns(
+    spec: &SortSpec,
+    schema: &Schema,
+) -> Result<Option<Vec<SortingColumn>>> {
+    let descr = ArrowSchemaConverter::new().convert(schema)?;
+    let mut out = Vec::with_capacity(spec.keys().len());
+    for key in spec.keys() {
+        let leaf = descr.columns().iter().position(|c| {
+            let parts = c.path().parts();
+            parts.len() == 1 && parts[0] == key.column
+        });
+        let Some(leaf) = leaf.and_then(|i| i32::try_from(i).ok()) else {
+            break;
+        };
+        out.push(SortingColumn {
+            column_idx: leaf,
+            descending: key.order == SortOrder::Desc,
+            nulls_first: key.nulls == Nulls::First,
+        });
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
 impl Sink {
     /// New sink.
     #[must_use]
@@ -465,6 +508,7 @@ impl Sink {
             time_range(&runs)
         };
         let schema = dataset_schema(table.dataset(), &self.cfg);
+        let sorting = native_sorting_columns(table.spec(), &schema)?;
         // Spec 5.4 asks for ZSTD, statistics and dictionary encoding explicitly
         // rather than by relying on arrow-rs defaults. An unlimited row count
         // disables the row-count-based split so that the byte-driven flush below
@@ -474,6 +518,7 @@ impl Sink {
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_dictionary_enabled(true)
             .set_max_row_group_row_count(None)
+            .set_sorting_columns(sorting)
             .set_key_value_metadata(Some(self.file_metadata(
                 table,
                 total_rows,
@@ -1138,6 +1183,145 @@ mod tests {
             .unwrap_or_else(|| panic!("missing metadata key {key}"))
     }
 
+    /// The native `SortingColumn` list of every row group of a written file,
+    /// as `(leaf index, descending, nulls_first)`.
+    fn row_group_sorting(
+        root: &std::path::Path,
+        path: &Path,
+    ) -> Vec<Option<Vec<(i32, bool, bool)>>> {
+        let file = std::fs::File::open(root.join(path.as_ref())).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
+        reader
+            .metadata()
+            .row_groups()
+            .iter()
+            .map(|rg| {
+                rg.sorting_columns().map(|cols| {
+                    cols.iter()
+                        .map(|c| (c.column_idx, c.descending, c.nulls_first))
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// Scenario: sort specifications over the logs and metrics values schemas:
+    /// a key after the two-leaf `attrs` map, a descending nulls-first key, a
+    /// list key in the middle of the spec, a list key first, and no keys.
+    /// Guarantees: `column_idx` is the Parquet leaf index, not the Arrow field
+    /// index; order and null placement are carried over; the list stops at the
+    /// first key that is not a top-level primitive column, so the native list
+    /// never claims an order no leaf column has; and an empty prefix emits no
+    /// list at all.
+    #[test]
+    fn native_sorting_columns_use_leaf_indexes_and_a_primitive_prefix() {
+        use crate::config::{DenormType, Denormalize, SortKey};
+        let key = |column: &str, order, nulls| SortKey {
+            column: column.into(),
+            order,
+            nulls,
+        };
+        let mut cfg = LakeConfig::default();
+        cfg.logs.denormalize = vec![Denormalize {
+            path: "resource.service.name".into(),
+            column: "service_name".into(),
+            ty: DenormType::String,
+        }];
+        let logs = dataset_schema(Dataset::LogsValues, &cfg);
+        // Arrow field 14; `attrs` (field 13) has two leaves, so leaf 15.
+        assert_eq!(logs.index_of("service_name").expect("field"), 14);
+        let spec = SortSpec::new(vec![
+            key("service_name", SortOrder::Asc, Nulls::Last),
+            key("time_unix_nano", SortOrder::Desc, Nulls::First),
+        ]);
+        let cols = native_sorting_columns(&spec, &logs)
+            .expect("convert")
+            .expect("two keys");
+        let got: Vec<_> = cols
+            .iter()
+            .map(|c| (c.column_idx, c.descending, c.nulls_first))
+            .collect();
+        assert_eq!(got, [(15, false, false), (3, true, true)]);
+
+        let metrics = dataset_schema(Dataset::MetricsValues, &cfg);
+        let spec = SortSpec::new(vec![
+            key("series_id", SortOrder::Asc, Nulls::Last),
+            key("bucket_counts", SortOrder::Asc, Nulls::Last),
+            key("time_unix_nano", SortOrder::Asc, Nulls::Last),
+        ]);
+        let cols = native_sorting_columns(&spec, &metrics)
+            .expect("convert")
+            .expect("one key");
+        assert_eq!(cols.len(), 1, "stops at the list key");
+        assert_eq!(cols[0].column_idx, 0);
+        let spec = SortSpec::new(vec![key("bucket_counts", SortOrder::Asc, Nulls::Last)]);
+        assert_eq!(
+            native_sorting_columns(&spec, &metrics).expect("convert"),
+            None
+        );
+        assert_eq!(
+            native_sorting_columns(&SortSpec::new(Vec::new()), &metrics).expect("convert"),
+            None
+        );
+    }
+
+    /// Scenario: a 30-row logs block written with the default sort and with
+    /// row groups forced down to a few rows each, then the same block with
+    /// values sorting disabled.
+    /// Guarantees: every row group of the values file carries the native
+    /// `SortingColumn` list of the default `series_id, time_unix_nano` sort
+    /// (Parquet leaves 0 and 3, ascending, nulls last) beside the `sort_key`
+    /// key/value, every row group of the series file carries `series_id`
+    /// ascending, and an unsorted values file carries no native list while its
+    /// series file still does.
+    #[tokio::test]
+    async fn every_row_group_carries_the_native_sorting_columns() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let mut cfg = LakeConfig::default();
+        cfg.parquet.row_group_bytes = 1;
+        cfg.sorting.merge_chunk_bytes = 1;
+        let b = sealed_block(&cfg, 30);
+        let sink = Sink::new(local(&dir), cfg.clone(), naming("w", "sorted"));
+        let report = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        let values = row_group_sorting(dir.path(), &report.files[1].1);
+        assert!(values.len() > 1, "row groups: {}", values.len());
+        for rg in &values {
+            assert_eq!(
+                rg.as_deref(),
+                Some(&[(0, false, false), (3, false, false)][..])
+            );
+        }
+        assert_eq!(
+            get(&file_kv(dir.path(), &report.files[1].1), "sort_key"),
+            "series_id:asc:nulls_last,time_unix_nano:asc:nulls_last"
+        );
+        for rg in row_group_sorting(dir.path(), &report.files[0].1) {
+            assert_eq!(rg.as_deref(), Some(&[(0, false, false)][..]));
+        }
+
+        let mut unsorted = LakeConfig::default();
+        unsorted.logs.values_sort = Vec::new();
+        let b = sealed_block(&unsorted, 30);
+        let sink = Sink::new(local(&dir), unsorted, naming("w", "unsorted"));
+        let report = sink
+            .write_block(&b, &CancellationToken::new())
+            .await
+            .expect("write");
+        assert_eq!(
+            get(&file_kv(dir.path(), &report.files[1].1), "sort_key"),
+            "none"
+        );
+        for rg in row_group_sorting(dir.path(), &report.files[1].1) {
+            assert_eq!(rg, None);
+        }
+        for rg in row_group_sorting(dir.path(), &report.files[0].1) {
+            assert_eq!(rg.as_deref(), Some(&[(0, false, false)][..]));
+        }
+    }
+
     /// Scenario: path components for a known window and sequence.
     /// Guarantees: the Hive layout and file name of spec section 5.3 are produced exactly.
     #[test]
@@ -1262,7 +1446,7 @@ mod tests {
             .collect();
         let all = arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat");
         assert_eq!(all.num_rows(), 30);
-        let spec = crate::sort::SortSpec::new(cfg.logs.values_sort.clone());
+        let spec = SortSpec::new(cfg.logs.values_sort.clone());
         assert!(crate::sort::is_sorted(&all, &spec).expect("sorted"));
 
         // rewrite: same names, still two files on disk
