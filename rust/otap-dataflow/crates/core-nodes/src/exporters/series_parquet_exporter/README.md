@@ -651,6 +651,12 @@ Alert on each of these counters. The first can be removed by validating
 requests before the WAL acknowledges them, which is planned but not
 implemented.
 
+The OTLP framing check runs only on OTLP bytes. A processor upstream that
+converts OTLP to Arrow, such as `durable_buffer` with `otlp_handling:
+convert_to_arrow` or `batch` batching in the OTAP format, hands this exporter
+Arrow records no framing check has seen: a damaged OTLP body becomes a partial
+or empty batch there, and is stored and acknowledged as such.
+
 ### Freshness
 
 There is no strict upper bound on the time from a producer's send to the
@@ -1088,8 +1094,11 @@ become null; a negative converted timestamp becomes null and increments
 - An OTLP body's protobuf framing is validated before conversion, because
   the shared byte views decode lazily, and the check follows the OTLP schema
   into every nested message, so damage at any depth refuses the whole
-  request. It checks framing and wire types only: string fields are not
-  checked for UTF-8 there.
+  request. A singular field or oneof that occurs twice in one message is
+  refused too, although protobuf allows it, because the byte views would
+  store one occurrence where prost keeps another; the file, parquet and otap
+  exporters accept it. String fields are not checked for UTF-8: invalid bytes
+  are stored as U+FFFD.
 - Dictionary-encoded OTAP Arrow columns are read through their dictionary,
   never expanded first. Every attribute key and value is charged as it is
   read: one longer than `ingress.max_row_bytes`, or an attribute table whose

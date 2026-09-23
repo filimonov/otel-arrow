@@ -18,16 +18,13 @@
 //! admission instead of opening another ACTIVE block, so the memory a worker
 //! can hold is bounded by the two blocks and the completions in flight.
 //!
-//! An OTLP request is checked for protobuf wire framing before it is
-//! converted, because the shared byte views decode lazily and report no error
-//! for a damaged body: without the check a truncated request would become a
-//! request carrying fewer rows than it holds, or none, and be acknowledged as
-//! stored. The check follows the OTLP schema into every nested message --
-//! resource, scope, record or metric, data point, exemplar, attribute and
-//! value -- so damage at any depth refuses the whole request; strings are not
-//! checked for UTF-8 there. Nesting deeper than any accepted
-//! `ingress.max_nesting_depth` is refused by the same walk, before the
-//! conversion's recursive value encoder runs.
+//! An OTLP request's framing is checked before it is converted (see
+//! `OtapPayload::validate_otlp_framing`), refusing a repeated singular field
+//! as well, because the byte views would store one occurrence where prost
+//! keeps another. Invalid UTF-8 is not refused: the conversion stores it with
+//! U+FFFD. Nesting deeper than any accepted `ingress.max_nesting_depth` is
+//! refused by the same walk, before the conversion's recursive value encoder
+//! runs.
 //!
 //! Logs and metrics are admitted through the same state machine and the same
 //! single extraction call; traces have no lake schema and are refused on the
@@ -435,21 +432,13 @@ impl Worker {
         })
     }
 
-    /// Refuse an OTLP body whose protobuf framing is broken at any depth.
+    /// Refuse an OTLP body whose protobuf framing is broken at any depth, or
+    /// that repeats a singular field (see the module documentation).
     ///
-    /// The shared OTLP byte views are deliberately non-validating: the
-    /// conversion this node performs reads them lazily and reports no error for
-    /// a truncated or corrupt body, so without this check a damaged request
-    /// would be converted into a request carrying fewer rows than it holds, or
-    /// none, and acknowledged as if it had been stored. The framing walk
-    /// follows the OTLP schema into every nested message in one linear pass
-    /// with no allocation -- see the module documentation for what that covers.
     /// A body nesting values deeper than the walk's own bound is deeper than
     /// any `ingress.max_nesting_depth` too, so it is refused as that limit
-    /// refuses it, `max_nesting_depth` being the configured one.
-    ///
-    /// A payload that already holds Arrow records has no wire framing to check;
-    /// it is validated by the conversion and the extraction instead.
+    /// refuses it, `max_nesting_depth` being the configured one. Arrow records
+    /// have no wire framing; the conversion and the extraction validate them.
     fn check_wire_format(payload: &OtapPayload, max_nesting_depth: usize) -> lake::Result<()> {
         let PayloadData::OtlpBytes(bytes) = payload.data() else {
             return Ok(());

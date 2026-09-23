@@ -461,45 +461,125 @@ async fn extraction_failure_is_refused_atomically() {
         .await;
 }
 
-/// Scenario: an OTLP protobuf body whose top-level framing is truncated
-/// reaches preparation after its byte-size check.
-/// Guarantees: it is refused permanently and the ACTIVE block is untouched.
-/// The shared byte views decode lazily and report no error for such a body, so
-/// the exporter checks the framing itself: without that a damaged request
-/// would convert to a request carrying no rows and be acknowledged as stored.
+/// Scenario: OTLP bodies the framing check refuses reach preparation after
+/// their byte-size check: a logs and a metrics body whose first field declares
+/// 127 missing bytes, a logs and a metrics body whose one nested `Resource*`
+/// message is `0a 01 0a`, a `ResourceLogs` carrying `resource` twice, a
+/// metric carrying both a gauge and a sum, and a log body nesting arrays one
+/// level beyond the walk's bound of 256.
+/// Guarantees: each is nacked permanently as `Refused` with a reason naming
+/// what refused it, and the ACTIVE block is untouched: repeated singular
+/// fields are refused here although the other exporters accept them, and a
+/// body too deep for the walk is refused as `ingress.max_nesting_depth`
+/// refuses it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_malformed_otlp_body_is_refused_atomically() {
+async fn a_body_the_framing_check_refuses_is_nacked_atomically() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, ArrayValue, any_value};
+    use otel_arrow_dfe_pdata::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH;
+
+    let len_field = |field: u32, payload: &[u8]| {
+        let mut out = Vec::new();
+        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    };
+    let logs = |body: Vec<u8>| otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+    let metrics =
+        |body: Vec<u8>| otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(body.into());
+
+    let attribute = len_field(
+        1,
+        &[len_field(1, b"k"), len_field(2, &len_field(1, b"v"))].concat(),
+    );
+    let mut record = vec![0x09];
+    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    let two_resources = [
+        len_field(1, &attribute),
+        len_field(1, &attribute),
+        len_field(2, &len_field(2, &record)),
+    ]
+    .concat();
+    let mut point = vec![0x19];
+    point.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    point.extend([0x31, 1, 0, 0, 0, 0, 0, 0, 0]);
+    let data = len_field(1, &point);
+    let gauge_and_sum = [
+        len_field(1, b"requests"),
+        len_field(5, &data),
+        len_field(7, &data),
+    ]
+    .concat();
+    let mut value = AnyValue {
+        value: Some(any_value::Value::StringValue("leaf".to_owned())),
+    };
+    for _ in 0..=MAX_ANY_VALUE_NESTING_DEPTH {
+        value = AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![value],
+            })),
+        };
+    }
+    let too_deep = encoded(&ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_789_960_500_000_000_000,
+                    body: Some(value),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    });
+    let malformed = "invalid request content: malformed OTLP";
+    let cases = [
+        (logs(vec![0x0A, 0x7F]), vec![malformed, "logs body"]),
+        (metrics(vec![0x0A, 0x7F]), vec![malformed, "metrics body"]),
+        (
+            logs(vec![0x0A, 0x01, 0x0A]),
+            vec![malformed, "ResourceLogs"],
+        ),
+        (
+            metrics(vec![0x0A, 0x01, 0x0A]),
+            vec![malformed, "ResourceMetrics"],
+        ),
+        (
+            logs(len_field(1, &two_resources)),
+            vec![malformed, "ResourceLogs.resource", "occurs more than once"],
+        ),
+        (
+            metrics(len_field(1, &len_field(2, &len_field(2, &gauge_and_sum)))),
+            vec![malformed, "Metric.data", "occurs more than once"],
+        ),
+        (logs(too_deep), vec!["exceeds ingress.max_nesting_depth"]),
+    ];
+
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (context, _) = logs_pdata().into_parts();
-            // Field 1 (`resource_logs`), length-delimited, declaring 127 bytes
-            // that the buffer does not contain.
-            let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(
-                bytes::Bytes::from_static(&[0x0A, 0x7F]),
-            );
             let store = Arc::new(object_store::memory::InMemory::new());
-            let (handler, mut rx) = effects(2);
+            let (handler, mut rx) = effects(cases.len());
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(worker_config(), store, wall, handler);
-
-            worker.admit(OtapPdata::new(context, payload.into()));
-            assert!(worker.active.data.is_empty());
-            assert!(worker.active.tokens.is_empty());
-            assert!(worker.pending.is_none());
-
-            assert!(worker.notify.next().await.is_ok());
-            match rx.recv().await.expect("a refusal") {
-                PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert!(nack.permanent);
-                    assert_eq!(nack.cause, NackCause::Refused);
-                    assert!(
-                        nack.reason
-                            .starts_with("invalid request content: malformed OTLP"),
-                        "reason: {}",
-                        nack.reason
-                    );
+            for (payload, named) in cases {
+                let mut context = Context::default();
+                context.set_source_node(7);
+                worker.admit(OtapPdata::new(context, payload.into()));
+                assert!(worker.active.data.is_empty(), "{named:?}");
+                assert!(worker.active.tokens.is_empty(), "{named:?}");
+                assert!(worker.pending.is_none(), "{named:?}");
+                assert!(worker.notify.next().await.is_ok());
+                match rx.recv().await.expect("a refusal") {
+                    PipelineCompletionMsg::DeliverNack { nack } => {
+                        assert!(nack.permanent, "{named:?}");
+                        assert_eq!(nack.cause, NackCause::Refused, "{named:?}");
+                        for part in named {
+                            assert!(nack.reason.contains(part), "{part}: {}", nack.reason);
+                        }
+                    }
+                    other => panic!("{named:?}: expected a refusal, got {other:?}"),
                 }
-                other => panic!("expected a framing refusal, got {other:?}"),
             }
         })
         .await;
@@ -531,118 +611,13 @@ async fn metrics_are_admitted_like_logs() {
         .await;
 }
 
-/// Scenario: an OTLP metrics body whose top-level framing is truncated reaches
-/// preparation after its byte-size check.
-/// Guarantees: it is refused permanently and the ACTIVE block is untouched.
-/// The framing walk is per signal, so admitting metrics must not let a damaged
-/// metrics body through the check that already covers logs.
+/// Scenario: an OTLP logs request whose record body is a string holding bytes
+/// that are not UTF-8 (`caf` then a lone `0xc3`).
+/// Guarantees: it is prepared for admission, not refused, and its body is
+/// extracted with U+FFFD in place of the invalid byte, as the OTAP conversion
+/// stores it.
 #[tokio::test(flavor = "current_thread")]
-async fn a_malformed_otlp_metrics_body_is_refused_atomically() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let mut context = Context::default();
-            context.set_source_node(7);
-            // Field 1 (`resource_metrics`), length-delimited, declaring 127
-            // bytes that the buffer does not contain.
-            let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
-                bytes::Bytes::from_static(&[0x0A, 0x7F]),
-            );
-            let store = Arc::new(object_store::memory::InMemory::new());
-            let (handler, mut rx) = effects(2);
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(worker_config(), store, wall, handler);
-
-            worker.admit(OtapPdata::new(context, payload.into()));
-            assert!(worker.active.data.is_empty());
-            assert!(worker.active.tokens.is_empty());
-            assert!(worker.pending.is_none());
-
-            assert!(worker.notify.next().await.is_ok());
-            match rx.recv().await.expect("a refusal") {
-                PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert!(nack.permanent);
-                    assert_eq!(nack.cause, NackCause::Refused);
-                    assert!(
-                        nack.reason
-                            .starts_with("invalid request content: malformed OTLP"),
-                        "reason: {}",
-                        nack.reason
-                    );
-                }
-                other => panic!("expected a framing refusal, got {other:?}"),
-            }
-        })
-        .await;
-}
-
-/// Scenario: a logs and a metrics request whose top-level framing is intact
-/// but whose first nested message is damaged -- `[0x0a, 0x01, 0x0a]`, a
-/// one-byte `ResourceLogs` / `ResourceMetrics` holding a field tag with no
-/// length -- which the lazy conversion reads as a request of zero rows.
-/// Guarantees: each is nacked permanently as `Refused` with a reason naming
-/// the malformed body and the damaged message, never acknowledged as a
-/// request with nothing to store, and the ACTIVE block is untouched.
-#[tokio::test(flavor = "current_thread")]
-async fn a_body_damaged_inside_a_nested_message_is_refused_not_acked() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let store = Arc::new(object_store::memory::InMemory::new());
-            let (handler, mut rx) = effects(4);
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(worker_config(), store, wall, handler);
-            let damaged = bytes::Bytes::from_static(&[0x0A, 0x01, 0x0A]);
-            for (payload, message) in [
-                (
-                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(damaged.clone()),
-                    "ResourceLogs",
-                ),
-                (
-                    otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(damaged.clone()),
-                    "ResourceMetrics",
-                ),
-            ] {
-                let mut context = Context::default();
-                context.set_source_node(7);
-                worker.admit(OtapPdata::new(context, payload.into()));
-                assert!(worker.active.data.is_empty());
-                assert!(worker.active.tokens.is_empty());
-                assert!(worker.pending.is_none());
-
-                assert!(worker.notify.next().await.is_ok());
-                match rx.recv().await.expect("a refusal") {
-                    PipelineCompletionMsg::DeliverNack { nack } => {
-                        assert!(nack.permanent);
-                        assert_eq!(nack.cause, NackCause::Refused);
-                        assert!(
-                            nack.reason
-                                .starts_with("invalid request content: malformed OTLP"),
-                            "reason: {}",
-                            nack.reason
-                        );
-                        assert!(nack.reason.contains(message), "reason: {}", nack.reason);
-                    }
-                    other => panic!("expected a framing refusal, got {other:?}"),
-                }
-            }
-        })
-        .await;
-}
-
-/// Scenario: an OTLP logs and an OTLP metrics request, each once plain and
-/// once with a balanced unknown group (field 31, holding a varint) placed
-/// before the first known field of its resource, of its log record and of its
-/// gauge data point -- which prost skips and the framing walk accepts.
-/// Guarantees: the decorated request is admitted with exactly the rows,
-/// descriptors and values of the plain one: the resource attributes, the log
-/// body and attributes, the point's value and attributes are all read, so an
-/// unknown group never ends a field lookup early and the request is never
-/// acknowledged with part of its data missing.
-#[tokio::test(flavor = "current_thread")]
-async fn an_unknown_group_before_known_fields_loses_nothing() {
-    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, KeyValue, any_value};
-    use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
-
-    const GROUP: &[u8] = &[0xfb, 0x01, 0x08, 0x05, 0xfc, 0x01];
+async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     let len_field = |field: u32, payload: &[u8]| {
         let mut out = Vec::new();
         prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
@@ -650,337 +625,25 @@ async fn an_unknown_group_before_known_fields_loses_nothing() {
         out.extend_from_slice(payload);
         out
     };
-    let string = |value: &str| AnyValue {
-        value: Some(any_value::Value::StringValue(value.to_owned())),
-    };
-    let attribute = |key: &str, value: &str| KeyValue {
-        key: key.to_owned(),
-        value: Some(string(value)),
-    };
-    // A message's encoding, with the group first when `decorated`.
-    let message = |bytes: Vec<u8>, decorated: bool| {
-        if decorated {
-            [GROUP, &bytes].concat()
-        } else {
-            bytes
-        }
-    };
-    let resource = |decorated| {
-        message(
-            encoded(&Resource {
-                attributes: vec![attribute("service.name", "checkout")],
-                ..Default::default()
-            }),
-            decorated,
-        )
-    };
-    let logs = |decorated| {
-        let record = message(
-            encoded(&LogRecord {
-                time_unix_nano: 1_789_960_500_000_000_000,
-                body: Some(string("payment accepted")),
-                attributes: vec![attribute("order", "o-17")],
-                ..Default::default()
-            }),
-            decorated,
-        );
-        let scope_logs = len_field(2, &record);
-        let resource_logs = [
-            len_field(1, &resource(decorated)),
-            len_field(2, &scope_logs),
-        ]
-        .concat();
-        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(len_field(1, &resource_logs).into())
-    };
-    let metrics = |decorated| {
-        let point = message(
-            encoded(&NumberDataPoint {
-                time_unix_nano: 1_789_960_500_000_000_000,
-                attributes: vec![attribute("route", "/pay")],
-                value: Some(number_data_point::Value::AsInt(42)),
-                ..Default::default()
-            }),
-            decorated,
-        );
-        let gauge = len_field(1, &point);
-        let metric = [len_field(1, b"requests"), len_field(5, &gauge)].concat();
-        let scope_metrics = len_field(2, &metric);
-        let resource_metrics = [
-            len_field(1, &resource(decorated)),
-            len_field(2, &scope_metrics),
-        ]
-        .concat();
-        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
-            len_field(1, &resource_metrics).into(),
-        )
-    };
+    let mut record = vec![0x09];
+    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
+    record.extend(len_field(5, &len_field(1, b"caf\xc3")));
+    let body = len_field(1, &len_field(2, &len_field(2, &record)));
+    let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
 
     let store = Arc::new(object_store::memory::InMemory::new());
     let (handler, _rx) = effects(2);
     let wall = Arc::new(lake::clock::TestWallClock::new(0));
     let worker = Worker::new(worker_config(), store, wall, handler);
-    let extract = |payload: otel_arrow_dfe_pdata::OtlpProtoBytes| {
-        let mut context = Context::default();
-        context.set_source_node(7);
-        match worker.prepare(OtapPdata::new(context, payload.into())) {
-            Prepared::Ready(pending) => pending.extracted,
-            Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
+    let mut context = Context::default();
+    context.set_source_node(7);
+    match worker.prepare(OtapPdata::new(context, payload.into())) {
+        Prepared::Ready(pending) => {
+            assert_eq!(pending.extracted.stats.rows, 1);
+            let values = format!("{:?}", pending.extracted.values);
+            assert!(values.contains("caf\u{FFFD}"), "{values}");
         }
-    };
-    for (name, plain, decorated, expected) in [
-        (
-            "logs",
-            logs(false),
-            logs(true),
-            ["checkout", "payment accepted", "o-17"],
-        ),
-        (
-            "metrics",
-            metrics(false),
-            metrics(true),
-            ["checkout", "/pay", "requests"],
-        ),
-    ] {
-        let plain = extract(plain);
-        let decorated = extract(decorated);
-        assert_eq!(decorated.stats.rows, 1, "{name}");
-        assert_eq!(decorated.stats, plain.stats, "{name}");
-        assert_eq!(
-            format!("{:?}", decorated.descriptors),
-            format!("{:?}", plain.descriptors),
-            "{name}"
-        );
-        assert_eq!(
-            format!("{:?}", decorated.values),
-            format!("{:?}", plain.values),
-            "{name}"
-        );
-        let all = format!("{:?}{:?}", decorated.descriptors, decorated.values);
-        for value in expected {
-            assert!(all.contains(value), "{name}: {value} is missing");
-        }
-        if name == "metrics" {
-            assert!(format!("{:?}", decorated.values).contains("42"), "{name}");
-        }
-    }
-}
-
-/// Scenario: an OTLP logs request whose one `ResourceLogs` carries its
-/// `resource` twice -- valid protobuf, which prost merges into one resource --
-/// and an OTLP metrics request whose metric carries both a gauge and a sum.
-/// Guarantees: each is nacked permanently as `Refused` with a sentence naming
-/// the message and the field, never admitted: the byte views would read one
-/// occurrence where prost merges or overrides, so storing the request would
-/// store data prost would not decode.
-#[tokio::test(flavor = "current_thread")]
-async fn a_repeated_singular_field_is_refused_not_acked() {
-    let len_field = |field: u32, payload: &[u8]| {
-        let mut out = Vec::new();
-        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
-        prost::encoding::encode_varint(payload.len() as u64, &mut out);
-        out.extend_from_slice(payload);
-        out
-    };
-    let attribute = len_field(
-        1,
-        &[len_field(1, b"k"), len_field(2, &len_field(1, b"v"))].concat(),
-    );
-    let mut record = vec![0x09];
-    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
-    let resource_logs = [
-        len_field(1, &attribute),
-        len_field(1, &attribute),
-        len_field(2, &len_field(2, &record)),
-    ]
-    .concat();
-    let logs = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(
-        len_field(1, &resource_logs).into(),
-    );
-    let mut point = vec![0x19];
-    point.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
-    point.extend([0x31, 1, 0, 0, 0, 0, 0, 0, 0]);
-    let data = len_field(1, &point);
-    let metric = [
-        len_field(1, b"requests"),
-        len_field(5, &data),
-        len_field(7, &data),
-    ]
-    .concat();
-    let metrics = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(
-        len_field(1, &len_field(2, &len_field(2, &metric))).into(),
-    );
-
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let store = Arc::new(object_store::memory::InMemory::new());
-            let (handler, mut rx) = effects(4);
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(worker_config(), store, wall, handler);
-            for (payload, named) in [(logs, "ResourceLogs.resource"), (metrics, "Metric.data")] {
-                let mut context = Context::default();
-                context.set_source_node(7);
-                worker.admit(OtapPdata::new(context, payload.into()));
-                assert!(worker.active.data.is_empty());
-                assert!(worker.pending.is_none());
-                assert!(worker.notify.next().await.is_ok());
-                match rx.recv().await.expect("a refusal") {
-                    PipelineCompletionMsg::DeliverNack { nack } => {
-                        assert!(nack.permanent);
-                        assert_eq!(nack.cause, NackCause::Refused);
-                        assert!(
-                            nack.reason
-                                .starts_with("invalid request content: malformed OTLP"),
-                            "reason: {}",
-                            nack.reason
-                        );
-                        assert!(nack.reason.contains(named), "reason: {}", nack.reason);
-                        assert!(
-                            nack.reason.contains("occurs more than once"),
-                            "reason: {}",
-                            nack.reason
-                        );
-                    }
-                    other => panic!("expected a refusal, got {other:?}"),
-                }
-            }
-        })
-        .await;
-}
-
-/// Scenario: an OTLP logs request whose record attribute value sets
-/// `array_value` twice -- `["alpha", "beta"]`, then an empty array -- and whose
-/// body sets `kvlist_value` twice, compared with the same request after prost
-/// decodes and re-encodes it (which merges each repeated member into one).
-/// Guarantees: both are admitted with the same rows, descriptors and values,
-/// and the array elements and every key of both lists are stored: a
-/// message-typed oneof member that follows itself is merged as prost merges
-/// it, so a trailing empty occurrence never silently drops the elements.
-#[tokio::test(flavor = "current_thread")]
-async fn a_repeated_any_value_member_is_merged_end_to_end() {
-    use prost::Message as _;
-
-    let len_field = |field: u32, payload: &[u8]| {
-        let mut out = Vec::new();
-        prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
-        prost::encoding::encode_varint(payload.len() as u64, &mut out);
-        out.extend_from_slice(payload);
-        out
-    };
-    let string = |text: &[u8]| len_field(1, text);
-    let key_value = |key: &[u8], value: &[u8]| [len_field(1, key), len_field(2, value)].concat();
-    // AnyValue: array_value ["alpha", "beta"], then array_value [].
-    let array = [
-        len_field(
-            5,
-            &[
-                len_field(1, &string(b"alpha")),
-                len_field(1, &string(b"beta")),
-            ]
-            .concat(),
-        ),
-        len_field(5, &[]),
-    ]
-    .concat();
-    // AnyValue: kvlist_value {k1: "one"}, then kvlist_value {k2: "two"}.
-    let kvlist = [
-        len_field(6, &len_field(1, &key_value(b"k1", &string(b"one")))),
-        len_field(6, &len_field(1, &key_value(b"k2", &string(b"two")))),
-    ]
-    .concat();
-    let mut record = vec![0x09];
-    record.extend(1_789_960_500_000_000_000_u64.to_le_bytes());
-    record.extend(len_field(5, &kvlist));
-    record.extend(len_field(6, &key_value(b"tags", &array)));
-    let scope_logs = len_field(2, &record);
-    let raw = len_field(1, &len_field(2, &scope_logs));
-    let canonical = ExportLogsServiceRequest::decode(&raw[..])
-        .expect("prost decodes it")
-        .encode_to_vec();
-    assert_ne!(raw, canonical, "prost merged the repeated members");
-
-    let store = Arc::new(object_store::memory::InMemory::new());
-    let (handler, _rx) = effects(2);
-    let wall = Arc::new(lake::clock::TestWallClock::new(0));
-    let worker = Worker::new(worker_config(), store, wall, handler);
-    let extract = |body: Vec<u8>| {
-        let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
-        let mut context = Context::default();
-        context.set_source_node(7);
-        match worker.prepare(OtapPdata::new(context, payload.into())) {
-            Prepared::Ready(pending) => pending.extracted,
-            Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
-        }
-    };
-    let raw = extract(raw);
-    let canonical = extract(canonical);
-    assert_eq!(raw.stats.rows, 1);
-    assert_eq!(raw.stats, canonical.stats);
-    let raw_all = format!("{:?}{:?}", raw.descriptors, raw.values);
-    assert_eq!(
-        raw_all,
-        format!("{:?}{:?}", canonical.descriptors, canonical.values)
-    );
-    for stored in ["alpha", "beta", "k1", "one", "k2", "two"] {
-        assert!(raw_all.contains(stored), "{stored} is missing");
-    }
-}
-
-/// Scenario: OTLP logs requests whose record body nests arrays exactly at the
-/// framing walk's bound of 256 levels and one level beyond it, under the
-/// default `ingress.max_nesting_depth` of 32.
-/// Guarantees: the walk passes the first and stops the second before any
-/// conversion, and both are refused alike as exceeding the configured
-/// `ingress.max_nesting_depth`, so the layer that notices the depth never
-/// changes the reason the sender reads.
-#[tokio::test(flavor = "current_thread")]
-async fn nesting_beyond_the_framing_bound_is_refused_as_too_deep() {
-    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, ArrayValue, any_value};
-    use otel_arrow_dfe_pdata::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH;
-
-    let body = |levels: usize| {
-        let mut value = AnyValue {
-            value: Some(any_value::Value::StringValue("leaf".to_owned())),
-        };
-        for _ in 0..levels {
-            value = AnyValue {
-                value: Some(any_value::Value::ArrayValue(ArrayValue {
-                    values: vec![value],
-                })),
-            };
-        }
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                scope_logs: vec![ScopeLogs {
-                    log_records: vec![LogRecord {
-                        time_unix_nano: 1_789_960_500_000_000_000,
-                        body: Some(value),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-        otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(encoded(&request).into())
-    };
-    let cfg = worker_config();
-    let limit = cfg.lake.ingress.max_nesting_depth;
-    assert!(limit < MAX_ANY_VALUE_NESTING_DEPTH);
-    let store = Arc::new(object_store::memory::InMemory::new());
-    let (handler, _rx) = effects(2);
-    let wall = Arc::new(lake::clock::TestWallClock::new(0));
-    let worker = Worker::new(cfg, store, wall, handler);
-    for levels in [MAX_ANY_VALUE_NESTING_DEPTH, MAX_ANY_VALUE_NESTING_DEPTH + 1] {
-        let payload = body(levels);
-        let mut context = Context::default();
-        context.set_source_node(7);
-        match worker.prepare(OtapPdata::new(context, payload.into())) {
-            Prepared::Failed(_, lake::Error::Refused(lake::RefuseReason::TooDeep(refused))) => {
-                assert_eq!(refused, limit, "{levels} levels")
-            }
-            Prepared::Failed(_, other) => panic!("{levels} levels: refused as {other:?}"),
-            Prepared::Ready(_) => panic!("{levels} levels were admitted"),
-        }
+        Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
     }
 }
 
