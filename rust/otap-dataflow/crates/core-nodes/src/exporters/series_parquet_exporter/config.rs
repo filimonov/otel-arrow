@@ -292,19 +292,16 @@ impl TryFrom<RawConfig> for Config {
         if raw.upload.abort_timeout.is_zero() {
             return Err("upload.abort_timeout must be positive".into());
         }
-        // The two cross-field rules whose lake form names lake keys: checked
-        // here first with the keys the user writes.
+        // The one cross-field rule whose lake form names a lake key
+        // (`ingress.max_block_bytes`): checked here first with the key the
+        // user writes. Every other cross-field rule is the lake's own, and its
+        // message already names the user's key.
         if raw.window.max_block_bytes / 2 < raw.ingress.max_extracted_bytes {
             return Err(
                 "window.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
                  because a request's series rows may take up to twice their extracted size \
                  in a block"
                     .into(),
-            );
-        }
-        if raw.ingress.max_row_bytes > raw.sorting.run_target_bytes / 4 {
-            return Err(
-                "ingress.max_row_bytes must be at most sorting.run_target_bytes / 4".into(),
             );
         }
         let lake = LakeConfig {
@@ -330,13 +327,11 @@ impl TryFrom<RawConfig> for Config {
             logs: raw.logs,
             metrics: raw.metrics,
         };
-        lake.validate().map_err(|e| match e {
-            // A configuration rule's own sentence, without the request
-            // refusal wrapper the lake error type carries.
-            otel_arrow_dfe_series_lake::Error::Refused(
-                otel_arrow_dfe_series_lake::RefuseReason::Invalid(rule),
-            ) => rule,
-            other => other.to_string(),
+        // A configuration rule's own sentence, without the request refusal
+        // wrapper the lake error type carries.
+        lake.validate().map_err(|e| {
+            e.invalid_detail()
+                .map_or_else(|| e.to_string(), str::to_owned)
         })?;
         check_retry_deadline(
             !matches!(raw.storage, StorageType::File { .. }),
