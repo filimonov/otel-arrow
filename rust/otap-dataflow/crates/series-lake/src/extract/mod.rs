@@ -274,11 +274,13 @@ impl Budget {
         self.add(bytes, crate::error::SizeBudget::Table)
     }
 
+    /// A charge past the limit is refused and not recorded.
     fn add(&mut self, bytes: usize, budget: crate::error::SizeBudget) -> Result<()> {
-        self.used = self.used.saturating_add(bytes);
-        if self.used > self.limit {
-            return Err(Error::too_large(budget, self.used, self.limit));
+        let used = self.used.saturating_add(bytes);
+        if used > self.limit {
+            return Err(Error::too_large(budget, used, self.limit));
         }
+        self.used = used;
         Ok(())
     }
 

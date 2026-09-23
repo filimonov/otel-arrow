@@ -158,3 +158,129 @@ proptest! {
         prop_assert_eq!(series_id(&a), series_id(&b));
     }
 }
+
+/// The decoder this crate used before it decoded in one pass: ciborium's
+/// `Value` tree, converted afterwards. Kept as the oracle `decode_cbor` must
+/// agree with; `None` is any refusal.
+fn reference_decode(bytes: &[u8], max_depth: usize) -> Option<Value> {
+    fn convert(raw: ciborium::Value, depth_left: usize) -> Option<Value> {
+        Some(match raw {
+            ciborium::Value::Null => Value::Null,
+            ciborium::Value::Bool(b) => Value::Bool(b),
+            ciborium::Value::Integer(i) => Value::Int(i64::try_from(i).ok()?),
+            ciborium::Value::Float(f) => Value::Double(f),
+            ciborium::Value::Text(s) => Value::Str(s),
+            ciborium::Value::Bytes(b) => Value::Bytes(b),
+            ciborium::Value::Array(items) => {
+                let depth_left = depth_left.checked_sub(1)?;
+                Value::Array(
+                    items
+                        .into_iter()
+                        .map(|item| convert(item, depth_left))
+                        .collect::<Option<_>>()?,
+                )
+            }
+            ciborium::Value::Map(entries) => {
+                let depth_left = depth_left.checked_sub(1)?;
+                let mut out = Vec::with_capacity(entries.len());
+                for (k, v) in entries {
+                    let key = match k {
+                        ciborium::Value::Text(s) => s,
+                        ciborium::Value::Null => String::new(),
+                        _ => return None,
+                    };
+                    out.push((key, convert(v, depth_left)?));
+                }
+                sort_kvlist(&mut out).ok()?;
+                Value::KvList(out)
+            }
+            _ => return None,
+        })
+    }
+    let raw: ciborium::Value =
+        ciborium::de::from_reader_with_recursion_limit(bytes, max_depth + 1).ok()?;
+    convert(raw, max_depth)
+}
+
+/// Structural equality with doubles compared by bits.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same(p, q))
+        }
+        (Value::KvList(x), Value::KvList(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((kp, p), (kq, q))| kp == kq && same(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+/// Arbitrary CBOR trees, including what the decoder must refuse: tags,
+/// integers outside `i64` (encoded as bignums), non-text map keys and
+/// duplicate keys.
+fn raw_cbor_strategy() -> impl Strategy<Value = ciborium::Value> {
+    let leaf = prop_oneof![
+        Just(ciborium::Value::Null),
+        any::<bool>().prop_map(ciborium::Value::Bool),
+        any::<i64>().prop_map(|i| ciborium::Value::Integer(i.into())),
+        any::<u64>().prop_map(|i| ciborium::Value::Integer(i.into())),
+        (-(1_i128 << 64)..(1_i128 << 64)).prop_map(|i| ciborium::Value::Integer(
+            ciborium::value::Integer::try_from(i).expect("within the CBOR integer range")
+        )),
+        any::<u64>().prop_map(|b| ciborium::Value::Float(f64::from_bits(b))),
+        ".{0,8}".prop_map(ciborium::Value::Text),
+        prop::collection::vec(any::<u8>(), 0..8).prop_map(ciborium::Value::Bytes),
+    ];
+    leaf.prop_recursive(6, 48, 4, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..4).prop_map(ciborium::Value::Array),
+            prop::collection::vec(
+                (
+                    prop_oneof![
+                        "[ab]{0,2}".prop_map(ciborium::Value::Text),
+                        Just(ciborium::Value::Null),
+                        any::<u8>().prop_map(|i| ciborium::Value::Integer(i.into())),
+                    ],
+                    inner.clone()
+                ),
+                0..4
+            )
+            .prop_map(ciborium::Value::Map),
+            (0_u64..8, inner).prop_map(|(t, v)| ciborium::Value::Tag(t, Box::new(v))),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
+
+    /// Scenario: arbitrary CBOR trees -- tags, bignums, non-text and duplicate
+    /// keys, nesting around a depth limit of 4 -- plus arbitrary bytes and
+    /// truncations, decoded by `decode_cbor` and by the ciborium-tree decoder
+    /// it replaced.
+    /// Guarantees: both accept exactly the same payloads and produce the same
+    /// value, doubles bit for bit, so identities and rendered cells are
+    /// unchanged.
+    #[test]
+    fn decode_cbor_agrees_with_the_ciborium_tree_decoder(
+        raw in raw_cbor_strategy(),
+        junk in prop::collection::vec(any::<u8>(), 0..32),
+        cut in 0usize..64,
+    ) {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&raw, &mut buf).expect("encode");
+        for bytes in [&buf[..], &buf[..cut.min(buf.len())], &junk[..]] {
+            let new = decode_cbor(bytes, DecodeLimits::new(4, usize::MAX)).ok();
+            let old = reference_decode(bytes, 4);
+            match (&new, &old) {
+                (Some(a), Some(b)) => prop_assert!(same(a, b), "{a:?} != {b:?}"),
+                (None, None) => {}
+                _ => prop_assert!(false, "decode {new:?}, reference {old:?} for {bytes:02x?}"),
+            }
+        }
+    }
+}

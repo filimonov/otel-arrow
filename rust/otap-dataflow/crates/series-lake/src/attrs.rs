@@ -24,7 +24,10 @@ use otel_arrow_dfe_pdata::schema::consts::{
 
 use crate::error::{Error, Result};
 use crate::extract::Budget;
-use crate::value::{DecodeLimits, Value, decode_cbor, entry_bytes, sort_kvlist, value_bytes};
+use crate::value::{
+    BUFFER_HEADER_BYTES, DecodeLimits, VALUE_NODE_BYTES, Value, decode_cbor_reserving, entry_bytes,
+    sort_kvlist, value_bytes,
+};
 
 /// Attributes of one OTAP attribute batch, grouped by parent id.
 #[derive(Debug, Default)]
@@ -233,20 +236,23 @@ impl AnyValueColumns {
     /// `ser` cell under those tags is malformed content rather than a default.
     ///
     /// A string, bytes or CBOR cell longer than `limits.max_cell_bytes` is
-    /// refused as too large before it is copied or decoded. A dictionary-encoded
-    /// `ser` value is decoded once and kept, charged to `budget`, until the last
-    /// row that references it takes it; the rows before get clones.
+    /// refused as too large before it is copied or decoded. The returned
+    /// value's [`value_bytes`] are charged to `budget`, each part before it is
+    /// allocated, and the caller owns that charge. A dictionary-encoded `ser`
+    /// value is decoded once and kept, charged, until the last row that
+    /// references it takes it; the rows before get clones.
     ///
     /// # Errors
     /// Returns [`Error::Refused`] for an unknown type tag, for a map or slice
     /// whose `ser` payload is missing, for a malformed CBOR payload, for an
-    /// oversized cell and for a kept copy past the budget.
+    /// oversized cell and for a value past the budget.
     pub(crate) fn value_at(
         &mut self,
         row: usize,
         limits: DecodeLimits,
         budget: &mut Budget,
     ) -> Result<Value> {
+        budget.charge_decoded(VALUE_NODE_BYTES)?;
         let Some(ty) = self.types.value_at(row) else {
             return Ok(Value::Null);
         };
@@ -257,7 +263,9 @@ impl AnyValueColumns {
             AttributeValueType::Str => {
                 let cell = self.strs.as_ref().and_then(|a| {
                     str_cell(a, row, |s| {
-                        cell_fits(s.len(), limits).map(|()| s.to_owned())
+                        cell_fits(s.len(), limits)?;
+                        budget.charge_decoded(s.len())?;
+                        Ok::<_, Error>(s.to_owned())
                     })
                 });
                 Value::Str(cell.transpose()?.unwrap_or_default())
@@ -271,7 +279,11 @@ impl AnyValueColumns {
             AttributeValueType::Bool => Value::Bool(bool_at(&self.bools, row).unwrap_or(false)),
             AttributeValueType::Bytes => {
                 let cell = self.bytes.as_ref().and_then(|a| {
-                    bytes_cell(a, row, |b| cell_fits(b.len(), limits).map(|()| b.to_vec()))
+                    bytes_cell(a, row, |b| {
+                        cell_fits(b.len(), limits)?;
+                        budget.charge_decoded(b.len())?;
+                        Ok::<_, Error>(b.to_vec())
+                    })
                 });
                 Value::Bytes(cell.transpose()?.unwrap_or_default())
             }
@@ -281,7 +293,8 @@ impl AnyValueColumns {
         })
     }
 
-    /// The decoded `ser` cell at `row`, `None` when it is absent or null.
+    /// The decoded `ser` cell at `row`, `None` when it is absent or null; its
+    /// content below the root node is charged to `budget`.
     fn ser_at(
         &mut self,
         row: usize,
@@ -292,7 +305,7 @@ impl AnyValueColumns {
             return Ok(None);
         };
         let Some((values, key)) = dictionary_at(sers, row) else {
-            return bytes_cell(sers, row, |b| decode_cbor(b, limits)).transpose();
+            return decode_charged(sers, row, limits, budget);
         };
         let Some(key) = key else {
             return Ok(None);
@@ -306,15 +319,18 @@ impl AnyValueColumns {
         *left = left.saturating_sub(1);
         let last = *left == 0;
         if last {
+            // The kept copy's content charge passes to the row; only its own
+            // node is given back.
             if let Some((value, bytes)) = self.decoded.remove(&key) {
-                budget.uncharge(bytes);
+                budget.uncharge(VALUE_NODE_BYTES);
                 self.decoded_bytes -= bytes;
                 return Ok(Some(value));
             }
-        } else if let Some((value, _)) = self.decoded.get(&key) {
+        } else if let Some((value, bytes)) = self.decoded.get(&key) {
+            budget.charge_decoded(bytes - VALUE_NODE_BYTES)?;
             return Ok(Some(value.clone()));
         }
-        let Some(value) = bytes_cell(values, key, |b| decode_cbor(b, limits)).transpose()? else {
+        let Some(value) = decode_charged(values, key, limits, budget)? else {
             return Ok(None);
         };
         if !last {
@@ -327,6 +343,29 @@ impl AnyValueColumns {
     }
 }
 
+/// Decode the CBOR cell at `row` of `a`, charging the tree below its root to
+/// `budget` as it is built; a failed decode gives its charge back.
+fn decode_charged(
+    a: &ArrayRef,
+    row: usize,
+    limits: DecodeLimits,
+    budget: &mut Budget,
+) -> Result<Option<Value>> {
+    let mut reserved = 0_usize;
+    let decoded = bytes_cell(a, row, |b| {
+        decode_cbor_reserving(b, limits, &mut |bytes| {
+            budget.charge_decoded(bytes)?;
+            reserved += bytes;
+            Ok(())
+        })
+    })
+    .transpose();
+    if decoded.is_err() {
+        budget.uncharge(reserved);
+    }
+    decoded
+}
+
 fn required(batch: &RecordBatch, name: &str, to: &DataType) -> Result<ArrayRef> {
     plain(batch, name, to)?.ok_or_else(|| Error::invalid(format!("attribute batch lacks {name}")))
 }
@@ -336,8 +375,8 @@ impl AttrTable {
     ///
     /// Keys and values are read through dictionary encoding rather than
     /// expanded, and each entry's decoded footprint ([`entry_bytes`]) is
-    /// charged to `budget` as it is read, so the table draws from the same
-    /// `max_extracted_bytes` as the rest of the request.
+    /// charged to `budget` before it is allocated, so the table draws from the
+    /// same `max_extracted_bytes` as the rest of the request.
     ///
     /// # Errors
     /// Refuses the batch when `parent_id` is missing or null, a required
@@ -357,14 +396,15 @@ impl AttrTable {
         let mut bytes = 0_usize;
         for (row, &parent_id) in parent_ids.iter().enumerate() {
             let key = str_cell(&keys, row, |k| {
-                cell_fits(k.len(), limits).map(|()| k.to_owned())
+                cell_fits(k.len(), limits)?;
+                budget.charge_decoded(k.len())?;
+                Ok::<_, Error>(k.to_owned())
             })
             .transpose()?
             .unwrap_or_default();
+            budget.charge_decoded(BUFFER_HEADER_BYTES)?;
             let value = any.value_at(row, limits, budget)?;
-            let entry = entry_bytes(&key, &value);
-            budget.charge_decoded(entry)?;
-            bytes += entry;
+            bytes += entry_bytes(&key, &value);
             groups.entry(parent_id).or_default().push((key, value));
         }
         any.release(budget);
@@ -679,7 +719,7 @@ mod tests {
         let refused = AttrTable::from_batch(&batch, limits, &mut budget(16 << 20));
         assert!(refused_by_table(&refused), "{refused:?}");
         let t = AttrTable::from_batch(&batch, limits, &mut budget(64 << 20)).expect("fits");
-        assert!(t.bytes > crate::value::VALUE_NODE_BYTES * ((1 << 20) - 5));
+        assert!(t.bytes > VALUE_NODE_BYTES * ((1 << 20) - 5));
     }
 
     /// Scenario: a small dictionary-encoded batch -- parent ids, keys and
