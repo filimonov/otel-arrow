@@ -160,6 +160,57 @@ def metric_request(request_id, unsupported=False):
     return req
 
 
+# The two streams the collapse test sends. They differ only in `request.id`,
+# which the upstream attribute processor deletes, and in their values; every
+# stream shares one timestamp, one start time and every other attribute.
+COLLAPSE_STREAMS = {
+    "req-a-7f3c": {"requests": 3, "latency": (2, 1.5, [1, 1]), "total": 10},
+    "req-b-91d2": {"requests": 4, "latency": (3, 2.5, [2, 1]), "total": 20},
+}
+COLLAPSE_METRICS = ("requests", "latency", "total")
+
+
+def collapse_request(case, request_ids, time_ns, start_ns):
+    """An OTLP metrics request with one point per metric for each stream.
+
+    `requests` is a delta monotonic integer sum, `latency` a delta
+    histogram and `total` a cumulative monotonic integer sum. Each point
+    carries `request.id`, the attribute to be deleted, and the surviving
+    attributes `route` and `case`; `case` names how the streams were sent,
+    so each sending mode has its own collapsed identity.
+    """
+    req = metrics_pb.ExportMetricsServiceRequest()
+    resource = req.resource_metrics.add()
+    resource.resource.attributes.add(key="host.id").value.string_value = "producer-1"
+    scope = resource.scope_metrics.add()
+    scope.scope.name = "series-e2e"
+    requests = scope.metrics.add(name="requests", unit="1")
+    requests.sum.aggregation_temporality = 1
+    requests.sum.is_monotonic = True
+    latency = scope.metrics.add(name="latency", unit="s")
+    latency.histogram.aggregation_temporality = 1
+    total = scope.metrics.add(name="total", unit="1")
+    total.sum.aggregation_temporality = 2
+    total.sum.is_monotonic = True
+    for request_id in request_ids:
+        stream = COLLAPSE_STREAMS[request_id]
+        count, sum_, buckets = stream["latency"]
+        points = (
+            requests.sum.data_points.add(as_int=stream["requests"]),
+            latency.histogram.data_points.add(count=count, sum=sum_),
+            total.sum.data_points.add(as_int=stream["total"]),
+        )
+        points[1].bucket_counts.extend(buckets)
+        points[1].explicit_bounds.append(1.0)
+        for point in points:
+            point.time_unix_nano = time_ns
+            point.start_time_unix_nano = start_ns
+            point.attributes.add(key="route").value.string_value = "/checkout"
+            point.attributes.add(key="case").value.string_value = case
+            point.attributes.add(key="request.id").value.string_value = request_id
+    return req
+
+
 class LocalLauncher:
     """Start the engine as a child process of this harness, on this host.
 
@@ -185,7 +236,11 @@ class LocalLauncher:
 # baseline of the layered benchmarks: the receiver and the engine are the
 # real ones, so it calibrates producer and engine cost, and it is never a
 # durable-storage measurement.
-TOPOLOGIES = ("strict", "buffered", "noop")
+#
+# `processed` inserts one caller-supplied processor node between the receiver
+# and the exporter. It exists for functional tests of how the exporter
+# behaves behind an upstream transformation and is never measured.
+TOPOLOGIES = ("strict", "buffered", "noop", "processed")
 
 # The node the buffered topology inserts between the receiver and the
 # exporter, and the settings every buffered measurement runs with: a bounded
@@ -193,6 +248,10 @@ TOPOLOGIES = ("strict", "buffered", "noop")
 # nothing retained is ever discarded for being old.
 BUFFER_NODE = "buffer"
 BUFFER_RETENTION_SIZE_CAP = "1GiB"
+
+# The node the processed topology inserts between the receiver and the
+# exporter.
+PROCESSOR_NODE = "processor"
 
 
 def deep_merge(base, patch):
@@ -223,6 +282,7 @@ def engine_config(
     cores=None,
     merge=None,
     grpc_host="127.0.0.1",
+    processor=None,
 ):
     """The complete configuration one engine launch serializes.
 
@@ -235,7 +295,9 @@ def engine_config(
     and recorded, so nothing is changed after it is returned. `grpc_host`
     is the address the receiver binds: a launcher that runs the engine in
     its own network namespace binds every address there, and reaches it
-    through a port it publishes on host loopback.
+    through a port it publishes on host loopback. `topology="processed"`
+    inserts `processor`, a complete node definition, between the receiver
+    and the exporter.
     """
     if topology not in TOPOLOGIES:
         raise ValueError(f"topology must be one of {TOPOLOGIES}: {topology}")
@@ -291,6 +353,16 @@ def engine_config(
         ]
     elif buffer_path is not None:
         raise ValueError("buffer_path is only meaningful for the buffered topology")
+    if topology == "processed":
+        if processor is None:
+            raise ValueError("the processed topology needs a processor node")
+        nodes[PROCESSOR_NODE] = processor
+        pipeline["connections"] = [
+            {"from": "receiver", "to": PROCESSOR_NODE},
+            {"from": PROCESSOR_NODE, "to": "exporter"},
+        ]
+    elif processor is not None:
+        raise ValueError("processor is only meaningful for the processed topology")
     if cores is not None:
         cores = [int(core) for core in cores]
         if not cores or len(set(cores)) != len(cores):
@@ -348,6 +420,7 @@ EXPECTED_EDGES = {
     "strict": [("receiver", "exporter")],
     "noop": [("receiver", "exporter")],
     "buffered": [("receiver", BUFFER_NODE), (BUFFER_NODE, "exporter")],
+    "processed": [("receiver", PROCESSOR_NODE), (PROCESSOR_NODE, "exporter")],
 }
 
 
@@ -369,6 +442,7 @@ class Engine:
         launcher=None,
         merge=None,
         binary=None,
+        processor=None,
     ):
         self.root = Path(directory)
         self.data = self.root / "data"
@@ -403,6 +477,7 @@ class Engine:
             cores=self.cores,
             merge=merge,
             grpc_host=bind_host,
+            processor=processor,
         )
         self.edges = graph_edges(self.config)
         if self.edges != EXPECTED_EDGES[topology]:
@@ -937,6 +1012,195 @@ class MetricsSlice(unittest.TestCase):
                     except Exception:
                         print(engine.engine_log())
                         raise
+    # Scenario: an upstream `processor:attribute` deletes `request.id`, a
+    # point attribute unique to each of two otherwise identical streams, in
+    # front of the exporter. Each stream sends a delta integer sum, a delta
+    # histogram and a cumulative integer sum with one shared timestamp, once
+    # with both streams in one request and once as two separate requests.
+    # Guarantees: every request is acknowledged; each collapsed identity has
+    # exactly one descriptor row, because the descriptor is written once per
+    # partition and worker; each collapsed pair is two values rows with the
+    # same series_id and timestamp; no `request.id` key or value survives in
+    # any written file; and DuckDB and ClickHouse agree that the collapsed
+    # delta sum and delta histogram sum to the originals. The cumulative pair
+    # is only shown not to break anything: it is stored as two running totals
+    # under one series_id, which no reader can tell apart, so its value is
+    # not asserted to be meaningful. The exporter has no series-to-points
+    # ratio signal at this revision, so none is asserted.
+    def test_attribute_delete_collapses_streams(self):
+        # Descriptors repeat per hour partition, so a window that straddles
+        # an hour boundary would legitimately write a second one.
+        if time.time() % 3600 > 3600 - 20:
+            time.sleep(3600 - time.time() % 3600 + 1)
+        processor = {
+            "type": "processor:attribute",
+            "config": {
+                "apply_to": ["signal"],
+                "actions": [{"action": "delete", "key": "request.id"}],
+            },
+        }
+        ids = sorted(COLLAPSE_STREAMS)
+        time_ns = time.time_ns() // 10**9 * 10**9
+        start_ns = time_ns - 10 * 10**9
+        with tempfile.TemporaryDirectory() as directory, Engine(
+            directory, topology="processed", processor=processor
+        ) as engine:
+            try:
+                call = metrics_rpc.MetricsServiceStub(engine.channel)
+                # Any RpcError here is a nack and fails the test.
+                call.Export(collapse_request("one", ids, time_ns, start_ns), timeout=20)
+                for request_id in ids:
+                    call.Export(
+                        collapse_request("two", [request_id], time_ns, start_ns),
+                        timeout=20,
+                    )
+                # The processor's own count of deleted signal attributes: one
+                # per point, three metrics times two streams in each mode. It
+                # is sampled on the telemetry interval, so it is polled.
+                points = 2 * len(COLLAPSE_METRICS) * len(ids)
+                deadline = time.monotonic() + 15
+                deleted = []
+                while time.monotonic() < deadline:
+                    deleted = [
+                        item["value"]
+                        for group in engine_metrics(engine)["metric_sets"]
+                        if group["name"] == "processor.attributes.modified"
+                        for item in group["metrics"]
+                        if item["name"] == "entries"
+                        and item["attributes"]
+                        == {
+                            "action": {"String": "deleted"},
+                            "domain": {"String": "signal"},
+                        }
+                    ]
+                    if deleted == [points]:
+                        break
+                    time.sleep(0.2)
+                self.assertEqual(deleted, [points], "processor deletions")
+                engine.shutdown()
+            except Exception:
+                print(engine.engine_log())
+                raise
+            root = engine.data.resolve()
+            files = sorted(root.rglob("*.parquet"))
+            self.assertTrue(files, "no Parquet files after three acknowledged exports")
+            with duckdb.connect() as db:
+                series = sql_string(root / "v=1/signal=metrics/dataset=series/**/*.parquet")
+                values = sql_string(root / "v=1/signal=metrics/dataset=values/**/*.parquet")
+                # Every descriptor row, deliberately without the
+                # latest-descriptor view: a repeated descriptor is what this
+                # counts.
+                descriptors = db.execute(
+                    "SELECT metric_name, attrs['case'], metric_type, temporality, "
+                    "count(*), count(DISTINCT series_id) "
+                    f"FROM read_parquet({series}, union_by_name=true, "
+                    "hive_partitioning=false) GROUP BY ALL ORDER BY ALL"
+                ).fetchall()
+                self.assertEqual(
+                    descriptors,
+                    sorted(
+                        (name, case, kind, temporality, 1, 1)
+                        for case in ("one", "two")
+                        for name, kind, temporality in (
+                            ("latency", "histogram", "delta"),
+                            ("requests", "sum", "delta"),
+                            ("total", "sum", "cumulative"),
+                        )
+                    ),
+                )
+                keys = db.execute(
+                    "SELECT DISTINCT unnest(map_keys(attrs)) "
+                    f"FROM read_parquet({series}, union_by_name=true, "
+                    "hive_partitioning=false) ORDER BY 1"
+                ).fetchall()
+                self.assertEqual(keys, [("case",), ("route",)])
+                # Each collapsed pair: two rows, one series_id, one
+                # timestamp, and the values of both originals.
+                pair_sql = (
+                    "SELECT s.metric_name, s.attrs['case'], count(*), "
+                    "count(DISTINCT v.series_id), count(DISTINCT v.time_unix_nano), "
+                    "min(v.time_unix_nano), sum(v.value_int), sum(v.count), "
+                    "sum(v.sum), list_sort(list(v.value_int)) "
+                    f"FROM read_parquet({values}, union_by_name=true, "
+                    "hive_partitioning=false) v "
+                    f"JOIN (SELECT DISTINCT series_id, metric_name, attrs "
+                    f"FROM read_parquet({series}, union_by_name=true, "
+                    "hive_partitioning=false)) s USING (series_id) "
+                    "GROUP BY ALL ORDER BY ALL"
+                )
+                pairs = db.execute(pair_sql).fetchall()
+                expected = []
+                for name in sorted(COLLAPSE_METRICS):
+                    for case in ("one", "two"):
+                        streams = [COLLAPSE_STREAMS[i] for i in ids]
+                        if name == "latency":
+                            numbers = (None, 5, 4.0, [None, None])
+                        else:
+                            numbers = (
+                                sum(stream[name] for stream in streams),
+                                None,
+                                None,
+                                sorted(stream[name] for stream in streams),
+                            )
+                        expected.append((name, case, 2, 1, 1, time_ns) + numbers)
+                self.assertEqual(pairs, expected)
+                buckets = db.execute(
+                    "SELECT s.attrs['case'], list_sort(list(v.bucket_counts)) "
+                    f"FROM read_parquet({values}, union_by_name=true, "
+                    "hive_partitioning=false) v "
+                    f"JOIN (SELECT DISTINCT series_id, metric_name, attrs "
+                    f"FROM read_parquet({series}, union_by_name=true, "
+                    "hive_partitioning=false)) s USING (series_id) "
+                    "WHERE s.metric_name = 'latency' GROUP BY ALL ORDER BY ALL"
+                ).fetchall()
+                self.assertEqual(
+                    buckets, [("one", [[1, 1], [2, 1]]), ("two", [[1, 1], [2, 1]])]
+                )
+                # No trace of the deleted attribute anywhere: every column of
+                # every row of every file, identity bytes included, and every
+                # file's key-value metadata.
+                forbidden = ["request.id"] + ids
+                for path in files:
+                    rendered = repr(
+                        db.execute(
+                            # Rendered in SQL: a timestamp with a time zone
+                            # cannot be fetched without pytz, and a BLOB
+                            # renders its printable bytes as text.
+                            "SELECT COLUMNS(*)::VARCHAR FROM "
+                            f"read_parquet({sql_string(path)})"
+                        ).fetchall()
+                    ) + repr(
+                        db.execute(
+                            "SELECT key, value FROM "
+                            f"parquet_kv_metadata({sql_string(path)})"
+                        ).fetchall()
+                    )
+                    for word in forbidden:
+                        self.assertNotIn(word, rendered, f"{word} survives in {path}")
+                        self.assertNotIn(
+                            word.encode(), path.read_bytes(), f"{word} in {path}"
+                        )
+            # ClickHouse reads the same files and computes the same sums.
+            with clickhouse_reader(root) as clickhouse:
+                ch_pairs = clickhouse(
+                    "SELECT s.metric_name, s.attrs['case'], count(), "
+                    "uniqExact(v.series_id), uniqExact(v.time_unix_nano), "
+                    "min(v.time_unix_nano), sum(v.value_int), sum(v.count), "
+                    "sum(v.sum), arraySort(groupArray(v.value_int)) "
+                    "FROM file('v=1/signal=metrics/dataset=values/**/*.parquet', "
+                    "'Parquet') AS v INNER JOIN (SELECT DISTINCT series_id, "
+                    "metric_name, attrs FROM "
+                    "file('v=1/signal=metrics/dataset=series/**/*.parquet', "
+                    "'Parquet')) AS s ON v.series_id = s.series_id "
+                    "GROUP BY 1, 2 ORDER BY 1, 2"
+                )
+            # Both readers return null for a sum over only nulls; ClickHouse's
+            # groupArray skips nulls where DuckDB's list keeps them.
+            ch_expected = [
+                row[:9] + ([] if row[0] == "latency" else row[9],) for row in expected
+            ]
+            self.assertEqual([tuple(row) for row in ch_pairs], ch_expected)
+
 
 def bulk_log_request(tag, records):
     """An OTLP logs request whose bodies are `tag`-0 .. `tag`-(records-1).

@@ -1135,6 +1135,59 @@ become null; a negative converted timestamp becomes null and increments
   further run bounded by `run_target_bytes`, so the transient at seal time can
   reach `(V + 1) * run_target_bytes` for V buffered runs.
 
+### High-cardinality point attributes
+
+A series identity is the complete set of resource, scope, metric and point
+attributes, as OpenTelemetry defines a stream. A point attribute that is unique
+per point, such as a request id, a trace id or a user id, therefore makes one
+series per point: the `series` dataset grows as fast as `values` and the
+descriptor cache stops hitting. The exporter cannot drop a varying attribute
+from the identity without merging streams that the producer reported as
+distinct, so remove or bucket such attributes upstream, in the SDK with Views
+or in the pipeline. The exporter has no series-to-points ratio signal yet;
+`series_cache.misses` rising with the point rate is the nearest indicator.
+
+Deleting the attribute with `processor:attribute` in front of this exporter
+works and is covered end to end:
+
+```yaml
+processor:
+  type: processor:attribute
+  config:
+    apply_to: ["signal"]
+    actions:
+      - {action: delete, key: request.id}
+```
+
+Two streams that differ only in the deleted attribute arrive with the same
+identity. They get one `series_id` and one descriptor, written once per
+partition and worker, and their points are stored as separate `values` rows
+under that `series_id`, even when the timestamps are equal. Nothing is refused,
+deduplicated or merged. Whether the collapsed rows still mean something
+depends on the point kind:
+
+- Delta sums and delta histograms stay correct. A reader sums the rows:
+  `value_int` or `value_double`, `count`, `sum` and the bucket counts element
+  by element give exactly the totals of the original streams.
+- Cumulative sums and cumulative histograms become wrong. Each row is one
+  stream's running total, and the totals of different streams interleave under
+  one `series_id` with nothing to tell them apart. A reader taking the latest
+  value picks one stream arbitrarily, and a rate over consecutive rows sees
+  false resets. Summing rows that share one timestamp happens to give the
+  combined total, but streams rarely report at the same instant and reset
+  independently, so that does not generalize.
+- Gauges become ambiguous. The collapsed series holds several samples for one
+  instant and no rule for combining them; last, mean and maximum are all
+  plausible and the files do not say which was meant.
+
+The `hash` action keeps the cardinality and only obscures the value. Spatial
+aggregation, dropping attributes and merging the colliding streams with a
+temporality-correct function (per-stream cumulative totals with reset
+handling, summed deltas, a chosen function for gauges), is not available in
+otap-dataflow today: `processor:temporal_reaggregation` aggregates over time
+only. Until such a processor exists, delete only attributes of delta metrics,
+or aggregate cumulative metrics and gauges in the SDK.
+
 ### Operational limits
 
 - Stage benchmarks and a measurement harness exist
