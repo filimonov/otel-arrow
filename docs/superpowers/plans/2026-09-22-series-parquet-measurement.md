@@ -771,6 +771,7 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 Each experiment is measured on the stage bench (encode, sink, upload stages) and confirmed by one attribution repetition; a change enters the defaults only if it lowers CPU per record beyond noise WITHOUT raising stored bytes beyond a stated bound (report the compressed size ratio) and without changing schema, data, sort order or golden fingerprints. File bytes may change; readers (DuckDB, ClickHouse) must read the result, proven by the E2E suite.
 
 - [ ] **Per-column writer properties:** disable dictionary encoding (and page statistics, keeping chunk statistics) for high-entropy columns (log `body`, attribute blobs, trace/span ids if present); keep dictionaries for low-cardinality columns (severity, series_id-adjacent keys, metric names). Try ZSTD levels 1 and 3 against the current default on the same data. Report CPU/record, bytes/record and read time for a representative DuckDB and ClickHouse query.
+  Constraint (compaction chat, 2026-09-23): whatever is disabled on high-entropy columns, page statistics and the page index stay enabled on `series_id` and `time_unix_nano` (and on `metric_name` for metrics), because a compactor and readers prune on them.
 - [ ] **S3 unsigned payload:** measure `with_unsigned_payload(true)` (SigV4 UNSIGNED-PAYLOAD) on the MinIO lane; if adopted, make it a documented S3 option that defaults on only for TLS endpoints (payload integrity then comes from TLS; for plain HTTP keep signed payloads), and state the trade-off in the README.
 - [ ] **Allocation churn:** using Task 6's measurement of builder capacity and allocator share, reuse values/series builders across requests (reset instead of reallocate) and size them from the actual row count; measure the allocator share before/after.
 - [ ] **Double UTF-8 validation:** after Task 3g, validate_framing checks every protobuf string once, and OTLP-to-OTAP conversion checks the same strings again when building string arrays (pdata encode/record/array.rs). Let conversion trust bytes validate_framing accepted on the exporter path, or switch the validator to simdutf8 (already in Cargo.lock); measure the logs otlp_convert stage before and after.
@@ -1287,6 +1288,8 @@ git commit -m "chore: measure series recovery from real S3 faults" -m "Co-Author
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
+**Amendment (compaction contract, 2026-09-23):** every S3 fault run in this task also checks the partition lateness bound: no object may become visible in partition hour H later than L = window.interval + flush_retry_deadline + upload.abort_timeout after the end of H. Record, per run, the latest visibility time of any object in each hour relative to that hour's end (HEAD/LIST timestamps from the store, not the writer's clock), and report every violation as a finding for Task 12.
+
 ### Task 10: Graceful process restart and ungraceful hard kill
 
 **Expected wall-clock cost:** 8-15 minutes for both stores/topologies and kill phases; fast controller tests under one second.
@@ -1458,6 +1461,8 @@ git add rust/otap-dataflow/crates/validation/tests/series_parquet/faults.py rust
 git commit -m "chore: measure series network DNS and acknowledgement faults" -m "Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
+
+**Amendment (compaction contract, 2026-09-23):** the dropped-completion-response case is the one where a client that has given up cannot prevent a late object: the store may still complete a CompleteMultipartUpload the writer abandoned. Measure it explicitly: after the writer's deadline, does the object appear in hour H, and how late relative to L? A violation is expected and is recorded as the evidence for the plan-4 per-writer seal marker; it is not fixed here.
 
 ### Task 12: Contingency - classify defects, fix bounded causes and rerun
 
