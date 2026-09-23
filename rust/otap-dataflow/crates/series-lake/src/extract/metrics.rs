@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, AsArray, ListArray};
+use arrow::array::{Array, ArrayRef, AsArray, ListArray};
 use arrow::datatypes::{DataType, Float64Type, Int32Type, TimeUnit, UInt8Type, UInt64Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
@@ -354,6 +354,92 @@ impl Common<'_> {
         let _ = memo.insert(key, id);
         Ok(id)
     }
+
+    /// Append one values row per point of one point kind.
+    ///
+    /// The one path number and histogram points share. Each point is resolved
+    /// to its metric and its series through [`Common::series_for`], memoized
+    /// on content for this kind's attribute table; its resource, scope and
+    /// point attributes are looked up; the shared leading columns and the
+    /// denormalized columns are built around the kind's own; and the row is
+    /// charged to the request's budget as it enters the sink.
+    ///
+    /// `kind` returns the eight per-kind columns of one point -- the other
+    /// kind's columns null, not zero -- and the bytes they retain beyond
+    /// [`PER_KIND_FIXED_BYTES`]. It runs once the point's series is known and
+    /// may refuse the request.
+    #[allow(clippy::too_many_arguments)]
+    fn append_points(
+        &mut self,
+        rows: usize,
+        columns: &PointColumns,
+        attrs: &AttrTable,
+        orphan: &'static str,
+        sink: &mut RowSink,
+        budget: &mut Budget,
+        mut kind: impl FnMut(usize) -> Result<([Col; 8], usize)>,
+    ) -> Result<()> {
+        let metrics = self.metrics;
+        let (resource_attrs, scope_attrs) = (self.resource_attrs, self.scope_attrs);
+        let mut memo = HashMap::new();
+        for row in 0..rows {
+            let metric_id =
+                opt_u16_at(&columns.parent, row).ok_or_else(|| Error::invalid(orphan))?;
+            let point_attrs = match opt_u32_at(&columns.attrs_id, row) {
+                Some(id) => attrs.get(id),
+                None => &[],
+            };
+            let id = self.series_for(&mut memo, metric_id, point_attrs, budget)?;
+            let m = metric_of(metrics, metric_id)?;
+            let (kind_cols, kind_bytes) = kind(row)?;
+            let resource = attrs_of(resource_attrs, m.resource_id);
+            let scope = attrs_of(scope_attrs, m.scope_id);
+            let (mut cols, mut approx) = common_cols(
+                id,
+                m,
+                resource,
+                self.cfg,
+                i64_at(&columns.time, row),
+                i64_at(&columns.start, row),
+                flags_at(&columns.flags, row),
+                &mut self.stats,
+            );
+            cols.extend(kind_cols);
+            approx += PER_KIND_FIXED_BYTES + kind_bytes;
+            approx += push_denorm(
+                &mut cols,
+                Dataset::MetricsValues,
+                resource,
+                scope,
+                point_attrs,
+                self.cfg,
+                &mut self.stats,
+            );
+            sink.push(
+                &ValuesRow {
+                    cols,
+                    approx_bytes: approx,
+                },
+                budget,
+            )?;
+            self.stats.rows += 1;
+        }
+        Ok(())
+    }
+}
+
+/// The columns of a point table that every point kind reads besides its own.
+struct PointColumns {
+    /// Parent metric id of each point.
+    parent: Option<ArrayRef>,
+    /// Point attribute parent id of each point.
+    attrs_id: Option<ArrayRef>,
+    /// `start_time_unix_nano`.
+    start: Option<ArrayRef>,
+    /// `time_unix_nano`.
+    time: Option<ArrayRef>,
+    /// `flags`.
+    flags: Option<ArrayRef>,
 }
 
 /// One row of `bucket_counts`, cast to the signed storage type.
@@ -524,151 +610,115 @@ pub(crate) fn extract_metrics(
     // one sink; each kind writes the other's columns as null.
     let mut sink = RowSink::new(Dataset::MetricsValues, cfg)?;
 
-    // Number points.
+    // Number points. Each column is read in the order the kinds always read
+    // them, so a request with several malformed columns is refused for the
+    // same one.
     if let Some(b) = records.get(ArrowPayloadType::NumberDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::NumberDpAttrs, limits)?;
-        let mut memo = HashMap::new();
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
-        let pid = plain(b, ID, &DataType::UInt32)?;
+        let attrs_id = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
         let time = plain(b, TIME_UNIX_NANO, &ts_ns)?;
         let iv = plain(b, INT_VALUE, &DataType::Int64)?;
         let dv = plain(b, DOUBLE_VALUE, &DataType::Float64)?;
-        let fl = plain(b, FLAGS, &DataType::UInt32)?;
-        for row in 0..b.num_rows() {
-            let metric_id = opt_u16_at(&parent, row)
-                .ok_or_else(|| Error::invalid("number point without parent metric id"))?;
-            let attrs_id = opt_u32_at(&pid, row);
-            let point_attrs = match attrs_id {
-                Some(id) => attrs.get(id),
-                None => &[],
-            };
-            let id = c.series_for(&mut memo, metric_id, point_attrs, budget)?;
-            let m = metric_of(&metrics, metric_id)?;
-            let resource = attrs_of(&resource_attrs, m.resource_id);
-            let scope = attrs_of(&scope_attrs, m.scope_id);
-            let (mut cols, mut approx) = common_cols(
-                id,
-                m,
-                resource,
-                cfg,
-                i64_at(&time, row),
-                i64_at(&start, row),
-                flags_at(&fl, row),
-                &mut c.stats,
-            );
-            cols.push(Col::Int(opt_i64(&iv, row)));
-            cols.push(Col::Double(opt_f64(&dv, row)));
-            // Histogram columns of a number point: null, not zero.
-            cols.push(Col::Int(None));
-            cols.push(Col::Double(None));
-            cols.push(Col::Double(None));
-            cols.push(Col::Double(None));
-            cols.push(Col::ListI64(None));
-            cols.push(Col::ListF64(None));
-            approx += PER_KIND_FIXED_BYTES;
-            approx += push_denorm(
-                &mut cols,
-                Dataset::MetricsValues,
-                resource,
-                scope,
-                point_attrs,
-                cfg,
-                &mut c.stats,
-            );
-            sink.push(
-                &ValuesRow {
-                    cols,
-                    approx_bytes: approx,
-                },
-                budget,
-            )?;
-            c.stats.rows += 1;
-        }
+        let flags = plain(b, FLAGS, &DataType::UInt32)?;
+        let columns = PointColumns {
+            parent,
+            attrs_id,
+            start,
+            time,
+            flags,
+        };
+        c.append_points(
+            b.num_rows(),
+            &columns,
+            &attrs,
+            "number point without parent metric id",
+            &mut sink,
+            budget,
+            |row| {
+                Ok((
+                    [
+                        Col::Int(opt_i64(&iv, row)),
+                        Col::Double(opt_f64(&dv, row)),
+                        // Histogram columns of a number point: null, not zero.
+                        Col::Int(None),
+                        Col::Double(None),
+                        Col::Double(None),
+                        Col::Double(None),
+                        Col::ListI64(None),
+                        Col::ListF64(None),
+                    ],
+                    0,
+                ))
+            },
+        )?;
     }
 
     // Histogram points.
     if let Some(b) = records.get(ArrowPayloadType::HistogramDataPoints) {
         let attrs = attr_table(records, ArrowPayloadType::HistogramDpAttrs, limits)?;
-        let mut memo = HashMap::new();
         let parent = plain(b, PARENT_ID, &DataType::UInt16)?;
-        let pid = plain(b, ID, &DataType::UInt32)?;
+        let attrs_id = plain(b, ID, &DataType::UInt32)?;
         let start = plain(b, START_TIME_UNIX_NANO, &ts_ns)?;
         let time = plain(b, TIME_UNIX_NANO, &ts_ns)?;
         let count = plain(b, HISTOGRAM_COUNT, &DataType::UInt64)?;
         let sum = plain(b, HISTOGRAM_SUM, &DataType::Float64)?;
         let min = plain(b, HISTOGRAM_MIN, &DataType::Float64)?;
         let max = plain(b, HISTOGRAM_MAX, &DataType::Float64)?;
-        let fl = plain(b, FLAGS, &DataType::UInt32)?;
+        let flags = plain(b, FLAGS, &DataType::UInt32)?;
         let bc = list_col(b, HISTOGRAM_BUCKET_COUNTS)?;
         let eb = list_col(b, HISTOGRAM_EXPLICIT_BOUNDS)?;
-        for row in 0..b.num_rows() {
-            let metric_id = opt_u16_at(&parent, row)
-                .ok_or_else(|| Error::invalid("histogram point without parent metric id"))?;
-            let attrs_id = opt_u32_at(&pid, row);
-            let point_attrs = match attrs_id {
-                Some(id) => attrs.get(id),
-                None => &[],
-            };
-            let id = c.series_for(&mut memo, metric_id, point_attrs, budget)?;
-            let m = metric_of(&metrics, metric_id)?;
-            let counts = bucket_counts_at(&bc, row)?;
-            let bounds = explicit_bounds_at(&eb, row)?;
-            let ok = (counts.is_empty() && bounds.is_empty()) || counts.len() == bounds.len() + 1;
-            if !ok {
-                return Err(Error::invalid(
-                    "histogram bucket_counts.len != explicit_bounds.len + 1",
-                ));
-            }
-            let cnt = count
-                .as_ref()
-                .and_then(|a| {
-                    a.is_valid(row)
-                        .then(|| a.as_primitive::<UInt64Type>().value(row))
-                })
-                .unwrap_or(0);
-            let cnt =
-                i64::try_from(cnt).map_err(|_| Error::invalid("histogram count above i64::MAX"))?;
-            let resource = attrs_of(&resource_attrs, m.resource_id);
-            let scope = attrs_of(&scope_attrs, m.scope_id);
-            let (mut cols, mut approx) = common_cols(
-                id,
-                m,
-                resource,
-                cfg,
-                i64_at(&time, row),
-                i64_at(&start, row),
-                flags_at(&fl, row),
-                &mut c.stats,
-            );
-            // Value columns of a histogram point: null, not zero.
-            cols.push(Col::Int(None));
-            cols.push(Col::Double(None));
-            cols.push(Col::Int(Some(cnt)));
-            cols.push(Col::Double(opt_f64(&sum, row)));
-            cols.push(Col::Double(opt_f64(&min, row)));
-            cols.push(Col::Double(opt_f64(&max, row)));
-            approx += PER_KIND_FIXED_BYTES + counts.len() * 8 + bounds.len() * 8;
-            cols.push(Col::ListI64(Some(counts)));
-            cols.push(Col::ListF64(Some(bounds)));
-            approx += push_denorm(
-                &mut cols,
-                Dataset::MetricsValues,
-                resource,
-                scope,
-                point_attrs,
-                cfg,
-                &mut c.stats,
-            );
-            sink.push(
-                &ValuesRow {
-                    cols,
-                    approx_bytes: approx,
-                },
-                budget,
-            )?;
-            c.stats.rows += 1;
-        }
+        let columns = PointColumns {
+            parent,
+            attrs_id,
+            start,
+            time,
+            flags,
+        };
+        c.append_points(
+            b.num_rows(),
+            &columns,
+            &attrs,
+            "histogram point without parent metric id",
+            &mut sink,
+            budget,
+            |row| {
+                let counts = bucket_counts_at(&bc, row)?;
+                let bounds = explicit_bounds_at(&eb, row)?;
+                let ok =
+                    (counts.is_empty() && bounds.is_empty()) || counts.len() == bounds.len() + 1;
+                if !ok {
+                    return Err(Error::invalid(
+                        "histogram bucket_counts.len != explicit_bounds.len + 1",
+                    ));
+                }
+                let cnt = count
+                    .as_ref()
+                    .and_then(|a| {
+                        a.is_valid(row)
+                            .then(|| a.as_primitive::<UInt64Type>().value(row))
+                    })
+                    .unwrap_or(0);
+                let cnt = i64::try_from(cnt)
+                    .map_err(|_| Error::invalid("histogram count above i64::MAX"))?;
+                let bytes = counts.len() * 8 + bounds.len() * 8;
+                Ok((
+                    [
+                        // Value columns of a histogram point: null, not zero.
+                        Col::Int(None),
+                        Col::Double(None),
+                        Col::Int(Some(cnt)),
+                        Col::Double(opt_f64(&sum, row)),
+                        Col::Double(opt_f64(&min, row)),
+                        Col::Double(opt_f64(&max, row)),
+                        Col::ListI64(Some(counts)),
+                        Col::ListF64(Some(bounds)),
+                    ],
+                    bytes,
+                ))
+            },
+        )?;
     }
 
     // One sink for both point kinds, so a mixed request still produces a single
