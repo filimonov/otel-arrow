@@ -4,7 +4,9 @@
 //! The write loop of one table: bounded steps, cancellation and the
 //! multipart abort, with the accounting of what the write holds.
 
-use super::properties::{native_sorting_columns, time_range};
+use super::properties::{
+    compression, native_sorting_columns, row_group_full, time_range, writer_properties,
+};
 use super::{FlushReport, Sink};
 
 use crate::buffer::{Block, SortedTableBuffer};
@@ -19,8 +21,6 @@ use object_store::path::Path;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -584,15 +584,7 @@ impl Sink {
         };
         let schema = dataset_schema(table.dataset(), &self.cfg);
         let sorting = native_sorting_columns(table.spec(), &schema)?;
-        // Spec 5.4 asks for ZSTD, statistics and dictionary encoding explicitly
-        // rather than by relying on arrow-rs defaults. An unlimited row count
-        // disables the row-count-based split so that the byte-driven flush below
-        // owns row group boundaries.
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_dictionary_enabled(true)
-            .set_max_row_group_row_count(None)
+        let props = writer_properties(compression())
             .set_sorting_columns(sorting)
             .set_key_value_metadata(Some(self.file_metadata(
                 table,
@@ -737,9 +729,11 @@ impl Sink {
             rows += chunk.num_rows();
             drop(chunk);
             workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
-            if writer.memory_size() >= self.cfg.parquet.writer_limit_bytes
-                || writer.in_progress_size() >= self.cfg.parquet.row_group_bytes
-            {
+            if row_group_full(
+                &self.cfg.parquet,
+                writer.memory_size(),
+                writer.in_progress_size(),
+            ) {
                 // Closing a row group is the other stretch, bounded by
                 // `row_group_bytes`, and it too runs in a poll of its own.
                 tokio::task::yield_now().await;

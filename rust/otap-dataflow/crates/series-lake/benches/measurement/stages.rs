@@ -7,9 +7,8 @@
 //! trait, `extract`, `Block::{reserve, admit, seal}`, `merge_runs`, the
 //! actual `Sink`, and real `object_store` clients built by the same
 //! constructor the exporter uses. The only code of its own is the
-//! diagnostic Parquet encoder, whose writer properties and flush predicate
-//! are copied from `sink.rs` and cross-checked against actual `Sink` output
-//! by [`sink_equivalence`].
+//! diagnostic Parquet encoder, which takes its writer properties and its
+//! row group predicate from the sink.
 //!
 //! A stage is split into three calls so that a caller can time exactly one
 //! of them: [`Stage::prepare`] builds one iteration's input, [`Stage::run`]
@@ -39,12 +38,13 @@ use otel_arrow_dfe_series_lake::canonical::{SeriesId, series_id};
 use otel_arrow_dfe_series_lake::config::LakeConfig;
 use otel_arrow_dfe_series_lake::extract::{Extracted, extract};
 use otel_arrow_dfe_series_lake::schema::Dataset;
-use otel_arrow_dfe_series_lake::sink::{FileNaming, FlushReport, Sink};
+use otel_arrow_dfe_series_lake::sink::{
+    FileNaming, FlushReport, Sink, row_group_full, writer_properties,
+};
 use otel_arrow_dfe_series_lake::sort::{SortSpec, is_sorted, merge_runs};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{Compression, Encoding, ZstdLevel};
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::basic::Compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
@@ -418,26 +418,10 @@ pub fn object_store(cfg: &BenchConfig) -> Result<Arc<dyn ObjectStore>> {
     )?)
 }
 
-/// Writer properties of the actual sink, without its file metadata.
-///
-/// Copied from `Sink::write_table`: statistics, dictionary encoding and no
-/// row-count split, so that the byte-driven flush owns row group
-/// boundaries. The file-identity key-value metadata is deliberately
-/// omitted; [`sink_equivalence`] checks the rest against real Sink output.
-#[must_use]
-pub fn writer_properties(compression: Compression) -> WriterProperties {
-    WriterProperties::builder()
-        .set_compression(compression)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_dictionary_enabled(true)
-        .set_max_row_group_row_count(None)
-        .build()
-}
-
 /// The production compression.
 #[must_use]
 pub fn zstd() -> Compression {
-    Compression::ZSTD(ZstdLevel::default())
+    otel_arrow_dfe_series_lake::sink::compression()
 }
 
 /// What one diagnostic encode observed of its writer.
@@ -474,7 +458,7 @@ pub fn encode_batches(
     let mut encoded = output;
     let mut observed = EncodeObservation::default();
     {
-        let properties = writer_properties(compression);
+        let properties = writer_properties(compression).build();
         let mut writer = ArrowWriter::try_new(&mut encoded, schema, Some(properties))?;
         for chunk in batches {
             writer.write(&chunk?)?;
@@ -482,9 +466,7 @@ pub fn encode_batches(
             let in_progress = writer.in_progress_size();
             observed.writer_memory_max_bytes = observed.writer_memory_max_bytes.max(memory);
             observed.in_progress_max_bytes = observed.in_progress_max_bytes.max(in_progress);
-            if memory >= cfg.parquet.writer_limit_bytes
-                || in_progress >= cfg.parquet.row_group_bytes
-            {
+            if row_group_full(&cfg.parquet, memory, in_progress) {
                 writer.flush()?;
                 observed.flushes += 1;
             }
@@ -529,166 +511,6 @@ fn merged_tables(block: &Block, cfg: &LakeConfig) -> Result<Vec<(Dataset, Vec<Re
         tables.push((table.dataset(), chunks));
     }
     Ok(tables)
-}
-
-/// One cross-check of diagnostic encoding against the actual sink.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Equivalence {
-    /// Files compared, one per non-empty table.
-    pub files_compared: usize,
-    /// Row groups compared.
-    pub row_groups_compared: usize,
-    /// Column chunks compared.
-    pub column_chunks_compared: usize,
-    /// Rows decoded and compared.
-    pub rows_compared: usize,
-    /// Sink file bytes over all files.
-    pub sink_bytes: usize,
-    /// Diagnostic bytes over all files.
-    pub diagnostic_bytes: usize,
-    /// Every difference found; empty when the two agree.
-    pub mismatches: Vec<String>,
-}
-
-/// Decoded batches and metadata of one Parquet file.
-fn read_parquet(
-    data: Bytes,
-) -> Result<(
-    Arc<parquet::file::metadata::ParquetMetaData>,
-    Vec<RecordBatch>,
-)> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
-    let metadata = builder.metadata().clone();
-    let batches = builder
-        .build()?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok((metadata, batches))
-}
-
-/// Write `block` through the actual sink and compare every file with the
-/// diagnostic encoding of the same merged chunks.
-///
-/// The comparison covers what a later sink change could silently diverge
-/// on: the Arrow schema's fields, decoded values, the row group count and
-/// each row group's row count, and per column chunk the compression codec,
-/// the presence of statistics and the use of dictionary encoding. Byte
-/// equality is not required, because the sink adds file-identity metadata.
-///
-/// # Errors
-/// Propagates sink, store and decoding failures; differences are reported,
-/// not raised.
-pub fn sink_equivalence(
-    block: &Block,
-    cfg: &LakeConfig,
-    runtime: &tokio::runtime::Runtime,
-    scratch: &FsPath,
-) -> Result<Equivalence> {
-    let root = scratch.join(format!("equivalence-{}", uuid_like()));
-    std::fs::create_dir_all(&root)?;
-    let store: Arc<dyn ObjectStore> = Arc::new(
-        object_store::local::LocalFileSystem::new_with_prefix(&root)?,
-    );
-    let sink = Sink::new(store.clone(), cfg.clone(), FileNaming::new(&cfg.writer_id));
-    let report = runtime.block_on(sink.write_block(block, &CancellationToken::new()))?;
-    let tables = merged_tables(block, cfg)?;
-    let mut result = Equivalence::default();
-    if report.files.len() != tables.len() {
-        result.mismatches.push(format!(
-            "sink wrote {} files for {} tables",
-            report.files.len(),
-            tables.len()
-        ));
-    }
-    for ((dataset, path, rows), (table_dataset, chunks)) in report.files.iter().zip(&tables) {
-        if dataset != table_dataset {
-            result
-                .mismatches
-                .push(format!("file order {dataset:?} vs {table_dataset:?}"));
-            continue;
-        }
-        let sink_bytes = runtime.block_on(async { store.get(path).await?.bytes().await })?;
-        let diagnostic = Bytes::from(encode_chunks(chunks, cfg, zstd())?);
-        result.sink_bytes += sink_bytes.len();
-        result.diagnostic_bytes += diagnostic.len();
-        let (sink_meta, sink_batches) = read_parquet(sink_bytes)?;
-        let (diag_meta, diag_batches) = read_parquet(diagnostic)?;
-        result.files_compared += 1;
-        let name = dataset.name();
-        let sink_schema = sink_batches.first().map(RecordBatch::schema);
-        let diag_schema = diag_batches.first().map(RecordBatch::schema);
-        if sink_schema.as_ref().map(|s| s.fields().clone())
-            != diag_schema.as_ref().map(|s| s.fields().clone())
-        {
-            result
-                .mismatches
-                .push(format!("{name}: decoded schema fields differ"));
-        }
-        let sink_rows: usize = sink_batches.iter().map(RecordBatch::num_rows).sum();
-        let diag_rows: usize = diag_batches.iter().map(RecordBatch::num_rows).sum();
-        if sink_rows != *rows || diag_rows != *rows {
-            result.mismatches.push(format!(
-                "{name}: rows sink {sink_rows} diagnostic {diag_rows} block {rows}"
-            ));
-        }
-        if let Some(schema) = sink_schema {
-            let left = arrow::compute::concat_batches(&schema, &sink_batches)?;
-            let right = arrow::compute::concat_batches(&schema, &diag_batches)?;
-            if left.columns() != right.columns() {
-                result
-                    .mismatches
-                    .push(format!("{name}: decoded values differ"));
-            }
-        }
-        result.rows_compared += sink_rows;
-        if sink_meta.num_row_groups() != diag_meta.num_row_groups() {
-            result.mismatches.push(format!(
-                "{name}: row groups sink {} diagnostic {}",
-                sink_meta.num_row_groups(),
-                diag_meta.num_row_groups()
-            ));
-        }
-        for (index, (left, right)) in sink_meta
-            .row_groups()
-            .iter()
-            .zip(diag_meta.row_groups())
-            .enumerate()
-        {
-            result.row_groups_compared += 1;
-            if left.num_rows() != right.num_rows() {
-                result.mismatches.push(format!(
-                    "{name}: row group {index} rows sink {} diagnostic {}",
-                    left.num_rows(),
-                    right.num_rows()
-                ));
-            }
-            for (column, (a, b)) in left.columns().iter().zip(right.columns()).enumerate() {
-                result.column_chunks_compared += 1;
-                if a.compression() != b.compression() {
-                    result.mismatches.push(format!(
-                        "{name}: rg {index} column {column} codec {:?} vs {:?}",
-                        a.compression(),
-                        b.compression()
-                    ));
-                }
-                if a.statistics().is_some() != b.statistics().is_some() {
-                    result.mismatches.push(format!(
-                        "{name}: rg {index} column {column} statistics differ"
-                    ));
-                }
-                let dictionary = |c: &parquet::file::metadata::ColumnChunkMetaData| {
-                    c.encodings()
-                        .any(|e| matches!(e, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY))
-                };
-                if dictionary(a) != dictionary(b) {
-                    result.mismatches.push(format!(
-                        "{name}: rg {index} column {column} dictionary use differs"
-                    ));
-                }
-            }
-        }
-    }
-    std::fs::remove_dir_all(&root)?;
-    Ok(result)
 }
 
 /// Characters Criterion replaces when it turns a benchmark id into a
@@ -1324,22 +1146,10 @@ impl Stage {
             }
             StageName::Sink => {
                 let block = self.sealed_block()?;
-                let equivalence =
-                    sink_equivalence(&block, &self.cfg.lake, &self.runtime, &self.cfg.scratch_dir)?;
-                self.record_equivalence(&equivalence)?;
                 self.block = Some(block);
             }
             StageName::Encode => {
                 let block = self.sealed_block()?;
-                if self.compression == zstd() {
-                    let equivalence = sink_equivalence(
-                        &block,
-                        &self.cfg.lake,
-                        &self.runtime,
-                        &self.cfg.scratch_dir,
-                    )?;
-                    self.record_equivalence(&equivalence)?;
-                }
                 self.chunks = merged_tables(&block, &self.cfg.lake)?;
                 for (_, chunks) in &self.chunks {
                     let estimate = encode_chunks(chunks, &self.cfg.lake, self.compression)?.len();
@@ -1358,25 +1168,6 @@ impl Stage {
             }
             _ => {}
         }
-        Ok(())
-    }
-
-    fn record_equivalence(&mut self, equivalence: &Equivalence) -> Result<()> {
-        self.fixture_checks.push(Check::new(
-            "diagnostic_encoding_matches_sink",
-            equivalence.mismatches.is_empty() && equivalence.files_compared > 0,
-            format!(
-                "{} files, {} row groups, {} column chunks, {} rows compared; mismatches {:?}",
-                equivalence.files_compared,
-                equivalence.row_groups_compared,
-                equivalence.column_chunks_compared,
-                equivalence.rows_compared,
-                equivalence.mismatches
-            ),
-        ));
-        let _ = self
-            .fixture_extra
-            .insert("equivalence".into(), serde_json::to_value(equivalence)?);
         Ok(())
     }
 

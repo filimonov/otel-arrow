@@ -64,7 +64,8 @@ use parquet::arrow::ArrowWriter;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use super::stages::{BenchConfig, Input, Result, Signal, hex_digest, writer_properties, zstd};
+use super::stages::{BenchConfig, Input, Result, Signal, hex_digest, zstd};
+use otel_arrow_dfe_series_lake::sink::writer_properties;
 
 /// Accounted bytes of one request's stand-in acknowledgement token, as in
 /// the stage benches.
@@ -464,7 +465,8 @@ fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
         let started = Instant::now();
         let mut merged = merge_runs(runs, table.spec(), cfg.lake.sorting.merge_chunk_bytes)?;
         let build = started.elapsed();
-        let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(writer_properties(zstd())))?;
+        let mut writer =
+            ArrowWriter::try_new(Vec::new(), schema, Some(writer_properties(zstd()).build()))?;
         let (mut chunks, mut rows) = (0usize, 0usize);
         let (mut max_next, mut max_write, mut max_flush) =
             (Duration::ZERO, Duration::ZERO, Duration::ZERO);

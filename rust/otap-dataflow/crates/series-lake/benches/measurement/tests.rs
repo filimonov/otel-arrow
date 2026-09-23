@@ -20,11 +20,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{
     NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
 use otel_arrow_dfe_pdata::proto::opentelemetry::resource::v1::Resource;
-use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
-use otel_arrow_dfe_series_lake::buffer::Block;
-use otel_arrow_dfe_series_lake::cache::SeriesCache;
 use otel_arrow_dfe_series_lake::config::LakeConfig;
-use otel_arrow_dfe_series_lake::extract::extract;
 use prost::Message as _;
 
 use super::stages::{
@@ -226,65 +222,6 @@ fn fixture_inputs(root: &Path) -> Result<Vec<Input>> {
         stages::read_input(&logs_path)?,
         stages::read_input(&metrics_path)?,
     ])
-}
-
-/// A sealed block of one fixture, built through the production path.
-fn sealed(input: &Input, cfg: &LakeConfig) -> Result<Block> {
-    let mut cache = SeriesCache::new(1000);
-    let mut block = Block::new(WINDOW_START, 1, cfg.clone());
-    for bytes in &input.requests {
-        let wire = match input.sidecar.signal {
-            Signal::Logs => OtlpProtoBytes::ExportLogsRequest(bytes.clone()),
-            Signal::Metrics => OtlpProtoBytes::ExportMetricsRequest(bytes.clone()),
-        };
-        let payload: OtapPayload = wire.into();
-        let mut records: OtapArrowRecords = payload.try_into_with_default()?;
-        let extracted = extract(&mut records, cfg)?;
-        let reservation = block.reserve(&extracted, &mut cache, 0)?;
-        block.admit(extracted, reservation)?;
-    }
-    block.seal(SEAL_AT_US)?;
-    Ok(block)
-}
-
-// Scenario: the diagnostic encoder and the actual Sink encode the same
-// sealed logs and metrics blocks, with row groups small enough that the
-// byte-driven flush predicate cuts several of them.
-// Guarantees: decoded schema and values, row-group boundaries, per-column
-// compression, statistics and dictionary use agree with real Sink output,
-// so a sink change cannot silently leave the diagnostic encoder stale.
-fn diagnostic_encoding_matches_sink(root: &Path) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let cfg = lake_config();
-    for input in fixture_inputs(root)? {
-        let block = sealed(&input, &cfg)?;
-        let report = stages::sink_equivalence(&block, &cfg, &runtime, root)?;
-        ensure(
-            report.mismatches.is_empty(),
-            format!(
-                "diagnostic encoding differs from the sink: {:?}",
-                report.mismatches
-            ),
-        )?;
-        ensure(
-            report.files_compared == 2,
-            format!("{} files compared", report.files_compared),
-        )?;
-        ensure(
-            report.row_groups_compared > report.files_compared,
-            format!(
-                "only {} row groups in {} files: the flush predicate was never exercised",
-                report.row_groups_compared, report.files_compared
-            ),
-        )?;
-        ensure(
-            report.rows_compared == input.sidecar.records + input.sidecar.expected_series,
-            format!("{} rows compared", report.rows_compared),
-        )?;
-    }
-    Ok(())
 }
 
 // Scenario: every exported stage runs once on the logs and the metrics
@@ -850,7 +787,6 @@ pub fn run() -> Result<()> {
     stage_names_are_the_contract()?;
     input_file_round_trips(root)?;
     input_generation_is_excluded_from_timing()?;
-    diagnostic_encoding_matches_sink(root)?;
     stage_row_counts_are_exact(root)?;
     run_never_builds_its_own_setup(root)?;
     a_heavier_fixture_does_not_move_the_measurement(root)?;

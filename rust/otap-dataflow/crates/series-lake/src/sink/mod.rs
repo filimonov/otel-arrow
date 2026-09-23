@@ -10,7 +10,7 @@ mod tests;
 mod write;
 
 pub use naming::{FileNaming, object_path};
-pub use properties::native_sorting_columns;
+pub use properties::{compression, native_sorting_columns, row_group_full, writer_properties};
 use write::{FlushWorkspace, MergeKeys};
 
 use crate::config::LakeConfig;

@@ -6,7 +6,7 @@
 use super::Sink;
 
 use crate::buffer::SortedTableBuffer;
-use crate::config::{Nulls, SortOrder};
+use crate::config::{Nulls, ParquetConfig, SortOrder};
 use crate::error::Result;
 use crate::schema::{dataset_schema, schema_fingerprint};
 use crate::sort::SortSpec;
@@ -15,7 +15,38 @@ use arrow::datatypes::Int64Type;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowSchemaConverter;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::{KeyValue, SortingColumn};
+use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
+
+/// The codec every file is written with (FORMAT.md section 5).
+#[must_use]
+pub fn compression() -> Compression {
+    Compression::ZSTD(ZstdLevel::default())
+}
+
+/// The writer properties of every file, before its sorting columns and
+/// footer metadata.
+///
+/// Compression, page statistics and dictionary encoding are set explicitly
+/// (FORMAT.md section 5), and the row count limit is off, so
+/// [`row_group_full`] alone decides where a row group ends.
+#[must_use]
+pub fn writer_properties(compression: Compression) -> WriterPropertiesBuilder {
+    WriterProperties::builder()
+        .set_compression(compression)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_dictionary_enabled(true)
+        .set_max_row_group_row_count(None)
+}
+
+/// Whether the writer closes its row group now: its buffered memory reached
+/// `parquet.writer_limit_bytes`, or its in-progress row group
+/// `parquet.row_group_bytes`.
+#[must_use]
+pub fn row_group_full(cfg: &ParquetConfig, memory_size: usize, in_progress_size: usize) -> bool {
+    memory_size >= cfg.writer_limit_bytes || in_progress_size >= cfg.row_group_bytes
+}
 
 /// Window length assumed when the configured interval does not fit in `i64`.
 pub(super) const DEFAULT_WINDOW_SECS: i64 = 15;
