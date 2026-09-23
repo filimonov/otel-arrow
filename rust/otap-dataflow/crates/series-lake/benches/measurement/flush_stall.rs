@@ -13,9 +13,13 @@
 //!    of the input, converted, extracted and admitted through the production
 //!    path until the block refuses one as full or runs out of requests, then
 //!    sealed.
-//! 2. `Sink::write_block` of that block into an in-memory store, which is
-//!    always ready, so every stretch measured is CPU the flush spent without
-//!    yielding, never time spent waiting for the network.
+//! 2. `Sink::write_block` of that block into a local file store in the
+//!    configuration's scratch directory. That store does its file I/O on
+//!    the runtime's blocking pool, off the measured thread, and never waits
+//!    for a network, so every stretch measured is CPU the sink itself spent
+//!    without yielding. (An in-memory store would not do: completing a
+//!    multipart upload there copies the whole object into one buffer on the
+//!    calling thread, a stretch no real store has.)
 //! 3. Beside it, on the same current-thread runtime, a ticker task that
 //!    stands in for the node loop: it records the instant each time the
 //!    runtime schedules it, then yields. The longest gap between two ticks is
@@ -42,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt as _;
-use object_store::memory::InMemory;
+use object_store::local::LocalFileSystem;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake::buffer::Block;
@@ -113,9 +117,14 @@ pub struct CancelRun {
     pub fraction: f64,
     /// Signal instant, from the start of the write.
     pub signal_ns: u128,
-    /// When the ticker got to cancel the token, after the signal.
+    /// When the ticker got to cancel the token, after the signal: how long
+    /// the node loop would have waited to see it.
     pub ticker_delay_ns: u128,
-    /// From the signal to the write returning.
+    /// From the signal to the first poll of the write after the token was
+    /// cancelled, where the sink checks the token: when the flush observes
+    /// the signal.
+    pub observe_latency_ns: u128,
+    /// From the signal to the write returning, its abort included.
     pub latency_ns: u128,
     /// Whether the write returned cancelled; false when it finished first.
     pub cancelled: bool,
@@ -176,7 +185,10 @@ pub struct Report {
     pub cancels: Vec<CancelRun>,
     /// The longest gap over every uncancelled write.
     pub max_gap_ns: u128,
-    /// The longest cancellation latency over every cancelled write.
+    /// The longest time from a signal to the flush observing it.
+    pub max_observe_latency_ns: u128,
+    /// The longest cancellation latency, abort included, over every
+    /// cancelled write.
     pub max_cancel_latency_ns: u128,
     /// Files of the first uncancelled write.
     pub files: Vec<DumpedFile>,
@@ -251,6 +263,10 @@ struct PollTimer<F> {
     inner: Pin<Box<F>>,
     polls: Rc<Cell<usize>>,
     longest: Rc<Cell<Duration>>,
+    /// When the ticker cancelled the token, and the start of the first poll
+    /// after that.
+    cancelled_at: Rc<Cell<Option<Instant>>>,
+    observed_at: Rc<Cell<Option<Instant>>>,
 }
 
 impl<F: Future> Future for PollTimer<F> {
@@ -258,6 +274,9 @@ impl<F: Future> Future for PollTimer<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let started = Instant::now();
+        if self.cancelled_at.get().is_some() && self.observed_at.get().is_none() {
+            self.observed_at.set(Some(started));
+        }
         let out = self.inner.as_mut().poll(cx);
         let took = started.elapsed();
         self.polls.set(self.polls.get() + 1);
@@ -277,6 +296,7 @@ struct Observed {
     max_poll: Duration,
     max_workspace: Option<usize>,
     cancelled_at: Option<Instant>,
+    observed_at: Option<Instant>,
     started: Instant,
     returned: Instant,
     result: std::result::Result<(), String>,
@@ -345,6 +365,7 @@ fn write_once(
                 }
             })
         };
+        let observed_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
         let polls = Rc::new(Cell::new(0));
         let longest = Rc::new(Cell::new(Duration::ZERO));
         let cpu = cpu_time::ProcessTime::now();
@@ -352,6 +373,8 @@ fn write_once(
             inner: Box::pin(sink.write_block(block, &cancel)),
             polls: Rc::clone(&polls),
             longest: Rc::clone(&longest),
+            cancelled_at: Rc::clone(&cancelled_at),
+            observed_at: Rc::clone(&observed_at),
         };
         let result = write.await;
         let returned = Instant::now();
@@ -367,6 +390,7 @@ fn write_once(
             max_poll: longest.get(),
             max_workspace: max_workspace.get(),
             cancelled_at: cancelled_at.get(),
+            observed_at: observed_at.get(),
             started,
             returned,
             result: result.map(|_report| ()).map_err(|e| e.to_string()),
@@ -462,14 +486,25 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
         .build()?;
     let mut writes = Vec::new();
     let mut files = Vec::new();
+    let scratch = cfg
+        .scratch_dir
+        .join(format!("flush-stall-{}", std::process::id()));
+    let fresh_store = |name: String| -> Result<(Arc<dyn ObjectStore>, PathBuf)> {
+        let dir = scratch.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&dir)?);
+        Ok((store, dir))
+    };
     for index in 0..args.writes.max(1) {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (store, dir) = fresh_store(format!("write-{index}"))?;
         let observed = write_once(&runtime, &block, cfg, Arc::clone(&store), None);
         observed
             .result
             .clone()
             .map_err(|e| format!("uncancelled write failed: {e}"))?;
         if index == 0 {
+            // Every file name carries the fixed identity, so a listing is the
+            // whole write.
             for (path, data) in objects(&runtime, &store)? {
                 if let Some(dir) = &args.dump {
                     let target = dir.join(&path);
@@ -485,6 +520,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
                 });
             }
         }
+        std::fs::remove_dir_all(&dir)?;
         let mut sorted = observed.gaps.clone();
         sorted.sort();
         let gaps_at_least = GAP_THRESHOLDS_MS
@@ -517,8 +553,9 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
     for index in 0..args.cancels {
         let fraction = (index as f64 + 0.5) / args.cancels as f64;
         let signal_after = median_wall.mul_f64(fraction);
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (store, dir) = fresh_store(format!("cancel-{index}"))?;
         let observed = write_once(&runtime, &block, cfg, store, Some(signal_after));
+        std::fs::remove_dir_all(&dir)?;
         let signal = observed.started + signal_after;
         let cancelled = observed.result.is_err();
         if let Err(error) = &observed.result
@@ -532,6 +569,9 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
             ticker_delay_ns: observed
                 .cancelled_at
                 .map_or(0, |at| at.saturating_duration_since(signal).as_nanos()),
+            observe_latency_ns: observed
+                .observed_at
+                .map_or(0, |at| at.saturating_duration_since(signal).as_nanos()),
             latency_ns: observed
                 .returned
                 .saturating_duration_since(signal)
@@ -539,7 +579,14 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
             cancelled,
         });
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     let max_gap_ns = writes.iter().map(|w| w.max_gap_ns).max().unwrap_or(0);
+    let max_observe_latency_ns = cancels
+        .iter()
+        .filter(|c| c.cancelled)
+        .map(|c| c.observe_latency_ns)
+        .max()
+        .unwrap_or(0);
     let max_cancel_latency_ns = cancels
         .iter()
         .filter(|c| c.cancelled)
@@ -554,6 +601,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
         writes,
         cancels,
         max_gap_ns,
+        max_observe_latency_ns,
         max_cancel_latency_ns,
         files,
         phases: phases(&block, cfg)?,
