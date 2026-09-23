@@ -223,8 +223,8 @@ pub struct SignalConfig {
     /// Sort keys for the values datasets.
     #[serde(default = "default_values_sort")]
     pub values_sort: Vec<SortKey>,
-    /// What happens to exemplars (metrics only); see
-    /// [`LakeConfig::exemplar_policy`]. Unset unless the document sets it.
+    /// What happens to exemplars (metrics only); unset means drop. See
+    /// [`LakeConfig::exemplar_policy`].
     #[serde(default)]
     pub exemplars: Option<ExemplarPolicy>,
 }
@@ -438,19 +438,14 @@ pub const PARTITION_KEYS: [&str; 5] = ["v", "signal", "dataset", "date", "hour"]
 impl LakeConfig {
     /// What happens to the exemplars of a stored point.
     ///
-    /// The stricter of the two policies: `unsupported: reject` rejects
-    /// exemplars too, `metrics.exemplars: reject` rejects them under
-    /// `unsupported: drop`, and otherwise they are dropped and counted.
-    /// Exemplars of a point that `unsupported: drop` discards go with that
-    /// point whatever this says.
+    /// `metrics.exemplars` alone decides, and an unset one means drop,
+    /// whatever `unsupported` says: most SDKs attach exemplars by default,
+    /// so refusing them unless asked would refuse a large share of real
+    /// metrics. Exemplars of a point that `unsupported: drop` discards go
+    /// with that point whatever this says.
     #[must_use]
     pub fn exemplar_policy(&self) -> ExemplarPolicy {
-        match (self.unsupported, self.metrics.exemplars) {
-            (UnsupportedPolicy::Reject, _) | (_, Some(ExemplarPolicy::Reject)) => {
-                ExemplarPolicy::Reject
-            }
-            (UnsupportedPolicy::Drop, _) => ExemplarPolicy::Drop,
-        }
+        self.metrics.exemplars.unwrap_or(ExemplarPolicy::Drop)
     }
 
     /// The fixed bytes a block charges per series row, pending entry
@@ -518,14 +513,6 @@ impl LakeConfig {
             return Err(Error::invalid(
                 "logs.exemplars is not a setting: log records carry no exemplars; set \
                  metrics.exemplars",
-            ));
-        }
-        if self.metrics.exemplars == Some(ExemplarPolicy::Drop)
-            && self.unsupported == UnsupportedPolicy::Reject
-        {
-            return Err(Error::invalid(
-                "metrics.exemplars: drop cannot be combined with unsupported: reject, which \
-                 rejects exemplars too; set unsupported: drop to drop exemplars",
             ));
         }
         if !self.metrics.series_attributes.is_empty() {
@@ -797,63 +784,40 @@ mod tests {
         assert!(err.to_string().contains("concurrency"));
     }
 
-    /// Scenario: every combination of `unsupported` and `metrics.exemplars`
-    /// the configuration accepts, the latter unset or set.
-    /// Guarantees: exemplars are rejected whenever either policy says reject
-    /// and dropped otherwise, so `unsupported: reject` rejects exemplars too
-    /// and an unset `metrics.exemplars` drops them under `unsupported: drop`.
+    /// Scenario: every combination of `unsupported` and `metrics.exemplars`,
+    /// the latter unset or set.
+    /// Guarantees: every combination is valid, and `metrics.exemplars` alone
+    /// decides: exemplars are dropped when it is unset or `drop`, whatever
+    /// `unsupported` says, and rejected only when it is `reject`.
     #[test]
-    fn the_exemplar_policy_is_the_stricter_of_the_two() {
-        for (unsupported, exemplars, expected) in [
-            (UnsupportedPolicy::Reject, None, ExemplarPolicy::Reject),
-            (
-                UnsupportedPolicy::Reject,
-                Some(ExemplarPolicy::Reject),
-                ExemplarPolicy::Reject,
-            ),
-            (UnsupportedPolicy::Drop, None, ExemplarPolicy::Drop),
-            (
-                UnsupportedPolicy::Drop,
-                Some(ExemplarPolicy::Drop),
-                ExemplarPolicy::Drop,
-            ),
-            (
-                UnsupportedPolicy::Drop,
-                Some(ExemplarPolicy::Reject),
-                ExemplarPolicy::Reject,
-            ),
-        ] {
-            let mut cfg = LakeConfig {
-                unsupported,
-                ..LakeConfig::default()
-            };
-            cfg.metrics.exemplars = exemplars;
-            cfg.validate().expect("a valid combination");
-            assert_eq!(
-                cfg.exemplar_policy(),
-                expected,
-                "{unsupported:?} / {exemplars:?}"
-            );
+    fn metrics_exemplars_alone_decides_and_defaults_to_drop() {
+        for unsupported in [UnsupportedPolicy::Reject, UnsupportedPolicy::Drop] {
+            for (exemplars, expected) in [
+                (None, ExemplarPolicy::Drop),
+                (Some(ExemplarPolicy::Drop), ExemplarPolicy::Drop),
+                (Some(ExemplarPolicy::Reject), ExemplarPolicy::Reject),
+            ] {
+                let mut cfg = LakeConfig {
+                    unsupported,
+                    ..LakeConfig::default()
+                };
+                cfg.metrics.exemplars = exemplars;
+                cfg.validate().expect("a valid combination");
+                assert_eq!(
+                    cfg.exemplar_policy(),
+                    expected,
+                    "{unsupported:?} / {exemplars:?}"
+                );
+            }
         }
     }
 
-    /// Scenario: `metrics.exemplars: drop` written beside `unsupported:
-    /// reject`, and `logs.exemplars` written at all.
-    /// Guarantees: both are refused at startup with a sentence naming the
-    /// settings, rather than one setting silently overriding the other or a
-    /// setting no log record can use being accepted.
+    /// Scenario: `logs.exemplars` written at all.
+    /// Guarantees: it is refused at startup with a sentence naming the
+    /// setting, because no log record carries exemplars.
     #[test]
-    fn contradictory_or_meaningless_exemplar_settings_are_refused() {
+    fn logs_exemplars_is_refused() {
         let mut cfg = LakeConfig::default();
-        cfg.metrics.exemplars = Some(ExemplarPolicy::Drop);
-        let err = cfg.validate().expect_err("drop under unsupported: reject");
-        let text = err.to_string();
-        assert!(text.contains("metrics.exemplars: drop"), "{text}");
-        assert!(text.contains("unsupported: reject"), "{text}");
-        let mut cfg = LakeConfig {
-            unsupported: UnsupportedPolicy::Drop,
-            ..LakeConfig::default()
-        };
         cfg.logs.exemplars = Some(ExemplarPolicy::Drop);
         let err = cfg.validate().expect_err("logs carry no exemplars");
         assert!(err.to_string().contains("logs.exemplars"), "{err}");

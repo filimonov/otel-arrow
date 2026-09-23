@@ -116,39 +116,33 @@ fn a_block_budget_written_under_ingress_is_refused() {
 }
 
 /// Scenario: the exemplar policy in a user document: `metrics.exemplars:
-/// reject` beside `unsupported: drop`, `metrics.exemplars: drop` beside the
-/// default `unsupported: reject`, and `logs.exemplars`.
-/// Guarantees: the first is accepted and rejects exemplars; the other two
-/// are refused at startup naming the setting, so no document can ask to
-/// drop exemplars while `unsupported: reject` rejects them, or configure a
-/// policy for log records, which carry none.
+/// drop` beside the default `unsupported: reject`, `metrics.exemplars:
+/// reject`, and `logs.exemplars`.
+/// Guarantees: the first two are accepted and mean what they say; the
+/// third is refused at startup naming the setting, because log records
+/// carry no exemplars.
 #[test]
 fn the_exemplar_policy_is_validated_at_startup() {
-    let cfg = serde_json::from_value::<Config>(serde_json::json!({
-        "storage": {"file": {"base_uri": "/tmp/series-test"}},
-        "unsupported": "drop",
-        "metrics": {"exemplars": "reject"}
-    }))
-    .expect("valid");
-    assert_eq!(
-        cfg.lake.exemplar_policy(),
-        lake::config::ExemplarPolicy::Reject
-    );
-    for (document, setting) in [
-        (
-            serde_json::json!({"metrics": {"exemplars": "drop"}}),
-            "metrics.exemplars: drop",
-        ),
-        (
-            serde_json::json!({"unsupported": "drop", "logs": {"exemplars": "drop"}}),
-            "logs.exemplars",
-        ),
+    for (exemplars, expected) in [
+        ("drop", lake::config::ExemplarPolicy::Drop),
+        ("reject", lake::config::ExemplarPolicy::Reject),
     ] {
-        let mut document = document;
-        document["storage"] = serde_json::json!({"file": {"base_uri": "/tmp/series-test"}});
-        let err = serde_json::from_value::<Config>(document).expect_err("refused");
-        assert!(err.to_string().contains(setting), "unexpected error: {err}");
+        let cfg = serde_json::from_value::<Config>(serde_json::json!({
+            "storage": {"file": {"base_uri": "/tmp/series-test"}},
+            "metrics": {"exemplars": exemplars}
+        }))
+        .expect("valid");
+        assert_eq!(cfg.lake.exemplar_policy(), expected, "{exemplars}");
     }
+    let err = serde_json::from_value::<Config>(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-test"}},
+        "logs": {"exemplars": "drop"}
+    }))
+    .expect_err("refused");
+    assert!(
+        err.to_string().contains("logs.exemplars"),
+        "unexpected error: {err}"
+    );
 }
 
 /// Scenario: `parquet.compression` names a codec the sink does not write.
@@ -6036,49 +6030,30 @@ async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
 }
 
 /// Scenario: a metrics request whose gauge point carries an exemplar
-/// arrives under the default `unsupported: reject`, and again under
-/// `unsupported: drop` with telemetry registered.
-/// Guarantees: under reject the request is refused as a permanent
-/// `unsupported` nack whose reason names exemplars and says how to keep the
-/// points, and nothing enters the block; under drop the point is admitted
-/// and the exemplar is counted in `dropped.exemplars{signal=metrics}`.
+/// arrives under the default configuration (`unsupported: reject`,
+/// `metrics.exemplars` unset) with telemetry registered, and again under an
+/// explicit `metrics.exemplars: reject`.
+/// Guarantees: by default the point is admitted and the exemplar is counted
+/// in `dropped.exemplars{signal=metrics}`; under the explicit reject the
+/// request is refused as a permanent `unsupported` nack whose reason names
+/// exemplars and the setting that keeps the points, and nothing enters the
+/// block.
 #[tokio::test(flavor = "current_thread")]
-async fn an_exemplar_is_refused_by_name_or_dropped_and_counted() {
+async fn an_exemplar_is_dropped_and_counted_by_default_and_refused_when_asked() {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (handler, mut rx) = effects(4);
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(
-                worker_config(),
-                Arc::new(object_store::memory::InMemory::new()),
-                Arc::clone(&wall) as _,
-                handler,
-            );
-            worker.admit(exemplar_metrics_pdata());
-            assert!(worker.active.data.is_empty(), "nothing was admitted");
-            assert!(worker.notify.next().await.is_ok());
-            match rx.recv().await.expect("a refusal") {
-                PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert!(nack.permanent);
-                    assert_eq!(nack.cause, NackCause::Refused);
-                    assert!(nack.reason.contains("exemplars"), "reason: {}", nack.reason);
-                    assert!(
-                        nack.reason.contains("unsupported: drop"),
-                        "reason: {}",
-                        nack.reason
-                    );
-                }
-                other => panic!("expected an exemplar refusal, got {other:?}"),
-            }
-
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let (handler, _rx) = effects(4);
-            let mut cfg = worker_config();
-            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Drop;
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let cfg = worker_config();
+            assert_eq!(
+                cfg.lake.unsupported,
+                lake::config::UnsupportedPolicy::Reject
+            );
             let mut worker = Worker::new(
                 cfg,
                 Arc::new(object_store::memory::InMemory::new()),
-                wall,
+                Arc::clone(&wall) as _,
                 handler,
             );
             worker.metrics = Some(super::metrics::Metrics::register(
@@ -6098,6 +6073,32 @@ async fn an_exemplar_is_refused_by_name_or_dropped_and_counted() {
                     .get(),
                 1
             );
+
+            let (handler, mut rx) = effects(4);
+            let mut cfg = worker_config();
+            cfg.lake.metrics.exemplars = Some(lake::config::ExemplarPolicy::Reject);
+            let mut worker = Worker::new(
+                cfg,
+                Arc::new(object_store::memory::InMemory::new()),
+                wall,
+                handler,
+            );
+            worker.admit(exemplar_metrics_pdata());
+            assert!(worker.active.data.is_empty(), "nothing was admitted");
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert!(nack.reason.contains("exemplars"), "reason: {}", nack.reason);
+                    assert!(
+                        nack.reason.contains("metrics.exemplars: drop"),
+                        "reason: {}",
+                        nack.reason
+                    );
+                }
+                other => panic!("expected an exemplar refusal, got {other:?}"),
+            }
         })
         .await;
 }

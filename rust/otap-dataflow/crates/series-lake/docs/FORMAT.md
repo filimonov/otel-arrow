@@ -322,13 +322,13 @@ An empty attribute list is an empty map, never null.
 
 Unsupported inputs in v1 and their policy:
 
-- Exemplars (children of supported points) are never stored. Under
-  `unsupported: reject`, or under `unsupported: drop` with
-  `metrics.exemplars: reject`, a request whose stored points carry any is
-  refused whole (`nacks{error.type=unsupported}`, a reason naming
-  exemplars). Otherwise the parent point is kept and `dropped.exemplars`
-  counts the exemplars. An exemplar of a point `unsupported: drop` discards
-  goes with its point and is counted.
+- Exemplars (children of supported points) are never stored.
+  `metrics.exemplars` alone decides, whatever `unsupported` says: `drop`,
+  the default, keeps the parent point and `dropped.exemplars` counts the
+  exemplars; `reject` refuses whole a request whose stored points carry
+  any (`nacks{error.type=unsupported}`, a reason naming exemplars). An
+  exemplar of a point `unsupported: drop` discards goes with its point and
+  is counted.
 - Exponential histogram and summary points: `unsupported: reject` (default)
   nacks the whole request with `NackCause::Refused`,
   `nacks{error.type=unsupported}`; `unsupported: drop` drops those points,

@@ -8,7 +8,7 @@ change_type: enhancement
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: "`exporter:series_parquet` gains `metrics.exemplars: drop | reject`; `unsupported: reject` now refuses requests carrying exemplars, and dropped exemplars are counted in `dropped.exemplars`."
+note: "`exporter:series_parquet` gains `metrics.exemplars: drop | reject` (default drop), and dropped exemplars are counted in `dropped.exemplars` instead of `dropped.unsupported`."
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Exemplars were always dropped. Under the default `unsupported: reject` a
-  request whose points carry them is now refused, naming exemplars; set
-  `unsupported: drop` to keep the points. `dropped.unsupported` loses its
-  `exemplar` kind. The README lists everything the exporter does not keep.
+  Exemplars are still dropped by default, whatever `unsupported` says;
+  `metrics.exemplars: reject` refuses a request that carries them, naming
+  exemplars. `dropped.unsupported` loses its `exemplar` kind. The README
+  lists everything the exporter does not keep.

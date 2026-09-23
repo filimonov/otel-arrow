@@ -299,7 +299,7 @@ silently writing zstd.
 | `parquet.writer_limit_bytes` | 96MiB |
 | `notify_batch` | 64 |
 | `unsupported` | reject |
-| `metrics.exemplars` | drop (applies under `unsupported: drop` only) |
+| `metrics.exemplars` | drop |
 | `writer_id` | `writer` |
 | `producer_id_attribute` | `host.id` |
 
@@ -1199,7 +1199,7 @@ where it cannot.
 | --- | --- | --- |
 | Traces | Nothing: the request is refused. | `nacks{error.type=unsupported}` |
 | Exponential histogram and summary points | Nothing under `unsupported: reject`: the request is refused. Under `drop`, the request's other points. | `nacks{error.type=unsupported}`, or `dropped.unsupported{kind}` per point |
-| Exemplars, with their filtered attributes, trace and span ids | Nothing under `unsupported: reject` or `metrics.exemplars: reject`: the request is refused with a reason naming exemplars. Otherwise the point, without its exemplars. | `nacks{error.type=unsupported}`, or `dropped.exemplars{signal=metrics}` per exemplar |
+| Exemplars, with their filtered attributes, trace and span ids | By default the point, without its exemplars. Under an explicit `metrics.exemplars: reject`, nothing: the request is refused with a reason naming exemplars. | `dropped.exemplars{signal=metrics}` per exemplar, or `nacks{error.type=unsupported}` |
 | Attribute value types in the `attrs`, `resource_attrs` and `scope_attrs` maps | Every value rendered to a string by `render_v1`, so `"42"` and `42` read the same. Identity attributes keep their types in `identity_bytes` and `series_id`, and a typed denormalized column keeps one. Log record attributes outside `logs.series_attributes` keep none. | Documented, by format decision; no counter |
 | The type of a log body that is not a string | The body rendered to JSON text, so a string body `"42"` and an integer body `42` read the same; a bytes body is a quoted base64 string. | Documented; no counter |
 | An optional metrics value, such as a histogram `sum`, `min` or `max`, that is exactly zero in every point of a request | Null. The OTAP transport omits a column whose every entry in a request is the type default, so that zero cannot be told apart from an absent value. | Documented; no counter |
@@ -1222,14 +1222,14 @@ alone, before any conversion. Points of an unsupported kind, namely
 exponential histograms and summaries, are rejected by default;
 `unsupported: drop` drops those points instead and counts them in
 `dropped.unsupported`. The policy decides the whole request atomically.
-No dataset stores exemplars. Under `unsupported: reject` a request whose
-stored points carry exemplars is refused too, with a reason naming
-exemplars. Under `unsupported: drop`, `metrics.exemplars` decides: `drop`
-(the default) keeps the points and counts the exemplars in
-`dropped.exemplars`, and `reject` refuses the request. `metrics.exemplars:
-drop` beside `unsupported: reject` is refused at startup, and so is
-`logs.exemplars`. An exemplar of a point that `unsupported: drop` discards
-goes with that point and is counted. A request that extracts no rows at
+No dataset stores exemplars, and `metrics.exemplars` alone decides what
+happens to them, whatever `unsupported` says. `drop`, the default, keeps the
+points and counts the exemplars in `dropped.exemplars`: most SDKs attach
+exemplars by default, so refusing them would refuse a large share of real
+metrics. `reject` refuses a request whose stored points carry exemplars,
+with a reason naming exemplars. `logs.exemplars` is refused at startup,
+because log records carry none. An exemplar of a point that
+`unsupported: drop` discards goes with that point and is counted. A request that extracts no rows at
 all is acknowledged immediately without opening a file; a request that mixes
 supported and dropped rows waits for its block to commit.
 
