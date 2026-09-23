@@ -74,6 +74,14 @@ jobs:
         run: |
           python3 -m venv /tmp/series-parquet-venv
           /tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
+      # The independent Python generator must reproduce every checked-in
+      # golden file byte for byte, so a golden edited by hand, or a generator
+      # change without regenerated goldens, fails here.
+      - name: Golden vectors regenerate unchanged
+        run: |
+          out="$(mktemp -d)"
+          /tmp/series-parquet-venv/bin/python3 crates/series-lake/tools/gen_golden.py "$out"
+          diff -ru crates/series-lake/tests/golden "$out"
       - name: Build the real engine
         run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
       - name: Require MinIO and RustFS, Alloy, DuckDB and ClickHouse
