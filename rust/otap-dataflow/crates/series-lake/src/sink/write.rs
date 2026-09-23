@@ -565,6 +565,104 @@ impl Sink {
         }
     }
 
+    /// Return to the runtime, then report a cancellation seen on the way back.
+    async fn checkpoint(
+        &self,
+        cancel: &CancellationToken,
+        cleanup: &mut Option<Instant>,
+    ) -> Result<()> {
+        tokio::task::yield_now().await;
+        if cancel.is_cancelled() {
+            return Err(self.cancelled_here(cleanup));
+        }
+        Ok(())
+    }
+
+    /// Merge a table's runs and hand every chunk to `writer`; returns the
+    /// rows written.
+    ///
+    /// The write is a sequence of bounded steps with a [`Sink::checkpoint`]
+    /// between every two of them, because the table's task shares its thread
+    /// with the node loop that admits requests, delivers acks and nacks,
+    /// answers telemetry and watches the shutdown deadline. Nothing about the
+    /// steps reaches the file: the chunks, their order and the writer calls
+    /// are the same as an unsliced write makes. `AsyncArrowWriter::write`
+    /// usually completes synchronously, and so does a buffered upload whose
+    /// store is ready, so every checkpoint yields explicitly.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_chunks(
+        &self,
+        mut build: MergeBuild,
+        writer: &mut AsyncArrowWriter<LedgeredWriter>,
+        watch: &CreationWatch,
+        keys: &MergeKeysHeld<'_>,
+        workspace: &FlushWorkspaceHeld<'_>,
+        cancel: &CancellationToken,
+        cleanup: &mut Option<Instant>,
+    ) -> Result<usize> {
+        // Step 1: encode the merge keys, one bounded slice at a time.
+        while !build.step()? {
+            keys.set(build.resident_key_bytes());
+            self.checkpoint(cancel, cleanup).await?;
+        }
+        let mut merge = build.finish()?;
+        keys.set(merge.resident_key_bytes());
+        // Step 2: produce, encode and flush the chunks, one bounded step at a
+        // time.
+        let mut rows = 0usize;
+        loop {
+            self.checkpoint(cancel, cleanup).await?;
+            let chunk = match merge.step() {
+                MergeStep::Done => break,
+                MergeStep::Progress => {
+                    workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+                    continue;
+                }
+                MergeStep::Chunk(c) => c,
+                MergeStep::Ready => {
+                    // Build the chunk's columns in bounded steps of their
+                    // own, returning to the runtime between every two.
+                    let chunk = {
+                        let mut builder = merge.chunk_builder();
+                        loop {
+                            if builder.step()? {
+                                break builder.finish()?;
+                            }
+                            workspace.set(
+                                merge.chunk_workspace_bytes() + builder.workspace_bytes(),
+                                writer.memory_size(),
+                            );
+                            self.checkpoint(cancel, cleanup).await?;
+                        }
+                    };
+                    merge.chunk_taken();
+                    chunk
+                }
+            };
+            workspace.set(chunk_charge(&merge, &chunk), writer.memory_size());
+            // Encoding one chunk is a stretch of its own, bounded by
+            // `merge_chunk_bytes`, so it gets a checkpoint of its own.
+            self.checkpoint(cancel, cleanup).await?;
+            self.step(writer.write(&chunk), watch, cancel, cleanup)
+                .await?;
+            rows += chunk.num_rows();
+            drop(chunk);
+            workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+            if row_group_full(
+                &self.cfg.parquet,
+                writer.memory_size(),
+                writer.in_progress_size(),
+            ) {
+                // Closing a row group is the other stretch, bounded by
+                // `row_group_bytes`.
+                self.checkpoint(cancel, cleanup).await?;
+                self.step(writer.flush(), watch, cancel, cleanup).await?;
+                workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
+            }
+        }
+        Ok(rows)
+    }
+
     pub(super) async fn write_table(
         &self,
         table: &SortedTableBuffer,
@@ -613,151 +711,33 @@ impl Sink {
 
         // Phase 1: the writer is writable. Every await races the token, and every
         // failure aborts the multipart upload.
-        let mut rows = 0usize;
-        let mut failure: Option<Error> = None;
-        let mut cleanup: Option<Instant> = None;
-        // The whole write is a sequence of bounded steps with a return to the
-        // runtime and a cancellation check between every two of them. The
-        // table's task shares its thread with the node loop that admits
-        // requests, delivers acks and nacks, answers telemetry and watches the
-        // shutdown deadline, so a step is the longest that loop can be kept
-        // waiting. Nothing about the steps reaches the file: the chunks, their
-        // order and the writer calls are the same as an unsliced write makes.
-        //
-        // `AsyncArrowWriter::write` usually completes synchronously, and so
-        // does a buffered upload whose store is ready, which is why every
-        // step yields explicitly rather than relying on the store to suspend.
-        let mut build = MergeBuild::new(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
+        let build = MergeBuild::new(runs, table.spec(), self.cfg.sorting.merge_chunk_bytes)?;
         // Held until this function returns, which is when the keys are
         // dropped. Raised as the keys are encoded, then set once to the
         // merge's bound for its whole life, so no later chunk is
         // under-charged.
         let keys = self.merge_keys.hold(0);
-        // Step 1: encode the merge keys, one bounded slice at a time.
-        loop {
-            match build.step() {
-                Ok(true) => break,
-                Ok(false) => keys.set(build.resident_key_bytes()),
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-            if cancel.is_cancelled() {
-                failure = Some(self.cancelled_here(&mut cleanup));
-                break;
-            }
-        }
-        let mut merged = match failure {
-            Some(_) => None,
-            None => match build.finish() {
-                Ok(merged) => Some(merged),
-                Err(e) => {
-                    failure = Some(e);
-                    None
-                }
-            },
-        };
-        if let Some(merged) = &merged {
-            keys.set(merged.resident_key_bytes());
-        }
-        // Step 2: produce, encode and flush the chunks, one bounded step at a
-        // time.
-        while let Some(merge) = merged.as_mut() {
-            tokio::task::yield_now().await;
-            if cancel.is_cancelled() {
-                failure = Some(self.cancelled_here(&mut cleanup));
-                break;
-            }
-            let chunk = match merge.step() {
-                MergeStep::Done => break,
-                MergeStep::Progress => {
-                    workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
-                    continue;
-                }
-                MergeStep::Chunk(c) => c,
-                MergeStep::Ready => {
-                    // Build the chunk's columns in bounded steps of their
-                    // own, returning to the runtime between every two.
-                    let built = {
-                        let mut builder = merge.chunk_builder();
-                        loop {
-                            match builder.step() {
-                                Ok(true) => break builder.finish(),
-                                Ok(false) => {}
-                                Err(e) => break Err(e),
-                            }
-                            workspace.set(
-                                merge.chunk_workspace_bytes() + builder.workspace_bytes(),
-                                writer.memory_size(),
-                            );
-                            tokio::task::yield_now().await;
-                            if cancel.is_cancelled() {
-                                break Err(self.cancelled_here(&mut cleanup));
-                            }
-                        }
-                    };
-                    match built {
-                        Ok(chunk) => {
-                            merge.chunk_taken();
-                            chunk
-                        }
-                        Err(e) => {
-                            failure = Some(e);
-                            break;
-                        }
-                    }
-                }
-            };
-            workspace.set(chunk_charge(merge, &chunk), writer.memory_size());
-            // Encoding one chunk is a stretch of its own, bounded by
-            // `merge_chunk_bytes`; it does not follow the step that produced
-            // the chunk without a return to the runtime in between.
-            tokio::task::yield_now().await;
-            if cancel.is_cancelled() {
-                failure = Some(self.cancelled_here(&mut cleanup));
-                break;
-            }
-            let step = self
-                .step(writer.write(&chunk), &watch, cancel, &mut cleanup)
-                .await;
-            if let Err(e) = step {
-                failure = Some(e);
-                break;
-            }
-            rows += chunk.num_rows();
-            drop(chunk);
-            workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
-            if row_group_full(
-                &self.cfg.parquet,
-                writer.memory_size(),
-                writer.in_progress_size(),
-            ) {
-                // Closing a row group is the other stretch, bounded by
-                // `row_group_bytes`, and it too runs in a poll of its own.
-                tokio::task::yield_now().await;
-                if cancel.is_cancelled() {
-                    failure = Some(self.cancelled_here(&mut cleanup));
-                    break;
-                }
-                let step = self
-                    .step(writer.flush(), &watch, cancel, &mut cleanup)
-                    .await;
-                if let Err(e) = step {
-                    failure = Some(e);
-                    break;
-                }
-                workspace.set(merge.chunk_workspace_bytes(), writer.memory_size());
-            }
-        }
-        drop(merged);
+        let mut cleanup: Option<Instant> = None;
+        let written = self
+            .write_chunks(
+                build,
+                &mut writer,
+                &watch,
+                &keys,
+                &workspace,
+                cancel,
+                &mut cleanup,
+            )
+            .await;
         workspace.set(0, writer.memory_size());
-        if let Some(cause) = failure {
-            let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
-            let abort_error = self.abort_upload(writer, deadline).await;
-            return Err(Self::with_abort(cause, abort_error));
-        }
+        let rows = match written {
+            Ok(rows) => rows,
+            Err(cause) => {
+                let deadline = cleanup.unwrap_or_else(|| self.cleanup_deadline());
+                let abort_error = self.abort_upload(writer, deadline).await;
+                return Err(Self::with_abort(cause, abort_error));
+            }
+        };
         if cancel.is_cancelled() {
             let abort_error = self.abort_upload(writer, self.cleanup_deadline()).await;
             return Err(Error::cancelled(abort_error));
