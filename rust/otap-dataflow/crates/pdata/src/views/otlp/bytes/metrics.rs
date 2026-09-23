@@ -37,8 +37,9 @@ use crate::schema::{SpanId, TraceId};
 use crate::views::otlp::bytes::common::{KeyValueIter, RawInstrumentationScope, RawKeyValue};
 use crate::views::otlp::bytes::decode::{
     FieldRanges, ProtoBytesParser, RepeatedFieldEncodings, RepeatedFieldProtoBytesParser,
-    RepeatedFixed64Iter, RepeatedVarintIter, decode_sint32, from_option_nonzero_range_to_primitive,
-    read_len_delim, read_varint, to_nonzero_range, validate_message_wire_format,
+    RepeatedFixed64Iter, RepeatedVarintIter, decode_sint32, field_range,
+    from_option_nonzero_range_to_primitive, read_len_delim, read_varint, to_nonzero_range,
+    validate_message_wire_format,
 };
 use crate::views::otlp::bytes::resource::RawResource;
 use otel_arrow_dfe_pdata_views::views::common::Str;
@@ -1060,6 +1061,10 @@ impl<'a> Iterator for ResourceMetricsIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
+            // Step over any other field -- unknown, or known with another wire
+            // type -- so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None

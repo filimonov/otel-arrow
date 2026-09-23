@@ -109,7 +109,8 @@ impl OtlpProtoBytes {
         self.as_bytes().len()
     }
 
-    /// Validate the top-level protobuf wire framing of the request body.
+    /// Validate the protobuf wire framing of the request body and of every
+    /// message nested in it.
     ///
     /// The byte views and the conversion to OTAP records read the body
     /// lazily and report no error for a damaged one: a truncated or corrupt
@@ -117,16 +118,37 @@ impl OtlpProtoBytes {
     /// exporter that must not acknowledge such a request as delivered calls
     /// this first.
     ///
-    /// Cost: one linear walk of the body with no allocation. Every field tag
-    /// is decoded and every length-delimited or fixed-width field is
-    /// bounds-checked against the end of the body; nested messages are not
-    /// decoded, so corruption inside a submessage is not detected here.
+    /// The walk follows the OTLP logs, metrics or traces schema into every
+    /// length-delimited field it defines as a sub-message, down to data
+    /// points, exemplars and `AnyValue` arrays and key-value lists, and checks
+    /// each nested message's framing as the top level is checked, as prost
+    /// would: a varint that overflows `u64`, a known field with the wrong
+    /// wire type, a `string` field that is not UTF-8, or a packed field that
+    /// is not a whole number of elements is refused, and so is a singular
+    /// field or oneof that occurs twice in one message (outside `AnyValue`),
+    /// which the byte views would read differently from prost; an unknown field,
+    /// including a balanced group, is framed and skipped. See
+    /// [`crate::views::otlp::bytes::validate`].
+    ///
+    /// Cost: one linear walk of the body with no allocation; each byte is
+    /// read once, by the innermost message holding it.
     ///
     /// # Errors
-    /// [`crate::error::Error::InvalidProtobufWireFormat`] when the framing is
-    /// broken.
+    /// [`crate::error::Error::InvalidOtlpWireFormat`], naming the problem, the
+    /// innermost message holding it and its byte offset, when the framing is
+    /// broken; [`crate::error::Error::OtlpNestingTooDeep`] when `AnyValue`
+    /// values nest deeper than
+    /// [`crate::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH`];
+    /// [`crate::error::Error::DuplicateOtlpField`] naming the message and the
+    /// field that occurs twice.
     pub fn validate_framing(&self) -> Result<()> {
-        crate::views::otlp::bytes::decode::validate_message_wire_format(self.as_bytes())
+        use crate::views::otlp::bytes::validate::{Message, validate_request};
+        let root = match self {
+            OtlpProtoBytes::ExportLogsRequest(_) => Message::ExportLogsServiceRequest,
+            OtlpProtoBytes::ExportMetricsRequest(_) => Message::ExportMetricsServiceRequest,
+            OtlpProtoBytes::ExportTracesRequest(_) => Message::ExportTraceServiceRequest,
+        };
+        validate_request(self.as_bytes(), root)
     }
 }
 

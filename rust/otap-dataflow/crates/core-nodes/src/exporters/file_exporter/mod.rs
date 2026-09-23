@@ -577,6 +577,29 @@ mod tests {
         assert!(frame.is_empty());
     }
 
+    /// Scenario: A logs, a metrics and a traces OTLP body whose top-level framing is intact but
+    /// whose one nested `Resource*` message holds a field tag with no length, `0a 01 0a`.
+    /// Guarantees: Each is refused before any JSON is framed, naming the damaged message, so a
+    /// damaged request is never written as an empty line the lazy view would have produced.
+    #[test]
+    fn nested_damage_is_refused_before_framing() {
+        for (signal, message) in [
+            (SignalType::Logs, "ResourceLogs"),
+            (SignalType::Metrics, "ResourceMetrics"),
+            (SignalType::Traces, "ResourceSpans"),
+        ] {
+            let payload = OtapPayload::from(OtlpProtoBytes::new_from_bytes(
+                signal,
+                vec![0x0a, 0x01, 0x0a],
+            ));
+            let mut frame = b"previous telemetry\n".to_vec();
+            let error = encode_payload(&payload, &mut frame, 4096)
+                .expect_err("a nested-damaged body is refused");
+            assert!(error.to_string().contains(message), "{signal:?}: {error}");
+            assert!(frame.is_empty(), "{signal:?}");
+        }
+    }
+
     /// Scenario: One exporter instance receives non-empty logs, metrics, and traces in sequence.
     /// Guarantees: Each signal produces exactly one replayable JSON line in its exclusive file.
     #[test]
