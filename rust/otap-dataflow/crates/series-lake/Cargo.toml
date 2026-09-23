@@ -14,9 +14,13 @@ categories = ["database-implementations"]
 
 [features]
 default = []
+# Builds the two harness-driven benches, `measurement` and `layered`, which
+# measure the fixtures the series_parquet measurement harness writes. Off by
+# default, so a workspace-wide `cargo bench` does not build them.
+bench-harness = []
 # Installs DHAT's global allocator in the `measurement` bench executable,
 # for its heap profile only. No library code uses it.
-bench-heap = []
+bench-heap = ["bench-harness"]
 
 [dependencies]
 otel-arrow-dfe-pdata.workspace = true
@@ -57,10 +61,12 @@ sha2.workspace = true
 [[bench]]
 name = "measurement"
 harness = false
+required-features = ["bench-harness"]
 
 [[bench]]
 name = "layered"
 harness = false
+required-features = ["bench-harness"]
 
 [lints]
 workspace = true

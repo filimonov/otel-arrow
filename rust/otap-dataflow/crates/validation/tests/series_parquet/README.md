@@ -67,7 +67,8 @@ starts no build of its own, because a compiler running beside a measurement
 invalidates it:
 
 ```bash
-cargo bench -p otel-arrow-dfe-series-lake --bench measurement --bench layered --no-run
+cargo bench -p otel-arrow-dfe-series-lake --bench measurement --bench layered --no-run \
+  --features bench-harness
 cargo bench -p otel-arrow-dfe-series-lake --bench measurement --no-run --features bench-heap
 cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
   --features series-parquet,aws,durable-buffer

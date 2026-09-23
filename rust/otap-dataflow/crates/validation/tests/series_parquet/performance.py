@@ -594,14 +594,16 @@ BENCH_ENV = {
 }
 
 # How each executable is built, named in the error a missing one raises.
+# Both benches are gated behind the `bench-harness` feature, which
+# `bench-heap` implies, so a workspace-wide `cargo bench` never builds them.
 BENCH_BUILD_COMMANDS = {
     ("measurement", False): (
         "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "
-        "--bench layered --no-run"
+        "--bench layered --no-run --features bench-harness"
     ),
     ("layered", False): (
         "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "
-        "--bench layered --no-run"
+        "--bench layered --no-run --features bench-harness"
     ),
     ("measurement", True): (
         "cargo bench -p otel-arrow-dfe-series-lake --bench measurement "

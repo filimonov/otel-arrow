@@ -110,6 +110,19 @@ fn main() -> Result<()> {
         stdout.write_all(b"\n")?;
         return Ok(());
     }
+    // A workspace-wide `cargo bench` runs every bench with no inputs; there
+    // is nothing to measure without them.
+    if std::env::var_os("SERIES_STAGE_CONFIG").is_none()
+        && std::env::var_os("SERIES_STAGE_INPUT").is_none()
+    {
+        writeln!(
+            std::io::stderr(),
+            "layered: skipped, SERIES_STAGE_CONFIG and SERIES_STAGE_INPUT are unset; this \
+             bench is driven by the series_parquet measurement harness \
+             (crates/validation/tests/series_parquet)"
+        )?;
+        return Ok(());
+    }
     let cfg = BenchConfig::read(&required("SERIES_STAGE_CONFIG")?)?;
     let input = stages::read_input(&required("SERIES_STAGE_INPUT")?)?;
     let handshake = std::env::var("SERIES_STAGE_HANDSHAKE").is_ok_and(|value| value == "1");

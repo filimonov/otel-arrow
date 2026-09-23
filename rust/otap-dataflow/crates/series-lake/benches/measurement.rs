@@ -12,6 +12,10 @@
 //! measurement --describe
 //! ```
 //!
+//! Built only with the `bench-harness` feature. Run with no measurement
+//! argument at all -- as `cargo bench` runs every bench -- it prints a skip
+//! message and exits 0.
+//!
 //! The input is deterministic length-prefixed OTLP requests of one signal
 //! with a sidecar JSON; the configuration is a JSON file holding the lake
 //! configuration and the object store. The result is written as JSON to
@@ -94,6 +98,9 @@ enum Command {
     SelfTest,
     Describe,
     Measure(Box<Args>),
+    /// Run with no measurement arguments at all, as a workspace-wide
+    /// `cargo bench` runs every bench: there is nothing to measure.
+    Skip,
 }
 
 /// What this executable is, for a harness that must not build anything.
@@ -147,6 +154,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command> {
             }
             other => return Err(format!("unknown argument {other}").into()),
         }
+    }
+    if values.is_empty() && !handshake {
+        return Ok(Command::Skip);
     }
     let mut take = |name: &str| {
         values
@@ -515,6 +525,14 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Command::Measure(args) => args,
+        Command::Skip => {
+            writeln!(
+                std::io::stderr(),
+                "measurement: skipped, no --stage given; this bench is driven by the \
+                 series_parquet measurement harness (crates/validation/tests/series_parquet)"
+            )?;
+            return Ok(());
+        }
     };
     if cfg!(feature = "bench-heap") != (args.profile == Profile::Heap) {
         return Err(format!(

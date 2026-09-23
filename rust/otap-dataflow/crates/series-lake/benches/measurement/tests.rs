@@ -747,6 +747,29 @@ fn stage_names_are_the_contract() -> Result<()> {
     Ok(())
 }
 
+/// Scenario: the executable is started the way a workspace-wide `cargo
+/// bench` starts it, with only `--bench`, and with nothing at all; then with
+/// one measurement argument but not the rest.
+/// Guarantees: the first two are a skip, so a plain `cargo bench` exits 0,
+/// while a partial measurement command line is still an error that names
+/// the missing argument.
+fn a_bare_cargo_bench_run_skips() -> Result<()> {
+    for arguments in [vec!["--bench"], vec![]] {
+        let command = super::parse_args(arguments.iter().map(|a| (*a).to_owned()))?;
+        ensure(
+            matches!(command, super::Command::Skip),
+            format!("{arguments:?} is not a skip"),
+        )?;
+    }
+    match super::parse_args(["--stage".to_owned(), "extract".to_owned()]) {
+        Err(error) => ensure(
+            error.to_string().contains("--input is required"),
+            format!("unexpected error: {error}"),
+        ),
+        Ok(_) => Err("a partial command line is accepted".into()),
+    }
+}
+
 /// Run every self-test; the first failure ends the process nonzero.
 ///
 /// # Errors
@@ -754,6 +777,7 @@ fn stage_names_are_the_contract() -> Result<()> {
 pub fn run() -> Result<()> {
     let holder = tempfile::tempdir()?;
     let root = holder.path();
+    a_bare_cargo_bench_run_skips()?;
     stage_names_are_the_contract()?;
     input_file_round_trips(root)?;
     input_generation_is_excluded_from_timing()?;
