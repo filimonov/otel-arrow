@@ -1524,30 +1524,24 @@ def _median(table, phase, name):
     return ((table.get(phase) or {}).get("terms") or {}).get(name, {}).get("median")
 
 
-# The committed Task 3 heap profile that measures one flush's transient
-# workspace: the actual Sink writing a sealed block of the primary logs
-# workload (merge, encode and upload buffers together), DHAT peak above the
-# block. It is the workspace term of the ledger during a flush interval.
-FLUSH_WORKSPACE_EVIDENCE = "stages-sink-async-logs-1k-stable-zstd-heap-f001.json"
+# The ledger's workspace term. The ledger may subtract only a workspace
+# measured in the same run and present at the sample; no such in-run
+# measurement of the flush workspace exists (the worker publishes none, and
+# a stage profile of another fixture is not this run), so the term is zero
+# and whatever the flush holds stays in the residual, where the frozen
+# tolerance judges it.
+NO_WORKSPACE_TERM = {
+    "bytes": 0,
+    "provenance": (
+        "no in-run measurement of the flush workspace exists, so the term is "
+        "zero; a flush's transient heap stays inside the residual"
+    ),
+}
 
 
-def flush_workspace(report_dir=None) -> dict:
-    """The measured workspace term, with its provenance, or zero if absent."""
-    path = measurement.resolve_report_dir(report_dir) / FLUSH_WORKSPACE_EVIDENCE
-    try:
-        document = json.loads(path.read_text(encoding="ascii"))
-        value = int(document["metrics"]["peak_workspace_bytes"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"bytes": 0, "provenance": f"{FLUSH_WORKSPACE_EVIDENCE} unavailable"}
-    return {
-        "bytes": value,
-        "provenance": (
-            f"measured: {FLUSH_WORKSPACE_EVIDENCE} peak_workspace_bytes, the DHAT "
-            f"peak of the actual Sink writing one sealed logs-1k-stable block; "
-            f"applied only to samples whose interval contains a flush"
-        ),
-        "sha256": measurement.file_digest(path),
-    }
+def ledger_check(entries, peak_rss) -> dict:
+    """The frozen reconciliation applied to ledger residual entries."""
+    return measurement.residual_check(entries, peak_rss)
 
 
 def settle_pair(result, spec, lifetimes, oracle, counts, latencies, control_counts,
@@ -1619,16 +1613,14 @@ def settle_pair(result, spec, lifetimes, oracle, counts, latencies, control_coun
     # live heap neither the exporter accounts for nor the paired control
     # holds is unexplained. Every sample of the measured traffic counts.
     peak_rss = max((sample["rss_bytes"] or 0 for sample in samples), default=0)
-    workspace = flush_workspace()
+    workspace = NO_WORKSPACE_TERM
     ledger_residuals = [
         {
             "monotonic_ns": sample["monotonic_ns"],
             "phase": sample["phase"],
             "flush_interval": flushing(sample),
             "residual_without_workspace_bytes": terms["unexplained_bytes"],
-            "residual_bytes": terms["unexplained_bytes"] - (
-                workspace["bytes"] if flushing(sample) else 0
-            ),
+            "residual_bytes": terms["unexplained_bytes"],
         }
         for sample in samples
         if sample["phase"] in ("load", "drain", "decay", "retained")
@@ -1639,7 +1631,7 @@ def settle_pair(result, spec, lifetimes, oracle, counts, latencies, control_coun
         )]
         if terms.get("unexplained_bytes") is not None
     ]
-    checks.append(measurement.residual_check(ledger_residuals, peak_rss))
+    checks.append(ledger_check(ledger_residuals, peak_rss))
     # The harness's own reconciliation, recorded but not gating here: its
     # heap term is the pipeline threads' allocated-minus-freed counters,
     # which keep every byte a pipeline thread allocated and another thread
@@ -2361,24 +2353,14 @@ def aggregate_family(case, children, output_dir, report_dir, *, ordinal,
             + (f"; over {MAXIMUM_SPREAD:.0%} in {unstable}" if unstable else ""),
         )
     )
+    per_pair = {child["run_id"]: pair_uncertainty(child) for child in children}
     uncertainty = {
-        "exporter_peak_rss_delta_bytes": max(
-            (
-                (life["block_pair_uncertainty"]["rss_bytes"]["p95_change_bytes"] or 0)
-                for child in children
-                for life in child.get("observations", {}).get("lifetimes", [])
-            ),
+        name: max(
+            (entry[name]["bound_bytes"] for entry in per_pair.values()
+             if entry[name]["bound_bytes"] is not None),
             default=None,
-        ),
-        "load_unexplained_median_bytes": max(
-            (
-                (life["block_pair_uncertainty"]["accounted_bytes"]["p95_change_bytes"] or 0)
-                for child in children
-                for life in child.get("observations", {}).get("lifetimes", [])
-                if life["topology"] != "noop"
-            ),
-            default=None,
-        ),
+        )
+        for name in SIGNED_METRICS
     }
     inconsistent = sorted(
         name for name in SIGNED_METRICS
@@ -2448,6 +2430,7 @@ def aggregate_family(case, children, output_dir, report_dir, *, ordinal,
                 for child in children
             },
             "signed_uncertainty_bytes": uncertainty,
+            "pair_uncertainty": per_pair,
         }
     )
     result["run_files"] = [
@@ -2725,3 +2708,254 @@ def residual_shares(entries) -> dict:
         "heap_beyond_tracked_growth_bytes": peak["heap_beyond_tracked_growth_bytes"],
         "hundred_ms_gauge_residual_bytes": peak["residual_bytes"],
     }
+
+
+
+# --------------------------------------------------------------------------
+# The uncertainty of one pair, over both of its lifetimes
+# --------------------------------------------------------------------------
+
+
+def _spread_stats(values) -> dict:
+    """Maximum and 95th percentile of non-negative magnitudes."""
+    values = sorted(value for value in values if value is not None)
+    if not values:
+        return {"count": 0, "max_bytes": None, "p95_bytes": None}
+    return {
+        "count": len(values),
+        "max_bytes": values[-1],
+        "p95_bytes": values[int(0.95 * (len(values) - 1))],
+    }
+
+
+def pair_uncertainty(child) -> dict:
+    """How far a pair's paired quantities can be off, from both lifetimes.
+
+    Read from a published pair result, so it can be recomputed for any
+    committed family. Four sources, each as its maximum (a bound over the
+    samples taken) and its 95th percentile (an estimate):
+
+    * block pairing: the change of the measured engine's accounted bytes,
+      and of either lifetime's RSS, between consecutive collections;
+    * control heap: how far the control's allocated heap strays from the
+      phase median the ledger subtracts;
+    * allocator statistics timing: how old the latest allocator print is
+      when a sample reads it, and how much allocated moves between two
+      consecutive prints.
+
+    `bound_bytes` adds the maxima and is a bound only over what was sampled
+    (a transient between two observations can exceed it);
+    `estimate_bytes` adds the 95th percentiles and is labelled an estimate.
+    """
+    lifetimes = {life["label"]: life for life in
+                 (child.get("observations") or {}).get("lifetimes", [])}
+    samples = child.get("samples") or []
+
+    def pairing(label, name, field):
+        """One lifetime's collection-to-collection change of one term."""
+        entry = ((lifetimes.get(label) or {}).get("block_pair_uncertainty") or {}).get(name)
+        return (entry or {}).get(field)
+
+    control_devs = []
+    for phase in ("load", "retained"):
+        values = [
+            (sample.get("jemalloc") or {}).get("allocated_bytes")
+            for sample in samples
+            if sample.get("lifetime") == "control" and sample.get("phase") == phase
+        ]
+        values = [value for value in values if value is not None]
+        if values:
+            middle = summarize(values)["median"]
+            control_devs.extend(abs(value - middle) for value in values)
+    control = _spread_stats(control_devs)
+    ages = _spread_stats(
+        sample.get("jemalloc_age_ns") for sample in samples
+        if sample.get("lifetime") == "measured"
+    )
+    moves = []
+    for sample in samples:
+        if sample.get("lifetime") != "measured":
+            continue
+        printed = [entry["allocated_bytes"] for entry in sample.get("jemalloc_printed") or []]
+        moves.extend(abs(b - a) for a, b in zip(printed, printed[1:]))
+    between_prints = _spread_stats(moves)
+
+    def total(*parts):
+        """The sum of the available parts, None when all are absent."""
+        parts = [part for part in parts if part is not None]
+        return sum(parts) if parts else None
+
+    unexplained = {
+        "accounted_pairing_max_bytes": pairing("measured", "accounted_bytes", "max_change_bytes"),
+        "accounted_pairing_p95_bytes": pairing("measured", "accounted_bytes", "p95_change_bytes"),
+        "control_heap_max_bytes": control["max_bytes"],
+        "control_heap_p95_bytes": control["p95_bytes"],
+        "allocated_between_prints_max_bytes": between_prints["max_bytes"],
+        "allocated_between_prints_p95_bytes": between_prints["p95_bytes"],
+    }
+    unexplained["bound_bytes"] = total(
+        unexplained["accounted_pairing_max_bytes"], unexplained["control_heap_max_bytes"],
+        unexplained["allocated_between_prints_max_bytes"],
+    )
+    unexplained["estimate_bytes"] = total(
+        unexplained["accounted_pairing_p95_bytes"], unexplained["control_heap_p95_bytes"],
+        unexplained["allocated_between_prints_p95_bytes"],
+    )
+    delta = {
+        "measured_rss_pairing_max_bytes": pairing("measured", "rss_bytes", "max_change_bytes"),
+        "control_rss_pairing_max_bytes": pairing("control", "rss_bytes", "max_change_bytes"),
+        "measured_rss_pairing_p95_bytes": pairing("measured", "rss_bytes", "p95_change_bytes"),
+        "control_rss_pairing_p95_bytes": pairing("control", "rss_bytes", "p95_change_bytes"),
+    }
+    delta["bound_bytes"] = total(
+        delta["measured_rss_pairing_max_bytes"], delta["control_rss_pairing_max_bytes"]
+    )
+    delta["estimate_bytes"] = total(
+        delta["measured_rss_pairing_p95_bytes"], delta["control_rss_pairing_p95_bytes"]
+    )
+    return {
+        "load_unexplained_median_bytes": unexplained,
+        "exporter_peak_rss_delta_bytes": delta,
+        "allocator_print_age_ns": {
+            "max": ages["max_bytes"], "p95": ages["p95_bytes"], "count": ages["count"],
+        },
+        "labels": {
+            "bound_bytes": "sum of maxima over the sampled observations",
+            "estimate_bytes": "sum of 95th percentiles; an estimate, not a bound",
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# Re-aggregating published families under a corrected ledger
+# --------------------------------------------------------------------------
+
+
+def reaggregate(index_names, output_dir, report_dir=None) -> dict:
+    """Re-judge published families from their committed pair results.
+
+    For each named index the family aggregate and its pairs are read back
+    from the report directory. Each pair's ledger gate is recomputed with no
+    workspace term, from the per-sample residuals the pair recorded, and its
+    uncertainty over both lifetimes; the family's stability verdict is read
+    from its aggregate unchanged. The result is a new published document that
+    references every file it read by hash; nothing already published is
+    rewritten.
+    """
+    report = measurement.resolve_report_dir(report_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    families = []
+    files = []
+    first_child = None
+    for name in index_names:
+        # A family aggregate (`...-fNNN`) is read directly; an index name
+        # resolves to the aggregate it currently lists.
+        if re.search(r"-f\d{3}$", name):
+            aggregate_entry = {"name": f"{name}.json"}
+        else:
+            index = json.loads((report / f"{name}.json").read_text(encoding="ascii"))
+            aggregate_entry = next(
+                entry for entry in index["run_files"]
+                if re.search(r"-f\d{3}\.json$", entry["name"])
+            )
+        aggregate = json.loads((report / aggregate_entry["name"]).read_text(encoding="ascii"))
+        pairs = []
+        for entry in aggregate["run_files"]:
+            path = report / entry["name"]
+            child = json.loads(path.read_text(encoding="ascii"))
+            first_child = first_child or child
+            files.append(measurement.file_entry(path))
+            residuals = [
+                dict(item, residual_bytes=item["residual_without_workspace_bytes"])
+                for item in (child.get("observations") or {}).get("ledger_residuals", [])
+            ]
+            peak = max(
+                (sample.get("rss_bytes") or 0 for sample in child.get("samples", [])
+                 if sample.get("lifetime") == "measured"),
+                default=0,
+            )
+            gate = ledger_check(residuals, peak)
+            beyond = sorted(
+                (item["residual_bytes"] for item in residuals), reverse=True
+            )[:3]
+            pairs.append({
+                "run_id": child["run_id"],
+                "ledger_gate": gate,
+                "ledger_residual_max_bytes": beyond[0] if beyond else None,
+                "flush_interval_samples": sum(1 for item in residuals if item.get("flush_interval")),
+                "uncertainty": pair_uncertainty(child),
+            })
+        files.append(measurement.file_entry(report / aggregate_entry["name"]))
+        stability = next(
+            (entry for entry in aggregate["checks"] if entry["name"] == "pair_stability"), None
+        )
+        gates_pass = all(
+            pair["ledger_gate"]["status"] == measurement.STATUS_PASSED for pair in pairs
+        )
+        children = [
+            json.loads((report / entry["name"]).read_text(encoding="ascii"))
+            for entry in aggregate["run_files"]
+        ]
+        signs = {}
+        for metric in SIGNED_METRICS:
+            values = [child["metrics"].get(metric) for child in children]
+            bound = max(
+                (pair["uncertainty"][metric]["bound_bytes"] or 0 for pair in pairs), default=None
+            )
+            signs[metric] = {
+                "values": values, "bound_bytes": bound,
+                "consistent": signed_consistent(values, bound),
+            }
+        families.append({
+            "index": name,
+            "aggregate": aggregate["run_id"],
+            "ledger_gate_passed_in_every_pair": gates_pass,
+            "pair_stability": stability,
+            "paired_sign": signs,
+            "family_passes_under_corrected_ledger": gates_pass and bool(stability)
+            and stability["status"] == measurement.STATUS_PASSED
+            and all(entry["consistent"] for entry in signs.values()),
+            "pairs": pairs,
+        })
+    run_id = "memory-ledger-reaggregation-r1"
+    result = measurement.new_result({"run_id": run_id, "case": "memory-reaggregation"},
+                                    artifact_kind="memory_reaggregation")
+    result["environment"] = {
+        "start": first_child["environment"]["start"],
+        "end": first_child["environment"]["end"],
+        "note": "re-judged from committed pair results; no engine was run",
+    }
+    result["observations"] = {
+        "workspace_term": NO_WORKSPACE_TERM,
+        "families": families,
+    }
+    result["metrics"] = {
+        "families_count": len(families),
+        "families_passing_count": sum(
+            1 for family in families if family["family_passes_under_corrected_ledger"]
+        ),
+    }
+    result["mandatory_metrics"] = sorted(result["metrics"])
+    for family in families:
+        result["checks"].append(
+            measurement.check(
+                f"ledger_{family['index']}", measurement.CHECK_MEASURED,
+                measurement.STATUS_PASSED if family["ledger_gate_passed_in_every_pair"]
+                else measurement.STATUS_FAILED,
+                "; ".join(
+                    f"{pair['run_id']}: {pair['ledger_gate']['detail']}" for pair in family["pairs"]
+                )[:2000],
+            )
+        )
+    result["run_files"] = files
+    result["status"] = measurement.STATUS_PASSED
+    measurement.settle_status(result)
+    for name, entry in ((entry["name"], entry) for entry in files):
+        source = report / name
+        destination = output_dir / name
+        if not destination.exists():
+            destination.write_bytes(source.read_bytes())
+    path = measurement.write_result(output_dir / f"{run_id}.json", result)
+    _ = measurement.publish_result_tree(path, report_dir)
+    return result

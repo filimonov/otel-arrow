@@ -4696,5 +4696,60 @@ class MemoryContracts(unittest.TestCase):
         )
 
 
+    # Scenario: the ledger's workspace term when the run itself measured no
+    # flush workspace.
+    # Guarantees: the term is zero with a provenance saying why, so a flush's
+    # transient heap stays in the residual and a tolerance failure is
+    # reported rather than explained away by another run's measurement.
+    def test_ledger_workspace_term_is_zero_without_an_in_run_measurement(self):
+        self.assertEqual(memory.NO_WORKSPACE_TERM["bytes"], 0)
+        self.assertIn("no in-run measurement", memory.NO_WORKSPACE_TERM["provenance"])
+        self.assertFalse(hasattr(memory, "flush_workspace"))
+        mib = 1024 * 1024
+        entries = [{"residual_bytes": 46 * mib, "monotonic_ns": 1, "phase": "load"}]
+        self.assertEqual(
+            memory.ledger_check(entries, 100 * mib)["status"], measurement.STATUS_FAILED
+        )
+
+    # Scenario: a published pair whose measured lifetime pairs accounted
+    # bytes 3 MiB apart at most, whose control heap strays 2 MiB from its
+    # load median, and whose allocator prints move 1 MiB apart at most.
+    # Guarantees: the pair's uncertainty covers both lifetimes and the
+    # allocator timing; the maxima add up to the bound and the 95th
+    # percentiles to a separately labelled estimate.
+    def test_pair_uncertainty_covers_both_lifetimes(self):
+        mib = 1024 * 1024
+
+        def bpu(accounted, rss):
+            """One lifetime's block-pair record."""
+            return {
+                "accounted_bytes": {"max_change_bytes": accounted, "p95_change_bytes": accounted // 2},
+                "rss_bytes": {"max_change_bytes": rss, "p95_change_bytes": rss // 2},
+            }
+
+        samples = [
+            {"lifetime": "control", "phase": "load", "jemalloc": {"allocated_bytes": value}}
+            for value in (6 * mib, 8 * mib, 10 * mib)
+        ] + [
+            {"lifetime": "measured", "phase": "load", "jemalloc_age_ns": 5,
+             "jemalloc_printed": [{"allocated_bytes": 20 * mib}, {"allocated_bytes": 21 * mib}]},
+        ]
+        child = {
+            "observations": {"lifetimes": [
+                {"label": "control", "block_pair_uncertainty": bpu(0, 4 * mib)},
+                {"label": "measured", "block_pair_uncertainty": bpu(3 * mib, 6 * mib)},
+            ]},
+            "samples": samples,
+        }
+        found = memory.pair_uncertainty(child)
+        unexplained = found["load_unexplained_median_bytes"]
+        self.assertEqual(unexplained["control_heap_max_bytes"], 2 * mib)
+        self.assertEqual(unexplained["allocated_between_prints_max_bytes"], 1 * mib)
+        self.assertEqual(unexplained["bound_bytes"], (3 + 2 + 1) * mib)
+        self.assertLessEqual(unexplained["estimate_bytes"], unexplained["bound_bytes"])
+        self.assertEqual(found["exporter_peak_rss_delta_bytes"]["bound_bytes"], 10 * mib)
+        self.assertIn("estimate", found["labels"]["estimate_bytes"])
+
+
 if __name__ == "__main__":
     unittest.main()
