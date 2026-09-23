@@ -650,7 +650,9 @@ impl Faults {
         let path = path.as_ref();
         let fail = mode == Fault::SlowFail
             || (mode == Fault::Series && path.contains("dataset=series/"))
-            || (path.contains("dataset=values/") && self.heal_values_once());
+            || (mode == Fault::ValuesOnce
+                && path.contains("dataset=values/")
+                && self.heal_values_once());
         if fail {
             return Err(object_store::Error::Generic {
                 store: "series-test",
@@ -660,7 +662,8 @@ impl Faults {
         Ok(())
     }
 
-    /// Whether [`Fault::ValuesOnce`] is active, healing it in the same step.
+    /// Whether [`Fault::ValuesOnce`] is still active, healing it in the same
+    /// step; only an operation that entered under it may take it.
     fn heal_values_once(&self) -> bool {
         let mut mode = self.mode.lock().expect("mode lock");
         if *mode != Fault::ValuesOnce {
