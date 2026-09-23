@@ -774,6 +774,109 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
+## Running behind durable_buffer
+
+The shipped buffered topology places `processor:durable_buffer` between the
+receiver and this exporter. It changes what a successful response to the
+producer means, how backpressure reaches the producer, how fresh the data in
+the object store is, and how the process scales across cores. This section
+states those effects so that an operator can size, monitor and alert on them.
+
+### What the producer's OK means
+
+Without the buffer, the producer is acknowledged only after the block holding
+its request is durable in the object store. With the buffer, the producer is
+acknowledged as soon as the request is written to the buffer's local WAL. The
+exporter's own acknowledgement then goes to the buffer, not to the producer.
+An OK therefore means "durable on this host's WAL", not "readable in the lake".
+
+Backpressure becomes two-stage. When the object store slows down, this
+exporter stops admitting new blocks, the buffer keeps the pending bundles on
+disk and retries them, and the producer notices nothing until the WAL reaches
+its size cap. From then on, with `size_cap_policy: backpressure`, new requests
+receive a retryable refusal (UNAVAILABLE for OTLP/gRPC). The producer is
+refused and must retry; it is not held inside a request.
+
+### Losses the producer never sees
+
+Everything that happens after the WAL acknowledgement is invisible to the
+producer:
+
+- A permanent refusal by this exporter (a damaged OTLP body, a request larger
+  than a block can hold, an unsupported signal or point kind) makes the buffer
+  drop that bundle. It is counted in the buffer's
+  `resolved{outcome="permanently_rejected"}`; without the buffer the same
+  request would have received a permanent refusal the producer could act on.
+- `size_cap_policy: drop_oldest` evicts acknowledged data when the WAL is full.
+- `max_age` expires acknowledged data older than the configured age.
+
+Alert on each of these counters. The first can be removed by validating
+requests before the WAL acknowledges them, which is planned but not
+implemented.
+
+### Freshness
+
+There is no strict upper bound on the time from a producer's send to the
+values file being visible in the object store. In the healthy state, with no
+backlog, the delay is roughly the buffer's segment finalisation (up to 1 s by
+default), its poll interval (100 ms), the wait for this exporter's window to
+end (up to `window.interval`), and the flush and upload of the block. With a
+15 s window that is about 16 s plus the write time, not 15 s. Producer-side
+batching adds to it. During an object-store outage the delay is unbounded:
+`flush_retry_deadline` bounds one series of attempts for one block, after
+which the buffer retries later; it does not bound the time to visibility.
+
+Monitor freshness directly: this exporter's `oldest_unacked.age` covers the
+blocks it holds, and the buffer's queue age and WAL fill cover the rest. An
+end-to-end "age of the oldest accepted but unwritten record" metric is planned.
+
+### Several cores: independent shards
+
+The engine runs one independent copy of the pipeline per configured core. With
+four cores there are four receivers, four durable buffers and four exporters.
+There is no shared WAL and no work stealing between them:
+
+- Each buffer opens its own directory `<path>/core_<core_id>` and retries only
+  its own bundles.
+- `retention_size_cap` is divided between the cores: 10 GiB on four cores
+  gives each buffer about 2.5 GiB. One overloaded core starts refusing even
+  while the other cores' directories have room. `max_in_flight`, by contrast,
+  applies to each buffer separately, and this exporter's memory budgets are
+  per worker and add up across cores.
+- Receivers share their port through SO_REUSEPORT where available. That
+  spreads connections, not requests or bytes; one long-lived busy connection
+  can load a single WAL. Monitor the maximum fill and queue age across cores,
+  not only the process-wide sum.
+- There is no global order. Bundles of one series can reach different
+  exporters, and a retried bundle can land after newer data. Each worker has
+  its own descriptor cache, so repeated series rows across workers are
+  expected; readers deduplicate them as the format describes. File names do
+  not collide: each exporter uses its own random `boot_id` and local sequence.
+
+### Several processes or pods
+
+Give every process its own physical buffer directory, for example a separate
+volume per instance. The same `path` string is only acceptable when it points
+to different file systems. Two live processes sharing one `<path>/core_<n>` are
+not a supported configuration: the WAL does not take an exclusive lock on its
+directory. This also applies to an old and a new pipeline instance overlapping
+during a live reconfiguration. Several processes may write to the same bucket;
+their random `boot_id`s keep their files apart.
+
+### Changing the core count
+
+A new worker opens only the directory of its own core id; nothing moves a
+queue from a core that no longer exists to another one, and a changed core
+count also changes each core's share of `retention_size_cap`. Scale a buffered
+deployment by stopping intake and draining the old shards first, or by an
+explicit WAL migration, never by editing the core count alone. Keep the old
+`core_<id>` directories available until they are empty.
+
+The durable buffer's own module documentation still lists `RoundRobin`,
+`Random` and `LeastLoaded` dispatch policies; the current configuration offers
+`one_of` and `broadcast`. Do not rely on that table for an even distribution
+across cores.
+
 ## Reading and schema changes
 
 Use DuckDB 1.1 or newer. Values rows reference repeated series descriptors, so
