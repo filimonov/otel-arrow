@@ -1074,6 +1074,8 @@ git commit -m "chore: record thirty-minute series parquet soak acceptance" -m "C
 Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 ```
 
+**Amendment (user decision 2026-09-23): heap dumps across the soak.** Using the raw-dump profiling mode from the first Task 12 item, each 30-minute soak also runs once with allocation sampling and takes a raw jemalloc dump after warm-up, at the midpoint and at the end of the input phase. `jeprof --base` between the first and last dump names every stack that grew. Growth that the ledger does not explain is a Task 12 finding. The profiled soak is diagnostic and never sets the soak baseline.
+
 ### Task 8: Disposable fault-tool provisioning and capability probes
 
 **Expected wall-clock cost:** 1-3 minutes for preflight and proxy smoke after provisioning; image builds/pulls separately budgeted at 15-60 minutes.
@@ -1546,6 +1548,13 @@ Use a `chore` commit subject when this pass contains only harness fixes, a no-de
 - [ ] Block admission keeps its worst-case check as a debug assertion plus a counted `internal` nack if it ever fires, since validation now makes it unreachable; a test proves an ingress-accepted request with max_series_per_request new series fits an empty block for logs, metrics and a denormalized schema.
 - [ ] Task 5's high-cardinality shape is rerun afterwards: at the limit it is accepted, one above it is refused at ingress with the new reason.
 Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as memory cap) and C (split an oversize request across blocks with a multi-block token) are recorded for plan 4 and not implemented here.
+
+**Amendment (user decision 2026-09-23): heap attribution by jemalloc profile, first Task 12 item.** Task 6 found the in-process `/debug/pprof/heap` endpoint unusable: its first dump makes the symbolizer hold about 266 MB, which dominates every later profile. Task 3i then attributed the high-rate ledger excess indirectly, by adding a term and re-running whole families. Replace that with direct heap attribution:
+- [ ] Add a harness allocator mode that samples allocations (`prof:true,prof_active:true`, `lg_prof_sample:17` unless measured otherwise) and dumps raw jemalloc heap files with no in-process symbolization: on demand through the `prof.dump` mallctl reached from the admin API or a test hook, and optionally on each new high-water mark with `prof_gdump:true`. The dump path lives under the run's output directory.
+- [ ] Symbolize offline on the host with `jeprof` against the exact engine binary. Record the top retaining stacks as text, and the difference between two dumps with `jeprof --base`. Prove the dump itself adds no more than 1 MB to the heap by comparing jemalloc `allocated` just before and just after a dump.
+- [ ] Take dumps at a flush peak and just before the flush in the logs high-rate shape, and on the 512k near-limit block. Attribute the ledger excess of Task 3i (33 to 47 MB per pair) and the about 160 MB large-table flush workspace, including the row-group tail that pins the previous row-group buffer, to named stacks. Only then decide the ledger fix: synchronous telemetry/allocator pairing, a missing term, or both.
+- [ ] Take dumps at the start and the end of a Task 6 local-storage run to attribute the engine `memory.usage` drift of +137/+273 MB.
+- [ ] The profiling mode is a diagnostic: its runs never write or update a baseline, and their timings are not compared with normal runs.
 
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
