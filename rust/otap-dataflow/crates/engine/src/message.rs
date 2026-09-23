@@ -798,20 +798,6 @@ impl<PData> ProcessorInbox<PData> {
     }
 }
 
-impl<PData> ProcessorInbox<PData> {
-    /// Deadline latched by the inbox while it drains buffered pdata.
-    ///
-    /// `None` until a Shutdown has been latched. The processor counterpart of
-    /// [`ExporterInbox::shutdown_deadline`]: a processor that holds work of
-    /// its own can bound it from the first pdata handed over after the latch
-    /// rather than from the control message released at the end of the
-    /// drain. Read-only, so drain order is unaffected.
-    #[must_use]
-    pub fn shutdown_deadline(&self) -> Option<Instant> {
-        self.core.shutting_down_deadline
-    }
-}
-
 impl<PData: ReceivedAtNode> ProcessorInbox<PData> {
     /// Receives the next message while honoring the current processor
     /// admission state, including during shutdown draining.
@@ -1492,41 +1478,5 @@ mod tests {
                 if released == deadline && reason == "test"
         ));
         assert_eq!(inbox.shutdown_deadline(), None);
-    }
-
-    /// Scenario: Shutdown is latched while a processor with admission open
-    /// still has buffered pdata.
-    /// Guarantees: the processor inbox exposes the latched deadline while it
-    /// hands over the buffered pdata, exactly as the exporter inbox does, and
-    /// reports none before the latch.
-    #[tokio::test]
-    async fn processor_deadline_is_visible_during_drain() {
-        let (control_tx, control_rx) = mpsc::Channel::<NodeControlMsg<TestMsg>>::new(2);
-        let (pdata_tx, pdata_rx) = mpsc::Channel::<TestMsg>::new(2);
-        let mut inbox = ProcessorInbox::new(
-            Receiver::Local(LocalReceiver::mpsc(control_rx)),
-            Receiver::Local(LocalReceiver::mpsc(pdata_rx)),
-            9,
-            Interests::empty(),
-        );
-        assert_eq!(inbox.shutdown_deadline(), None);
-
-        let deadline = clock::now() + Duration::from_secs(1);
-        pdata_tx
-            .send_async(TestMsg::new("buffered"))
-            .await
-            .expect("pdata");
-        control_tx
-            .send_async(NodeControlMsg::Shutdown {
-                deadline,
-                reason: "test".to_owned(),
-            })
-            .await
-            .expect("shutdown");
-
-        let message = inbox.recv_when(true).await.expect("drained data");
-        assert!(matches!(message, Message::PData(TestMsg(ref body)) if body == "buffered"));
-        assert_eq!(inbox.shutdown_deadline(), Some(deadline));
-        drop(pdata_tx);
     }
 }
