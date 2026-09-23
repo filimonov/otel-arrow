@@ -33,17 +33,6 @@ LONG_COMMANDS = (
     "stages", "attribution", "capacity", "memory", "soak", "failures", "buffered",
 )
 
-# Subcommands later tasks own. They are named here so that the command line
-# is one contract rather than a set that grows behind the plan.
-PLANNED_COMMANDS = (
-    "capacity",
-    "soak",
-    "failures",
-    "buffered",
-    "remediate",
-    "report",
-)
-
 
 def registered_cases() -> dict:
     """Every named case this command line can run today."""
@@ -1326,13 +1315,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = preflight.add_argument("--output-dir", required=True, type=Path)
     _ = preflight.add_argument("--option", action="append", default=[])
-    for name in PLANNED_COMMANDS:
-        planned = sub.add_parser(
-            name, help=f"{name}: implemented by a later task of this plan"
-        )
-        _ = planned.add_argument("--output-dir", type=Path)
-        _ = planned.add_argument("--finding", type=Path)
-        _ = planned.add_argument("--option", action="append", default=[])
     return parser
 
 
@@ -1455,10 +1437,7 @@ def main(argv=None) -> int:
             f"{json.dumps(result['metrics'], sort_keys=True)}\n"
         )
         return 0 if result["status"] == measurement.STATUS_PASSED else 1
-    sys.stderr.write(
-        f"{arguments.command} is implemented by a later task of this plan\n"
-    )
-    return 2
+    raise AssertionError(f"unhandled command: {arguments.command}")
 
 
 if __name__ == "__main__":

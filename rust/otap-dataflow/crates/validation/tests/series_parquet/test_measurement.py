@@ -1788,7 +1788,7 @@ class CommandContracts(unittest.TestCase):
         environment = dict(os.environ)
         environment.pop("SERIES_MEASURE_LONG", None)
         with mock.patch.dict(os.environ, environment, clear=True):
-            self.assertEqual(measure.main(["soak"]), 2)
+            self.assertEqual(measure.main(["memory"]), 2)
 
     # Scenario: the harness-local case is constructed.
     # Guarantees: its registered settings are a hundred requests of mixed
@@ -4597,7 +4597,6 @@ class MemoryContracts(unittest.TestCase):
     # memory pair claims a producer and a reader but no object store.
     def test_memory_command_and_roles(self):
         self.assertIn("memory", measure.LONG_COMMANDS)
-        self.assertNotIn("memory", measure.PLANNED_COMMANDS)
         self.assertEqual(
             dict(measurement.CASE_ROLES["memory"]), {"producer": 2, "reader": 1}
         )
@@ -6044,9 +6043,9 @@ class AttributionContracts(unittest.TestCase):
 
     # Scenario: the attribution subcommand is asked for without the long
     # opt-in, and the command line is inspected.
-    # Guarantees: it is a real, long subcommand, no longer a planned one.
+    # Guarantees: it is registered as a long subcommand and gated the same
+    # way as any other.
     def test_attribution_is_a_long_subcommand(self):
-        self.assertNotIn("attribution", measure.PLANNED_COMMANDS)
         self.assertIn("attribution", measure.LONG_COMMANDS)
         environment = dict(os.environ)
         environment.pop("SERIES_MEASURE_LONG", None)

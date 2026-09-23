@@ -856,7 +856,6 @@ class PreflightOutcome(unittest.TestCase):
     # Guarantees: the subcommand is implemented, a skip exits 3 and a
     # failure exits 1, so a caller can tell them apart.
     def test_command_line_exit_statuses(self):
-        self.assertNotIn("fault-preflight", measure.PLANNED_COMMANDS)
         output = str(temporary_directory(self))
         for raised, status in ((unittest.SkipTest("x"), measure.FAULT_PREFLIGHT_SKIPPED_EXIT),
                                (AssertionError("x"), 1)):
