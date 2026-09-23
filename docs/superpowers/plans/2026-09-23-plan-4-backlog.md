@@ -65,5 +65,5 @@ priority where stated.
   chaos, failpoints (spec 10.3).
 - Tests: factory with a bound bearer-token capability (needs an engine test
   helper); DuckDB/ClickHouse actually using native SortingColumn.
-- Upstream: pdata CBOR encoder recursion limit; PR split; Python lane under
+- Upstream: decide core-nodes vs contrib-nodes placement with the maintainers; pdata CBOR encoder recursion limit; PR split; Python lane under
   tools/; history rewrite before the upstream PR (user decision).

@@ -670,6 +670,18 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 - [ ] Document the result in the README next to the high-cardinality strategy: delete is correct for delta sums and histograms (readers sum), wrong for cumulative (interleaved running totals) and ambiguous for gauges; spatial aggregation is not available in otap-dataflow today (plan-4 backlog item).
 - [ ] Standard rules: Scenario/Guarantees comments, ASCII, SERIES_REQUIRE_DOCKER=1, measured launches unaffected.
 
+### Task 3i: Bounded runtime work on the ingest core and an explicit loss contract (sixth review, user decisions 2026-09-23)
+
+**Why now:** the project review criterion (rust/otap-dataflow/docs/ai/ai-assisted-pr-review.md, "single-threaded async runtime responsiveness") flags runtime-path work that monopolizes the core. Merge-key building runs synchronously for every row of every run before the first yield (series-lake sink.rs calling merge_runs, sort.rs key construction), and each chunk is encoded synchronously, so a large block delays admission, backpressure, ack/nack delivery, cancel and shutdown on the same core. Moving flush off the core stays in plan 4 with the shared writer; this task bounds the work instead.
+
+- [ ] Measure first (reuse the Task 5 worst-stall probe if it exists, otherwise add it here): longest uninterrupted stretch of the worker thread during a flush of the largest default block for logs and metrics, and the latency from a shutdown/cancel signal to the flush observing it.
+- [ ] Build merge keys in bounded slices (a configured or constant row budget per slice) with `tokio::task::yield_now()` between slices; produce and encode output chunks one at a time with a yield between chunks; check cancellation and the shutdown deadline between slices and chunks. No change to output bytes, ordering, row groups or goldens: a golden and E2E proof that files are byte-identical for the same input.
+- [ ] Re-measure the worst stretch and the reaction latency; report before/after; total CPU per record must not regress beyond noise (stage bench spot run).
+- [ ] Loss contract: add `metrics.exemplars: drop | reject` (default drop); under `unsupported: reject` exemplars are rejected too (the request is refused with a sentence naming exemplars). Count dropped exemplars (`dropped.exemplars`, per signal). Add one README section "What this exporter does not keep" listing every intentional loss with its metric: exemplars, attribute map value types (the v1 format is lossy by decision), a histogram sum of exactly zero after an OTAP round trip, and anything else a reader might expect; the section is the contract a producer can rely on.
+- [ ] Standard rules: tests first where behaviour changes, Scenario/Guarantees, ASCII, chloggen for the exemplar policy, `cargo xtask check`, E2E under taskset -c 0-7,16-23.
+
+Placement in core-nodes versus contrib-nodes is decided when the upstream PR is prepared (user decision 2026-09-23).
+
 ### Task 3f: Behaviour-preserving simplification (fourth review, user decision 2026-09-23)
 
 **Order:** after Task 6 has merged (it edits series-lake buffer/sort and bench stages) and before the fault matrix (Tasks 9-11, 13), so the fault tasks exercise the simplified code. No behaviour, format, golden vector, metric name or config key changes; the existing unit, golden, contract and E2E suites are the safety net, and every commit keeps them green. Items 1 (worker state machine behind an event API), 3 (notifier rewrite) and 6 (LakeWriter facade) are NOT in this task: they rewrite exactly what plan 4's shared writer rewrites, and go there (see docs/superpowers/plans/2026-09-23-plan-4-backlog.md).
