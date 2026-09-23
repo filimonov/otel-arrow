@@ -163,8 +163,8 @@ Both recipes need `union_by_name` / `mergeSchema` because denormalized columns
 may be added over time. To detect an incompatible mix, compare the
 `schema_fingerprint` key (16 lowercase hex digits) in each file's Parquet
 metadata: files of one dataset with different fingerprints disagree on the
-column set, a column's type, or column order, and a reader that ignores
-this silently drops or misreads columns. See `docs/FORMAT.md` for exactly
+column set, a column's type or nullability, or column order, and a reader
+that ignores this silently drops or misreads columns. See `docs/FORMAT.md` for exactly
 what the fingerprint covers.
 
 ## Testing

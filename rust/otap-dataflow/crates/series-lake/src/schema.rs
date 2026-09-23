@@ -216,25 +216,111 @@ pub fn dataset_schema(ds: Dataset, cfg: &LakeConfig) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// xxh3_64 over a length-prefixed `name` and Arrow type of every field, in
-/// order: `<len>:<name><len>:<type>` per field, concatenated.
+/// First line of every schema rendering: the name and version of the type
+/// vocabulary below. A future vocabulary change bumps the version, so its
+/// fingerprints can never be confused with this one's.
+pub const SCHEMA_RENDERING_HEADER: &str = "series-lake-schema/1";
+
+/// The crate-owned rendering of a dataset schema that [`schema_fingerprint`]
+/// hashes (FORMAT.md section 3).
 ///
-/// The prefixes make the serialization unambiguous. A plain `name:type;` join
-/// is not: one string column named `a:Utf8;b` produces exactly the same string
-/// as two string columns named `a` and `b`, so two genuinely different schemas
-/// would share a fingerprint without any hash collision, defeating the mismatch
-/// detection the fingerprint exists for. `LakeConfig::validate` separately
-/// rejects denormalized column names holding `:` or `;`, but the encoding does
-/// not rely on that rule.
+/// The header line, then one line per field in schema order:
+/// `<len>:<name><len>:<type>` followed by a newline, where each `<len>` is the
+/// decimal byte length of the string after its colon. `<type>` is a type code
+/// of the crate's own vocabulary followed by the field's nullability, `!` for a
+/// required field and `?` for a nullable one; list items and map keys and
+/// values carry their own nullability the same way.
+///
+/// The vocabulary is modelled on pdata's `SchemaIdBuilder`: it is owned here
+/// and never taken from Arrow's `Display`, so an Arrow upgrade that changes
+/// how a type prints cannot move a persisted fingerprint. Unlike
+/// `SchemaIdBuilder`, fields are not sorted by name: the column position is
+/// part of a Parquet file's physical schema, and two files whose columns are
+/// in different orders cannot have their row groups concatenated by a
+/// compaction that trusts the fingerprint.
+///
+/// The length prefixes keep the serialization unambiguous. A plain
+/// `name:type;` join is not: one string column named `a:Str;b` produces the
+/// same text as two string columns named `a` and `b`, so two genuinely
+/// different schemas would share a fingerprint without any hash collision.
+/// `LakeConfig::validate` separately rejects denormalized column names holding
+/// `:` or `;`, but the encoding does not rely on that rule.
 #[must_use]
-pub fn schema_fingerprint(schema: &Schema) -> u64 {
-    let mut s = String::new();
+pub fn schema_rendering(schema: &Schema) -> String {
+    let mut out = String::with_capacity(64 * (schema.fields().len() + 1));
+    out.push_str(SCHEMA_RENDERING_HEADER);
+    out.push('\n');
     for f in schema.fields() {
         let name = f.name();
-        let ty = f.data_type().to_string();
-        s.push_str(&format!("{}:{}{}:{}", name.len(), name, ty.len(), ty));
+        let mut ty = String::new();
+        render_field_type(f, &mut ty);
+        out.push_str(&format!("{}:{}{}:{}\n", name.len(), name, ty.len(), ty));
     }
-    xxhash_rust::xxh3::xxh3_64(s.as_bytes())
+    out
+}
+
+/// The type code of `field` followed by its nullability marker.
+fn render_field_type(field: &Field, out: &mut String) {
+    render_type(field.data_type(), out);
+    out.push(if field.is_nullable() { '?' } else { '!' });
+}
+
+/// The type code of one Arrow type in the `series-lake-schema/1` vocabulary.
+///
+/// The vocabulary covers every type a dataset schema can hold, plus the other
+/// fixed-width integers and floats so that a future intrinsic column of one of
+/// those types needs no vocabulary change. Anything else renders as `Unk<>`;
+/// no dataset schema produces it, which a unit test asserts for every dataset.
+fn render_type(dt: &DataType, out: &mut String) {
+    match dt {
+        DataType::Boolean => out.push_str("Bol"),
+        DataType::Int8 => out.push_str("I8"),
+        DataType::Int16 => out.push_str("I16"),
+        DataType::Int32 => out.push_str("I32"),
+        DataType::Int64 => out.push_str("I64"),
+        DataType::UInt8 => out.push_str("U8"),
+        DataType::UInt16 => out.push_str("U16"),
+        DataType::UInt32 => out.push_str("U32"),
+        DataType::UInt64 => out.push_str("U64"),
+        DataType::Float32 => out.push_str("F32"),
+        DataType::Float64 => out.push_str("F64"),
+        DataType::Utf8 => out.push_str("Str"),
+        DataType::Binary => out.push_str("Bin"),
+        DataType::FixedSizeBinary(n) => out.push_str(&format!("FSB<{n}>")),
+        DataType::Timestamp(unit, tz) => {
+            let unit = match unit {
+                TimeUnit::Second => "s",
+                TimeUnit::Millisecond => "ms",
+                TimeUnit::Microsecond => "us",
+                TimeUnit::Nanosecond => "ns",
+            };
+            out.push_str(&format!("Ts<{unit},{}>", tz.as_deref().unwrap_or("")));
+        }
+        DataType::List(item) => {
+            out.push('[');
+            render_field_type(item, out);
+            out.push(']');
+        }
+        DataType::Map(entries, _) => {
+            out.push_str("Map<");
+            if let DataType::Struct(kv) = entries.data_type()
+                && kv.len() == 2
+            {
+                render_field_type(&kv[0], out);
+                out.push(',');
+                render_field_type(&kv[1], out);
+            }
+            out.push('>');
+        }
+        _ => out.push_str("Unk<>"),
+    }
+}
+
+/// xxh3_64 (seed 0) of [`schema_rendering`]'s UTF-8 bytes, rendered in file
+/// metadata as 16 lowercase hex digits.
+#[must_use]
+pub fn schema_fingerprint(schema: &Schema) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(schema_rendering(schema).as_bytes())
 }
 
 #[cfg(test)]
@@ -251,24 +337,89 @@ mod tests {
     /// Scenario: the default `logs_values` schema, whose column set and types
     /// are frozen for format version 1.
     /// Guarantees: the fingerprint is exactly this value. A change to any
-    /// column's name, type or position changes it, so this test pins the
-    /// serialization the readers in `docs/FORMAT.md` are told to compare.
+    /// column's name, type, nullability or position changes it, so this test
+    /// pins the rendering the readers in `docs/FORMAT.md` are told to compare.
+    /// Every dataset's golden rendering and fingerprint is pinned in
+    /// `tests/golden.rs` against the vectors `tools/gen_golden.py` computes.
     #[test]
     fn golden_fingerprint_of_the_default_logs_values_schema() {
         let cfg = LakeConfig::default();
         let fp = schema_fingerprint(&dataset_schema(Dataset::LogsValues, &cfg));
-        assert_eq!(fp, 0xaf2f_139c_9bdf_7b07_u64, "{fp:#018x}");
+        assert_eq!(fp, 0x0151_2d4e_b446_f355_u64, "{fp:#018x}");
     }
 
-    /// Scenario: one string column literally named `a:Utf8;b`, against two
+    /// Scenario: every dataset under the default configuration and under a
+    /// configuration with one denormalized column of each type.
+    /// Guarantees: every column type is inside the crate's own vocabulary, so
+    /// no rendering falls back to `Unk<>` and no fingerprint depends on a type
+    /// the format does not name.
+    #[test]
+    fn every_dataset_column_type_is_in_the_vocabulary() {
+        let mut denorm = LakeConfig::default();
+        for (i, ty) in [
+            DenormType::String,
+            DenormType::Int64,
+            DenormType::Double,
+            DenormType::Bool,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for sig in [&mut denorm.logs, &mut denorm.metrics] {
+                sig.denormalize.push(Denormalize {
+                    path: format!("resource.k{i}"),
+                    column: format!("c{i}"),
+                    ty,
+                });
+            }
+        }
+        for cfg in [LakeConfig::default(), denorm] {
+            for ds in Dataset::ALL {
+                let r = schema_rendering(&dataset_schema(ds, &cfg));
+                assert!(r.starts_with("series-lake-schema/1\n"), "{r}");
+                assert!(!r.contains("Unk<"), "{ds:?}: {r}");
+            }
+        }
+    }
+
+    /// Scenario: two schemas that differ only in whether one column is
+    /// nullable, and two that differ only in the nullability of a list item.
+    /// Guarantees: nullability is part of the fingerprint at the top level and
+    /// inside nested types, so a required column and a nullable one never
+    /// share a compaction scope.
+    #[test]
+    fn nullability_changes_the_fingerprint() {
+        let one = |nullable| Schema::new(vec![Field::new("a", DataType::Int64, nullable)]);
+        assert_ne!(
+            schema_fingerprint(&one(true)),
+            schema_fingerprint(&one(false))
+        );
+        let list = |nullable| {
+            Schema::new(vec![Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, nullable))),
+                true,
+            )])
+        };
+        assert_eq!(
+            schema_rendering(&list(false)),
+            "series-lake-schema/1\n1:l7:[I64!]?\n"
+        );
+        assert_ne!(
+            schema_fingerprint(&list(true)),
+            schema_fingerprint(&list(false))
+        );
+    }
+
+    /// Scenario: one string column literally named `a:Str;b`, against two
     /// string columns named `a` and `b`. Under a `name:type;` join both
-    /// serialize to `a:Utf8;b:Utf8;`.
+    /// serialize to `a:Str;b:Str;`.
     /// Guarantees: the length-prefixed serialization keeps them apart, so a
     /// column name holding the old delimiters cannot forge another schema's
     /// fingerprint.
     #[test]
     fn delimiter_bearing_names_do_not_collide() {
-        let one = Schema::new(vec![Field::new("a:Utf8;b", DataType::Utf8, true)]);
+        let one = Schema::new(vec![Field::new("a:Str;b", DataType::Utf8, true)]);
         let two = Schema::new(vec![
             Field::new("a", DataType::Utf8, true),
             Field::new("b", DataType::Utf8, true),
