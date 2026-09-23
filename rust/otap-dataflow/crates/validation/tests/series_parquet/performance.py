@@ -5069,8 +5069,11 @@ def run_attribution_child(plan, job, output_dir, report_dir):
         attribution_experiment(plan, job, spec, result, directory, controls)
 
     try:
+        # On a host other measurements share, a repetition may wait its turn
+        # for the lease; it measures nothing until it holds it.
         result = command.run_case(
             spec, run_dir, experiment=experiment, report_dir=report_dir, evaluate=False,
+            lease_wait_s=plan.get("lease_wait_s", 0.0),
         )
     except (KeyboardInterrupt, SystemExit):
         raise
@@ -5706,6 +5709,7 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
     plan = {
         "profile": not rehearsal,
         "repetitions": repetitions,
+        "lease_wait_s": float(options.get("lease_wait_s", 0.0)),
         "minimum_samples": int(options.get("minimum_samples", ATTRIBUTION_MINIMUM_SAMPLES)),
         "allocation": allocation,
         "oracle_cores": oracle_cores(allocation, topology["sibling_groups"]),

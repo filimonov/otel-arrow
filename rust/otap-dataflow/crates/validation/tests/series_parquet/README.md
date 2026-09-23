@@ -137,7 +137,9 @@ are recorded in the index). The flush wall time that is not flush-task CPU
 is reported as `upload_wait_s`, outside the CPU shares. `--option
 rehearsal=true` runs the control lifetimes alone into the output directory
 and publishes nothing; `--option records=...`, `cpu_ns_per_record=...`,
-`repetitions=...` and `configs=[...]` adjust the family.
+`repetitions=...` and `configs=[...]` adjust the family, and `--option
+lease_wait_s=...` lets each repetition wait that long for the host lease
+another measurement holds, instead of being refused.
 
 The remaining subcommands (`capacity`, `memory`, `soak`, `fault-preflight`,
 `failures`, `buffered`, `remediate`, `report`) are named here so the command
