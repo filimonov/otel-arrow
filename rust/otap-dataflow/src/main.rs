@@ -118,12 +118,16 @@ cfg_if! {
 /// thread, and the measured exporter engine's by 1.4 to 6.6 percent with it
 /// (retention right after an allocation burst still varies). jemalloc reads
 /// this weak symbol before the `MALLOC_CONF` environment variable, so the
-/// environment still overrides or extends it. The symbol is `malloc_conf` because the
-/// `unprefixed_malloc_on_supported_platforms` feature leaves jemalloc's
-/// symbols unprefixed on Linux; background threads need Linux pthreads, so
-/// the option is set there only.
+/// environment still overrides or extends it. The symbol is `malloc_conf`
+/// because the `unprefixed_malloc_on_supported_platforms` feature leaves
+/// jemalloc's symbols unprefixed on Linux. It is set on glibc Linux only:
+/// tikv-jemalloc-sys lists musl among the targets where jemalloc's
+/// background threads do not work, so a musl build keeps jemalloc's own
+/// default (no background thread, and the startup line says `off`), as does
+/// every other target.
 #[cfg(all(
     target_os = "linux",
+    target_env = "gnu",
     not(feature = "dhat-heap"),
     not(feature = "mimalloc"),
     feature = "jemalloc"
@@ -359,12 +363,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    /// Scenario: a default Linux build, whose global allocator is jemalloc,
-    /// reads jemalloc's own record of its startup options.
+    /// Scenario: a default glibc Linux build, whose global allocator is
+    /// jemalloc, reads jemalloc's own record of its startup options, in a
+    /// test process started without `MALLOC_CONF`.
     /// Guarantees: the compiled-in configuration was read, so jemalloc
-    /// started with its background purging thread on.
+    /// started with its background purging thread on. `MALLOC_CONF` is read
+    /// after it and may legitimately turn the thread off, so a process that
+    /// inherited one cannot observe the default and says so instead of
+    /// asserting.
     #[cfg(all(
         target_os = "linux",
+        target_env = "gnu",
         not(feature = "dhat-heap"),
         not(feature = "mimalloc"),
         feature = "jemalloc"
@@ -372,6 +381,13 @@ mod tests {
     #[test]
     fn jemalloc_starts_with_its_background_thread() {
         assert_eq!(memory_allocator_name(), "jemalloc");
+        if let Some(conf) = std::env::var_os("MALLOC_CONF") {
+            eprintln!(
+                "skipped: MALLOC_CONF={conf:?} overrides the compiled-in default, which this \
+                 process therefore cannot observe"
+            );
+            return;
+        }
         assert_eq!(
             otel_arrow_dfe_engine::memory_limiter::jemalloc_background_thread(),
             Some(true)

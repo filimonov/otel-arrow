@@ -1036,13 +1036,14 @@ at workspace, not at retained block data.
 
 ### Memory model
 
-On Linux the engine starts jemalloc with its background purging thread (the
-startup line `INFO memory allocator jemalloc, background_thread on` says so).
-Without it, freed pages go back to the kernel only while the process keeps
-allocating, so the quiet RSS of identical engines spread by up to 23 percent
-between runs; with it, the exporter engine's quiet RSS spread by 1.4 to 6.6
-percent. Retention right after an allocation burst still varies by several
-MiB. `MALLOC_CONF` overrides the setting.
+On glibc Linux the engine starts jemalloc with its background purging thread
+(the startup line `INFO memory allocator jemalloc, background_thread on` says
+so; musl builds keep jemalloc's default and say `off`). Without it, freed
+pages go back to the kernel only while the process keeps allocating: a
+series_parquet engine's quiet RSS spread by 15 to 34 percent between
+identical runs, and by 1.4 to 6.6 percent with it. Retention right after an
+allocation burst still varies by several MiB, so a short-lived process's
+RSS stays less predictable. `MALLOC_CONF` overrides the setting.
 
 Per worker, let B be `window.max_block_bytes`, E
 `ingress.max_extracted_bytes`, C the configured

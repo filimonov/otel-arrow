@@ -8,7 +8,7 @@ change_type: enhancement
 component: engine
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: On Linux, df_engine now starts jemalloc with its background purging thread, so freed memory returns to the OS while the engine is quiet and RSS is predictable.
+note: On glibc Linux, df_engine now starts jemalloc with its background purging thread, so freed memory returns to the OS while the engine is quiet.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Measured: quiet RSS of identical engines spread up to 23 percent without
-  the thread; with it the exporter engine's spread 1.4 to 6.6 percent.
-  `MALLOC_CONF` still overrides it (`background_thread:false`). Startup
-  prints the allocator and its background_thread state.
+  Measured on a series_parquet engine: quiet RSS spread 15 to 34 percent
+  between identical runs without the thread, 1.4 to 6.6 percent with it.
+  `MALLOC_CONF` still overrides it. musl builds keep jemalloc's default.
+  Startup prints the allocator and its background_thread state.
