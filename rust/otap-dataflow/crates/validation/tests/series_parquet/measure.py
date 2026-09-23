@@ -29,12 +29,13 @@ except ImportError:  # Imported by path, e.g. from an ad hoc script.
 
 
 # Subcommands whose measurement is long enough that it must be asked for.
-LONG_COMMANDS = ("stages", "capacity", "memory", "soak", "failures", "buffered")
+LONG_COMMANDS = (
+    "stages", "attribution", "capacity", "memory", "soak", "failures", "buffered",
+)
 
 # Subcommands later tasks own. They are named here so that the command line
 # is one contract rather than a set that grows behind the plan.
 PLANNED_COMMANDS = (
-    "attribution",
     "capacity",
     "memory",
     "soak",
@@ -691,19 +692,7 @@ def settle_local_result(result, spec, phases, oracle, counts, latencies, output_
         )
     )
     summaries = result["observations"]["phases"]
-    problems = []
-    for summary in summaries:
-        if summary["sampler_errors"]:
-            problems.append(f"{summary['label']}: {len(summary['sampler_errors'])} sampler errors")
-        for worker in summary["workers"] or []:
-            answered = summary["answered_epochs_by_worker"].get(worker["key"], 0)
-            if answered < MINIMUM_EPOCHS:
-                problems.append(
-                    f"{summary['label']}: {worker['key']} answered {answered} epochs"
-                )
-        for key, gap in summary["stale_gap_s_by_worker"].items():
-            if gap > STALE_COLLECTIONS * REPORTING_INTERVAL_S + SAMPLE_PERIOD_S:
-                problems.append(f"{summary['label']}: {key} stale for {gap:.2f}s")
+    problems = sample_problems(summaries)
     checks.append(
         measurement.check(
             "minimum_samples",
@@ -790,6 +779,29 @@ def settle_local_result(result, spec, phases, oracle, counts, latencies, output_
         if path.is_file()
     ]
     result["status"] = measurement.STATUS_PASSED
+
+
+def sample_problems(summaries) -> list:
+    """Why the engine lifetimes in `summaries` are not enough of a sample.
+
+    Every lifetime must have sampled without errors, every worker must have
+    answered `MINIMUM_EPOCHS` collection epochs, and no worker's uptime may
+    have gone stale for more than `STALE_COLLECTIONS` collections.
+    """
+    problems = []
+    for summary in summaries:
+        if summary["sampler_errors"]:
+            problems.append(f"{summary['label']}: {len(summary['sampler_errors'])} sampler errors")
+        for worker in summary["workers"] or []:
+            answered = summary["answered_epochs_by_worker"].get(worker["key"], 0)
+            if answered < MINIMUM_EPOCHS:
+                problems.append(
+                    f"{summary['label']}: {worker['key']} answered {answered} epochs"
+                )
+        for key, gap in summary["stale_gap_s_by_worker"].items():
+            if gap > STALE_COLLECTIONS * REPORTING_INTERVAL_S + SAMPLE_PERIOD_S:
+                problems.append(f"{summary['label']}: {key} stale for {gap:.2f}s")
+    return problems
 
 
 def harness_local_case(output_dir, report_dir=None, **options) -> dict:
@@ -1292,6 +1304,13 @@ def build_parser() -> argparse.ArgumentParser:
         "stage-results", help="git add one published evidence tree"
     )
     _ = stage.add_argument("--index", required=True, type=Path)
+    attribution = sub.add_parser(
+        "attribution",
+        help="profile the real engine with perf and reconcile its CPU shares "
+        "with the stage family",
+    )
+    _ = attribution.add_argument("--output-dir", required=True, type=Path)
+    _ = attribution.add_argument("--option", action="append", default=[])
     rescrub = sub.add_parser(
         "rescrub",
         help="scrub one published evidence tree in place and re-hash it",
@@ -1305,6 +1324,11 @@ def build_parser() -> argparse.ArgumentParser:
         _ = planned.add_argument("--finding", type=Path)
         _ = planned.add_argument("--option", action="append", default=[])
     return parser
+
+
+# The exit status of an attribution the host could not profile: neither a
+# pass nor a measured failure, so a caller can tell the two apart.
+ATTRIBUTION_SKIPPED_EXIT = 3
 
 
 def main(argv=None) -> int:
@@ -1339,6 +1363,24 @@ def main(argv=None) -> int:
             f"{result['run_id']}: {result['status']} "
             f"{json.dumps(result['metrics'], sort_keys=True)}\n"
         )
+        return 0 if result["status"] == measurement.STATUS_PASSED else 1
+    if arguments.command == "attribution":
+        try:
+            from . import performance
+        except ImportError:
+            import performance
+        options = parse_options(arguments.option)
+        result = performance.run_attribution(
+            performance.attribution_spec(**options), arguments.output_dir, **options
+        )
+        sys.stderr.write(
+            f"{result['run_id']}: {result['status']} "
+            f"{result.get('acceptance', {}).get('mandatory')} "
+            f"{json.dumps(result['metrics'], sort_keys=True)}\n"
+        )
+        if result["status"] == measurement.STATUS_SKIPPED:
+            sys.stderr.write(f"{result['acceptance']['reason']}\n")
+            return ATTRIBUTION_SKIPPED_EXIT
         return 0 if result["status"] == measurement.STATUS_PASSED else 1
     if arguments.command == "run":
         result = run_named(

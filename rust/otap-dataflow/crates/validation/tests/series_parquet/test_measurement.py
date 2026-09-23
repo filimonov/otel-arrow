@@ -4336,5 +4336,702 @@ class HarnessHygieneContracts(unittest.TestCase):
         self.assertTrue(all(kwargs.get("timeout") for _, kwargs in calls))
 
 
+
+# A stand-in for perf that speaks the control-FIFO protocol a real one does:
+# `record` acknowledges enable and disable, writes its data file when it is
+# interrupted, and `script` prints a fixed two-sample profile. With
+# FAKE_PERF_MODE=refuse, `record` fails the way a host with a restrictive
+# perf_event_paranoid makes it fail.
+FAKE_PERF = r"""
+import os, select, signal, sys
+mode = os.environ.get("FAKE_PERF_MODE", "record")
+arguments = sys.argv[1:]
+if arguments[:1] == ["--version"]:
+    print("perf version fake")
+    sys.exit(0)
+if arguments[:1] == ["script"]:
+    print("df_engine  101 [003]  10.000001:    5000000 cpu-clock:u: ")
+    print("\t    55d0a1 otel_arrow_dfe_series_lake::extract::logs::extract_logs+0x12 (/bin/df_engine)")
+    print("\t    55d0a0 main (/bin/df_engine)")
+    print("")
+    print("df_engine  101 [003]  10.005001:    5000000 cpu-clock:u: ")
+    print("\t    55d0b1 parquet::arrow::arrow_writer::ArrowWriter::write+0x9 (/bin/df_engine)")
+    print("\t    55d0b0 main (/bin/df_engine)")
+    print("")
+    sys.exit(0)
+if mode == "refuse":
+    sys.stderr.write("Error:\nAccess to performance monitoring and observability "
+                     "operations is limited.\nperf_event_paranoid setting is 4:\n")
+    sys.exit(255)
+output = arguments[arguments.index("-o") + 1]
+ctl, ack = arguments[arguments.index("--control") + 1].split(":", 1)[1].split(",")
+stop = []
+signal.signal(signal.SIGINT, lambda *_: stop.append(True))
+ctl_fd = os.open(ctl, os.O_RDONLY | os.O_NONBLOCK)
+ack_fd = os.open(ack, os.O_WRONLY)
+pending = b""
+while not stop:
+    ready, _, _ = select.select([ctl_fd], [], [], 0.05)
+    if not ready:
+        continue
+    try:
+        pending += os.read(ctl_fd, 64)
+    except BlockingIOError:
+        continue
+    while b"\n" in pending:
+        line, pending = pending.split(b"\n", 1)
+        if line in (b"enable", b"disable"):
+            os.write(ack_fd, b"ack\n")
+with open(output, "w") as handle:
+    handle.write("fake")
+sys.exit(0)
+"""
+
+
+def fake_perf(case) -> str:
+    """An executable stand-in for perf in a directory of this test's own."""
+    path = temporary_directory(case) / "perf"
+    path.write_text(f"#!{sys.executable}\n{FAKE_PERF}", encoding="ascii")
+    path.chmod(0o755)
+    return str(path)
+
+
+# The shape of a `perf script -F comm,tid,cpu,time,period,event,ip,sym,dso`
+# profile: two samples, innermost frame first, one of them through the
+# kernel, and one line that is neither a header nor a frame.
+PERF_SCRIPT_TEXT = """\
+pipeline-defaul  4242 [001] 12345.000100:    5025125 cpu-clock:
+\tffffffff9a2b1c00 copy_user_enhanced_fast_string+0x10 ([kernel.kallsyms])
+\t    55d0c3a1b2c4 <object_store::aws::client::S3Client>::put_part::{{closure}}+0x44 (/tmp/df_engine)
+\t    55d0c3a1b000 <otel_arrow_dfe_series_lake::sink::Sink>::write_block::<T>::{{closure}}+0x1f (/tmp/df_engine)
+\t    55d0c3a10000 tokio::runtime::task::raw::poll+0x3 (/tmp/df_engine)
+
+pipeline-defaul  4242 [001] 12345.005100:    4999875 cpu-clock:
+\t    55d0c3a2a000 _rjem_malloc+0x5 (/tmp/df_engine)
+\t    55d0c3a29000 otel_arrow_dfe_series_lake::extract::logs::extract_logs+0x800 (/tmp/df_engine)
+\t    55d0c3a28000 [unknown] ([unknown])
+
+this line is neither
+"""
+
+
+class AttributionContracts(unittest.TestCase):
+    """Direct CPU attribution of the real engine and its reconciliation."""
+
+    # Scenario: extraction, encoding and upload have distinct CPU stacks and durations.
+    # Guarantees: overlapping async wall intervals cannot inflate CPU percentages.
+    def test_cpu_attribution_is_exclusive(self):
+        samples = [
+            {"frames": ["Worker::extract", "extract::logs::extract"], "weight": 7},
+            {"frames": ["Sink::write_block", "parquet::arrow::arrow_writer"], "weight": 5},
+            {"frames": ["Sink::write_block", "object_store::client::http"], "weight": 2},
+        ]
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(cpu["extraction"], 7)
+        self.assertEqual(cpu["encoding"], 5)
+        self.assertEqual(cpu["upload"], 2)
+        self.assertEqual(sum(cpu.values()), 14)
+
+    # Scenario: stacks as the release engine produces them -- the allocator
+    # under extraction, Tokio and hyper frames under an object store call,
+    # an Arrow kernel under the merge, a bare scheduler stack, and a stack
+    # of frames no rule knows.
+    # Guarantees: the innermost production frame decides, a runtime frame
+    # never takes a production sample, the runtime fallback still claims
+    # the scheduler's own work, unmatched samples stay unknown, and the
+    # allocator's callers are named.
+    def test_the_innermost_production_frame_decides(self):
+        lake = "otel_arrow_dfe_series_lake"
+        stacks = {
+            "allocator": [
+                "tokio::runtime::task::raw::poll",
+                f"{lake}::extract::logs::extract_logs",
+                "alloc::vec::Vec<T>::push",
+                "<tikv_jemallocator::Jemalloc as core::alloc::global::GlobalAlloc>::alloc",
+                "_rjem_je_malloc_default",
+            ],
+            "upload": [
+                f"<{lake}::sink::Sink>::write_block::{{{{closure}}}}",
+                "<object_store::buffered::BufWriter as tokio::io::AsyncWrite>::poll_write",
+                "hyper::proto::h1::dispatch::Dispatcher::poll",
+                "tokio::net::tcp::stream::TcpStream::poll_write",
+                "__libc_send",
+            ],
+            "sort_seal_merge": [
+                f"<{lake}::sink::Sink>::write_table::{{{{closure}}}}",
+                f"<{lake}::sort::MergeIter as core::iter::traits::iterator::Iterator>::next",
+                "arrow_select::interleave::interleave",
+                "__memmove_avx_unaligned_erms",
+            ],
+            "encoding": [
+                f"<{lake}::sink::Sink>::write_table::{{{{closure}}}}",
+                "parquet::arrow::arrow_writer::ArrowWriter<W>::write",
+                "ZSTD_compressBlock_doubleFast",
+            ],
+            "conversion": [
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::extract",
+                "<otel_arrow_dfe_pdata::otap::OtapArrowRecords as otel_arrow_dfe_pdata::payload::TryFromWithOptions<otel_arrow_dfe_pdata::OtlpProtoBytes>>::try_from_with_options",
+                "otel_arrow_dfe_pdata::encode::encode_logs_otap_batch",
+                "arrow_array::builder::GenericByteBuilder<T>::append_value",
+            ],
+            "buffer": [
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::offer",
+                f"<{lake}::buffer::Block<T>>::admit",
+                f"{lake}::cache::SeriesCache::is_committed",
+            ],
+            "engine_runtime": [
+                "std::sys::pal::unix::thread::Thread::new::thread_start",
+                "tokio::runtime::scheduler::current_thread::CurrentThread::block_on",
+                "mio::poll::Poll::poll",
+                "epoll_wait",
+            ],
+            "unknown": ["[unknown]", "__memmove_avx_unaligned_erms"],
+        }
+        samples = [
+            {"frames": frames, "weight": 3} for frames in stacks.values()
+        ]
+        for category, frames in stacks.items():
+            with self.subTest(category=category):
+                self.assertEqual(performance.classify_frames(frames)[0], category)
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(sum(cpu.values()), 3 * len(stacks))
+        self.assertEqual(set(cpu), set(performance.CPU_CATEGORIES))
+        callers = performance.allocator_callers(samples)
+        self.assertEqual(callers["extraction"], 3)
+        self.assertEqual(sum(callers.values()), cpu["allocator"])
+
+    # Scenario: a sample with a zero, negative, fractional or boolean weight,
+    # or without a list of frames.
+    # Guarantees: it is refused rather than added, and an empty stack is an
+    # unknown sample, not an error.
+    def test_invalid_samples_are_refused(self):
+        for weight in (0, -1, 1.5, True, None):
+            with self.subTest(weight=weight):
+                with self.assertRaises(ValueError):
+                    _ = performance.classify_cpu([{"frames": ["main"], "weight": weight}])
+        with self.assertRaises(ValueError):
+            _ = performance.classify_cpu([{"frames": "main", "weight": 1}])
+        self.assertEqual(
+            performance.classify_cpu([{"frames": [], "weight": 4}])["unknown"], 4
+        )
+
+    # Scenario: demangled Rust symbols with offsets, legacy hashes, generic
+    # arguments, turbofish, trait impls and nested qualified paths.
+    # Guarantees: each reduces to the implementing type's module path, which
+    # is what a rule prefix matches.
+    def test_frame_paths_drop_rust_symbol_syntax(self):
+        cases = {
+            "<otel_arrow_dfe_series_lake::sink::Sink>::write_block::<u8>::{{closure}}+0x1f":
+                "otel_arrow_dfe_series_lake::sink::Sink::write_block::{{closure}}",
+            "otel_arrow_dfe_series_lake::extract::metrics::extract_metrics::h0123456789abcdef":
+                "otel_arrow_dfe_series_lake::extract::metrics::extract_metrics",
+            "<alloc::vec::Vec<T,A> as core::ops::drop::Drop>::drop":
+                "alloc::vec::Vec::drop",
+            "<&mut F as core::ops::function::FnOnce<A>>::call_once": "F::call_once",
+            "<<tokio::runtime::task::Task<S> as X>::Output as Y>::poll":
+                "tokio::runtime::task::Task::Output::poll",
+            "<[otel_arrow_dfe_series_lake::value::Value] as Z>::to_vec":
+                "otel_arrow_dfe_series_lake::value::Value]::to_vec",
+        }
+        for symbol, path in cases.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(performance.frame_path(symbol), path)
+        self.assertEqual(
+            performance.classify_frame(
+                "<[otel_arrow_dfe_series_lake::value::Value] as Z>::to_vec", 1
+            ),
+            "extraction",
+        )
+
+    # Scenario: the text `perf script` prints for two samples, one through
+    # the kernel, followed by a stray line.
+    # Guarantees: frames come out outermost first with their period as the
+    # weight, the kernel sample is marked, and the stray line is counted,
+    # never silently dropped.
+    def test_perf_script_is_parsed_outermost_first(self):
+        parsed = performance.parse_perf_script(PERF_SCRIPT_TEXT)
+        samples = parsed["samples"]
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(parsed["unparsed_lines_count"], 1)
+        first, second = samples
+        self.assertEqual(first["weight"], 5025125)
+        self.assertEqual((first["comm"], first["tid"], first["cpu"]), ("pipeline-defaul", 4242, 1))
+        self.assertEqual(first["frames"][0], "tokio::runtime::task::raw::poll+0x3")
+        self.assertEqual(first["frames"][-1], "copy_user_enhanced_fast_string+0x10")
+        self.assertTrue(first["kernel"])
+        self.assertFalse(second["kernel"])
+        self.assertEqual(performance.classify_frames(first["frames"])[0], "upload")
+        self.assertEqual(performance.classify_frames(second["frames"])[0], "allocator")
+        cpu = performance.classify_cpu(samples)
+        self.assertEqual(cpu["upload"] + cpu["allocator"], 5025125 + 4999875)
+
+    # Scenario: a profile of ten samples, three of them unknown, one inside
+    # the flush task.
+    # Guarantees: shares are by weight and add up to one, each has the
+    # binomial interval of its sample count, CPU seconds are split by
+    # logical CPU and thread, and the unknown share is named by its leaf.
+    def test_profile_summary_states_shares_intervals_and_the_residual(self):
+        flush = "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::flush::write_until::{{closure}}"
+        samples = (
+            [{"frames": ["otel_arrow_dfe_series_lake::extract::extract"], "weight": 10,
+              "cpu": 1, "comm": "worker"}] * 6
+            + [{"frames": [flush, "parquet::file::writer::write"], "weight": 10,
+                "cpu": 2, "comm": "worker"}]
+            + [{"frames": ["__memcpy_evex"], "weight": 10, "cpu": 1, "comm": "other"}] * 3
+        )
+        summary = performance.profile_summary(samples)
+        categories = summary["categories"]
+        self.assertAlmostEqual(sum(entry["share_ratio"] for entry in categories.values()), 1.0)
+        self.assertAlmostEqual(categories["extraction"]["share_ratio"], 0.6)
+        self.assertAlmostEqual(
+            categories["extraction"]["share_ci95_ratio"], 1.96 * (0.6 * 0.4 / 10) ** 0.5
+        )
+        self.assertEqual(summary["classified_samples_count"], 7)
+        self.assertEqual(summary["flush_task_weight"], 10)
+        self.assertEqual(summary["cpu_s_by_logical_cpu"], {"1": 90e-9, "2": 10e-9})
+        self.assertEqual(summary["named_residual"][0]["symbol"], "__memcpy_evex")
+
+    # Scenario: the rules are recorded with a result.
+    # Guarantees: every category is named, every rule states its pass, its
+    # pattern and why, and the decision procedure is written down.
+    def test_the_mapping_rules_are_retained(self):
+        rules = performance.classification_rules()
+        self.assertEqual(rules["categories"], list(performance.CPU_CATEGORIES))
+        self.assertIn("innermost", rules["decision"])
+        self.assertTrue(all({"pass", "category", "pattern", "why"} <= set(rule)
+                            for rule in rules["rules"]))
+        named = {rule["category"] for rule in rules["rules"]}
+        self.assertEqual(named, set(performance.CPU_CATEGORIES) - {"unknown"})
+
+    # Scenario: a logs and a metrics workload are prebuilt, and the logs one
+    # is asked for again.
+    # Guarantees: every request read back is byte for byte what
+    # `build_request` returns, records included, and an identical input is
+    # reused rather than rebuilt.
+    def test_prebuilt_requests_are_the_built_requests(self):
+        root = temporary_directory(self)
+        for signal_name, workload in (
+            ("logs", Workload(requests=7, records_per_request=5, body_bytes=64,
+                              series=3, metrics_every=4)),
+            ("metrics", Workload(requests=4, records_per_request=9, series=5,
+                                 metrics_every=1)),
+        ):
+            prebuilt = performance.PrebuiltRequests.build(
+                workload, signal_name, root / signal_name, processes=0
+            )
+            self.addCleanup(prebuilt.close)
+            self.assertEqual(
+                prebuilt.indexes, performance.request_indexes(workload, signal_name)
+            )
+            for index in prebuilt.indexes:
+                self.assertEqual(prebuilt.request(index), build_request(workload, index))
+            self.assertEqual(
+                prebuilt.sidecar["records"],
+                len(prebuilt.indexes) * workload.records_per_request,
+            )
+        logs = Workload(requests=7, records_per_request=5, body_bytes=64, series=3,
+                        metrics_every=4)
+        before = (root / "logs" / "sidecar.json").read_text(encoding="ascii")
+        again = performance.PrebuiltRequests.build(logs, "logs", root / "logs", processes=0)
+        self.addCleanup(again.close)
+        self.assertEqual((root / "logs" / "sidecar.json").read_text(encoding="ascii"), before)
+
+    # Scenario: the logs workload is sized for a profile at 5 us of engine
+    # CPU per record over three repetitions.
+    # Guarantees: the stage family's shape is kept, the logs requests are a
+    # whole number of blocks carrying enough records for the sample target
+    # with its margin, and the total is the smallest that carries them.
+    def test_the_profile_is_sized_for_the_sample_target(self):
+        workload = performance.attribution_workload(
+            "logs-1k-stable", 5000.0, repetitions=3
+        )
+        base = performance.WORKLOAD_CONFIGS["logs-1k-stable"]["workload"]
+        for field in ("records_per_request", "body_bytes", "series", "metrics_every", "seed"):
+            self.assertEqual(getattr(workload, field), getattr(base, field))
+        logs = performance.signal_request_count(workload, "logs")
+        self.assertEqual(logs % performance.ATTRIBUTION_BLOCK_REQUESTS, 0)
+        self.assertEqual(logs, len(performance.request_indexes(workload, "logs")))
+        cpu_s = logs * workload.records_per_request * 5000.0 / 1e9
+        expected = cpu_s * performance.PERF_FREQUENCY_HZ * 3
+        self.assertGreaterEqual(
+            expected,
+            performance.ATTRIBUTION_MINIMUM_SAMPLES * performance.ATTRIBUTION_SAMPLE_MARGIN,
+        )
+        shorter = measurement.dataclasses.replace(workload, requests=workload.requests - 1)
+        self.assertLess(performance.signal_request_count(shorter, "logs"), logs)
+        with self.assertRaisesRegex(AssertionError, "positive reference"):
+            _ = performance.attribution_workload("metrics-mixed", 0, repetitions=3)
+
+    # Scenario: a profiled and a control lifetime take their requests from
+    # one prebuilt input of 1,000 blocks, and from one of a single block.
+    # Guarantees: the profiled lifetime sends everything, the control sends
+    # the first third in whole blocks, and never less than one block.
+    def test_the_control_lifetime_sends_a_whole_block_prefix(self):
+        block = performance.ATTRIBUTION_BLOCK_REQUESTS
+        indexes = list(range(1000 * block))
+        self.assertEqual(performance.lifetime_indexes(indexes, profiled=True), indexes)
+        control = performance.lifetime_indexes(indexes, profiled=False)
+        self.assertEqual(control, indexes[: 333 * block])
+        self.assertEqual(len(control) % block, 0)
+        single = list(range(block))
+        self.assertEqual(performance.lifetime_indexes(single, profiled=False), single)
+
+    # Scenario: the campaign's pin, physical cores 0-7 with their SMT
+    # siblings, is offered to an attribution family.
+    # Guarantees: the observability core, the engine's four-core
+    # reservation, the producer, the store and the profiler each own a
+    # physical core, eight in all, and no reader is claimed.
+    def test_the_attribution_roles_fit_the_campaign_pin(self):
+        groups = [[core, core + 16] for core in range(16)]
+        pinned = list(range(8)) + list(range(16, 24))
+        allocation = measurement.role_allocation(
+            groups, pinned, [1], roles=measurement.CASE_ROLES["attribution"]
+        )
+        self.assertEqual(
+            allocation,
+            {
+                "engine_observability": [0],
+                "engine": [1],
+                "engine_reserved": [2, 3, 4],
+                "producer": [5],
+                "store": [6],
+                "profiler": [7],
+            },
+        )
+
+    # Scenario: two telemetry documents of one worker, before and after a
+    # window with two flushes, the admin API serving the flush instrument
+    # cumulatively.
+    # Guarantees: the window's flushes are the difference of the readings,
+    # a worker with no flush yet reads as none, and a reading that goes
+    # backwards is an error, never a negative wall time.
+    def test_flush_wall_time_is_a_difference_of_cumulative_readings(self):
+        def document(sum_s, count, max_s):
+            built = telemetry(5)
+            if count is not None:
+                built["metric_sets"][1]["metrics"].append(
+                    {"name": "flush.duration",
+                     "value": {"min": 0.1, "max": max_s, "sum": sum_s, "count": count}}
+                )
+            return built
+
+        before = performance.flush_reading(document(0.0, None, 0.0))
+        self.assertEqual(before["count"], 0)
+        middle = performance.flush_reading(document(0.5, 1, 0.5))
+        after = performance.flush_reading(document(1.25, 3, 0.5))
+        window = performance.flush_window(middle, after)
+        self.assertEqual(window["flush_count"], 2)
+        self.assertAlmostEqual(window["flush_wall_s"], 0.75)
+        with self.assertRaisesRegex(AssertionError, "backwards"):
+            _ = performance.flush_window(after, middle)
+
+    # Scenario: a worker thread and a helper thread over a two-second window,
+    # and a thread that started inside it.
+    # Guarantees: the worker's window splits into on-CPU, run-queue and
+    # off-CPU fractions that add up to one, and every thread is listed with
+    # its role.
+    def test_thread_schedule_splits_the_window(self):
+        before = {
+            10: {"comm": "pipeline-defaul", "on_cpu_ns": 1_000, "runqueue_wait_ns": 0,
+                 "timeslices_count": 1},
+            11: {"comm": "tokio-rt", "on_cpu_ns": 0, "runqueue_wait_ns": 0,
+                 "timeslices_count": 0},
+        }
+        after = {
+            10: {"comm": "pipeline-defaul", "on_cpu_ns": 1_000 + 1_200_000_000,
+                 "runqueue_wait_ns": 200_000_000, "timeslices_count": 9},
+            11: {"comm": "tokio-rt", "on_cpu_ns": 100_000_000, "runqueue_wait_ns": 0,
+                 "timeslices_count": 2},
+            12: {"comm": "new", "on_cpu_ns": 5, "runqueue_wait_ns": 0,
+                 "timeslices_count": 1},
+        }
+        schedule = performance.thread_schedule(before, after, 2_000_000_000, {10})
+        worker = schedule["workers"]["10"]
+        self.assertAlmostEqual(worker["on_cpu_ratio"], 0.6)
+        self.assertAlmostEqual(worker["runqueue_wait_ratio"], 0.1)
+        self.assertAlmostEqual(worker["off_cpu_ratio"], 0.3)
+        roles = {thread["tid"]: thread["role"] for thread in schedule["threads"]}
+        self.assertEqual(roles, {10: "worker", 11: "other", 12: "other"})
+        self.assertTrue(schedule["threads"][2]["started_in_window"])
+
+    # Scenario: the preflight profiles a busy process through a stand-in
+    # perf that speaks the control-FIFO protocol, and again through one
+    # that refuses the way perf_event_paranoid 4 makes perf refuse.
+    # Guarantees: the preflight passes only when perf attached,
+    # acknowledged enable and disable and produced an unwound sample; a
+    # refusal is reported with perf's own words, and nothing is left
+    # running either way.
+    def test_the_preflight_proves_the_recording_or_names_the_refusal(self):
+        perf = fake_perf(self)
+        attached = performance.perf_preflight(temporary_directory(self), perf=perf)
+        self.assertTrue(attached["attached"], attached)
+        self.assertEqual(attached["unwound_samples_count"], 2)
+        self.assertEqual(attached["record_returncode"], 0)
+        with mock.patch.dict(os.environ, {"FAKE_PERF_MODE": "refuse"}):
+            refused = performance.perf_preflight(temporary_directory(self), perf=perf)
+        self.assertFalse(refused["attached"])
+        self.assertIn("perf exited with 255", refused["reason"])
+        self.assertIn("perf_event_paranoid", refused["perf_log_tail"])
+        missing = performance.perf_preflight(
+            temporary_directory(self), perf="/no/such/perf"
+        )
+        self.assertFalse(missing["attached"])
+        self.assertIn("no perf executable", missing["reason"])
+
+    # Scenario: the attribution command runs on a host where perf cannot
+    # attach.
+    # Guarantees: nothing is built, no store is started and no repetition
+    # runs; the published index is skipped with a failed perf_attached
+    # check, the preflight's evidence and acceptance marked incomplete, and
+    # the command exits with the skipped status, not success.
+    def test_a_host_that_cannot_profile_publishes_an_incomplete_index(self):
+        report = temporary_directory(self)
+        output = temporary_directory(self)
+        refusal = {"attached": False, "perf_event_paranoid": 4,
+                   "reason": "perf exited with 255 before acknowledging enable"}
+        allocation = {"engine_observability": [0], "engine": [1],
+                      "engine_reserved": [2, 3, 4], "producer": [5], "store": [6],
+                      "profiler": [7]}
+        with mock.patch.object(performance, "perf_preflight", return_value=refusal), \
+                mock.patch.object(measurement, "role_allocation", return_value=allocation), \
+                mock.patch.object(measure, "prepare_build",
+                                  side_effect=AssertionError("must not build")), \
+                mock.patch.object(measurement.test_e2e, "DockerStore",
+                                  side_effect=AssertionError("must not start a store")), \
+                mock.patch.dict(os.environ, {"SERIES_MEASURE_LONG": "1"}):
+            code = measure.main([
+                "attribution", "--output-dir", str(output),
+                "--option", f"report_dir={report}", "--option", "cores=[1]",
+            ])
+        self.assertEqual(code, measure.ATTRIBUTION_SKIPPED_EXIT)
+        index = json.loads((report / "attribution.json").read_text(encoding="ascii"))
+        self.assertEqual(index["status"], measurement.STATUS_SKIPPED)
+        self.assertEqual(index["acceptance"]["mandatory"], "incomplete")
+        self.assertEqual(index["preflight"]["perf_event_paranoid"], 4)
+        checks = {entry["name"]: entry for entry in index["checks"]}
+        self.assertEqual(checks["perf_attached"]["status"], measurement.STATUS_FAILED)
+        self.assertEqual(index["run_files"], [])
+        self.assertEqual(index["metrics"]["children_count"], 0)
+        self.assertEqual(index["classification"]["categories"],
+                         list(performance.CPU_CATEGORIES))
+
+    def evidence(self, *, verified=True, spot_extract=800.0):
+        """Two stage families as the reconciliation reads them."""
+        def summary(cost):
+            return {
+                "metrics": dict({name: 1.0 for name in performance.STAGE_METRICS},
+                                cpu_ns_per_record=cost,
+                                output_bytes_per_input_record=100.0),
+                "input_representation": "otlp_wire_bytes",
+                "output_representation": "otap_arrow_records",
+                "denominator": performance.DENOMINATOR,
+                "repetitions": 3,
+            }
+
+        config = "metrics-mixed"
+        costs = {"convert": 500.0, "extract": 1400.0, "sort_seal": 350.0,
+                 "merge": 100.0, "encode": 220.0, "upload": 15.0,
+                 "otlp_noop": 300.0, "otlp_minio": 3000.0}
+        modes = {"upload": "async", "otlp_minio": "async", "otlp_noop": "pipeline"}
+        pinned = {
+            f"{stage}/{modes.get(stage, 'isolated')}/{config}": summary(cost)
+            for stage, cost in costs.items()
+        }
+        spot = {f"extract/isolated/{config}": summary(spot_extract)}
+        return {
+            "pinned": {"index": "stages.json", "present": True, "verified": verified,
+                       "expected_sha256": "a" * 64, "file": {"sha256": "b" * 64},
+                       "summaries": pinned},
+            "spot": {"index": "stages-spot.json", "present": True, "verified": True,
+                     "git": {"revision": "r1"}, "summaries": spot},
+        }
+
+    def aggregate(self):
+        """One workload's aggregate as reconciliation reads it."""
+        categories = {name: {"share_ratio": 0.0} for name in performance.CPU_CATEGORIES}
+        categories["extraction"]["share_ratio"] = 0.25
+        return {
+            "workload_config_id": "metrics-mixed",
+            "environment": {"git": {"revision": "r1"}},
+            "metrics": dict(
+                {f"{name}_cpu_ns_per_record": 0.0 for name in performance.CPU_CATEGORIES},
+                engine_cpu_ns_per_record=3200.0,
+                extraction_cpu_ns_per_record=800.0,
+                upload_wait_s=4.0,
+                flush_wall_s=6.0,
+            ),
+            "checks": [measurement.check("attribution_exclusive", measurement.CHECK_HARD,
+                                         measurement.STATUS_PASSED)],
+            "observations": {"pooled_profile": {
+                "categories": categories,
+                "allocator_callers_share_ratio": {"extraction": 0.025},
+            }},
+        }
+
+    # Scenario: a metrics workload's attributed extraction cost is joined
+    # with the pinned family, whose extraction predates Task 3c's memo, and
+    # a spot family re-measured at the attribution's revision.
+    # Guarantees: the spot family is the preferred reference where it
+    # measured the stage, the pinned cost is kept beside it, the allocator
+    # samples extraction caused are added back before comparing, the known
+    # deviation is stated, the whole engine is compared with the noop
+    # pipeline plus the object-store layer, and no byte rate is added
+    # across stages.
+    def test_reconciliation_joins_stage_evidence_by_workload(self):
+        reconciliation = performance.reconcile_attribution(
+            [self.aggregate()], self.evidence()
+        )
+        self.assertTrue(reconciliation["valid"], reconciliation["problems"])
+        self.assertTrue(reconciliation["spot_revision_matches"])
+        rows = {row["row"]: row for row in reconciliation["workloads"]["metrics-mixed"]["rows"]}
+        extraction = rows["extraction"]
+        self.assertEqual(extraction["stages"][0]["source"], "spot")
+        self.assertEqual(extraction["reference_cpu_ns_per_record"], 800.0)
+        self.assertEqual(extraction["pinned_reference_cpu_ns_per_record"], 1400.0)
+        self.assertAlmostEqual(
+            extraction["attributed_with_allocator_cpu_ns_per_record"], 800.0 + 0.025 * 3200.0
+        )
+        self.assertEqual(extraction["verdict"], "agrees")
+        self.assertIn("memo", extraction["known_deviation"])
+        total = rows["total"]
+        self.assertEqual(total["reference_cpu_ns_per_record"], 3300.0)
+        self.assertEqual(total["attributed_with_allocator_cpu_ns_per_record"], 3200.0)
+        self.assertEqual(rows["conversion"]["verdict"], "differs")
+        for row in rows.values():
+            self.assertFalse([key for key in row if "bytes" in key])
+            for stage in row["stages"]:
+                self.assertIn("output_representation", stage)
+
+    # Scenario: the pinned family on disk no longer has the recorded hash,
+    # a joined stage is missing from it, or a profile was not exclusive.
+    # Guarantees: each makes the reconciliation invalid and names why.
+    def test_an_unverified_or_incomplete_reconciliation_is_invalid(self):
+        evidence = self.evidence(verified=False)
+        del evidence["pinned"]["summaries"]["merge/isolated/metrics-mixed"]
+        aggregate = self.aggregate()
+        aggregate["checks"] = []
+        reconciliation = performance.reconcile_attribution([aggregate], evidence)
+        self.assertFalse(reconciliation["valid"])
+        problems = " ".join(reconciliation["problems"])
+        self.assertIn("hashes to", problems)
+        self.assertIn("merge/isolated/metrics-mixed", problems)
+        self.assertIn("not shown to be exclusive", problems)
+
+    def child(self, repetition, classified, cpu=3000.0):
+        """One profiled repetition that passed every gate."""
+        metrics = dict(
+            {f"{name}_cpu_ns_per_record": cpu / 10 for name in performance.CPU_CATEGORIES},
+            engine_cpu_ns_per_record=cpu,
+            control_engine_cpu_ns_per_record=cpu * 0.98,
+            throughput_records_per_s=1e5,
+            control_throughput_records_per_s=1.02e5,
+            classified_samples_count=classified,
+            flush_wall_s=5.0,
+            upload_wait_s=2.0,
+            peak_rss_bytes=1e8,
+        )
+        categories = {name: {"weight": 10, "samples_count": classified // 8,
+                             "share_ratio": 0.1, "share_ci95_ratio": 0.01}
+                      for name in performance.CPU_CATEGORIES}
+        categories["unknown"]["samples_count"] = 0
+        checks = passed_hard_checks() + [
+            measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+            for name in ("perf_recorded", "perf_sampling_coverage",
+                         "attribution_exclusive", "unknown_residual_bounded")
+        ]
+        return measured_result(
+            run_id=f"attribution-metrics-mixed-strict-minio-c1-w15-r{repetition:03d}",
+            case="attribution",
+            metrics=metrics,
+            metric_directions={
+                name: performance.ATTRIBUTION_METRIC_DIRECTIONS[name] for name in metrics
+            },
+            checks=checks,
+            repetition=repetition,
+            workload_config_id="metrics-mixed",
+            observations={
+                "attribution": {"categories": categories,
+                                "allocator_callers": {"extraction": 5},
+                                "named_residual": [{"symbol": "x", "weight": 1}]},
+                "profile_overhead": {"cpu_per_record_ratio": 0.02},
+            },
+        )
+
+    # Scenario: three profiled repetitions of one workload carry 12,000
+    # classified samples in all, and three others carry 6,000.
+    # Guarantees: the aggregate takes the medians, pools the profile, and
+    # passes the sample gate only with 10,000 or more; a first valid
+    # aggregate creates its baseline, and a short one never does.
+    def test_the_family_needs_ten_thousand_classified_samples(self):
+        plan = {"profile": True, "repetitions": 3, "minimum_samples": 10_000,
+                "cores": [1], "family_ordinal": 1}
+
+        def written(children, directory):
+            """The children, each also written where the aggregate hashes it."""
+            for child in children:
+                _ = measurement.write_result(directory / f"{child['run_id']}.json", child)
+            return children
+
+        output = temporary_directory(self)
+        enough = performance.aggregate_attribution(
+            written([self.child(index, 4000) for index in (1, 2, 3)], output),
+            plan=plan, output_dir=output,
+        )
+        checks = {entry["name"]: entry for entry in enough["checks"]}
+        self.assertEqual(checks["classified_samples_sufficient"]["status"],
+                         measurement.STATUS_PASSED)
+        self.assertEqual(enough["status"], measurement.STATUS_PASSED, enough["checks"])
+        self.assertEqual(enough["metrics"]["engine_cpu_ns_per_record"], 3000.0)
+        self.assertEqual(len(enough["baseline_files"]), 1)
+        self.assertEqual(
+            enough["observations"]["pooled_profile"]["classified_samples_count"], 12000
+        )
+        other = temporary_directory(self)
+        short = performance.aggregate_attribution(
+            written([self.child(index, 2000) for index in (4, 5, 6)], other),
+            plan=plan, output_dir=other,
+        )
+        checks = {entry["name"]: entry for entry in short["checks"]}
+        self.assertEqual(checks["classified_samples_sufficient"]["status"],
+                         measurement.STATUS_FAILED)
+        self.assertEqual(short["baseline_files"], [])
+
+    # Scenario: a stages family is asked for a filtered set of stages or
+    # workloads, or the complete set under another name.
+    # Guarantees: a filtered family must publish under its own index and is
+    # checked against what it asked for; the complete family is only ever
+    # `stages.json`; unknown names are refused.
+    def test_a_spot_family_never_replaces_the_family_of_record(self):
+        with self.assertRaisesRegex(AssertionError, "spot family"):
+            _ = performance.family_scope(["metrics-mixed"], ["extract"])
+        spot = performance.family_scope(
+            ["metrics-mixed"], ["extract", "upload"], "stages-spot"
+        )
+        self.assertEqual(spot["kind"], "spot")
+        self.assertEqual(spot["stages"], ["extract", "upload"])
+        full = performance.family_scope(list(performance.WORKLOAD_CONFIGS), None)
+        self.assertEqual((full["kind"], full["index"]), ("full", "stages"))
+        with self.assertRaisesRegex(AssertionError, "family of record"):
+            _ = performance.family_scope(
+                list(performance.WORKLOAD_CONFIGS), None, "stages-spot"
+            )
+        with self.assertRaisesRegex(AssertionError, "unknown stages"):
+            _ = performance.family_scope(["metrics-mixed"], ["nope"], "stages-spot")
+
+    # Scenario: the attribution subcommand is asked for without the long
+    # opt-in, and the command line is inspected.
+    # Guarantees: it is a real, long subcommand, no longer a planned one.
+    def test_attribution_is_a_long_subcommand(self):
+        self.assertNotIn("attribution", measure.PLANNED_COMMANDS)
+        self.assertIn("attribution", measure.LONG_COMMANDS)
+        environment = dict(os.environ)
+        environment.pop("SERIES_MEASURE_LONG", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                measure.main(["attribution", "--output-dir", str(temporary_directory(self))]),
+                2,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

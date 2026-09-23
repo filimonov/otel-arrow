@@ -85,10 +85,46 @@ keeps the `dhat-heap.json` it writes. `stages` takes
 `--option configs='["logs-1k-stable"]'`, `--option stages='["extract"]'` and
 `--option repetitions=3`.
 
-The remaining subcommands (`attribution`,
-`capacity`, `memory`, `soak`, `fault-preflight`, `failures`, `buffered`,
-`remediate`, `report`) are named here so the command line is one contract;
-each is implemented by its own task.
+A filtered `stages` run is a spot family. It must publish under an index of
+its own, `--option index_name=stages-spot`, so it can never replace
+`stages.json`, the family of record, and its coverage checks cover the
+stages and workloads it asked for.
+
+`attribution` profiles the real engine with perf and reconciles its CPU
+shares with the stage families:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure attribution \
+  --output-dir /tmp/series-attribution
+```
+
+It needs the release engine, Docker with the MinIO image, and a `perf`
+that may attach to this user's processes (`kernel.perf_event_paranoid` of 2
+or lower, or `CAP_PERFMON`). A preflight records a busy process with the
+exact command line a measured run uses; when perf cannot attach, no
+repetition runs, `attribution.json` is published with status `skipped`, a
+failed `perf_attached` check and the preflight's evidence, the mandatory
+acceptance stays incomplete, and the command exits 3.
+
+Each of the stage family's two primary workloads is prebuilt once, before
+any lease, lengthened until three repetitions give at least 10,000
+classified samples at 199 Hz. Each repetition runs an unprofiled control
+lifetime and a profiled one on the same cores and store: blocks rotate
+every 128 requests with 256 in flight. The profiled lifetime records
+`perf record -e cpu-clock -F 199 -g --call-graph dwarf -p ENGINE_PID`, with
+the events enabled through control FIFOs across exactly the input phase,
+first request to last durable acknowledgement. Every sample is assigned once
+by its innermost production frame (`performance.classify_cpu`; the rules
+are recorded in the index). The flush wall time that is not flush-task CPU
+is reported as `upload_wait_s`, outside the CPU shares. `--option
+rehearsal=true` runs the control lifetimes alone into the output directory
+and publishes nothing; `--option records=...`, `cpu_ns_per_record=...`,
+`repetitions=...` and `configs=[...]` adjust the family.
+
+The remaining subcommands (`capacity`, `memory`, `soak`, `fault-preflight`,
+`failures`, `buffered`, `remediate`, `report`) are named here so the command
+line is one contract; each is implemented by its own task.
 
 ## Environment variables
 
@@ -101,6 +137,7 @@ each is implemented by its own task.
 | `SERIES_MEASURE_LEASE` | The exclusive host measurement lease file. Defaults to `/tmp/series-parquet-host-measurement.lock`, shared by every checkout and launcher on the host. |
 | `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series-parquet,aws,durable-buffer` and `jemalloc`. |
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
+| `SERIES_PERF` | The perf executable an attribution records with. Defaults to `perf` on the PATH. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
 Python dependencies are pinned in `requirements.txt` and, with hashes, in

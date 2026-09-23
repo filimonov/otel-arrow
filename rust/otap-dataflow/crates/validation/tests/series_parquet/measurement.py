@@ -1259,10 +1259,15 @@ ROLE_CORES = (("producer", 2), ("store", 1), ("reader", 1))
 # produces, stores and reads its output back, while a stages family sends
 # through the producer for its pipeline baseline and uploads to the store,
 # but runs no reader. The engine reservation is kept whole for both,
-# because both launch the engine binary.
+# because both launch the engine binary. An attribution family runs perf
+# beside the engine, so it gives the profiler a physical core of its own
+# and its producer one: the producer only sends prebuilt bytes. It claims
+# no reader: the oracle reads back only after each engine has stopped,
+# when nothing is being measured.
 CASE_ROLES = {
     "engine": ROLE_CORES,
     "stages": (("producer", 2), ("store", 1)),
+    "attribution": (("producer", 1), ("store", 1), ("profiler", 1)),
 }
 
 
@@ -2396,10 +2401,14 @@ class Producer:
     classification and left failed.
     """
 
-    def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight):
+    def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight,
+                 source=None):
         self.channel = channel
         self.ledger = ledger
         self.workload = workload
+        # Where request bytes come from: `build_request` by default, or a
+        # prebuilt input that returns exactly what it would, read by index.
+        self.source = source or (lambda index: build_request(self.workload, index))
         self.cores = set(cores)
         self.timeout_s = timeout_s
         self.max_in_flight = max_in_flight
@@ -2419,7 +2428,7 @@ class Producer:
 
     def send_one(self, index):
         """Send request `index` once and record what happened."""
-        signal, wire, rows = build_request(self.workload, index)
+        signal, wire, rows = self.source(index)
         start = time.monotonic_ns()
         _ = self.ledger.add_request(index, signal, wire, rows, send_ns=start)
         try:
