@@ -99,10 +99,27 @@ SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
   --output-dir /tmp/series-attribution
 ```
 
-It needs the release engine, Docker with the MinIO image, and a `perf`
-that may attach to this user's processes (`kernel.perf_event_paranoid` of 2
-or lower, or `CAP_PERFMON`). A preflight records a busy process with the
-exact command line a measured run uses; when perf cannot attach, no
+It needs Docker with the MinIO image, a `perf` that may attach to this
+user's processes (`kernel.perf_event_paranoid` of 2 or lower, or
+`CAP_PERFMON`), `c++filt` from binutils for Rust's v0 symbols, and a
+profilable release engine, `target/release/df_engine-perf`
+(`SERIES_ATTRIBUTION_ENGINE` names another). The workspace's default linker,
+lld, places the executable segment 4 KiB above its file offset, and perf's
+libdw unwinder, which derives the module base from the file offset, then
+ends every stack after its first frame. Relinking only the binary crate
+with page-aligned segments changes no generated code:
+
+```bash
+cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer -- \
+  -C link-arg=-Wl,-z,separate-loadable-segments
+cp target/release/df_engine target/release/df_engine-perf
+cargo build --release --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,durable-buffer   # restores df_engine
+```
+
+A preflight checks that engine's segment layout and records a busy process
+with the exact command line a measured run uses; when perf cannot attach, no
 repetition runs, `attribution.json` is published with status `skipped`, a
 failed `perf_attached` check and the preflight's evidence, the mandatory
 acceptance stays incomplete, and the command exits 3.
@@ -138,6 +155,7 @@ line is one contract; each is implemented by its own task.
 | `SERIES_ENGINE_FEATURES`, `SERIES_ENGINE_ALLOCATOR` | The feature set and allocator the engine was built with, recorded in the build fingerprint. Default `default,series-parquet,aws,durable-buffer` and `jemalloc`. |
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_PERF` | The perf executable an attribution records with. Defaults to `perf` on the PATH. |
+| `SERIES_ATTRIBUTION_ENGINE` | The engine an attribution profiles. Defaults to `target/release/df_engine-perf`. |
 | `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
 
 Python dependencies are pinned in `requirements.txt` and, with hashes, in

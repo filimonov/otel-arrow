@@ -4532,6 +4532,13 @@ class AttributionContracts(unittest.TestCase):
                 "tokio::runtime::task::Task::Output::poll",
             "<[otel_arrow_dfe_series_lake::value::Value] as Z>::to_vec":
                 "otel_arrow_dfe_series_lake::value::Value]::to_vec",
+            # Rust's v0 mangling, as c++filt demangles it, with crate
+            # disambiguators and const generics.
+            "<otel_arrow_dfe_core_nodes[ac52c27a24eadf66]::exporters::series_parquet_exporter"
+            "::worker::Worker>::admit":
+                "otel_arrow_dfe_core_nodes::exporters::series_parquet_exporter::worker::Worker::admit",
+            "arrow_ord[4b22431ba0740f66]::ord::compare_impl::<false: bool, false: bool>"
+            "::{closure#0}": "arrow_ord::ord::compare_impl::{closure#0}",
         }
         for symbol, path in cases.items():
             with self.subTest(symbol=symbol):
@@ -4542,6 +4549,46 @@ class AttributionContracts(unittest.TestCase):
             ),
             "extraction",
         )
+        self.assertEqual(
+            performance.classify_frame("__rustc[100742bb89c490cb]::__rust_alloc", 1),
+            "allocator",
+        )
+
+    # Scenario: three ELF files: one linked the way lld links the engine by
+    # default, with the executable segment 4 KiB above its file offset, one
+    # relinked with page-aligned segments, and one where every segment shares
+    # one base.
+    # Guarantees: only a binary whose executable segments share the first
+    # segment's base is accepted, since perf's unwinder places the module
+    # there; the refusal names the relink command, and the preflight
+    # refuses such an engine before recording anything.
+    def test_an_engine_perf_cannot_unwind_is_refused(self):
+        def elf(path, segments):
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            struct.pack_into("<Q", header, 32, 64)
+            struct.pack_into("<HH", header, 54, 56, len(segments))
+            table = b"".join(
+                struct.pack("<IIQQQQQQ", 1, flags, offset, vaddr, vaddr, 0, 0, 0x1000)
+                for offset, vaddr, flags in segments
+            )
+            path.write_bytes(bytes(header) + table)
+            return path
+
+        root = temporary_directory(self)
+        lld = elf(root / "lld", [(0, 0, 4), (0x1ca7d40, 0x1ca8d40, 5)])
+        relinked = elf(root / "relinked", [(0, 0, 4), (0x1ca8000, 0x1ca8000, 5)])
+        fixed = elf(root / "fixed", [(0, 0x400000, 4), (0x20000, 0x420000, 5)])
+        refused = performance.unwind_layout(lld)
+        self.assertFalse(refused["compatible"])
+        self.assertIn("separate-loadable-segments", refused["build"])
+        self.assertTrue(performance.unwind_layout(relinked)["compatible"])
+        self.assertTrue(performance.unwind_layout(fixed)["compatible"])
+        facts = performance.perf_preflight(
+            temporary_directory(self), perf=fake_perf(self), engine=lld
+        )
+        self.assertFalse(facts["attached"])
+        self.assertIn("relink", facts["reason"])
 
     # Scenario: the text `perf script` prints for two samples, one through
     # the kernel, followed by a stray line.
@@ -4680,7 +4727,8 @@ class AttributionContracts(unittest.TestCase):
     # siblings, is offered to an attribution family.
     # Guarantees: the observability core, the engine's four-core
     # reservation, the producer, the store and the profiler each own a
-    # physical core, eight in all, and no reader is claimed.
+    # physical core, eight in all, and no reader is claimed; the read-back
+    # after an engine stops uses only that engine's cores and siblings.
     def test_the_attribution_roles_fit_the_campaign_pin(self):
         groups = [[core, core + 16] for core in range(16)]
         pinned = list(range(8)) + list(range(16, 24))
@@ -4698,6 +4746,11 @@ class AttributionContracts(unittest.TestCase):
                 "profiler": [7],
             },
         )
+        with mock.patch.object(os, "sched_getaffinity", return_value=set(pinned)):
+            self.assertEqual(
+                performance.oracle_cores(allocation, groups),
+                [1, 2, 3, 4, 17, 18, 19, 20],
+            )
 
     # Scenario: two telemetry documents of one worker, before and after a
     # window with two flushes, the admin API serving the flush instrument

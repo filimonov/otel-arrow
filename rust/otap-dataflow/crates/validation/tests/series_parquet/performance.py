@@ -3042,7 +3042,7 @@ _END = r"(?:$|::)"
 # walked past, so their CPU belongs to the stage that called them.
 CPU_RULES = (
     (1, "allocator",
-     r"^(?:_rjem_|je_|__rust_(?:alloc|dealloc|realloc|alloc_zeroed)$|__rdl_|"
+     r"^(?:_rjem_|je_|(?:__rustc::)?__rust_(?:alloc|dealloc|realloc|alloc_zeroed)$|__rdl_|"
      r"tikv_jemalloc|tikv_jemallocator::|jemallocator::|malloc$|free$|"
      r"realloc$|calloc$|cfree$|_int_(?:malloc|free|realloc)$|"
      r"__libc_(?:malloc|free|realloc|calloc)$|alloc::alloc::|alloc::raw_vec::|"
@@ -3139,6 +3139,8 @@ def classification_rules() -> dict:
 
 
 _SYMBOL_OFFSET = re.compile(r"\+0x[0-9a-fA-F]+$")
+# The crate disambiguator a v0 symbol demangles with: `crate[4f8f0dac]::...`.
+_CRATE_DISAMBIGUATOR = re.compile(r"\[[0-9a-f]{4,}\]")
 _LEGACY_HASH = re.compile(r"::h[0-9a-f]{16}$")
 _SELF_TYPE_PREFIX = re.compile(r"^(?:[&*\[( ]|mut |const |dyn )+")
 
@@ -3184,6 +3186,7 @@ def frame_path(symbol: str) -> str:
     prefix without knowing Rust's symbol syntax.
     """
     text = _LEGACY_HASH.sub("", _SYMBOL_OFFSET.sub("", symbol.strip()))
+    text = _CRATE_DISAMBIGUATOR.sub("", text)
     if text.startswith("<"):
         depth = 0
         for position, char in enumerate(text):
@@ -3495,6 +3498,79 @@ PREFLIGHT_BUSY_NS = 300_000_000
 PREFLIGHT_DEADLINE_S = 30
 
 
+# The demangler `perf script` output passes through: binutils' c++filt
+# reads Rust's v0 mangling, which perf itself leaves mangled.
+DEMANGLER = ("c++filt",)
+
+# The engine an attribution profiles, and how it is built. The workspace's
+# default linker, lld, places the executable segment at a virtual address
+# that differs from its file offset, and perf's libdw unwinder derives the
+# module's base from the file offset: every call-frame lookup lands 4 KiB
+# away and each stack ends after its first frame. Relinking only the binary
+# crate with `-z separate-loadable-segments` makes every segment's offset
+# equal its address and changes no generated code.
+ATTRIBUTION_ENGINE_ENV = "SERIES_ATTRIBUTION_ENGINE"
+ATTRIBUTION_ENGINE = "target/release/df_engine-perf"
+ATTRIBUTION_ENGINE_BUILD = (
+    "cargo rustc --release --locked -p otel-arrow-dfe --bin df_engine "
+    "--features series-parquet,aws,durable-buffer -- "
+    "-C link-arg=-Wl,-z,separate-loadable-segments && "
+    "cp target/release/df_engine target/release/df_engine-perf && "
+    "cargo build --release --locked -p otel-arrow-dfe --bin df_engine "
+    "--features series-parquet,aws,durable-buffer"
+)
+
+
+def attribution_engine() -> Path:
+    """The engine binary an attribution profiles."""
+    return Path(
+        os.environ.get(ATTRIBUTION_ENGINE_ENV)
+        or Path(test_e2e.WORKSPACE) / ATTRIBUTION_ENGINE
+    )
+
+
+def elf_load_segments(path) -> list:
+    """Every PT_LOAD of a 64-bit little-endian ELF: offset, address, flags."""
+    with open(path, "rb") as handle:
+        header = handle.read(64)
+        if header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+            raise AssertionError(f"{path} is not a 64-bit little-endian ELF")
+        phoff = struct.unpack_from("<Q", header, 32)[0]
+        phentsize, phnum = struct.unpack_from("<HH", header, 54)
+        handle.seek(phoff)
+        table = handle.read(phentsize * phnum)
+    segments = []
+    for index in range(phnum):
+        kind, flags, offset, vaddr = struct.unpack_from("<IIQQ", table, index * phentsize)
+        if kind == 1:
+            segments.append({"offset": offset, "vaddr": vaddr, "executable": bool(flags & 1)})
+    return segments
+
+
+def unwind_layout(path) -> dict:
+    """Whether perf's libdw unwinder can place this binary's code.
+
+    It can when every executable segment sits at the same address-minus-
+    offset as the first segment, which is where the unwinder puts the
+    module's base.
+    """
+    segments = elf_load_segments(path)
+    base = segments[0]["vaddr"] - segments[0]["offset"] if segments else None
+    skewed = [
+        segment for segment in segments
+        if segment["executable"] and segment["vaddr"] - segment["offset"] != base
+    ]
+    return {
+        "binary": str(path),
+        "compatible": bool(segments) and not skewed,
+        "skewed_executable_segments": [
+            {"offset": hex(segment["offset"]), "vaddr": hex(segment["vaddr"])}
+            for segment in skewed
+        ],
+        "build": ATTRIBUTION_ENGINE_BUILD,
+    }
+
+
 def perf_binary() -> str:
     """The perf executable: `SERIES_PERF`, else `perf` on the PATH."""
     return os.environ.get(PERF_BINARY_ENV) or shutil.which("perf") or "perf"
@@ -3512,12 +3588,19 @@ def perf_record_argv(perf, pid, output, ctl, ack) -> list:
 
     The events start disabled (`-D -1`) and are switched on and off through
     the control FIFOs, so the profile covers exactly the input phase.
+    `--sample-cpu` records the CPU of each sample, which a per-process
+    recording otherwise leaves out.
     """
     return [
         str(perf), "record", "-e", PERF_EVENT, "-F", str(PERF_FREQUENCY_HZ),
-        "-g", "--call-graph", PERF_CALL_GRAPH, "-p", str(pid), "-o", str(output),
-        "-D", "-1", "--control", f"fifo:{ctl},{ack}",
+        "-g", "--call-graph", PERF_CALL_GRAPH, "--sample-cpu", "-p", str(pid),
+        "-o", str(output), "-D", "-1", "--control", f"fifo:{ctl},{ack}",
     ]
+
+
+# perf record answers an interrupt by writing its file and then ending
+# itself with that same signal, so both exits mean a complete recording.
+PERF_COMPLETE_EXITS = (0, -signal.SIGINT)
 
 
 def perf_script_argv(perf, data) -> list:
@@ -3554,6 +3637,7 @@ class PerfRecorder:
         self._ctl_fd = None
         self._ack_fd = None
         self._log = None
+        self.demangler = None
 
     def start(self, pid):
         """Attach to `pid` with every event disabled."""
@@ -3651,19 +3735,36 @@ class PerfRecorder:
         return self.returncode
 
     def script(self, output, deadline_s=PERF_SCRIPT_DEADLINE_S) -> str:
-        """Run `perf script` on the recorded file and return its text."""
+        """Run `perf script` on the recorded file and return its text.
+
+        perf demangles legacy Rust symbols but not v0 ones (`_RNv...`), so
+        the text is passed through the demangler when one is installed; the
+        file keeps what the classifier read.
+        """
         output = Path(output)
-        with open(output, "w", encoding="ascii", errors="replace") as stream:
-            done = subprocess.run(
-                pinned_argv(perf_script_argv(self.perf, self.data), self.cores),
-                stdout=stream, stderr=subprocess.PIPE, text=True,
-                timeout=deadline_s,
-            )
+        done = subprocess.run(
+            pinned_argv(perf_script_argv(self.perf, self.data), self.cores),
+            capture_output=True, text=True, errors="replace", timeout=deadline_s,
+        )
         if done.returncode != 0:
             raise AssertionError(
                 f"perf script failed with {done.returncode}: {done.stderr[-500:]}"
             )
-        return output.read_text(encoding="ascii", errors="replace")
+        text = done.stdout
+        demangler = shutil.which(DEMANGLER[0])
+        if demangler:
+            demangled = subprocess.run(
+                [demangler] + list(DEMANGLER[1:]), input=text, capture_output=True,
+                text=True, errors="replace", timeout=deadline_s,
+            )
+            if demangled.returncode != 0:
+                raise AssertionError(
+                    f"{DEMANGLER[0]} failed with {demangled.returncode}"
+                )
+            text = demangled.stdout
+        self.demangler = demangler
+        output.write_text(text.encode("ascii", "replace").decode("ascii"), encoding="ascii")
+        return output.read_text(encoding="ascii")
 
     def close(self):
         """Release the FIFOs and perf's log; perf is killed if still alive."""
@@ -3689,6 +3790,7 @@ class PerfRecorder:
                 (self.disabled_ns - self.enabled_ns) / 1e9
                 if self.enabled_ns and self.disabled_ns else None
             ),
+            "demangler": self.demangler,
         }
 
 
@@ -3709,7 +3811,7 @@ def perf_event_paranoid(path="/proc/sys/kernel/perf_event_paranoid"):
         return None
 
 
-def perf_preflight(directory, *, cores=(), perf=None) -> dict:
+def perf_preflight(directory, *, cores=(), perf=None, engine=None) -> dict:
     """Whether the exact recording an attribution makes works on this host.
 
     A busy child is profiled with the same command line, control FIFOs and
@@ -3733,6 +3835,21 @@ def perf_preflight(directory, *, cores=(), perf=None) -> dict:
     if shutil.which(perf) is None and not Path(perf).is_file():
         facts["reason"] = f"no perf executable {perf!r} on this host"
         return facts
+    if engine is not None:
+        if not Path(engine).is_file():
+            facts["reason"] = (
+                f"no profilable engine at {engine}; build it with: "
+                f"{ATTRIBUTION_ENGINE_BUILD}"
+            )
+            return facts
+        facts["engine_layout"] = unwind_layout(engine)
+        if not facts["engine_layout"]["compatible"]:
+            facts["reason"] = (
+                f"{engine} has executable segments whose address differs from "
+                f"their file offset, which perf's unwinder cannot place; relink "
+                f"it with: {ATTRIBUTION_ENGINE_BUILD}"
+            )
+            return facts
     try:
         version = subprocess.run(
             [perf, "--version"], capture_output=True, text=True, timeout=30
@@ -3755,6 +3872,11 @@ def perf_preflight(directory, *, cores=(), perf=None) -> dict:
         )
         recorder.disable()
         facts["record_returncode"] = recorder.stop()
+        if facts["record_returncode"] not in PERF_COMPLETE_EXITS:
+            raise AssertionError(
+                f"perf record ended with {facts['record_returncode']}: "
+                f"{recorder.log_tail()}"
+            )
         parsed = parse_perf_script(recorder.script(directory / "perf-script.txt"))
         samples = parsed["samples"]
         facts["samples_count"] = len(samples)
@@ -4548,7 +4670,7 @@ def attribution_lifetime(label, plan, job, spec, result, run_dir, controls, *,
     plan["store"].download(local)
     try:
         oracle = measurement.run_pinned(
-            plan["allocation"].get("reader") or sorted(os.sched_getaffinity(0)),
+            plan["oracle_cores"],
             measurement.read_oracle,
             local,
             ledger,
@@ -4633,6 +4755,25 @@ def attribution_lifetime(label, plan, job, spec, result, run_dir, controls, *,
             lifetime["profile"]["total_weight"] / sampled if sampled > 0 else None
         )
     return lifetime
+
+
+def oracle_cores(allocation, sibling_groups) -> list:
+    """Where the read-back runs: the stopped engine's physical cores.
+
+    The oracle starts DuckDB and clickhouse-local, which use every CPU they
+    are given. It runs only after an engine has stopped, so it takes the
+    engine's worker and reserved cores with their SMT siblings, and the
+    build monitor, the harness and the store keep theirs: a starved monitor
+    is a coverage gap, and a coverage gap invalidates the run.
+    """
+    owned = set(allocation.get("engine", [])) | set(allocation.get("engine_reserved", []))
+    cores = set()
+    for group in sibling_groups:
+        if owned & set(group):
+            cores |= set(group)
+    cores |= owned
+    available = set(os.sched_getaffinity(0))
+    return sorted(cores & available) or sorted(available)
 
 
 def lifetime_indexes(indexes, *, profiled) -> list:
@@ -4728,7 +4869,7 @@ def settle_attribution_child(result, plan, job, lifetimes, run_dir):
         for name, passed, detail in (
             (
                 "perf_recorded",
-                profiled.get("perf_returncode") == 0
+                profiled.get("perf_returncode") in PERF_COMPLETE_EXITS
                 and profile["samples_count"] > 0
                 and perf["parse"]["unparsed_lines_count"] == 0,
                 f"perf exited {profiled.get('perf_returncode')}; "
@@ -5567,6 +5708,7 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         "repetitions": repetitions,
         "minimum_samples": int(options.get("minimum_samples", ATTRIBUTION_MINIMUM_SAMPLES)),
         "allocation": allocation,
+        "oracle_cores": oracle_cores(allocation, topology["sibling_groups"]),
         "cores": list(spec.cores),
         "family_ordinal": attribution_family_ordinal(report_dir),
         "evidence": stage_evidence(evidence_dir, options, configs),
@@ -5578,12 +5720,27 @@ def run_attribution(spec: measurement.RunSpec, output_dir, report_dir=None,
         preflight = {"attached": False, "rehearsal": True,
                      "reason": "a rehearsal does not profile"}
     else:
-        preflight = perf_preflight(output_dir / "preflight", cores=allocation["profiler"])
+        preflight = perf_preflight(
+            output_dir / "preflight", cores=allocation["profiler"],
+            engine=attribution_engine(),
+        )
         if not preflight["attached"]:
             return publish_attribution(
                 spec, plan, [], [], output_dir, report_dir, started, preflight=preflight
             )
-    plan["provenance"] = command.prepare_build()
+    if rehearsal:
+        plan["provenance"] = command.prepare_build()
+    else:
+        build = measurement.engine_build(attribution_engine())
+        if build["profile"] != command.MEASURED_PROFILE:
+            raise AssertionError(
+                f"an attribution profiles a release engine, not {build['profile']}"
+            )
+        build["link_layout"] = preflight["engine_layout"]
+        build["canonical_release_sha256"] = measurement.engine_build(command.engine_binary())[
+            "binary_sha256"
+        ]
+        plan["provenance"] = {"build": build, "git": measurement.git_provenance()}
     plan["merge"] = command.engine_merge(
         dataclasses.replace(
             spec,
