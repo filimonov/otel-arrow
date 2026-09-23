@@ -730,12 +730,13 @@ mod tests {
         }
     }
 
-    /// Scenario: An OTLP logs request whose record carries bytes that are not UTF-8 in its string
-    /// body and its severity text.
-    /// Guarantees: It is written and acknowledged, not refused, with U+FFFD in place of the
-    /// invalid bytes, as the OTAP conversion stores it.
+    /// Scenario: An OTLP logs request, well framed, whose record carries bytes that are not
+    /// UTF-8 in its string body and its severity text.
+    /// Guarantees: It passes the framing check and is refused by the JSON encoder, as before the
+    /// framing check existed: a permanent nack as invalid pdata, of unspecified cause, and no
+    /// signal file.
     #[test]
-    fn invalid_utf8_is_written_with_replacement_characters() {
+    fn invalid_utf8_is_refused_by_the_json_encoder() {
         let len_field = |field: u32, payload: &[u8]| {
             let mut out = Vec::new();
             prost::encoding::encode_key(
@@ -781,20 +782,13 @@ mod tests {
             })
             .run_validation(move |mut ctx, result| async move {
                 result.unwrap();
-                let mut completions = ctx.take_pipeline_completion_receiver().unwrap();
-                let completion = tokio::time::timeout(Duration::from_secs(3), completions.recv())
-                    .await
-                    .expect("timed out waiting for the ACK")
-                    .expect("completion channel closed");
-                assert!(
-                    matches!(completion, PipelineCompletionMsg::DeliverAck { .. }),
-                    "{completion:?}"
-                );
-                let content = tokio::fs::read_to_string(&logs_path).await.unwrap();
-                let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-                let record = &value["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
-                assert_eq!(record["severityText"], "\u{FFFD}");
-                assert_eq!(record["body"]["stringValue"], "caf\u{FFFD}");
+                let (cause, reason) = next_permanent_nack(
+                    &mut ctx,
+                    "file exporter rejected invalid pdata: could not encode OTLP JSON",
+                )
+                .await;
+                assert_eq!(cause, NackCause::Unspecified, "{reason}");
+                assert!(!logs_path.exists());
             });
     }
 
