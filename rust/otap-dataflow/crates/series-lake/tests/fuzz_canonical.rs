@@ -5,7 +5,8 @@
 
 use otel_arrow_dfe_series_lake::canonical::{Descriptor, Signal, canonical_bytes, series_id};
 use otel_arrow_dfe_series_lake::value::{
-    DecodeLimits, Unbounded, Value, body_string_reserving, decode_cbor, map_string, sort_kvlist,
+    DecodeLimits, Unbounded, Value, body_string_reserving, decode_cbor, map_string, rendered_len,
+    sort_kvlist,
 };
 use proptest::prelude::*;
 
@@ -320,8 +321,8 @@ proptest! {
     /// rendered by `map_string` and by the serde_json tree it replaced, and
     /// by the reserving body entry point.
     /// Guarantees: the renderings are identical, so stored cells and log
-    /// bodies do not change, and the reserving entry point returns the same
-    /// string.
+    /// bodies do not change, the reserving entry point returns the same
+    /// string, and `rendered_len` measures it exactly.
     #[test]
     fn map_string_agrees_with_the_serde_json_tree(v in value_strategy()) {
         let expected = match &v {
@@ -332,6 +333,7 @@ proptest! {
         prop_assert_eq!(&map_string(&v), &expected);
         let reserved = body_string_reserving(&v, &mut Unbounded).expect("unbounded");
         prop_assert_eq!(&reserved, &expected);
+        prop_assert_eq!(rendered_len(&v), expected.as_ref().map_or(0, String::len));
     }
 }
 

@@ -149,3 +149,74 @@ fn a_body_rendering_never_allocates_more_than_it_reserved() {
         }
     }
 }
+
+/// Scenario: one log record with 47 attributes, each the same 600 000
+/// control-character string inside an array -- about 28 MiB decoded, under
+/// the default 32 MiB extraction budget, and 3.6 MB each once rendered with
+/// JSON escapes -- extracted under dhat's heap profiler at the default limits.
+/// Guarantees: the request is refused as a row that passes `max_row_bytes`,
+/// after rendering one value rather than all 47 (about 170 MB), and the heap
+/// the extraction allocates stays within its budget plus a small constant.
+#[test]
+fn a_residual_map_is_refused_before_it_is_rendered_past_the_budget() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{
+        AnyValue, ArrayValue, KeyValue, any_value,
+    };
+    use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::{
+        LogRecord, LogsData, ResourceLogs, ScopeLogs,
+    };
+    use otel_arrow_dfe_series_lake::config::LakeConfig;
+    use otel_arrow_dfe_series_lake::error::{Excess, RefuseReason};
+
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let value = AnyValue {
+        value: Some(any_value::Value::ArrayValue(ArrayValue {
+            values: vec![AnyValue {
+                value: Some(any_value::Value::StringValue("\u{1}".repeat(600_000))),
+            }],
+        })),
+    };
+    let data = LogsData {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_000,
+                    attributes: (0..47)
+                        .map(|i| KeyValue {
+                            key: format!("a{i:02}"),
+                            value: Some(value.clone()),
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    };
+    let cfg = LakeConfig::default();
+    let mut records = otel_arrow_dfe_pdata::testing::round_trip::encode_logs(&data);
+    drop(data);
+    drop(value);
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let result = otel_arrow_dfe_series_lake::extract::extract(&mut records, &cfg);
+    let allocated = dhat::HeapStats::get().max_bytes;
+    drop(profiler);
+    assert!(
+        matches!(
+            result,
+            Err(Error::Refused(RefuseReason::RequestTooLarge(Excess {
+                budget: SizeBudget::Row,
+                ..
+            })))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        allocated <= cfg.ingress.max_extracted_bytes + (2 << 20),
+        "allocated {allocated}"
+    );
+}

@@ -393,65 +393,68 @@ pub fn sort_kvlist(list: &mut [(String, Value)]) -> Result<()> {
 #[must_use]
 pub fn render_v1(v: &Value) -> String {
     let mut out = String::new();
-    write_v1(v, &mut out);
+    let _ = write_v1(v, &mut out);
     out
 }
 
-fn write_v1(v: &Value, out: &mut String) {
-    use std::fmt::Write as _;
+/// Write the `render_v1` rendering of `v` to `out`; fails only if `out` does.
+fn write_v1<W: std::fmt::Write>(v: &Value, out: &mut W) -> std::fmt::Result {
     match v {
-        Value::Null => out.push_str("null"),
+        Value::Null => out.write_str("null"),
         Value::Str(s) => write_json_str(s, out),
         Value::Bytes(b) => {
-            out.push('"');
-            BASE64_STANDARD.encode_string(b, out);
-            out.push('"');
+            out.write_char('"')?;
+            // Whole groups of three bytes encode independently, so the chunks
+            // concatenate to the encoding of the whole input.
+            let mut buf = [0_u8; 1024];
+            for chunk in b.chunks(768) {
+                let n = BASE64_STANDARD
+                    .encode_slice(chunk, &mut buf)
+                    .map_err(|_| std::fmt::Error)?;
+                out.write_str(std::str::from_utf8(&buf[..n]).map_err(|_| std::fmt::Error)?)?;
+            }
+            out.write_char('"')
         }
-        Value::Int(i) => {
-            let _ = write!(out, "{i}");
-        }
+        Value::Int(i) => write!(out, "{i}"),
         Value::Double(d) => write_double(*d, out),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
         Value::Array(items) => {
-            out.push('[');
+            out.write_char('[')?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.write_char(',')?;
                 }
-                write_v1(item, out);
+                write_v1(item, out)?;
             }
-            out.push(']');
+            out.write_char(']')
         }
         Value::KvList(entries) => {
-            out.push('{');
+            out.write_char('{')?;
             for (i, (k, v)) in entries.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.write_char(',')?;
                 }
-                write_json_str(k, out);
-                out.push(':');
-                write_v1(v, out);
+                write_json_str(k, out)?;
+                out.write_char(':')?;
+                write_v1(v, out)?;
             }
-            out.push('}');
+            out.write_char('}')
         }
     }
 }
 
-fn write_double(d: f64, out: &mut String) {
-    use std::fmt::Write as _;
+fn write_double<W: std::fmt::Write>(d: f64, out: &mut W) -> std::fmt::Result {
     if d.is_nan() {
-        out.push_str("\"NaN\"");
+        out.write_str("\"NaN\"")
     } else if d == f64::INFINITY {
-        out.push_str("\"Infinity\"");
+        out.write_str("\"Infinity\"")
     } else if d == f64::NEG_INFINITY {
-        out.push_str("\"-Infinity\"");
+        out.write_str("\"-Infinity\"")
     } else {
         // serde_json's shortest round-trip form of a finite f64.
         match serde_json::Number::from_f64(d) {
-            Some(n) => {
-                let _ = write!(out, "{n}");
-            }
-            None => out.push_str("null"),
+            Some(n) => write!(out, "{n}"),
+            None => out.write_str("null"),
         }
     }
 }
@@ -473,51 +476,43 @@ fn json_escape(b: u8) -> Option<&'static str> {
     }
 }
 
-fn write_json_str(s: &str, out: &mut String) {
-    out.push('"');
+fn write_json_str<W: std::fmt::Write>(s: &str, out: &mut W) -> std::fmt::Result {
+    out.write_char('"')?;
     let mut plain = 0;
     for (i, b) in s.bytes().enumerate() {
         if let Some(escape) = json_escape(b) {
-            out.push_str(&s[plain..i]);
-            out.push_str(escape);
+            out.write_str(&s[plain..i])?;
+            out.write_str(escape)?;
             plain = i + 1;
         }
     }
-    out.push_str(&s[plain..]);
-    out.push('"');
+    out.write_str(&s[plain..])?;
+    out.write_char('"')
 }
 
-/// An upper bound of the length [`render_v1`] writes for `v`: exact for
-/// everything but numbers, which are bounded by their longest spelling.
-fn render_bound(v: &Value) -> Option<usize> {
-    // `-9223372036854775808`, and `-2.2250738585072014e-308` or `"-Infinity"`.
-    const INT: usize = 20;
-    const DOUBLE: usize = 24;
-    let list = |n: usize| 2 + n.saturating_sub(1);
-    Some(match v {
-        Value::Null => 4,
-        Value::Bool(_) => 5,
-        Value::Int(_) => INT,
-        Value::Double(_) => DOUBLE,
-        Value::Str(s) => json_str_len(s)?,
-        Value::Bytes(b) => b.len().div_ceil(3).checked_mul(4)?.checked_add(2)?,
-        Value::Array(items) => items.iter().try_fold(list(items.len()), |acc, item| {
-            acc.checked_add(render_bound(item)?)
-        })?,
-        Value::KvList(entries) => entries
-            .iter()
-            .try_fold(list(entries.len()), |acc, (k, v)| {
-                acc.checked_add(json_str_len(k)?)?
-                    .checked_add(1)?
-                    .checked_add(render_bound(v)?)
-            })?,
-    })
+/// A writer that only counts what it is given.
+struct Measure(usize);
+
+impl std::fmt::Write for Measure {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
 }
 
-fn json_str_len(s: &str) -> Option<usize> {
-    s.bytes().try_fold(2_usize, |acc, b| {
-        acc.checked_add(json_escape(b).map_or(1, str::len))
-    })
+/// The length of [`map_string`]'s result, `0` for [`Value::Null`], measured
+/// without allocating.
+#[must_use]
+pub fn rendered_len(v: &Value) -> usize {
+    match v {
+        Value::Null => 0,
+        Value::Str(s) => s.len(),
+        other => {
+            let mut measure = Measure(0);
+            let _ = write_v1(other, &mut measure);
+            measure.0
+        }
+    }
 }
 
 /// Attribute-map entry point: raw string for strings, `None` for unset,
@@ -537,36 +532,45 @@ pub fn body_string(v: &Value) -> Option<String> {
     map_string(v)
 }
 
-/// [`body_string`] within `reservations`: an upper bound of the rendering
-/// is reserved before anything is allocated, and afterwards exactly the
-/// returned string's length stays reserved.
+/// [`map_string`] within `reservations`: the rendered length is measured and
+/// reserved before the string is allocated, and stays reserved.
+///
+/// The string's `capacity()` is what is charged; an allocator surplus beyond
+/// it is not visible to Rust.
 ///
 /// # Errors
 /// The refusal of the reservation, or an allocation failure.
+pub fn map_string_reserving(
+    v: &Value,
+    reservations: &mut dyn Reservations,
+) -> Result<Option<String>> {
+    if let Value::Null = v {
+        return Ok(None);
+    }
+    let len = rendered_len(v);
+    reservations.reserve(len)?;
+    let mut out = String::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| Error::internal("render: allocation failed"))?;
+    reservations.reserve(out.capacity() - len)?;
+    match v {
+        Value::Str(s) => out.push_str(s),
+        other => {
+            let _ = write_v1(other, &mut out);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Log-body entry point of [`map_string_reserving`]: identical rules.
+///
+/// # Errors
+/// As [`map_string_reserving`].
 pub fn body_string_reserving(
     v: &Value,
     reservations: &mut dyn Reservations,
 ) -> Result<Option<String>> {
-    let bound = match v {
-        Value::Null => return Ok(None),
-        Value::Str(s) => s.len(),
-        other => render_bound(other).ok_or_else(overflow)?,
-    };
-    reservations.reserve(bound)?;
-    let mut out = String::new();
-    out.try_reserve_exact(bound)
-        .map_err(|_| Error::internal("render: allocation failed"))?;
-    match v {
-        Value::Str(s) => out.push_str(s),
-        other => write_v1(other, &mut out),
-    }
-    if out.len() < out.capacity() {
-        let old = out.capacity();
-        reservations.reserve(out.len())?;
-        out.shrink_to_fit();
-        reservations.release(old);
-    }
-    Ok(Some(out))
+    map_string_reserving(v, reservations)
 }
 
 /// Inline bytes of one decoded value node.

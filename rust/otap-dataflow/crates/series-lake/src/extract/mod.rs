@@ -25,7 +25,10 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
-use crate::value::{BUFFER_HEADER_BYTES, DecodeLimits, Value, kv_bytes, map_string};
+use crate::value::{
+    BUFFER_HEADER_BYTES, DecodeLimits, Value, kv_bytes, map_string, map_string_reserving,
+    rendered_len,
+};
 
 /// The single "cast this batch column to a plain type" helper of the crate.
 ///
@@ -259,6 +262,15 @@ impl Budget {
     /// Charge a row of `bytes`, `held` of which the budget already holds for
     /// it; the row limit applies to the whole row.
     pub(crate) fn charge_row_holding(&mut self, bytes: usize, held: usize) -> Result<()> {
+        self.check_row(bytes)?;
+        let rest = bytes
+            .checked_sub(held)
+            .ok_or_else(|| Error::internal("a row holds more than its size"))?;
+        self.charge(rest)
+    }
+
+    /// Refuse a row of `bytes` larger than `max_row_bytes`.
+    pub(crate) fn check_row(&self, bytes: usize) -> Result<()> {
         if bytes > self.max_row {
             return Err(Error::too_large(
                 crate::error::SizeBudget::Row,
@@ -266,10 +278,7 @@ impl Budget {
                 self.max_row,
             ));
         }
-        let rest = bytes
-            .checked_sub(held)
-            .ok_or_else(|| Error::internal("a row holds more than its size"))?;
-        self.charge(rest)
+        Ok(())
     }
 
     /// Charge bytes that are not one row, such as a sealed batch.
@@ -315,6 +324,20 @@ impl Budget {
 /// A position of a [`Budget`], taken before work that may fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Mark(usize);
+
+/// Rendered cells reserve through the request budget and refuse as the
+/// extracted output they are part of.
+pub(crate) struct Rendering<'b>(pub(crate) &'b mut Budget);
+
+impl crate::value::Reservations for Rendering<'_> {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.0.charge(bytes)
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.0.uncharge(bytes);
+    }
+}
 
 /// Decoded attribute values reserve through the request budget.
 impl crate::value::Reservations for Budget {
@@ -662,20 +685,55 @@ pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
     (Col::Map(entries), bytes)
 }
 
+/// [`map_cell`] within the request budget, for a row whose other cells come
+/// to `row_before` bytes.
+///
+/// Each entry's key and rendered value are reserved before they are
+/// allocated and stay held for the row; the row is refused as soon as it
+/// passes `max_row_bytes`, and a refusal rolls the budget back.
+pub(crate) fn map_cell_reserving<'a>(
+    list: impl IntoIterator<Item = &'a (String, Value)>,
+    row_before: usize,
+    budget: &mut Budget,
+) -> Result<(Col, usize)> {
+    let mark = budget.mark();
+    let cell = map_cell_within(list, row_before, budget);
+    if cell.is_err() {
+        budget.rollback(mark);
+    }
+    cell
+}
+
+fn map_cell_within<'a>(
+    list: impl IntoIterator<Item = &'a (String, Value)>,
+    row_before: usize,
+    budget: &mut Budget,
+) -> Result<(Col, usize)> {
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    let mut held = 0_usize;
+    for (k, v) in list {
+        let key = rendered_entry_bytes(k, None);
+        budget.charge(key)?;
+        let rendered = map_string_reserving(v, &mut Rendering(budget))?;
+        held += rendered_entry_bytes(k, rendered.as_deref());
+        budget.check_row(row_before.saturating_add(held))?;
+        entries.push((k.clone(), rendered));
+    }
+    Ok((Col::Map(entries), held))
+}
+
 /// Bytes one rendered map entry retains.
 fn rendered_entry_bytes(key: &str, rendered: Option<&str>) -> usize {
     key.len() + BUFFER_HEADER_BYTES + rendered.map_or(0, str::len)
 }
 
-/// Bytes a sorted attribute list occupies once rendered into a map cell.
-///
-/// Measured by rendering, because the expansion is serde_json's escaping and
-/// `render_v1`'s base64 encoding and cannot be predicted from the value tree. Used
-/// where the cell itself is built later (a descriptor is rendered when its
-/// request is admitted) and only its size is needed now.
+/// Bytes a sorted attribute list occupies once rendered into a map cell,
+/// measured without rendering it. Used where the cell itself is built later
+/// (a descriptor is rendered when its request is admitted) and only its size
+/// is needed now.
 pub(crate) fn rendered_kv_bytes(list: &[(String, Value)]) -> usize {
     list.iter()
-        .map(|(k, v)| rendered_entry_bytes(k, map_string(v).as_deref()))
+        .map(|(k, v)| k.len() + BUFFER_HEADER_BYTES + rendered_len(v))
         .sum()
 }
 
@@ -1098,6 +1156,50 @@ mod tests {
             stats.denorm_type_mismatch_by_column.values().sum::<u64>(),
             stats.denorm_type_mismatch
         );
+    }
+
+    /// Scenario: a residual attribute list of bytes, nested, escaped and
+    /// null values rendered within a budget, and three 600 000-character
+    /// control-character strings -- 3.6 MB each once escaped -- against the
+    /// default 1 MiB row limit.
+    /// Guarantees: the ordinary list renders exactly the cell `map_cell`
+    /// builds and holds exactly its bytes; the large list is refused as a
+    /// row on its first value, with the budget back at its mark.
+    #[test]
+    fn a_rendered_map_is_held_and_refused_as_soon_as_the_row_is_too_large() {
+        let list = vec![
+            ("b".to_string(), Value::Bytes(vec![0xFF; 100])),
+            (
+                "n".to_string(),
+                Value::KvList(vec![("i".into(), Value::Array(vec![Value::Double(0.5)]))]),
+            ),
+            ("q".to_string(), Value::Str("\"\\\n".repeat(5))),
+            ("z".to_string(), Value::Null),
+        ];
+        let mut budget = Budget::new(&LakeConfig::default());
+        let mark = budget.mark();
+        let (cell, held) = map_cell_reserving(&list, 100, &mut budget).expect("fits");
+        let (expected, bytes) = map_cell(&list);
+        assert_eq!(format!("{cell:?}"), format!("{expected:?}"));
+        assert_eq!(held, bytes);
+        assert_eq!(held, rendered_kv_bytes(&list));
+        budget.uncharge(held);
+        assert_eq!(budget.mark(), mark);
+
+        let big = Value::Array(vec![Value::Str("\u{1}".repeat(600_000))]);
+        let list: Vec<(String, Value)> = (0..3).map(|i| (format!("a{i}"), big.clone())).collect();
+        let mut budget = Budget::new(&LakeConfig::default());
+        let mark = budget.mark();
+        assert!(matches!(
+            map_cell_reserving(&list, 100, &mut budget),
+            Err(Error::Refused(RefuseReason::RequestTooLarge(
+                crate::error::Excess {
+                    budget: crate::error::SizeBudget::Row,
+                    ..
+                }
+            )))
+        ));
+        assert_eq!(budget.mark(), mark);
     }
 
     /// Scenario: a `resource` struct and an `AnyValue` `body` struct whose

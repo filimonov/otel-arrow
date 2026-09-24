@@ -15,9 +15,10 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
-    any_value_col, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, fixed_at,
-    flags_at, identity, map_cell, plain, producer_id, str_at, struct_child, timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, Rendering, RowSink, SharedLists,
+    ValuesRow, any_value_col, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row,
+    fixed_at, flags_at, identity, map_cell_reserving, plain, producer_id, str_at, struct_child,
+    timestamp_pair,
 };
 use crate::attrs::prim_at;
 use crate::canonical::{Descriptor, SeriesId, Signal};
@@ -99,10 +100,10 @@ pub(crate) fn extract_logs(
         let resource = attrs_of(&resource_attrs, rid);
         let scope = attrs_of(&scope_attrs, sid);
         let all_attrs = attrs_of(&log_attrs, lid);
-        let (identity_attrs, residual): (Vec<(String, Value)>, Vec<(String, Value)>) = all_attrs
+        let (identity_refs, residual): (Vec<&(String, Value)>, Vec<&(String, Value)>) = all_attrs
             .iter()
-            .cloned()
             .partition(|(k, _)| allow.iter().any(|a| a == k));
+        let identity_attrs: Vec<(String, Value)> = identity_refs.into_iter().cloned().collect();
         let identity_key = crate::canonical::canonical_bytes(&Descriptor {
             signal: Signal::Logs,
             resource_attrs: Arc::from([]),
@@ -167,7 +168,7 @@ pub(crate) fn extract_logs(
         let body_str = match &mut body {
             Some(b) => {
                 let value = b.value_at(row, limits, budget)?;
-                let rendered = body_string_reserving(&value, budget)?;
+                let rendered = body_string_reserving(&value, &mut Rendering(budget))?;
                 budget.uncharge(value_bytes(&value));
                 rendered
             }
@@ -183,10 +184,10 @@ pub(crate) fn extract_logs(
         // and the body are charged their rendered `String::len()`, because
         // base64 encoding and JSON escaping can make the stored cell several
         // times the size of the decoded value tree.
-        let (residual_cell, residual_bytes) = map_cell(&residual);
         let mut approx = 16 + 8 * 6 + 24 + 8;
         approx += body_str.as_ref().map_or(0, String::len);
         approx += severity_text_str.len() + event_name_str.len() + producer.len();
+        let (residual_cell, residual_bytes) = map_cell_reserving(residual, approx, budget)?;
         approx += residual_bytes;
         let severity = prim_at::<Int32Type>(&severity_number, row).unwrap_or(0);
         let mut cols = vec![
@@ -214,7 +215,7 @@ pub(crate) fn extract_logs(
             &ValuesRow {
                 cols,
                 approx_bytes: approx,
-                held_bytes: body_held,
+                held_bytes: body_held + residual_bytes,
             },
             budget,
         )?;
