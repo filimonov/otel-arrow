@@ -6250,41 +6250,109 @@ class GeneratorContracts(unittest.TestCase):
         self.assertEqual((failed["unexpected_record_count"],
                           failed["stored_failed_records_count"]), (0, 1))
 
-    # Scenario: the stored logs rows of one acknowledged request, whole, and
-    # with one body corrupted.
-    # Guarantees: the field-by-field sample passes the whole rows and names
-    # the corrupted record.
-    def test_a_corrupted_record_fails_the_sample(self):
+    # Logs requests of WORKLOAD (every third request carries metrics).
+    ACKED = (1, 2, 4)
+
+    def lake(self, *, drop=(), extra=(), corrupt=()):
+        """A logs lake of the acknowledged requests' rows as the generator
+        wrote them: `drop` omits sequences, `extra` adds (request, point)
+        rows (a repeat of an existing one duplicates it), `corrupt` changes
+        the body of sequences."""
         import duckdb
 
         source = generator.TemplateRequests(self.WORKLOAD)
-        records = generator.expected_records(source, 1)
-        for corrupt in (False, True):
-            root = temporary_directory(self)
-            values = root / "v=1/signal=logs/dataset=values"
-            series = root / "v=1/signal=logs/dataset=series"
-            values.mkdir(parents=True)
-            series.mkdir(parents=True)
-            with duckdb.connect() as db:
-                db.execute("CREATE TABLE v (series_id BLOB, time_unix_nano BIGINT, body VARCHAR)")
-                db.execute("CREATE TABLE s (series_id BLOB, emitted_at BIGINT, "
-                           "attrs MAP(VARCHAR, VARCHAR))")
-                for seq, record in sorted(records.items()):
-                    body = record["body"][:-1] + "!" if corrupt and seq == 5 else record["body"]
-                    key = f"s{seq}".encode("ascii")
-                    db.execute("INSERT INTO v VALUES (?, ?, ?)",
-                               [key, record["time_unix_nano"], body])
-                    db.execute("INSERT INTO s VALUES (?, 1, MAP(['logger.name'], [?]))",
-                               [key, record["logger"]])
-                db.execute(f"COPY v TO '{values / 'part.parquet'}' (FORMAT PARQUET)")
-                db.execute(f"COPY s TO '{series / 'part.parquet'}' (FORMAT PARQUET)")
-                report = generator.compare_sample(db, root, source, [1], "logs", count=40)
-            self.assertEqual(report["sampled_count"], 4)
-            if corrupt:
-                self.assertEqual([m["seq"] for m in report["mismatches"]], [5])
-                self.assertEqual(report["mismatches"][0]["fields"], ["body"])
-            else:
-                self.assertEqual(report["mismatch_count"], 0)
+        rows = []
+        for index in self.ACKED:
+            rows += sorted(generator.expected_records(source, index).items())
+        for index, point in extra:
+            seq = index * 4 + point
+            rows.append((seq, generator.expected_records(source, index)[seq]))
+        root = temporary_directory(self)
+        # Partition directories as the exporter writes them: ClickHouse's
+        # `**` glob matches at least one directory.
+        values = root / "v=1/signal=logs/dataset=values/date=2026-09-24/hour=00"
+        series = root / "v=1/signal=logs/dataset=series/date=2026-09-24/hour=00"
+        values.mkdir(parents=True)
+        series.mkdir(parents=True)
+        with duckdb.connect() as db:
+            db.execute("CREATE TABLE v (series_id BLOB, time_unix_nano BIGINT, body VARCHAR)")
+            db.execute("CREATE TABLE s (series_id BLOB, emitted_at BIGINT, "
+                       "attrs MAP(VARCHAR, VARCHAR))")
+            for seq, record in rows:
+                if seq in drop:
+                    continue
+                body = record["body"][:-1] + "!" if seq in corrupt else record["body"]
+                key = f"s{seq}".encode("ascii")
+                db.execute("INSERT INTO v VALUES (?, ?, ?)", [key, record["time_unix_nano"], body])
+                db.execute("INSERT INTO s VALUES (?, 1, MAP(['logger.name'], [?]))",
+                           [key, record["logger"]])
+            db.execute(f"COPY v TO '{values / 'part.parquet'}' (FORMAT PARQUET)")
+            db.execute(f"COPY s TO '{series / 'part.parquet'}' (FORMAT PARQUET)")
+        return root, source
+
+    def oracle(self, root, source, failed=()):
+        """`aggregate_oracle` end to end, both readers. The file invariants
+        read the exporter's own part-file metadata, which these hand-made
+        files do not carry; they are reported clean here and nothing else is
+        replaced."""
+        measurement.test_e2e.require_clickhouse()
+        clean = {"part_file_count": 2, "descriptor_rows_count": 0, "problems": []}
+        with mock.patch.object(generator, "file_invariants", return_value=clean):
+            return generator.aggregate_oracle(root, source, list(self.ACKED), list(failed),
+                                              sample=200)
+
+    # Scenario: three acknowledged logs requests stored whole; then one request
+    # lost, one record duplicated, a request never sent stored, a record
+    # corrupted, and a failed request's rows stored.
+    # Guarantees: aggregate_oracle passes the whole store and the failed
+    # request's rows (at least once), and fails every defect with its own
+    # problem, through coverage, the aggregate equalities and the sample.
+    def test_the_aggregate_oracle_fails_each_defect_end_to_end(self):
+        for signal_index in self.ACKED:
+            self.assertEqual(self.WORKLOAD.signal_of(signal_index), "logs")
+        report = self.oracle(*self.lake())
+        self.assertTrue(report["passed"], report["problems"])
+        self.assertEqual(report["readers"]["logs"]["count"], 12)
+        cases = {
+            "lost": (dict(drop={8, 9, 10, 11}), (), ("missing_record_count=4",
+                                                     "acknowledged rows 8, expected 12")),
+            "duplicated": (dict(extra=[(1, 1)]), (), ("duplicate_record_count=1",
+                                                      "distinct stored records 12")),
+            "foreign": (dict(extra=[(5, 0), (5, 1)]), (), ("unexpected_record_count=2",
+                                                           "rows beyond the acknowledged")),
+            "corrupted": (dict(corrupt={5}), (), ("sampled records differ",)),
+        }
+        for name, (defect, failed, expected) in cases.items():
+            report = self.oracle(*self.lake(**defect), failed=failed)
+            self.assertFalse(report["passed"], name)
+            for fragment in expected:
+                self.assertTrue(any(fragment in problem for problem in report["problems"]),
+                                (name, fragment, report["problems"]))
+        at_least_once = self.oracle(*self.lake(extra=[(5, 0), (5, 1), (5, 2), (5, 3)]),
+                                    failed=[5])
+        self.assertTrue(at_least_once["passed"], at_least_once["problems"])
+
+    # Scenario: the per-request counters report a clean store while the stored
+    # rows' count and sequence sum disagree with the acknowledged requests.
+    # Guarantees: aggregate_oracle gates the aggregate equalities itself; a
+    # store the counters miss still fails.
+    def test_the_aggregate_oracle_gates_its_equalities(self):
+        root, source = self.lake()
+        real = generator.request_coverage
+
+        def blind(*args, **kwargs):
+            coverage = real(*args, **kwargs)
+            coverage["acknowledged_seq_sum"] += 1
+            coverage["stored_record_count"] += 1
+            return coverage
+
+        with mock.patch.object(generator, "request_coverage", side_effect=blind):
+            report = self.oracle(root, source)
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("acknowledged sequence sum" in p for p in report["problems"]),
+                        report["problems"])
+        self.assertTrue(any("rows beyond the acknowledged" in p for p in report["problems"]),
+                        report["problems"])
 
 
 class CapacityContracts(unittest.TestCase):

@@ -288,6 +288,10 @@ def request_coverage(db, relation, rpr, acked, failed) -> dict:
     count, distinct, low, high, total = db.execute(
         f"SELECT count(*), count(DISTINCT seq), min(seq), max(seq), sum(seq) FROM {relation}"
     ).fetchone()
+    a_count, a_distinct, a_low, a_high, a_total = db.execute(
+        f"SELECT count(*), count(DISTINCT seq), min(seq), max(seq), sum(seq) FROM {relation} "
+        "WHERE seq // ? IN (SELECT req FROM acked_requests)", [rpr],
+    ).fetchone()
     expected_count = len(acked) * rpr
     expected_sum = sum(r * rpr * rpr + rpr * (rpr - 1) // 2 for r in acked)
     return {
@@ -299,6 +303,13 @@ def request_coverage(db, relation, rpr, acked, failed) -> dict:
         "seq_max": int(high) if high is not None else None,
         "seq_sum": int(total) if total is not None else 0,
         "expected_seq_sum_of_acknowledged": expected_sum,
+        "acknowledged_stored_count": int(a_count),
+        "acknowledged_distinct_count": int(a_distinct),
+        "acknowledged_seq_min": int(a_low) if a_low is not None else None,
+        "acknowledged_seq_max": int(a_high) if a_high is not None else None,
+        "acknowledged_seq_sum": int(a_total) if a_total is not None else 0,
+        "expected_seq_min": min(acked) * rpr if acked else None,
+        "expected_seq_max": max(acked) * rpr + rpr - 1 if acked else None,
         "lost_requests_count": int(lost_requests),
         "missing_record_count": int(lost_records),
         "duplicate_record_count": int(duplicated),
@@ -308,6 +319,34 @@ def request_coverage(db, relation, rpr, acked, failed) -> dict:
         "stored_failed_requests_count": int(stored_failed[0]),
         "stored_failed_records_count": int(stored_failed[1]),
     }
+
+
+def aggregate_equalities(coverage) -> list:
+    """The equalities an acknowledged store must meet, as problems.
+
+    The rows of the acknowledged requests: as many as they hold, each once,
+    their sequence sum, lowest and highest exactly the generator's. Every
+    stored row: an acknowledged record or a record of a failed request,
+    each stored once. Independent of the per-request counters, so a defect
+    those miss still fails here.
+    """
+    expected = coverage["expected_record_count"]
+    checks = (
+        ("acknowledged rows", coverage["acknowledged_stored_count"], expected),
+        ("distinct acknowledged records", coverage["acknowledged_distinct_count"], expected),
+        ("acknowledged sequence sum", coverage["acknowledged_seq_sum"],
+         coverage["expected_seq_sum_of_acknowledged"]),
+        ("lowest acknowledged sequence", coverage["acknowledged_seq_min"],
+         coverage["expected_seq_min"]),
+        ("highest acknowledged sequence", coverage["acknowledged_seq_max"],
+         coverage["expected_seq_max"]),
+        ("rows beyond the acknowledged and failed records",
+         coverage["stored_record_count"] - coverage["stored_failed_records_count"], expected),
+        ("distinct stored records", coverage["distinct_record_count"],
+         coverage["stored_record_count"]),
+    )
+    return [f"{name} {actual}, expected {wanted}" for name, actual, wanted in checks
+            if actual != wanted]
 
 
 def expected_records(generator, index) -> dict:
@@ -479,7 +518,9 @@ def aggregate_oracle(root, generator, acked, failed=(), *, sample=SAMPLE_RECORDS
     """Check every stored row against the acknowledged requests.
 
     Per signal: coverage per request (no acknowledged record lost, none
-    duplicated, none foreign), the global count and sequence sum, a random
+    duplicated, none foreign), the aggregate equalities of the acknowledged
+    rows (count, distinct count, sequence sum, lowest and highest) and of
+    every stored row (`aggregate_equalities`), a random
     sample compared field by field with the generator, and the file
     invariants; with `cross_reader`, clickhouse-local's count and sequence
     sum must equal DuckDB's.
@@ -520,6 +561,7 @@ def aggregate_oracle(root, generator, acked, failed=(), *, sample=SAMPLE_RECORDS
                         "unexpected_record_count", "out_of_range_positions_count"):
                 if coverage[key]:
                     problems.append(f"{signal}: {key}={coverage[key]}")
+            problems += [f"{signal}: {problem}" for problem in aggregate_equalities(coverage)]
             if coverage["sample"].get("mismatch_count"):
                 problems.append(f"{signal}: {coverage['sample']['mismatch_count']} sampled "
                                 f"records differ: {coverage['sample']['mismatches'][:3]}")
