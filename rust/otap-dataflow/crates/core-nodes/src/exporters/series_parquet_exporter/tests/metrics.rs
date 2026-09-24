@@ -234,10 +234,9 @@ async fn telemetry_is_scanned_only_when_it_is_collected() {
 /// Scenario: the shutdown deadline elapses while a write is outstanding, so
 /// the node cancels it instead of waiting for it.
 /// Guarantees: the abandoned flush is counted exactly as a write that returned
-/// `Cancelled` would be -- one failure, one cancellation and one duration --
-/// and the retries it had already spent are counted too, so a node that
-/// always runs out of time does not silently report zero flush failures or
-/// zero retries.
+/// `Cancelled` would be -- one `flush.failures{error.type=cancelled}`, one
+/// cancellation and one duration -- so a node that always runs out of time
+/// does not silently report zero flush failures.
 #[tokio::test(flavor = "current_thread")]
 async fn an_abandoned_flush_is_counted_as_cancelled() {
     tokio::task::LocalSet::new()
@@ -259,22 +258,13 @@ async fn an_abandoned_flush_is_counted_as_cancelled() {
             worker.admit(logs_pdata());
             worker.rotate();
             assert!(worker.flushing.is_some(), "a write is outstanding");
-            // Three attempts started: the write had been retried twice when
-            // the deadline decided it.
-            worker
-                .flushing
-                .as_ref()
-                .expect("a write is outstanding")
-                .attempts
-                .set(3);
 
             worker.abandon().await;
             assert_eq!(worker.abandoned, 1, "the one admitted request");
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_failures.get(), 1);
+            assert_eq!(flush_failures(metrics, WriteFailure::Cancelled), 1);
             assert_eq!(metrics.worker.flush_cancelled.get(), 1);
             assert_eq!(metrics.worker.flush_duration.count, 1);
-            assert_eq!(metrics.worker.flush_retries.get(), 2);
         })
         .await;
 }

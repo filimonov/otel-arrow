@@ -16,7 +16,7 @@
 //! the value is republished rather than accumulated twice. Gauges report the
 //! worker's state at the moment it was sampled.
 
-use super::outcome::Outcome;
+use super::outcome::{Outcome, WriteFailure};
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
@@ -64,15 +64,22 @@ pub(super) struct WorkerMetrics {
     /// Wall time one flush took, from rotation to completion.
     #[metric(name = "flush.duration", unit = "s")]
     pub flush_duration: Mmsc,
-    /// Flushes that did not put their block in object storage.
-    #[metric(name = "flush.failures", unit = "{flush}")]
-    pub flush_failures: Counter<u64>,
-    /// Write attempts beyond the first, per completed flush.
+    /// Write attempts started beyond the first of their flush, credited when
+    /// each starts.
     #[metric(name = "flush.retries", unit = "{attempt}")]
     pub flush_retries: Counter<u64>,
     /// Flushes that failed because the write was cancelled.
     #[metric(name = "flush.cancelled", unit = "{flush}")]
     pub flush_cancelled: Counter<u64>,
+    /// Cancelled writes of decided flushes whose multipart abort failed or
+    /// that did not unwind by the cleanup cutoff, each of which may leave an
+    /// upload to the bucket's lifecycle rule.
+    #[metric(name = "flush.abort_failures", unit = "{flush}")]
+    pub flush_abort_failures: Counter<u64>,
+    /// Writes of decided flushes that completed while being cancelled: their
+    /// files hold rows whose requests were nacked.
+    #[metric(name = "flush.late_commits", unit = "{flush}")]
+    pub flush_late_commits: Counter<u64>,
     /// Requests acknowledged as durable.
     #[metric(unit = "{message}")]
     pub acks: ObserveCounter<u64>,
@@ -151,6 +158,24 @@ pub(super) struct FlushMetrics {
     /// Non-empty blocks handed to a write task.
     #[metric(name = "flushes", unit = "{flush}")]
     pub count: Counter<u64>,
+}
+
+/// Why one flush did not put its block in object storage.
+#[attribute_set(item, measurement)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlushFailureAttrs {
+    /// The class of the failed write.
+    #[attribute_key = "error.type"]
+    pub error_type: WriteFailure,
+}
+
+/// Failed flushes, split by why they failed.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = FlushFailureAttrs)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct FlushFailureMetrics {
+    /// Flushes that did not put their block in object storage.
+    #[metric(name = "flush.failures", unit = "{flush}")]
+    pub failures: Counter<u64>,
 }
 
 /// The refusal class of one nacked request: its [`Outcome`], never `ack`.
@@ -341,6 +366,8 @@ pub(super) struct Metrics {
     pub worker: MetricSet<WorkerMetrics>,
     /// Flushes started, by rotation trigger.
     pub flush: MeasurementMetricSet<FlushMetrics>,
+    /// Failed flushes, by failure class.
+    pub flush_failures: MeasurementMetricSet<FlushFailureMetrics>,
     /// Refused requests, by refusal class.
     pub nacks: MeasurementMetricSet<NackMetrics>,
     /// Durable rows and files, by dataset.
@@ -393,6 +420,7 @@ impl Metrics {
         Self {
             worker: WorkerMetrics::register(ctx),
             flush: FlushMetrics::register(ctx),
+            flush_failures: FlushFailureMetrics::register(ctx),
             nacks: NackMetrics::register(ctx),
             written: WrittenMetrics::register(ctx),
             emitted: EmittedMetrics::register(ctx),
@@ -448,6 +476,14 @@ impl Metrics {
         }
     }
 
+    /// Count one flush that did not put its block in object storage.
+    pub(super) fn flush_failed(&mut self, error_type: WriteFailure) {
+        self.flush_failures
+            .with(FlushFailureAttrs { error_type })
+            .failures
+            .add(1);
+    }
+
     /// Record the string values the conversion of one admitted request of
     /// `signal` repaired; called with [`Metrics::extracted`].
     pub(super) fn repaired(&mut self, signal: SignalType, count: u64) {
@@ -466,6 +502,7 @@ impl Metrics {
         }
         let _ = reporter.report(&mut self.worker);
         let _ = reporter.report_measurement(&mut self.flush);
+        let _ = reporter.report_measurement(&mut self.flush_failures);
         let _ = reporter.report_measurement(&mut self.nacks);
         let _ = reporter.report_measurement(&mut self.written);
         let _ = reporter.report_measurement(&mut self.emitted);
@@ -484,6 +521,7 @@ impl Metrics {
             out.extend(exports.terminal_snapshots());
         }
         out.extend(self.flush.terminal_snapshots());
+        out.extend(self.flush_failures.terminal_snapshots());
         out.extend(self.nacks.terminal_snapshots());
         out.extend(self.written.terminal_snapshots());
         out.extend(self.emitted.terminal_snapshots());
@@ -597,9 +635,10 @@ mod tests {
                 ("block.requests_pending", "{request}"),
                 ("block.pending_slot_occupied", "{slot}"),
                 ("flush.duration", "s"),
-                ("flush.failures", "{flush}"),
                 ("flush.retries", "{attempt}"),
                 ("flush.cancelled", "{flush}"),
+                ("flush.abort_failures", "{flush}"),
+                ("flush.late_commits", "{flush}"),
                 ("acks", "{message}"),
                 ("notify.queued", "{request}"),
                 ("notify.token_size", "By"),
@@ -629,6 +668,23 @@ mod tests {
                 &snapshots[0],
                 &[("flushes", "{flush}")],
                 &[("reason", label)],
+            );
+        }
+
+        for (error_type, label) in [
+            (WriteFailure::Deadline, "deadline"),
+            (WriteFailure::PermanentStorage, "permanent_storage"),
+            (WriteFailure::Cancelled, "cancelled"),
+            (WriteFailure::Encode, "encode"),
+            (WriteFailure::Internal, "internal"),
+        ] {
+            metrics.flush_failed(error_type);
+            let snapshots = metrics.flush_failures.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(
+                &snapshots[0],
+                &[("flush.failures", "{flush}")],
+                &[("error.type", label)],
             );
         }
 

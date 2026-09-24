@@ -376,6 +376,12 @@ impl WriteFailure {
         }
     }
 
+    /// Stable machine token of the class: the `error.type` label of
+    /// `flush.failures` and the `error_type` log field.
+    pub(super) fn label(self) -> &'static str {
+        self.as_str()
+    }
+
     /// The words a producer is told in place of the store's own error text,
     /// which names the endpoint, bucket and key layout.
     fn phrase(self) -> &'static str {

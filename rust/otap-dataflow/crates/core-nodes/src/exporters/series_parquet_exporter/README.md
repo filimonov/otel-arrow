@@ -915,9 +915,10 @@ Unlabelled worker state and totals:
 | `block.requests_pending` | `{request}` | Requests the worker still owes a decision. |
 | `block.pending_slot_occupied` | `{slot}` | Whether the single parking slot is occupied. |
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
-| `flush.failures` | `{flush}` | Flushes that did not reach object storage. |
-| `flush.retries` | `{attempt}` | Write attempts beyond the first, per flush, abandoned ones included. |
+| `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
+| `flush.abort_failures` | `{flush}` | Cancelled writes of decided flushes whose multipart abort failed or that did not unwind by the cleanup cutoff; each may leave an upload to the bucket's lifecycle rule. |
+| `flush.late_commits` | `{flush}` | Writes of decided flushes that completed while being cancelled; their files hold rows whose requests were nacked. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -936,6 +937,7 @@ Labelled sets, each with one closed enumeration:
 | Metric | Unit | Label | Values |
 | --- | --- | --- | --- |
 | `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
+| `flush.failures` | `{flush}` | `error.type` | `deadline`, `permanent_storage`, `cancelled`, `encode`, `internal` |
 | `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `block_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
@@ -967,8 +969,14 @@ success, so an abandoned or failed block credits nothing. `series.emitted`
 with `reason=rotation` rising means byte or request rotations inside single
 windows are re-emitting descriptors, which is the signal to raise
 `window.max_block_bytes` or `window.max_requests_per_block`.
-`flush.retries` counts every attempt beyond the first, whether the flush then
-succeeded, failed, or was decided by the shutdown deadline.
+`flush.retries` counts every attempt beyond the first when it starts, so an
+outage in progress shows its retries before the flush resolves.
+`flush.failures` says why a flush failed: `deadline` (the store kept failing
+or did not answer until the retry deadline), `permanent_storage` (refused
+credentials or permissions, or a missing bucket or path, which is not
+retried), `cancelled` (the shutdown deadline cancelled the write),
+`encode` (the Parquet or Arrow encoding failed) and `internal` (a seal
+failure or a lost write task).
 
 `admission.closed` is where a slow destination becomes visible. While it
 reads 1 the node takes nothing from its input channel, so the receiver
@@ -985,10 +993,11 @@ window interval means the destination, not the producers, is the limit.
 | `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
 | `series_parquet.upload.parts_exceed_limit` | WARN | At start, when a file of `window.max_block_bytes` would need more than 10,000 parts of `upload.part_bytes`: `max_block_bytes`, `part_bytes`, `parts`, `max_parts`. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
-| `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt, with the file name and object count. |
-| `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt, with the error. |
+| `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt: `seq`, `attempt`, `file`, `objects`, `deadline_remaining`. |
+| `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
-| `series_parquet.flush.failed` | ERROR | A block failed; every request in it is nacked as retryable. |
+| `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit | How the cancelled write of a decided flush unwound: `outcome` (`abort_failed` with `abort_error`, or `late_commit`), `seq`, `attempt`, `file`. A clean abort is DEBUG. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
 | `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
 | `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |

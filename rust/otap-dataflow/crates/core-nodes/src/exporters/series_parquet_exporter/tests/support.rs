@@ -7,7 +7,7 @@
 
 pub(super) use super::super::config::Config;
 
-pub(super) use super::super::outcome::Outcome;
+pub(super) use super::super::outcome::{Outcome, WriteFailure};
 
 pub(super) use super::super::token::{AckToken, Notifier};
 
@@ -485,6 +485,18 @@ pub(super) fn terminal_value(
         return snapshot.get_metrics()[index].to_u64_lossy();
     }
     panic!("no terminal snapshot carries {name} with {labels:?}")
+}
+
+/// Failed flushes counted in `flush.failures{error.type}` under `error_type`.
+pub(super) fn flush_failures(
+    metrics: &super::super::metrics::Metrics,
+    error_type: WriteFailure,
+) -> u64 {
+    metrics
+        .flush_failures
+        .get(super::super::metrics::FlushFailureAttrs { error_type })
+        .failures
+        .get()
 }
 
 /// Which failure a [`FaultStore`] injects.

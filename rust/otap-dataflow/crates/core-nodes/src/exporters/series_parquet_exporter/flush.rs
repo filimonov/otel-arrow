@@ -39,7 +39,8 @@
 //! very poll the deadline expired in if the owner has stopped listening. Such
 //! a file holds rows whose requests were nacked, which the producer's retry
 //! then writes again -- a duplicate that at-least-once delivery permits, never
-//! a loss. What the deadline does guarantee is that a write that has finished
+//! a loss; how each cancelled write unwound is reported by
+//! [`Trace::cleaned_up`]. What the deadline does guarantee is that a write that has finished
 //! when it is polled is reported as the success it is, see [`write_until`].
 
 use super::token::AckToken;
@@ -162,7 +163,7 @@ async fn write_until(
     limit: Rc<Limit>,
     abort_timeout: Duration,
     result_tx: tokio::sync::oneshot::Sender<FlushDone>,
-    started_attempts: Rc<Cell<u64>>,
+    trace: Rc<Trace>,
 ) {
     let mut attempts = 0_u64;
     let mut delay = FIRST_BACKOFF;
@@ -185,12 +186,10 @@ async fn write_until(
             return;
         }
         attempts += 1;
-        started_attempts.set(attempts);
+        trace.attempts.set(attempts);
         // The names this attempt will write, announced before it writes them,
         // so an operator can see that a retry rewrites objects rather than
-        // adding any. Every object of a block shares one file name and differs
-        // only in its dataset directory, so the name and the count are the
-        // whole set.
+        // adding any.
         //
         // The first attempt of a flush is the ordinary case and says nothing
         // an operator needs at INFO -- one line per written block already
@@ -199,24 +198,25 @@ async fn write_until(
         // field only: it is unbounded in cardinality (window, boot id and
         // sequence all move) and never labels a metric, where attempts are
         // counted instead.
-        let planned = sink.planned_paths(&data);
-        let file = planned
-            .first()
-            .and_then(object_store::path::Path::filename)
-            .unwrap_or("");
+        let remaining = limit.at().saturating_duration_since(clock::now());
         if attempts > 1 {
+            trace.tally.retries.set(trace.tally.retries.get() + 1);
             otel_info!(
                 "series_parquet.flush.attempt",
+                seq = trace.seq,
                 attempt = attempts,
-                file = file,
-                objects = planned.len()
+                file = &*trace.file,
+                objects = trace.objects,
+                deadline_remaining = ?remaining
             );
         } else {
             otel_debug!(
                 "series_parquet.flush.attempt",
+                seq = trace.seq,
                 attempt = attempts,
-                file = file,
-                objects = planned.len()
+                file = &*trace.file,
+                objects = trace.objects,
+                deadline_remaining = ?remaining
             );
         }
         // A child token so the attempt can be cancelled on the deadline
@@ -248,11 +248,12 @@ async fn write_until(
                 let _ = result_tx.send(done(attempts, Err(decided)));
                 attempt_cancel.cancel();
                 let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
-                tokio::select! {
+                let unwound = tokio::select! {
                     biased;
-                    _ = &mut write => {}
-                    () = clock::sleep_until(cutoff) => {}
-                }
+                    result = &mut write => Some(result),
+                    () = clock::sleep_until(cutoff) => None,
+                };
+                trace.cleaned_up(attempts, unwound);
                 // Dropping the write after the bound releases the last task-owned
                 // resources even if the object store future never cooperates.
                 return;
@@ -264,7 +265,7 @@ async fn write_until(
         // leave no trace at all, and a failure that ends the flush at once is
         // then logged per attempt exactly like a retried one.
         if let Err(error) = &result {
-            log_failed_attempt(attempts, file, error);
+            trace.attempt_failed(attempts, limit.at(), error);
         }
         match result {
             Ok(report) => {
@@ -298,17 +299,141 @@ async fn write_until(
     }
 }
 
-/// Log one failed write attempt at WARN, retried or not.
-///
-/// The only place the per-attempt WARN is emitted.
-fn log_failed_attempt(attempt: u64, file: &str, error: &lake::Error) {
-    otel_warn!(
-        "series_parquet.flush.attempt_failed",
-        attempt = attempt,
-        file = file,
-        retryable = error.is_retryable(),
-        error = %error
-    );
+/// Counts a flush task records as they happen, which the worker moves into
+/// its metrics whenever it samples them.
+#[derive(Debug, Default)]
+pub(super) struct FlushTally {
+    /// Write attempts started beyond the first of their flush.
+    pub(super) retries: Cell<u64>,
+    /// Cleanups of a decided write that may have left a multipart upload
+    /// behind: the abort failed, or the write did not unwind in time.
+    pub(super) abort_failures: Cell<u64>,
+    /// Decided writes that completed anyway while being cancelled.
+    pub(super) late_commits: Cell<u64>,
+}
+
+/// What one flush task reports its attempts and its cleanup under.
+pub(super) struct Trace {
+    /// The file name every object of the block shares; each object differs
+    /// only in its dataset directory.
+    pub(super) file: Rc<str>,
+    /// Objects one attempt writes.
+    objects: usize,
+    /// The block's per-worker sequence.
+    seq: u64,
+    /// Attempts the task has started so far, the one in flight included.
+    attempts: Cell<u64>,
+    /// Where the counts go.
+    tally: Rc<FlushTally>,
+}
+
+#[cfg(test)]
+impl Trace {
+    /// A trace for block `seq` writing `file`, for a test that reports a
+    /// cleanup without running a flush.
+    pub(super) fn for_test(file: &str, seq: u64, tally: Rc<FlushTally>) -> Self {
+        Self {
+            file: file.into(),
+            objects: 2,
+            seq,
+            attempts: Cell::new(0),
+            tally,
+        }
+    }
+}
+
+impl Trace {
+    /// Log one failed write attempt at WARN, retried or not.
+    ///
+    /// The only place the per-attempt WARN is emitted.
+    fn attempt_failed(&self, attempt: u64, deadline: Instant, error: &lake::Error) {
+        otel_warn!(
+            "series_parquet.flush.attempt_failed",
+            seq = self.seq,
+            attempt = attempt,
+            file = &*self.file,
+            retryable = error.is_retryable(),
+            deadline_remaining = ?deadline.saturating_duration_since(clock::now()),
+            error = %error
+        );
+    }
+
+    /// Report how the cancelled write of an already decided flush unwound:
+    /// `None` when it had not by the cleanup cutoff.
+    ///
+    /// A write that completed anyway committed files whose requests were
+    /// nacked, which the producer's retry writes again. One whose abort
+    /// failed, or that never unwound, may have left a multipart upload to the
+    /// bucket's lifecycle rule.
+    pub(super) fn cleaned_up(
+        &self,
+        attempt: u64,
+        unwound: Option<lake::Result<lake::sink::FlushReport>>,
+    ) {
+        let abort_error = match &unwound {
+            Some(Ok(_)) => {
+                self.tally
+                    .late_commits
+                    .set(self.tally.late_commits.get() + 1);
+                otel_info!(
+                    "series_parquet.flush.cleanup",
+                    outcome = "late_commit",
+                    seq = self.seq,
+                    attempt = attempt,
+                    file = &*self.file,
+                    message = "a decided write completed while it was cancelled; its files \
+                               hold rows whose requests were nacked"
+                );
+                return;
+            }
+            Some(Err(error)) => match abort_failure(error) {
+                Some(abort_error) => abort_error.to_owned(),
+                None => {
+                    otel_debug!(
+                        "series_parquet.flush.cleanup",
+                        outcome = "aborted",
+                        seq = self.seq,
+                        attempt = attempt,
+                        file = &*self.file
+                    );
+                    return;
+                }
+            },
+            None => "the write did not unwind by the cleanup cutoff".to_owned(),
+        };
+        self.abort_failed(attempt, &abort_error);
+    }
+
+    /// Count and log a cleanup that may have left a multipart upload behind.
+    pub(super) fn abort_failed(&self, attempt: u64, abort_error: &str) {
+        self.tally
+            .abort_failures
+            .set(self.tally.abort_failures.get() + 1);
+        otel_warn!(
+            "series_parquet.flush.cleanup",
+            outcome = "abort_failed",
+            seq = self.seq,
+            attempt = attempt,
+            file = &*self.file,
+            abort_error = abort_error,
+            message = "a multipart upload of a decided write may be left to the bucket \
+                       lifecycle rule"
+        );
+    }
+}
+
+/// Why the cleanup abort of a failed or cancelled write did not succeed, if
+/// the error says it did not.
+fn abort_failure(error: &lake::Error) -> Option<&str> {
+    match error {
+        lake::Error::Transient(
+            lake::TransientError::Cancelled {
+                abort_error: Some(abort_error),
+            }
+            | lake::TransientError::AbortFailed { abort_error, .. },
+        ) => Some(abort_error),
+        _ => None,
+    }
 }
 
 /// The outcome of a flush whose retry deadline expired.
@@ -344,15 +469,13 @@ pub(super) struct FlushJob {
     /// Counted at admission but reported only once the write has returned
     /// success, so a series row is credited exactly when its file exists.
     pub(super) emitted: [u64; 3],
-    /// Attempts the task has started so far, the one in flight included.
-    ///
-    /// Shared with the task so a block decided without its result -- at the
-    /// shutdown deadline -- still reports the retries it spent.
-    pub(super) attempts: Rc<Cell<u64>>,
     /// The sealed block's window start, in Unix seconds, for the commit log.
     pub(super) window_start_secs: i64,
     /// The sealed block's per-worker sequence, for the commit log.
     pub(super) seq: u64,
+    /// What the task reports its attempts and its cleanup under, shared with
+    /// it: the file name, and the attempts started so far.
+    pub(super) trace: Rc<Trace>,
     /// The deadline the task retries until, which shutdown can bring forward.
     limit: Rc<Limit>,
 }
@@ -372,12 +495,26 @@ impl FlushJob {
         emitted: [u64; 3],
         retry_deadline: Duration,
         abort_timeout: Duration,
+        tally: Rc<FlushTally>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let bytes = data.bytes;
         let window_start_secs = data.window_start_secs;
         let seq = data.seq;
-        let attempts = Rc::new(Cell::new(0));
+        // Every object of a block shares one file name and differs only in
+        // its dataset directory, so the name and the count are the whole set.
+        let planned = sink.planned_paths(&data);
+        let trace = Rc::new(Trace {
+            file: planned
+                .first()
+                .and_then(object_store::path::Path::filename)
+                .unwrap_or("")
+                .into(),
+            objects: planned.len(),
+            seq,
+            attempts: Cell::new(0),
+            tally,
+        });
         let started = clock::now();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let limit = Rc::new(Limit {
@@ -392,7 +529,7 @@ impl FlushJob {
             Rc::clone(&limit),
             abort_timeout,
             result_tx,
-            Rc::clone(&attempts),
+            Rc::clone(&trace),
         ));
         Self {
             handle,
@@ -402,9 +539,9 @@ impl FlushJob {
             bytes,
             started,
             emitted,
-            attempts,
             window_start_secs,
             seq,
+            trace,
             limit,
         }
     }
@@ -474,7 +611,8 @@ impl FlushJob {
     /// runtime teardown. Waiting is bounded because the destination may be the
     /// reason the node is shutting down: past `deadline` the task is aborted
     /// and the abort itself is awaited, so the task is provably gone rather
-    /// than merely asked to stop.
+    /// than merely asked to stop. An aborted task that had started a write
+    /// is reported as a cleanup whose abort failed.
     pub(super) async fn shutdown(&mut self, deadline: Instant) {
         self.cancel.cancel();
         let joined = tokio::select! {
@@ -485,6 +623,13 @@ impl FlushJob {
         if joined.is_none() {
             self.handle.abort();
             let _ = (&mut self.handle).await;
+            let attempt = self.trace.attempts.get();
+            if attempt != 0 {
+                self.trace.abort_failed(
+                    attempt,
+                    "the write task did not unwind by the cleanup cutoff and was aborted",
+                );
+            }
         }
     }
 }

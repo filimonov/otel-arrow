@@ -46,11 +46,11 @@
 
 use super::super::log_gate::LogGate;
 use super::config::Config;
-use super::flush::{self, FlushDone, FlushJob};
+use super::flush::{self, FlushDone, FlushJob, FlushTally};
 use super::metrics::{
     DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs,
 };
-use super::outcome::{self, Outcome, StorageFailed};
+use super::outcome::{self, Outcome, StorageFailed, WriteFailure};
 use super::token::{AckToken, Notifier};
 use super::window::Window;
 use lake::buffer::Block;
@@ -265,6 +265,9 @@ pub(super) struct Worker {
     /// the exporters account for from the one process RSS sample it already
     /// takes; dropping the worker withdraws its bytes and its registration.
     pub(super) accounting: SeriesMemoryAccounting,
+    /// What every flush task counts as it happens, moved into the metrics on
+    /// each sample.
+    flush_tally: Rc<FlushTally>,
 }
 
 /// A test that drops a worker still holding completions tears them down with
@@ -345,6 +348,7 @@ impl Worker {
             abandoned: 0,
             metrics: None,
             accounting: SeriesMemoryAccounting::register(),
+            flush_tally: Rc::default(),
         }
     }
 
@@ -764,7 +768,7 @@ impl Worker {
             .seal(nanos_to_micros(self.wall.now_unix_nanos()))
         {
             if let Some(metrics) = &mut self.metrics {
-                metrics.worker.flush_failures.add(1);
+                metrics.flush_failed(WriteFailure::Internal);
             }
             otel_warn!("series_parquet.seal.failed", error = %error);
             // Sealing is in-memory Arrow work; storage was never touched.
@@ -791,6 +795,7 @@ impl Worker {
             old.emitted,
             self.cfg.window.flush_retry_deadline,
             self.cfg.lake.upload.abort_timeout,
+            Rc::clone(&self.flush_tally),
         );
         if let Some(deadline) = self.deadline {
             job.cut_to(deadline);
@@ -840,12 +845,6 @@ impl Worker {
         let mut reason: Option<Rc<str>> = None;
         let outcome = match &done {
             Ok(finished) => {
-                if let Some(metrics) = &mut self.metrics {
-                    metrics
-                        .worker
-                        .flush_retries
-                        .add(finished.attempts.saturating_sub(1));
-                }
                 match &finished.result {
                     Ok(report) => {
                         for id in &finished.data.pending_series {
@@ -895,16 +894,23 @@ impl Worker {
                         Outcome::Ack
                     }
                     Err(error) => {
+                        let class = WriteFailure::of(error);
                         if let Some(metrics) = &mut self.metrics {
-                            metrics.worker.flush_failures.add(1);
+                            metrics.flush_failed(class);
                             if error.is_cancelled() {
                                 metrics.worker.flush_cancelled.add(1);
                             }
                         }
                         otel_error!(
                             "series_parquet.flush.failed",
-                            error = %error,
+                            window_start = job.window_start_secs,
+                            seq = job.seq,
+                            file = &*job.trace.file,
+                            requests = job.tokens.len(),
+                            bytes = job.bytes,
                             attempts = finished.attempts,
+                            error_type = class.label(),
+                            error = %error,
                             message = "Block failed before durable completion"
                         );
                         reason = Some(Rc::from(StorageFailed(error).to_string()));
@@ -914,9 +920,17 @@ impl Worker {
             }
             Err(error) => {
                 if let Some(metrics) = &mut self.metrics {
-                    metrics.worker.flush_failures.add(1);
+                    metrics.flush_failed(WriteFailure::Internal);
                 }
-                otel_warn!("series_parquet.flush.task_failed", error = %error);
+                otel_warn!(
+                    "series_parquet.flush.task_failed",
+                    window_start = job.window_start_secs,
+                    seq = job.seq,
+                    file = &*job.trace.file,
+                    requests = job.tokens.len(),
+                    bytes = job.bytes,
+                    error = %error
+                );
                 self.failed_outcome()
             }
         };
@@ -1116,6 +1130,18 @@ impl Worker {
         let parked = self.pending.is_some();
         let now = clock::now();
         if let Some(metrics) = &mut self.metrics {
+            // Credited by the flush tasks as they happen, so an outage shows
+            // its retries while it lasts.
+            let tally = &self.flush_tally;
+            metrics.worker.flush_retries.add(tally.retries.take());
+            metrics
+                .worker
+                .flush_abort_failures
+                .add(tally.abort_failures.take());
+            metrics
+                .worker
+                .flush_late_commits
+                .add(tally.late_commits.take());
             metrics.worker.cache_entries.set(entries);
             metrics.worker.cache_hits.observe(stats.hits);
             metrics.worker.cache_misses.observe(stats.misses);
@@ -1259,15 +1285,8 @@ impl Worker {
                         .saturating_duration_since(job.started)
                         .as_secs_f64(),
                 );
-                metrics.worker.flush_failures.add(1);
+                metrics.flush_failed(WriteFailure::Cancelled);
                 metrics.worker.flush_cancelled.add(1);
-                // The retries this write spent are counted like a completed
-                // flush counts them, or an outage that runs into the deadline
-                // would report none at all.
-                metrics
-                    .worker
-                    .flush_retries
-                    .add(job.attempts.get().saturating_sub(1));
             }
             for token in std::mem::take(&mut job.tokens) {
                 self.notify.push(token, Outcome::Shutdown);

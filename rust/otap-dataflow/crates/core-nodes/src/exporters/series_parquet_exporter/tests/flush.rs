@@ -117,15 +117,15 @@ async fn values_retry_reuses_paths_and_bytes() {
                 PipelineCompletionMsg::DeliverAck { .. }
             ));
 
-            let metrics = worker.metrics.as_ref().expect("metrics");
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_mut().expect("metrics");
             assert_eq!(
                 metrics.worker.flush_retries.get(),
                 1,
                 "the extra attempt is reported as a retry"
             );
-            assert_eq!(
-                metrics.worker.flush_failures.get(),
-                0,
+            assert!(
+                metrics.flush_failures.terminal_snapshots().is_empty(),
                 "a retried flush that succeeded is not a failure"
             );
             assert_eq!(metrics.worker.flush_cancelled.get(), 0);
@@ -479,7 +479,8 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
             );
             worker.complete(done);
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_failures.get(), 1);
+            assert_eq!(flush_failures(metrics, WriteFailure::Deadline), 1);
+            assert_eq!(flush_failures(metrics, WriteFailure::Cancelled), 0);
             assert_eq!(metrics.worker.flush_cancelled.get(), 0);
 
             assert!(worker.notify.next().await.is_ok());
@@ -556,8 +557,10 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
                 other => panic!("expected the deadline with the last error, got {other:?}"),
             }
             worker.complete(done);
+            worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
             assert_eq!(metrics.worker.flush_retries.get(), 2);
+            assert_eq!(flush_failures(metrics, WriteFailure::Deadline), 1);
             assert_eq!(metrics.worker.flush_cancelled.get(), 0);
 
             assert!(worker.notify.next().await.is_ok());
@@ -580,6 +583,19 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
         .await;
     let failed = events.named("series_parquet.flush.failed");
     assert_eq!(failed.len(), 1, "{failed:?}");
+    let field = |name: &str| failed[0].fields.get(name).cloned();
+    assert_eq!(field("window_start"), Some(FieldValue::I64(0)));
+    assert_eq!(field("seq"), Some(FieldValue::U64(0)));
+    assert_eq!(field("requests"), Some(FieldValue::U64(1)));
+    assert!(matches!(field("bytes"), Some(FieldValue::U64(n)) if n > 0));
+    assert!(
+        field("file").is_some_and(|file| file.text().ends_with(".parquet")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        field("error_type"),
+        Some(FieldValue::Str("deadline".into()))
+    );
     assert!(
         failed[0].fields.get("error").is_some_and(|error| {
             let text = error.text();
@@ -601,6 +617,14 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             Some(&FieldValue::U64(index as u64 + 1))
         );
         assert_eq!(event.fields.get("retryable"), Some(&FieldValue::Bool(true)));
+        assert_eq!(event.fields.get("seq"), Some(&FieldValue::U64(0)));
+        assert!(
+            matches!(
+                event.fields.get("deadline_remaining"),
+                Some(FieldValue::Debug(_))
+            ),
+            "{event:?}"
+        );
         assert!(
             event
                 .fields
@@ -609,6 +633,82 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             "{event:?}"
         );
     }
+    // Attempts 2 and 3 are retries, announced at INFO with the block's
+    // sequence and the time left before its deadline.
+    let retries: Vec<_> = events
+        .named("series_parquet.flush.attempt")
+        .into_iter()
+        .filter(|event| event.level == tracing::Level::INFO)
+        .collect();
+    assert_eq!(retries.len(), 2, "{retries:?}");
+    for event in &retries {
+        assert_eq!(event.fields.get("seq"), Some(&FieldValue::U64(0)));
+        assert!(
+            matches!(
+                event.fields.get("deadline_remaining"),
+                Some(FieldValue::Debug(_))
+            ),
+            "{event:?}"
+        );
+    }
+}
+
+/// Scenario: every write fails after twenty seconds under a sixty-second
+/// flush deadline, and telemetry is sampled while the second attempt is still
+/// in flight, before the flush has resolved.
+/// Guarantees: `flush.retries` already reads 1, so an outage in progress
+/// shows its retries instead of zero until the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_is_counted_when_it_starts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = fault_store();
+            store.hooks().set(Fault::SlowFail);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_secs(60);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(logs_pdata());
+            worker.rotate();
+            // The first attempt fails at 20 s and the second starts at 20.2 s.
+            step_for(&sim, Duration::from_secs(25)).await;
+            assert!(
+                store
+                    .hooks()
+                    .entered_at
+                    .lock()
+                    .expect("entered_at lock")
+                    .len()
+                    >= 2,
+                "the second attempt has reached the store"
+            );
+            assert!(worker.flushing.is_some(), "the flush has not resolved");
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_retries.get(), 1);
+
+            let ticker = ticking(&sim, Duration::from_secs(1));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            job.cleanup().await.expect("the task is released");
+            drop(ticker);
+        })
+        .await;
 }
 
 /// Scenario: an encoding bug and a storage I/O error arrive as the same lake
@@ -806,13 +906,17 @@ async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
 /// Guarantees: the retryable decision is published at the deadline, the
 /// FLUSHING slot stays occupied until the cleanup ends, the cleanup does end
 /// once the abort allowance elapses, and no completed values object is left in
-/// the store.
+/// the store. The failed abort is reported: one `series_parquet.flush.cleanup`
+/// WARN with the block's sequence, file, attempt and abort error, and
+/// `flush.abort_failures` reads 1.
 #[tokio::test(flavor = "current_thread")]
 async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
+    let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let store = fault_store();
             store.hooks().set(Fault::MultipartWedge);
             let (handler, _rx) = effects(8);
@@ -835,6 +939,10 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             cfg.lake.sorting.merge_chunk_bytes = 4096;
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
 
             worker.admit(bulk_logs_pdata(20_000));
             worker.rotate();
@@ -889,8 +997,103 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
                 store.inner().head(&path).await.is_err(),
                 "a wedged upload never completes an object"
             );
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_abort_failures.get(), 1);
+            assert_eq!(metrics.worker.flush_late_commits.get(), 0);
+            assert_eq!(flush_failures(metrics, WriteFailure::Deadline), 1);
         })
         .await;
+    let cleanup = events.named("series_parquet.flush.cleanup");
+    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+    let event = &cleanup[0];
+    assert_eq!(event.level, tracing::Level::WARN);
+    let field = |name: &str| event.fields.get(name).cloned();
+    assert_eq!(
+        field("outcome"),
+        Some(FieldValue::Str("abort_failed".into()))
+    );
+    assert_eq!(field("seq"), Some(FieldValue::U64(0)));
+    assert_eq!(field("attempt"), Some(FieldValue::U64(1)));
+    assert!(
+        field("file").is_some_and(|file| file.text().ends_with(".parquet")),
+        "{event:?}"
+    );
+    assert!(
+        field("abort_error").is_some_and(|error| !error.text().is_empty()),
+        "{event:?}"
+    );
+}
+
+/// Scenario: the cleanup of a decided write is reported for every way it can
+/// unwind: the write completed anyway, it was aborted cleanly, its abort
+/// timed out inside the sink, its abort failed after a write error, and it
+/// did not unwind by the cleanup cutoff.
+/// Guarantees: a late commit is one INFO `series_parquet.flush.cleanup` with
+/// `outcome=late_commit` and counts in `flush.late_commits`; a clean abort is
+/// DEBUG and counts nothing; each of the other three is a WARN with
+/// `outcome=abort_failed` and its abort error, and counts in
+/// `flush.abort_failures`.
+#[test]
+fn every_cleanup_outcome_is_logged_and_counted() {
+    let events = capture();
+    let tally = std::rc::Rc::new(super::super::flush::FlushTally::default());
+    let trace =
+        super::super::flush::Trace::for_test("part-x.parquet", 7, std::rc::Rc::clone(&tally));
+    trace.cleaned_up(2, Some(Ok(lake::sink::FlushReport { files: Vec::new() })));
+    trace.cleaned_up(2, Some(Err(lake::Error::cancelled(None))));
+    trace.cleaned_up(
+        2,
+        Some(Err(lake::Error::cancelled(Some("abort timed out".into())))),
+    );
+    trace.cleaned_up(
+        2,
+        Some(Err(lake::Error::Transient(
+            lake::TransientError::AbortFailed {
+                source: Box::new(lake::Error::internal("encode")),
+                abort_error: "abort refused".into(),
+            },
+        ))),
+    );
+    trace.cleaned_up(2, None);
+    assert_eq!(tally.late_commits.get(), 1);
+    assert_eq!(tally.abort_failures.get(), 3);
+    let logged = events.named("series_parquet.flush.cleanup");
+    let summary: Vec<_> = logged
+        .iter()
+        .map(|event| {
+            (
+                event.level,
+                event.fields.get("outcome").map(|v| v.text().to_owned()),
+                event.fields.get("abort_error").map(|v| v.text().to_owned()),
+            )
+        })
+        .collect();
+    let warn = |abort: &str| {
+        (
+            tracing::Level::WARN,
+            Some("abort_failed".to_owned()),
+            Some(abort.to_owned()),
+        )
+    };
+    assert_eq!(
+        summary,
+        [
+            (tracing::Level::INFO, Some("late_commit".to_owned()), None),
+            (tracing::Level::DEBUG, Some("aborted".to_owned()), None),
+            warn("abort timed out"),
+            warn("abort refused"),
+            warn("the write did not unwind by the cleanup cutoff"),
+        ]
+    );
+    for event in &logged {
+        assert_eq!(event.fields.get("seq"), Some(&FieldValue::U64(7)));
+        assert_eq!(event.fields.get("attempt"), Some(&FieldValue::U64(2)));
+        assert_eq!(
+            event.fields.get("file").map(FieldValue::text),
+            Some("part-x.parquet")
+        );
+    }
 }
 
 /// Scenario: one request is admitted, its block is written to an in-memory
