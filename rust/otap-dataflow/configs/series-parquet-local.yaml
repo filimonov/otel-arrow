@@ -5,8 +5,9 @@
 #   otlp receiver --> series_parquet exporter --> local files
 #
 # The receiver is connected directly to the exporter with
-# `wait_for_result: true`, so an OK OTLP response means the request's rows are
-# already durable in the configured storage. Build with
+# `wait_for_result: true`, so an OK OTLP response means the request's files
+# are in place; the local backend does not fsync, so they survive an engine
+# crash, not necessarily a host crash. Build with
 # `--features series-parquet` and create the base directory before starting.
 #
 # Usage:

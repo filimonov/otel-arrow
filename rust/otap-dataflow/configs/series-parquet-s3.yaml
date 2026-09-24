@@ -15,8 +15,8 @@
 # (SERIES_S3_ACCESS_KEY_ID, SERIES_S3_SECRET_ACCESS_KEY), which must name the
 # credentials of a local MinIO or RustFS container on the loopback endpoint.
 # An unset variable leaves that credential empty, which the store refuses at
-# the first write; the file itself never carries a credential. Production deployments use the shared
-# AWS auth provider configuration instead of static credentials.
+# the first write; the file itself never carries a credential. Production
+# deployments use the shared AWS auth provider configuration instead.
 #
 # Admission is sized for 100k records/s on the one core, sent as requests of
 # about 512 records. An ack is held for, on average, half a window plus the
