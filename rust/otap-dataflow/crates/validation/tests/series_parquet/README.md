@@ -327,6 +327,13 @@ reports the log's size (start, maximum, end, slope), the buffer's in-flight
 and queued items, and, like every trial, the lag from a request's
 acknowledgement to the completion of the last object holding its records.
 
+A `trial={...}` may also set `wal_dir` (where the buffer's write-ahead log
+lives), `local_store_dir` (where the local store writes) and
+`buffer_config` (merged into the durable buffer's configuration), for
+diagnostic trials that isolate a device; every trial records the writes,
+bytes written and mean write and flush latency of the host's block
+devices over its measured interval.
+
 `--option search_floor={"cell": {"variant": rate}}` starts a cell's search
 at a floor derived from measured neighbours instead of 1,000 records/s: half
 of the smaller of the same store's one-worker ceiling times the workers and

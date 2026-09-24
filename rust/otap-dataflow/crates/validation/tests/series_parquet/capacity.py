@@ -1007,6 +1007,45 @@ def trial_residuals(samples, idle, pairs=()) -> tuple:
     return measurement.rss_residuals(samples, idle), {"source": "pipeline_memory_usage"}
 
 
+# The block devices a trial's disk traffic is read from.
+DISK_DEVICES = ("nvme0n1", "nvme1n1", "dm-0", "dm-1")
+
+
+def diskstats() -> dict:
+    """/proc/diskstats counters of the named devices, by device."""
+    found = {}
+    for line in Path("/proc/diskstats").read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 20 and fields[2] in DISK_DEVICES:
+            values = [int(value) for value in fields[3:]]
+            found[fields[2]] = {
+                "writes": values[4], "sectors_written": values[6], "write_ms": values[7],
+                "flushes": values[14], "flush_ms": values[15],
+            }
+    return found
+
+
+def disk_view(start, end, window_ns) -> dict:
+    """Writes, bytes written and the mean write and flush latency per device."""
+    if not start or not end:
+        return {}
+    seconds = window_ns / 1e9
+    view = {}
+    for device, after in end.items():
+        before = start.get(device)
+        if not before:
+            continue
+        delta = {key: after[key] - before[key] for key in after}
+        view[device] = {
+            "write_bytes_per_s": delta["sectors_written"] * 512 / seconds,
+            "writes_per_s": delta["writes"] / seconds,
+            "write_await_ms": delta["write_ms"] / delta["writes"] if delta["writes"] else None,
+            "flushes_per_s": delta["flushes"] / seconds,
+            "flush_await_ms": delta["flush_ms"] / delta["flushes"] if delta["flushes"] else None,
+        }
+    return view
+
+
 def buffer_view(samples, window, trial, stats) -> dict:
     """The durable buffer over the measured interval, and why it did not keep up.
 
@@ -1475,6 +1514,8 @@ def engine_settings(plan, trial, root):
         "receiver": {"protocols": {"grpc": {"max_concurrent_requests": capacity}}},
         "pipeline_policies": {"channel_capacity": {"pdata": capacity}},
     }
+    if trial.get("buffer_config") and trial["topology"] == "buffered":
+        merge[test_e2e.BUFFER_NODE] = dict(trial["buffer_config"])
     overrides = None
     if trial["topology"] != "noop":
         overrides = {
@@ -1483,15 +1524,22 @@ def engine_settings(plan, trial, root):
         }
         if plan["store"] is not None:
             overrides["retry"] = test_e2e.S3_RETRY
+    storage = dict(plan["store"].storage) if plan["store"] is not None else None
+    if trial.get("local_store_dir") and plan["store"] is None:
+        storage = {"file": {"base_uri": str(Path(trial["local_store_dir"]) / root.parent.name)}}
+    buffer_path = None
+    if trial["topology"] == "buffered":
+        buffer_path = (Path(trial["wal_dir"]) / root.parent.name) if trial.get("wal_dir") \
+            else root / "buffer"
     return {
-        "storage": dict(plan["store"].storage) if plan["store"] is not None else None,
+        "storage": storage,
         "overrides": overrides,
         "interval": f"{trial['interval_s']}s",
         "cores": list(plan["cores"]),
         "merge": merge,
         "binary": Path(plan["provenance"]["build"]["binary"]),
         "topology": trial["topology"],
-        "buffer_path": (root / "buffer") if trial["topology"] == "buffered" else None,
+        "buffer_path": buffer_path,
     }
 
 
@@ -1575,6 +1623,7 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
                 "producer_cpu_ns": sum(
                     performance.procfs_cpu_ns(pid) for pid in fleet.pids()
                 ),
+                "diskstats": diskstats(),
             }
             controls.raise_if_invalid()
         sends = fleet.finish(PRODUCER_TIMEOUT_S + 120)
@@ -1726,7 +1775,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         (warm[-1]["extras"].get(key) or {}).get("acks", 0) > 0 for key in busy
     )
     # Store objects, downloaded or local, then the oracle.
-    data_dir = Path(engine.data)
+    # A local store writes where its configuration points; a trial may move it.
+    storage = (engine.config["groups"]["default"]["pipelines"]["main"]["nodes"]["exporter"]
+               .get("config", {}).get("storage") or {})
+    data_dir = Path((storage.get("file") or {}).get("base_uri") or engine.data)
     objects = [] if trial["topology"] == "noop" else object_inventory(plan, store, data_dir)
     uploads = incomplete_uploads(store) if trial["topology"] != "noop" else {}
     local = data_dir if store is None else run_dir / "store"
@@ -1894,6 +1946,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         "rates": measured,
         "oracle_s": oracle_s,
         "freshness": fresh,
+        "disk": disk_view(readings["start"].get("diskstats"), readings["end"].get("diskstats"),
+                          window_ns),
+        "wal_dir": trial.get("wal_dir"),
+        "local_store_dir": trial.get("local_store_dir"),
         "buffer": buffer,
         "generator": source.as_json(),
         "acknowledged_request_ranges": request_ranges(acked),
@@ -2150,7 +2206,8 @@ def next_ordinal_factory(*directories):
 def make_trial(plan, *, workload_id=PRIMARY_WORKLOAD, rate, purpose,
                topology="strict", interval_s=SEARCH_INTERVAL_S, connections=SEARCH_CONNECTIONS,
                receiver_capacity=SHIPPED_RECEIVER_CAPACITY, upload_concurrency=2,
-               warmup_s=None, measure_s=MEASURE_S, jemalloc_stats=True) -> dict:
+               warmup_s=None, measure_s=MEASURE_S, jemalloc_stats=True,
+               wal_dir=None, local_store_dir=None, buffer_config=None) -> dict:
     """One trial's settings; the warm-up covers at least two windows."""
     if warmup_s is None:
         warmup_s = max(WARMUP_S, 2 * interval_s + 5)
@@ -2170,6 +2227,9 @@ def make_trial(plan, *, workload_id=PRIMARY_WORKLOAD, rate, purpose,
         "warmup_s": warmup_s,
         "measure_s": measure_s,
         "jemalloc_stats": jemalloc_stats,
+        "wal_dir": wal_dir,
+        "local_store_dir": local_store_dir,
+        "buffer_config": buffer_config,
         "ordinal": plan["next_ordinal"](),
     }
 
