@@ -5,7 +5,6 @@
 //! table's rows by its `sort_key` (FORMAT.md section 5).
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array};
@@ -17,7 +16,7 @@ use arrow::buffer::NullBuffer;
 use arrow::compute::{SortColumn, SortOptions, interleave, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Float64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow::row::{Row, RowConverter, Rows, SortField};
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 
 use crate::config::{Nulls, SortKey, SortOrder};
@@ -163,6 +162,62 @@ pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), taken)?)
 }
 
+/// Sort the rows of several batches of one schema into one batch, in the
+/// order [`sort_batch`] gives their concatenation.
+///
+/// Only the sort-key columns are concatenated; every column is then gathered
+/// once, straight from the batches. Returns the concatenation for an empty
+/// spec.
+///
+/// # Errors
+/// Refuses a spec naming a column the batches lack, and propagates an Arrow
+/// failure of the concatenation, the sort or the gather.
+pub fn sort_batches(batches: &[RecordBatch], spec: &SortSpec) -> Result<RecordBatch> {
+    let Some(first) = batches.first() else {
+        return Err(Error::internal("no batches to sort"));
+    };
+    if let [only] = batches {
+        return sort_batch(only, spec);
+    }
+    let schema = first.schema();
+    if spec.is_empty() {
+        return Ok(arrow::compute::concat_batches(&schema, batches)?);
+    }
+    check_columns(first, spec)?;
+    let keys = spec
+        .keys
+        .iter()
+        .map(|k| {
+            let parts = batches
+                .iter()
+                .map(|b| {
+                    b.column_by_name(&k.column)
+                        .map(AsRef::as_ref)
+                        .ok_or_else(|| Error::internal(format!("sort column {} missing", k.column)))
+                })
+                .collect::<Result<Vec<&dyn Array>>>()?;
+            Ok(SortColumn {
+                values: normalize_key(&arrow::compute::concat(&parts)?),
+                options: Some(SortSpec::options(k)),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&keys, None)?;
+    let rows: Vec<(usize, usize)> = batches
+        .iter()
+        .enumerate()
+        .flat_map(|(b, batch)| (0..batch.num_rows()).map(move |r| (b, r)))
+        .collect();
+    let order: Vec<(usize, usize)> = indices.values().iter().map(|&i| rows[i as usize]).collect();
+    let columns = (0..schema.fields().len())
+        .map(|c| {
+            let parts: Vec<&dyn Array> = batches.iter().map(|b| b.column(c).as_ref()).collect();
+            interleave(&parts, &order)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 /// Most rows one merge step encodes keys for, or pops from the merge heap,
 /// before it returns.
 ///
@@ -172,9 +227,9 @@ pub fn sort_batch(batch: &RecordBatch, spec: &SortSpec) -> Result<RecordBatch> {
 /// order: the merge produces the same chunks however its work is sliced.
 pub const MERGE_STEP_ROWS: usize = 8192;
 
-/// Most encoded key bytes one merge step builds or copies before it returns.
+/// Most encoded key bytes one merge step builds or compares before it returns.
 ///
-/// Encoding and copying keys costs time in proportion to their bytes, so a
+/// Encoding and comparing keys costs time in proportion to their bytes, so a
 /// wide key, such as a log body, gets proportionally fewer rows per step.
 pub const MERGE_STEP_KEY_BYTES: usize = 1 << 20;
 
@@ -214,8 +269,9 @@ impl StepBudget {
     }
 }
 
+/// A run's next row in the merge: where its key is encoded, not a copy of it.
+#[derive(Debug, Clone, Copy)]
 struct HeapItem {
-    row: OwnedRow,
     run: usize,
     /// Row index within the run.
     idx: usize,
@@ -224,25 +280,78 @@ struct HeapItem {
     off: usize,
 }
 
-impl PartialEq for HeapItem {
-    fn eq(&self, o: &Self) -> bool {
-        self.row.as_ref() == o.row.as_ref() && self.run == o.run
+impl HeapItem {
+    /// The row's encoded key among every run's key segments.
+    fn key<'k>(&self, keys: &'k [Vec<Rows>]) -> Row<'k> {
+        keys[self.run][self.seg].row(self.off)
+    }
+
+    /// Merge order: the smaller key first, and for equal keys the earlier run,
+    /// so that equal rows leave the merge in run order.
+    fn before(&self, other: &Self, keys: &[Vec<Rows>]) -> bool {
+        self.key(keys)
+            .cmp(&other.key(keys))
+            .then(self.run.cmp(&other.run))
+            == Ordering::Less
     }
 }
-impl Eq for HeapItem {}
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
+
+/// A binary min-heap of [`HeapItem`]s in merge order, comparing the keys
+/// where they are encoded.
+#[derive(Default)]
+struct MergeHeap {
+    items: Vec<HeapItem>,
 }
-impl Ord for HeapItem {
-    // Reversed so BinaryHeap pops the smallest row; ties broken by run index so
-    // that equal rows leave the merge in run order.
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.row
-            .as_ref()
-            .cmp(self.row.as_ref())
-            .then(o.run.cmp(&self.run))
+
+impl MergeHeap {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    fn push(&mut self, item: HeapItem, keys: &[Vec<Rows>]) {
+        self.items.push(item);
+        let mut child = self.items.len() - 1;
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if !self.items[child].before(&self.items[parent], keys) {
+                break;
+            }
+            self.items.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn pop(&mut self, keys: &[Vec<Rows>]) -> Option<HeapItem> {
+        let last = self.items.len().checked_sub(1)?;
+        self.items.swap(0, last);
+        let top = self.items.pop();
+        let len = self.items.len();
+        let mut parent = 0;
+        loop {
+            let (left, right) = (2 * parent + 1, 2 * parent + 2);
+            let mut first = parent;
+            if left < len && self.items[left].before(&self.items[first], keys) {
+                first = left;
+            }
+            if right < len && self.items[right].before(&self.items[first], keys) {
+                first = right;
+            }
+            if first == parent {
+                break;
+            }
+            self.items.swap(parent, first);
+            parent = first;
+        }
+        top
     }
 }
 
@@ -316,13 +425,11 @@ pub struct MergeBuild {
     sorted: bool,
     /// Totals kept as the slices are encoded, so that neither reporting the
     /// keys nor finishing the build scans them again: the heap every run's
-    /// first row enters once encoded, the heap bytes of every segment, the
-    /// longest encoded key, and the pinned bytes and rows of the runs begun
-    /// so far, which set the chunk's row count.
-    heap: BinaryHeap<HeapItem>,
+    /// first row enters once encoded, the heap bytes of every segment, and
+    /// the pinned bytes and rows of the runs begun so far, which set the
+    /// chunk's row count.
+    heap: MergeHeap,
     key_bytes: usize,
-    owned_key_bytes: usize,
-    longest_key: usize,
     pinned_bytes: usize,
     pinned_rows: usize,
     seen: CountedAllocations,
@@ -379,10 +486,8 @@ impl MergeBuild {
             encoded_rows: 0,
             budget: StepBudget::DEFAULT,
             sorted,
-            heap: BinaryHeap::new(),
+            heap: MergeHeap::default(),
             key_bytes: 0,
-            owned_key_bytes: 0,
-            longest_key: 0,
             pinned_bytes: 0,
             pinned_rows: 0,
             seen: CountedAllocations::default(),
@@ -448,29 +553,22 @@ impl MergeBuild {
             }
             let slice = run.slice(self.offset, rows);
             let encoded = key_rows(&slice, &self.spec, converter)?;
-            let (mut bytes, mut longest) = (0usize, 0usize);
-            for length in encoded.lengths() {
-                bytes += length;
-                longest = longest.max(length);
-            }
+            let bytes: usize = encoded.lengths().sum();
             self.encoded_bytes += bytes;
             self.encoded_rows += rows;
             self.key_bytes += encoded.size();
-            self.longest_key = self.longest_key.max(longest);
             rows_done += rows;
             bytes_done += bytes;
+            self.keys[self.run].push(encoded);
             if self.offset == 0 {
-                let first = encoded.row(0);
-                self.owned_key_bytes += first.as_ref().len();
-                self.heap.push(HeapItem {
-                    row: first.owned(),
+                let first = HeapItem {
                     run: self.run,
                     idx: 0,
                     seg: 0,
                     off: 0,
-                });
+                };
+                self.heap.push(first, &self.keys);
             }
-            self.keys[self.run].push(encoded);
             self.offset += rows;
             if self.offset >= run.num_rows() {
                 self.run += 1;
@@ -480,12 +578,12 @@ impl MergeBuild {
         Ok(self.is_complete())
     }
 
-    /// Heap the keys encoded so far hold beside the runs: every segment,
-    /// the owned key of every run seeded into the heap, and the heap's own
-    /// allocation. Kept as running totals, so asking costs nothing.
+    /// Heap the keys encoded so far hold beside the runs: every segment and
+    /// the heap's own allocation. Kept as running totals, so asking costs
+    /// nothing.
     #[must_use]
     pub fn resident_key_bytes(&self) -> usize {
-        self.key_bytes + self.owned_key_bytes + self.heap.capacity() * size_of::<HeapItem>()
+        self.key_bytes + self.heap.capacity() * size_of::<HeapItem>()
     }
 
     /// Seed the merge heap and hand over the merge, encoding whatever keys
@@ -515,7 +613,6 @@ impl MergeBuild {
             keys: self.keys,
             heap: self.heap,
             key_bytes: self.key_bytes,
-            longest_key: self.longest_key,
             rows_per_chunk,
             next_run: 0,
             sorted: self.sorted,
@@ -561,7 +658,7 @@ pub enum MergeStep {
 ///
 /// A chunk can be produced in bounded steps through [`MergeIter::step`]: a
 /// step pops heap rows and interleaves output columns until it has done
-/// about [`MERGE_STEP_ROWS`] rows of work or copied
+/// about [`MERGE_STEP_ROWS`] rows of work or compared
 /// [`MERGE_STEP_KEY_BYTES`] of keys. `next()` runs the same steps back to
 /// back, so both produce exactly the same chunks.
 pub struct MergeIter {
@@ -569,12 +666,9 @@ pub struct MergeIter {
     schema: SchemaRef,
     /// Sorted mode: encoded keys per run, as segments, plus the merge heap.
     keys: Vec<Vec<Rows>>,
-    heap: BinaryHeap<HeapItem>,
+    heap: MergeHeap,
     /// Heap bytes of every key segment, a total kept by the build.
     key_bytes: usize,
-    /// The longest encoded key of any row of any run: the most one heap
-    /// entry's owned key row can ever hold.
-    longest_key: usize,
     rows_per_chunk: usize,
     /// Unsorted mode: index of the next run to hand out unchanged.
     next_run: usize,
@@ -596,18 +690,14 @@ impl MergeIter {
     /// holds for the iterator's whole life.
     ///
     /// Every run's encoded sort keys, allocated when the merge is built and
-    /// released only when the iterator is dropped, plus the merge heap and
-    /// the key row each heap entry owns. The owned rows change as the merge
-    /// advances and variable-width keys differ in length, so each of the at
-    /// most one entry per run is charged the longest key of any row: the
-    /// value never falls below what is resident at any point of the merge,
-    /// however far it has advanced. The runs themselves are not counted:
-    /// the block they came from already accounts for them. Zero in unsorted
-    /// mode, which encodes no keys.
+    /// released only when the iterator is dropped, plus the merge heap, whose
+    /// entries point into those keys and never grow past one per run. The
+    /// runs themselves are not counted: the block they came from already
+    /// accounts for them. Zero in unsorted mode, which encodes no keys.
     #[must_use]
     pub fn resident_key_bytes(&self) -> usize {
         let entries = self.heap.capacity().max(self.keys.len());
-        self.key_bytes + entries * size_of::<HeapItem>() + self.keys.len() * self.longest_key
+        self.key_bytes + entries * size_of::<HeapItem>()
     }
 
     /// Whether the chunks this merge hands out are allocated by it.
@@ -645,16 +735,11 @@ impl MergeIter {
         self.pending_rows = 0;
     }
 
-    /// What the owned key rows and the merge heap hold right now (tests).
+    /// What the key segments and the merge heap hold right now (tests).
     #[cfg(test)]
     fn resident_key_bytes_now(&self) -> usize {
         self.keys.iter().flatten().map(Rows::size).sum::<usize>()
             + self.heap.capacity() * size_of::<HeapItem>()
-            + self
-                .heap
-                .iter()
-                .map(|item| item.row.as_ref().as_ref().len())
-                .sum::<usize>()
     }
 
     /// The same merge, stepped by a different budget (tests).
@@ -691,7 +776,7 @@ impl MergeIter {
             return MergeStep::Chunk(run.clone());
         }
         let mut work = 0usize;
-        let mut copied = 0usize;
+        let mut compared = 0usize;
         let result = loop {
             if self.popped_enough() {
                 break if self.pending_rows == 0 {
@@ -700,12 +785,12 @@ impl MergeIter {
                     MergeStep::Ready
                 };
             }
-            if work >= self.budget.rows || copied >= self.budget.key_bytes {
+            if work >= self.budget.rows || compared >= self.budget.key_bytes {
                 break MergeStep::Progress;
             }
             let (rows, bytes) = self.pop_slice(self.budget.rows - work);
             work += rows;
-            copied += bytes;
+            compared += bytes;
         };
         #[cfg(test)]
         {
@@ -722,12 +807,14 @@ impl MergeIter {
 
     /// Pop at most `max_rows` more rows of the chunk being produced, and at
     /// most about the budget's key bytes; returns the rows popped and the
-    /// key bytes copied.
+    /// key bytes of the rows it entered into the heap.
     fn pop_slice(&mut self, max_rows: usize) -> (usize, usize) {
         let mut rows = 0usize;
-        let mut copied = 0usize;
-        while rows < max_rows && copied < self.budget.key_bytes {
-            let Some(item) = self.heap.pop() else { break };
+        let mut compared = 0usize;
+        while rows < max_rows && compared < self.budget.key_bytes {
+            let Some(item) = self.heap.pop(&self.keys) else {
+                break;
+            };
             match self.ranges.last_mut() {
                 Some(last) if last.0 == item.run && last.1 + last.2 == item.idx => last.2 += 1,
                 _ => self.ranges.push((item.run, item.idx, 1)),
@@ -741,21 +828,20 @@ impl MergeIter {
                 (item.seg + 1, 0)
             };
             if let Some(segment) = segments.get(seg) {
-                let row = segment.row(off);
-                copied += row.as_ref().len();
-                self.heap.push(HeapItem {
-                    row: row.owned(),
+                compared += segment.row(off).as_ref().len();
+                let next = HeapItem {
                     run: item.run,
                     idx: item.idx + 1,
                     seg,
                     off,
-                });
+                };
+                self.heap.push(next, &self.keys);
             }
             if self.pending_rows >= self.rows_per_chunk {
                 break;
             }
         }
-        (rows, copied)
+        (rows, compared)
     }
 }
 
@@ -1908,7 +1994,8 @@ mod tests {
     /// time.
     /// Guarantees: the reported resident key bytes, taken once when the merge
     /// is built, are never below what the merge actually holds at any later
-    /// point, although every owned heap row is replaced by a longer one.
+    /// point, and what it holds does not grow with the keys the heap points
+    /// at.
     #[test]
     fn resident_key_bytes_bound_keys_that_grow_during_the_merge() {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
@@ -1927,22 +2014,20 @@ mod tests {
         let mut merge = merge_runs(vec![run(20, 'a'), run(30, 'b')], &spec, 1).expect("merge");
         let reported = merge.resident_key_bytes();
         let first = merge.resident_key_bytes_now();
-        let mut largest = first;
         while let Some(chunk) = merge.next() {
             let _ = chunk.expect("chunk");
             let now = merge.resident_key_bytes_now();
-            largest = largest.max(now);
             assert!(
                 now <= reported,
                 "{now} resident bytes above the reported {reported}"
             );
+            assert_eq!(now, first, "the heap holds no copy of a key");
             assert_eq!(
                 merge.resident_key_bytes(),
                 reported,
                 "the bound does not move"
             );
         }
-        assert!(largest > first, "the owned key rows grew during the merge");
     }
 
     /// Scenario: an empty spec (sorting disabled).
@@ -2132,6 +2217,31 @@ mod tests {
                 assert!(build_steps > runs.len(), "{build_steps} key slices");
                 assert!(steps > chunks.len() * 2, "{steps} merge steps");
             }
+        }
+    }
+
+    /// Scenario: the tie-heavy runs and the runs with map, list and nullable
+    /// string columns, sorted as several batches, as one batch, and with an
+    /// empty spec.
+    /// Guarantees: sorting several batches gives exactly the batch that
+    /// sorting their concatenation gives, ties included, and an empty spec
+    /// gives the concatenation.
+    #[test]
+    fn sorting_batches_matches_sorting_their_concatenation() {
+        for (runs, spec) in [tie_heavy_runs(), nested_runs()] {
+            let all = concat(&runs);
+            assert_eq!(
+                sort_batches(&runs, &spec).expect("batches"),
+                sort_batch(&all, &spec).expect("concatenation")
+            );
+            assert_eq!(
+                sort_batches(&runs[..1], &spec).expect("one batch"),
+                sort_batch(&runs[0], &spec).expect("one")
+            );
+            assert_eq!(
+                sort_batches(&runs, &SortSpec::new(vec![])).expect("unsorted"),
+                all
+            );
         }
     }
 
@@ -2428,11 +2538,11 @@ mod tests {
 
     /// Scenario: the tie-heavy runs' keys encoded two rows per step.
     /// Guarantees: the build keeps its totals as it goes -- the resident key
-    /// bytes, the longest key and the heap, seeded with each run's first row
-    /// as soon as that row is encoded -- so neither reporting the keys after
-    /// a slice nor finishing the build scans every key again; the resident
-    /// figure always equals a full recount of the segments, the owned key of
-    /// every seeded run and the heap's backing allocation.
+    /// bytes and the heap, seeded with each run's first row as soon as that
+    /// row is encoded -- so neither reporting the keys after a slice nor
+    /// finishing the build scans every key again; the resident figure always
+    /// equals a full recount of the segments and the heap's backing
+    /// allocation.
     #[test]
     fn the_build_keeps_its_totals_as_it_goes() {
         let (runs, spec) = tie_heavy_runs();
@@ -2442,25 +2552,11 @@ mod tests {
         loop {
             let done = build.step().expect("slice");
             let segments: Vec<&Rows> = build.keys.iter().flatten().collect();
-            let owned: usize = build
-                .heap
-                .iter()
-                .map(|item| item.row.as_ref().as_ref().len())
-                .sum();
             assert_eq!(
                 build.resident_key_bytes(),
                 segments.iter().map(|rows| rows.size()).sum::<usize>()
-                    + owned
                     + build.heap.capacity() * size_of::<HeapItem>(),
-                "segments, the owned key of every seeded run and the heap"
-            );
-            assert_eq!(
-                build.longest_key,
-                segments
-                    .iter()
-                    .flat_map(|rows| rows.lengths())
-                    .max()
-                    .unwrap_or(0)
+                "segments and the heap"
             );
             assert_eq!(
                 build.heap.len(),

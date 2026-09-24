@@ -8,7 +8,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
@@ -20,7 +19,7 @@ use crate::config::LakeConfig;
 use crate::error::{Error, RefuseReason, Result};
 use crate::extract::{DescriptorRow, Extracted, series_batch};
 use crate::schema::Dataset;
-use crate::sort::{SortSpec, sort_batch};
+use crate::sort::{SortSpec, sort_batch, sort_batches};
 
 /// Building batches plus sealed sorted runs for one dataset.
 pub struct SortedTableBuffer {
@@ -54,7 +53,7 @@ impl SortedTableBuffer {
     ///
     /// The returned value is an upper bound used while the block fills: it never
     /// sees the bytes that `seal` releases when the building batches are replaced
-    /// by one concatenated run. `Block::seal` recomputes the truth.
+    /// by one sorted run. `Block::seal` recomputes the truth.
     ///
     /// Deduplication is scoped to the run being built, never wider. `seen` holds
     /// raw buffer addresses, which are only meaningful while the buffers they
@@ -65,7 +64,7 @@ impl SortedTableBuffer {
     /// `run_target` forever.
     ///
     /// # Errors
-    /// Propagates an Arrow failure from the concatenate-and-sort of a sealed run.
+    /// Propagates an Arrow failure from the sort of a sealed run.
     pub fn append(&mut self, batch: RecordBatch) -> Result<usize> {
         let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
         self.rows += batch.num_rows();
@@ -89,17 +88,15 @@ impl SortedTableBuffer {
     /// performs one deduplicated recount over the whole block instead.
     ///
     /// # Errors
-    /// Propagates an Arrow failure from the concatenate or the sort.
+    /// Propagates an Arrow failure from the sort.
     pub fn seal(&mut self) -> Result<()> {
-        let Some(first) = self.building.first() else {
+        if self.building.is_empty() {
             return Ok(());
-        };
+        }
         if self.spec.is_empty() {
             self.runs.append(&mut self.building);
         } else {
-            let schema = first.schema();
-            let merged = concat_batches(&schema, &self.building)?;
-            let sorted = sort_batch(&merged, &self.spec)?;
+            let sorted = sort_batches(&self.building, &self.spec)?;
             self.runs.push(sorted);
             self.building.clear();
         }
@@ -208,17 +205,15 @@ impl SortedTableBuffer {
     /// them would copy every row to no purpose.
     ///
     /// # Errors
-    /// Propagates an Arrow failure from the concatenate or the sort.
+    /// Propagates an Arrow failure from the sort.
     fn finalized(&self) -> Result<Vec<RecordBatch>> {
-        let Some(first) = self.building.first() else {
+        if self.building.is_empty() {
             return Ok(Vec::new());
-        };
+        }
         if self.spec.is_empty() {
             return Ok(self.building.clone());
         }
-        let schema = first.schema();
-        let merged = concat_batches(&schema, &self.building)?;
-        Ok(vec![sort_batch(&merged, &self.spec)?])
+        Ok(vec![sort_batches(&self.building, &self.spec)?])
     }
 
     /// Prepare every stamp replacement without mutating the retained batches.
@@ -708,7 +703,7 @@ mod tests {
     /// eight bytes per series row plus 64 bytes of buffer slack, and shares
     /// every non-stamp column with the batch it replaces. The values tables are
     /// measured separately: finalizing their building run is an ordinary
-    /// concatenate-and-sort and is not part of this bound.
+    /// sort and is not part of this bound.
     #[test]
     fn seal_peak_retained_bytes_only_adds_timestamp_values() {
         let cfg = LakeConfig::default();
