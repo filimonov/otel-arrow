@@ -21,8 +21,8 @@ the Loki bridge enqueues, before they are merged.
 
 The oracle is the E2E read-back: rows per source file and `e2e.source`,
 read by DuckDB and by ClickHouse, the latest-descriptor join, and every
-line's sequence number. Delivery is at least once; duplicates are counted
-and reported, a missing line fails the trial.
+line's sequence number. Every written line must be stored exactly once: a
+missing line and a duplicated one both fail the trial.
 """
 
 import collections

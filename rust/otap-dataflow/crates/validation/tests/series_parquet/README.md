@@ -404,7 +404,7 @@ one-record requests the Loki bridge enqueues before the batcher merges them.
 The oracle is the end-to-end suite's read-back, not the sequence oracle:
 rows per source file and `e2e.source` from DuckDB and ClickHouse, the
 latest-descriptor join, and every written sequence number present, with
-duplicates counted (Alloy delivers at least once). `alloy_variants` names
+a duplicated line failing it like a missing one. `alloy_variants` names
 the trials: `shipped` keeps the receiver's default 4 MiB decoding limit and
 `decoding_16mib` raises it, the one setting the second trial changes.
 
