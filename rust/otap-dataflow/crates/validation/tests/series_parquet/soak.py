@@ -929,8 +929,22 @@ class FamilyState:
                          if self.path.is_file() else {"runs": {}})
 
     def record(self, step, value):
+        """The step's latest run; every run of a step stays in `history`."""
+        history = self.document.setdefault("history", {}).setdefault(step, [])
+        previous = self.document["runs"].get(step)
+        for entry in (previous, value):
+            if isinstance(entry, str) and entry not in history:
+                history.append(entry)
         self.document["runs"][step] = value
         _ = measurement.write_json_atomic(self.path, self.document)
+
+    def history(self, step) -> list:
+        """Every run a step produced, the failed ones included, in order."""
+        recorded = list((self.document.get("history") or {}).get(step) or [])
+        latest = self.get(step)
+        if isinstance(latest, str) and latest not in recorded:
+            recorded.append(latest)
+        return recorded
 
     def get(self, step):
         return self.document["runs"].get(step)
@@ -1090,8 +1104,9 @@ def publish(state, output_dir, report_dir) -> list:
     indexes = []
     bracket = state.get("bracket") or {}
     families = (
-        ("soak-strict", [state.get("strict"), state.get("pr_strict"), state.get("alloy")]),
-        ("soak-buffered", [state.get("buffered"), state.get("pr_buffered")]
+        ("soak-strict", state.history("strict") + state.history("pr_strict")
+         + state.history("alloy")),
+        ("soak-buffered", state.history("buffered") + state.history("pr_buffered")
          + list(bracket.get("run_ids") or [])),
     )
     for case, run_ids in families:
