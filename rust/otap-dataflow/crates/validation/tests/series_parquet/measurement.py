@@ -2995,7 +2995,7 @@ def read_oracle(root, ledger: Ledger, *, require_all: bool, healthy: bool,
     }
     with duckdb.connect() as db:
         files, coverage, values, _bodies, _metric_rows = test_e2e.scan_objects(
-            case, root, db
+            case, root, db, collect_bodies=False
         )
         report["part_file_count"] = len(files)
         report["descriptor_identity_count"] = len(coverage)

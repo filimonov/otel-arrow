@@ -2280,7 +2280,7 @@ def verify_layout(test, root, path, metadata):
     return match
 
 
-def scan_objects(test, root, db):
+def scan_objects(test, root, db, *, collect_bodies=True):
     """Check every part file's own invariants and report what it holds.
 
     This is the workload-independent half of `verify_files`: the layout, the
@@ -2292,7 +2292,8 @@ def scan_objects(test, root, db):
     same invariants as the fixture tests rather than restating them.
 
     Returns the part files, the descriptor coverage set, the values keys, the
-    logs bodies and the number of metrics values rows.
+    logs bodies and the number of metrics values rows. `collect_bodies=False`
+    returns no bodies, for a caller that reads gigabytes of them otherwise.
     """
     files = sorted(Path(root).rglob("*.parquet"))
     test.assertTrue(files)
@@ -2349,12 +2350,13 @@ def scan_objects(test, root, db):
                 )
             values.extend((signal, partition, worker, row[0]) for row in keys)
             if signal == "logs":
-                bodies.extend(
-                    row[0]
-                    for row in db.execute(
-                        "SELECT body FROM read_parquet(?)", [str(path)]
-                    ).fetchall()
-                )
+                if collect_bodies:
+                    bodies.extend(
+                        row[0]
+                        for row in db.execute(
+                            "SELECT body FROM read_parquet(?)", [str(path)]
+                        ).fetchall()
+                    )
             else:
                 metric_rows += len(keys)
                 # Each row fills one point kind's columns and leaves the
