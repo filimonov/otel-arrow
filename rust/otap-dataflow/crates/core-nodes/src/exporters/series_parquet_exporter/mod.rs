@@ -3,8 +3,8 @@
 
 //! `exporter:series_parquet`: the factory and the node's select loop.
 //!
-//! The block state machine is documented in [`worker`], the window clock in
-//! [`window`], and the operating contract in the README.
+//! The block state machine is documented in the `worker` module, the window
+//! clock in `window`, and the operating contract in the README.
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
