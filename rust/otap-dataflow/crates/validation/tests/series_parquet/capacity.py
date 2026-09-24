@@ -197,9 +197,8 @@ def next_search_rate(trials, *, start=SEARCH_START_RECORDS_PER_S,
     high = min(unsustainable)
     below = [rate for rate in sustainable if rate < high]
     if not below:
-        if high <= start:
-            return None
-        return max(start, high // 2)
+        # Halve until a rate passes, from wherever the search started.
+        return high // 2 if high // 2 >= SEARCH_START_RECORDS_PER_S else None
     low = max(below)
     if (high - low) / low <= width:
         return None
@@ -662,15 +661,28 @@ EXTRA_GAUGES = (
     "series_cache.misses", "series_cache.evictions", "flush.retries",
     "flush.failures",
 )
-# Labelled metrics kept per worker, summed over the named label's values.
+# The durable buffer's unlabelled metrics kept per worker, by extras key.
+BUFFER = "processor.durable_buffer"
+EXTRA_BUFFER_GAUGES = {
+    "buffer.storage.bytes.used": (BUFFER, "storage.bytes.used"),
+    "buffer.in.flight": (BUFFER, "in.flight"),
+}
+# Labelled metrics kept per worker by extras key: (metric set, metric,
+# label), summed over the label's values.
 EXTRA_LABELLED = {
-    "rows.written": (EXPORTER, "dataset"),
-    "files.written": (EXPORTER, "dataset"),
-    "series.emitted": (EXPORTER, "reason"),
-    "flushes": (EXPORTER, "reason"),
-    "nacks": (EXPORTER, "error.type"),
-    "accepted": ("receiver.otlp.requests", "protocol"),
-    "rejected": ("receiver.otlp.requests", "error.type"),
+    "rows.written": (EXPORTER, "rows.written", "dataset"),
+    "files.written": (EXPORTER, "files.written", "dataset"),
+    "series.emitted": (EXPORTER, "series.emitted", "reason"),
+    "flushes": (EXPORTER, "flushes", "reason"),
+    "nacks": (EXPORTER, "nacks", "error.type"),
+    "accepted": ("receiver.otlp.requests", "accepted", "protocol"),
+    "rejected": ("receiver.otlp.requests", "rejected", "error.type"),
+    "buffer.items.queued": (f"{BUFFER}.items", "queued", "signal"),
+    "buffer.items.produced": (f"{BUFFER}.items", "produced", "signal"),
+    "buffer.items.consumed": (f"{BUFFER}.items", "consumed", "signal"),
+    "buffer.items.rejected": (f"{BUFFER}.items", "rejected", "signal"),
+    "buffer.ingest.failures": (f"{BUFFER}.ingest", "failures", "failure"),
+    "buffer.bundles.resolved": (f"{BUFFER}.bundles", "resolved", "outcome"),
 }
 
 
@@ -693,8 +705,13 @@ def telemetry_extras(document) -> dict:
                 "sum": float(flush.get("sum") or 0.0), "count": int(flush.get("count") or 0),
                 "max": float(flush.get("max") or 0.0),
             }
-        for name, (metric_set, label) in EXTRA_LABELLED.items():
-            entities = worker["labelled"].get(f"{metric_set}:{name}") or {}
+        for name, (metric_set, metric) in EXTRA_BUFFER_GAUGES.items():
+            entities = worker["metrics"].get(f"{metric_set}:{metric}") or {}
+            values = [value for value in entities.values() if isinstance(value, (int, float))]
+            if values:
+                entry[name] = values[0]
+        for name, (metric_set, metric, label) in EXTRA_LABELLED.items():
+            entities = worker["labelled"].get(f"{metric_set}:{metric}") or {}
             totals = collections.Counter()
             for parts in entities.values():
                 for label_key, value in parts.items():
@@ -988,6 +1005,105 @@ def trial_residuals(samples, idle, pairs=()) -> tuple:
             "resident_peak_bytes": max(pair["jemalloc_resident_bytes"] for pair in pairs),
         }
     return measurement.rss_residuals(samples, idle), {"source": "pipeline_memory_usage"}
+
+
+def buffer_view(samples, window, trial, stats) -> dict:
+    """The durable buffer over the measured interval, and why it did not keep up.
+
+    The buffer acknowledges the producer once a request is in its write-
+    ahead log, so a buffered trial is sustainable only when the log stays
+    bounded -- it grows over the interval by less than one window of the
+    offered bytes -- and the buffer refused nothing: no ingest failure
+    (backpressure at its size cap) and no bundle the exporter permanently
+    rejected.
+    """
+    usable = [s for s in samples if s.get("extras")]
+    inside = [s for s in usable if window[0] <= s["monotonic_ns"] <= window[1]]
+    if not inside:
+        return {"reasons": ["no buffer sample inside the measured interval"]}
+    wal = [(s["monotonic_ns"], extras_total(s, "buffer.storage.bytes.used")) for s in inside]
+    start = value_at(samples, window[0], "buffer.storage.bytes.used") or wal[0][1]
+    end = value_at(samples, window[1], "buffer.storage.bytes.used") or wal[-1][1]
+    slope = backlog_slope([((t - window[0]) / 1e9, b) for t, b in wal])
+    measure_s = (window[1] - window[0]) / 1e9
+    bytes_per_record = (stats["wire_bytes_total"] / max(1, stats["requests_scheduled_count"])
+                        / CAPACITY_WORKLOADS[trial["workload_id"]]["workload"].records_per_request)
+    allowance = trial["rate"] * trial["interval_s"] * bytes_per_record
+
+    def delta(name, label=None):
+        a = value_at(samples, window[0], name, label) or 0
+        b = value_at(samples, window[1], name, label) or 0
+        return b - a
+
+    failures = delta("buffer.ingest.failures")
+    rejected = delta("buffer.bundles.resolved", "permanently_rejected")
+    reasons = []
+    if slope * measure_s > allowance:
+        reasons.append(f"write-ahead log grows {slope * measure_s:.0f} bytes over the interval, "
+                       f"more than one window of offered bytes ({allowance:.0f})")
+    if failures:
+        reasons.append(f"{failures:.0f} buffer ingest failures")
+    if rejected:
+        reasons.append(f"{rejected:.0f} bundles permanently rejected downstream")
+    return {
+        "wal_bytes_start": start,
+        "wal_bytes_max": max(b for _t, b in wal),
+        "wal_bytes_end": end,
+        "wal_slope_bytes_per_s": slope,
+        "wal_growth_allowance_bytes": allowance,
+        "in_flight_max": max(extras_total(s, "buffer.in.flight") for s in inside),
+        "items_queued_max": max(extras_total(s, "buffer.items.queued") for s in inside),
+        "ingest_failures_count": failures,
+        "bundles_permanently_rejected_count": rejected,
+        "bundles_acked_count": delta("buffer.bundles.resolved", "acked"),
+        "bundles_deferred_count": delta("buffer.bundles.resolved", "deferred"),
+        "placement": "a node of every worker pipeline, on the worker's own core; its "
+        "write-ahead log is in the trial's engine directory on the harness disk",
+        "reasons": reasons,
+    }
+
+
+def freshness(db_root, rpr, sends, objects, epoch_offset_ns) -> dict:
+    """Acknowledgement to object-visible lag per acknowledged request.
+
+    A request is visible when the last object holding any of its records
+    has completed; the lag is that completion less the producer's
+    acknowledgement. Negative means the acknowledgement came after the
+    object, as it does in the strict topology.
+    """
+    import duckdb
+
+    completion = {key: t for key, _size, t in objects}
+    acked = {index: finish for index, finish, code in
+             zip(sends["indexes"], sends["finish"], sends["code"]) if code == 0}
+    visible = {}
+    with duckdb.connect() as db:
+        for signal in ("logs", "metrics"):
+            glob = Path(db_root) / f"v=1/signal={signal}/dataset=values/**/*.parquet"
+            if not any(Path(db_root).glob(f"v=1/signal={signal}/dataset=values/**/*.parquet")):
+                continue
+            rows = db.execute(
+                f"SELECT DISTINCT filename, {requests_generator._seq('time_unix_nano')} // {rpr} "
+                f"FROM read_parquet({test_e2e.sql_string(glob)}, filename=true, "
+                "hive_partitioning=false)"
+            ).fetchall()
+            for filename, request in rows:
+                key = str(Path(filename).relative_to(db_root))
+                at = completion.get(key)
+                if at is not None:
+                    visible[int(request)] = max(visible.get(int(request), 0), at)
+    lags = sorted((visible[index] - epoch_offset_ns - finish) / 1e9
+                  for index, finish in acked.items() if index in visible)
+    if not lags:
+        return {}
+    return {
+        "requests_count": len(lags),
+        "lag_p50_s": measurement.percentile(lags, 0.50),
+        "lag_p95_s": measurement.percentile(lags, 0.95),
+        "lag_p99_s": measurement.percentile(lags, 0.99),
+        "lag_max_s": lags[-1],
+        "completion_clock": "file modification time (local) or LastModified (S3, 1 s)",
+    }
 
 
 def degradation(samples, window, interval_s, schedule) -> dict:
@@ -1576,6 +1692,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         late_unblocked_ratio=stats["late_unblocked_ratio"],
         failed_requests=failed, partial_requests=partial,
     )
+    buffer = buffer_view(samples, window, trial, stats) if trial["topology"] == "buffered" \
+        else None
+    if buffer and buffer["reasons"] and verdict["verdict"] == "sustainable":
+        verdict = {"verdict": "unsustainable", "reasons": buffer["reasons"]}
     if stored_window is not None and verdict["verdict"] == "sustainable" and \
             stored_window < stored_floor:
         verdict = {"verdict": "unsustainable", "reasons": [
@@ -1609,6 +1729,7 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     acked = [index for index, code in zip(sends["indexes"], sends["code"]) if code == 0]
     failed = [index for index, code in zip(sends["indexes"], sends["code"]) if code != 0]
     oracle_s = None
+    fresh = {}
     try:
         if trial["topology"] != "noop":
             if store is not None:
@@ -1620,6 +1741,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
                 acked, failed,
             )
             oracle_s = (time.monotonic_ns() - started) / 1e9
+            fresh = measurement.run_pinned(
+                plan["oracle_cores"], freshness, local, rpr, sends, objects,
+                time.time_ns() - time.monotonic_ns(),
+            )
             duplication = measurement.run_pinned(
                 plan["oracle_cores"], descriptor_duplication, local
             )
@@ -1761,6 +1886,8 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         },
         "rates": measured,
         "oracle_s": oracle_s,
+        "freshness": fresh,
+        "buffer": buffer,
         "generator": source.as_json(),
         "acknowledged_request_ranges": request_ranges(acked),
         "failed_request_ranges": request_ranges(failed),
@@ -2148,13 +2275,18 @@ def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dic
 # The search variants: their trial purposes, receiver slots per worker and
 # window. `default_window` is the shipped configuration as it ships.
 SEARCH_PURPOSES = {"shipped": "search", "raised": "search_raised",
-                   "default_window": "search_default_window"}
+                   "default_window": "search_default_window",
+                   "buffered": "search_buffered"}
 REPETITION_PURPOSES = {"shipped": "repetition", "raised": "repetition_raised",
-                       "default_window": "repetition_default_window"}
+                       "default_window": "repetition_default_window",
+                       "buffered": "repetition_buffered"}
 VARIANT_CAPACITY = {"shipped": SHIPPED_RECEIVER_CAPACITY, "raised": RAISED_RECEIVER_CAPACITY,
-                    "default_window": SHIPPED_RECEIVER_CAPACITY}
+                    "default_window": SHIPPED_RECEIVER_CAPACITY,
+                    "buffered": SHIPPED_RECEIVER_CAPACITY}
 VARIANT_INTERVAL_S = {"shipped": SEARCH_INTERVAL_S, "raised": SEARCH_INTERVAL_S,
-                      "default_window": DEFAULT_INTERVAL_S}
+                      "default_window": DEFAULT_INTERVAL_S, "buffered": SEARCH_INTERVAL_S}
+VARIANT_TOPOLOGY = {"shipped": "strict", "raised": "strict", "default_window": "strict",
+                    "buffered": "buffered"}
 
 
 def admission_ceiling(slots_per_worker, records_per_request, hold_s) -> float:
@@ -2205,7 +2337,10 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
     workload_id = options.get("workload_id", PRIMARY_WORKLOAD)
     purpose = SEARCH_PURPOSES[variant]
     capacity = VARIANT_CAPACITY[variant]
-    if variant == "raised":
+    floor = ((options.get("search_floor") or {}).get(cell) or {}).get(variant)
+    start = int(floor or SEARCH_START_RECORDS_PER_S)
+    shipped = {"unsustainable_records_per_s": None}
+    if variant == "raised" and state.trials(cell, SEARCH_PURPOSES["shipped"], workload_id):
         shipped = winning(state, cell, workload_id)
         if shipped["sustainable_records_per_s"] is None:
             return
@@ -2227,7 +2362,7 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
                 (int(rate), "unsustainable")
                 for rate in (options.get("unmeasurable_above") or {}).get(cell, ())
             ]
-            rate, trial_purpose = next_search_rate(steering), purpose
+            rate, trial_purpose = next_search_rate(steering, start=start), purpose
             if rate is None:
                 # Decided: repeat the winner until three trials measured it;
                 # a repetition that fails moves the search below that rate.
@@ -2240,13 +2375,19 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
                 trial_purpose = REPETITION_PURPOSES[variant]
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
                                             purpose=trial_purpose, receiver_capacity=capacity,
-                                            interval_s=VARIANT_INTERVAL_S[variant]),
+                                            interval_s=VARIANT_INTERVAL_S[variant],
+                                            topology=VARIANT_TOPOLOGY[variant]),
                     output_dir, report_dir, cell)
 
 
 def step_search_raised(plan, state, output_dir, report_dir, cell, options):
     """The search with the receiver capacity raised, from the shipped bracket."""
     step_search(plan, state, output_dir, report_dir, cell, options, variant="raised")
+
+
+def step_search_buffered(plan, state, output_dir, report_dir, cell, options):
+    """The search of the buffered topology at the shipped receiver slots."""
+    step_search(plan, state, output_dir, report_dir, cell, options, variant="buffered")
 
 
 def step_search_default_window(plan, state, output_dir, report_dir, cell, options):
@@ -2376,6 +2517,7 @@ STEPS = {
     "search_raised": step_search_raised,
     "stats_off": step_stats_off,
     "search_default_window": step_search_default_window,
+    "search_buffered": step_search_buffered,
     "workloads": step_workloads,
     "high_cardinality": step_high_cardinality,
 }
@@ -2441,7 +2583,8 @@ def aggregate_cell(state, cell, output_dir, report_dir, family_ordinal,
     first = children[0]
     store_kind, cores = cell.rsplit("-c", 1)
     case = f"capacity-{PRIMARY_WORKLOAD}-{variant}"
-    run_id = (f"{case}-strict-{store_kind}-c{cores}-w{VARIANT_INTERVAL_S[variant]}"
+    run_id = (f"{case}-{VARIANT_TOPOLOGY[variant]}-{store_kind}-c{cores}"
+              f"-w{VARIANT_INTERVAL_S[variant]}"
               f"-f{family_ordinal:03d}")
     result = measurement.new_result(
         {"run_id": run_id, "case": case}, artifact_kind="capacity_aggregate",
@@ -2691,6 +2834,11 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
             "search_interval_override": "one-second windows instead of the shipped 15 s, "
             "so a bounded producer concurrency does not cap the strict hold time",
             "search_connections": SEARCH_CONNECTIONS,
+            "search_floors": options.get("search_floor") or {},
+            "search_floor_rule": "a cell after the first may start at half of min(the "
+            "one-worker ceiling on the same store times the workers, the shipped-slot "
+            "formula ceiling), rounded down to the doubling grid; an unsustainable first "
+            "trial halves until one passes",
             "receiver_capacity_per_worker": dict(VARIANT_CAPACITY),
             "admission_ceiling": "strict records/s per worker <= receiver slots x records "
             "per request / hold time, a window plus the flush that makes a block durable",

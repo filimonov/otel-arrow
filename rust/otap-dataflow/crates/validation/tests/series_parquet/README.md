@@ -316,6 +316,24 @@ s windows, 128 slots), where that bound is far below the exporter's; the
 remedies are more slots, larger requests, a shorter window or the buffered
 topology, whose acknowledgement does not wait for the object store.
 
+`search_buffered` searches the buffered topology (the durable buffer in
+front of the exporter) at the shipped 128 slots. Its acknowledgement comes
+once a request is in the buffer's write-ahead log, so beside the rules
+above a buffered trial is sustainable only when the log grows over the
+measured interval by less than one window of the offered bytes, the buffer
+reports no ingest failure and no bundle permanently rejected downstream,
+and the values rows written keep up with the offered rate. Each trial
+reports the log's size (start, maximum, end, slope), the buffer's in-flight
+and queued items, and, like every trial, the lag from a request's
+acknowledgement to the completion of the last object holding its records.
+
+`--option search_floor={"cell": {"variant": rate}}` starts a cell's search
+at a floor derived from measured neighbours instead of 1,000 records/s: half
+of the smaller of the same store's one-worker ceiling times the workers and
+the shipped-slot formula ceiling, rounded down to the doubling grid. An
+unsustainable floor halves until a rate passes; the index records each
+floor.
+
 A capacity trial's RSS reconciliation reads the allocator, not the
 pipelines' `memory.usage`, which credits a free only to the allocating
 thread and so grows with every byte the local store writes from its

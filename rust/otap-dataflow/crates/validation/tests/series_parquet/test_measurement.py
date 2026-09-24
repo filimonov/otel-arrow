@@ -6338,6 +6338,17 @@ class CapacityContracts(unittest.TestCase):
         self.assertEqual(decision["sustainable_records_per_s"], 256_000)
         self.assertEqual(decision["flip_rates_records_per_s"], [320_000])
 
+    # Scenario: a search starts at a floor of 256,000 records/s derived from
+    # its neighbours, and the floor itself is unsustainable.
+    # Guarantees: the first trial is the floor, and the search halves until
+    # a rate passes, then bisects as before.
+    def test_a_search_from_a_floor_halves_until_one_passes(self):
+        self.assertEqual(capacity.next_search_rate([], start=256_000), 256_000)
+        trials = [(256_000, "unsustainable")]
+        self.assertEqual(capacity.next_search_rate(trials, start=256_000), 128_000)
+        trials.append((128_000, "sustainable"))
+        self.assertEqual(capacity.next_search_rate(trials, start=256_000), 192_000)
+
     # Scenario: every one of the twelve doubling trials is sustainable.
     # Guarantees: the search stops and reports a lower bound, never a maximum.
     def test_an_unbracketed_search_is_a_lower_bound(self):
