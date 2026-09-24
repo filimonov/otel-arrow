@@ -182,6 +182,43 @@ fn the_factory_creates_file_storage_without_a_capability() {
     assert!(created.is_ok(), "file storage needs no capability");
 }
 
+/// Scenario: series_parquet S3 configurations with `unsigned_payload` unset
+/// over AWS, an HTTPS and a plain HTTP endpoint, and set explicitly.
+/// Guarantees: unset resolves to on over TLS and off over plain HTTP, and
+/// an explicit value is kept whatever the endpoint.
+#[test]
+fn unsigned_payload_defaults_to_on_over_tls_for_series_parquet() {
+    use otel_arrow_dfe_otap::object_store::StorageType;
+    let resolved = |endpoint: Option<&str>, unsigned: Option<bool>| {
+        let mut s3 =
+            serde_json::json!({"base_uri": "s3://bucket/lake", "auth": {"type": "default"}});
+        if let Some(endpoint) = endpoint {
+            s3["endpoint"] = endpoint.into();
+            s3["allow_http"] = true.into();
+        }
+        if let Some(unsigned) = unsigned {
+            s3["unsigned_payload"] = unsigned.into();
+        }
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "storage": {"s3": s3},
+            "retry": {"retry_timeout": "30s"}
+        }))
+        .expect("valid config");
+        match cfg.storage {
+            StorageType::S3 {
+                unsigned_payload, ..
+            } => unsigned_payload,
+            other => panic!("not S3: {other:?}"),
+        }
+    };
+    let (https, http) = (Some("https://s3.example.com"), Some("http://minio:9000"));
+    assert_eq!(resolved(None, None), Some(true));
+    assert_eq!(resolved(https, None), Some(true));
+    assert_eq!(resolved(http, None), Some(false));
+    assert_eq!(resolved(https, Some(false)), Some(false));
+    assert_eq!(resolved(http, Some(true)), Some(true));
+}
+
 /// Scenario: the factory builds the exporter for S3 storage, with a valid
 /// retry budget, and no capability bound to the node.
 /// Guarantees: creation succeeds without a bearer token provider, because S3

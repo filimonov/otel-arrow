@@ -218,9 +218,9 @@ pub enum StorageType {
         virtual_hosted_style_request: Option<bool>,
 
         /// Whether requests are signed with SigV4 `UNSIGNED-PAYLOAD` instead
-        /// of a SHA-256 of every uploaded byte. Unset, it is on for a TLS
-        /// endpoint, which protects the payload, and off for plain HTTP;
-        /// see [`unsigned_payload_default`].
+        /// of a SHA-256 of every uploaded byte. Unset, payloads are signed,
+        /// unless the exporter resolves the option first
+        /// ([`StorageType::with_unsigned_payload_over_tls`]).
         unsigned_payload: Option<bool>,
 
         /// The auth settings, see [cloud_auth::aws::AuthMethod]
@@ -228,19 +228,51 @@ pub enum StorageType {
     },
 }
 
-/// Whether an S3 store signs `UNSIGNED-PAYLOAD` when `unsigned_payload` is
-/// unset: exactly when its requests go over TLS, that is when the endpoint,
-/// or without one the base URI, is not a plain `http://` URL. The AWS
-/// endpoints an `s3://` base URI resolves to are HTTPS.
+/// Whether an S3 store's requests go over TLS: the endpoint, or without one
+/// the base URI, is not a plain `http://` URL. The AWS endpoints an `s3://`
+/// base URI resolves to are HTTPS.
 #[cfg(feature = "aws")]
 #[must_use]
-pub fn unsigned_payload_default(base_uri: &str, endpoint: Option<&str>) -> bool {
+pub fn s3_uses_tls(base_uri: &str, endpoint: Option<&str>) -> bool {
     let url = endpoint.unwrap_or(base_uri);
     !url.get(..7)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
 }
 
 impl StorageType {
+    /// The same storage with an unset S3 `unsigned_payload` resolved to
+    /// whether the store uses TLS ([`s3_uses_tls`]); any other storage, and
+    /// an explicit value, unchanged. The shared constructor leaves an unset
+    /// option signed; an exporter that wants the TLS default applies this.
+    #[must_use]
+    pub fn with_unsigned_payload_over_tls(self) -> Self {
+        match self {
+            #[cfg(feature = "aws")]
+            Self::S3 {
+                base_uri,
+                region,
+                endpoint,
+                allow_http,
+                virtual_hosted_style_request,
+                unsigned_payload,
+                auth,
+            } => {
+                let unsigned_payload =
+                    unsigned_payload.or_else(|| Some(s3_uses_tls(&base_uri, endpoint.as_deref())));
+                Self::S3 {
+                    base_uri,
+                    region,
+                    endpoint,
+                    allow_http,
+                    virtual_hosted_style_request,
+                    unsigned_payload,
+                    auth,
+                }
+            }
+            other => other,
+        }
+    }
+
     /// The backend's name, for logs: `file`, `azure` or `s3`.
     ///
     /// Never any of the variant's fields, which may name credentials.
@@ -454,44 +486,56 @@ pub fn from_storage_type_with_retry_and_token_provider(
         }
 
         #[cfg(feature = "aws")]
-        StorageType::S3 {
-            base_uri,
-            region,
-            endpoint,
-            allow_http,
-            virtual_hosted_style_request,
-            unsigned_payload,
-            auth,
-        } => {
-            use object_store::aws::AmazonS3Builder;
-
-            let unsigned = unsigned_payload
-                .unwrap_or_else(|| unsigned_payload_default(base_uri, endpoint.as_deref()));
-            let mut builder = AmazonS3Builder::from_env()
-                .with_url(base_uri)
-                .with_unsigned_payload(unsigned);
-
-            if let Some(region) = region {
-                builder = builder.with_region(region);
-            }
-            if let Some(endpoint) = endpoint {
-                builder = builder.with_endpoint(endpoint);
-            }
-            if let Some(allow) = allow_http {
-                builder = builder.with_allow_http(*allow);
-            }
-            if let Some(vhost) = virtual_hosted_style_request {
-                builder = builder.with_virtual_hosted_style_request(*vhost);
-            }
-            if let Some(retry) = retry {
-                builder = builder.with_retry(retry.to_object_store_retry_config()?);
-            }
-
-            builder = cloud_auth::aws::configure_builder(builder, auth);
-            let store = builder.build()?;
+        StorageType::S3 { base_uri, .. } => {
+            let store = s3_builder(storage, retry)?.build()?;
             wrap_with_prefix(store, base_uri)
         }
     }
+}
+
+/// The S3 client builder for `storage`; another backend is an error.
+#[cfg(feature = "aws")]
+fn s3_builder(
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+) -> Result<object_store::aws::AmazonS3Builder, object_store::Error> {
+    use object_store::aws::AmazonS3Builder;
+
+    let StorageType::S3 {
+        base_uri,
+        region,
+        endpoint,
+        allow_http,
+        virtual_hosted_style_request,
+        unsigned_payload,
+        auth,
+    } = storage
+    else {
+        return Err(object_store::Error::Generic {
+            store: "S3",
+            source: "not an S3 storage configuration".into(),
+        });
+    };
+    let mut builder = AmazonS3Builder::from_env().with_url(base_uri);
+    if let Some(region) = region {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if let Some(allow) = allow_http {
+        builder = builder.with_allow_http(*allow);
+    }
+    if let Some(vhost) = virtual_hosted_style_request {
+        builder = builder.with_virtual_hosted_style_request(*vhost);
+    }
+    if let Some(unsigned) = unsigned_payload {
+        builder = builder.with_unsigned_payload(*unsigned);
+    }
+    if let Some(retry) = retry {
+        builder = builder.with_retry(retry.to_object_store_retry_config()?);
+    }
+    Ok(cloud_auth::aws::configure_builder(builder, auth))
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1046,13 +1090,42 @@ mod test {
         assert!(serde_json::from_str::<StorageType>(&json).is_err());
     }
 
+    /// An S3 storage config for `base_uri` and `endpoint` with the given
+    /// `unsigned_payload`.
+    #[cfg(feature = "aws")]
+    fn s3(base_uri: &str, endpoint: Option<&str>, unsigned_payload: Option<bool>) -> StorageType {
+        StorageType::S3 {
+            base_uri: base_uri.to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: endpoint.map(str::to_string),
+            allow_http: Some(true),
+            virtual_hosted_style_request: None,
+            unsigned_payload,
+            auth: cloud_auth::aws::AuthMethod::Default,
+        }
+    }
+
+    /// Whether the S3 client `storage` builds signs `UNSIGNED-PAYLOAD`.
+    #[cfg(feature = "aws")]
+    fn signs_unsigned_payload(storage: &StorageType) -> bool {
+        use object_store::aws::AmazonS3ConfigKey;
+        s3_builder(storage, None)
+            .expect("an S3 builder")
+            .get_config_value(&AmazonS3ConfigKey::UnsignedPayload)
+            .is_some_and(|v| v == "true")
+    }
+
     /// Scenario: S3 storage configs that set `unsigned_payload` or leave it
-    /// unset, against AWS, an HTTPS endpoint and a plain HTTP endpoint.
-    /// Guarantees: the option parses; unset, `UNSIGNED-PAYLOAD` is signed
-    /// exactly when the requests go over TLS, whatever the scheme's case.
+    /// unset, against AWS, an HTTPS endpoint and a plain HTTP endpoint, built
+    /// by the shared constructor as they are and after
+    /// `with_unsigned_payload_over_tls`.
+    /// Guarantees: the option parses; the shared constructor signs every
+    /// payload unless the option says otherwise, whatever the endpoint; the
+    /// TLS resolution turns an unset option on exactly over TLS, whatever
+    /// the scheme's case, and keeps an explicit value.
     #[test]
     #[cfg(feature = "aws")]
-    fn unsigned_payload_is_parsed_and_defaults_on_for_tls_only() {
+    fn unsigned_payload_is_signed_unless_set_or_resolved_over_tls() {
         let json = json!({
             "s3": {
                 "base_uri": "s3://my-bucket/telemetry",
@@ -1061,35 +1134,42 @@ mod test {
             }
         })
         .to_string();
-        let expected = StorageType::S3 {
-            base_uri: "s3://my-bucket/telemetry".to_string(),
-            region: None,
-            endpoint: None,
-            allow_http: None,
-            virtual_hosted_style_request: None,
-            unsigned_payload: Some(false),
-            auth: cloud_auth::aws::AuthMethod::Default,
-        };
+        let mut expected = s3("s3://my-bucket/telemetry", None, Some(false));
+        if let StorageType::S3 {
+            region, allow_http, ..
+        } = &mut expected
+        {
+            *region = None;
+            *allow_http = None;
+        }
         test_deserialize(&json, expected);
 
-        assert!(unsigned_payload_default("s3://my-bucket/telemetry", None));
-        assert!(unsigned_payload_default(
-            "s3://b",
-            Some("https://s3.eu-west-1.amazonaws.com")
-        ));
-        assert!(unsigned_payload_default(
-            "https://b.s3.amazonaws.com/p",
-            None
-        ));
-        assert!(!unsigned_payload_default(
-            "s3://b",
-            Some("http://localhost:9000")
-        ));
-        assert!(!unsigned_payload_default(
-            "s3://b",
-            Some("HTTP://minio:9000")
-        ));
-        assert!(!unsigned_payload_default("http://minio:9000/b", None));
+        let https = Some("https://s3.eu-west-1.amazonaws.com");
+        let http = Some("http://localhost:9000");
+        for endpoint in [None, https, http] {
+            assert!(!signs_unsigned_payload(&s3("s3://b", endpoint, None)));
+            assert!(signs_unsigned_payload(&s3("s3://b", endpoint, Some(true))));
+            assert!(!signs_unsigned_payload(&s3(
+                "s3://b",
+                endpoint,
+                Some(false)
+            )));
+        }
+        let resolved = |base: &str, endpoint, set| {
+            signs_unsigned_payload(&s3(base, endpoint, set).with_unsigned_payload_over_tls())
+        };
+        assert!(resolved("s3://b", None, None));
+        assert!(resolved("s3://b", https, None));
+        assert!(resolved("https://b.s3.amazonaws.com/p", None, None));
+        assert!(!resolved("s3://b", http, None));
+        assert!(!resolved("s3://b", Some("HTTP://minio:9000"), None));
+        assert!(!resolved("http://minio:9000/b", None, None));
+        assert!(!resolved("s3://b", https, Some(false)));
+        assert!(resolved("s3://b", http, Some(true)));
+        let file = StorageType::File {
+            base_uri: "/tmp/x".to_string(),
+        };
+        assert_eq!(file.clone().with_unsigned_payload_over_tls(), file);
     }
 
     #[test]

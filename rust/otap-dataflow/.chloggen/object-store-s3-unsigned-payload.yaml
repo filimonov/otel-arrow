@@ -8,7 +8,7 @@ change_type: enhancement
 component: otap
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: "S3 object storage gains `unsigned_payload`; unset, uploads over TLS are signed as UNSIGNED-PAYLOAD instead of hashing every byte, and plain HTTP keeps signed payloads."
+note: "S3 object storage gains `unsigned_payload`; `exporter:series_parquet` defaults it on for TLS endpoints, so uploads skip hashing every byte, and off for plain HTTP."
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,6 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Over TLS the store no longer checks the body against the request
-  signature; integrity in transit rests on TLS. Set `unsigned_payload: false`
-  to keep signed payloads on an HTTPS endpoint.
+  Other exporters keep signed payloads unless the option is set. With it on,
+  the store no longer checks the body against the request signature;
+  integrity in transit rests on TLS. Set `unsigned_payload: false` to keep
+  signed payloads on an HTTPS endpoint.
