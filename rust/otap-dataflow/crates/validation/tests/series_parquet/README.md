@@ -219,6 +219,110 @@ The remaining subcommands (`capacity`, `soak`, `failures`, `buffered`,
 `remediate`, `report`) are named here so the command line is one contract;
 each is implemented by its own task.
 
+## Reference deployment
+
+The end-to-end suite runs the exporter's reference topology: a file producer
+in Docker Grafana Alloy, the host's `df_engine` with its OTLP gRPC receiver,
+and a Docker MinIO (or RustFS) destination, read back by two readers.
+
+```text
+/input/events.log -> Alloy -> OTLP gRPC -> df_engine -> MinIO Parquet
+                                                       |
+                                             downloaded object snapshot
+                                                       |
+                                               DuckDB + ClickHouse
+```
+
+It runs on Linux: Alloy uses host networking to reach the engine's loopback
+listener, and MinIO publishes an ephemeral loopback-only S3 port. The engine
+YAML is generated from `configs/series-parquet-local.yaml` with S3 storage
+settings equivalent to `configs/series-parquet-s3.yaml`, one core and
+`wait_for_result: true`; the helpers write the launched YAML as
+`pipeline.yaml` in the test's working directory and remove only their own
+containers.
+
+`DockerSlice.test_minio` in `test_e2e.py` (`test_rustfs` against RustFS)
+writes 12 known lines through Alloy and six metrics requests over OTLP gRPC,
+downloads the objects, and runs DuckDB and `clickhouse-local` over the same
+files. Both readers must return every body with its `e2e.source` attribute,
+agree on the row counts, and keep them through the latest-descriptor join.
+ClickHouse's `file()` does not synthesize `date` and `hour`, so the suite
+reads DuckDB with `hive_partitioning=false` to compare column by column.
+Native ClickHouse is preferred at `/usr/bin/clickhouse-local`
+(`SERIES_CLICKHOUSE_LOCAL` selects another executable), with `docker exec`
+in the selected ClickHouse image as the fallback. Missing both reader routes
+skips locally; a reader that is present but cannot run the query fails.
+
+```bash
+python3 -m venv /tmp/series-parquet-venv
+/tmp/series-parquet-venv/bin/pip install --require-hashes -r crates/validation/tests/series_parquet/requirements.lock.txt
+SERIES_REQUIRE_DOCKER=1 /tmp/series-parquet-venv/bin/python -m unittest -v \
+  crates.validation.tests.series_parquet.test_e2e.DockerSlice.test_minio
+```
+
+Images default to `minio/minio:RELEASE.2025-04-22T22-12-26Z`,
+`rustfs/rustfs:1.0.0-rc.3`, `clickhouse/clickhouse-server:26.7.4` and
+`grafana/alloy:v1.19.2` (see "Environment variables" to override them).
+Alloy is the only image the runner may pull. A missing Docker daemon or image
+skips locally unless `SERIES_REQUIRE_DOCKER` is `1`; a startup or reader
+failure always fails. The `series-parquet-e2e` workflow provisions the images
+and runs both stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
+
+### The Alloy producer
+
+[`configs/series-parquet.alloy`](../../../../configs/series-parquet.alloy),
+shared by the normal and the outage tests, tails `/input/events.log` and
+exports to `OTLP_ENDPOINT`, the engine's `127.0.0.1:<grpc_port>`. Its
+transform stage sets the resource attributes the Loki bridge does not supply:
+`host.id`, named by `producer_id_attribute`, and `service.name`, which feeds
+the denormalized service column; an attributes stage inserts `e2e.source`.
+The fixture is one producer, so it sets a constant `host.id`; each real
+producer needs its own value (series-lake README, "Producer id contract").
+
+The shipped attempt timeout of 180s is the exporter README's attempt-timeout
+rule applied to a 15s window and a 60s flush deadline. The tests run a
+one-second window and set 6s through `SERIES_ALLOY_TIMEOUT`, which the config
+reads, so an expired attempt is visible inside their own waits. The fixture
+writes 12 lines, far below `min_size`, so the batcher releases them on its 5s
+`flush_timeout`.
+
+The producer settings were measured against `grafana/alloy:v1.19.2` with a
+server that holds each export for a fixed time, as the exporter does. A
+producer holding one export per window sustains at most
+
+```text
+records/second = num_consumers * records_per_export / hold_time
+```
+
+where the hold time is at worst a whole window plus the flush: four consumers
+sustained about 5000 records per second at a 15s hold and about 1050 at a 60s
+hold. The shipped file runs eight consumers with a 20000-record minimum
+batch, sized for 10000 records/s from one producer. Three settings decide
+whether that ceiling is reachable:
+
+- **Batching must be switched on.** `otelcol.receiver.loki` turns one log line
+  into one OTLP request, and the sending queue's batcher is off without a
+  `batch {}` block, so `records_per_export` stays 1.
+- **The queue must be sized in items.** With the default `sizer = "requests"`
+  the accumulating batch keeps its single-record slots until its export
+  finishes, so a batch never exceeds `queue_size` and concurrency collapses
+  to one.
+- **Alloy's default `timeout` of 5s is below any usable window.** A producer
+  left on it completes nothing against a 15s window and logs a deadline error
+  every five seconds.
+
+Queue overflow is silent loss before the exporter sees the data. By default
+the sending queue returns a retryable error that the Loki bridge logs and
+discards, and the tailer reads on, so the file source sets
+`block_on_overflow = true` and leaves unread data on disk. Watch
+`otelcol_exporter_enqueue_failed_log_records_total`, the only loss signal:
+`otelcol_exporter_send_failed_log_records_total` stays zero under
+`max_elapsed_time = "0s"`. Budget about 4 KB of resident memory per
+`queue_size` item; an in-flight export keeps its queue space until it
+completes, retries included. The engine's `max_concurrent_requests` must be
+at least the sum of `num_consumers` over its producers, or exports queue at
+the receiver with no signal from the exporter; the local example sets 128.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -234,7 +338,8 @@ each is implemented by its own task.
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_PERF` | The perf executable an attribution records with. Defaults to `perf` on the PATH. |
 | `SERIES_ATTRIBUTION_ENGINE` | The engine an attribution profiles. Defaults to `target/release/df_engine-perf`. |
-| `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses. |
+| `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses, each a locally present tag; defaults in "Reference deployment". |
+| `SERIES_CLICKHOUSE_LOCAL` | The `clickhouse-local` executable; default `/usr/bin/clickhouse-local`. |
 
 Python dependencies are pinned in `requirements.txt` and, with hashes, in
 `requirements.lock.txt`; install with `pip install --require-hashes -r
