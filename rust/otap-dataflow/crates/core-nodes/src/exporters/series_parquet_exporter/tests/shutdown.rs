@@ -591,20 +591,11 @@ async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
             store.hooks().set(Fault::None);
 
             let got = completions_until(&sim, &mut rx, &node, deadline).await;
-            let mut acked: Vec<usize> = got
-                .into_iter()
-                .map(|(_, message)| match message {
-                    PipelineCompletionMsg::DeliverAck { ack } => ack
-                        .accepted
-                        .into_parts()
-                        .0
-                        .source_node()
-                        .expect("a routed request"),
-                    other => panic!("expected an ack, got {other:?}"),
-                })
-                .collect();
-            acked.sort_unstable();
-            assert_eq!(acked, vec![1, 2, 3, 4, 5], "both blocks are acknowledged");
+            assert_eq!(
+                acked_ids(got),
+                vec![1, 2, 3, 4, 5],
+                "both blocks are acknowledged"
+            );
             assert_no_more_completions(&mut rx);
             assert!(clock::now() < deadline, "the drain ends inside the grace");
             let _ = node
@@ -674,15 +665,73 @@ async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
         .await;
 }
 
-/// Scenario: every write takes 20 s to fail, and a terminate granting 30 s
-/// latches one second into the first block's first attempt.
-/// Guarantees: no attempt starts that the last one says cannot finish by the
-/// deadline: neither the first block's retry nor the ACTIVE block's first
-/// attempt is started, both blocks are nacked as retryable `NodeShutdown`
-/// right after the one attempt fails, and the node returns before the grace
-/// ends instead of waiting for it.
+/// The sorted ids of `got`, all of which must be acks.
+fn acked_ids(got: Vec<(std::time::Instant, PipelineCompletionMsg<OtapPdata>)>) -> Vec<usize> {
+    let mut ids: Vec<usize> = got
+        .into_iter()
+        .map(|(_, message)| match message {
+            PipelineCompletionMsg::DeliverAck { ack } => ack
+                .accepted
+                .into_parts()
+                .0
+                .source_node()
+                .expect("a routed request"),
+            other => panic!("expected an ack, got {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Scenario: the first block's store fails fast on every write, a terminate
+/// grants 30 s, and the store heals 300 ms before the deadline.
+/// Guarantees: attempts keep starting up to the deadline at the minimum
+/// backoff, so the attempt started after the heal commits the first block, the
+/// ACTIVE block is then sealed and written, and all five requests are
+/// acknowledged before the deadline.
 #[tokio::test(flavor = "current_thread")]
-async fn no_attempt_starts_that_cannot_finish_by_the_deadline() {
+async fn a_store_that_heals_just_before_the_deadline_still_commits() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::Series);
+            let (node, mut rx, control_tx, deadline) = shutdown_while_both_blocks_wait(
+                &store,
+                &sim,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+            )
+            .await;
+            step_for(&sim, Duration::from_millis(29_700)).await;
+            assert!(clock::now() < deadline);
+            store.hooks().set(Fault::None);
+
+            let got = completions_until(&sim, &mut rx, &node, deadline).await;
+            assert!(
+                got.iter().all(|(at, _)| *at <= deadline),
+                "decided by the deadline"
+            );
+            assert_eq!(acked_ids(got), vec![1, 2, 3, 4, 5]);
+            let _ = node
+                .await
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            assert_no_more_completions(&mut rx);
+            drop(control_tx);
+        })
+        .await;
+}
+
+/// Scenario: a terminate granting 30 s latches one second into the first
+/// block's first attempt, which takes 20 s to fail; the store is healed while
+/// that attempt is still running.
+/// Guarantees: a slow earlier failure does not stop later attempts: the first
+/// block's retry and then the ACTIVE block's first attempt both start before
+/// the deadline and commit, so all five requests are acknowledged.
+#[tokio::test(flavor = "current_thread")]
+async fn a_slow_failure_does_not_stop_the_attempts_after_it() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let sim = clock::SimClock::new();
@@ -696,29 +745,22 @@ async fn no_attempt_starts_that_cannot_finish_by_the_deadline() {
                 Duration::from_secs(30),
             )
             .await;
+            // The first attempt read its fault on entry, so it still fails.
+            step_for(&sim, Duration::from_secs(9)).await;
+            store.hooks().set(Fault::None);
 
             let got = completions_until(&sim, &mut rx, &node, deadline).await;
-            assert_eq!(got.len(), 5, "every request is decided before the deadline");
-            for (_, message) in got {
-                match message {
-                    PipelineCompletionMsg::DeliverNack { nack } => {
-                        assert!(!nack.permanent);
-                        assert_eq!(nack.cause, NackCause::NodeShutdown);
-                    }
-                    other => panic!("expected a nack, got {other:?}"),
-                }
-            }
-            assert_eq!(
-                store
-                    .hooks()
-                    .entered_at
-                    .lock()
-                    .expect("entered_at lock")
-                    .len(),
-                1,
-                "only the attempt already running when shutdown latched"
+            assert_eq!(acked_ids(got), vec![1, 2, 3, 4, 5]);
+            let entered = store
+                .hooks()
+                .entered_at
+                .lock()
+                .expect("entered_at lock")
+                .clone();
+            assert!(
+                entered.iter().skip(1).all(|at| *at < deadline),
+                "the later attempts started before the deadline"
             );
-            assert!(node.is_finished(), "the node returns inside the grace");
             let _ = node
                 .await
                 .expect("the node task joins")

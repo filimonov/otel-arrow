@@ -235,17 +235,15 @@ holds, inside that deadline:
 - The parked request, if there is one, is nacked as retryable at once,
   because no block will be opened for it.
 - The FLUSHING block keeps retrying, but its deadline becomes the earlier of
-  its own and the shutdown deadline, the backoff between attempts drops to its
-  200ms minimum, and a retry starts only if the last attempt that returned
-  would have finished before the deadline.
+  its own and the shutdown deadline, and the backoff between attempts drops
+  to its 200ms minimum. An attempt starts only before the deadline, and one
+  still running at the deadline is cancelled there.
 - The ACTIVE block is sealed as soon as the flush slot frees, without waiting
-  for its window, and is written under the same rules; its first attempt is
-  judged by how long the previous block's last attempt took.
+  for its window, and is written under the same rules.
 - A request force-drained after the latch is refused with a retryable
   `NodeShutdown` nack, so a full completion channel cannot stall the drain.
-- Whatever cannot finish is nacked as retryable with `NodeShutdown`: a block
-  as soon as no attempt can finish in time, and everything still held at the
-  deadline itself. Each of those decisions is attempted once, and one the
+- Whatever has not finished by the deadline is nacked as retryable with
+  `NodeShutdown`. Each of those decisions is attempted once, and one the
   completion channel will not take is counted as a delivery failure; its
   producer sees its own timeout and retries.
 

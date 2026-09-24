@@ -234,9 +234,6 @@ pub(super) struct Worker {
     seq: u64,
     /// What will have asked for the next rotation.
     pub(super) reason: FlushReason,
-    /// How long the last write attempt that returned took, which judges the
-    /// first attempt of a flush sealed after shutdown (see `FlushJob::new`).
-    last_attempt: Option<std::time::Duration>,
     /// Largest completion token the worker has held, for capacity reporting.
     pub(super) token_high_water: usize,
     /// Telemetry scans taken, which a test pins to collections.
@@ -334,7 +331,6 @@ impl Worker {
             sink,
             seq: 1,
             reason: FlushReason::Time,
-            last_attempt: None,
             token_high_water: size_of::<AckToken>(),
             #[cfg(test)]
             samples: 0,
@@ -784,7 +780,6 @@ impl Worker {
             old.emitted,
             self.cfg.window.flush_retry_deadline,
             self.cfg.lake.upload.abort_timeout,
-            self.last_attempt,
         );
         if let Some(deadline) = self.deadline {
             job.cut_to(deadline);
@@ -834,9 +829,6 @@ impl Worker {
         let mut reason: Option<Rc<str>> = None;
         let outcome = match &done {
             Ok(finished) => {
-                if finished.took.is_some() {
-                    self.last_attempt = finished.took;
-                }
                 if let Some(metrics) = &mut self.metrics {
                     metrics
                         .worker
@@ -905,21 +897,7 @@ impl Worker {
                             message = "Block failed before durable completion"
                         );
                         reason = Some(Rc::from(BlockWriteFailed(error).to_string()));
-                        // Out of the time shutdown left it, whether at the
-                        // latched deadline or because no retry could finish
-                        // before it.
-                        let cut = job.cut_by_shutdown()
-                            && matches!(
-                                error,
-                                lake::Error::Transient(
-                                    lake::TransientError::DeadlineExceeded { .. }
-                                )
-                            );
-                        if cut {
-                            Outcome::Shutdown
-                        } else {
-                            self.failed_outcome()
-                        }
+                        self.failed_outcome()
                     }
                 }
             }
