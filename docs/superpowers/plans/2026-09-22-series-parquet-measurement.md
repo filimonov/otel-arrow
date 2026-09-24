@@ -1623,6 +1623,12 @@ Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as me
 - [ ] Take dumps at the start and the end of a Task 6 local-storage run to attribute the engine `memory.usage` drift of +137/+273 MB.
 - [ ] The profiling mode is a diagnostic: its runs never write or update a baseline, and their timings are not compared with normal runs.
 
+
+**Amendment (Task 5 finding, 2026-09-24): receiver in-flight memory.** In strict mode the receiver keeps every in-flight request in memory until its block is durable, bounded only by the number of receiver slots, not by bytes. At 1.216M records/s with 4096 slots per worker, jemalloc held 16.2 GB (RSS 17 GB) while the exporter accounted 3.4 GB, the rest being requests held in the receiver (4096 slots x 4 workers x about 1 MB). With the shipped 128 slots and `ingress.max_request_bytes` 16 MiB, the unbudgeted worst case is 2 GB per worker.
+- [ ] README sizing states the whole-process bound: workers x (exporter budget + receiver slots x maximum request size), with the measured figures, and warns that raising `max_concurrent_requests` to lift the strict admission ceiling multiplies this term.
+- [ ] At startup the exporter logs that bound, computed from its own configuration and the receiver slots it can see (or states that it cannot see them).
+- [ ] Decide and record a byte bound for in-flight requests: either a receiver-level byte limit (an engine change, upstream) or an exporter-level retryable refusal when bytes held for unacknowledged requests pass a threshold; implement the exporter-level one here if the engine change is deferred.
+
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
 **Expected wall-clock cost:** 55-80 minutes for both stores, both topologies' latency cohorts and window comparisons; under one second for latency/backoff analysis tests.
