@@ -872,11 +872,9 @@ impl<PData> ExporterInbox<PData> {
 impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
     /// Deadline latched by the inbox while it force-drains buffered pdata.
     ///
-    /// `None` until a Shutdown has been latched. Stateful exporters can keep
-    /// shutdown bounded when a completion send is full before the final
-    /// Shutdown control message is released: the exporter learns the deadline
-    /// from the first force-drained pdata rather than from the control message
-    /// it has not been handed yet. Read-only, so drain order is unaffected.
+    /// `None` until a Shutdown has been latched. A stateful exporter learns the
+    /// deadline from the first force-drained pdata, before the final Shutdown
+    /// control message is released. Read-only, so drain order is unaffected.
     #[must_use]
     pub fn shutdown_deadline(&self) -> Option<Instant> {
         self.core.shutting_down_deadline

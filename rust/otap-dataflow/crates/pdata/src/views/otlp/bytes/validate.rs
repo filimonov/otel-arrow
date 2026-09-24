@@ -27,9 +27,9 @@
 //!
 //! A field the schema does not know keeps protobuf skip semantics: its
 //! framing is checked and its content is skipped. An unknown group (wire
-//! types 3 and 4) is skipped when it is balanced -- closed by an end key of
-//! its own field number, nested groups included, each group counted against
-//! the same nesting limit -- and a stray or mismatched end group is refused.
+//! types 3 and 4) is skipped when it is balanced (closed by an end key of its
+//! own field number, nested groups included, each counted against the same
+//! nesting limit), and a stray or mismatched end group is refused.
 //! Content is not checked: no value is range-checked and a `string` field may
 //! hold invalid UTF-8, which the conversion to OTAP records replaces with
 //! U+FFFD.
@@ -1054,13 +1054,10 @@ mod tests {
         ]
     }
 
-    /// Scenario: a logs, a metrics and a traces request built by prost that
-    /// set every field of every message the validator knows -- all five
-    /// metric types, exemplars, packed bucket counts and bounds, entity refs,
-    /// span events, links and status, and nested array and key-value list
-    /// attribute values.
-    /// Guarantees: each passes, so the schema table matches the wire types a
-    /// conforming encoder writes and a well-formed request is never refused.
+    /// Scenario: prost-built logs, metrics and traces requests setting every field the validator
+    /// knows (all metric types, exemplars, packed lists, entity refs, span events, links, nested
+    /// values).
+    /// Guarantees: each passes, so the schema table matches what a conforming encoder writes.
     #[test]
     fn a_fully_populated_request_passes() {
         for (root, body) in requests() {
@@ -1103,18 +1100,11 @@ mod tests {
         out
     }
 
-    /// Scenario: each fully populated logs, metrics and traces request, and
-    /// the same request with a balanced unknown group, an unknown
-    /// length-delimited field whose bytes look like a known field, and an
-    /// unknown varint placed before the first field of every message -- the
-    /// request itself, resources, scopes, log records, metrics, every data
-    /// point kind, exemplars, spans, events, links, key-values, any-values,
-    /// arrays and lists.
-    /// Guarantees: the decorated request passes validation and converts to
-    /// exactly the OTAP records the plain one does, so every field after
-    /// unknown content is still read by the byte views: nothing the
-    /// validator accepts is silently dropped, and no unknown bytes are read
-    /// as a phantom record.
+    /// Scenario: each full request, and the same with a balanced unknown group, a look-alike
+    /// unknown length-delimited field and an unknown varint before the first field of every
+    /// message.
+    /// Guarantees: the decorated request passes and converts to exactly the plain request's OTAP
+    /// records.
     #[test]
     fn unknown_content_before_known_fields_is_skipped_by_the_views() {
         use crate::otap::OtapArrowRecords;
@@ -1186,21 +1176,12 @@ mod tests {
         }
     }
 
-    /// Scenario: for every singular field -- scalar, string, sub-message or
-    /// oneof member -- that the fully populated logs, metrics and traces
-    /// requests set, the same request with that field written twice in its
-    /// message (118 cases over 26 message types, among them
-    /// `ResourceLogs.resource`, `ScopeSpans.scope`, `LogRecord.body`,
-    /// `Metric.data`, the exponential histogram buckets, `Span.status` and
-    /// `KeyValue.value`), plus a number data point and an exemplar carrying
-    /// both members of their `value` oneof.
-    /// Guarantees: under `RepeatedSingular::Refuse` each is refused as
-    /// `DuplicateOtlpField` naming the message and the field, because the byte views read a repeated singular field
-    /// differently from prost (first occurrence instead of the last, one
-    /// occurrence instead of the merge); the requests with each field once
-    /// pass, `AnyValue`'s own repeated members -- which its view reads as
-    /// prost does -- are still accepted, and under `RepeatedSingular::Accept`
-    /// every doubled request passes.
+    /// Scenario: each singular field or oneof member of the full requests written twice (118 cases
+    /// over 26 message types), plus both members of the `value` oneof of a number point and an
+    /// exemplar.
+    /// Guarantees: under `Refuse` each is a `DuplicateOtlpField` naming message and field, since
+    /// the views read repeats unlike prost; `AnyValue`'s repeated members pass, and under `Accept`
+    /// everything passes.
     #[test]
     fn a_repeated_singular_field_is_refused() {
         let mut targets = Vec::new();
@@ -1305,12 +1286,10 @@ mod tests {
         );
     }
 
-    /// Scenario: every proper prefix of each fully populated request, and
-    /// each request with one byte of a nested length prefix changed.
-    /// Guarantees: no prefix that ends inside a field passes: a prefix passes
-    /// only if it ends exactly on a field boundary of the top level, where
-    /// it is itself a well-formed, shorter request. So a body cut anywhere
-    /// inside a nested message is refused, however deep the cut.
+    /// Scenario: every proper prefix of each full request, and each with one nested length byte
+    /// changed.
+    /// Guarantees: only prefixes ending on a top-level field boundary pass; a cut inside any nested
+    /// message is refused.
     #[test]
     fn a_body_cut_inside_any_nested_message_is_refused() {
         for (root, body) in requests() {
@@ -1333,11 +1312,8 @@ mod tests {
         }
     }
 
-    /// Scenario: a request whose only damage is several levels deep -- a
-    /// string `AnyValue` inside a log record attribute declaring more bytes
-    /// than it has.
-    /// Guarantees: it is refused as `InvalidOtlpWireFormat` naming `AnyValue`
-    /// and the byte offset of the damaged field within the whole request.
+    /// Scenario: a string `AnyValue` inside a log attribute declaring more bytes than it has.
+    /// Guarantees: `InvalidOtlpWireFormat` names `AnyValue` and the offset within the request.
     #[test]
     fn deep_damage_names_the_message_and_offset() {
         let any_value = [0x0a, 0x05, b'a'];
@@ -1369,12 +1345,9 @@ mod tests {
         }
     }
 
-    /// Scenario: a log record carrying unknown fields of every wire type,
-    /// one of them length-delimited with bytes that are not a valid message,
-    /// and an unknown field that overruns its record.
-    /// Guarantees: unknown fields keep proto3 skip semantics -- their framing
-    /// is checked but their content is never parsed -- so a newer sender's
-    /// extension fields pass and only a broken frame is refused.
+    /// Scenario: unknown log record fields of every wire type, one holding an invalid message, and
+    /// one overrunning its record.
+    /// Guarantees: unknown fields are framed but not parsed, so only the broken frame is refused.
     #[test]
     fn unknown_fields_are_skipped_but_framed() {
         let mut record = vec![0xf8, 0x01, 0x05]; // field 31, varint
@@ -1407,12 +1380,9 @@ mod tests {
         ));
     }
 
-    /// Scenario: known fields sent with a wire type the schema does not give
-    /// them -- `ResourceLogs` as a varint, a log record's `time_unix_nano`
-    /// as a varint, an `AnyValue` string as fixed32 -- and field keys using
-    /// the obsolete group wire types or field number zero.
-    /// Guarantees: each is refused, as prost would refuse it, rather than
-    /// being read by the lazy views as garbage or silently dropped.
+    /// Scenario: known fields with a wrong wire type (`ResourceLogs` and `time_unix_nano` as
+    /// varints, an `AnyValue` string as fixed32), group wire types and field number zero.
+    /// Guarantees: each is refused, as prost refuses it.
     #[test]
     fn a_known_field_with_the_wrong_wire_type_is_refused() {
         let root = Message::ExportLogsServiceRequest;
@@ -1432,12 +1402,9 @@ mod tests {
         }
     }
 
-    /// Scenario: histogram bucket counts and bounds sent unpacked, packed
-    /// with a length that is not a multiple of eight, and exponential
-    /// histogram bucket counts packed with a truncated varint.
-    /// Guarantees: both proto3 encodings of a repeated scalar pass, and a
-    /// packed field whose payload does not divide into whole elements is
-    /// refused rather than read as fewer buckets than were sent.
+    /// Scenario: bucket counts and bounds unpacked, packed with a length not a multiple of eight,
+    /// and a packed truncated varint.
+    /// Guarantees: both encodings pass, and a packed field without whole elements is refused.
     #[test]
     fn packed_fields_must_hold_whole_elements() {
         let root = Message::ExportMetricsServiceRequest;
@@ -1510,11 +1477,9 @@ mod tests {
         len_field(1, &len_field(2, &len_field(2, &record)))
     }
 
-    /// Scenario: log bodies nesting arrays and key-value lists exactly at
-    /// and one level beyond `MAX_ANY_VALUE_NESTING_DEPTH`.
-    /// Guarantees: the limit is exact -- the deepest accepted nesting is the
-    /// limit itself -- the walk at the limit completes on a test thread's
-    /// stack, and one level more is refused as `OtlpNestingTooDeep`.
+    /// Scenario: log bodies nesting exactly at and one beyond `MAX_ANY_VALUE_NESTING_DEPTH`.
+    /// Guarantees: the limit itself is accepted on a test thread's stack; one more is
+    /// `OtlpNestingTooDeep`.
     #[test]
     fn nesting_is_bounded_exactly() {
         let root = Message::ExportLogsServiceRequest;
@@ -1552,15 +1517,10 @@ mod tests {
         }
     }
 
-    /// Scenario: a log record's `severity_number` (a varint) holding
-    /// `u64::MAX` in ten bytes, then the ten-byte varint
-    /// `80 80 80 80 80 80 80 80 80 02` and an eleven-byte varint in the same
-    /// field, one as a nested length prefix, and one inside packed
-    /// exponential-histogram bucket counts.
-    /// Guarantees: the maximum `u64` passes, and a varint carrying bits past
-    /// the 64th is refused wherever it appears -- key, length, scalar or
-    /// packed element -- instead of being read as a wrapped value, as prost
-    /// refuses it.
+    /// Scenario: `u64::MAX` in ten bytes, the ten-byte `80 .. 80 02` and an eleven-byte varint, as
+    /// a scalar, a nested length and a packed bucket count.
+    /// Guarantees: the maximum passes; bits past the 64th are refused wherever they appear, as
+    /// prost refuses them.
     #[test]
     fn a_varint_that_overflows_u64_is_refused() {
         let root = Message::ExportLogsServiceRequest;
@@ -1615,11 +1575,9 @@ mod tests {
         );
     }
 
-    /// Scenario: `AnyValue.string_value`, a `KeyValue.key` and a `Metric.name`
-    /// holding bytes that are not UTF-8 (`0xff`, a lone `0xc3`), under both
-    /// policies.
-    /// Guarantees: each passes: UTF-8 is content, which the conversion to OTAP
-    /// records replaces with U+FFFD, not framing.
+    /// Scenario: `AnyValue.string_value`, a `KeyValue.key` and a `Metric.name` holding `0xff` or a
+    /// lone `0xc3`, under both policies.
+    /// Guarantees: each passes: UTF-8 is content, repaired by the conversion, not framing.
     #[test]
     fn a_string_field_is_not_checked_for_utf8() {
         let attribute = |key: &[u8], value: &[u8]| {
@@ -1647,15 +1605,11 @@ mod tests {
         }
     }
 
-    /// Scenario: unknown field 31 of a log record encoded as a group --
-    /// empty (`fb 01 fc 01`), holding fields of every other wire type, and
-    /// holding a nested group of field 32 -- then a stray end group, an end
-    /// group of the wrong field, a group never closed, a group on a known
-    /// field, and groups nested exactly at and one beyond the nesting limit.
-    /// Guarantees: a balanced unknown group is skipped as prost skips it, so a
-    /// sender's proto2 extension never refuses a request; every unbalanced or
-    /// misplaced group is refused, and group nesting is bounded by the same
-    /// limit as `AnyValue` nesting.
+    /// Scenario: unknown field 31 as a group (empty, holding every wire type, holding a nested
+    /// group), stray and mismatched end groups, an unclosed group, a group on a known field, and
+    /// groups at and beyond the nesting limit.
+    /// Guarantees: balanced unknown groups are skipped as prost skips them; every other shape is
+    /// refused, and group nesting shares the `AnyValue` limit.
     #[test]
     fn unknown_groups_are_skipped_when_balanced() {
         let root = Message::ExportLogsServiceRequest;
@@ -1761,14 +1715,10 @@ mod tests {
         }
     }
 
-    /// Scenario: every field number from 1 to 63 of every message reachable
-    /// from the three request roots through the schema table, compared with
-    /// the fields the fully populated prost-built requests set.
-    /// Guarantees: the table knows exactly the fields the prost-generated
-    /// types encode -- none is missing and none is invented -- so every
-    /// table entry's wire type is exercised by `a_fully_populated_request_passes`,
-    /// and every singular slot, a oneof's shared one included, fits the
-    /// 64-bit mask of the walk.
+    /// Scenario: field numbers 1 to 63 of every message reachable in the schema table, against the
+    /// fields the full prost requests set.
+    /// Guarantees: the table has exactly the prost fields, and every singular slot fits the walk's
+    /// 64-bit mask.
     #[test]
     fn the_schema_table_matches_the_prost_types() {
         let mut messages = vec![
@@ -1930,16 +1880,10 @@ mod tests {
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
 
-        /// Scenario: a fully populated logs, metrics or traces request with one
-        /// to three random byte edits (overwrite, insert, delete, cut), each
-        /// applied to the whole body or inside one length-delimited field at
-        /// any depth with the enclosing lengths rewritten, checked under both
-        /// policies and decoded by prost.
-        /// Guarantees: under `RepeatedSingular::Accept` the validator agrees
-        /// with prost: it accepts a body exactly when prost decodes it, except
-        /// that prost also refuses a string that is not UTF-8, which the
-        /// validator leaves to the conversion; and `Refuse` accepts nothing
-        /// `Accept` refuses.
+        /// Scenario: full requests with one to three random byte edits, on the whole body or inside
+        /// one field at any depth with the enclosing lengths rewritten, under both policies.
+        /// Guarantees: under `Accept` it accepts exactly what prost decodes, except non-UTF-8
+        /// strings; `Refuse` accepts nothing `Accept` refuses.
         #[test]
         fn the_validator_agrees_with_prost_on_edited_bodies(
             signal in 0usize..3,
@@ -1972,12 +1916,10 @@ mod tests {
         }
     }
 
-    /// Scenario: a logs, a metrics and a traces payload whose one nested
-    /// `Resource*` message is `0a 01 0a` -- a field tag with no length --
-    /// the same payloads empty, and a payload of Arrow records.
-    /// Guarantees: `OtapPayload::validate_otlp_framing` refuses each damaged
-    /// body naming the damaged message, under both policies, and passes the
-    /// empty bodies and the Arrow records, which have no wire framing.
+    /// Scenario: logs, metrics and traces payloads whose nested `Resource*` is `0a 01 0a` (a tag
+    /// without a length), the same payloads empty, and Arrow records.
+    /// Guarantees: `OtapPayload::validate_otlp_framing` refuses the damaged bodies naming the
+    /// message and passes the rest.
     #[test]
     fn the_payload_check_refuses_damage_and_passes_arrow_records() {
         use crate::OtapPayload;

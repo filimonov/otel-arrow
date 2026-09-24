@@ -11,10 +11,8 @@ pub(crate) const LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Lets at most one line through per [`LOG_INTERVAL`] and counts the rest.
 ///
-/// A producer that keeps resending a request an exporter refuses would
-/// otherwise write one line per request at whatever rate it sends; each line
-/// that is written says how many were left out since the previous one, and
-/// the exporter's metrics still count every refusal.
+/// Each line written says how many were left out since the previous one; the
+/// exporter's metrics still count every refusal.
 #[derive(Debug, Default)]
 pub(crate) struct LogGate {
     /// When the last line was let through.
