@@ -542,7 +542,23 @@ pub(crate) fn extract_metrics(
     let mut pinned_bytes = 0;
     // Number and histogram points share one dataset (FORMAT.md section 2), so they share
     // one sink; each kind writes the other's columns as null.
-    let mut sink = RowSink::new(Dataset::MetricsValues, cfg)?;
+    let points = |pt| records.get(pt).map_or(0, |b| b.num_rows());
+    let list_items = |name| {
+        records
+            .get(ArrowPayloadType::HistogramDataPoints)
+            .and_then(|b| b.column_by_name(name))
+            .and_then(|c| c.as_list_opt::<i32>())
+            .map_or(0, |list| list.values().len())
+    };
+    let mut sink = RowSink::new(
+        Dataset::MetricsValues,
+        cfg,
+        points(ArrowPayloadType::NumberDataPoints) + points(ArrowPayloadType::HistogramDataPoints),
+        &[
+            ("bucket_counts", list_items(HISTOGRAM_BUCKET_COUNTS)),
+            ("explicit_bounds", list_items(HISTOGRAM_EXPLICIT_BOUNDS)),
+        ],
+    )?;
 
     // Number points. Each column is read in the order the kinds always read
     // them, so a request with several malformed columns is refused for the

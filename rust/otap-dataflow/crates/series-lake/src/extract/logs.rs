@@ -135,7 +135,16 @@ pub(crate) fn extract_logs(
 
     let allow: &[String] = &cfg.logs.series_attributes;
     let values_denorm = denorm_columns(Dataset::LogsValues, cfg);
-    let mut sink = RowSink::new(Dataset::LogsValues, cfg)?;
+    let body_bytes = body
+        .as_ref()
+        .and_then(|b| b.str_bytes())
+        .map(|bytes| (BODY, bytes));
+    let mut sink = RowSink::new(
+        Dataset::LogsValues,
+        cfg,
+        logs.num_rows(),
+        body_bytes.as_slice(),
+    )?;
     let mut descriptors: Vec<DescriptorRow> = Vec::new();
     let mut seen: HashSet<SeriesId> = HashSet::new();
     let mut resources = SharedLists::default();

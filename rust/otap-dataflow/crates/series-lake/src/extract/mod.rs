@@ -683,29 +683,42 @@ enum AnyBuilder {
     Bytes(BinaryBuilder),
 }
 
-fn builder_for(dt: &DataType) -> Result<AnyBuilder> {
+/// Bytes a string or binary builder starts with per row when nothing better
+/// is known about its column.
+const DEFAULT_CELL_BYTES: usize = 16;
+
+/// A builder for `dt` with room for `rows` rows and, for a string, binary or
+/// list column, `items` bytes or list items (a default per row when `None`).
+fn builder_for(dt: &DataType, rows: usize, items: Option<usize>) -> Result<AnyBuilder> {
+    let bytes = items.unwrap_or(rows * DEFAULT_CELL_BYTES);
+    let items = items.unwrap_or(0);
     Ok(match dt {
-        DataType::Utf8 => AnyBuilder::Str(StringBuilder::new()),
-        DataType::Int64 => AnyBuilder::Int(Int64Builder::new()),
-        DataType::Int32 => AnyBuilder::Int32(Int32Builder::new()),
-        DataType::Float64 => AnyBuilder::Double(Float64Builder::new()),
-        DataType::Boolean => AnyBuilder::Bool(BooleanBuilder::new()),
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            AnyBuilder::TsUs(TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()))
+        DataType::Utf8 => AnyBuilder::Str(StringBuilder::with_capacity(rows, bytes)),
+        DataType::Int64 => AnyBuilder::Int(Int64Builder::with_capacity(rows)),
+        DataType::Int32 => AnyBuilder::Int32(Int32Builder::with_capacity(rows)),
+        DataType::Float64 => AnyBuilder::Double(Float64Builder::with_capacity(rows)),
+        DataType::Boolean => AnyBuilder::Bool(BooleanBuilder::with_capacity(rows)),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => AnyBuilder::TsUs(
+            TimestampMicrosecondBuilder::with_capacity(rows).with_timezone_opt(tz.clone()),
+        ),
+        DataType::FixedSizeBinary(n) => {
+            AnyBuilder::Fixed(FixedSizeBinaryBuilder::with_capacity(rows, *n))
         }
-        DataType::FixedSizeBinary(n) => AnyBuilder::Fixed(FixedSizeBinaryBuilder::new(*n)),
-        DataType::Map(_, _) => AnyBuilder::Map(MapBuilder::new(
+        DataType::Map(_, _) => AnyBuilder::Map(MapBuilder::with_capacity(
             None,
-            StringBuilder::new(),
-            StringBuilder::new(),
+            StringBuilder::with_capacity(rows, bytes),
+            StringBuilder::with_capacity(rows, bytes),
+            rows,
         )),
-        DataType::List(f) if f.data_type() == &DataType::Int64 => {
-            AnyBuilder::ListI64(ListBuilder::new(Int64Builder::new()).with_field(f.clone()))
-        }
-        DataType::List(f) => {
-            AnyBuilder::ListF64(ListBuilder::new(Float64Builder::new()).with_field(f.clone()))
-        }
-        DataType::Binary => AnyBuilder::Bytes(BinaryBuilder::new()),
+        DataType::List(f) if f.data_type() == &DataType::Int64 => AnyBuilder::ListI64(
+            ListBuilder::with_capacity(Int64Builder::with_capacity(items), rows)
+                .with_field(f.clone()),
+        ),
+        DataType::List(f) => AnyBuilder::ListF64(
+            ListBuilder::with_capacity(Float64Builder::with_capacity(items), rows)
+                .with_field(f.clone()),
+        ),
+        DataType::Binary => AnyBuilder::Bytes(BinaryBuilder::with_capacity(rows, bytes)),
         other => return Err(Error::internal(format!("unsupported builder type {other}"))),
     })
 }
@@ -791,13 +804,27 @@ pub(crate) struct RowSink {
 }
 
 impl RowSink {
-    /// New sink for one dataset.
-    pub(crate) fn new(ds: Dataset, cfg: &LakeConfig) -> Result<Self> {
+    /// New sink for one dataset, its builders sized for `rows` rows and for
+    /// the known content of the columns `items` names (bytes of a string
+    /// column, items of a list column), each at most `run_target_bytes`.
+    pub(crate) fn new(
+        ds: Dataset,
+        cfg: &LakeConfig,
+        rows: usize,
+        items: &[(&str, usize)],
+    ) -> Result<Self> {
         let schema = dataset_schema(ds, cfg);
+        let run_target = cfg.sorting.run_target_bytes;
         let builders = schema
             .fields()
             .iter()
-            .map(|f| builder_for(f.data_type()))
+            .map(|f| {
+                let known = items
+                    .iter()
+                    .find(|(name, _)| name == f.name())
+                    .map(|&(_, n)| n.min(run_target));
+                builder_for(f.data_type(), rows, known)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             schema,
@@ -1084,7 +1111,7 @@ pub fn series_batch(
     let mut builders = schema
         .fields()
         .iter()
-        .map(|f| builder_for(f.data_type()))
+        .map(|f| builder_for(f.data_type(), rows.len(), None))
         .collect::<Result<Vec<_>>>()?;
     for r in rows {
         let d = &r.descriptor;
@@ -1119,8 +1146,8 @@ pub fn series_batch(
             append(b, c)?;
         }
     }
-    // The builders start with room for 1024 rows. A request-sized batch is
-    // usually far smaller, so release the unused capacity here: the block
+    // The builders are sized from the row count and a per-row guess of each
+    // string's bytes, so release what the guess left unused: the block
     // charges what it retains, and a run is measured against `run_target_bytes`
     // straight after this call. `Array::shrink_to_fit` on an `ArrayRef` shrinks
     // through `Arc::get_mut`, which succeeds because `finish` has just produced

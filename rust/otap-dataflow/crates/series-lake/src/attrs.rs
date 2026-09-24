@@ -284,6 +284,15 @@ impl AnyValueColumns {
         value
     }
 
+    /// Bytes of every string in a plain `str` column, `None` when the column
+    /// is absent or dictionary encoded.
+    pub(crate) fn str_bytes(&self) -> Option<usize> {
+        let strings = self.strs.as_ref()?.as_string_opt::<i32>()?;
+        let offsets = strings.value_offsets();
+        let (first, last) = (offsets.first()?, offsets.last()?);
+        usize::try_from(last - first).ok()
+    }
+
     /// The string at `row`, borrowed, when the row's type is `Str`; `None`
     /// for any other type, which [`AnyValueColumns::value_at`] reads. The
     /// string is the one `value_at` would return, under the same cell limit.
