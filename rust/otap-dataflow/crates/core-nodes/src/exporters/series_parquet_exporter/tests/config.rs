@@ -307,6 +307,29 @@ fn an_s3_config_without_a_retry_section_is_refused_at_load() {
     .expect("a 30s retry budget fits the 60s deadline");
 }
 
+/// Scenario: `upload.abort_timeout` is set to 999 ms and to exactly 1 s.
+/// Guarantees: the floor is 1 s inclusive: below it startup is refused with a
+/// sentence naming the key, the value and the floor, and at it the
+/// configuration is accepted.
+#[test]
+fn the_abort_timeout_has_a_one_second_floor() {
+    let validate = super::super::SERIES_PARQUET.validate_config;
+    let with = |abort: &str| {
+        serde_json::json!({
+            "storage": {"file": {"base_uri": "/tmp/series-config"}},
+            "upload": {"abort_timeout": abort}
+        })
+    };
+    let err = validate(&with("999ms"))
+        .expect_err("below the floor")
+        .to_string();
+    assert!(
+        err.contains("upload.abort_timeout (999ms) must be at least 1s"),
+        "{err}"
+    );
+    validate(&with("1s")).expect("the floor itself is accepted");
+}
+
 /// Scenario: configuration contains misspelled settings or cross-field
 /// violations, each applied alone to a base configuration that is itself
 /// valid, and each checked through the factory's own `validate_config`.
@@ -451,7 +474,12 @@ fn startup_rejects_invalid_configuration() {
         (
             "upload",
             serde_json::json!({"abort_timeout": "0s"}),
-            "upload.abort_timeout must be positive",
+            "upload.abort_timeout (0ns) must be at least 1s",
+        ),
+        (
+            "upload",
+            serde_json::json!({"abort_timeout": "999ms"}),
+            "upload.abort_timeout (999ms) must be at least 1s",
         ),
         (
             "upload",

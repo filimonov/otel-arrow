@@ -184,6 +184,12 @@ fn batch() -> usize {
     64
 }
 
+/// Shortest accepted `upload.abort_timeout`: the shutdown drain decides every
+/// held request synchronously and then waits for cleanup only until the
+/// latched deadline plus this timeout, so the timeout must leave room for that
+/// decision (README.md, "The drain").
+const MIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Refuse a store retry budget that one write attempt could spend past the
 /// block's own flush deadline.
 ///
@@ -289,8 +295,11 @@ impl TryFrom<RawConfig> for Config {
                 return Err(format!("{key} must be positive"));
             }
         }
-        if raw.upload.abort_timeout.is_zero() {
-            return Err("upload.abort_timeout must be positive".into());
+        if raw.upload.abort_timeout < MIN_ABORT_TIMEOUT {
+            return Err(format!(
+                "upload.abort_timeout ({:?}) must be at least {MIN_ABORT_TIMEOUT:?}",
+                raw.upload.abort_timeout
+            ));
         }
         // The one cross-field rule whose lake form names a lake key
         // (`ingress.max_block_bytes`): checked here first with the key the
