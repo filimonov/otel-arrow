@@ -1,0 +1,121 @@
+{
+  "schema": "series-flush-stall/1",
+  "workload_config_id": "logs-512k-near-limit-256",
+  "signal": "logs",
+  "block": {
+    "requests": 249,
+    "refused_as_full": true,
+    "bytes": 522389692,
+    "values_rows": 996,
+    "series_rows": 10
+  },
+  "writes": [
+    {
+      "wall_ns": 505011110,
+      "cpu_ns": 504924330,
+      "ticks": 19454,
+      "max_gap_ns": 32289211,
+      "p99_gap_ns": 320,
+      "p50_gap_ns": 310,
+      "gaps_at_least": {
+        "ge_100ms": 0,
+        "ge_10ms": 18,
+        "ge_1ms": 52,
+        "ge_50ms": 0,
+        "ge_5ms": 40
+      },
+      "polls": 19454,
+      "max_poll_ns": 32286171,
+      "max_workspace_bytes": 150076168
+    },
+    {
+      "wall_ns": 456757679,
+      "cpu_ns": 456487270,
+      "ticks": 16238,
+      "max_gap_ns": 20174751,
+      "p99_gap_ns": 320,
+      "p50_gap_ns": 310,
+      "gaps_at_least": {
+        "ge_100ms": 0,
+        "ge_10ms": 7,
+        "ge_1ms": 48,
+        "ge_50ms": 0,
+        "ge_5ms": 40
+      },
+      "polls": 16238,
+      "max_poll_ns": 20169801,
+      "max_workspace_bytes": 150076168
+    },
+    {
+      "wall_ns": 456524658,
+      "cpu_ns": 456086940,
+      "ticks": 11747,
+      "max_gap_ns": 20470910,
+      "p99_gap_ns": 330,
+      "p50_gap_ns": 310,
+      "gaps_at_least": {
+        "ge_100ms": 0,
+        "ge_10ms": 10,
+        "ge_1ms": 48,
+        "ge_50ms": 0,
+        "ge_5ms": 39
+      },
+      "polls": 11747,
+      "max_poll_ns": 20467320,
+      "max_workspace_bytes": 161731151
+    }
+  ],
+  "cancels": [],
+  "max_gap_ns": 32289211,
+  "max_observe_latency_ns": 0,
+  "max_cancel_latency_ns": 0,
+  "files": [
+    {
+      "path": "v=1/signal=logs/dataset=series/date=2026-09-21/hour=03/part-20260921T031500Z-local_1-flushstall-00000001.parquet",
+      "bytes": 5820,
+      "sha256": "ee0bb59b6b272a39b846abbc60716c0ff6a378609fe10138dd62149921757432"
+    },
+    {
+      "path": "v=1/signal=logs/dataset=values/date=2026-09-21/hour=03/part-20260921T031500Z-local_1-flushstall-00000001.parquet",
+      "bytes": 389510726,
+      "sha256": "90b39eff1eedd57e8c0fd8b78db1092c34212ac81e2e1d05d8902622dd52243a"
+    }
+  ],
+  "phases": [
+    {
+      "dataset": "series",
+      "rows": 10,
+      "runs": 10,
+      "build_ns": 99980,
+      "chunks": 1,
+      "max_chunk_rows": 10,
+      "max_chunk_bytes": 4484,
+      "max_next_ns": 23250,
+      "max_write_ns": 71729,
+      "max_flush_ns": 0,
+      "close_ns": 100950
+    },
+    {
+      "dataset": "values",
+      "rows": 996,
+      "runs": 63,
+      "build_ns": 410629,
+      "chunks": 33,
+      "max_chunk_rows": 31,
+      "max_chunk_bytes": 16257616,
+      "max_next_ns": 950347,
+      "max_write_ns": 11516412,
+      "max_flush_ns": 72794502,
+      "close_ns": 5153967
+    }
+  ],
+  "admission": {
+    "max_extract_ns": 1363097,
+    "max_reserve_ns": 1270,
+    "max_admit_ns": 15810,
+    "max_admit_sealing_run_ns": 1771466,
+    "admits_sealing_run": 62,
+    "max_sealed_run_rows": 16,
+    "seal_ns": 341049
+  }
+}

@@ -69,3 +69,15 @@ uncancelled and 20 cancelled writes per fixture on the same inputs.
 - `probe-binaries-s6.sha256`: the two executables.
 - 956adf0ae and 9d4bc07c0 are the commits as measured; rebased onto
   54bc1aa52 they are 14eea415c and f580bcdf0.
+
+The admission path (Task 5) was timed with the probe of d8381c1f2 on the
+library at 7e2268935, on the same four inputs, with 3 uncancelled writes and
+no cancelled ones, under the pin with the host lease.
+
+- `*-t5-admission.json`: the probe's result. `admission` holds the longest
+  conversion plus extraction of one request, `Block::reserve`,
+  `Block::admit` without and with a values-run seal at
+  `sorting.run_target_bytes`, and `Block::seal` with its recount. The
+  flush-side `max_gap_ns` of the same run is the comparison.
+- `probe-binaries-t5-admission.sha256`: the executable. It was built before
+  a formatting-only change to the probe source.
