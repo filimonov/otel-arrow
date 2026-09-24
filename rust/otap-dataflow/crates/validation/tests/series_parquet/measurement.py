@@ -2640,7 +2640,15 @@ class Sampler:
 
 
 def _memory_terms(sample) -> dict:
-    """The measured memory terms of one sample, all in bytes."""
+    """The measured memory terms of one sample, all in bytes.
+
+    The heap term is the pipelines' `memory.usage`, which credits a free
+    only to the thread that allocated: a buffer a worker allocates and
+    another thread frees -- the local file store frees its write buffers on
+    the runtime's blocking pool -- is never subtracted, so there the counter
+    grows with every byte written. A family that reads jemalloc's own
+    totals reconciles with `allocator_band_residuals` instead.
+    """
     procfs = sample["procfs"]
     workers = sample["workers"].values()
     return {
@@ -2693,6 +2701,51 @@ def rss_residuals(samples, idle) -> list:
                 "residual_bytes": (terms["rss_bytes"] - reference["rss_bytes"])
                 - file_growth
                 - heap_growth,
+            }
+        )
+    return residuals
+
+
+def allocator_band_residuals(pairs) -> list:
+    """The unexplained RSS of allocator prints, each paired with an RSS read.
+
+    Each pair holds jemalloc's `allocated` and `resident` totals and the
+    process's smaps rollup read milliseconds after the print. The anonymous
+    growth since the first pair is the heap as RSS sees it, and two measured
+    totals bound it: at least the live heap, and at most what the allocator
+    holds resident -- the live heap, the freed pages it keeps and capacity
+    reserved but never touched. The residual is how far the growth lies
+    outside that band, signed, zero inside it.
+    """
+    residuals = []
+    if not pairs:
+        return residuals
+    reference = pairs[0]
+    for pair in pairs[1:]:
+        procfs, base = pair["procfs"], reference["procfs"]
+        file_growth = (procfs["smaps_rss_bytes"] - procfs["smaps_anonymous_bytes"]) - (
+            base["smaps_rss_bytes"] - base["smaps_anonymous_bytes"]
+        )
+        heap_growth = (procfs["smaps_rss_bytes"] - base["smaps_rss_bytes"]) - file_growth
+        lower = pair["jemalloc_allocated_bytes"] - reference["jemalloc_allocated_bytes"]
+        upper = pair["jemalloc_resident_bytes"] - reference["jemalloc_resident_bytes"]
+        if heap_growth > upper:
+            residual = heap_growth - upper
+        elif heap_growth < lower:
+            residual = heap_growth - lower
+        else:
+            residual = 0
+        residuals.append(
+            {
+                "monotonic_ns": pair["monotonic_ns"],
+                "rss_bytes": procfs["smaps_rss_bytes"],
+                "rss_growth_bytes": procfs["smaps_rss_bytes"] - base["smaps_rss_bytes"],
+                "file_growth_bytes": file_growth,
+                "heap_rss_growth_bytes": heap_growth,
+                "allocated_growth_bytes": lower,
+                "allocator_resident_growth_bytes": upper,
+                "heap_source": "jemalloc_band",
+                "residual_bytes": residual,
             }
         )
     return residuals

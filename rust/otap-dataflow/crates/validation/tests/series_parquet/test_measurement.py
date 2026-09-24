@@ -6308,6 +6308,62 @@ class CapacityContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ = Workload(series_scope="window")
 
+    @staticmethod
+    def memory_sample(t, pipeline_heap, rss=500 << 20):
+        """One telemetry sample with the given RSS and pipeline counter."""
+        return {
+            "monotonic_ns": t,
+            "procfs": {"smaps_rss_bytes": rss, "smaps_anonymous_bytes": rss - (50 << 20)},
+            "workers": {"w": {"gauges": {"memory.budget": 1, "memory.accounted": 70 << 20},
+                              "pipeline_memory_usage_bytes": pipeline_heap}},
+        }
+
+    @staticmethod
+    def allocator_pair(t, rss, resident, allocated):
+        """One allocator print paired with the RSS read after it."""
+        return {
+            "monotonic_ns": t,
+            "procfs": {"smaps_rss_bytes": rss, "smaps_anonymous_bytes": rss - (50 << 20)},
+            "jemalloc_resident_bytes": resident,
+            "jemalloc_allocated_bytes": allocated,
+            "jemalloc_allocated_peak_bytes": allocated,
+        }
+
+    # Scenario: the workers' `memory.usage` grows by 10 GB over a trial, as
+    # it does when the local store's blocking pool frees what a worker
+    # allocated, while the RSS the allocator's prints are paired with swings
+    # between its live heap and its resident total.
+    # Guarantees: the capacity residual is the allocator band and passes;
+    # the pipeline counter alone reads a 10 GB negative residual and fails;
+    # RSS beyond the allocator's resident total is a positive residual.
+    def test_the_residual_heap_term_is_the_allocator_band(self):
+        samples = [self.memory_sample(k * 10**9, (10 << 20) + k * (1 << 30))
+                   for k in range(11)]
+        pairs = [
+            self.allocator_pair(k * 10**9, (300 + 150 * (k % 2)) << 20,
+                                (230 + 200 * (k % 2)) << 20, (30 + 100 * (k % 2)) << 20)
+            for k in range(11)
+        ]
+        residuals, heap = capacity.trial_residuals(samples, samples[0], pairs)
+        self.assertEqual(heap["source"], "jemalloc_band")
+        self.assertEqual(heap["retention_peak_bytes"], 300 << 20)
+        self.assertTrue(all(r["residual_bytes"] == 0 for r in residuals))
+        self.assertEqual(
+            measurement.residual_check(residuals, 500 << 20)["status"],
+            measurement.STATUS_PASSED,
+        )
+        residuals, heap = capacity.trial_residuals(samples, samples[0])
+        self.assertEqual(heap["source"], "pipeline_memory_usage")
+        self.assertLess(min(r["residual_bytes"] for r in residuals), -(9 << 30))
+        self.assertEqual(
+            measurement.residual_check(residuals, 500 << 20)["status"],
+            measurement.STATUS_FAILED,
+        )
+        leaking = [self.allocator_pair(0, 300 << 20, 230 << 20, 30 << 20),
+                   self.allocator_pair(10**9, 900 << 20, 430 << 20, 230 << 20)]
+        residuals, _heap = capacity.trial_residuals(samples, samples[0], leaking)
+        self.assertEqual(residuals[0]["residual_bytes"], 400 << 20)
+
     # Scenario: the capacity subcommand is asked for without the long opt-in.
     # Guarantees: it is gated as a long measurement.
     def test_capacity_is_a_long_subcommand(self):

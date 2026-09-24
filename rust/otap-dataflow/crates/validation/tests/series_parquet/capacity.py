@@ -91,10 +91,16 @@ DEFAULT_INTERVAL_S = 15
 SHIPPED_RECEIVER_CAPACITY = 128
 RAISED_RECEIVER_CAPACITY = 4096
 
-# jemalloc's statistics print, coarse enough to cost nothing at the rates
-# measured here; only the default-window runs, which reach the highest block
-# fill, carry it.
-JEMALLOC_STATS_CONF = "stats_interval:268435456,stats_interval_opts:Jgmdablxeh"
+# jemalloc's statistics print after this many bytes of allocation. Its
+# `allocated` total is the heap term of the RSS reconciliation, so every
+# exporter trial carries it; the interval is coarse enough that the prints
+# cost nothing measurable, which a trial without them checks.
+JEMALLOC_STATS_INTERVAL_BYTES = 64 << 20
+# How often the allocator prints are looked for, and paired with the RSS.
+ALLOCATOR_TAIL_S = 0.005
+JEMALLOC_STATS_CONF = (
+    f"stats_interval:{JEMALLOC_STATS_INTERVAL_BYTES},stats_interval_opts:Jgmdablxeh"
+)
 
 RECORDS_PER_REQUEST = 1000
 
@@ -863,7 +869,67 @@ class CapacitySampler(measurement.Sampler):
         sample["load_average_1_5_15"] = measurement.load_average()
         sample["phase"] = self.phase
         sample["extras"] = telemetry_extras(document)
+        if self.pairs:
+            sample["allocator_latest"] = dict(self.pairs[-1])
         return sample
+
+    def watch_allocator(self, log_path):
+        """Pair every jemalloc statistics print with the RSS read after it.
+
+        The engine prints its allocator totals into its log after every
+        `JEMALLOC_STATS_INTERVAL_BYTES` of allocation. A thread of its own
+        reads the log every `ALLOCATOR_TAIL_S` and, on each new print, reads
+        the process's smaps rollup at once, so the allocator's resident total
+        and the RSS it is compared with are milliseconds apart.
+        """
+        try:
+            from . import memory
+        except ImportError:
+            import memory
+        self.allocator = memory.JemallocStats(log_path)
+        self.pairs = []
+        self._tail = threading.Thread(target=self._follow, name="allocator-tail",
+                                      daemon=True)
+        return self
+
+    def _follow(self):
+        while not self._stop.is_set():
+            try:
+                prints = self.allocator.poll()
+                if prints:
+                    procfs = measurement.procfs_process_sample(self.engine.pid)
+                    latest = prints[-1]
+                    self.pairs.append({
+                        "monotonic_ns": procfs["monotonic_ns"],
+                        "procfs": {key: procfs[key] for key in (
+                            "smaps_rss_bytes", "smaps_anonymous_bytes") if key in procfs},
+                        "jemalloc_resident_bytes": latest["resident_bytes"],
+                        "jemalloc_allocated_bytes": latest["allocated_bytes"],
+                        "jemalloc_allocated_peak_bytes": max(
+                            entry["allocated_bytes"] for entry in prints),
+                        "jemalloc_metadata_bytes": latest["metadata_bytes"],
+                        "prints_count": len(prints),
+                    })
+            except Exception as error:  # noqa: BLE001 - recorded, never a zero
+                self.errors.append({"monotonic_ns": time.monotonic_ns(),
+                                    "error": f"allocator tail: {error}"[:500]})
+            _ = self._stop.wait(ALLOCATOR_TAIL_S)
+
+    def start(self):
+        super().start()
+        if self._tail is not None:
+            self._tail.start()
+        return self
+
+    def stop(self):
+        super().stop()
+        if self._tail is not None and self._tail.is_alive():
+            self._tail.join(timeout=30)
+        return self
+
+    allocator = None
+    pairs = ()
+    _tail = None
 
 
 def extras_total(sample, name, label=None) -> float:
@@ -1091,6 +1157,38 @@ def jemalloc_peak(log_path) -> dict:
     return dict(peak, prints_count=len(stats))
 
 
+def trial_residuals(samples, idle, pairs=()) -> tuple:
+    """The RSS residuals of one trial and the heap term they used.
+
+    With allocator prints the ledger is the prints, each paired with the RSS
+    read right after it (`CapacitySampler.watch_allocator`), and the first
+    pair is the reference: `measurement.allocator_band_residuals`. A trial
+    without prints falls back to the pipeline counter from the idle
+    reference.
+    """
+    if idle is None:
+        return [], None
+    pairs = [pair for pair in pairs if "smaps_rss_bytes" in pair["procfs"]]
+    if pairs:
+        high = 0
+        for pair in pairs:
+            high = max(high, pair["jemalloc_allocated_peak_bytes"])
+            pair["allocated_high_water_bytes"] = high
+        return measurement.allocator_band_residuals(pairs), {
+            "source": "jemalloc_band",
+            "reference_monotonic_ns": pairs[0]["monotonic_ns"],
+            "pairs_count": len(pairs),
+            "stats_interval_bytes": JEMALLOC_STATS_INTERVAL_BYTES,
+            "tail_period_s": ALLOCATOR_TAIL_S,
+            "retention_peak_bytes": max(
+                pair["jemalloc_resident_bytes"] - pair["jemalloc_allocated_bytes"]
+                for pair in pairs),
+            "allocated_peak_bytes": high,
+            "resident_peak_bytes": max(pair["jemalloc_resident_bytes"] for pair in pairs),
+        }
+    return measurement.rss_residuals(samples, idle), {"source": "pipeline_memory_usage"}
+
+
 def memory_at_fill(samples, jemalloc) -> dict:
     """RSS, accounted and budget at the trial's highest block fill."""
     usable = [s for s in samples if s.get("extras")]
@@ -1145,8 +1243,11 @@ class CapacityPhase:
                 buffered=phase.buffered,
                 period_s=command.SAMPLE_PERIOD_S,
                 phase=phase.label,
-            )
+            ).watch_allocator(Path(phase.engine.log.name))
             phase.sampler.start()
+            # The residual is the trial's own (`trial_residuals`); the phase
+            # summary computes none, so it never mixes two heap terms.
+            phase.capacity_idle, phase.idle = phase.idle, None
             return snapshot
 
         phase.ready = ready
@@ -1528,6 +1629,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     store = plan["store"]
     samples = list(phase.sampler.samples)
     summary = phase.summary()
+    residuals, heap = trial_residuals(
+        samples, getattr(phase, "capacity_idle", None) if trial["topology"] != "noop" else None,
+        getattr(phase.sampler, "pairs", ()),
+    )
     stats = send_statistics(
         sends, window=window, rate=trial["rate"], records_per_request=rpr,
         wire_bytes_of=lambda index: pool.entry(index)[1],
@@ -1751,9 +1856,18 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         "rates": measured,
         "ledger_extend_s": ledger_s,
         "stored_rows_of_unsent_requests_count": stored_unsent,
-        "rss_residual_count": len(summary.get("residuals") or []),
+        "rss_residual_count": len(residuals),
+        "rss_heap_term": heap,
+        "rss_residual_range_bytes": [
+            min((r["residual_bytes"] for r in residuals), default=None),
+            max((r["residual_bytes"] for r in residuals), default=None),
+        ],
     }
-    result["observations"] = {"phase": {k: v for k, v in summary.items() if k != "residuals"}}
+    result["observations"] = {
+        "phase": {k: v for k, v in summary.items() if k != "residuals"},
+        "residuals": residuals[::PUBLISHED_SAMPLE_STRIDE],
+        "allocator_pairs": list(getattr(phase.sampler, "pairs", ()))[::PUBLISHED_SAMPLE_STRIDE],
+    }
     # Every sample decided the checks above; one a second is published.
     result["samples"] = [
         dict(measurement.compact_sample(sample), extras=sample.get("extras"))
@@ -1801,7 +1915,7 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     ))
     if trial["topology"] != "noop":
         peak = max((s["process_rss_bytes"] for s in samples), default=0)
-        checks.append(measurement.residual_check(summary.get("residuals") or [], peak))
+        checks.append(measurement.residual_check(residuals, peak))
     checks.append(measurement.check(
         "warmup_complete", measurement.CHECK_HARD,
         measurement.STATUS_PASSED if warm_ok else measurement.STATUS_FAILED,
@@ -1987,7 +2101,7 @@ def next_ordinal_factory(*directories):
 def make_trial(plan, *, workload_id=PRIMARY_WORKLOAD, rate, purpose,
                topology="strict", interval_s=SEARCH_INTERVAL_S, connections=SEARCH_CONNECTIONS,
                receiver_capacity=SHIPPED_RECEIVER_CAPACITY, upload_concurrency=2,
-               warmup_s=None, measure_s=MEASURE_S, jemalloc_stats=False) -> dict:
+               warmup_s=None, measure_s=MEASURE_S, jemalloc_stats=True) -> dict:
     """One trial's settings; the warm-up covers at least two windows."""
     if warmup_s is None:
         warmup_s = max(WARMUP_S, 2 * interval_s + 5)
@@ -2239,7 +2353,6 @@ def step_confirm_default_window(plan, state, output_dir, report_dir, cell, optio
         _ = execute(plan, state, make_trial(
             plan, rate=rate, purpose=f"default_window_upload{concurrency}",
             interval_s=DEFAULT_INTERVAL_S, upload_concurrency=concurrency,
-            jemalloc_stats=True,
         ), output_dir, report_dir, cell)
 
 
@@ -2605,6 +2718,8 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
         or measurement.environment_snapshot({"harness": os.getpid()}),
         "build": (first_child.get("environment") or {}).get("build"),
         "git": (first_child.get("environment") or {}).get("git"),
+        "malloc_conf": JEMALLOC_STATS_CONF,
+        "jemalloc_stats_interval_bytes": JEMALLOC_STATS_INTERVAL_BYTES,
     }
     summary = {}
     for cell in cells:
