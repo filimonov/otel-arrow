@@ -696,8 +696,8 @@ fn a_bare_cargo_bench_run_skips() -> Result<()> {
 // Scenario: merge fixtures from sealed logs and metrics blocks, and an extract
 // fixture from one-record logs requests.
 // Guarantees: the merge reports resident sort keys (nonzero, below the block's
-// pinned bytes, peak consistent with total), and a one-row request pins far
-// more values bytes than its row occupies.
+// pinned bytes, peak consistent with total), and a one-row request pins more
+// values bytes than its row occupies.
 fn memory_terms_are_reported(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     for input in fixture_inputs(root)? {
@@ -750,7 +750,7 @@ fn memory_terms_are_reported(root: &Path) -> Result<()> {
     ensure(
         number("requests") == 8
             && number("values_rows") == 8
-            && number("values_pinned_bytes") > 4 * number("values_logical_bytes")
+            && number("values_pinned_bytes") > number("values_logical_bytes")
             && number("capacity_overhead_bytes_per_request_median") > 0,
         format!("one-record requests: values capacity {capacity}"),
     )?;

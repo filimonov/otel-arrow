@@ -1707,11 +1707,11 @@ impl Stage {
     /// Record, per request, the values bytes extraction pins against the
     /// bytes the rows actually occupy.
     ///
-    /// A values builder starts with room for 1024 rows and the extracted
-    /// batch keeps that capacity, so a request of a few rows pins far more
-    /// than its rows. Both are Arrow buffer sizes: pinned is the deduplicated
-    /// capacity the block is charged, logical the used length of the same
-    /// buffers.
+    /// Values builders are sized from the request, but every Arrow buffer is
+    /// rounded up to its allocation granularity, so a request of a few rows
+    /// still pins more than its rows. Both are Arrow buffer sizes: pinned is
+    /// the deduplicated capacity the block is charged, logical the used
+    /// length of the same buffers.
     fn record_values_capacity(&mut self) -> Result<()> {
         let extracted = convert_extract(self.wire(), &self.cfg.lake)?;
         let mut requests = Vec::with_capacity(extracted.len());
