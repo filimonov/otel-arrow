@@ -52,6 +52,7 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt as _;
 use object_store::local::LocalFileSystem;
 use object_store::{ObjectStore, ObjectStoreExt as _};
+use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake::buffer::Block;
 use otel_arrow_dfe_series_lake::cache::SeriesCache;
@@ -164,6 +165,10 @@ pub struct TablePhases {
     pub build_ns: u128,
     /// Chunks produced.
     pub chunks: usize,
+    /// Rows of the largest chunk: the merge's rows per chunk.
+    pub max_chunk_rows: usize,
+    /// Pinned bytes of the largest chunk, against `sorting.merge_chunk_bytes`.
+    pub max_chunk_bytes: usize,
     /// The longest `MergeIter::next`: heap pops plus the interleave.
     pub max_next_ns: u128,
     /// The longest `ArrowWriter::write` of one chunk.
@@ -463,6 +468,7 @@ fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
         let mut writer =
             ArrowWriter::try_new(Vec::new(), schema, Some(writer_properties(zstd()).build()))?;
         let (mut chunks, mut rows) = (0usize, 0usize);
+        let (mut max_chunk_rows, mut max_chunk_bytes) = (0usize, 0usize);
         let (mut max_next, mut max_write, mut max_flush) =
             (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         loop {
@@ -470,6 +476,11 @@ fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
             let Some(chunk) = merged.next() else { break };
             let chunk = chunk?;
             max_next = max_next.max(started.elapsed());
+            max_chunk_rows = max_chunk_rows.max(chunk.num_rows());
+            max_chunk_bytes = max_chunk_bytes.max(record_batch_pinned_bytes(
+                &chunk,
+                &mut CountedAllocations::default(),
+            ));
             let started = Instant::now();
             writer.write(&chunk)?;
             max_write = max_write.max(started.elapsed());
@@ -491,6 +502,8 @@ fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
             runs: run_count,
             build_ns: build.as_nanos(),
             chunks,
+            max_chunk_rows,
+            max_chunk_bytes,
             max_next_ns: max_next.as_nanos(),
             max_write_ns: max_write.as_nanos(),
             max_flush_ns: max_flush.as_nanos(),
