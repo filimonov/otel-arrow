@@ -21,6 +21,7 @@ import mmap
 import multiprocessing
 import os
 from pathlib import Path
+import resource
 import shutil
 import struct
 import subprocess
@@ -180,13 +181,13 @@ def next_search_rate(trials, *, start=SEARCH_START_RECORDS_PER_S,
     from `start` while every trial was sustainable, up to `doubling` trials;
     then the bracket between the highest sustainable and the lowest
     unsustainable rate is bisected until its width is at most `width` of
-    the sustainable rate. A producer-limited trial ends the search: the
-    producer, not the engine, bounded it.
+    the sustainable rate. A producer-limited rate bounds the bisection from
+    above like an unsustainable one, since nothing above it can be offered,
+    but the decision then names a lower bound, never a maximum.
     """
-    if any(verdict == "producer_limited" for _rate, verdict in trials):
-        return None
     sustainable = [rate for rate, verdict in trials if verdict == "sustainable"]
-    unsustainable = [rate for rate, verdict in trials if verdict == "unsustainable"]
+    unsustainable = [rate for rate, verdict in trials
+                     if verdict in ("unsustainable", "producer_limited")]
     if not trials:
         return start
     if not unsustainable:
@@ -210,19 +211,23 @@ def search_decision(trials) -> dict:
     sustainable = [rate for rate, verdict in trials if verdict == "sustainable"]
     unsustainable = [rate for rate, verdict in trials if verdict == "unsustainable"]
     limited = [rate for rate, verdict in trials if verdict == "producer_limited"]
+    bounds = unsustainable + limited
+    ceiling = min(bounds) if bounds else None
     high = min(unsustainable) if unsustainable else None
-    below = [rate for rate in sustainable if high is None or rate < high]
+    below = [rate for rate in sustainable if ceiling is None or rate < ceiling]
     low = max(below) if below else None
+    producer_bound = ceiling is not None and ceiling in limited and ceiling not in unsustainable
     return {
         "sustainable_records_per_s": low,
         "unsustainable_records_per_s": high,
-        "bracketed": low is not None and high is not None,
+        "bracketed": low is not None and high is not None and not producer_bound,
         "bracket_width_ratio": (high - low) / low if low and high else None,
         "producer_limited_records_per_s": min(limited) if limited else None,
         # Rates measured both ways: the band where verdicts flip.
         "flip_rates_records_per_s": sorted(set(sustainable) & set(unsustainable)),
         "kind": (
-            "maximum" if low is not None and high is not None
+            "lower_bound_producer_limited" if low is not None and producer_bound
+            else "maximum" if low is not None and high is not None
             else "lower_bound" if low is not None else "none"
         ),
     }
@@ -580,6 +585,7 @@ def _sender_process(pipe, config):
         pipe.send({"ready": True, "pid": os.getpid(), "connections": len(channels)})
         start_ns = pipe.recv()["start_ns"]
         cpu_before = os.times()
+        faults_before = resource.getrusage(resource.RUSAGE_SELF).ru_majflt
         wake = threading.Event()
         interval_ns = config["interval_ns"]
         late_ns = int(PRODUCER_LATE_S * 1e9)
@@ -628,6 +634,8 @@ def _sender_process(pipe, config):
             "complete": finished.is_set(),
             "cpu_user_s": cpu_after.user - cpu_before.user,
             "cpu_system_s": cpu_after.system - cpu_before.system,
+            "major_faults_count": (
+                resource.getrusage(resource.RUSAGE_SELF).ru_majflt - faults_before),
             "connections": len(channels),
             "in_flight": config["in_flight"],
         }
@@ -713,8 +721,8 @@ class SenderFleet:
                         "behind", "outstanding_at_send"):
                 merged[key].extend(part[key])
             processes.append(
-                {key: part[key] for key in ("pid", "count", "complete", "cpu_user_s",
-                                            "cpu_system_s", "connections", "in_flight",
+                {key: part.get(key) for key in ("pid", "count", "complete", "cpu_user_s",
+                                            "cpu_system_s", "connections", "in_flight", "major_faults_count",
                                             "details", "schedule_end_ns")}
             )
         order = sorted(range(len(merged["indexes"])), key=lambda k: merged["indexes"][k])

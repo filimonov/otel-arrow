@@ -6258,16 +6258,22 @@ class CapacityContracts(unittest.TestCase):
         self.assertFalse(decision["bracketed"])
 
     # Scenario: a trial's producer fell behind with in-flight slots free.
-    # Guarantees: the search ends there and the trial is producer-limited,
-    # not an unsustainable bracket of the engine.
-    def test_a_producer_limited_trial_ends_the_search(self):
+    # Guarantees: the trial is producer-limited, the search bisects below
+    # it, and a search bounded there names a lower bound, never a maximum.
+    def test_a_producer_limited_trial_bounds_the_search(self):
         verdict = capacity.stability_verdict(
             offered=100_000, tail_durable=60_000, backlog_slope_records_per_s=10_000,
             late_unblocked_ratio=0.2, failed_requests=0, partial_requests=0,
         )
         self.assertEqual(verdict["verdict"], "producer_limited")
-        self.assertIsNone(capacity.next_search_rate([(1000, "sustainable"),
-                                                     (2000, "producer_limited")]))
+        trials = [(1000, "sustainable"), (2000, "producer_limited")]
+        self.assertEqual(capacity.next_search_rate(trials), 1500)
+        trials += [(1500, "sustainable"), (1750, "sustainable"), (1875, "sustainable")]
+        self.assertIsNone(capacity.next_search_rate(trials))
+        decision = capacity.search_decision(trials)
+        self.assertEqual(decision["kind"], "lower_bound_producer_limited")
+        self.assertFalse(decision["bracketed"])
+        self.assertEqual(decision["sustainable_records_per_s"], 1875)
 
     # Scenario: the receiver shed 6,219 requests as RESOURCE_EXHAUSTED while
     # 3% of the sends also started late with a slot free.

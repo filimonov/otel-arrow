@@ -250,8 +250,13 @@ owns its core likewise), each owning a share of the client connections
 connection) and sending prebuilt requests at monotonic target times, with
 in-flight requests bounded by the receivers' summed capacity. A send is
 never retried and never silently re-timed: its target, send and response
-instants are all kept, and a send that starts over 50 ms late with a slot
-free marks the trial `producer_limited`. Requests come from a pool built
+instants are all kept, and more than 1 percent of sends starting over 50
+ms late with a slot free marks the trial `producer_limited` (unless the
+engine refused a request, which makes it unsustainable). A producer-limited
+rate bounds the bisection from above, and a search bounded there reports
+`lower_bound_producer_limited`, never a maximum. Each sender reads its
+requests about 3 s ahead of their send and reports its major page faults.
+Requests come from a pool built
 once in segments (`/var/tmp/series-capacity-pools`); a request's bytes
 depend only on the workload and its index, so a larger trial extends the
 pool without rebuilding it. The ledger lives on tmpfs, keeps the pool
