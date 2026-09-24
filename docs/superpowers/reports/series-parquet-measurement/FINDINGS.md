@@ -792,6 +792,116 @@ percent to the changed code.
   (f003).
 - `campaign/reports/task-3i-report.md`.
 
+## Task 5: maximum sustainable throughput and durable write speed
+
+### Question
+
+How many records per second does the exporter sustain per core and on four
+cores, into each store, with the shipped configuration and with the receiver
+admission raised; what limits it; and what it takes to reach 1M records/s.
+
+### Method
+
+- Workload: 80/20 logs/metric points, 1 KiB bodies, 10k hot series, 1000
+  records per request, 256 connections, ZSTD. 15 s warm-up, 60 s measured,
+  bounded drain; 1 s windows for the searches, 15 s for the default-window
+  cells. A winner needs 3 of 3 sustainable trials; the bracket is at most 10
+  percent.
+- Sustainable: no receiver or exporter refusals, no backlog growth, every
+  acknowledged record stored exactly once. Buffered also needs a bounded WAL.
+- Producers: 8 Python sender processes on CPUs 8-15,24-31, one physical core
+  each, sending self-verifying template requests; calibrated to 4M/s against
+  a noop exporter. The engine keeps its explicit cores in 0-7,16-23.
+- Oracle: DuckDB aggregates per producer and signal (count, distinct, sum,
+  min and max of the record sequence against the acknowledged requests, a
+  200-record field-by-field sample), cross-checked with clickhouse-local.
+- Memory: the RSS residual takes its heap term as the band between jemalloc
+  `allocated` and `resident`; the engine's `pipeline.memory.usage` counter is
+  not used (see below).
+
+### Results: sustainable rate, thousands of records/s
+
+| Store | Workers | Shipped slots (128) | Raised slots (4096) | 15 s window | Buffered |
+| --- | --- | --- | --- | --- | --- |
+| local | 1 | 128 | 255 | | |
+| local | 4 | 288 | 684 (722 flips) | | 144 |
+| MinIO | 1 | 128 | 187 | 8.5 | |
+| MinIO | 4 | 240 | 448 | 28 | 152 |
+| RustFS | 1 | not run | 192 | | |
+| RustFS | 4 | 224 | 360 | | |
+
+Durable write speed at the ceiling: local 416 MB/s (684k), MinIO 273 MB/s
+(448k), RustFS 220 MB/s (360k).
+
+### What limits it
+
+- Shipped strict: receiver slots, not the exporter. A strict request holds
+  its slot until its block is durable, so throughput per worker is at most
+  slots x records per request / hold time. Confirmed: 128k per worker at a
+  1 s window, 8.5k at the shipped 15 s window (formula 8.53k). Above it the
+  receiver sheds with RESOURCE_EXHAUSTED while workers are 25-35 percent on
+  CPU and the exporter refuses nothing.
+- Raised strict: the exporter's CPU on the ingest core. The flush shares the
+  core with ingest; at 722-760k on four workers the hottest worker's flush
+  reaches the window, rotation waits and admission closes.
+- Buffered: the WAL's device. The buffer writes about twice the wire bytes
+  (WAL entry plus the finalized 32 MiB segment), syncs every 25 ms and
+  finalizes segments synchronously on the worker's runtime; on this host's
+  single NVMe, shared with the store, writes wait 12-50 ms and the worker
+  stalls. With the WAL on tmpfs it sustains at least 256k and fails at 384k.
+  Engine CPU per record is 5.9 us against 4.6 us strict.
+
+### Scaling and the 1M/s target
+
+- Four workers give 0.67 of four times one worker: 0.81 (CPU per record up
+  22 percent from L3 and memory-bandwidth contention on one CCD) x 0.82
+  (occupancy: per-window connection-hash imbalance saturates the hottest
+  worker first). Whole-process: 259k records per CPU-second at one worker,
+  213k at four.
+- 1M/s was not measured; the highest sustained rate is 684k on four worker
+  cores. The estimate from the four-worker figures is about six worker cores.
+
+### Other results
+
+- Fan-in (MinIO, four workers, 448k offered): one connection reaches 226k
+  and uses one worker; 8 connections 396k; 64 connections 439k and still fail
+  the backlog rule; 256 sustain 448k. Connections must well outnumber workers.
+- Ack latency, strict, 1 s window: p50 0.67 s, p99 1.17 s at 256k; 15 s
+  window: p50 8.4 s, p99 15.0 s. Buffered at 152k: freshness p50 0.72 s,
+  p99 1.36 s.
+- Upload concurrency 1 vs 2: no difference at any ceiling measured.
+- jemalloc stats prints (the memory method) cost at most about 6 percent.
+- High cardinality (a unique attribute per point): one series per point; the
+  series dataset reaches 66 percent of the values dataset and CPU per point
+  is 1.9 times the hot workload.
+- Alloy as producer: its reference batches (20,000 records, 7.96 MB) are all
+  refused by the shipped 4 MiB receiver decoding limit (OUT_OF_RANGE) and it
+  retries forever; with 16 MiB it sustains about 29.6k lines/s on one
+  connection, every line read back exactly once.
+
+### Findings for Task 12
+
+- The engine's `pipeline.memory.usage` credits frees only to the allocating
+  thread; buffers freed on the tokio blocking pool make it grow without bound
+  (10.3 GB against 550 MB RSS), buffers freed elsewhere give the other sign.
+- In-flight requests in the receiver are outside every memory budget: with
+  4096 slots per worker, 16.2 GB allocated against 3.4 GB exporter-accounted;
+  with 4096 slots and 8 MB requests the engine vanished without a log line.
+- The receiver's load-shed is not counted by
+  `receiver.otlp.requests.rejected`, and its message names a per-connection
+  limit although the limit is the worker's slots.
+- The reference Alloy config and the shipped decoding limit cannot work
+  together above about 4k lines/s.
+- The durable buffer exposes neither its WAL flush interval nor its segment
+  size and finalizes segments on the worker's runtime.
+
+### Evidence
+
+- `capacity-local-*.json`, `capacity-minio-*.json`, `capacity-rustfs-*.json`
+  (family indexes, re-judged in family 2) and their `capacity-*-r*.json`
+  children; superseded trials carry their reason.
+- `campaign/reports/task-5-report.md`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question
