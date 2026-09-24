@@ -93,10 +93,8 @@ pub(super) struct WorkerMetrics {
     /// the node is not taking requests from its input channel, 0 otherwise.
     ///
     /// Admission closes while a rotation waits for the flush slot, while a
-    /// request is parked, and when the completion credit is spent. A closed
-    /// gate is where a slow destination becomes backpressure, which the
-    /// receiver upstream reports as its own refusals rather than as anything
-    /// this node counts.
+    /// request is parked, and when the completion credit is spent; the
+    /// receiver upstream then reports the backpressure as its own refusals.
     #[metric(name = "admission.closed", unit = "{state}")]
     pub admission_closed: Gauge<u64>,
     /// Times admission went from open to closed.
@@ -333,10 +331,8 @@ pub(super) struct RepairedMetrics {
 
 /// One configured denormalized physical column.
 ///
-/// This is a registration attribute rather than a measurement one because the
-/// set of columns is fixed by configuration at startup, not by anything a
-/// request carries: one metric set is registered per configured column and no
-/// request can add another.
+/// A registration attribute: one metric set is registered per configured
+/// column at startup, and no request can add another.
 #[attribute_set(item, registration)]
 #[derive(Debug, Clone)]
 pub(super) struct ColumnAttrs {
@@ -548,11 +544,8 @@ mod tests {
         }
     }
 
-    /// Scenario: the unit-word check is given names in the guide's form and
-    /// names carrying a unit.
-    /// Guarantees: the check that every exporter metric passes below rejects
-    /// `_bytes`, `_seconds` and `_count` suffixes, so a unit can never slip
-    /// back into a name unnoticed.
+    /// Scenario: names in the metrics guide's form and names ending in a unit word.
+    /// Guarantees: `_bytes`, `_seconds` and `_count` suffixes are rejected.
     #[test]
     fn a_unit_in_a_metric_name_is_rejected() {
         for name in [
@@ -598,11 +591,8 @@ mod tests {
         assert_eq!(actual, labels);
     }
 
-    /// Scenario: every exporter metric set is registered and each closed label
-    /// bucket is touched.
-    /// Guarantees: exact descriptor/measurement names, units and label values
-    /// remain stable, and the only unbounded-looking label is a configured
-    /// column name.
+    /// Scenario: every exporter metric set is registered and each closed label bucket touched.
+    /// Guarantees: names, units and label values are exactly the documented ones.
     #[test]
     fn series_metric_schema_is_exact() {
         let (ctx, registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -833,12 +823,9 @@ mod tests {
         assert!(metrics.emitted.terminal_snapshots().is_empty());
     }
 
-    /// Scenario: one extraction reports drops of every unsupported kind, an
-    /// out-of-range timestamp, and mismatches for a configured and an
-    /// unconfigured column.
-    /// Guarantees: each kind lands in its own bucket, the configured column is
-    /// counted, and the unconfigured one is ignored rather than registering a
-    /// label the configuration never declared.
+    /// Scenario: one extraction reports every unsupported kind, an out-of-range timestamp and
+    /// mismatches for a configured and an unconfigured column.
+    /// Guarantees: each lands in its bucket and the unconfigured column registers no label.
     #[test]
     fn extraction_counters_stay_bounded_by_configuration() {
         let (ctx, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();

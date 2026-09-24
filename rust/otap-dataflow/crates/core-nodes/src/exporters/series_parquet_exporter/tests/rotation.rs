@@ -6,15 +6,10 @@
 
 use super::support::*;
 
-/// Scenario: a request joins the ACTIVE block of a fifteen-second window and
-/// the wall clock then steps back by an hour, far more than one interval,
-/// while the engine's monotonic clock keeps running.
-/// Guarantees: the block is still rotated within one interval of monotonic
-/// time since the window started, instead of waiting out the hour the wall
-/// clock now claims is left; the block that replaces it keeps the floored
-/// window start and re-emits its descriptors. A backward step therefore
-/// delays acknowledgements by at most one interval and never reopens or
-/// reorders a window.
+/// Scenario: a request in a 15s window, then the wall clock steps back an hour while monotonic time
+/// runs.
+/// Guarantees: the block rotates within one monotonic interval; its replacement keeps the floored
+/// start and re-emits descriptors.
 #[tokio::test(flavor = "current_thread")]
 async fn a_backward_clock_step_rotates_within_one_monotonic_interval() {
     use futures::FutureExt;
@@ -67,13 +62,9 @@ async fn a_backward_clock_step_rotates_within_one_monotonic_interval() {
         .await;
 }
 
-/// Scenario: a one-second window opened 600 ms into its interval, and the wall
-/// clock steps back by one and a half seconds -- just over one interval --
-/// right after, while monotonic time advances in 100 ms steps, so when the
-/// monotonic interval ends the wall clock is 900 ms short of the boundary.
-/// Guarantees: the window is rotated once one interval of monotonic time has
-/// passed, with its start floored, however small the step is, so no backward
-/// step of any size keeps a block open past one monotonic interval.
+/// Scenario: a 1s window opened 600 ms in, then a 1.5s backward step, so the monotonic interval
+/// ends 900 ms short of the boundary.
+/// Guarantees: the window rotates after one monotonic interval with its start floored.
 #[tokio::test(flavor = "current_thread")]
 async fn a_step_just_over_one_interval_rotates_within_one_monotonic_interval() {
     use futures::FutureExt;
@@ -106,14 +97,9 @@ async fn a_step_just_over_one_interval_rotates_within_one_monotonic_interval() {
     assert_eq!(window.clock.last_boundary(), 100_000);
 }
 
-/// Scenario: the wall clock runs half a second slow over one fifteen-second
-/// window, so the monotonic interval ends just before the wall clock reaches
-/// the boundary.
-/// Guarantees: the monotonic bound is strict: the window is rotated at the end
-/// of the monotonic interval with its start floored, and the ordinary
-/// boundary rotation follows once the wall clock arrives and moves the start
-/// forward. A slewing clock therefore costs at most one extra file set per
-/// window, never a block held open past one monotonic interval.
+/// Scenario: the wall clock runs half a second slow over a 15s window.
+/// Guarantees: a floored rotation at the monotonic bound, then the boundary rotation moves the
+/// start forward.
 #[tokio::test(flavor = "current_thread")]
 async fn wall_clock_drift_rotates_at_the_monotonic_bound_then_at_the_boundary() {
     use futures::FutureExt;
@@ -152,11 +138,8 @@ async fn wall_clock_drift_rotates_at_the_monotonic_bound_then_at_the_boundary() 
     assert_eq!(window.clock.last_boundary(), 100_005);
 }
 
-/// Scenario: a window boundary passes while the previous block is still being
-/// written and the ACTIVE block is empty.
-/// Guarantees: the empty block is replaced by one for the new window at once,
-/// without waiting for the flush slot, so admission stays open across the
-/// boundary instead of closing until an unrelated write finishes.
+/// Scenario: a boundary passes while a write holds the flush slot and the ACTIVE block is empty.
+/// Guarantees: the empty block is replaced at once and admission stays open.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
     tokio::task::LocalSet::new()
@@ -190,12 +173,8 @@ async fn an_empty_block_rotates_without_waiting_for_the_flush_slot() {
         .await;
 }
 
-/// Scenario: a boundary sleep fires after the wall clock has jumped forward
-/// past several windows, and afterwards the wall clock steps backwards.
-/// Guarantees: the missed windows coalesce into one rotation at the latest
-/// boundary, the sleep is re-armed for the window that follows it, and the
-/// backward step neither re-fires the boundary that was already consumed nor
-/// leaves the node without an armed sleep.
+/// Scenario: a boundary sleep fires after a jump past several windows, then the clock steps back.
+/// Guarantees: one rotation at the latest boundary, the sleep re-armed, no re-fire after the step.
 #[tokio::test(flavor = "current_thread")]
 async fn busy_rotation_rearms_boundary_sleep() {
     let sim = clock::SimClock::new();
@@ -227,11 +206,8 @@ async fn busy_rotation_rearms_boundary_sleep() {
     );
 }
 
-/// Scenario: two requests are extracted immediately before and immediately
-/// after a one-second window boundary.
-/// Guarantees: the earlier request stays in the ACTIVE block and does not
-/// seal it by itself, and the later one is parked for the next window with
-/// admission closed, so each request belongs to exactly one window.
+/// Scenario: two requests extracted just before and just after a 1s boundary.
+/// Guarantees: the first stays in the ACTIVE block, the second is parked for the next window.
 #[tokio::test(flavor = "current_thread")]
 async fn admission_time_assigns_exactly_one_window() {
     let (handler, _rx) = effects(8);
@@ -259,11 +235,8 @@ async fn admission_time_assigns_exactly_one_window() {
     assert!(!worker.accept());
 }
 
-/// Scenario: a request is extracted at exactly 1_000_000_000 ns, the first
-/// nanosecond of the second one-second window, after one extracted in the
-/// last nanosecond of the first.
-/// Guarantees: the boundary nanosecond belongs to the new window, not to the
-/// one it ends, so window assignment has no off-by-one at the boundary.
+/// Scenario: requests at the last nanosecond of a window and at the first of the next.
+/// Guarantees: the boundary nanosecond belongs to the new window.
 #[tokio::test(flavor = "current_thread")]
 async fn admission_at_the_exact_boundary_belongs_to_the_next_window() {
     let (handler, _rx) = effects(8);
@@ -292,14 +265,9 @@ async fn admission_at_the_exact_boundary_belongs_to_the_next_window() {
     );
 }
 
-/// Scenario: two window boundaries are crossed while the one flush slot is
-/// held by a write the test has parked. Nothing is parked and no block is
-/// full, so the boundary is the only thing that can ask for a rotation. The
-/// write is then released without the clock moving again.
-/// Guarantees: a boundary reached while the flush slot is busy is not lost,
-/// the rotation it asks for is served the moment the flush completes rather
-/// than at the next boundary, and two missed boundaries produce one rotation
-/// rather than two.
+/// Scenario: two boundaries are crossed while a parked write holds the flush slot; the write is
+/// then released without moving the clock.
+/// Guarantees: one rotation is served as soon as the flush completes.
 #[tokio::test(flavor = "current_thread")]
 async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
     tokio::task::LocalSet::new()
@@ -425,14 +393,10 @@ async fn a_boundary_crossed_while_flushing_rotates_when_the_flush_completes() {
         .await;
 }
 
-/// Scenario: a request is parked for a later window while the one flush slot
-/// is held by a write the test has parked, a newer request queues behind it,
-/// and control traffic arrives throughout. The write is then released without
-/// the clock moving again.
-/// Guarantees: the parked request enters the block the completed flush opens,
-/// ahead of the request that was queued behind it, which is not admitted
-/// while one is parked; control stays served while pdata admission is closed;
-/// and the flush that follows is a single rotation.
+/// Scenario: a request parked for a later window while a parked write holds the slot, a newer
+/// request behind it and control traffic throughout.
+/// Guarantees: the parked request enters the block the flush opens, ahead of the newer one; control
+/// stays served; one rotation.
 #[tokio::test(flavor = "current_thread")]
 async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
     tokio::task::LocalSet::new()
@@ -569,9 +533,7 @@ async fn a_parked_request_enters_the_block_the_finished_flush_opens() {
 }
 
 /// Scenario: a block reaches its request limit inside one window.
-/// Guarantees: the rotation is requested by the limit rather than by the
-/// window, so a burst is not held until the boundary, and admission closes
-/// until the block has been sealed.
+/// Guarantees: the limit requests the rotation and admission closes until the seal.
 #[tokio::test(flavor = "current_thread")]
 async fn the_request_limit_asks_for_a_rotation_within_a_window() {
     let (handler, _rx) = effects(8);
@@ -591,13 +553,10 @@ async fn the_request_limit_asks_for_a_rotation_within_a_window() {
     assert!(!worker.accept());
 }
 
-/// Scenario: a request-limited block rotates twice inside one window and then
-/// a later window opens a block in a different partition, with every flush
-/// completing durably.
-/// Guarantees: the flush trigger, the re-emission cause and the written
-/// dataset are labelled from what the worker actually did. The replacement
-/// block inside one window reports `rotation`, a block in a new partition
-/// reports `partition`, and an empty rotation is not counted as a flush.
+/// Scenario: a request-limited block rotates twice in one window, then a later window opens a new
+/// partition.
+/// Guarantees: flushes, `series.emitted` reasons (`rotation`, `partition`) and datasets are
+/// labelled as they happened; an empty rotation is no flush.
 #[tokio::test(flavor = "current_thread")]
 async fn rotation_causes_and_flush_reasons_are_labelled() {
     tokio::task::LocalSet::new()
@@ -680,10 +639,8 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
             worker.sample_metrics();
             let metrics = worker.metrics.as_mut().expect("metrics");
             assert_eq!(metrics.worker.acks.get(), 3);
-            // Three real writes, each sealed by the one-request limit. The
-            // empty rotation the parked request forced is not one of them,
-            // and the block that took the parked request was still sealed by
-            // the limit rather than by its window.
+            // Three real writes, each sealed by the one-request limit; the
+            // empty rotation the parked request forced is not one of them.
             for (reason, expected) in [
                 (FlushReason::Requests, 3),
                 (FlushReason::Time, 0),
@@ -708,12 +665,8 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
         .await;
 }
 
-/// Scenario: two logs requests share the ACTIVE block, and sealing it fails
-/// because the logs values sort names a column the dataset does not have.
-/// Guarantees: the block is not written, and both co-tenants are nacked as
-/// retryable `internal` failures with the internal-error sentence rather than
-/// as storage failures, because the seal is in-memory work that never touched
-/// storage.
+/// Scenario: two logs requests share a block whose seal fails (the sort names a missing column).
+/// Guarantees: nothing is written and both are nacked as retryable `internal` failures.
 #[tokio::test(flavor = "current_thread")]
 async fn a_seal_failure_nacks_every_co_tenant_as_internal() {
     let (handler, mut rx) = effects(4);
@@ -761,11 +714,8 @@ async fn a_seal_failure_nacks_every_co_tenant_as_internal() {
     assert_no_more_completions(&mut rx);
 }
 
-/// Scenario: a block asks for a rotation because it filled its request budget,
-/// and the window boundary fires before that rotation has been served.
-/// Guarantees: the flush is reported as time-triggered, because that is what
-/// sealed it. A threshold that never got to rotate must not leave its reason
-/// behind for every boundary flush that follows.
+/// Scenario: a request-limit rotation is still owed when the boundary fires.
+/// Guarantees: the flush is reported as time-triggered.
 #[tokio::test(flavor = "current_thread")]
 async fn a_boundary_rotation_is_not_reported_under_a_stale_threshold_reason() {
     tokio::task::LocalSet::new()
@@ -787,8 +737,8 @@ async fn a_boundary_rotation_is_not_reported_under_a_stale_threshold_reason() {
             assert_eq!(worker.reason, FlushReason::Requests);
             assert!(worker.rotation_requested);
 
-            // The one-second window ends before the requested rotation has
-            // been served, so the boundary is what actually seals the block.
+            // The one-second window ends before the requested rotation is
+            // served, so the boundary seals the block.
             wall.set(2_000_000_000);
             worker.wake_window();
             assert_eq!(worker.reason, FlushReason::Time);

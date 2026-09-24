@@ -6,12 +6,9 @@
 
 use super::support::*;
 
-/// Scenario: a request is admitted, rotated into a real in-memory object store
-/// flush, and completed.
-/// Guarantees: no completion is emitted before the flush resolved, both files
-/// exist in the store by the time the ack is queued, and only a completed
-/// flush marks the descriptor committed in the cache under the flushed
-/// block's partition.
+/// Scenario: a request is admitted, rotated into an in-memory store flush, and completed.
+/// Guarantees: both files exist before the ack is queued, and only then is the descriptor committed
+/// under the block's partition.
 #[tokio::test(flavor = "current_thread")]
 async fn complete_files_before_ack() {
     tokio::task::LocalSet::new()
@@ -73,11 +70,9 @@ async fn complete_files_before_ack() {
         .await;
 }
 
-/// Scenario: the series file is written, the first values file write fails,
-/// and the store heals before the retry.
-/// Guarantees: the retry re-uses the frozen file names and byte-identical
-/// objects, the block is acknowledged exactly once, and the retry is counted
-/// without counting a flush failure.
+/// Scenario: the first values write fails and the store heals before the retry.
+/// Guarantees: the retry rewrites the same names with identical bytes; one ack, one retry, no flush
+/// failure.
 #[tokio::test(flavor = "current_thread")]
 async fn values_retry_reuses_paths_and_bytes() {
     tokio::task::LocalSet::new()
@@ -139,10 +134,9 @@ async fn values_retry_reuses_paths_and_bytes() {
         .await;
 }
 
-/// Scenario: the series file write fails until the absolute retry deadline,
-/// and a request carrying the same descriptor arrives afterwards.
-/// Guarantees: the failed block nacks retryably without marking the cache, and
-/// the next block writes that descriptor again.
+/// Scenario: the series write fails until the deadline, then the same descriptor arrives again.
+/// Guarantees: the block nacks retryably without marking the cache, and the next block rewrites the
+/// descriptor.
 #[tokio::test(flavor = "current_thread")]
 async fn failed_descriptor_does_not_poison_cache() {
     tokio::task::LocalSet::new()
@@ -211,11 +205,10 @@ async fn failed_descriptor_does_not_poison_cache() {
         .await;
 }
 
-/// Scenario: a flush parked across an hour boundary is joined by the same
-/// series in a later partition, and the cache evicts that series before the
-/// flush resolves.
-/// Guarantees: the commit names the flushed block's own partition, and it
-/// cannot retract the descriptor the next partition still owes.
+/// Scenario: a flush parked across an hour boundary, the same series in the next partition, and an
+/// eviction before the flush resolves.
+/// Guarantees: the commit names the flushed block's partition and leaves the next one's descriptor
+/// owed.
 #[tokio::test(flavor = "current_thread")]
 async fn overlapping_series_and_eviction_preserve_partition_coverage() {
     tokio::task::LocalSet::new()
@@ -279,10 +272,9 @@ async fn overlapping_series_and_eviction_preserve_partition_coverage() {
         .await;
 }
 
-/// Scenario: the same series is admitted to the ACTIVE block while the
-/// FLUSHING block carrying it is parked in the same window.
-/// Guarantees: both blocks keep their own descriptor copy, and the flushed
-/// block's commit cannot retract the copy the ACTIVE block still owes.
+/// Scenario: the same series joins the ACTIVE block while the FLUSHING block carrying it is parked
+/// in the same window.
+/// Guarantees: both blocks keep their own descriptor copy.
 #[tokio::test(flavor = "current_thread")]
 async fn same_window_overlap_keeps_both_descriptors() {
     tokio::task::LocalSet::new()
@@ -360,11 +352,9 @@ async fn same_window_overlap_keeps_both_descriptors() {
         .await;
 }
 
-/// Scenario: a write is parked in the store when its absolute retry deadline
-/// expires, while cleanup is allowed a whole second.
-/// Guarantees: the retryable decision is published at the deadline rather than
-/// after the cleanup allowance, and the FLUSHING slot stays occupied by the
-/// cleanup until it has finished.
+/// Scenario: a parked write reaches its retry deadline with a one-second cleanup allowance.
+/// Guarantees: the retryable decision is published at the deadline and the slot stays taken until
+/// the cleanup ends.
 #[tokio::test(flavor = "current_thread")]
 async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
     tokio::task::LocalSet::new()
@@ -426,13 +416,9 @@ async fn retry_deadline_publishes_before_cleanup_and_reserves_slot() {
         .await;
 }
 
-/// Scenario: the one write of a flush never returns, so the block's retry
-/// deadline expires while that first attempt is still in flight.
-/// Guarantees: the flush ends as a distinct deadline outcome rather than as a
-/// cancellation -- the cancellation counter stays at zero -- and every request
-/// of the block is nacked retryably with a reason that says the deadline
-/// expired with no attempt returned, so a storage hang is never reported as a
-/// shutdown or as an unexplained failure.
+/// Scenario: the one write of a flush never returns.
+/// Guarantees: a deadline outcome, not a cancellation, and every request nacked retryably with a
+/// reason saying no attempt returned.
 #[tokio::test(flavor = "current_thread")]
 async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
     tokio::task::LocalSet::new()
@@ -502,16 +488,9 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
         .await;
 }
 
-/// Scenario: every write fails, but only after twenty seconds -- the shape of
-/// a cloud store retrying one request internally until its own
-/// `retry_timeout` -- under a sixty-second flush deadline.
-/// Guarantees: the flush retries the block until the deadline, counts every
-/// attempt in `flush.retries`, and nacks the block retryably with the fixed
-/// sentence classifying the store as unavailable, while the
-/// `series_parquet.flush.failed` ERROR carries the destination's last error,
-/// so an outage is visible with its cause rather than as a bare "cancelled"
-/// with zero retries. Each of the two attempts that returned is logged at
-/// WARN as retryable with its attempt number and the store's error.
+/// Scenario: every write fails after 20s, like a store retrying internally, under a 60s deadline.
+/// Guarantees: retries until the deadline, each attempt counted and logged at WARN, the fixed
+/// `unavailable` nack, and the last error in `series_parquet.flush.failed`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
     let events = capture();
@@ -653,11 +632,8 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
     }
 }
 
-/// Scenario: every write fails after twenty seconds under a sixty-second
-/// flush deadline, and telemetry is sampled while the second attempt is still
-/// in flight, before the flush has resolved.
-/// Guarantees: `flush.retries` already reads 1, so an outage in progress
-/// shows its retries instead of zero until the deadline.
+/// Scenario: telemetry sampled while the second of two slow failing attempts is in flight.
+/// Guarantees: `flush.retries` already reads 1.
 #[tokio::test(flavor = "current_thread")]
 async fn a_retry_is_counted_when_it_starts() {
     tokio::task::LocalSet::new()
@@ -711,9 +687,8 @@ async fn a_retry_is_counted_when_it_starts() {
         .await;
 }
 
-/// Scenario: an encoding bug and a storage I/O error arrive as the same lake
-/// error type.
-/// Guarantees: only a failure with a storage origin earns whole-block retries.
+/// Scenario: an encoding bug and a storage I/O error as the same lake error type.
+/// Guarantees: only the storage failure is retried.
 #[test]
 fn retry_classifier_distinguishes_encoding_from_storage() {
     assert!(!lake::Error::is_retryable(&lake::Error::from(
@@ -755,13 +730,9 @@ fn retry_classifier_distinguishes_encoding_from_storage() {
     )));
 }
 
-/// Scenario: every write is refused as `PermissionDenied` under a
-/// sixty-second flush deadline.
-/// Guarantees: the block fails on its first attempt instead of being retried
-/// until the deadline, so refused credentials are reported at once rather
-/// than a minute later as a deadline expiry; the producer is told the fixed
-/// sentence classifying the write as rejected by the store, without the
-/// store's error text or the object path.
+/// Scenario: every write is refused as `PermissionDenied` under a 60s deadline.
+/// Guarantees: the block fails on its first attempt with the fixed `rejected by the store` sentence
+/// and no store text.
 #[tokio::test(flavor = "current_thread")]
 async fn a_permission_error_is_not_retried_until_the_deadline() {
     tokio::task::LocalSet::new()
@@ -809,12 +780,8 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
         .await;
 }
 
-/// Scenario: a write attempt fails with an error no retry can cure, so the
-/// flush ends on that first attempt.
-/// Guarantees: the failed attempt still goes through the per-attempt WARN
-/// (`series_parquet.flush.attempt_failed`) with its attempt number and the
-/// store's error, exactly as a retried failure does, so every failed attempt
-/// leaves a per-attempt trace and not only the block-level ERROR.
+/// Scenario: a first attempt fails with an error no retry can cure.
+/// Guarantees: it is logged by the per-attempt WARN with its attempt number and error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
     let events = capture();
@@ -855,11 +822,8 @@ async fn a_non_retryable_failed_attempt_is_logged_at_warn() {
     );
 }
 
-/// Scenario: the last object of a block is written in the same engine-clock
-/// step in which the block's retry deadline expires, so the write result and
-/// the deadline are both ready when the flush task is next polled.
-/// Guarantees: the flush reports the success, not a deadline expiry, so a
-/// block whose files exist is acknowledged rather than nacked and resent.
+/// Scenario: the last object is written in the engine-clock step in which the deadline expires.
+/// Guarantees: the flush reports success and the block is acknowledged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
     tokio::task::LocalSet::new()
@@ -900,15 +864,9 @@ async fn a_write_finishing_as_the_deadline_expires_is_a_success() {
         .await;
 }
 
-/// Scenario: a values multipart upload is initiated and then wedges, its parts
-/// never landing and its abort never returning, while the block's absolute
-/// retry deadline expires.
-/// Guarantees: the retryable decision is published at the deadline, the
-/// FLUSHING slot stays occupied until the cleanup ends, the cleanup does end
-/// once the abort allowance elapses, and no completed values object is left in
-/// the store. The failed abort is reported: one `series_parquet.flush.cleanup`
-/// WARN with the block's sequence, file, attempt and abort error, and
-/// `flush.abort_failures` reads 1.
+/// Scenario: a values multipart upload wedges, parts and abort never returning, until the deadline.
+/// Guarantees: the decision is published at the deadline, the cleanup ends at its allowance, no
+/// object is left, and one `abort_failed` cleanup WARN is counted.
 #[tokio::test(flavor = "current_thread")]
 async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
     let events = capture();
@@ -923,16 +881,11 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_millis(20);
             cfg.lake.upload.abort_timeout = Duration::from_secs(1);
-            // Set past validation on purpose. The S3 minimum part size puts a
-            // real multipart upload out of reach of any block a unit test can
-            // encode in milliseconds; a small buffer capacity reaches the same
-            // `put_multipart_opts`, `put_part` and `abort` calls at a block
-            // size that costs nothing to build. The small row group is what
-            // makes the writer push parts while it is still writing, and the
-            // small merge chunk keeps it writing chunk after chunk, so it is
-            // still blocked on the wedged part -- in the phase where an abort
-            // is attempted -- when the deadline expires, even though the flush
-            // polls the write once more before it looks at the deadline.
+            // Set past validation: a small part size reaches the multipart
+            // calls with a cheap block, the small row group makes the writer
+            // push parts while writing, and the small merge chunk keeps it
+            // blocked on the wedged part, where an abort is attempted, when
+            // the deadline expires.
             cfg.lake.upload.part_bytes = 4096;
             cfg.lake.upload.concurrency = 1;
             cfg.lake.parquet.row_group_bytes = 4096;
@@ -1046,19 +999,10 @@ fn cleanup_trace(
     (trace, shared, paths)
 }
 
-/// Scenario: the cleanup of a failed block is reported for every way it can
-/// end: the write completed anyway; it was cancelled with no object, with
-/// one of the two objects, and with both objects in the store; its abort
-/// timed out inside the sink; its abort failed after a write error; it did
-/// not unwind by the cleanup cutoff; and the probe itself could not finish
-/// by the cutoff.
-/// Guarantees: a completed write and a cancellation that left every object
-/// are INFO `outcome=late_commit` and count in `flush.late_commits`; no
-/// object is DEBUG `aborted`; one object is INFO `partial` with the count;
-/// the three abort failures are WARN `abort_failed` with their abort error
-/// and count in `flush.abort_failures`; an unfinished probe is WARN
-/// `unknown` and counts nothing. Every event names the block's sequence,
-/// attempt and file.
+/// Scenario: every way a failed block's cleanup can end: completed anyway, cancelled with none, one
+/// or both objects present, abort timed out, abort failed, not unwound, probe unfinished.
+/// Guarantees: each outcome gets its level (`late_commit`, `aborted`, `partial`, `abort_failed`,
+/// `unknown`) and counter, with sequence, attempt and file.
 #[tokio::test(flavor = "current_thread")]
 async fn every_cleanup_outcome_is_logged_and_counted() {
     let events = capture();
@@ -1169,14 +1113,8 @@ async fn every_cleanup_outcome_is_logged_and_counted() {
     }
 }
 
-/// Scenario: a values multipart upload whose CompleteMultipartUpload lands in
-/// the store and whose response is then lost (the call never returns), so
-/// the flush's retry deadline expires with the upload finalized, through the
-/// real sink.
-/// Guarantees: the block is nacked as retryable storage, and the cleanup
-/// probes the frozen objects, finds both, and reports a late commit: one INFO
-/// `series_parquet.flush.cleanup` with `outcome=late_commit` naming the file,
-/// and `flush.late_commits` reads 1 while `flush.abort_failures` reads 0.
+/// Scenario: a multipart upload completes at the store and its response is lost until the deadline.
+/// Guarantees: a retryable storage nack and one `late_commit` cleanup; `flush.late_commits` is 1.
 #[tokio::test(flavor = "current_thread")]
 async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
     let events = capture();
@@ -1249,14 +1187,9 @@ async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
     );
 }
 
-/// Scenario: a values multipart upload whose CompleteMultipartUpload lands in
-/// the store and then fails with a retryable store error in place of its
-/// response, through the real sink; the flush waits to retry, and its retry
-/// deadline expires during that backoff.
-/// Guarantees: the flush ends as a deadline expiry carrying the store's
-/// error after one attempt, and the cleanup still probes the frozen
-/// objects: one INFO `series_parquet.flush.cleanup` with
-/// `outcome=late_commit`, and `flush.late_commits` reads 1.
+/// Scenario: a completed multipart upload answers with a retryable error, and the deadline expires
+/// during the backoff.
+/// Guarantees: a deadline expiry carrying the store's error, and one `late_commit` cleanup.
 #[tokio::test(flavor = "current_thread")]
 async fn a_completed_upload_that_errors_is_a_late_commit_when_the_deadline_ends_the_backoff() {
     let events = capture();
@@ -1334,12 +1267,9 @@ async fn a_completed_upload_that_errors_is_a_late_commit_when_the_deadline_ends_
     );
 }
 
-/// Scenario: one request is admitted, its block is written to an in-memory
-/// store on the first attempt, and the worker completes it.
-/// Guarantees: the commit is logged once as `series_parquet.block.committed`
-/// carrying the block's window start, its sequence, the path of its first
-/// object and the attempt count, so an operator can go from a log line to
-/// the files it wrote.
+/// Scenario: one block written on its first attempt.
+/// Guarantees: `series_parquet.block.committed` carries window start, sequence, first path and
+/// attempts.
 #[tokio::test(flavor = "current_thread")]
 async fn a_committed_block_names_its_window_sequence_and_path() {
     let events = capture();

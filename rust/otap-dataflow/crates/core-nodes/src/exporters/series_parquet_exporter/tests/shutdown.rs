@@ -6,16 +6,10 @@
 
 use super::support::*;
 
-/// Scenario: two requests are buffered and a third is sent after the node has
-/// already latched shutdown and refused the first two, with the upstream
-/// sender still alive throughout.
-/// Guarantees: every one of them is decided with a retryable `NodeShutdown`
-/// nack and the node returns its terminal state only after the upstream
-/// channel closes, so a node that has latched shutdown never returns while
-/// requests it could still be handed are outstanding; and the node ends with
-/// one `series_parquet.shutdown.complete` event summarizing that none was
-/// admitted, all three were nacked, none was left to the deadline, and the
-/// deadline was not reached.
+/// Scenario: two buffered requests and a third sent after shutdown latched, the sender alive
+/// throughout.
+/// Guarantees: each gets a retryable `NodeShutdown` nack, the node returns only after the channel
+/// closes, and `series_parquet.shutdown.complete` reports 0 admitted, 3 nacked.
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_decides_every_force_drained_request() {
     let events = capture();
@@ -66,18 +60,16 @@ async fn shutdown_decides_every_force_drained_request() {
                 expect_shutdown_nack(&mut rx).await;
             }
 
-            // The node has refused everything it was handed and is idle, but
-            // the sender is still alive, so this request must still be
-            // decided rather than dropped with the inbox.
+            // The node is idle, but the sender is still alive, so this request
+            // must still be decided.
             pdata_tx
                 .send_async(logs_pdata())
                 .await
                 .expect("a late request enqueues");
             expect_shutdown_nack(&mut rx).await;
 
-            // Closing the upstream pdata channel is what releases the latched
-            // shutdown; the control sender stays alive, as it does in the
-            // engine.
+            // Closing the upstream pdata channel releases the latched
+            // shutdown; the control sender stays alive, as in the engine.
             drop(pdata_tx);
             let terminal = tokio::time::timeout(Duration::from_secs(5), node)
                 .await
@@ -115,10 +107,9 @@ async fn shutdown_decides_every_force_drained_request() {
         .await;
 }
 
-/// Scenario: the shutdown deadline elapses while a flush is still outstanding.
-/// Guarantees: the write is cancelled and every completion the worker still
-/// owns is delivered as a retryable `NodeShutdown` nack, so a request is never
-/// dropped undecided along with the worker.
+/// Scenario: the shutdown deadline elapses while a flush is outstanding.
+/// Guarantees: the write is cancelled and every held completion gets a retryable `NodeShutdown`
+/// nack.
 #[tokio::test(flavor = "current_thread")]
 async fn the_deadline_decides_every_outstanding_request() {
     tokio::task::LocalSet::new()
@@ -150,12 +141,9 @@ async fn the_deadline_decides_every_outstanding_request() {
         .await;
 }
 
-/// Scenario: the shutdown deadline elapses while a values multipart upload is
-/// wedged, so the abort its cancellation triggers never returns.
-/// Guarantees: every request is decided and delivered before any waiting, and
-/// the terminal return happens only once the supervising task has been
-/// released -- within `upload.abort_timeout`, ended by an abort of the task
-/// that is itself awaited.
+/// Scenario: the deadline elapses while a multipart upload is wedged and its abort never returns.
+/// Guarantees: every request is decided before any wait, and the node returns once the task is
+/// released within `upload.abort_timeout`.
 #[tokio::test(flavor = "current_thread")]
 async fn the_deadline_returns_only_once_the_flush_task_is_released() {
     tokio::task::LocalSet::new()
@@ -245,11 +233,9 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
         .await;
 }
 
-/// Scenario: the inbox already holds buffered pdata when a Shutdown is
-/// latched, so the request is force-drained past a closed admission gate.
-/// Guarantees: the forced message exposes the latched deadline before the
-/// Shutdown control message is released, and the request is refused with a
-/// retryable `NodeShutdown` nack that is never counted as a delivery failure.
+/// Scenario: buffered pdata is force-drained after a Shutdown latches.
+/// Guarantees: it sees the latched deadline and gets a retryable `NodeShutdown` nack, not a
+/// delivery failure.
 #[tokio::test(flavor = "current_thread")]
 async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
     tokio::task::LocalSet::new()
@@ -302,11 +288,10 @@ async fn forced_pdata_exposes_shutdown_and_is_retryably_nacked() {
         .await;
 }
 
-/// Scenario: the shutdown deadline elapses with a parked write holding the
-/// FLUSHING slot, a populated ACTIVE block and one parked request.
-/// Guarantees: the parked request is nacked the moment shutdown is latched,
-/// every remaining uncommitted token of both blocks is nacked at the deadline,
-/// and the worker is left holding nothing.
+/// Scenario: the deadline elapses with a parked write, a populated ACTIVE block and a parked
+/// request.
+/// Guarantees: the parked request is nacked at the latch, both blocks at the deadline; nothing is
+/// left.
 #[tokio::test(flavor = "current_thread")]
 async fn deadline_nacks_both_blocks_and_pending() {
     tokio::task::LocalSet::new()
@@ -371,11 +356,8 @@ async fn deadline_nacks_both_blocks_and_pending() {
         .await;
 }
 
-/// Scenario: shutdown is latched with one block already flushing and a second
-/// block open, and storage recovers well before the deadline.
-/// Guarantees: the node finishes the outstanding FLUSHING block, then rotates
-/// and flushes the ACTIVE one, both requests are acknowledged only after their
-/// files exist, and nothing is nacked.
+/// Scenario: shutdown latches with one block flushing and one open, and storage recovers early.
+/// Guarantees: both blocks are written and acknowledged; nothing is nacked.
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_commits_both_blocks_before_deadline() {
     tokio::task::LocalSet::new()
@@ -412,9 +394,9 @@ async fn shutdown_commits_both_blocks_before_deadline() {
                 .await
                 .expect("the request of the second block enqueues");
             // The inbox serves control before pdata, so the shutdown below
-            // would force-drain the fifth request rather than let it be
-            // admitted. The marker is behind it in the same pdata channel, so
-            // its completion proves the fifth request is already in a block.
+            // would force-drain the fifth request; the marker behind it in the
+            // same channel proves by its completion that the fifth is in a
+            // block.
             marker(&pdata_tx, &mut rx, 99).await;
 
             control_tx
@@ -424,8 +406,8 @@ async fn shutdown_commits_both_blocks_before_deadline() {
                 })
                 .await
                 .expect("the shutdown enqueues");
-            // Releasing the latched Shutdown is what closing the upstream
-            // pdata channel does, exactly as the engine does it.
+            // Closing the upstream pdata channel releases the latched
+            // Shutdown, as in the engine.
             drop(pdata_tx);
             // Storage heals, so both blocks can reach object storage inside
             // the deadline.
@@ -562,14 +544,10 @@ async fn completions_until(
     got
 }
 
-/// Scenario: the first block's store fails for 23 s, long enough for its
-/// retry backoff to have grown to ten seconds, while a second block waits
-/// ACTIVE; a terminate then grants a 60 s grace, and the store heals 32 s into
-/// it, before the first block's own retry deadline.
-/// Guarantees: once shutdown latches the backoff drops to its minimum, so the
-/// first block is retried and written right after the store heals, the
-/// ACTIVE block is then sealed and written without waiting for its window,
-/// and all five requests are acknowledged before the grace ends.
+/// Scenario: the store fails for 23 s (backoff at 10 s) with a second block ACTIVE; a terminate
+/// grants 60 s and the store heals 32 s into it.
+/// Guarantees: the backoff drops to its minimum, both blocks are written, and all five requests are
+/// acknowledged before the deadline.
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
     tokio::task::LocalSet::new()
@@ -607,11 +585,9 @@ async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
         .await;
 }
 
-/// Scenario: the same two blocks, but the store never heals and the grace,
-/// 30 s, ends before the first block's own retry deadline.
-/// Guarantees: every request of both blocks is nacked as a retryable
-/// `NodeShutdown` at the latched deadline, not before it, and no write reaches
-/// the store at or after the deadline.
+/// Scenario: the same two blocks; the store never heals and the 30 s deadline comes first.
+/// Guarantees: every request is nacked `NodeShutdown` at the deadline, and no write starts at or
+/// after it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
     tokio::task::LocalSet::new()
@@ -683,12 +659,9 @@ fn acked_ids(got: Vec<(std::time::Instant, PipelineCompletionMsg<OtapPdata>)>) -
     ids
 }
 
-/// Scenario: the first block's store fails fast on every write, a terminate
-/// grants 30 s, and the store heals 300 ms before the deadline.
-/// Guarantees: attempts keep starting up to the deadline at the minimum
-/// backoff, so the attempt started after the heal commits the first block, the
-/// ACTIVE block is then sealed and written, and all five requests are
-/// acknowledged before the deadline.
+/// Scenario: every write fails fast; a terminate grants 30 s and the store heals 300 ms before the
+/// deadline.
+/// Guarantees: attempts keep starting until the deadline, and all five requests are acknowledged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_heals_just_before_the_deadline_still_commits() {
     tokio::task::LocalSet::new()
@@ -724,12 +697,8 @@ async fn a_store_that_heals_just_before_the_deadline_still_commits() {
         .await;
 }
 
-/// Scenario: a terminate granting 30 s latches one second into the first
-/// block's first attempt, which takes 20 s to fail; the store is healed while
-/// that attempt is still running.
-/// Guarantees: a slow earlier failure does not stop later attempts: the first
-/// block's retry and then the ACTIVE block's first attempt both start before
-/// the deadline and commit, so all five requests are acknowledged.
+/// Scenario: a 30 s terminate latches during a 20 s failing attempt; the store heals meanwhile.
+/// Guarantees: the retry and the ACTIVE block's attempt both start before the deadline and commit.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slow_failure_does_not_stop_the_attempts_after_it() {
     tokio::task::LocalSet::new()
@@ -819,11 +788,8 @@ async fn still_pending<F: Future + Unpin>(future: &mut F) -> bool {
     true
 }
 
-/// Scenario: the flush task observes its expiry 5 s after the latched
-/// deadline, while the upload it cancels never finishes aborting.
-/// Guarantees: the task still releases the write at the latched deadline plus
-/// `upload.abort_timeout`, an absolute cutoff, not that long after the moment
-/// the expiry was observed; the block is nacked as a retryable shutdown.
+/// Scenario: the flush task sees its expiry 5 s late while the cancelled upload never aborts.
+/// Guarantees: the write is released at the latched deadline plus `upload.abort_timeout`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_late_expiry_is_cleaned_up_by_the_absolute_cutoff() {
     tokio::task::LocalSet::new()
@@ -860,12 +826,9 @@ async fn a_late_expiry_is_cleaned_up_by_the_absolute_cutoff() {
         .await;
 }
 
-/// Scenario: the node's deadline branch runs 5 s after the latched deadline,
-/// before the flush task has observed its own expiry, and the upload it
-/// cancels never finishes aborting.
-/// Guarantees: `abandon` decides the block at once and returns by the latched
-/// deadline plus `upload.abort_timeout`, not that long after it started, so a
-/// late wake cannot push the node's return past the absolute cutoff.
+/// Scenario: the node's deadline branch runs 5 s late, before the task sees its expiry, and the
+/// upload never aborts.
+/// Guarantees: `abandon` returns by the latched deadline plus `upload.abort_timeout`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_late_deadline_branch_returns_by_the_absolute_cutoff() {
     tokio::task::LocalSet::new()
@@ -897,12 +860,9 @@ async fn a_late_deadline_branch_returns_by_the_absolute_cutoff() {
 /// Requests per block in [`abandon_decides_a_full_worker_well_inside_the_floor`].
 const HELD_PER_BLOCK: usize = 512;
 
-/// Scenario: at the deadline the worker holds as many completions as its
-/// notifier allows -- a FLUSHING block of 512 requests parked in its write
-/// and an ACTIVE block of 511 -- with `upload.abort_timeout` at its 1 s floor.
-/// Guarantees: `abandon` decides and delivers all 1023 before its first await,
-/// and that synchronous phase takes well under the 1 s the floor leaves it, so
-/// the cleanup that follows still ends at the absolute cutoff.
+/// Scenario: a full worker (512 requests flushing, 511 ACTIVE) at the deadline with a 1 s
+/// `upload.abort_timeout`.
+/// Guarantees: all 1023 are decided before the first await, well inside the 1 s floor.
 #[tokio::test(flavor = "current_thread")]
 async fn abandon_decides_a_full_worker_well_inside_the_floor() {
     tokio::task::LocalSet::new()
@@ -963,13 +923,9 @@ async fn abandon_decides_a_full_worker_well_inside_the_floor() {
         .await;
 }
 
-/// Scenario: shutdown latches a 60 s deadline while a block's write is
-/// parked, the node learns it from a force-drained request, and upstream drops
-/// its pdata sender while the node is taking a control message; the clock then
-/// moves past one second before the store heals.
-/// Guarantees: the closed pdata channel releases the latched Shutdown with its
-/// own deadline, so the flush is still awaited after that second and every
-/// request of the block is acknowledged, not nacked `NodeShutdown`.
+/// Scenario: a 60 s deadline latches during a parked write, the pdata sender drops during a control
+/// message, and the store heals after a second.
+/// Guarantees: the released Shutdown keeps its deadline and the block is acknowledged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
     let events = capture();
@@ -1061,11 +1017,8 @@ async fn a_closed_pdata_channel_keeps_the_latched_shutdown_deadline() {
         .await;
 }
 
-/// Scenario: the real `SeriesParquet::start` future is aborted while a storage
-/// write is parked and will never return.
-/// Guarantees: cancellation drops the parked write and releases the block, the
-/// sink and the object store within the configured abort timeout, so a node
-/// torn down mid-flush leaves nothing owned by a task nobody joins.
+/// Scenario: the `SeriesParquet::start` future is aborted while a write is parked forever.
+/// Guarantees: the write, block, sink and store are released within the abort timeout.
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_start_cancels_flush_task() {
     tokio::task::LocalSet::new()
@@ -1111,12 +1064,9 @@ async fn dropping_start_cancels_flush_task() {
         .await;
 }
 
-/// Scenario: a backlog of buffered requests is force-drained while the
-/// completion channel is already full and nothing will ever read it.
-/// Guarantees: every request still gets exactly one shutdown decision, each
-/// undeliverable decision is counted as a delivery failure rather than parked,
-/// and the node returns at the latched deadline instead of waiting for
-/// completion credit.
+/// Scenario: a buffered backlog is force-drained into a full completion channel nobody reads.
+/// Guarantees: one decision per request, undeliverable ones counted, and the node returns at the
+/// deadline.
 #[tokio::test(flavor = "current_thread")]
 async fn saturated_inbox_shutdown_stays_bounded() {
     tokio::task::LocalSet::new()
@@ -1212,13 +1162,10 @@ async fn force_drained_past_a_held_block(
     (worker, rx)
 }
 
-/// Scenario: one request is FLUSHING in a parked write, three requests are
-/// force-drained after shutdown while the completion channel has room for
-/// one and nobody reads it, and the write is then released.
-/// Guarantees: the refusal that does not fit beside the held block is
-/// attempted once and counted instead of queued, so the flushing block's ack
-/// still has a slot: no panic, the block is acknowledged, and each of the four
-/// requests is decided exactly once.
+/// Scenario: one request flushing in a parked write, three force-drained into a channel of one,
+/// then the write released.
+/// Guarantees: the refusal that does not fit is counted, the block is acknowledged, and each
+/// request is decided once.
 #[tokio::test(flavor = "current_thread")]
 async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
     tokio::task::LocalSet::new()
@@ -1259,11 +1206,8 @@ async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
         .await;
 }
 
-/// Scenario: the same held block and force-drained requests, but the
-/// shutdown deadline fires while the write is still parked.
-/// Guarantees: the deadline decides the flushing block without a panic,
-/// every completion the channel cannot take is counted as a delivery failure,
-/// and each of the four requests is decided exactly once.
+/// Scenario: the same setup, but the deadline fires while the write is parked.
+/// Guarantees: no panic, undeliverable completions counted, each request decided once.
 #[tokio::test(flavor = "current_thread")]
 async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
     tokio::task::LocalSet::new()
@@ -1291,13 +1235,9 @@ async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
         .await;
 }
 
-/// Scenario: window boundaries keep arriving while the one flush slot is held
-/// by a write that never returns and the completion channel is already full,
-/// and a telemetry control message and then a shutdown are sent into that.
-/// Guarantees: the real node re-arms its boundary timer rather than losing or
-/// spinning on it, still serves control messages, and observes the shutdown it
-/// is then sent, counting the completion it could never hand over instead of
-/// waiting for it.
+/// Scenario: boundaries arrive while a never-returning write holds the slot and the completion
+/// channel is full; then telemetry and a shutdown.
+/// Guarantees: the boundary timer is re-armed, control is served, and the shutdown is observed.
 #[tokio::test(flavor = "current_thread")]
 async fn blocked_completion_keeps_boundary_and_control_live() {
     tokio::task::LocalSet::new()
@@ -1376,13 +1316,8 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
         .await;
 }
 
-/// Scenario: the inbox latches a Shutdown it cannot release yet, because an
-/// upstream sender is still alive, and hands the node a telemetry control
-/// message while it drains.
-/// Guarantees: the node takes the latched deadline from the inbox rather than
-/// waiting for a Shutdown message it has not been given, so the block it holds
-/// is sealed and acknowledged instead of waiting for a window boundary ten
-/// minutes away.
+/// Scenario: the inbox latches a Shutdown it cannot release yet and hands over a telemetry message.
+/// Guarantees: the node takes the latched deadline and seals and acknowledges its block.
 #[tokio::test(flavor = "current_thread")]
 async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
     tokio::task::LocalSet::new()
@@ -1444,14 +1379,10 @@ async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
         .await;
 }
 
-/// Scenario: the real `drive` loop is polled for the first time in a state
-/// where its shutdown deadline has already elapsed and the flush task has
-/// already published a successful result that nothing has taken yet. The
-/// deadline branch is biased above the branch that awaits that result, so both
-/// are ready in the same poll and the deadline wins it.
-/// Guarantees: the block whose files exist is acknowledged and its descriptors
-/// are committed, rather than refused as uncommitted work, so shutdown never
-/// asks a producer to resend rows that are already in object storage.
+/// Scenario: `drive` first polled with the deadline elapsed and a successful flush result already
+/// published.
+/// Guarantees: the block is acknowledged and its descriptors committed (see
+/// `FlushJob::try_finish`).
 #[tokio::test(flavor = "current_thread")]
 async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
     tokio::task::LocalSet::new()

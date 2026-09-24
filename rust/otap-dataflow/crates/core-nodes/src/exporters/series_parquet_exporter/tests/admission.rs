@@ -6,12 +6,8 @@
 
 use super::support::*;
 
-/// Scenario: a traces request reaches an exporter that has no traces schema,
-/// and a logs request larger than `ingress.max_request_bytes` arrives.
-/// Guarantees: both are refused as permanent client errors with the rule that
-/// rejected them, and neither leaves anything in the ACTIVE block, because
-/// validation judges the request's own content and the identical bytes would
-/// be refused again.
+/// Scenario: a traces request and a logs request larger than `ingress.max_request_bytes`.
+/// Guarantees: both are refused permanently with their rule and leave the ACTIVE block empty.
 #[tokio::test(flavor = "current_thread")]
 async fn validation_refusals_are_permanent() {
     tokio::task::LocalSet::new()
@@ -53,16 +49,10 @@ async fn validation_refusals_are_permanent() {
         .await;
 }
 
-/// Scenario: a well-formed logs request is admitted and rotated, but the
-/// object store cannot be written, because the directory the store was rooted
-/// at has been replaced by a regular file.
-/// Guarantees: every request of the block is nacked as retryable rather than
-/// refused, and the descriptor is left uncommitted so the next block writes it
-/// again. An unreachable or full destination must not tell the sender to
-/// change a request that is perfectly valid. Replacing the root with a file is
-/// used rather than dropping its write permission because no user, including
-/// root, can create a path below a regular file, so the failure is
-/// deterministic everywhere the tests run.
+/// Scenario: the store's root directory is replaced by a regular file (unwritable even for root,
+/// unlike a chmod) before a block is written.
+/// Guarantees: every request of the block is nacked as retryable and the descriptor stays
+/// uncommitted.
 #[tokio::test(flavor = "current_thread")]
 async fn a_storage_failure_after_validation_is_retryable() {
     tokio::task::LocalSet::new()
@@ -81,9 +71,8 @@ async fn a_storage_failure_after_validation_is_retryable() {
 
             let (handler, mut rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            // A broken destination is retried until the block's absolute
-            // deadline, so the test gives it one it can reach on a simulated
-            // clock rather than waiting out the configured default.
+            // A broken destination is retried until the block's deadline, so
+            // the test gives it one reachable on a simulated clock.
             let sim = clock::SimClock::new();
             let _clock_guard = sim.install();
             let mut cfg = worker_config();
@@ -128,14 +117,9 @@ async fn a_storage_failure_after_validation_is_retryable() {
         .await;
 }
 
-/// Scenario: both failure classes are turned into the outcome the notifier
-/// delivers.
-/// Guarantees: a size refusal keeps the budget it exceeded as its outcome,
-/// excess nesting is its own outcome rather than invalid content, an
-/// unsupported signal keeps its own, any other validation refusal is
-/// reported as invalid, and every
-/// retryable failure becomes a storage outcome, so the phase a failure came
-/// from still decides what the sender is told.
+/// Scenario: each failure class is turned into the outcome the notifier delivers.
+/// Guarantees: size refusals keep their budget, nesting and unsupported keep theirs, other refusals
+/// are invalid, retryable failures are storage.
 #[test]
 fn each_failure_class_maps_to_its_outcome() {
     assert_eq!(
@@ -182,14 +166,8 @@ fn each_failure_class_maps_to_its_outcome() {
     );
 }
 
-/// Scenario: extraction fails on a writer invariant -- the column/builder
-/// mismatch a writer bug produces -- rather than on the request's content,
-/// and the failure is classified by the rule the admission path uses and then
-/// delivered.
-/// Guarantees: only a lake refusal is permanent. The internal error becomes a
-/// retryable nack labelled `internal`, and its reason is a sentence carrying
-/// the sanitized detail, so a producer never drops data because of an
-/// exporter bug and an operator can still see what went wrong.
+/// Scenario: extraction fails on a writer invariant, classified and delivered as admission does.
+/// Guarantees: a retryable `internal` nack whose reason carries the sanitized detail.
 #[tokio::test(flavor = "current_thread")]
 async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
     let failure = lake::Error::internal("column/builder mismatch for Str(None)\nsecond line");
@@ -221,16 +199,10 @@ async fn an_internal_extraction_error_is_a_retryable_nack_with_detail() {
     assert_no_more_completions(&mut rx);
 }
 
-/// Scenario: a writer invariant really breaks inside the lake while a request
-/// is admitted: the values sort key is changed after validation to a column
-/// the dataset does not have, and the run target is one byte, so the lake's
-/// run sort fails with its own internal error on the first request. (No
-/// request content can make extraction itself break an invariant: its
-/// builders and rows are derived from the same configuration, and OTAP schema
-/// validation refuses mistyped columns before extraction runs.)
-/// Guarantees: the request is nacked as retryable, not refused, with the
-/// `internal` label and a reason carrying the lake's detail, so a bug of the
-/// writer never tells a producer to drop its data.
+/// Scenario: the values sort key is changed after validation to a missing column and the run target
+/// is one byte, so the lake's run sort fails internally (no request content can break an extraction
+/// invariant).
+/// Guarantees: a retryable `internal` nack whose reason carries the lake's detail.
 #[tokio::test(flavor = "current_thread")]
 async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
     let (handler, mut rx) = effects(4);
@@ -275,13 +247,9 @@ async fn a_real_writer_invariant_failure_is_a_retryable_nack_with_detail() {
     assert_no_more_completions(&mut rx);
 }
 
-/// Scenario: a metrics request is admitted, and a logs request's admission
-/// then breaks a writer invariant (the logs values sort names a column the
-/// dataset does not have and every append sorts a run), so the partially
-/// updated ACTIVE block is failed with the metrics request inside it.
-/// Guarantees: the co-tenant is nacked as a retryable `internal` failure with
-/// the internal-error sentence, not as a storage failure, because nothing was
-/// written and neither request is at fault.
+/// Scenario: a metrics request is admitted, then a logs request's admission breaks a writer
+/// invariant (its sort names a missing column).
+/// Guarantees: the co-tenant is nacked as a retryable `internal` failure, not as storage.
 #[tokio::test(flavor = "current_thread")]
 async fn an_admission_failure_nacks_its_co_tenant_as_internal() {
     let (handler, mut rx) = effects(4);
@@ -334,11 +302,8 @@ async fn an_admission_failure_nacks_its_co_tenant_as_internal() {
     assert_no_more_completions(&mut rx);
 }
 
-/// Scenario: an error detail longer than the reason bound, and one holding
-/// control characters and multi-byte characters at the cut.
-/// Guarantees: the detail a nack reason carries is bounded, single-line and
-/// cut on a character boundary, so request-derived text cannot make a status
-/// message unbounded or split a character.
+/// Scenario: a detail longer than the bound, with control and multi-byte characters at the cut.
+/// Guarantees: the reason detail is bounded, single-line and cut on a character boundary.
 #[test]
 fn a_reason_detail_is_bounded_and_single_line() {
     let long = "x".repeat(10_000);
@@ -351,11 +316,8 @@ fn a_reason_detail_is_bounded_and_single_line() {
     assert_eq!(super::super::outcome::sanitized("a\r\nb\tc"), "a  b c");
 }
 
-/// Scenario: the bounded engine completion channel fills while a second
-/// notification waits.
-/// Guarantees: cancelling a poll preserves the second context and sends it
-/// exactly once later, so a request never loses its decision because the
-/// exporter had to attend to something else.
+/// Scenario: the completion channel fills while a second notification waits.
+/// Guarantees: a cancelled poll keeps the second context, sent exactly once later.
 #[tokio::test(flavor = "current_thread")]
 async fn notification_survives_cancelled_poll() {
     let (handler, mut rx) = effects(1);
@@ -393,12 +355,8 @@ async fn notification_survives_cancelled_poll() {
     assert_no_more_completions(&mut rx);
 }
 
-/// Scenario: two requests fill a two-request block and a third request needs
-/// the next one.
-/// Guarantees: exactly one extracted request is parked, admission closes while
-/// it waits, and it enters the next block before anything newer, so a request
-/// that could not be reserved is neither dropped nor reordered behind later
-/// input and the worker still holds no more than two blocks and one request.
+/// Scenario: two requests fill a two-request block and a third needs the next one.
+/// Guarantees: one request is parked, admission closes, and it enters the next block first.
 #[tokio::test(flavor = "current_thread")]
 async fn one_pending_request_resumes_before_new_input() {
     tokio::task::LocalSet::new()
@@ -426,11 +384,8 @@ async fn one_pending_request_resumes_before_new_input() {
         .await;
 }
 
-/// Scenario: a request whose logical size exceeds the input budget is offered
-/// to an empty ACTIVE block.
-/// Guarantees: nothing is admitted, no request is parked and the sender gets a
-/// permanent refusal, because a request that cannot fit an empty block would
-/// be refused by every following block as well.
+/// Scenario: a request over the input budget is offered to an empty ACTIVE block.
+/// Guarantees: a permanent refusal; nothing admitted or parked.
 #[tokio::test(flavor = "current_thread")]
 async fn oversized_input_is_refused_atomically() {
     tokio::task::LocalSet::new()
@@ -459,11 +414,8 @@ async fn oversized_input_is_refused_atomically() {
         .await;
 }
 
-/// Scenario: preparation consumes Arrow input whose original array is still
-/// weakly observed from outside the worker.
-/// Guarantees: the parked extraction retains no original input array and no
-/// conversion record batch, so parking one request cannot keep a whole
-/// request's Arrow buffers resident beside the two blocks.
+/// Scenario: preparation consumes Arrow input still weakly observed from outside.
+/// Guarantees: the parked extraction retains no original array and no conversion batch.
 #[tokio::test(flavor = "current_thread")]
 async fn prepare_releases_original_arrow_payload() {
     use otel_arrow_dfe_pdata::TryIntoWithOptions;
@@ -492,11 +444,8 @@ async fn prepare_releases_original_arrow_payload() {
     prepared.discard();
 }
 
-/// Scenario: a well-formed request is converted and then fails the extraction
-/// budget, which is measured only after the conversion has run.
-/// Guarantees: the failure is a permanent refusal, nothing is parked and the
-/// ACTIVE block is left untouched, because every validation phase completes
-/// before the block is reserved against.
+/// Scenario: a converted request fails the extraction budget.
+/// Guarantees: a permanent refusal; nothing parked and the ACTIVE block untouched.
 #[tokio::test(flavor = "current_thread")]
 async fn extraction_failure_is_refused_atomically() {
     tokio::task::LocalSet::new()
@@ -528,17 +477,11 @@ async fn extraction_failure_is_refused_atomically() {
         .await;
 }
 
-/// Scenario: OTLP bodies the framing check refuses reach preparation after
-/// their byte-size check: a logs and a metrics body whose first field declares
-/// 127 missing bytes, a logs and a metrics body whose one nested `Resource*`
-/// message is `0a 01 0a`, a `ResourceLogs` carrying `resource` twice, a
-/// metric carrying both a gauge and a sum, and a log body nesting arrays one
-/// level beyond the walk's bound of 256.
-/// Guarantees: each is nacked permanently as `Refused` with a reason naming
-/// what refused it, and the ACTIVE block is untouched: repeated singular
-/// fields are refused here although the other exporters accept them, and a
-/// body too deep for the walk is refused as `ingress.max_nesting_depth`
-/// refuses it.
+/// Scenario: OTLP bodies that fail the framing check: a first field declaring 127 missing bytes and
+/// a nested `Resource*` of `0a 01 0a` (logs and metrics each), `resource` twice, a gauge and a sum
+/// in one metric, and arrays nested past 256 levels.
+/// Guarantees: each is a permanent `Refused` nack naming what refused it, the too-deep one as
+/// `ingress.max_nesting_depth`, and the ACTIVE block is untouched.
 #[tokio::test(flavor = "current_thread")]
 async fn a_body_the_framing_check_refuses_is_nacked_atomically() {
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{AnyValue, ArrayValue, any_value};
@@ -653,11 +596,8 @@ async fn a_body_the_framing_check_refuses_is_nacked_atomically() {
         .await;
 }
 
-/// Scenario: a well-formed OTLP metrics request reaches the same worker that
-/// admits logs.
-/// Guarantees: it is admitted through one extraction into the ACTIVE block and
-/// holds its completion there, so metrics travel the single admission state
-/// machine rather than a signal-specific path.
+/// Scenario: a well-formed OTLP metrics request reaches the worker.
+/// Guarantees: it is admitted through the same extraction into the ACTIVE block.
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_are_admitted_like_logs() {
     tokio::task::LocalSet::new()
@@ -699,11 +639,8 @@ fn invalid_utf8_body_pdata() -> OtapPdata {
     OtapPdata::new(context, payload.into())
 }
 
-/// Scenario: an OTLP logs request whose record body is a string holding bytes
-/// that are not UTF-8 (`caf` then a lone `0xc3`).
-/// Guarantees: it is prepared for admission, not refused, and its body is
-/// extracted with U+FFFD in place of the invalid byte, as the OTAP conversion
-/// stores it.
+/// Scenario: a log body string holding `caf` and a lone `0xc3`.
+/// Guarantees: it is admitted with U+FFFD in place of the invalid byte.
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     let store = Arc::new(object_store::memory::InMemory::new());
@@ -721,11 +658,8 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     }
 }
 
-/// Scenario: with telemetry registered, the logs request whose body holds a
-/// byte that is not UTF-8 is admitted, then a well-formed logs request.
-/// Guarantees: `repaired.invalid_utf8{signal=logs}` counts the one repaired
-/// value and the well-formed request adds nothing; no `metrics` bucket is
-/// touched.
+/// Scenario: the repaired log body, then a well-formed logs request, with telemetry.
+/// Guarantees: `repaired.invalid_utf8{signal=logs}` counts one; the `metrics` bucket is untouched.
 #[tokio::test(flavor = "current_thread")]
 async fn a_repaired_log_body_is_counted_by_signal() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -763,11 +697,8 @@ async fn a_repaired_log_body_is_counted_by_signal() {
     );
 }
 
-/// Scenario: OTLP logs requests whose record attribute value is an array, or
-/// a key-value list, holding a string with a byte that is not UTF-8 (`0xc3`).
-/// Guarantees: each passes the framing check but is refused permanently as
-/// undecodable, never admitted: the conversion encodes array and list values
-/// strictly, unlike a top-level string, which it stores with U+FFFD.
+/// Scenario: an array and a key-value list attribute value holding a string with `0xc3`.
+/// Guarantees: each passes the framing check and is refused permanently as undecodable.
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_utf8_inside_an_array_or_kvlist_value_is_refused_as_undecodable() {
     let len_field = |field: u32, payload: &[u8]| {
@@ -809,13 +740,8 @@ async fn invalid_utf8_inside_an_array_or_kvlist_value_is_refused_as_undecodable(
     }
 }
 
-/// Scenario: one metrics request carries a supported gauge point next to an
-/// unsupported summary point, under an explicit `unsupported: reject`.
-/// Guarantees: the whole request is refused as one permanent `unsupported`
-/// nack and the ACTIVE block keeps the bytes and the request count it had, so
-/// the policy is applied atomically and the supported half of a rejected
-/// request is never stored. Nothing is parked, because the refusal judges the
-/// request's own content rather than whichever block happened to be active.
+/// Scenario: a gauge point beside a summary point under `unsupported: reject`.
+/// Guarantees: one permanent `unsupported` nack; the ACTIVE block is unchanged and nothing parked.
 #[tokio::test(flavor = "current_thread")]
 async fn a_mixed_metrics_request_is_rejected_atomically() {
     tokio::task::LocalSet::new()
@@ -862,13 +788,9 @@ async fn a_mixed_metrics_request_is_rejected_atomically() {
         .await;
 }
 
-/// Scenario: the same mixed metrics request arrives under the default
-/// `unsupported` policy with telemetry registered, and the block it lands in
-/// is rotated and written.
-/// Guarantees: the default is `drop`: the gauge point is admitted, the
-/// summary point is counted in `dropped.unsupported{kind=summary}` rather
-/// than stored, and the request is acknowledged only once its block has been
-/// written, so a dropped point does not make the request ack early or fail.
+/// Scenario: the same mixed request under the default policy, written to storage.
+/// Guarantees: the gauge is stored, the summary counted in `dropped.unsupported{kind=summary}`, and
+/// the ack waits for the block.
 #[tokio::test(flavor = "current_thread")]
 async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
     tokio::task::LocalSet::new()
@@ -930,12 +852,8 @@ async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
         .await;
 }
 
-/// Scenario: the wall clock steps backwards between parking a request for a
-/// later window and opening the block that request is waiting for.
-/// Guarantees: one rotation admits the parked request, which is not parked
-/// again. The block a parked request is opened for takes its window from that
-/// request, so a clock that steps back cannot make the node spin opening empty
-/// blocks the parked request is forever too late for.
+/// Scenario: the wall clock steps back between parking a request and opening its block.
+/// Guarantees: one rotation admits the parked request; it is not parked again.
 #[tokio::test(flavor = "current_thread")]
 async fn a_backward_clock_step_does_not_repark_the_pending_request() {
     tokio::task::LocalSet::new()
@@ -969,12 +887,8 @@ async fn a_backward_clock_step_does_not_repark_the_pending_request() {
         .await;
 }
 
-/// Scenario: a request whose reservation alone exceeds the block budget is
-/// offered to an empty ACTIVE block.
-/// Guarantees: `Block::reserve` refuses it as `RequestTooLarge`, the worker
-/// reports that permanently rather than parking it, and the block is
-/// untouched. An empty block is the largest one the request will ever be
-/// offered, so parking it would rotate for ever without admitting it.
+/// Scenario: a request whose reservation alone exceeds the block budget, on an empty block.
+/// Guarantees: a permanent `RequestTooLarge` refusal; not parked, block untouched.
 #[tokio::test(flavor = "current_thread")]
 async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
     tokio::task::LocalSet::new()
@@ -1027,14 +941,9 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
         .await;
 }
 
-/// Scenario: three requests reach the running node; the block takes two of
-/// them and the third has to wait for the next one. Both clocks are
-/// simulated, so the window boundary that seals the second block is reached
-/// by advancing them rather than by waiting.
-/// Guarantees: the parked request reaches storage before the newer one, and
-/// the newer one is not taken off the channel while a request is parked, so
-/// backpressure is real rather than a third block. Each request carries its
-/// own source node, so the completions say which request was decided first.
+/// Scenario: three requests reach the running node, two per block, on simulated clocks.
+/// Guarantees: the parked request is stored before the newer one, which stays on the channel
+/// meanwhile.
 #[tokio::test(flavor = "current_thread")]
 async fn the_parked_request_is_stored_before_a_newer_one() {
     tokio::task::LocalSet::new()
@@ -1052,9 +961,8 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
             let (handler, mut rx) = effects(8);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
 
-            // A block reserves room for two requests but is only rotated by
-            // the window or a third one, so the third request is parked
-            // rather than left on the channel.
+            // A block takes two requests and is rotated by the window or a
+            // third one, which is parked.
             let mut cfg = worker_config();
             cfg.window.max_requests_per_block = 3;
             cfg.lake.ingress.max_requests_per_block = 2;
@@ -1111,14 +1019,8 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
         .await;
 }
 
-/// Scenario: one request is refused by the extraction budget and, on a second
-/// worker, one by the block budget.
-/// Guarantees: each refusal is logged at WARN as
-/// `series_parquet.request.failed`, with the setting that refused it, the
-/// size observed against it and the limit as numbers, and the reason sentence
-/// the producer is told states the same size and limit, at both stages, so an
-/// operator can see how far over which budget a producer is without
-/// reproducing the request.
+/// Scenario: one request refused by the extraction budget and one by the block budget.
+/// Guarantees: each WARN and reason sentence carry the setting, the observed size and the limit.
 #[tokio::test(flavor = "current_thread")]
 async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     let events = capture();
@@ -1196,12 +1098,8 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     drop(events);
 }
 
-/// Scenario: six traces requests are refused in a burst on a simulated clock,
-/// then one more a second later.
-/// Guarantees: the worker writes one `series_parquet.request.failed` line for
-/// the burst, and the next line, an interval later, reports the five it left
-/// out, so a producer resending a refused request cannot flood the log while
-/// every refusal is still counted.
+/// Scenario: six refusals in a burst on a simulated clock, then one a second later.
+/// Guarantees: one line for the burst; the next reports the five left out.
 #[tokio::test(flavor = "current_thread")]
 async fn refusal_warnings_are_rate_limited() {
     let events = capture();
@@ -1235,15 +1133,10 @@ async fn refusal_warnings_are_rate_limited() {
     assert_eq!(worker.notify.outcomes()[Outcome::Unsupported as usize], 7);
 }
 
-/// Scenario: a metrics request whose gauge point carries an exemplar
-/// arrives with `metrics.exemplars` unset, even under `unsupported: reject`,
-/// with telemetry registered, and again under an explicit
-/// `metrics.exemplars: reject`.
-/// Guarantees: by default the point is admitted and the exemplar is counted
-/// in `dropped.exemplars{signal=metrics}`; under the explicit reject the
-/// request is refused as a permanent `unsupported` nack whose reason names
-/// exemplars and the setting that keeps the points, and nothing enters the
-/// block.
+/// Scenario: a gauge point with an exemplar, with `metrics.exemplars` unset (also under
+/// `unsupported: reject`) and then set to `reject`.
+/// Guarantees: by default the exemplar is counted in `dropped.exemplars{signal=metrics}`; under
+/// `reject` the request is refused naming exemplars.
 #[tokio::test(flavor = "current_thread")]
 async fn an_exemplar_is_dropped_and_counted_by_default_and_refused_when_asked() {
     tokio::task::LocalSet::new()

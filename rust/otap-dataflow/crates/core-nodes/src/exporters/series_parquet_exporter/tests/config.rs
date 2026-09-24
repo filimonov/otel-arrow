@@ -6,11 +6,9 @@
 
 use super::support::*;
 
-/// Scenario: the full adapter maps byte strings and rejects an impossible lake
-/// budget.
-/// Guarantees: startup validates the same constraints as the public core API,
-/// and `window.max_block_bytes` written as `64MiB` reaches
-/// `lake.ingress.max_block_bytes` as the exact byte count.
+/// Scenario: the adapter maps byte strings and meets an impossible lake budget.
+/// Guarantees: `64MiB` reaches `lake.ingress.max_block_bytes` exactly, and the lake's rules are
+/// enforced.
 #[test]
 fn configuration_maps_and_validates() {
     let cfg: Config = serde_json::from_value(serde_json::json!({
@@ -31,10 +29,8 @@ fn configuration_maps_and_validates() {
     );
 }
 
-/// Scenario: a user names a block-level budget inside `ingress`, where the
-/// adapter instead takes it from `window`.
-/// Guarantees: the setting is refused rather than silently ignored, so a
-/// pipeline never runs with a budget the user believes they set.
+/// Scenario: a block-level budget written under `ingress`.
+/// Guarantees: the setting is refused, not ignored.
 #[test]
 fn a_block_budget_written_under_ingress_is_refused() {
     let err = serde_json::from_value::<Config>(serde_json::json!({
@@ -49,11 +45,8 @@ fn a_block_budget_written_under_ingress_is_refused() {
     );
 }
 
-/// Scenario: an exporter document with `unsupported` omitted, and with
-/// `unsupported: reject`.
-/// Guarantees: omitted means `drop`, so one unsupported point never refuses
-/// a whole metrics request unless the user asks for it; an explicit `reject`
-/// is kept.
+/// Scenario: `unsupported` omitted, and set to `reject`.
+/// Guarantees: omitted means `drop`; an explicit `reject` is kept.
 #[test]
 fn unsupported_defaults_to_drop_and_reject_is_kept() {
     for (policy, expected) in [
@@ -69,12 +62,8 @@ fn unsupported_defaults_to_drop_and_reject_is_kept() {
     }
 }
 
-/// Scenario: the exemplar policy in a user document: `metrics.exemplars:
-/// drop` beside the default `unsupported`, `metrics.exemplars: reject`, and
-/// `logs.exemplars`.
-/// Guarantees: the first two are accepted and mean what they say; the
-/// third is refused at startup naming the setting, because log records
-/// carry no exemplars.
+/// Scenario: `metrics.exemplars: drop`, `metrics.exemplars: reject` and `logs.exemplars`.
+/// Guarantees: the first two are accepted; `logs.exemplars` is refused naming the setting.
 #[test]
 fn the_exemplar_policy_is_validated_at_startup() {
     for (exemplars, expected) in [
@@ -100,8 +89,7 @@ fn the_exemplar_policy_is_validated_at_startup() {
 }
 
 /// Scenario: `parquet.compression` names a codec the sink does not write.
-/// Guarantees: the configuration is refused instead of writing zstd while the
-/// document claims another codec.
+/// Guarantees: the configuration is refused.
 #[test]
 fn a_parquet_compression_other_than_zstd_is_refused() {
     let err = serde_json::from_value::<Config>(serde_json::json!({
@@ -116,8 +104,7 @@ fn a_parquet_compression_other_than_zstd_is_refused() {
 }
 
 /// Scenario: `window.interval` is a sub-second duration.
-/// Guarantees: the adapter refuses it, matching the whole-second rule the
-/// window arithmetic and the `window_secs` file metadata both rely on.
+/// Guarantees: the adapter refuses it.
 #[test]
 fn a_sub_second_window_interval_is_refused() {
     let err = serde_json::from_value::<Config>(serde_json::json!({
@@ -131,10 +118,8 @@ fn a_sub_second_window_interval_is_refused() {
     );
 }
 
-/// Scenario: the example pipeline configuration shipped in `configs/` is fed
-/// to the same validator the engine uses at startup.
-/// Guarantees: the documented example stays loadable, so the manual
-/// try-it-out instructions in the module README cannot silently rot.
+/// Scenario: `configs/series-parquet-local.yaml` fed to the engine's startup validator.
+/// Guarantees: the shipped example stays loadable.
 #[test]
 fn the_shipped_example_configuration_is_valid() {
     let yaml = include_str!("../../../../../../configs/series-parquet-local.yaml");
@@ -146,10 +131,8 @@ fn the_shipped_example_configuration_is_valid() {
     assert_eq!(cfg.lake.writer_id, "local_1");
 }
 
-/// Scenario: the factory builds the exporter for local file storage with no
-/// capability bound to the node.
-/// Guarantees: creation succeeds, because file storage needs no bearer token
-/// provider, so a local pipeline never has to declare one.
+/// Scenario: the factory builds file storage with no capability bound to the node.
+/// Guarantees: creation succeeds without a bearer token provider.
 #[test]
 fn the_factory_creates_file_storage_without_a_capability() {
     use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -182,10 +165,8 @@ fn the_factory_creates_file_storage_without_a_capability() {
     assert!(created.is_ok(), "file storage needs no capability");
 }
 
-/// Scenario: series_parquet S3 configurations with `unsigned_payload` unset
-/// over AWS, an HTTPS and a plain HTTP endpoint, and set explicitly.
-/// Guarantees: unset resolves to on over TLS and off over plain HTTP, and
-/// an explicit value is kept whatever the endpoint.
+/// Scenario: S3 `unsigned_payload` unset over AWS, HTTPS and plain HTTP, and set explicitly.
+/// Guarantees: unset is on over TLS and off over plain HTTP; an explicit value is kept.
 #[test]
 fn unsigned_payload_defaults_to_on_over_tls_for_series_parquet() {
     use otel_arrow_dfe_otap::object_store::StorageType;
@@ -219,11 +200,8 @@ fn unsigned_payload_defaults_to_on_over_tls_for_series_parquet() {
     assert_eq!(resolved(http, Some(true)), Some(true));
 }
 
-/// Scenario: the factory builds the exporter for S3 storage, with a valid
-/// retry budget, and no capability bound to the node.
-/// Guarantees: creation succeeds without a bearer token provider, because S3
-/// authenticates through its own `auth` section; only Azure storage requires
-/// the capability.
+/// Scenario: the factory builds S3 storage with no capability bound to the node.
+/// Guarantees: creation succeeds; S3 authenticates through its own `auth` section.
 #[test]
 fn the_factory_creates_s3_storage_without_a_token_provider() {
     use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -256,13 +234,8 @@ fn the_factory_creates_s3_storage_without_a_token_provider() {
     assert!(created.is_ok(), "S3 storage needs no bearer token provider");
 }
 
-/// Scenario: the factory builds the exporter for Azure storage, which
-/// authenticates through a bearer token provider, with no capability bound
-/// to the node; the store retry budget is valid, so only the missing
-/// capability can refuse it.
-/// Guarantees: creation fails with an invalid-configuration error naming the
-/// capability, before the node starts, instead of starting an exporter that
-/// cannot authenticate.
+/// Scenario: the factory builds Azure storage, valid otherwise, with no capability bound.
+/// Guarantees: creation fails before the node starts, naming the capability.
 #[test]
 #[cfg(feature = "azure")]
 fn the_factory_refuses_azure_storage_without_a_token_provider() {
@@ -308,13 +281,9 @@ fn the_factory_refuses_azure_storage_without_a_token_provider() {
     assert!(err.to_string().contains("bearer_token_provider"), "{err}");
 }
 
-/// Scenario: an explicit cloud store retry budget equal to, above and below
-/// the block's flush deadline, no retry section, and local file storage with
-/// the same values.
-/// Guarantees: only an explicit `retry.retry_timeout` that is not strictly
-/// shorter than `window.flush_retry_deadline` is refused, with both values in
-/// the message; an absent section and local file storage, which applies no
-/// store retry, are never refused for it.
+/// Scenario: an explicit cloud retry budget equal to, above and below the flush deadline, none, and
+/// file storage with the same values.
+/// Guarantees: only an explicit budget not strictly shorter is refused, naming both values.
 #[test]
 fn an_explicit_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
     let deadline = Duration::from_secs(60);
@@ -344,15 +313,10 @@ fn an_explicit_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
     assert!(cfg.retry.is_none());
 }
 
-/// Scenario: a minimal S3 configuration with no `retry` section is loaded
-/// through the factory's own `validate_config` and as a `Config`, once with
-/// the default flush deadline and once with `window.flush_retry_deadline: 20s`;
-/// then with an explicit `retry.retry_timeout` of 60s and of 3m against the
-/// default 60s deadline.
-/// Guarantees: the minimal configuration loads, and its effective store retry
-/// budget is half the flush deadline (30s, then 10s) with object_store's other
-/// retry defaults; an explicit budget at or above the deadline is refused at
-/// load naming both values.
+/// Scenario: a minimal S3 configuration without `retry`, at the default and a 20s flush deadline,
+/// then with explicit budgets of 60s and 3m.
+/// Guarantees: the derived budget is half the deadline with object_store's other defaults; an
+/// explicit budget at or above the deadline is refused.
 #[test]
 fn a_minimal_s3_config_derives_its_retry_budget_from_the_flush_deadline() {
     let validate = super::super::SERIES_PARQUET.validate_config;
@@ -383,10 +347,8 @@ fn a_minimal_s3_config_derives_its_retry_budget_from_the_flush_deadline() {
     }
 }
 
-/// Scenario: `upload.abort_timeout` is set to 999 ms and to exactly 1 s.
-/// Guarantees: the floor is 1 s inclusive: below it startup is refused with a
-/// sentence naming the key, the value and the floor, and at it the
-/// configuration is accepted.
+/// Scenario: `upload.abort_timeout` of 999 ms and of exactly 1 s.
+/// Guarantees: below 1 s startup is refused naming key, value and floor; 1 s is accepted.
 #[test]
 fn the_abort_timeout_has_a_one_second_floor() {
     let validate = super::super::SERIES_PARQUET.validate_config;
@@ -406,14 +368,9 @@ fn the_abort_timeout_has_a_one_second_floor() {
     validate(&with("1s")).expect("the floor itself is accepted");
 }
 
-/// Scenario: configuration contains misspelled settings or cross-field
-/// violations, each applied alone to a base configuration that is itself
-/// valid, and each checked through the factory's own `validate_config`.
-/// Guarantees: the factory rejects every one of them before any network
-/// listener starts, and each rejection names the rule it broke, so a case can
-/// only pass by failing for the reason it was written for, never because the
-/// base itself was broken, and a pipeline never runs with a budget the
-/// operator believes they set.
+/// Scenario: each misspelled setting or cross-field violation applied alone to a valid base,
+/// through the factory's `validate_config`.
+/// Guarantees: each is rejected with the rule it broke.
 #[test]
 fn startup_rejects_invalid_configuration() {
     let validate = super::super::SERIES_PARQUET.validate_config;

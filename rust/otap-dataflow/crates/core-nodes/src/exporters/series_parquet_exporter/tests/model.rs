@@ -309,16 +309,11 @@ impl Model {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
 
-    /// Scenario: random sequences of admissions, window boundaries, store
-    /// faults (failing, parking, healthy), releases, shutdowns, clock steps
-    /// and completion drains against a worker with two requests per block and
-    /// a completion channel with room for two, ended by a heal and a
-    /// shutdown.
-    /// Guarantees: no request is ever delivered more than one completion,
-    /// every request is decided exactly once by the end, a request left
-    /// without a completion is counted as a delivery failure, the worker
-    /// never owes more completions than its notifier holds, and an ack is
-    /// delivered only once every file of its block exists.
+    /// Scenario: random sequences of admissions, boundaries, store faults, releases, shutdowns,
+    /// clock steps and drains, two requests per block and a completion channel of two, ended by a
+    /// heal and a shutdown.
+    /// Guarantees: every request gets exactly one completion or one counted delivery failure, the
+    /// worker never owes more than its notifier holds, and an ack follows every file of its block.
     #[test]
     fn every_request_is_decided_exactly_once(ops in proptest::collection::vec(op(), 1..40)) {
         let runtime = tokio::runtime::Builder::new_current_thread()

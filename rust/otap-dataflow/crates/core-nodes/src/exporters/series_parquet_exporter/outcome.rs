@@ -19,9 +19,8 @@ use std::fmt::{self, Display, Formatter};
 
 /// How a request was decided, in the form the sender is told about it.
 ///
-/// Each refusal rule is a separate variant rather than one, so the counters
-/// keep saying which validation rule rejected a request after the error value
-/// itself has been dropped with the payload.
+/// Each refusal rule is a separate variant, so the counters keep saying which
+/// rule rejected a request after the error value has been dropped.
 ///
 /// Also the `error.type` label of the `nacks` counter. `Ack` is never recorded
 /// there, and an untouched bucket is never reported. The nack variants are
@@ -437,16 +436,9 @@ mod tests {
         lake::SizeBudget::Block,
     ];
 
-    /// Scenario: one error of every lake refusal reason -- a size refusal per
-    /// size budget, excess nesting, unsupported content, invalid content and
-    /// the two block-scoped refusals -- and one of each non-refusal class is
-    /// mapped to its outcome, and the outcome to its nack.
-    /// Guarantees: the whole table of error -> outcome -> (nack cause,
-    /// permanent, `error.type`) holds: a size refusal names the budget it
-    /// exceeded, only a refusal of the request's own content is a permanent
-    /// `Refused` nack, a block-scoped refusal that reaches a sender is an
-    /// internal retryable failure, storage failures are retryable `storage`,
-    /// and every label is the one the `nacks` counter has always carried.
+    /// Scenario: one error of every lake refusal reason and of each non-refusal class.
+    /// Guarantees: error -> outcome -> (nack cause, permanent, `error.type`) is the pinned table;
+    /// only a refusal of the request's own content is a permanent `Refused` nack.
     #[test]
     fn every_lake_error_maps_to_one_outcome_and_one_nack() {
         let store = || {
@@ -594,14 +586,8 @@ mod tests {
         assert_eq!(Outcome::Ack.label(), "ack");
     }
 
-    /// Scenario: the reason sentence is built for one error of every shape a
-    /// sender can be told about: each size budget, with and without a
-    /// measured size; traces, exemplars and an unsupported point kind; excess
-    /// nesting; invalid content spanning two lines; two storage failures; an
-    /// internal failure; and a block-scoped refusal that reached a sender.
-    /// Guarantees: every sentence is byte for byte the pinned one, so moving
-    /// how sentences are built never changes the status message a producer
-    /// logs, and a detail taken from the error stays on one line.
+    /// Scenario: the reason sentence for one error of every shape a sender can be told about.
+    /// Guarantees: every sentence is byte for byte the pinned one and stays on one line.
     #[test]
     fn every_reason_sentence_is_pinned() {
         let sized = |budget, observed| {
@@ -690,15 +676,10 @@ mod tests {
         }
     }
 
-    /// Scenario: a failed write of every [`WriteFailure`] class, each built
-    /// from errors whose text names an endpoint, a bucket and a key: a
-    /// retryable store error, an expired deadline after one, a cancellation,
-    /// a cancellation whose abort failed, refused credentials, a missing
-    /// bucket, a store error the Parquet writer wrapped, an abort failure
-    /// around a permanent one, an encoding failure and an invariant.
-    /// Guarantees: each is classified as listed and the sentence a producer is
-    /// told is byte for byte the fixed one with that class; no text of the
-    /// store's error reaches it.
+    /// Scenario: a failed write of every `WriteFailure` class, from errors naming an endpoint, a
+    /// bucket and a key.
+    /// Guarantees: each gets its class and the fixed sentence; no text of the store's error reaches
+    /// the producer.
     #[test]
     fn a_failed_write_is_told_as_a_fixed_sentence_and_a_class() {
         let secret = "http://10.0.0.7:9000/bucket/v=1/signal=logs/key.parquet";

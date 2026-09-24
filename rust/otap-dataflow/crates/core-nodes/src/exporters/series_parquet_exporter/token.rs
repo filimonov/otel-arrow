@@ -175,9 +175,8 @@ pub(super) struct Notifier {
 impl Notifier {
     /// Create a notifier that may hold `capacity` live completions.
     ///
-    /// The queue grows with the completions it actually holds rather than
-    /// being reserved at `capacity`, which is derived from an unbounded
-    /// configuration value.
+    /// The queue grows with the completions it holds and is not reserved at
+    /// `capacity`, which is derived from an unbounded configuration value.
     pub(super) fn new(effects: EffectHandler<OtapPdata>, capacity: usize) -> Self {
         Self {
             effects,
@@ -458,7 +457,7 @@ impl Notifier {
 }
 
 /// A test that drops a notifier still holding queued completions tears them
-/// down with it rather than deciding them.
+/// down with it undecided.
 #[cfg(test)]
 impl Drop for Notifier {
     fn drop(&mut self) {
@@ -475,13 +474,9 @@ mod tests {
     use otel_arrow_dfe_engine::control::{NackCause, PipelineCompletionMsg};
     use std::time::Duration;
 
-    /// Scenario: a request carrying transport headers is split into its
-    /// completion and its payload. Authorization claims are not planted: the
-    /// only way to attach them, `capture_authorized_identity`, is private to
-    /// the otap crate, so this test cannot cover the claims half of `split`.
-    /// Guarantees: the completion keeps the routing frames but not the
-    /// transport headers, so the credentials a producer sent are not held for
-    /// as long as its request waits for its block to be written.
+    /// Scenario: a request carrying transport headers is split (claims cannot be planted from
+    /// outside the otap crate).
+    /// Guarantees: the completion keeps the routing frames but not the transport headers.
     #[test]
     fn split_drops_transport_headers() {
         use otel_arrow_dfe_config::context::ContextEntryName;
@@ -507,11 +502,8 @@ mod tests {
         token.discard();
     }
 
-    /// Scenario: a token moves from a reserved queue cell into a blocked send
-    /// future.
-    /// Guarantees: queue storage, external routing buffers and future storage
-    /// are each charged once, so a saturated notifier reports the memory it
-    /// actually holds rather than double counting the token in flight.
+    /// Scenario: a token moves from a reserved queue cell into a blocked send future.
+    /// Guarantees: queue storage, external buffers and future storage are each charged once.
     #[tokio::test(flavor = "current_thread")]
     async fn notifier_bytes_do_not_double_count_inline_tokens() {
         let (handler, _rx) = effects(1);
@@ -540,9 +532,8 @@ mod tests {
     }
 
     /// Scenario: each outcome class is delivered through the notifier.
-    /// Guarantees: an ack arrives as an ack, a validation refusal as a
-    /// permanent `Refused` nack and a storage failure as a retryable one, so a
-    /// retry processor redelivers exactly the requests that can still succeed.
+    /// Guarantees: ack as ack, refusal as permanent `Refused` nack, storage failure as retryable
+    /// nack.
     #[tokio::test(flavor = "current_thread")]
     async fn each_outcome_is_delivered_as_its_completion() {
         let (handler, mut rx) = effects(4);
@@ -584,15 +575,10 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: force-drained requests are refused while the completion
-    /// channel has room for one, so the second has to wait, a third finds the
-    /// notifier at capacity, and the channel is then drained.
-    /// Guarantees: the first is delivered at once, the second stays in the
-    /// send slot and is delivered once the channel has room rather than being
-    /// dropped, and only the third, past the notifier's bound, is counted as a
-    /// delivery failure and released, so force-drain is bounded, never
-    /// blocks, and loses a refusal only when both the channel and the bound
-    /// are exhausted.
+    /// Scenario: three force-drained refusals against a channel with room for one and a notifier
+    /// bound of one.
+    /// Guarantees: the first is delivered, the second waits in the send slot, only the third is
+    /// counted as a delivery failure.
     #[tokio::test(flavor = "current_thread")]
     async fn forced_shutdown_refusals_wait_in_the_bound_then_fail() {
         let (handler, mut rx) = effects(1);
@@ -631,14 +617,9 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: three hundred decided completions -- more than tokio's
-    /// cooperative budget of 128 operations per task poll -- are drained at
-    /// the shutdown deadline into a completion channel with room for all of
-    /// them.
-    /// Guarantees: every one is delivered and none is counted as a failure,
-    /// because the drain is not throttled by the runtime's cooperative
-    /// budget, so a restart hands each producer a retryable nack instead of
-    /// leaving it to its own timeout.
+    /// Scenario: 300 completions, more than tokio's cooperative budget, drained at the deadline
+    /// into a channel with room.
+    /// Guarantees: all are delivered and none is counted as a failure.
     #[tokio::test(flavor = "current_thread")]
     async fn a_deadline_drain_delivers_more_than_the_coop_budget() {
         const N: usize = 300;
@@ -661,12 +642,8 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: three hundred force-drained requests arrive after shutdown
-    /// has been latched, one after the other within a single task poll, while
-    /// the completion channel has room for all of them.
-    /// Guarantees: each is refused with a delivered retryable `NodeShutdown`
-    /// nack and none is counted as a delivery failure, so the force-drain path
-    /// is not silently truncated by the cooperative budget either.
+    /// Scenario: 300 force-drained requests within one task poll, with room in the channel.
+    /// Guarantees: each gets a delivered retryable `NodeShutdown` nack.
     #[tokio::test(flavor = "current_thread")]
     async fn force_drained_refusals_beyond_the_coop_budget_are_all_delivered() {
         const N: usize = 300;
@@ -691,13 +668,8 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: a notifier is created with a capacity no queue could ever
-    /// hold -- what a very large `window.max_requests_per_block` doubles to --
-    /// and then used.
-    /// Guarantees: creation allocates nothing up front and the queue grows
-    /// only with the completions it actually holds, so a large configured
-    /// bound neither aborts the worker at start nor reserves memory it never
-    /// uses.
+    /// Scenario: a notifier with a capacity no queue could hold.
+    /// Guarantees: creation allocates nothing and the queue grows only with what it holds.
     #[tokio::test(flavor = "current_thread")]
     async fn a_huge_capacity_is_not_preallocated() {
         let (handler, mut rx) = effects(1);
@@ -713,12 +685,8 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: one completion is parked in a blocked send and a second,
-    /// strictly later one waits behind it in the queue.
-    /// Guarantees: the oldest outstanding completion is the blocked send, not
-    /// the queued one and not a completion that has already been delivered, so
-    /// a shutdown deadline is measured against the work the notifier still
-    /// owes.
+    /// Scenario: a blocked send and a later completion queued behind it.
+    /// Guarantees: the oldest outstanding completion is the blocked send.
     #[tokio::test(flavor = "current_thread")]
     async fn oldest_is_the_blocked_send_not_the_queued_completion() {
         let (handler, _rx) = effects(1);
@@ -758,13 +726,8 @@ mod tests {
         assert_eq!(notify.oldest(), Some(blocked_received));
     }
 
-    /// Scenario: normal completions are queued until admission would leave
-    /// the notifier one slot from its capacity, and a force-drained request is
-    /// then refused, and a second one after it.
-    /// Guarantees: admission stops at `capacity - 1` live completions and the
-    /// last slot takes the first force-drained refusal; the second, which no
-    /// longer fits, is attempted once and delivered at once rather than
-    /// queued past the bound.
+    /// Scenario: normal completions up to one short of capacity, then two force-drained refusals.
+    /// Guarantees: the last slot takes the first refusal; the second is attempted once, not queued.
     #[tokio::test(flavor = "current_thread")]
     async fn the_last_completion_slot_is_left_for_a_forced_refusal() {
         // Capacity 4 stands for 2N with N = 2; the cap on normal live
@@ -794,12 +757,9 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: completions are pushed past the notifier's bound, first while
-    /// the completion channel has room for one and then while it is full.
-    /// Guarantees: a push past the bound never panics and never grows the
-    /// queue: it is delivered at once when the channel takes it and counted as
-    /// a delivery failure when it does not, so a credit miscount cannot drop
-    /// every held completion with a panicking worker.
+    /// Scenario: pushes past the notifier's bound, with the channel open and then full.
+    /// Guarantees: no panic and no queue growth: delivered at once or counted as a delivery
+    /// failure.
     #[tokio::test(flavor = "current_thread")]
     async fn a_push_past_the_bound_is_delivered_at_once_not_asserted() {
         let (handler, mut rx) = effects(1);

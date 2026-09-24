@@ -3,15 +3,11 @@
 
 //! User configuration mapped onto the engine-independent lake configuration.
 //!
-//! The user-facing shape is deliberately flatter than
+//! The user shape is flatter than
 //! [`otel_arrow_dfe_series_lake::config::LakeConfig`]: block budgets live under
-//! `window` next to the interval that governs them, and byte-valued settings
-//! accept the human byte units (`64MiB`) the rest of the engine accepts,
-//! through field annotations on the typed sections. [`RawConfig`] is the
-//! literal user document; [`Config`] is the validated result, and every
-//! constraint the core crate enforces is checked here so a bad pipeline is
-//! refused at startup rather than at the first request. Every refusal names
-//! the dotted key a user writes, one rule per message.
+//! `window`, and byte sizes accept units such as `64MiB`. [`Config`] is the
+//! validated [`RawConfig`]; every lake constraint is checked here at startup,
+//! and each refusal names the dotted key a user writes.
 
 use otel_arrow_dfe_config::byte_units::deserialize_required_usize;
 use otel_arrow_dfe_otap::object_store::{RetryOptions, StorageType};
@@ -53,8 +49,7 @@ impl Default for Window {
 /// The request-level budgets a user sets under `ingress`.
 ///
 /// Only four of the lake's ingress limits: the two block-level ones are set
-/// under `window`, so writing them here is an unknown field rather than a
-/// value that would be silently overridden.
+/// under `window`, so writing them here is an unknown field.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Ingress {
@@ -82,7 +77,7 @@ impl Default for Ingress {
 /// The Parquet writer settings a user sets under `parquet`.
 ///
 /// `compression` documents the one codec the sink writes; any other value is
-/// refused rather than ignored.
+/// refused.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Parquet {
@@ -120,7 +115,7 @@ impl Default for Cache {
 
 /// Define a `deserialize_with` function that reads one section and prefixes
 /// its error with the section's key, so a misspelled or malformed setting is
-/// reported as `ingress: unknown field ...` rather than without a location.
+/// reported as `ingress: unknown field ...`.
 macro_rules! section {
     ($name:ident, $ty:ty, $key:literal) => {
         fn $name<'de, D: Deserializer<'de>>(d: D) -> Result<$ty, D::Error> {
@@ -265,8 +260,7 @@ impl TryFrom<RawConfig> for Config {
         if raw.window.max_requests_per_block == 0 {
             return Err("window.max_requests_per_block must be at least 1".into());
         }
-        // The node sizes its notification buffer from this count; refuse a
-        // value that cannot be doubled rather than overflowing there.
+        // The node sizes its notification buffer from twice this count.
         if raw.window.max_requests_per_block.checked_mul(2).is_none() {
             return Err("window.max_requests_per_block overflows the notification capacity".into());
         }
@@ -279,8 +273,7 @@ impl TryFrom<RawConfig> for Config {
         if let Some(compression) = &raw.parquet.compression
             && compression != "zstd"
         {
-            // The sink always writes zstd; refuse anything else rather than
-            // writing a different codec than the document claims.
+            // The sink always writes zstd.
             return Err(format!(
                 "parquet.compression must be zstd (the only codec written), not {compression:?}"
             ));

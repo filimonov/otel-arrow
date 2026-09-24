@@ -5,10 +5,8 @@
 
 use super::support::*;
 
-/// Scenario: telemetry is collected after admitting a request and while a
-/// notification waits.
-/// Guarantees: gauges include live requests and all required worker
-/// instruments have stable names.
+/// Scenario: telemetry collected after an admission, while a notification waits.
+/// Guarantees: the gauges count live requests and every worker instrument is present.
 #[tokio::test(flavor = "current_thread")]
 async fn worker_metrics_cover_live_memory_and_requests() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -41,9 +39,7 @@ async fn worker_metrics_cover_live_memory_and_requests() {
 }
 
 /// Scenario: a worker with registered instruments samples its telemetry.
-/// Guarantees: the worker publishes exactly its accounted bytes into the
-/// process-wide series accounting, so the engine residual subtracts what this
-/// worker actually retains.
+/// Guarantees: it publishes exactly its accounted bytes into the process-wide accounting.
 #[tokio::test(flavor = "current_thread")]
 async fn worker_publishes_accounted_bytes_to_process_accounting() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -75,10 +71,8 @@ async fn worker_publishes_accounted_bytes_to_process_accounting() {
     assert_eq!(worker.accounting.bytes(), accounted);
 }
 
-/// Scenario: one block is abandoned after admission and a later block commits
-/// successfully.
-/// Guarantees: `series_emitted` excludes admitted/abandoned rows and
-/// increments only on durable completion.
+/// Scenario: one block is abandoned after admission and a later block commits.
+/// Guarantees: `series.emitted` counts only the committed block's rows.
 #[tokio::test(flavor = "current_thread")]
 async fn series_emitted_requires_durable_completion() {
     tokio::task::LocalSet::new()
@@ -157,12 +151,9 @@ async fn series_emitted_requires_durable_completion() {
         .await;
 }
 
-/// Scenario: a node takes several requests, one telemetry collection and a
-/// shutdown, driving many turns of its select loop.
-/// Guarantees: the worker scans itself exactly once per collection and once
-/// more for the terminal handoff. The scan walks both token vectors and the
-/// notification queue, so sampling it per loop turn would make a block cost
-/// quadratic time in its request count.
+/// Scenario: a node takes several requests, one telemetry collection and a shutdown.
+/// Guarantees: the worker scans itself once per collection and once for the terminal handoff, never
+/// per loop turn.
 #[tokio::test(flavor = "current_thread")]
 async fn telemetry_is_scanned_only_when_it_is_collected() {
     tokio::task::LocalSet::new()
@@ -197,8 +188,8 @@ async fn telemetry_is_scanned_only_when_it_is_collected() {
                 })
                 .await
                 .expect("the shutdown enqueues");
-            // Closing the upstream channel is what releases the latched
-            // shutdown once the backlog has been drained.
+            // Closing the upstream channel releases the latched shutdown once
+            // the backlog has been drained.
             drop(pdata_tx);
 
             let mut worker = Worker::new(
@@ -231,12 +222,9 @@ async fn telemetry_is_scanned_only_when_it_is_collected() {
         .await;
 }
 
-/// Scenario: the shutdown deadline elapses while a write is outstanding, so
-/// the node cancels it instead of waiting for it.
-/// Guarantees: the abandoned flush is counted exactly as a write that returned
-/// `Cancelled` would be -- one `flush.failures{error.type=cancelled}`, one
-/// cancellation and one duration -- so a node that always runs out of time
-/// does not silently report zero flush failures.
+/// Scenario: the shutdown deadline elapses while a write is outstanding.
+/// Guarantees: one `flush.failures{error.type=cancelled}`, one cancellation and one duration are
+/// counted.
 #[tokio::test(flavor = "current_thread")]
 async fn an_abandoned_flush_is_counted_as_cancelled() {
     tokio::task::LocalSet::new()
@@ -269,12 +257,9 @@ async fn an_abandoned_flush_is_counted_as_cancelled() {
         .await;
 }
 
-/// Scenario: one request fills a block, a second is parked behind it, and the
-/// first block's completions are released into the notifier.
-/// Guarantees: the parked extraction and the undelivered completions are each
-/// reported as their own `By` gauge and are both included in the accounted
-/// total, so the memory a saturated worker holds is visible per component
-/// rather than only in aggregate.
+/// Scenario: a full block, a parked request, and released completions in the notifier.
+/// Guarantees: the parked and notification bytes have their own gauges and are in the accounted
+/// total.
 #[tokio::test(flavor = "current_thread")]
 async fn pending_and_notification_bytes_are_reported() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -312,14 +297,9 @@ async fn pending_and_notification_bytes_are_reported() {
     assert_eq!(metrics.worker.pending_slot.get(), 1);
 }
 
-/// Scenario: a worker's admission gate closes while a rotation waits for the
-/// flush slot, is sampled, reopens, and is sampled again; later a shutdown is
-/// latched with the gate closed.
-/// Guarantees: `admission.closed` reads 1 exactly while the gate is closed,
-/// `admission.closures` counts each open-to-closed transition once however
-/// many loop turns it lasts, `admission.closed.duration` accumulates the time
-/// spent closed, and a gate closed by shutdown is not reported as
-/// backpressure.
+/// Scenario: the admission gate closes for a rotation, reopens, and later closes at shutdown.
+/// Guarantees: `admission.closed`, `admission.closures` and `admission.closed.duration` track the
+/// backpressure closure only.
 #[tokio::test(flavor = "current_thread")]
 async fn admission_closure_is_visible_in_metrics() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -379,13 +359,9 @@ async fn admission_closure_is_visible_in_metrics() {
     );
 }
 
-/// Scenario: a worker whose metrics were installed through `set_metrics`
-/// refuses a traces request and force-drains a logs request at shutdown.
-/// Guarantees: both decisions are recorded once in the shared
-/// `exporter.exports` set, by signal and by the engine-wide outcome class --
-/// `refused` for the traces request, `failure` for the retryable shutdown
-/// refusal -- and the set is handed over with the terminal snapshots, so the
-/// exporter appears in the same cross-exporter views as its siblings.
+/// Scenario: a refused traces request and a force-drained logs request at shutdown.
+/// Guarantees: `exporter.exports` records `refused` and `failure` once each and is in the terminal
+/// snapshots.
 #[tokio::test(flavor = "current_thread")]
 async fn decisions_are_recorded_in_the_shared_export_metrics() {
     let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
@@ -431,10 +407,9 @@ async fn decisions_are_recorded_in_the_shared_export_metrics() {
     assert_eq!(exports("logs", "success"), None, "nothing was acked");
 }
 
-/// Scenario: a worker starts on more cores than any host has memory for, and
-/// then a second one on a single core.
-/// Guarantees: the start event carries writer id, boot id and storage, and
-/// the oversubscribed budget is a WARN emitted only when the condition holds.
+/// Scenario: a worker on more cores than any host has memory for, then one on a single core.
+/// Guarantees: the start event names the worker; the oversubscription WARN fires only for the
+/// first.
 #[tokio::test(flavor = "current_thread")]
 async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     let events = capture();
@@ -498,12 +473,9 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     );
 }
 
-/// Scenario: a worker starts with `window.max_block_bytes: 60GiB` and
-/// `upload.part_bytes: 5MiB`, a whole-block file of 12,288 parts, and a
-/// second one with the defaults, 63 parts.
-/// Guarantees: the first start emits one
-/// `series_parquet.upload.parts_exceed_limit` WARN naming both settings, the
-/// part count and the 10,000-part limit; the defaults emit none.
+/// Scenario: a 60GiB block with 5MiB parts (12,288 parts), then the defaults (63 parts).
+/// Guarantees: only the first emits `series_parquet.upload.parts_exceed_limit` with both settings
+/// and both counts.
 #[tokio::test(flavor = "current_thread")]
 async fn start_up_warns_when_a_block_could_exceed_the_multipart_part_limit() {
     let events = capture();
@@ -549,13 +521,9 @@ async fn start_up_warns_when_a_block_could_exceed_the_multipart_part_limit() {
     );
 }
 
-/// Scenario: a block is rotated into a flush whose first file write is held
-/// at the store gate, and telemetry is sampled while it is held and again
-/// once the flush has completed.
-/// Guarantees: while the write is held the sink reports the bytes the
-/// upload still holds, the worker publishes them as `flush.workspace` and
-/// charges them in `memory.accounted` beside the ACTIVE and FLUSHING
-/// blocks; once the flush has completed the workspace is zero again.
+/// Scenario: telemetry sampled while a flush's first write is held at the store gate, and after.
+/// Guarantees: the held upload bytes appear in `flush.workspace` and `memory.accounted`, and are
+/// zero afterwards.
 #[tokio::test(flavor = "current_thread")]
 async fn the_flush_workspace_is_charged_while_a_write_is_in_flight() {
     tokio::task::LocalSet::new()

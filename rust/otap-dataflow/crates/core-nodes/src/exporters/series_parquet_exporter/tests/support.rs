@@ -117,7 +117,7 @@ pub(in super::super) fn assert_no_more_completions(
 }
 
 /// A payload-free request that still carries a routing frame, so the
-/// completion it owes is actually routed rather than skipped.
+/// completion it owes is routed.
 pub(in super::super) fn empty_pdata() -> OtapPdata {
     let mut context = Context::default();
     context.set_source_node(7);
@@ -196,7 +196,7 @@ pub(super) fn traces_payload() -> OtapPayload {
 }
 
 /// One metrics request carrying a supported gauge point and an unsupported
-/// summary point, which is what the `unsupported` policy decides.
+/// summary point, for the `unsupported` policy.
 pub(super) fn mixed_metrics_payload() -> OtapPayload {
     let request = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
@@ -347,11 +347,9 @@ pub(super) fn logs_pdata_from(source: usize) -> OtapPdata {
 
 /// Store hooks whose writes park until a test opens their gate.
 ///
-/// This is what keeps a block FLUSHING for as long as a test needs: no write
-/// can resolve while the gate holds no permit, so the worker's one flush slot
-/// stays taken across as many window boundaries as the test crosses. Opening
-/// the gate leaves it open, because a permit is returned as soon as the write
-/// that took it has passed.
+/// A closed gate keeps a block FLUSHING across as many window boundaries as a
+/// test crosses. Opening it leaves it open: a permit is returned as soon as the
+/// write that took it has passed.
 #[derive(Debug)]
 pub(super) struct GatedStore {
     /// Permits to write; empty until the test releases the parked flush.
@@ -367,7 +365,7 @@ impl GatedStore {
     /// Announce a write, then wait for the gate.
     ///
     /// The count is raised before the wait, so a test observing it knows the
-    /// write is parked rather than still to come.
+    /// write is parked.
     pub(super) async fn pass(&self) {
         let _ = self.entered.fetch_add(1, SeqCst);
         let permit = self.gate.acquire().await.expect("the gate is never closed");
@@ -397,11 +395,9 @@ impl StoreHooks for GatedStore {
 
 /// Give the node task turns until `condition` holds, or fail the test.
 ///
-/// Both clocks the node reads are simulated, so there is nothing to wait for:
-/// the node only needs turns on the single-threaded runtime it shares with
-/// the test. The bound is a failure rather than a timeout, so a condition
-/// that never holds fails loudly instead of letting the test carry on
-/// against a node that has not done what the test is about to assert.
+/// Both clocks the node reads are simulated, so the node only needs turns on
+/// the single-threaded runtime it shares with the test; a condition that never
+/// holds fails the test after a bounded number of turns.
 pub(super) async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     for _ in 0..10_000 {
         if condition() {
@@ -462,8 +458,7 @@ pub(super) async fn stored_files(store: &object_store::memory::InMemory) -> usiz
 
 /// Read one metric value out of a terminal handoff by name and labels.
 ///
-/// Panics rather than returning an option: a test asking for a metric the
-/// handoff does not carry has found the regression it was written for.
+/// Panics when the handoff does not carry the metric.
 pub(super) fn terminal_value(
     snapshots: &[MetricSetSnapshot],
     name: &str,
@@ -541,14 +536,9 @@ pub(super) const SLOW_FAILURE: Duration = Duration::from_secs(20);
 /// write actually uses: a small single-shot PUT and the initiation of a
 /// multipart upload.
 ///
-/// This is a fault wrapper around an in-memory store, not a network
-/// destination: it proves what the exporter does with a store that refuses,
-/// stalls or heals, and nothing about real object storage behaviour.
-///
-/// Recording each PUT before it is allowed to fail is what lets a test compare
-/// the bytes and the path of a failed attempt with those of the retry that
-/// followed it, which is the observable form of "retries reuse frozen file
-/// names and byte-identical objects".
+/// A fault wrapper around an in-memory store. Each PUT is recorded before it
+/// may fail, so a test can compare a failed attempt's path and bytes with the
+/// retry's.
 pub(super) type FaultStore = HookStore<Faults>;
 
 /// A [`FaultStore`] over a fresh in-memory store, injecting nothing yet.
@@ -567,7 +557,7 @@ pub(super) struct Faults {
     /// Path and payload of every PUT, including the ones that then failed.
     pub(super) writes: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     /// Raised as each write reaches the injection point, so a test can wait
-    /// for a flush to have started rather than guess that it has.
+    /// for a flush to have started.
     pub(super) entered: tokio::sync::Notify,
     /// Engine-clock instant at which each write reached the injection point.
     pub(super) entered_at: std::sync::Mutex<Vec<std::time::Instant>>,
@@ -575,8 +565,8 @@ pub(super) struct Faults {
     pub(super) release: tokio::sync::Notify,
     /// Writes currently parked inside the store under [`Fault::Park`].
     pub(super) parked: AtomicUsize,
-    /// Parked writes whose future was dropped rather than released, which is
-    /// what a cancelled node has to produce.
+    /// Parked writes whose future was dropped without a release, as a
+    /// cancelled node drops them.
     pub(super) parked_drops: AtomicUsize,
     /// Parts handed to a wedged multipart upload.
     pub(super) parts: Arc<AtomicUsize>,
@@ -596,7 +586,7 @@ pub(super) struct LostCompleteUpload {
     pub(super) inner: Box<dyn MultipartUpload>,
     /// Completions that landed, shared with the store the test holds.
     pub(super) completes: Arc<AtomicUsize>,
-    /// Whether the lost response is an error rather than no answer.
+    /// Whether the lost response is an error; otherwise no answer.
     pub(super) fails: bool,
 }
 
@@ -645,11 +635,9 @@ pub(super) struct WedgedUpload {
 impl MultipartUpload for WedgedUpload {
     fn put_part(&mut self, _data: PutPayload) -> UploadPart {
         let _ = self.parts.fetch_add(1, SeqCst);
-        // Parked rather than delivered: the writer must still be in the phase
-        // where the sink aborts a failed upload when the deadline arrives. A
-        // part that lands immediately lets the writer reach the finalizing
-        // phase, which by design leaves a cancelled upload to the bucket's
-        // multipart lifecycle rule rather than aborting it.
+        // Parked, so the writer is still in the phase where the sink aborts a
+        // failed upload at the deadline; past finalization a cancelled upload
+        // is left to the bucket's lifecycle rule.
         Box::pin(std::future::pending())
     }
 
@@ -685,16 +673,14 @@ impl Faults {
         if mode == Fault::Park {
             /// Accounts for one parked write for as long as its future lives.
             ///
-            /// A write that is released decrements the live count only; one
-            /// whose future is dropped while still parked also counts as a
-            /// drop, which is the observable form of "cancellation released
-            /// the write rather than leaking it".
+            /// A released write decrements the live count only; one whose
+            /// future is dropped while still parked also counts as a drop.
             struct Parked<'a> {
                 /// Writes still parked.
                 live: &'a AtomicUsize,
                 /// Parked writes whose future was dropped.
                 drops: &'a AtomicUsize,
-                /// Whether the park ended by release rather than by a drop.
+                /// Whether the park ended by release; otherwise by a drop.
                 released: bool,
             }
             impl Drop for Parked<'_> {
@@ -802,11 +788,9 @@ impl StoreHooks for Faults {
 
 /// Advances a simulated clock on every runtime turn, until it is dropped.
 ///
-/// The flush retry backoff and the absolute retry deadline are both measured
-/// on the engine clock, so a test that needs a retry to happen has to move
-/// that clock rather than sleep on the real one. Advancing on every turn is
-/// also self-limiting: the absolute deadline is reached in a finite number of
-/// steps, so a condition that never holds fails the flush instead of hanging.
+/// The retry backoff and deadline are measured on the engine clock, so a test
+/// that needs a retry moves that clock; the deadline is reached in a finite
+/// number of turns, so a condition that never holds fails the flush.
 pub(super) struct Ticker(tokio::task::JoinHandle<()>);
 
 impl Drop for Ticker {
@@ -818,10 +802,8 @@ impl Drop for Ticker {
 /// Advance both the engine clock and the wall clock, a second per turn.
 ///
 /// Window boundaries are aligned to wall time but waited for on the engine
-/// clock, so a test that needs boundaries to keep arriving has to move both.
-/// One boundary is reached per turn, and the sleep the node re-arms is not
-/// ready again until the next one, so the other select branches keep their
-/// turn rather than being starved by a boundary that is always ready.
+/// clock, so a test that needs boundaries moves both. One boundary is reached
+/// per turn, so the other select branches keep their turns.
 pub(super) fn ticking_windows(
     sim: &clock::SimClock,
     wall: &Arc<lake::clock::TestWallClock>,
@@ -842,8 +824,8 @@ pub(super) fn ticking_windows(
 /// Advance `sim` by `total` in 100 ms steps, giving every task on the
 /// runtime several turns after each step.
 ///
-/// Stepping from the test, rather than from a [`Ticker`], lets the test act
-/// at a chosen simulated instant.
+/// Stepping from the test, not from a [`Ticker`], lets the test act at a
+/// chosen simulated instant.
 pub(super) async fn step_for(sim: &clock::SimClock, total: Duration) {
     let step = Duration::from_millis(100);
     let mut elapsed = Duration::ZERO;
@@ -1066,10 +1048,8 @@ pub(super) fn bulk_logs_pdata(records: usize) -> OtapPdata {
 /// Build a real exporter inbox over local channels, with `capacity` pdata
 /// slots.
 ///
-/// The engine's own inbox is used rather than a stand-in, because the
-/// behaviour under test is the engine's: a latched Shutdown is released only
-/// after the buffered pdata has been force-drained past a closed admission
-/// gate, and it is the inbox that decides when that happens.
+/// The engine's own inbox: it releases a latched Shutdown only after the
+/// buffered pdata has been force-drained past a closed admission gate.
 pub(super) fn inbox(
     capacity: usize,
 ) -> (
