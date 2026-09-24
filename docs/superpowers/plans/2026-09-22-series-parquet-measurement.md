@@ -1636,6 +1636,12 @@ Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as me
 - [ ] At startup the exporter logs that bound, computed from its own configuration and the receiver slots it can see (or states that it cannot see them).
 - [ ] Decide and record a byte bound for in-flight requests: either a receiver-level byte limit (an engine change, upstream) or an exporter-level retryable refusal when bytes held for unacknowledged requests pass a threshold; implement the exporter-level one here if the engine change is deferred.
 
+
+**Amendment (Task 5 finding, 2026-09-24): the reference Alloy config and the receiver's message limit.** `configs/series-parquet.alloy` has no batch processor, so a request is whatever the Loki bridge reads at once (20,000 lines, 7.96 MB in Task 5); the engine's OTLP gRPC receiver refuses messages above tonic's 4 MiB default (`max_decoding_message_size`, crates/otap/src/otap_grpc/server_settings.rs) with OUT_OF_RANGE, which OTLP clients retry forever, so nothing is delivered. The exporter meanwhile accepts requests up to `ingress.max_request_bytes` 16 MiB.
+- [ ] The reference Alloy config gains `otelcol.processor.batch` with a size cap that keeps requests well below the receiver limit (for example 4,000 records), with a comment explaining the limit and the slot formula (larger requests raise the strict ceiling).
+- [ ] The shipped series_parquet engine configs set the receiver's `max_decoding_message_size` equal to the exporter's `ingress.max_request_bytes`; at startup the exporter warns when the receiver limit it can see is below `ingress.max_request_bytes` (or states it cannot see it).
+- [ ] An E2E case sends one Alloy batch above 4 MiB and asserts it is stored, so the suite covers large batches, not only 12 lines.
+
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
 **Expected wall-clock cost:** 55-80 minutes for both stores, both topologies' latency cohorts and window comparisons; under one second for latency/backoff analysis tests.
