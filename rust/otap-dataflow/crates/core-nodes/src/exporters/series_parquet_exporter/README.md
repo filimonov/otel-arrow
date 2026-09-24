@@ -247,14 +247,24 @@ holds, inside that deadline:
   completion channel will not take is counted as a delivery failure; its
   producer sees its own timeout and retries.
 
-The node returns as soon as it holds nothing, and at the latest
-`upload.abort_timeout` after the deadline itself, which is the bound on
-unwinding an abandoned write; the bound is absolute, so a deadline the node
-observes late does not extend it. The drain therefore fits any deadline: a
-short one nacks more and a long one commits more, and no setting has to be
-sized against it.
-Committed blocks are never re-exported merely because a notification could not
-be delivered.
+No attempt starts after the latched deadline. The node returns as soon as it
+holds nothing, and at the latest by the deadline plus `upload.abort_timeout`,
+the bound on unwinding an abandoned write, plus the time to decide the
+requests it still holds at the deadline. That decision is synchronous and
+costs about 1 microsecond per request in an unoptimized test build: about 9ms
+for the 8,191 completions a worker can hold at the default
+`window.max_requests_per_block` of 4096. The bound is absolute: a deadline the
+node observes late does not extend it. `upload.abort_timeout` is refused below
+1s, so the cleanup always has most of its allowance after that decision. The
+drain therefore fits any deadline: a short one nacks more and a long one
+commits more, and no setting has to be sized against it.
+
+A storage operation that was already issued when the deadline cut its attempt
+may still complete at the store after the deadline: the exporter stops
+waiting for it, and a finalizing upload is not aborted. Its block is nacked
+all the same, so the producer's retry can write those rows a second time, as
+at-least-once delivery allows. Committed blocks are never re-exported merely
+because a notification could not be delivered.
 
 ### Granting a deadline
 
@@ -267,14 +277,16 @@ curl -X POST 'http://127.0.0.1:8080/api/v1/groups/shutdown?wait=true&timeout_sec
 ```
 
 There is no pipeline YAML shutdown-deadline key. Supervisors must allow the
-deadline plus `upload.abort_timeout`.
+deadline plus `upload.abort_timeout` plus the decision of the held requests
+described above.
 
 On Kubernetes the kubelet sends SIGTERM and kills the container once
 `terminationGracePeriodSeconds` has passed, 30s by default, which is shorter
-than the engine's 60s. No attempt runs past the engine's deadline and every
-cleanup ends `upload.abort_timeout` after it, so set
-`terminationGracePeriodSeconds` to at least the engine's 60s plus
-`upload.abort_timeout` and a margin, for example 75. For a
+than the engine's 60s. No attempt starts after the engine's deadline and the
+exporter returns by that deadline plus `upload.abort_timeout` plus the
+decision of the held requests, so set `terminationGracePeriodSeconds` to at
+least the engine's 60s plus `upload.abort_timeout` and a margin, for example
+75. For a
 longer drain, add a `preStop` hook that calls the admin shutdown operation
 with the timeout you want and set `terminationGracePeriodSeconds` above that
 timeout plus `upload.abort_timeout`: the grace period starts before the hook
@@ -318,8 +330,9 @@ quarter of `sorting.run_target_bytes`; `window.max_block_bytes` must be at least
 twice `ingress.max_extracted_bytes`, because a block charges a request's series
 rows at up to twice their extracted estimate; `upload.part_bytes` must be at
 least 5MiB for the S3 multipart minimum; request counts, byte and depth budgets,
-cache capacity, upload concurrency, `notify_batch` and the abort and retry
-durations must all be positive. A logical input size that cannot be measured is
+cache capacity, upload concurrency, `notify_batch` and the retry durations
+must all be positive, and `upload.abort_timeout` must be at least 1s (see
+"The drain"). A logical input size that cannot be measured is
 refused before conversion. `retry` settings apply to individual storage
 operations; `window.flush_retry_deadline` is the absolute authority for retrying
 a whole sealed block. For cloud storage, `retry.retry_timeout` must be strictly

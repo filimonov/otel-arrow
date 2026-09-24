@@ -894,6 +894,75 @@ async fn a_late_deadline_branch_returns_by_the_absolute_cutoff() {
         .await;
 }
 
+/// Requests per block in [`abandon_decides_a_full_worker_well_inside_the_floor`].
+const HELD_PER_BLOCK: usize = 512;
+
+/// Scenario: at the deadline the worker holds as many completions as its
+/// notifier allows -- a FLUSHING block of 512 requests parked in its write
+/// and an ACTIVE block of 511 -- with `upload.abort_timeout` at its 1 s floor.
+/// Guarantees: `abandon` decides and delivers all 1023 before its first await,
+/// and that synchronous phase takes well under the 1 s the floor leaves it, so
+/// the cleanup that follows still ends at the absolute cutoff.
+#[tokio::test(flavor = "current_thread")]
+async fn abandon_decides_a_full_worker_well_inside_the_floor() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
+            let (handler, mut rx) = effects(2 * HELD_PER_BLOCK);
+            let mut cfg = worker_config_with_requests(HELD_PER_BLOCK);
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            for id in 1..=HELD_PER_BLOCK {
+                worker.admit(logs_pdata_from(id));
+            }
+            worker.rotate();
+            store.hooks().entered.notified().await;
+            let mut id = HELD_PER_BLOCK;
+            while worker.accept() {
+                id += 1;
+                worker.admit(logs_pdata_from(id));
+            }
+            let held = worker.live_tokens();
+            assert_eq!(held, 2 * HELD_PER_BLOCK - 1, "the notifier's full credit");
+
+            worker.shutdown(clock::now());
+            {
+                let mut abandoning = std::pin::pin!(worker.abandon());
+                let started = std::time::Instant::now();
+                let first = futures::poll!(&mut abandoning);
+                let spent = started.elapsed();
+                assert!(
+                    first.is_pending(),
+                    "the cleanup is awaited after the decision"
+                );
+                assert!(
+                    spent < Duration::from_millis(250),
+                    "deciding {held} requests took {spent:?}"
+                );
+                // Every decision is in the channel before the first await.
+                for _ in 0..held {
+                    match rx.try_recv() {
+                        Ok(PipelineCompletionMsg::DeliverNack { nack }) => {
+                            assert_eq!(nack.cause, NackCause::NodeShutdown);
+                        }
+                        other => panic!("expected a delivered nack, got {other:?}"),
+                    }
+                }
+                abandoning.await;
+            }
+            assert_eq!(
+                worker.notify.outcomes()[Outcome::Shutdown as usize],
+                held as u64
+            );
+            assert_eq!(worker.notify.failures(), 0);
+            assert_no_more_completions(&mut rx);
+            assert!(worker.is_idle());
+        })
+        .await;
+}
+
 /// Scenario: shutdown latches a 60 s deadline while a block's write is
 /// parked, the node learns it from a force-drained request, and upstream drops
 /// its pdata sender while the node is taking a control message; the clock then
