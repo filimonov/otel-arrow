@@ -4,7 +4,9 @@
 //! Fuzz-style property tests for the canonical encoder and CBOR decoder (FORMAT.md section 1).
 
 use otel_arrow_dfe_series_lake::canonical::{Descriptor, Signal, canonical_bytes, series_id};
-use otel_arrow_dfe_series_lake::value::{DecodeLimits, Value, decode_cbor, sort_kvlist};
+use otel_arrow_dfe_series_lake::value::{
+    DecodeLimits, Unbounded, Value, body_string_reserving, decode_cbor, map_string, sort_kvlist,
+};
 use proptest::prelude::*;
 
 fn value_strategy() -> impl Strategy<Value = Value> {
@@ -282,5 +284,53 @@ proptest! {
                 _ => prop_assert!(false, "decode {new:?}, reference {old:?} for {bytes:02x?}"),
             }
         }
+    }
+}
+
+/// The `render_v1` this crate used before it wrote JSON directly: a
+/// serde_json tree, printed. Kept as the oracle `map_string` must agree with.
+fn reference_render(v: &Value) -> serde_json::Value {
+    use base64::Engine as _;
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Str(s) => J::String(s.clone()),
+        Value::Bytes(b) => J::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        Value::Int(i) => J::from(*i),
+        Value::Double(d) if d.is_nan() => J::String("NaN".into()),
+        Value::Double(d) if *d == f64::INFINITY => J::String("Infinity".into()),
+        Value::Double(d) if *d == f64::NEG_INFINITY => J::String("-Infinity".into()),
+        Value::Double(d) => serde_json::Number::from_f64(*d).map_or(J::Null, J::Number),
+        Value::Bool(b) => J::Bool(*b),
+        Value::Array(items) => J::Array(items.iter().map(reference_render).collect()),
+        Value::KvList(entries) => J::Object(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), reference_render(v)))
+                .collect(),
+        ),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
+
+    /// Scenario: arbitrary value trees -- every scalar, arbitrary Unicode and
+    /// control characters in strings and keys, any double bit pattern --
+    /// rendered by `map_string` and by the serde_json tree it replaced, and
+    /// by the reserving body entry point.
+    /// Guarantees: the renderings are identical, so stored cells and log
+    /// bodies do not change, and the reserving entry point returns the same
+    /// string.
+    #[test]
+    fn map_string_agrees_with_the_serde_json_tree(v in value_strategy()) {
+        let expected = match &v {
+            Value::Null => None,
+            Value::Str(s) => Some(s.clone()),
+            other => Some(reference_render(other).to_string()),
+        };
+        prop_assert_eq!(&map_string(&v), &expected);
+        let reserved = body_string_reserving(&v, &mut Unbounded).expect("unbounded");
+        prop_assert_eq!(&reserved, &expected);
     }
 }

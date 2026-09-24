@@ -253,6 +253,12 @@ impl Budget {
     /// A single row larger than `max_row_bytes` refuses the request, as does a
     /// running total past `max_extracted_bytes`.
     pub(crate) fn charge_row(&mut self, bytes: usize) -> Result<()> {
+        self.charge_row_holding(bytes, 0)
+    }
+
+    /// Charge a row of `bytes`, `held` of which the budget already holds for
+    /// it; the row limit applies to the whole row.
+    pub(crate) fn charge_row_holding(&mut self, bytes: usize, held: usize) -> Result<()> {
         if bytes > self.max_row {
             return Err(Error::too_large(
                 crate::error::SizeBudget::Row,
@@ -260,7 +266,10 @@ impl Budget {
                 self.max_row,
             ));
         }
-        self.charge(bytes)
+        let rest = bytes
+            .checked_sub(held)
+            .ok_or_else(|| Error::internal("a row holds more than its size"))?;
+        self.charge(rest)
     }
 
     /// Charge bytes that are not one row, such as a sealed batch.
@@ -442,6 +451,9 @@ pub(crate) struct ValuesRow {
     pub cols: Vec<Col>,
     /// Approximate retained bytes.
     pub approx_bytes: usize,
+    /// The part of `approx_bytes` the budget already holds, reserved while a
+    /// cell was built.
+    pub held_bytes: usize,
 }
 
 enum AnyBuilder {
@@ -588,7 +600,7 @@ impl RowSink {
 
     /// Append one row, sealing the current slice first when it would overflow.
     pub(crate) fn push(&mut self, row: &ValuesRow, budget: &mut Budget) -> Result<()> {
-        budget.charge_row(row.approx_bytes)?;
+        budget.charge_row_holding(row.approx_bytes, row.held_bytes)?;
         if row.cols.len() != self.builders.len() {
             return Err(Error::internal("row width does not match dataset schema"));
         }

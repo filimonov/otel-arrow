@@ -380,44 +380,144 @@ pub fn sort_kvlist(list: &mut [(String, Value)]) -> Result<()> {
     Ok(())
 }
 
-/// The `render_v1` recursive rendering of FORMAT.md section 2.
+/// The `render_v1` recursive rendering of FORMAT.md section 2, as compact
+/// JSON written straight into a string.
 ///
 /// Non-finite doubles and bytes use the spellings of the workspace's OTLP JSON
 /// encoder (`otel_arrow_dfe_pdata::otlp::json`): `"NaN"`, `"Infinity"` and
 /// `"-Infinity"`, and padded standard base64 for bytes, so a reader that
 /// knows OTLP JSON reads them the same way here. The rendering as a whole is
 /// not OTLP JSON: a value is not wrapped in an `AnyValue` object, integers are
-/// JSON numbers, and kvlists are JSON objects with sorted keys.
-pub fn render_v1(v: &Value) -> serde_json::Value {
-    use serde_json::Value as J;
+/// JSON numbers, and kvlists are JSON objects with sorted keys. Strings are
+/// escaped and finite doubles formatted exactly as serde_json does.
+#[must_use]
+pub fn render_v1(v: &Value) -> String {
+    let mut out = String::new();
+    write_v1(v, &mut out);
+    out
+}
+
+fn write_v1(v: &Value, out: &mut String) {
+    use std::fmt::Write as _;
     match v {
-        Value::Null => J::Null,
-        Value::Str(s) => J::String(s.clone()),
-        Value::Bytes(b) => J::String(BASE64_STANDARD.encode(b)),
-        Value::Int(i) => J::from(*i),
-        Value::Double(d) => render_double(*d),
-        Value::Bool(b) => J::Bool(*b),
-        Value::Array(items) => J::Array(items.iter().map(render_v1).collect()),
-        Value::KvList(entries) => J::Object(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), render_v1(v)))
-                .collect(),
-        ),
+        Value::Null => out.push_str("null"),
+        Value::Str(s) => write_json_str(s, out),
+        Value::Bytes(b) => {
+            out.push('"');
+            BASE64_STANDARD.encode_string(b, out);
+            out.push('"');
+        }
+        Value::Int(i) => {
+            let _ = write!(out, "{i}");
+        }
+        Value::Double(d) => write_double(*d, out),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_v1(item, out);
+            }
+            out.push(']');
+        }
+        Value::KvList(entries) => {
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_str(k, out);
+                out.push(':');
+                write_v1(v, out);
+            }
+            out.push('}');
+        }
     }
 }
 
-fn render_double(d: f64) -> serde_json::Value {
+fn write_double(d: f64, out: &mut String) {
+    use std::fmt::Write as _;
     if d.is_nan() {
-        serde_json::Value::String("NaN".into())
+        out.push_str("\"NaN\"");
     } else if d == f64::INFINITY {
-        serde_json::Value::String("Infinity".into())
+        out.push_str("\"Infinity\"");
     } else if d == f64::NEG_INFINITY {
-        serde_json::Value::String("-Infinity".into())
+        out.push_str("\"-Infinity\"");
     } else {
-        // serde_json renders finite f64 with the shortest round-trip form.
-        serde_json::Number::from_f64(d).map_or(serde_json::Value::Null, serde_json::Value::Number)
+        // serde_json's shortest round-trip form of a finite f64.
+        match serde_json::Number::from_f64(d) {
+            Some(n) => {
+                let _ = write!(out, "{n}");
+            }
+            None => out.push_str("null"),
+        }
     }
+}
+
+/// The JSON escape of one byte of a string, as serde_json writes it, or
+/// `None` when the byte stands for itself.
+fn json_escape(b: u8) -> Option<&'static str> {
+    const CONTROL: [&str; 32] = [
+        "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007",
+        "\\b", "\\t", "\\n", "\\u000b", "\\f", "\\r", "\\u000e", "\\u000f", "\\u0010", "\\u0011",
+        "\\u0012", "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017", "\\u0018", "\\u0019",
+        "\\u001a", "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
+    ];
+    match b {
+        b'"' => Some("\\\""),
+        b'\\' => Some("\\\\"),
+        0..0x20 => Some(CONTROL[usize::from(b)]),
+        _ => None,
+    }
+}
+
+fn write_json_str(s: &str, out: &mut String) {
+    out.push('"');
+    let mut plain = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if let Some(escape) = json_escape(b) {
+            out.push_str(&s[plain..i]);
+            out.push_str(escape);
+            plain = i + 1;
+        }
+    }
+    out.push_str(&s[plain..]);
+    out.push('"');
+}
+
+/// An upper bound of the length [`render_v1`] writes for `v`: exact for
+/// everything but numbers, which are bounded by their longest spelling.
+fn render_bound(v: &Value) -> Option<usize> {
+    // `-9223372036854775808`, and `-2.2250738585072014e-308` or `"-Infinity"`.
+    const INT: usize = 20;
+    const DOUBLE: usize = 24;
+    let list = |n: usize| 2 + n.saturating_sub(1);
+    Some(match v {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Int(_) => INT,
+        Value::Double(_) => DOUBLE,
+        Value::Str(s) => json_str_len(s)?,
+        Value::Bytes(b) => b.len().div_ceil(3).checked_mul(4)?.checked_add(2)?,
+        Value::Array(items) => items.iter().try_fold(list(items.len()), |acc, item| {
+            acc.checked_add(render_bound(item)?)
+        })?,
+        Value::KvList(entries) => entries
+            .iter()
+            .try_fold(list(entries.len()), |acc, (k, v)| {
+                acc.checked_add(json_str_len(k)?)?
+                    .checked_add(1)?
+                    .checked_add(render_bound(v)?)
+            })?,
+    })
+}
+
+fn json_str_len(s: &str) -> Option<usize> {
+    s.bytes().try_fold(2_usize, |acc, b| {
+        acc.checked_add(json_escape(b).map_or(1, str::len))
+    })
 }
 
 /// Attribute-map entry point: raw string for strings, `None` for unset,
@@ -427,7 +527,7 @@ pub fn map_string(v: &Value) -> Option<String> {
     match v {
         Value::Null => None,
         Value::Str(s) => Some(s.clone()),
-        other => Some(render_v1(other).to_string()),
+        other => Some(render_v1(other)),
     }
 }
 
@@ -435,6 +535,38 @@ pub fn map_string(v: &Value) -> Option<String> {
 #[must_use]
 pub fn body_string(v: &Value) -> Option<String> {
     map_string(v)
+}
+
+/// [`body_string`] within `reservations`: an upper bound of the rendering
+/// is reserved before anything is allocated, and afterwards exactly the
+/// returned string's length stays reserved.
+///
+/// # Errors
+/// The refusal of the reservation, or an allocation failure.
+pub fn body_string_reserving(
+    v: &Value,
+    reservations: &mut dyn Reservations,
+) -> Result<Option<String>> {
+    let bound = match v {
+        Value::Null => return Ok(None),
+        Value::Str(s) => s.len(),
+        other => render_bound(other).ok_or_else(overflow)?,
+    };
+    reservations.reserve(bound)?;
+    let mut out = String::new();
+    out.try_reserve_exact(bound)
+        .map_err(|_| Error::internal("render: allocation failed"))?;
+    match v {
+        Value::Str(s) => out.push_str(s),
+        other => write_v1(other, &mut out),
+    }
+    if out.len() < out.capacity() {
+        let old = out.capacity();
+        reservations.reserve(out.len())?;
+        out.shrink_to_fit();
+        reservations.release(old);
+    }
+    Ok(Some(out))
 }
 
 /// Inline bytes of one decoded value node.
@@ -831,6 +963,41 @@ mod tests {
         assert!(counter.requests.is_empty());
     }
 
+    /// Scenario: a 3000-byte bytes body, rendered as 4002 characters of quoted
+    /// base64, against a limit one byte short and without one, and a nested
+    /// body of escaped strings and doubles.
+    /// Guarantees: the rendering's bound is reserved before anything is
+    /// allocated, so the short limit refuses it with nothing held; once
+    /// rendered, exactly the string's length stays reserved, the bound was at
+    /// least that, and the string is the one `body_string` gives.
+    #[test]
+    fn body_rendering_is_reserved_before_it_is_built() {
+        let body = Value::Bytes(vec![0xAB; 3000]);
+        let mut counter = Counter::new(4001);
+        assert!(body_string_reserving(&body, &mut counter).is_err());
+        assert_eq!(counter.requests, vec![4002]);
+        assert_eq!(counter.held, 0);
+
+        let nested = Value::KvList(vec![
+            ("b".into(), body),
+            ("d".into(), Value::Double(-2.225_073_858_507_201_4e-308)),
+            ("q".into(), Value::Str("\"\\\n\u{1}".repeat(40))),
+            (
+                "s".into(),
+                Value::Array(vec![Value::Double(f64::NEG_INFINITY)]),
+            ),
+        ]);
+        for v in [nested, Value::Str("raw".into())] {
+            let mut counter = Counter::new(usize::MAX);
+            let rendered = body_string_reserving(&v, &mut counter)
+                .expect("rendered")
+                .expect("not null");
+            assert_eq!(Some(&rendered), body_string(&v).as_ref());
+            assert_eq!(counter.held, rendered.len());
+            assert!(counter.requests[0] >= rendered.len());
+        }
+    }
+
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.
     /// Guarantees: the JSON mapping of FORMAT.md section 2 is produced exactly.
     #[test]
@@ -844,9 +1011,8 @@ mod tests {
             ("s".into(), Value::Str("x".into())),
             ("t".into(), Value::Bool(true)),
         ]);
-        let json = serde_json::to_string(&render_v1(&v)).expect("json");
         assert_eq!(
-            json,
+            render_v1(&v),
             r#"{"b":"qxI=","d":"NaN","e":1.5,"i":42,"n":null,"s":"x","t":true}"#
         );
     }

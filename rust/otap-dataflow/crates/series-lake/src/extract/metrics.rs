@@ -426,6 +426,7 @@ impl Common<'_> {
                 &ValuesRow {
                     cols,
                     approx_bytes: approx,
+                    held_bytes: 0,
                 },
                 budget,
             )?;

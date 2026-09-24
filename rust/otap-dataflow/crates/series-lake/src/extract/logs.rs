@@ -24,7 +24,7 @@ use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
-use crate::value::{DecodeLimits, Value, body_string, value_bytes};
+use crate::value::{DecodeLimits, Value, body_string_reserving, value_bytes};
 
 /// Memo key for a logs series.
 ///
@@ -162,16 +162,18 @@ pub(crate) fn extract_logs(
         let o_ns = prim_at::<TimestampNanosecondType>(&observed, row).unwrap_or(0);
         let (t_ns, t_us) = timestamp_pair(t_ns, &mut stats);
         let (o_ns, o_us) = timestamp_pair(o_ns, &mut stats);
-        // The decoded body lives only until it is rendered.
+        // The decoded body lives only until it is rendered; the rendering
+        // stays held and becomes part of the row's charge.
         let body_str = match &mut body {
             Some(b) => {
                 let value = b.value_at(row, limits, budget)?;
-                let rendered = body_string(&value);
+                let rendered = body_string_reserving(&value, budget)?;
                 budget.uncharge(value_bytes(&value));
                 rendered
             }
             None => None,
         };
+        let body_held = body_str.as_ref().map_or(0, String::len);
         let severity_text_str = str_at(&severity_text, row);
         let event_name_str = str_at(&event_name, row);
         let producer = producer_id(resource, &cfg.producer_id_attribute);
@@ -212,6 +214,7 @@ pub(crate) fn extract_logs(
             &ValuesRow {
                 cols,
                 approx_bytes: approx,
+                held_bytes: body_held,
             },
             budget,
         )?;

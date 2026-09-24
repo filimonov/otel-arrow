@@ -5,12 +5,17 @@
 //! binary, because the allocator is process-wide.
 
 use otel_arrow_dfe_series_lake::value::{
-    DecodeLimits, Reservations, VALUE_NODE_BYTES, decode_cbor_reserving, value_bytes,
+    DecodeLimits, Reservations, VALUE_NODE_BYTES, Value, body_string_reserving,
+    decode_cbor_reserving, value_bytes,
 };
 use otel_arrow_dfe_series_lake::{Error, Result, SizeBudget};
 
 #[global_allocator]
 static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
+/// dhat's counters are process-wide, so the tests of this binary measure one
+/// at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Reservations up to `limit`, recording the largest total held.
 struct Held {
@@ -49,6 +54,9 @@ const ERROR_SLACK: usize = 1024;
 /// decode holds exactly its decoded size less the root node.
 #[test]
 fn a_decode_never_allocates_more_than_it_reserved() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ints = [&[0x1a, 0x00, 0x01, 0x86, 0xa0][..], &[0x01; 100_000]].concat();
     let indefinite_ints = [&[0x9f][..], &[0x01; 100_000], &[0xff]].concat();
     let mut chunked_bytes = vec![0x5f];
@@ -98,6 +106,46 @@ fn a_decode_never_allocates_more_than_it_reserved() {
             if let Ok(value) = &result {
                 assert_eq!(held.held + VALUE_NODE_BYTES, value_bytes(value), "{name}");
             }
+        }
+    }
+}
+
+/// Scenario: log bodies -- a large bytes value, a long raw string and a
+/// nested value of escaped strings and doubles -- rendered under dhat's heap
+/// profiler, unbounded and against a limit below their size.
+/// Guarantees: rendering never allocates more than it reserved, and a
+/// rendering that does not fit is refused before its string is allocated.
+#[test]
+fn a_body_rendering_never_allocates_more_than_it_reserved() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let nested = Value::KvList(vec![
+        ("b".into(), Value::Bytes(vec![7; 10_000])),
+        ("d".into(), Value::Array(vec![Value::Double(0.1); 1000])),
+        ("q".into(), Value::Str("\"\n\u{2}x".repeat(2000))),
+    ]);
+    for (name, body) in [
+        ("bytes", Value::Bytes(vec![0xAB; 300_000])),
+        ("string", Value::Str("s".repeat(300_000))),
+        ("nested", nested),
+    ] {
+        for limit in [usize::MAX, 4096] {
+            let mut held = Held {
+                limit,
+                held: 0,
+                peak: 0,
+            };
+            let profiler = dhat::Profiler::builder().testing().build();
+            let rendered = body_string_reserving(&body, &mut held);
+            let allocated = dhat::HeapStats::get().max_bytes;
+            drop(profiler);
+            let slack = if rendered.is_err() { ERROR_SLACK } else { 0 };
+            assert!(
+                allocated <= held.peak + slack,
+                "{name} at limit {limit}: allocated {allocated}, reserved {}",
+                held.peak
+            );
         }
     }
 }
