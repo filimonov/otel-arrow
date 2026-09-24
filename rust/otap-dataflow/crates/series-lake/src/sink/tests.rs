@@ -1458,3 +1458,64 @@ async fn a_step_whose_token_has_fired_is_not_driven_again() {
         "the operation was polled after the cancellation"
     );
 }
+
+/// Scenario: every leaf column of every dataset schema, and the writer
+/// properties every file is written with.
+/// Guarantees: each high-entropy column names a real leaf and is written
+/// without a dictionary and with chunk statistics only, while `series_id`,
+/// `time_unix_nano` and `metric_name` keep page statistics, which the page
+/// index is built from, and a dictionary.
+#[test]
+fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics() {
+    use parquet::file::properties::EnabledStatistics;
+    use parquet::schema::types::ColumnPath;
+    let cfg = LakeConfig::default();
+    let leaves: Vec<String> = Dataset::ALL
+        .iter()
+        .flat_map(|&ds| {
+            let schema = dataset_schema(ds, &cfg);
+            parquet::arrow::ArrowSchemaConverter::new()
+                .convert(&schema)
+                .expect("parquet schema")
+                .columns()
+                .iter()
+                .map(|c| c.path().string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let props = writer_properties(compression()).build();
+    for column in HIGH_ENTROPY_COLUMNS {
+        assert!(
+            leaves.iter().any(|leaf| leaf == column),
+            "{column} is no leaf of any dataset"
+        );
+        let path = ColumnPath::from(column);
+        assert!(
+            !props.dictionary_enabled(&path),
+            "{column} keeps a dictionary"
+        );
+        assert_eq!(
+            props.statistics_enabled(&path),
+            EnabledStatistics::Chunk,
+            "{column}"
+        );
+    }
+    for column in [
+        "series_id",
+        "time_unix_nano",
+        "metric_name",
+        "attrs.entries.keys",
+    ] {
+        assert!(
+            leaves.iter().any(|leaf| leaf == column),
+            "{column} is no leaf"
+        );
+        let path = ColumnPath::from(column);
+        assert!(props.dictionary_enabled(&path), "{column}");
+        assert_eq!(
+            props.statistics_enabled(&path),
+            EnabledStatistics::Page,
+            "{column}"
+        );
+    }
+}

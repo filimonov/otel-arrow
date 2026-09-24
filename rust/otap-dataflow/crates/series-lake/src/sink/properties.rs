@@ -18,6 +18,7 @@ use parquet::arrow::ArrowSchemaConverter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::{KeyValue, SortingColumn};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
+use parquet::schema::types::ColumnPath;
 
 /// The codec every file is written with (FORMAT.md section 5).
 #[must_use]
@@ -25,19 +26,38 @@ pub fn compression() -> Compression {
     Compression::ZSTD(ZstdLevel::default())
 }
 
+/// Leaf columns whose values are mostly distinct: written without a
+/// dictionary and with column-chunk statistics only (FORMAT.md section 5).
+pub const HIGH_ENTROPY_COLUMNS: [&str; 5] = [
+    "body",
+    "attrs.entries.values",
+    "trace_id",
+    "span_id",
+    "identity_bytes",
+];
+
 /// The writer properties of every file, before its sorting columns and
 /// footer metadata.
 ///
-/// Compression, page statistics and dictionary encoding are set explicitly
-/// (FORMAT.md section 5), and the row count limit is off, so
+/// Compression, statistics and dictionary encoding are set explicitly
+/// (FORMAT.md section 5): page statistics and dictionaries everywhere except
+/// on [`HIGH_ENTROPY_COLUMNS`]. The row count limit is off, so
 /// [`row_group_full`] alone decides where a row group ends.
 #[must_use]
 pub fn writer_properties(compression: Compression) -> WriterPropertiesBuilder {
-    WriterProperties::builder()
-        .set_compression(compression)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_dictionary_enabled(true)
-        .set_max_row_group_row_count(None)
+    HIGH_ENTROPY_COLUMNS.iter().fold(
+        WriterProperties::builder()
+            .set_compression(compression)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_dictionary_enabled(true)
+            .set_max_row_group_row_count(None),
+        |builder, column| {
+            let path = ColumnPath::from(*column);
+            builder
+                .set_column_dictionary_enabled(path.clone(), false)
+                .set_column_statistics_enabled(path, EnabledStatistics::Chunk)
+        },
+    )
 }
 
 /// Whether the writer closes its row group now: its buffered memory reached

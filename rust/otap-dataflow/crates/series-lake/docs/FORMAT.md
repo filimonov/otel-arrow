@@ -569,7 +569,11 @@ both recipes and how to detect incompatible mixes.
 ## 5. Parquet options
 
 ZSTD, target row group about 64 MiB, statistics enabled at the page level,
-dictionary encoding for strings. Key/value metadata: `format_version=1`,
+dictionary encoding for strings. The mostly distinct columns `body`,
+`attrs.entries.values`, `trace_id`, `span_id` and `identity_bytes` are
+written without a dictionary and with column-chunk statistics only; the
+sort-key columns and `metric_name` keep page statistics and the page index.
+Key/value metadata: `format_version=1`,
 `series_hash=xxh3_128/canonical_v1`, `schema_fingerprint`,
 `sort_key` (comma-separated `column:asc|desc:nulls_first|nulls_last`, or
 `none` when sorting is disabled; series files always carry
