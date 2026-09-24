@@ -6737,6 +6737,38 @@ class AlloyContracts(unittest.TestCase):
         # One client connection, one upstream connection.
         self.assertEqual(len(tap.channels), 1)
 
+    @staticmethod
+    def _alloy_lake(root, seqs, producer="alloy-producer"):
+        """A logs lake with one values row per sequence and one descriptor."""
+        import duckdb
+        values = Path(root) / "v=1/signal=logs/dataset=values/date=2026-09-24/hour=00"
+        series = Path(root) / "v=1/signal=logs/dataset=series/date=2026-09-24/hour=00"
+        values.mkdir(parents=True)
+        series.mkdir(parents=True)
+        bodies = ", ".join(f"('{alloy_capacity.line(seq)}')" for seq in seqs)
+        with duckdb.connect() as db:
+            db.execute(f"""COPY (SELECT body, 7::UBIGINT AS series_id, '{producer}' AS producer_id,
+                MAP {{'log.file.path': '/input/events.log', 'e2e.source': 'alloy-file'}} AS attrs
+                FROM (VALUES {bodies}) t(body)) TO '{values}/part.parquet' (FORMAT parquet)""")
+            db.execute(f"""COPY (SELECT 7::UBIGINT AS series_id, 1::BIGINT AS emitted_at,
+                MAP {{'host.id': '{producer}'}} AS resource_attrs)
+                TO '{series}/part.parquet' (FORMAT parquet)""")
+
+    # Scenario: Alloy's lines read back once each, then with one line stored twice.
+    # Guarantees: the end-to-end read-back passes only when every written line is
+    # stored exactly once; a duplicate is a problem, not a statistic.
+    def test_alloy_read_back_fails_on_a_duplicate(self):
+        alloy_capacity.test_e2e.require_clickhouse()
+        for seqs, passed in (([0, 1, 2], True), ([0, 1, 1, 2], False)):
+            with tempfile.TemporaryDirectory() as root:
+                self._alloy_lake(root, seqs)
+                verdict = alloy_capacity.read_back(root, 3)
+            self.assertEqual(verdict["passed"], passed, verdict["problems"])
+            if not passed:
+                self.assertTrue(any("duplicate" in problem for problem in verdict["problems"]),
+                                verdict["problems"])
+                self.assertEqual(verdict["files"]["/input/events.log"]["duplicate_rows"], 1)
+
     def test_feeder_and_alloy_never_share_a_core(self):
         groups = [[8, 24], [9, 25], [10, 26], [11, 27]]
         alloy, feeder = alloy_capacity.split_producer_cpus(groups)

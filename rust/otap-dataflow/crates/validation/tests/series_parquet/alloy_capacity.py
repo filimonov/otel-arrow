@@ -666,7 +666,24 @@ def read_back(root, written) -> dict:
                 f"SELECT attrs['log.file.path'], attrs['e2e.source'], count() "
                 f"FROM file({test_e2e.sql_string(relative)}, 'Parquet') GROUP BY 1, 2")
         }
-    producer = test_e2e.alloy_producer_id()
+    return judge_read_back(
+        rows, multiplicity={str(k): v for k, v in multiplicity.items()}, total=total,
+        joined=joined, clickhouse_rows=clickhouse_rows, written=written,
+        producer=test_e2e.alloy_producer_id(), problems=problems,
+    )
+
+
+def judge_read_back(rows, *, multiplicity, total, joined, clickhouse_rows, written,
+                    producer, problems=()) -> dict:
+    """The read-back's verdict from what the two readers returned.
+
+    `rows` are DuckDB's per source file and `e2e.source` groups: rows,
+    distinct well-formed sequences, first and last sequence, malformed rows
+    and producer ids. Every written line must be stored exactly once: a
+    missing line and a duplicated one are both problems, and so is any row
+    beyond the lines written.
+    """
+    problems = list(problems)
     files = {}
     for source_file, source, count, distinct, low, high, malformed, producers in rows:
         files[source_file] = {
@@ -686,6 +703,8 @@ def read_back(root, written) -> dict:
             problems.append(f"e2e.source {entry['e2e_source']!r}")
         if entry["distinct_lines"] != written:
             problems.append(f"{written - entry['distinct_lines']} of {written} lines missing")
+        if entry["duplicate_rows"]:
+            problems.append(f"{entry['duplicate_rows']} duplicate rows")
         if written and (entry["first_seq"] != 0 or entry["last_seq"] != written - 1):
             problems.append(f"sequence range {entry['first_seq']}..{entry['last_seq']}, "
                             f"expected 0..{written - 1}")
@@ -693,11 +712,16 @@ def read_back(root, written) -> dict:
             problems.append(f"{entry['malformed_rows']} malformed bodies")
         if entry["producer_ids"] != [producer]:
             problems.append(f"producer ids {entry['producer_ids']}")
-    for key, (source_file, count) in (
-            ((f, e["e2e_source"]), (f, e["rows"])) for f, e in files.items()):
-        if clickhouse_rows.get(key) != count:
+    repeated = {copies: lines for copies, lines in multiplicity.items() if str(copies) != "1"}
+    if repeated:
+        problems.append(f"lines stored more than once, by copies: {repeated}")
+    if total != written:
+        problems.append(f"{total} values rows for {written} lines written")
+    for source_file, entry_ in files.items():
+        key = (source_file, entry_["e2e_source"])
+        if clickhouse_rows.get(key) != entry_["rows"]:
             problems.append(f"ClickHouse counts {clickhouse_rows.get(key)} rows of "
-                            f"{source_file}, DuckDB {count}")
+                            f"{source_file}, DuckDB {entry_['rows']}")
     if joined[0] != total:
         problems.append(f"latest-descriptor join kept {joined[0]} of {total} rows")
     if sorted(joined[1]) != [producer]:
@@ -705,7 +729,7 @@ def read_back(root, written) -> dict:
     return {
         "passed": not problems, "problems": problems, "files": files,
         "expected_lines": written, "total_rows": total,
-        "multiplicity_histogram": {str(k): v for k, v in multiplicity.items()},
+        "multiplicity_histogram": dict(multiplicity),
         "readers": ["duckdb", "clickhouse"],
     }
 
