@@ -2896,6 +2896,15 @@ def rejudge_band_index(index_name, output_dir, report_dir=None) -> dict:
             if check_entry["name"] == "rss_reconciliation":
                 check_entry["status"] = verdict["rejudged"]
                 check_entry["detail"] = f"re-judged by the current band rule: {verdict['reason']}"
+        # A run whose only recorded failure was a failed check, and the
+        # baseline evaluation refusing it for that check, completed its
+        # experiment; with every check now passed it is a passed run.
+        refusals = [event for event in again.get("events", []) if event["kind"] == "failed"]
+        completed = all(event["detail"].startswith("AssertionError: hard gates failed")
+                        for event in refusals)
+        if completed and all(check_entry["status"] == STATUS_PASSED
+                             for check_entry in again["checks"]):
+            again["status"] = STATUS_PASSED
         settle_status(again)
         change["run_status_rejudged"] = again["status"]
         if result.get("baseline_decision") is not None and again["status"] == STATUS_PASSED:

@@ -6763,6 +6763,57 @@ class CapacityContracts(unittest.TestCase):
         verdict = measurement.rejudge_band_check(result)
         self.assertIsNone(verdict["rejudged"])
 
+    # Scenario: a published index names a run that was its own baseline
+    # family and failed only the band check, on an excursion the current
+    # rule covers.
+    # Guarantees: the advanced index records the change and the rule, keeps
+    # the old index as a child, leaves the run file untouched and writes the
+    # baseline the run now earns.
+    def test_rejudge_band_index_writes_the_earned_baseline(self):
+        root = temporary_directory(self)
+        report, output = root / "report", root / "output"
+        report.mkdir()
+        full = self.allocator_pair(10**7, 1000 << 20, 950 << 20, 800 << 20)
+        run = measured_result(run_id="t-strict-local-c1-w15-r001")
+        run["status"] = measurement.STATUS_FAILED
+        run["checks"] = passed_hard_checks(except_names=("rss_reconciliation",)) + [
+            measurement.check(
+                "rss_reconciliation", measurement.CHECK_HARD, measurement.STATUS_FAILED,
+                "residual range [0, 314572800] bytes over 2 samples; tolerance 104857600 "
+                "bytes; 1 positive and 0 negative beyond it")]
+        run["baseline_decision"] = {"action": "rejected"}
+        run["events"] = [{"kind": "failed", "detail": "AssertionError: hard gates failed, "
+                          "no baseline may be written: ['rss_reconciliation']"}]
+        run["capacity"] = {"rss_heap_term": {"source": "jemalloc_band"}}
+        run["observations"] = {"residual_excursions": {"events": [{
+            "residual": {"monotonic_ns": 3, "residual_bytes": 300 << 20,
+                         "heap_rss_growth_bytes": 550 << 20,
+                         "allocator_resident_growth_bytes": 300 << 20},
+            "beyond_tolerance": True,
+            "pairs": [dict(full, offset=-1), dict(
+                self.allocator_pair(3 * 10**7, 850 << 20, 550 << 20, 400 << 20), offset=0)],
+        }]}}
+        run_path = measurement.write_published_json(report / f"{run['run_id']}.json", run)
+        index = measurement.new_result({"run_id": "t-index", "case": "t-index"},
+                                       artifact_kind="index")
+        index.update(status=measurement.STATUS_FAILED, elapsed_s=1.0,
+                     run_files=[measurement.file_entry(run_path)])
+        index["environment"] = {"start": run["environment"]["start"],
+                                "end": run["environment"]["end"]}
+        _ = measurement.write_published_json(report / "t-index.json", index)
+        advanced = measurement.rejudge_band_index("t-index.json", output, report)
+        change = advanced["rss_band_rejudgement"]["verdict_changes"][0]
+        self.assertEqual((change["recorded"], change["rejudged"],
+                          change["run_status_rejudged"]),
+                         (measurement.STATUS_FAILED, measurement.STATUS_PASSED,
+                          measurement.STATUS_PASSED))
+        self.assertEqual(change["baseline_decision"]["action"], "created")
+        self.assertTrue((report / change["baseline_decision"]["baseline_name"]).is_file())
+        self.assertEqual(advanced["rss_band_rule"], measurement.RSS_BAND_RULE)
+        self.assertEqual(len(advanced["child_indexes"]), 1)
+        self.assertEqual(measurement.file_digest(run_path),
+                         measurement.file_entry(report / f"{run['run_id']}.json")["sha256"])
+
     # Scenario: jemalloc's live heap exceeds the exporter's accounted bytes
     # by 100 MB plus 1 KB for every values row written.
     # Guarantees: the ledger view reports the difference at the highest fill
