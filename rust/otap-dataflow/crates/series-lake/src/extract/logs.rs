@@ -3,6 +3,7 @@
 
 //! Logs extraction.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -17,16 +18,17 @@ use otel_arrow_dfe_pdata::schema::consts::{
 use hashbrown::HashTable;
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, Rendering, RowSink,
-    SharedLists, StrCol, ValuesRow, any_value_col, attr_table, attrs_of, denorm_bytes,
-    denorm_lookup, descriptor_row, entry_eq, fixed_at, flags_at, hash_kv, identity,
-    map_cell_reserving, plain, producer_id, str_at, struct_child, timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, Producers, Rendering, RowSink,
+    SharedLists, ValuesRow, any_value_col, attr_table, attrs_of, denorm_col, descriptor_row,
+    entry_eq, fixed_ref, flags_at, hash_kv, identity, map_cell_reserving, plain, str_col, str_of,
+    struct_child, timestamp_pair,
 };
 use crate::attrs::prim_at;
 use crate::canonical::{Descriptor, SeriesId, Signal};
 use crate::config::LakeConfig;
 use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
+use crate::value::Reservations as _;
 use crate::value::{DecodeLimits, Value, body_string_reserving, value_bytes};
 
 /// Memo key for a logs series, borrowed from the request.
@@ -139,12 +141,9 @@ pub(crate) fn extract_logs(
     let mut resources = SharedLists::default();
     let mut scopes = SharedLists::default();
     let series_columns = cfg.series_columns(Signal::Logs);
-    let key_strings = [
-        StrCol::new(&res_schema)?,
-        StrCol::new(&scope_name)?,
-        StrCol::new(&scope_version)?,
-        StrCol::new(&scope_schema)?,
-    ];
+    let key_strings = [&res_schema, &scope_name, &scope_version, &scope_schema];
+    let mut producers = Producers::new(cfg);
+    let columns = sink.width();
     let hasher = MemoHasher::default();
     let mut memo: HashTable<MemoEntry<'_>> = HashTable::new();
     let mut identity_attrs: Vec<&(String, Value)> = Vec::new();
@@ -162,7 +161,7 @@ pub(crate) fn extract_logs(
         let key = MemoKey {
             resource_id: rid,
             scope_id: sid,
-            strings: key_strings.each_ref().map(|col| col.at(row)),
+            strings: key_strings.map(|col| str_of(col, row)),
             identity: &identity_attrs,
         };
         let hash = key.hash_with(&hasher);
@@ -219,21 +218,32 @@ pub(crate) fn extract_logs(
         let o_ns = prim_at::<TimestampNanosecondType>(&observed, row).unwrap_or(0);
         let (t_ns, t_us) = timestamp_pair(t_ns, &mut stats);
         let (o_ns, o_us) = timestamp_pair(o_ns, &mut stats);
-        // The decoded body lives only until it is rendered; the rendering
-        // stays held and becomes part of the row's charge.
-        let body_str = match &mut body {
-            Some(b) => {
-                let value = b.value_at(row, limits, budget)?;
-                let rendered = body_string_reserving(&value, &mut Rendering(budget))?;
-                budget.uncharge(value_bytes(&value));
-                rendered
-            }
+        // A string body is stored as it arrived and held at its length; any
+        // other body is decoded, lives only until it is rendered, and its
+        // rendering is held. Either holding becomes part of the row's charge.
+        let borrowed_body = match &body {
+            Some(b) => b.str_value_at(row, limits)?,
             None => None,
         };
-        let body_held = body_str.as_ref().map_or(0, String::len);
-        let severity_text_str = str_at(&severity_text, row);
-        let event_name_str = str_at(&event_name, row);
-        let producer = producer_id(resource, &cfg.producer_id_attribute);
+        let body_str: Option<Cow<'_, str>> = match borrowed_body {
+            Some(s) => {
+                Rendering(budget).reserve(s.len())?;
+                Some(Cow::Borrowed(s))
+            }
+            None => match &mut body {
+                Some(b) => {
+                    let value = b.value_at(row, limits, budget)?;
+                    let rendered = body_string_reserving(&value, &mut Rendering(budget))?;
+                    budget.uncharge(value_bytes(&value));
+                    rendered.map(Cow::Owned)
+                }
+                None => None,
+            },
+        };
+        let body_held = body_str.as_ref().map_or(0, |s| s.len());
+        let severity_text_str = str_of(&severity_text, row);
+        let event_name_str = str_of(&event_name, row);
+        let producer = producers.get(rid, resource);
         // Charge everything the row actually retains, in the form it is stored
         // in: fixed cells, the rendered body, the rendered residual attribute
         // map, the denormalized strings and the projected producer id. The map
@@ -241,32 +251,33 @@ pub(crate) fn extract_logs(
         // base64 encoding and JSON escaping can make the stored cell several
         // times the size of the decoded value tree.
         let mut approx = 16 + 8 * 6 + 24 + 8;
-        approx += body_str.as_ref().map_or(0, String::len);
+        approx += body_held;
         approx += severity_text_str.len() + event_name_str.len() + producer.len();
         let residual = all_attrs.iter().filter(|(k, _)| !is_identity(k));
         let (residual_cell, residual_bytes) = map_cell_reserving(residual, approx, budget)?;
         approx += residual_bytes;
         let severity = prim_at::<Int32Type>(&severity_number, row).unwrap_or(0);
-        let mut cols = vec![
-            Col::Fixed(Some(series_id.to_vec())),
-            Col::Str(Some(producer)),
+        let mut cols = Vec::with_capacity(columns);
+        cols.extend([
+            Col::Fixed(Some(&series_id)),
+            str_col(producer),
             Col::TsUs(t_us),
             Col::Int(t_ns),
             Col::TsUs(o_us),
             Col::Int(o_ns),
             Col::Int32(Some(severity)),
-            Col::Str(Some(severity_text_str)),
+            str_col(severity_text_str),
             Col::Str(body_str),
-            Col::Str(Some(event_name_str)),
-            Col::Fixed(fixed_at(&trace_id, row)),
-            Col::Fixed(fixed_at(&span_id, row)),
+            str_col(event_name_str),
+            Col::Fixed(fixed_ref(&trace_id, row)),
+            Col::Fixed(fixed_ref(&span_id, row)),
             Col::Int32(Some(flags_at(&flags_col, row))),
             residual_cell,
-        ];
+        ]);
         for d in &values_denorm {
-            let v = denorm_lookup(d, resource, scope, all_attrs, &mut stats);
-            approx += denorm_bytes(&v);
-            cols.push(Col::from(v));
+            let (cell, bytes) = denorm_col(d, resource, scope, all_attrs, &mut stats);
+            approx += bytes;
+            cols.push(cell);
         }
         sink.push(
             &ValuesRow {
@@ -574,6 +585,54 @@ mod tests {
         assert_eq!(ids.value(2), ids.value(3));
         assert_ne!(ids.value(0), ids.value(2));
         assert_ne!(ids.value(0), ids.value(4));
+    }
+
+    /// Scenario: a string log body one byte longer than the cell limit, and
+    /// one exactly at it.
+    /// Guarantees: the body stored from the request's own string column is
+    /// refused as an oversized cell, as a decoded body is, and the body at
+    /// the limit is stored byte for byte.
+    #[test]
+    fn a_string_body_is_held_to_the_cell_limit() {
+        let mut cfg = cfg();
+        cfg.ingress.max_row_bytes = 4096;
+        let limit = DecodeLimits::new(cfg.ingress.max_nesting_depth, cfg.ingress.max_row_bytes)
+            .max_cell_bytes;
+        let body = |len: usize| LogsData {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("b".repeat(len))),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut over = encode_logs(&body(limit + 1));
+        assert!(matches!(
+            extract(&mut over, &cfg),
+            Err(Error::Refused(RefuseReason::RequestTooLarge(
+                crate::error::Excess {
+                    budget: crate::error::SizeBudget::Cell,
+                    ..
+                }
+            )))
+        ));
+        let small = limit - 1024;
+        let mut fits = encode_logs(&body(small));
+        let out = extract(&mut fits, &cfg).expect("extract");
+        let stored = out.values[0].1[0]
+            .column_by_name("body")
+            .expect("body")
+            .as_string::<i32>()
+            .value(0)
+            .to_owned();
+        assert_eq!(stored, "b".repeat(small));
     }
 
     /// Scenario: a descriptor row set is turned into a series batch.

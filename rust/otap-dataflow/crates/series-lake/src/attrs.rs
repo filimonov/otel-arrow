@@ -13,9 +13,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type, UInt8Type, UInt16Type};
 use arrow::record_batch::RecordBatch;
-use otel_arrow_dfe_pdata::arrays::{
-    ByteArrayAccessor, MaybeDictArrayAccessor, NullableArrayAccessor, StringArrayAccessor,
-};
+use otel_arrow_dfe_pdata::arrays::{MaybeDictArrayAccessor, NullableArrayAccessor};
 use otel_arrow_dfe_pdata::otlp::attributes::AttributeValueType;
 use otel_arrow_dfe_pdata::schema::consts::{
     ATTRIBUTE_BOOL, ATTRIBUTE_BYTES, ATTRIBUTE_DOUBLE, ATTRIBUTE_INT, ATTRIBUTE_KEY, ATTRIBUTE_SER,
@@ -88,23 +86,48 @@ pub(crate) fn readable(col: ArrayRef, to: &DataType) -> Result<ArrayRef> {
 /// Apply `f` to the string at `row` of a [`readable`] `Utf8` column, reading
 /// through a dictionary without copying; `None` when the cell is null.
 pub(crate) fn str_cell<R>(a: &ArrayRef, row: usize, f: impl FnOnce(&str) -> R) -> Option<R> {
+    str_ref(a, row).map(f)
+}
+
+/// The string at `row` of a [`readable`] `Utf8` column, borrowed from it and
+/// read through a dictionary; `None` when the cell or its key is null.
+pub(crate) fn str_ref(a: &ArrayRef, row: usize) -> Option<&str> {
     if let Some(strings) = a.as_string_opt::<i32>() {
-        return strings.is_valid(row).then(|| f(strings.value(row)));
+        return strings.is_valid(row).then(|| strings.value(row));
     }
-    StringArrayAccessor::try_new(a).ok()?.str_at(row).map(f)
+    let (values, key) = dictionary_at(a, row)?;
+    Some(values.as_string_opt::<i32>()?.value(key?))
 }
 
 /// Apply `f` to the bytes at `row` of a [`readable`] binary or fixed-size
 /// binary column, reading through a dictionary without copying; `None` when
 /// the cell is null.
 pub(crate) fn bytes_cell<R>(a: &ArrayRef, row: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-    if let Some(bytes) = a.as_binary_opt::<i32>() {
-        return bytes.is_valid(row).then(|| f(bytes.value(row)));
+    bytes_ref(a, row).map(f)
+}
+
+/// The bytes at `row` of a [`readable`] binary or fixed-size binary column,
+/// borrowed from it and read through a dictionary; `None` when the cell or
+/// its key is null.
+pub(crate) fn bytes_ref(a: &ArrayRef, row: usize) -> Option<&[u8]> {
+    fn plain(a: &dyn Array, row: usize) -> Option<Option<&[u8]>> {
+        if let Some(bytes) = a.as_binary_opt::<i32>() {
+            return Some(bytes.is_valid(row).then(|| bytes.value(row)));
+        }
+        a.as_fixed_size_binary_opt()
+            .map(|bytes| bytes.is_valid(row).then(|| bytes.value(row)))
     }
-    if let Some(bytes) = a.as_fixed_size_binary_opt() {
-        return bytes.is_valid(row).then(|| f(bytes.value(row)));
+    if let Some(cell) = plain(a.as_ref(), row) {
+        return cell;
     }
-    ByteArrayAccessor::try_new(a).ok()?.slice_at(row).map(f)
+    let (values, key) = dictionary_at(a, row)?;
+    let key = key?;
+    if let Some(bytes) = values.as_binary_opt::<i32>() {
+        return Some(bytes.value(key));
+    }
+    values
+        .as_fixed_size_binary_opt()
+        .map(|bytes| bytes.value(key))
 }
 
 /// The value at `row` of a [`readable`] primitive column, reading through a
@@ -259,6 +282,29 @@ impl AnyValueColumns {
             budget.rollback(mark);
         }
         value
+    }
+
+    /// The string at `row`, borrowed, when the row's type is `Str`; `None`
+    /// for any other type, which [`AnyValueColumns::value_at`] reads. The
+    /// string is the one `value_at` would return, under the same cell limit.
+    ///
+    /// # Errors
+    /// Refuses a string longer than `limits.max_cell_bytes`.
+    pub(crate) fn str_value_at(&self, row: usize, limits: DecodeLimits) -> Result<Option<&str>> {
+        let is_str = self
+            .types
+            .value_at(row)
+            .is_some_and(|ty| AttributeValueType::try_from(ty) == Ok(AttributeValueType::Str));
+        if !is_str {
+            return Ok(None);
+        }
+        let s = self
+            .strs
+            .as_ref()
+            .and_then(|a| str_ref(a, row))
+            .unwrap_or("");
+        cell_fits(s.len(), limits)?;
+        Ok(Some(s))
     }
 
     fn read_value(

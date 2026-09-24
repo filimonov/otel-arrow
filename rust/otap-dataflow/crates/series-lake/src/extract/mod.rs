@@ -7,6 +7,7 @@
 pub mod logs;
 pub mod metrics;
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -17,12 +18,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use arrow::record_batch::RecordBatch;
-use otel_arrow_dfe_pdata::arrays::StringArrayAccessor;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
-use crate::attrs::{AnyValueColumns, AttrTable, bytes_cell, prim_at, readable, str_cell};
+use crate::attrs::{AnyValueColumns, AttrTable, bytes_ref, prim_at, readable, str_ref};
 use crate::canonical::{Descriptor, SeriesId, Signal, canonical_double_bits};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
@@ -354,10 +354,19 @@ impl crate::value::Reservations for Budget {
 
 /// Approximate retained bytes of one denormalized cell.
 pub(crate) fn denorm_bytes(v: &Option<DenormValue>) -> usize {
-    match v {
+    denorm_cell_bytes(v.as_ref().map(|v| match v {
+        DenormValue::Str(s) => Some(s.len()),
+        _ => None,
+    }))
+}
+
+/// [`denorm_bytes`] of an absent cell (`None`), a string of the given
+/// length, or a scalar (`Some(None)`).
+fn denorm_cell_bytes(cell: Option<Option<usize>>) -> usize {
+    match cell {
         None => 8,
-        Some(DenormValue::Str(s)) => s.len() + BUFFER_HEADER_BYTES,
-        Some(_) => 16,
+        Some(Some(len)) => len + BUFFER_HEADER_BYTES,
+        Some(None) => 16,
     }
 }
 
@@ -378,6 +387,34 @@ fn lookup<'a>(list: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
     list.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
+/// [`map_string`] of a value, borrowing a string instead of copying it.
+fn map_str(v: &Value) -> Option<Cow<'_, str>> {
+    match v {
+        Value::Str(s) => Some(Cow::Borrowed(s)),
+        other => map_string(other).map(Cow::Owned),
+    }
+}
+
+/// [`map_string_reserving`] of a value, borrowing a string instead of
+/// copying it; the borrowed string's length is reserved all the same.
+fn map_str_reserving<'a>(v: &'a Value, budget: &mut Budget) -> Result<Option<Cow<'a, str>>> {
+    match v {
+        Value::Str(s) => {
+            budget.charge(s.len())?;
+            Ok(Some(Cow::Borrowed(s)))
+        }
+        other => Ok(map_string_reserving(other, &mut Rendering(budget))?.map(Cow::Owned)),
+    }
+}
+
+/// A denormalized value borrowed from the attribute list it was found in.
+enum DenormRef<'a> {
+    Str(Cow<'a, str>),
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+}
+
 /// Resolve one denormalized column for a row.
 pub(crate) fn denorm_lookup(
     d: &Denormalize,
@@ -386,6 +423,42 @@ pub(crate) fn denorm_lookup(
     attrs: &[(String, Value)],
     stats: &mut ExtractStats,
 ) -> Option<DenormValue> {
+    Some(match denorm_ref(d, resource, scope, attrs, stats)? {
+        DenormRef::Str(s) => DenormValue::Str(s.into_owned()),
+        DenormRef::Int(i) => DenormValue::Int(i),
+        DenormRef::Double(f) => DenormValue::Double(f),
+        DenormRef::Bool(b) => DenormValue::Bool(b),
+    })
+}
+
+/// The values-row cell of one denormalized column and the bytes it retains,
+/// [`denorm_bytes`] of what [`denorm_lookup`] resolves.
+pub(crate) fn denorm_col<'a>(
+    d: &Denormalize,
+    resource: &'a [(String, Value)],
+    scope: &'a [(String, Value)],
+    attrs: &'a [(String, Value)],
+    stats: &mut ExtractStats,
+) -> (Col<'a>, usize) {
+    match denorm_ref(d, resource, scope, attrs, stats) {
+        None => (Col::Str(None), denorm_cell_bytes(None)),
+        Some(DenormRef::Str(s)) => {
+            let bytes = denorm_cell_bytes(Some(Some(s.len())));
+            (Col::Str(Some(s)), bytes)
+        }
+        Some(DenormRef::Int(i)) => (Col::Int(Some(i)), denorm_cell_bytes(Some(None))),
+        Some(DenormRef::Double(f)) => (Col::Double(Some(f)), denorm_cell_bytes(Some(None))),
+        Some(DenormRef::Bool(b)) => (Col::Bool(Some(b)), denorm_cell_bytes(Some(None))),
+    }
+}
+
+fn denorm_ref<'a>(
+    d: &Denormalize,
+    resource: &'a [(String, Value)],
+    scope: &'a [(String, Value)],
+    attrs: &'a [(String, Value)],
+    stats: &mut ExtractStats,
+) -> Option<DenormRef<'a>> {
     let (src, key) = d.source().ok()?;
     let v = match src {
         DenormSource::Resource => lookup(resource, key),
@@ -393,10 +466,10 @@ pub(crate) fn denorm_lookup(
         DenormSource::Attrs => lookup(attrs, key),
     }?;
     match (d.ty, v) {
-        (DenormType::String, v) => map_string(v).map(DenormValue::Str),
-        (DenormType::Int64, Value::Int(i)) => Some(DenormValue::Int(*i)),
-        (DenormType::Double, Value::Double(f)) => Some(DenormValue::Double(*f)),
-        (DenormType::Bool, Value::Bool(b)) => Some(DenormValue::Bool(*b)),
+        (DenormType::String, v) => map_str(v).map(DenormRef::Str),
+        (DenormType::Int64, Value::Int(i)) => Some(DenormRef::Int(*i)),
+        (DenormType::Double, Value::Double(f)) => Some(DenormRef::Double(*f)),
+        (DenormType::Bool, Value::Bool(b)) => Some(DenormRef::Bool(*b)),
         (_, Value::Null) => None,
         _ => {
             stats.denorm_type_mismatch += 1;
@@ -422,10 +495,32 @@ pub(crate) fn denorm_lookup(
 }
 
 /// Producer id projection of a resource attribute list.
-pub(crate) fn producer_id(resource: &[(String, Value)], attribute: &str) -> String {
+fn producer_id<'a>(resource: &'a [(String, Value)], attribute: &str) -> Cow<'a, str> {
     lookup(resource, attribute)
-        .and_then(map_string)
+        .and_then(map_str)
         .unwrap_or_default()
+}
+
+/// The producer ids of one request, projected once per resource id.
+pub(crate) struct Producers<'a> {
+    attribute: &'a str,
+    ids: std::collections::HashMap<Option<u32>, Cow<'a, str>>,
+}
+
+impl<'a> Producers<'a> {
+    pub(crate) fn new(cfg: &'a LakeConfig) -> Self {
+        Self {
+            attribute: &cfg.producer_id_attribute,
+            ids: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The producer id of resource `id`, whose attributes are `resource`.
+    pub(crate) fn get(&mut self, id: Option<u32>, resource: &'a [(String, Value)]) -> &str {
+        self.ids
+            .entry(id)
+            .or_insert_with(|| producer_id(resource, self.attribute))
+    }
 }
 
 /// The hasher of the per-request series memos, seeded once per process so
@@ -515,30 +610,12 @@ fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
     }
 }
 
-/// A `Utf8` column whose cells are borrowed for the whole request.
-pub(crate) struct StrCol<'a>(Option<StringArrayAccessor<'a>>);
-
-impl<'a> StrCol<'a> {
-    /// The cells of a [`readable`] `Utf8` column, or of an absent one.
-    pub(crate) fn new(a: &'a Option<ArrayRef>) -> Result<Self> {
-        a.as_ref()
-            .map(StringArrayAccessor::try_new)
-            .transpose()
-            .map(Self)
-            .map_err(|e| Error::invalid(format!("string column: {e}")))
-    }
-
-    /// The string at `row`, empty when null or absent, as [`str_at`] reads it.
-    pub(crate) fn at(&self, row: usize) -> &str {
-        self.0.as_ref().and_then(|a| a.str_at(row)).unwrap_or("")
-    }
-}
-
-/// A typed cell of a values row, in dataset schema order.
+/// A typed cell of a values row, in dataset schema order, borrowed from the
+/// request wherever the stored value is the request's own.
 #[derive(Debug, Clone)]
-pub(crate) enum Col {
+pub(crate) enum Col<'a> {
     /// Utf8.
-    Str(Option<String>),
+    Str(Option<Cow<'a, str>>),
     /// Int64.
     Int(Option<i64>),
     /// Int32.
@@ -550,36 +627,41 @@ pub(crate) enum Col {
     /// Timestamp(us).
     TsUs(Option<i64>),
     /// FixedSizeBinary.
-    Fixed(Option<Vec<u8>>),
+    Fixed(Option<&'a [u8]>),
     /// Map<Utf8, Utf8>.
-    Map(Vec<(String, Option<String>)>),
+    Map(Vec<(&'a str, Option<Cow<'a, str>>)>),
     /// List<Int64>. `None` is a null list, which a number point writes into
     /// the merged metrics values dataset.
     ListI64(Option<Vec<i64>>),
     /// List<Float64>. `None` is a null list, which a number point writes into
     /// the merged metrics values dataset.
-    ListF64(Option<Vec<f64>>),
+    ListF64(Option<Cow<'a, [f64]>>),
     /// Binary.
-    Bytes(Vec<u8>),
+    Bytes(&'a [u8]),
 }
 
-impl From<Option<DenormValue>> for Col {
-    fn from(v: Option<DenormValue>) -> Self {
+impl<'a> From<&'a Option<DenormValue>> for Col<'a> {
+    fn from(v: &'a Option<DenormValue>) -> Self {
         match v {
             None => Col::Str(None),
-            Some(DenormValue::Str(s)) => Col::Str(Some(s)),
-            Some(DenormValue::Int(i)) => Col::Int(Some(i)),
-            Some(DenormValue::Double(f)) => Col::Double(Some(f)),
-            Some(DenormValue::Bool(b)) => Col::Bool(Some(b)),
+            Some(DenormValue::Str(s)) => Col::Str(Some(Cow::Borrowed(s))),
+            Some(DenormValue::Int(i)) => Col::Int(Some(*i)),
+            Some(DenormValue::Double(f)) => Col::Double(Some(*f)),
+            Some(DenormValue::Bool(b)) => Col::Bool(Some(*b)),
         }
     }
 }
 
+/// A string cell borrowed from the request.
+pub(crate) fn str_col(s: &str) -> Col<'_> {
+    Col::Str(Some(Cow::Borrowed(s)))
+}
+
 /// One values row.
 #[derive(Debug, Clone)]
-pub(crate) struct ValuesRow {
+pub(crate) struct ValuesRow<'a> {
     /// Cells in dataset schema order.
-    pub cols: Vec<Col>,
+    pub cols: Vec<Col<'a>>,
     /// Approximate retained bytes.
     pub approx_bytes: usize,
     /// The part of `approx_bytes` the budget already holds, reserved while a
@@ -628,7 +710,7 @@ fn builder_for(dt: &DataType) -> Result<AnyBuilder> {
     })
 }
 
-fn append(b: &mut AnyBuilder, c: &Col) -> Result<()> {
+fn append(b: &mut AnyBuilder, c: &Col<'_>) -> Result<()> {
     match (b, c) {
         (AnyBuilder::Str(b), Col::Str(v)) => b.append_option(v.as_deref()),
         (AnyBuilder::Int(b), Col::Int(v)) => b.append_option(*v),
@@ -729,8 +811,13 @@ impl RowSink {
         })
     }
 
+    /// Cells of every row of the dataset.
+    pub(crate) fn width(&self) -> usize {
+        self.builders.len()
+    }
+
     /// Append one row, sealing the current slice first when it would overflow.
-    pub(crate) fn push(&mut self, row: &ValuesRow, budget: &mut Budget) -> Result<()> {
+    pub(crate) fn push(&mut self, row: &ValuesRow<'_>, budget: &mut Budget) -> Result<()> {
         budget.charge_row_holding(row.approx_bytes, row.held_bytes)?;
         if row.cols.len() != self.builders.len() {
             return Err(Error::internal("row width does not match dataset schema"));
@@ -781,11 +868,9 @@ impl RowSink {
 /// strings (which can expand them several-fold). Charging the tree's size would
 /// therefore admit a row whose stored form is far past `max_row_bytes`, which no
 /// later recount can undo. The caller charges the returned size.
-pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col, usize) {
-    let entries: Vec<(String, Option<String>)> = list
-        .iter()
-        .map(|(k, v)| (k.clone(), map_string(v)))
-        .collect();
+pub(crate) fn map_cell(list: &[(String, Value)]) -> (Col<'_>, usize) {
+    let entries: Vec<(&str, Option<Cow<'_, str>>)> =
+        list.iter().map(|(k, v)| (k.as_str(), map_str(v))).collect();
     let bytes = entries
         .iter()
         .map(|(k, v)| rendered_entry_bytes(k, v.as_deref()))
@@ -803,7 +888,7 @@ pub(crate) fn map_cell_reserving<'a>(
     list: impl IntoIterator<Item = &'a (String, Value)>,
     row_before: usize,
     budget: &mut Budget,
-) -> Result<(Col, usize)> {
+) -> Result<(Col<'a>, usize)> {
     let mark = budget.mark();
     let cell = map_cell_within(list, row_before, budget);
     if cell.is_err() {
@@ -816,16 +901,16 @@ fn map_cell_within<'a>(
     list: impl IntoIterator<Item = &'a (String, Value)>,
     row_before: usize,
     budget: &mut Budget,
-) -> Result<(Col, usize)> {
-    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+) -> Result<(Col<'a>, usize)> {
+    let mut entries: Vec<(&str, Option<Cow<'_, str>>)> = Vec::new();
     let mut held = 0_usize;
     for (k, v) in list {
         let key = rendered_entry_bytes(k, None);
         budget.charge(key)?;
-        let rendered = map_string_reserving(v, &mut Rendering(budget))?;
+        let rendered = map_str_reserving(v, budget)?;
         held += rendered_entry_bytes(k, rendered.as_deref());
         budget.check_row(row_before.saturating_add(held))?;
-        entries.push((k.clone(), rendered));
+        entries.push((k, rendered));
     }
     Ok((Col::Map(entries), held))
 }
@@ -961,9 +1046,12 @@ pub(crate) fn attrs_of(table: &AttrTable, id: Option<u32>) -> &[(String, Value)]
 /// Reads through a dictionary (see [`readable`]), so only this one cell is
 /// copied.
 pub(crate) fn str_at(a: &Option<ArrayRef>, row: usize) -> String {
-    a.as_ref()
-        .and_then(|a| str_cell(a, row, str::to_owned))
-        .unwrap_or_default()
+    str_of(a, row).to_owned()
+}
+
+/// A Utf8 column's cell borrowed from it, empty when null or absent.
+pub(crate) fn str_of(a: &Option<ArrayRef>, row: usize) -> &str {
+    a.as_ref().and_then(|a| str_ref(a, row)).unwrap_or("")
 }
 
 /// A `UInt32` OTLP flags column reinterpreted into the signed storage column.
@@ -976,9 +1064,10 @@ pub(crate) fn flags_at(a: &Option<ArrayRef>, row: usize) -> i32 {
     prim_at::<UInt32Type>(a, row).unwrap_or(0) as i32
 }
 
-/// A `FixedSizeBinary` column read as owned bytes, `None` when null or absent.
-pub(crate) fn fixed_at(a: &Option<ArrayRef>, row: usize) -> Option<Vec<u8>> {
-    a.as_ref().and_then(|a| bytes_cell(a, row, <[u8]>::to_vec))
+/// A `FixedSizeBinary` column's cell borrowed from it, `None` when null or
+/// absent.
+pub(crate) fn fixed_ref(a: &Option<ArrayRef>, row: usize) -> Option<&[u8]> {
+    a.as_ref().and_then(|a| bytes_ref(a, row))
 }
 
 /// Build a `series` batch from descriptor rows.
@@ -999,15 +1088,15 @@ pub fn series_batch(
         .collect::<Result<Vec<_>>>()?;
     for r in rows {
         let d = &r.descriptor;
-        let mut cols: Vec<Col> = vec![
-            Col::Fixed(Some(r.series_id.to_vec())),
-            Col::Bytes(r.identity_bytes.clone()),
+        let mut cols: Vec<Col<'_>> = vec![
+            Col::Fixed(Some(&r.series_id)),
+            Col::Bytes(&r.identity_bytes),
             Col::TsUs(Some(emitted_at_us)),
-            Col::Str(Some(d.resource_schema_url.clone())),
+            str_col(&d.resource_schema_url),
             map_cell(&d.resource_attrs).0,
-            Col::Str(Some(d.scope_name.clone())),
-            Col::Str(Some(d.scope_version.clone())),
-            Col::Str(Some(d.scope_schema_url.clone())),
+            str_col(&d.scope_name),
+            str_col(&d.scope_version),
+            str_col(&d.scope_schema_url),
             map_cell(&d.scope_attrs).0,
             map_cell(&d.attrs).0,
         ];
@@ -1017,15 +1106,15 @@ pub fn series_batch(
                 .as_ref()
                 .ok_or_else(|| Error::internal("metrics descriptor without metric"))?;
             cols.extend([
-                Col::Str(Some(m.name.clone())),
-                Col::Str(Some(m.unit.clone())),
-                Col::Str(Some(m.kind.as_str().to_string())),
-                Col::Str(Some(m.temporality.as_str().to_string())),
+                str_col(&m.name),
+                str_col(&m.unit),
+                str_col(m.kind.as_str()),
+                str_col(m.temporality.as_str()),
                 Col::Bool(Some(m.is_monotonic)),
-                Col::Str(Some(m.description.clone())),
+                str_col(&m.description),
             ]);
         }
-        cols.extend(r.denorm.iter().cloned().map(Col::from));
+        cols.extend(r.denorm.iter().map(Col::from));
         for (b, c) in builders.iter_mut().zip(&cols) {
             append(b, c)?;
         }

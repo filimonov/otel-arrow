@@ -8,9 +8,10 @@
 //! not stored in the row: readers take it from `metric_type` in the series
 //! descriptor through the join of FORMAT.md section 6.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use arrow::array::{Array, ArrayRef, AsArray, ListArray};
+use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray, ListArray, PrimitiveArray};
 use arrow::datatypes::{
     DataType, Float64Type, Int32Type, Int64Type, TimeUnit, TimestampNanosecondType, UInt8Type,
     UInt16Type, UInt32Type, UInt64Type,
@@ -27,9 +28,9 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, RowSink, SharedLists,
-    ValuesRow, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at,
-    hash_kv, identity, kv_eq, plain, producer_id, str_at, struct_child, timestamp_pair, typed_col,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, Producers, RowSink,
+    SharedLists, ValuesRow, attr_table, attrs_of, denorm_col, descriptor_row, flags_at, hash_kv,
+    identity, kv_eq, plain, str_at, str_col, struct_child, timestamp_pair, typed_col,
 };
 use crate::attrs::{AttrTable, bool_at, prim_at};
 use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
@@ -293,7 +294,7 @@ impl Common<'_> {
     /// [`PER_KIND_FIXED_BYTES`]. It runs once the point's series is known and
     /// may refuse the request.
     #[allow(clippy::too_many_arguments)]
-    fn append_points(
+    fn append_points<'k>(
         &mut self,
         rows: usize,
         columns: &PointColumns,
@@ -301,11 +302,14 @@ impl Common<'_> {
         orphan: &'static str,
         sink: &mut RowSink,
         budget: &mut Budget,
-        mut kind: impl FnMut(usize) -> Result<([Col; 8], usize)>,
+        mut kind: impl FnMut(usize) -> Result<([Col<'k>; 8], usize)>,
     ) -> Result<()> {
         let metrics = self.metrics;
         let (resource_attrs, scope_attrs) = (self.resource_attrs, self.scope_attrs);
         let mut memo = HashMap::with_hasher(MemoHasher::default());
+        let denorm = denorm_columns(Dataset::MetricsValues, self.cfg);
+        let mut producers = Producers::new(self.cfg);
+        let width = sink.width();
         for row in 0..rows {
             let metric_id = prim_at::<UInt16Type>(&columns.parent, row)
                 .map(u32::from)
@@ -319,27 +323,24 @@ impl Common<'_> {
             let (kind_cols, kind_bytes) = kind(row)?;
             let resource = attrs_of(resource_attrs, m.resource_id);
             let scope = attrs_of(scope_attrs, m.scope_id);
-            let (mut cols, mut approx) = common_cols(
-                id,
+            let (common, mut approx) = common_cols(
+                &id,
                 m,
-                resource,
-                self.cfg,
+                producers.get(m.resource_id, resource),
                 prim_at::<TimestampNanosecondType>(&columns.time, row).unwrap_or(0),
                 prim_at::<TimestampNanosecondType>(&columns.start, row).unwrap_or(0),
                 flags_at(&columns.flags, row),
                 &mut self.stats,
             );
+            let mut cols = Vec::with_capacity(width);
+            cols.extend(common);
             cols.extend(kind_cols);
             approx += PER_KIND_FIXED_BYTES + kind_bytes;
-            approx += push_denorm(
-                &mut cols,
-                Dataset::MetricsValues,
-                resource,
-                scope,
-                point_attrs,
-                self.cfg,
-                &mut self.stats,
-            );
+            for d in &denorm {
+                let (cell, bytes) = denorm_col(d, resource, scope, point_attrs, &mut self.stats);
+                approx += bytes;
+                cols.push(cell);
+            }
             sink.push(
                 &ValuesRow {
                     cols,
@@ -368,37 +369,65 @@ struct PointColumns {
     flags: Option<ArrayRef>,
 }
 
+/// A list column of a point table with its items cast once to `T`.
+///
+/// An absent or null list row is an empty list, which is the "no buckets"
+/// case.
+struct ListItems<T: ArrowPrimitiveType> {
+    list: Option<(ListArray, PrimitiveArray<T>)>,
+}
+
+impl<T: ArrowPrimitiveType> ListItems<T> {
+    fn new(list: Option<&ListArray>) -> Result<Self> {
+        let list = list
+            .map(|list| {
+                let items = arrow::compute::cast(list.values(), &T::DATA_TYPE)?;
+                Ok::<_, Error>((list.clone(), items.as_primitive::<T>().clone()))
+            })
+            .transpose()?;
+        Ok(Self { list })
+    }
+
+    /// The items of `row`, and whether any of them is null.
+    fn at(&self, row: usize) -> (&[T::Native], bool) {
+        let Some((list, items)) = self.list.as_ref().filter(|(l, _)| l.is_valid(row)) else {
+            return (&[], false);
+        };
+        let offsets = list.value_offsets();
+        #[allow(clippy::cast_sign_loss)]
+        let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+        let nulls = items
+            .nulls()
+            .is_some_and(|n| n.slice(start, end - start).null_count() > 0);
+        (&items.values()[start..end], nulls)
+    }
+}
+
 /// One row of `bucket_counts`, cast to the signed storage type.
 ///
 /// A null element would silently become a bucket of 0, which is a different
-/// histogram, so it refuses the request instead. An absent or null list row is
-/// an empty list, which is the "no buckets" case.
-fn bucket_counts_at(a: &Option<ListArray>, row: usize) -> Result<Vec<i64>> {
-    let Some(list) = a.as_ref().filter(|a| a.is_valid(row)).map(|a| a.value(row)) else {
-        return Ok(vec![]);
-    };
-    let vals = arrow::compute::cast(&list, &DataType::UInt64)?;
-    let mut out = Vec::with_capacity(vals.len());
-    for v in vals.as_primitive::<UInt64Type>().iter() {
-        let v = v.ok_or_else(|| Error::invalid("null bucket count"))?;
-        out.push(i64::try_from(v).map_err(|_| Error::invalid("bucket count above i64::MAX"))?);
+/// histogram, so it refuses the request instead.
+fn bucket_counts_at(a: &ListItems<UInt64Type>, row: usize) -> Result<Vec<i64>> {
+    let (items, nulls) = a.at(row);
+    if nulls {
+        return Err(Error::invalid("null bucket count"));
     }
-    Ok(out)
+    items
+        .iter()
+        .map(|&v| i64::try_from(v).map_err(|_| Error::invalid("bucket count above i64::MAX")))
+        .collect()
 }
 
-/// One row of `explicit_bounds`.
+/// One row of `explicit_bounds`, borrowed.
 ///
 /// A null element would silently become a bound of 0.0, which is a different
 /// histogram, so it refuses the request instead.
-fn explicit_bounds_at(a: &Option<ListArray>, row: usize) -> Result<Vec<f64>> {
-    let Some(list) = a.as_ref().filter(|a| a.is_valid(row)).map(|a| a.value(row)) else {
-        return Ok(vec![]);
-    };
-    let vals = arrow::compute::cast(&list, &DataType::Float64)?;
-    vals.as_primitive::<Float64Type>()
-        .iter()
-        .map(|v| v.ok_or_else(|| Error::invalid("null explicit bound")))
-        .collect()
+fn explicit_bounds_at(a: &ListItems<Float64Type>, row: usize) -> Result<&[f64]> {
+    let (items, nulls) = a.at(row);
+    if nulls {
+        return Err(Error::invalid("null explicit bound"));
+    }
+    Ok(items)
 }
 
 /// Bytes a merged values row's fixed per-kind cells retain: the two value
@@ -407,25 +436,23 @@ fn explicit_bounds_at(a: &Option<ListArray>, row: usize) -> Result<Vec<f64>> {
 const PER_KIND_FIXED_BYTES: usize = 16 + 32 + 48;
 
 /// The eight leading columns shared by both point kinds, plus their bytes.
-fn common_cols(
-    id: SeriesId,
-    m: &MetricRow,
-    resource: &[(String, Value)],
-    cfg: &LakeConfig,
+fn common_cols<'r>(
+    id: &'r SeriesId,
+    m: &'r MetricRow,
+    producer: &'r str,
     t_ns: i64,
     s_ns: i64,
     fl: i32,
     stats: &mut ExtractStats,
-) -> (Vec<Col>, usize) {
+) -> ([Col<'r>; 8], usize) {
     let (t_ns, t_us) = timestamp_pair(t_ns, stats);
     let (s_ns, s_us) = timestamp_pair(s_ns, stats);
-    let producer = producer_id(resource, &cfg.producer_id_attribute);
-    let name = m.metric.name.clone();
+    let name = &m.metric.name;
     let bytes = 16 + producer.len() + name.len() + 8 * 5 + 48;
-    let cols = vec![
-        Col::Fixed(Some(id.to_vec())),
-        Col::Str(Some(producer)),
-        Col::Str(Some(name)),
+    let cols = [
+        Col::Fixed(Some(id)),
+        str_col(producer),
+        str_col(name),
         Col::TsUs(t_us),
         Col::Int(t_ns),
         Col::TsUs(s_us),
@@ -433,25 +460,6 @@ fn common_cols(
         Col::Int32(Some(fl)),
     ];
     (cols, bytes)
-}
-
-/// Append the denormalized cells of `ds` and return the bytes they add.
-fn push_denorm(
-    cols: &mut Vec<Col>,
-    ds: Dataset,
-    resource: &[(String, Value)],
-    scope: &[(String, Value)],
-    attrs: &[(String, Value)],
-    cfg: &LakeConfig,
-    stats: &mut ExtractStats,
-) -> usize {
-    let mut bytes = 0;
-    for d in denorm_columns(ds, cfg) {
-        let v = denorm_lookup(d, resource, scope, attrs, stats);
-        bytes += denorm_bytes(&v);
-        cols.push(Col::from(v));
-    }
-    bytes
 }
 
 pub(crate) fn extract_metrics(
@@ -594,8 +602,16 @@ pub(crate) fn extract_metrics(
         let min = plain(b, HISTOGRAM_MIN, &DataType::Float64)?;
         let max = plain(b, HISTOGRAM_MAX, &DataType::Float64)?;
         let flags = plain(b, FLAGS, &DataType::UInt32)?;
-        let bc = typed_col::<ListArray>(b, HISTOGRAM_BUCKET_COUNTS, "a list")?.cloned();
-        let eb = typed_col::<ListArray>(b, HISTOGRAM_EXPLICIT_BOUNDS, "a list")?.cloned();
+        let bc = ListItems::<UInt64Type>::new(typed_col::<ListArray>(
+            b,
+            HISTOGRAM_BUCKET_COUNTS,
+            "a list",
+        )?)?;
+        let eb = ListItems::<Float64Type>::new(typed_col::<ListArray>(
+            b,
+            HISTOGRAM_EXPLICIT_BOUNDS,
+            "a list",
+        )?)?;
         let columns = PointColumns {
             parent,
             attrs_id,
@@ -634,7 +650,7 @@ pub(crate) fn extract_metrics(
                         Col::Double(prim_at::<Float64Type>(&min, row)),
                         Col::Double(prim_at::<Float64Type>(&max, row)),
                         Col::ListI64(Some(counts)),
-                        Col::ListF64(Some(bounds)),
+                        Col::ListF64(Some(Cow::Borrowed(bounds))),
                     ],
                     bytes,
                 ))
@@ -1477,10 +1493,11 @@ mod tests {
     }
 
     /// Scenario: `bucket_counts` and `explicit_bounds` rows that hold a null
-    /// element, and rows that are absent or null altogether.
+    /// element, rows that are absent or null altogether, and a valid row
+    /// after them.
     /// Guarantees: a null element refuses the request as invalid rather than
     /// being stored as a 0 bucket or a 0.0 bound; an absent or null list row is
-    /// read as the empty list.
+    /// read as the empty list; a later row reads exactly its own items.
     #[test]
     fn null_list_elements_are_refused() {
         let mut counts = ListBuilder::new(UInt64Builder::new());
@@ -1488,6 +1505,8 @@ mod tests {
         counts.values().append_null();
         counts.append(true);
         counts.append(false);
+        counts.values().append_slice(&[2, 3]);
+        counts.append(true);
         let counts = counts.finish();
 
         let mut bounds = ListBuilder::new(Float64Builder::new());
@@ -1495,32 +1514,38 @@ mod tests {
         bounds.values().append_null();
         bounds.append(true);
         bounds.append(false);
+        bounds.values().append_value(2.5);
+        bounds.append(true);
         let bounds = bounds.finish();
+        let counts = ListItems::<UInt64Type>::new(Some(&counts)).expect("counts");
+        let bounds = ListItems::<Float64Type>::new(Some(&bounds)).expect("bounds");
 
         assert!(matches!(
-            bucket_counts_at(&Some(counts.clone()), 0),
+            bucket_counts_at(&counts, 0),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
         assert!(matches!(
-            explicit_bounds_at(&Some(bounds.clone()), 0),
+            explicit_bounds_at(&bounds, 0),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
         // A null list row, and an absent column, are both the empty list.
+        let empty: &[f64] = &[];
         assert_eq!(
-            bucket_counts_at(&Some(counts), 1).expect("null row"),
+            bucket_counts_at(&counts, 1).expect("null row"),
+            Vec::<i64>::new()
+        );
+        assert_eq!(explicit_bounds_at(&bounds, 1).expect("null row"), empty);
+        assert_eq!(bucket_counts_at(&counts, 2).expect("valid row"), vec![2, 3]);
+        assert_eq!(explicit_bounds_at(&bounds, 2).expect("valid row"), &[2.5]);
+        let absent_counts = ListItems::<UInt64Type>::new(None).expect("absent");
+        let absent_bounds = ListItems::<Float64Type>::new(None).expect("absent");
+        assert_eq!(
+            bucket_counts_at(&absent_counts, 0).expect("absent"),
             Vec::<i64>::new()
         );
         assert_eq!(
-            explicit_bounds_at(&Some(bounds), 1).expect("null row"),
-            Vec::<f64>::new()
-        );
-        assert_eq!(
-            bucket_counts_at(&None, 0).expect("absent"),
-            Vec::<i64>::new()
-        );
-        assert_eq!(
-            explicit_bounds_at(&None, 0).expect("absent"),
-            Vec::<f64>::new()
+            explicit_bounds_at(&absent_bounds, 0).expect("absent"),
+            empty
         );
     }
 
