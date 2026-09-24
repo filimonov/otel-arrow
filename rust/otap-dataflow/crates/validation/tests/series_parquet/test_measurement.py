@@ -3849,7 +3849,7 @@ class StageContracts(unittest.TestCase):
         self.assertIn(child["run_id"], derived["affinity_matched"]["detail"])
 
     # Scenario: the timing and the heap children of one stage are built
-    # differently, one with the system allocator and one with DHAT.
+    # differently, one on jemalloc and one with DHAT.
     # Guarantees: the two carry different baseline fingerprints, so a heap
     # profile is never compared against a timing baseline.
     def test_profiles_do_not_share_a_fingerprint(self):
@@ -3868,7 +3868,8 @@ class StageContracts(unittest.TestCase):
                 "core_allocation": {"bench": [1]},
                 "build": {
                     "profile": "bench", "features": "default",
-                    "allocator": "system", "toolchain": "rustc 1.88",
+                    "allocator": performance.TIMING_ALLOCATOR,
+                    "toolchain": "rustc 1.88",
                 },
             },
             "config": {"effective": {"lake": {}}},
@@ -3951,7 +3952,7 @@ class StageContracts(unittest.TestCase):
         description = {
             "bench": "measurement",
             "bench_heap": False,
-            "allocator": "system",
+            "allocator": performance.TIMING_ALLOCATOR,
             "debug_assertions": True,
         }
         with mock.patch.dict(
@@ -4001,7 +4002,7 @@ class StageContracts(unittest.TestCase):
             described[str(path)] = {
                 "bench": name.split("-")[0],
                 "bench_heap": heap,
-                "allocator": "dhat" if heap else "system",
+                "allocator": "dhat" if heap else performance.TIMING_ALLOCATOR,
                 "debug_assertions": False,
             }
         with mock.patch.object(performance.test_e2e, "WORKSPACE", directory):
@@ -4013,6 +4014,104 @@ class StageContracts(unittest.TestCase):
         self.assertTrue(timing["measurement"]["executable"].endswith("measurement-aaa"))
         self.assertTrue(timing["layered"]["executable"].endswith("layered-ccc"))
         self.assertTrue(heap["measurement"]["executable"].endswith("measurement-bbb"))
+
+    # Scenario: the newest prebuilt timing bench still runs on the system
+    # allocator, an older one on the engine's jemalloc; then only the system
+    # one is left.
+    # Guarantees: a timing child always runs on the engine's allocator: the
+    # jemalloc build is chosen over the newer one, and without it the family
+    # refuses to start, naming the allocator it found and the build command.
+    def test_a_timing_bench_must_run_on_the_engine_allocator(self):
+        directory = temporary_directory(self)
+        deps = directory / "target/release/deps"
+        deps.mkdir(parents=True)
+        described = {}
+        for age, (name, allocator) in enumerate((
+            ("measurement-new", "system"),
+            ("measurement-old", performance.TIMING_ALLOCATOR),
+            ("layered-ccc", performance.TIMING_ALLOCATOR),
+        )):
+            path = deps / name
+            _ = path.write_text("")
+            path.chmod(0o755)
+            os.utime(path, (1000 - age, 1000 - age))
+            described[str(path)] = {
+                "bench": name.split("-")[0], "bench_heap": False,
+                "allocator": allocator, "debug_assertions": False,
+            }
+        with mock.patch.object(performance.test_e2e, "WORKSPACE", directory):
+            with mock.patch.object(
+                performance, "describe_bench", lambda path, **_: described[str(path)]
+            ):
+                timing = performance.locate_benches()
+                self.assertTrue(
+                    timing["measurement"]["executable"].endswith("measurement-old")
+                )
+                (deps / "measurement-old").unlink()
+                with self.assertRaisesRegex(
+                    AssertionError, r"'system' allocator.*jemalloc\+background_thread"
+                ):
+                    _ = performance.locate_benches()
+
+    # Scenario: the build provenance of a timing bench is taken from what
+    # the executable described, once for a system-allocator build and once
+    # for the engine's jemalloc build, on otherwise equal stage results.
+    # Guarantees: the recorded allocator is the described one and the two
+    # builds fingerprint differently, so a baseline written on one allocator
+    # is never compared with a run on the other; an executable that does not
+    # name its allocator is refused.
+    def test_the_described_allocator_enters_the_fingerprint(self):
+        directory = temporary_directory(self)
+        engine = {"profile": "release", "features": "x", "allocator": "jemalloc",
+                  "toolchain": "rustc 1.88", "binary": "b", "binary_sha256": "h",
+                  "binary_size_bytes": 1}
+        builds = {}
+        with mock.patch.object(
+            performance.measurement, "engine_build", lambda _path: dict(engine)
+        ):
+            for allocator in ("system", performance.TIMING_ALLOCATOR):
+                builds[allocator] = performance.bench_build({
+                    "executable": str(directory / "measurement-aaa"),
+                    "description": {"bench": "measurement", "allocator": allocator},
+                    "features": [],
+                })
+            with self.assertRaisesRegex(AssertionError, "does not name its allocator"):
+                _ = performance.bench_build({
+                    "executable": str(directory / "measurement-aaa"),
+                    "description": {"bench": "measurement"}, "features": [],
+                })
+        self.assertEqual(
+            builds[performance.TIMING_ALLOCATOR]["allocator"], "jemalloc+background_thread"
+        )
+        self.assertEqual(builds["system"]["features"], "default")
+
+        def result(build):
+            """A stage result that differs only in its build."""
+            return {
+                "case": "stages-extract",
+                "run_dir": str(directory),
+                "environment": {
+                    "machine_identity_sha256": "m",
+                    "start": {
+                        "cpu_model": "cpu", "logical_core_count": 32,
+                        "physical_core_count": 16, "sibling_groups": [[0, 16]],
+                        "ram_bytes": 1, "kernel": "linux", "available_cores": [0, 1],
+                    },
+                    "core_allocation": {"bench": [1]},
+                    "build": build,
+                },
+                "config": {"effective": {"lake": {}}},
+                "workload": measurement.Workload().as_json(),
+                "workload_schedule": {
+                    "duration_s": 1, "rate_requests_per_s": "closed_loop",
+                    "max_in_flight": 1,
+                },
+            }
+
+        self.assertNotEqual(
+            measurement.baseline_fingerprint(result(builds["system"])),
+            measurement.baseline_fingerprint(result(builds[performance.TIMING_ALLOCATOR])),
+        )
 
     # Scenario: the noop pipeline stores nothing, and its stage result says
     # so with a measured zero.

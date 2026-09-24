@@ -602,6 +602,12 @@ BENCH_ENV = {
     ("layered", False): "SERIES_LAYERED_BENCH",
 }
 
+# The allocator a timing bench must describe: the engine's jemalloc with its
+# background thread (the bench's `allocator.rs`). Stage families before it
+# timed on the system allocator; their baselines carry that allocator in
+# their fingerprint and are never compared with a jemalloc run.
+TIMING_ALLOCATOR = "jemalloc+background_thread"
+
 # How each executable is built, named in the error a missing one raises.
 # Both benches are gated behind the `bench-harness` feature, which
 # `bench-heap` implies, so a workspace-wide `cargo bench` never builds them.
@@ -625,7 +631,8 @@ def describe_bench(executable, timeout_s=60) -> dict:
     """Ask one prebuilt executable what it is.
 
     The executable answers `--describe` with its target name, whether DHAT's
-    allocator is installed and whether it carries debug assertions. Asking
+    allocator is installed, the allocator it runs on and whether it carries
+    debug assertions. Asking
     cargo instead would build the target it was asked about, and a compiler
     running beside a measurement is exactly what invalidates one.
     """
@@ -665,7 +672,8 @@ def locate_benches(*, features=()) -> dict:
     launches executables that already exist and refuses to start when one is
     missing, naming the command that builds it. Each candidate identifies
     itself, so the DHAT build and the timing build are told apart by what
-    they are rather than by their file name, and a debug build is refused.
+    they are rather than by their file name, a debug build is refused, and
+    so is a timing build that does not run on `TIMING_ALLOCATOR`.
     """
     heap = "bench-heap" in features
     wanted = [("measurement", heap)] + ([] if heap else [("layered", False)])
@@ -697,6 +705,13 @@ def locate_benches(*, features=()) -> dict:
                 continue
             if bool(description.get("bench_heap")) != needs_heap:
                 continue
+            if not needs_heap and description.get("allocator") != TIMING_ALLOCATOR:
+                problems.append(
+                    f"{path}: runs on the {description.get('allocator')!r} "
+                    f"allocator; a timing bench runs on {TIMING_ALLOCATOR!r} "
+                    f"like the engine"
+                )
+                continue
             found[name] = {
                 "executable": str(path),
                 "description": description,
@@ -715,20 +730,25 @@ def locate_benches(*, features=()) -> dict:
     return found
 
 
-def bench_build(executable, *, features, allocator) -> dict:
-    """The build provenance of one bench executable.
+def bench_build(located) -> dict:
+    """The build provenance of one bench executable `locate_benches` found.
 
     The profile is `bench`: cargo's bench profile inherits release and adds
     fat link-time optimization, and its artifacts land beside the release
-    ones. The features and the allocator separate a timing build from the
-    DHAT one, so the two never share a baseline fingerprint.
+    ones. The allocator is the one the executable described, so it enters
+    the baseline fingerprint: the DHAT and timing builds never share one,
+    and neither do timing builds on different allocators.
     """
-    executable = Path(executable)
-    build = measurement.engine_build(executable)
+    allocator = located["description"].get("allocator")
+    if not allocator:
+        raise AssertionError(
+            f"{located['executable']} does not name its allocator in --describe"
+        )
+    build = measurement.engine_build(Path(located["executable"]))
     build.update(
         {
             "profile": "bench",
-            "features": ",".join(sorted(features)) or "default",
+            "features": ",".join(located["features"]) or "default",
             "allocator": allocator,
         }
     )
@@ -2595,23 +2615,15 @@ def run_stages(spec: measurement.RunSpec, output_dir, report_dir=None, **options
         "benches": {
             "measurement": {
                 "executable": timing["measurement"]["executable"],
-                "build": bench_build(
-                    timing["measurement"]["executable"], features=(),
-                    allocator="system",
-                ),
+                "build": bench_build(timing["measurement"]),
             },
             "measurement_heap": {
                 "executable": heap["measurement"]["executable"],
-                "build": bench_build(
-                    heap["measurement"]["executable"], features=("bench-heap",),
-                    allocator="dhat",
-                ),
+                "build": bench_build(heap["measurement"]),
             },
             "layered": {
                 "executable": timing["layered"]["executable"],
-                "build": bench_build(
-                    timing["layered"]["executable"], features=(), allocator="system",
-                ),
+                "build": bench_build(timing["layered"]),
             },
         },
         "inputs": {},
