@@ -80,6 +80,8 @@ PRODUCER_PROCESSES = 4
 SEARCH_CONNECTIONS = 256
 FAN_IN_CONNECTIONS = (1, 8, 64, 256)
 PRODUCER_TIMEOUT_S = 180.0
+# How far ahead of its schedule a sender asks for its requests' pages.
+PREFETCH_AHEAD_S = 3.0
 SENDER_READY_DEADLINE_S = 120
 MESSAGE_LIMIT_BYTES = 64 << 20
 
@@ -425,6 +427,13 @@ class CapacityPool:
         segment = self._segment(index // POOL_SEGMENT_REQUESTS)
         return signal, segment["wire"][offset:offset + length]
 
+    def prefetch(self, index):
+        """Ask the kernel to read one request's bytes ahead, without waiting."""
+        offset, length, _signal, _digest = self.entry(index)
+        wire = self._segment(index // POOL_SEGMENT_REQUESTS)["wire"]
+        start = offset - offset % mmap.PAGESIZE
+        wire.madvise(mmap.MADV_WILLNEED, start, offset + length - start)
+
     def request(self, index):
         """Request `index` as `build_request` returns it."""
         signal, wire = self.wire(index)
@@ -561,6 +570,13 @@ def _sender_process(pipe, config):
                 if state["done"] == count:
                     finished.set()
 
+        # Requests are read ahead of their send, so a send never waits for
+        # the pool's pages while the engine's writes keep the disk busy.
+        positions = config["positions"]
+        gap = (positions[-1] - positions[0]) / (count - 1) if count > 1 else 1
+        lookahead = max(4, math.ceil(PREFETCH_AHEAD_S * 1e9 / (gap * config["interval_ns"])))
+        for position in range(min(count, lookahead)):
+            pool.prefetch(indexes[position])
         pipe.send({"ready": True, "pid": os.getpid(), "connections": len(channels)})
         start_ns = pipe.recv()["start_ns"]
         cpu_before = os.times()
@@ -583,6 +599,8 @@ def _sender_process(pipe, config):
                 catching_up = True
                 _ = slots.acquire()
             index = indexes[position]
+            if position + lookahead < count:
+                pool.prefetch(indexes[position + lookahead])
             signal, wire = pool.wire(index)
             body = bytes(wire)
             with lock:
