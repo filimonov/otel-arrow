@@ -2162,6 +2162,7 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
             "epoch_offset_ns": epoch_offset_ns, "buffer": buffer,
             "download_s": download_s, "oracle_s": oracle_s, "memory": memory,
             "source": source, "summary": summary,
+            "pairs": list(getattr(phase.sampler, "pairs", ())),
         })
 
 

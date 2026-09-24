@@ -203,6 +203,22 @@ class SoakAnalysis(unittest.TestCase):
         self.assertEqual(drained["storage_drain_s"], 3.0)
         self.assertEqual(drained["acked_not_committed_requests_count"], 0)
 
+    # Scenario: one residual of ten thousand lies beyond the tolerance.
+    # Guarantees: it is kept whole with the allocator pairs around it, while
+    # an in-band residual is not.
+    def test_residual_excursions_keep_their_pairs(self):
+        pairs = [{"monotonic_ns": k, "jemalloc_allocated_bytes": k} for k in range(10001)]
+        residuals = [{"monotonic_ns": k + 1, "residual_bytes": 0} for k in range(10000)]
+        residuals[5000]["residual_bytes"] = 200 << 20
+        kept = soak.residual_excursions(residuals, pairs, 1 << 30)
+        self.assertEqual(kept["beyond_tolerance_count"], 1)
+        self.assertEqual(len(kept["events"]), 1)
+        offsets = [pair["offset"] for pair in kept["events"][0]["pairs"]]
+        self.assertEqual(offsets, list(range(-soak.EXCURSION_NEIGHBOURS,
+                                             soak.EXCURSION_NEIGHBOURS + 1)))
+        self.assertEqual(kept["events"][0]["pairs"][soak.EXCURSION_NEIGHBOURS]["monotonic_ns"],
+                         5001)
+
 
 def engine_or_skip():
     """Skip when no engine is built, unless Docker is required."""
