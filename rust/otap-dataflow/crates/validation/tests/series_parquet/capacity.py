@@ -2628,8 +2628,6 @@ def step_fan_in(plan, state, output_dir, report_dir, cell, options):
     if rate is None:
         return
     for connections in options.get("fan_in", FAN_IN_CONNECTIONS):
-        if connections == SEARCH_CONNECTIONS:
-            continue
         _ = execute(plan, state, make_trial(
             plan, rate=rate, purpose=f"fan_in_{connections}", connections=connections,
             receiver_capacity=capacity,
