@@ -194,9 +194,8 @@ impl SortedTableBuffer {
     /// The non-mutating half of [`SortedTableBuffer::seal`], used by
     /// `Block::seal` so that finalizing a values table is part of the same
     /// all-or-nothing transaction as stamping the series tables. An empty
-    /// building set produces no run. With sorting disabled the building batches
-    /// become runs as they are, sharing every buffer, because concatenating
-    /// them would copy every row to no purpose.
+    /// building set produces no run, and with sorting disabled the building
+    /// batches become runs as they are (see [`SortedTableBuffer::seal`]).
     ///
     /// # Errors
     /// Propagates an Arrow failure from the sort.
