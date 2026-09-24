@@ -254,8 +254,12 @@ connection) and sending prebuilt requests at monotonic target times, with
 in-flight requests bounded by the receivers' summed capacity. A send is
 never retried and never silently re-timed: its target, send and response
 instants are all kept, and more than 1 percent of sends starting over 50
-ms late with a slot free marks the trial `producer_limited` (unless the
-engine refused a request, which makes it unsustainable). A producer-limited
+ms late with a slot free marks the trial `producer_limited`, unless the
+engine failed anywhere: a refused or failed request, a partially rejected
+one, or, in the buffered topology, a growing write-ahead log, an ingest
+failure or a permanently rejected bundle makes it unsustainable, with the
+lateness kept as a reason (`capacity.judge_trial`, which also re-judges a
+stored trial through `rejudge_stored`). A producer-limited
 rate bounds the bisection from above, and a search bounded there reports
 `lower_bound_producer_limited`, never a maximum. Each sender reports the
 CPU it spent generating requests and its major page faults.

@@ -6436,6 +6436,46 @@ class CapacityContracts(unittest.TestCase):
         self.assertEqual(verdict["verdict"], "unsustainable")
         self.assertTrue(any("late" in reason for reason in verdict["reasons"]))
 
+    # Scenario: 5% of the sends started late with a slot free while the engine
+    # partially rejected a request, or while the durable buffer's log grew,
+    # its ingest failed or it rejected a bundle.
+    # Guarantees: every engine-side failure outranks the producer's lateness:
+    # the trial is unsustainable with the engine's reason first and the
+    # lateness kept, in the live path and the stored-trial path alike.
+    def test_engine_side_failures_outrank_producer_lateness(self):
+        base = dict(offered=100_000, tail_durable=100_000, backlog_slope_records_per_s=0,
+                    late_unblocked_ratio=0.05, failed_requests=0, partial_requests=0)
+        self.assertEqual(capacity.judge_trial(**base)["verdict"], "producer_limited")
+        for change in ({"partial_requests": 3},
+                       {"engine_reasons": ["write-ahead log grows 9e9 bytes"]},
+                       {"engine_reasons": ["4 buffer ingest failures"]},
+                       {"engine_reasons": ["2 bundles permanently rejected downstream"]}):
+            verdict = capacity.judge_trial(**dict(base, **change))
+            self.assertEqual(verdict["verdict"], "unsustainable", change)
+            self.assertTrue(any("late" in reason for reason in verdict["reasons"]), change)
+            self.assertNotIn("late", verdict["reasons"][0], change)
+        stored = {
+            "capacity": {
+                "offered_records_per_s": 100_000, "window_monotonic_ns": [0, 60_000_000_000],
+                "producer": {"late_unblocked_ratio": 0.05,
+                             "outcomes": {"ack": 6000, "partial_rejection": 1}},
+                "buffer": {"reasons": ["4 buffer ingest failures"]},
+                "stored_rows_window_records_per_s": 100_000,
+                "stored_rows_floor_records": 5_000_000,
+            },
+            "metrics": {"durable_tail_records_per_s": 100_000, "backlog_slope_ratio": 0.0},
+        }
+        verdict = capacity.rejudge_stored(stored)
+        self.assertEqual(verdict["verdict"], "unsustainable")
+        self.assertIn("1 requests partially rejected", verdict["reasons"])
+        self.assertIn("4 buffer ingest failures", verdict["reasons"])
+        stored["capacity"]["producer"]["outcomes"] = {"ack": 6000}
+        stored["capacity"]["buffer"] = None
+        self.assertEqual(capacity.rejudge_stored(stored)["verdict"], "producer_limited")
+        stored["capacity"]["producer"]["late_unblocked_ratio"] = 0.0
+        stored["capacity"]["stored_rows_window_records_per_s"] = 50_000
+        self.assertEqual(capacity.rejudge_stored(stored)["verdict"], "unsustainable")
+
     # Scenario: the durable tail rate is 97% of offered, or the backlog grows
     # by 3% of the offered rate, or a request failed.
     # Guarantees: each alone makes the trial unsustainable, with its reason.

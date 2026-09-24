@@ -258,16 +258,27 @@ def backlog_slope(points) -> float:
 
 
 def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
-                      late_unblocked_ratio, failed_requests, partial_requests) -> dict:
+                      late_unblocked_ratio, failed_requests, partial_requests,
+                      engine_reasons=()) -> dict:
     """Whether one trial sustained its offered rate, and why not.
 
-    A request the engine refused or failed decides first: the engine did
-    not sustain the rate, whatever the producer did. Otherwise a trial whose
-    sends fell behind their targets while in-flight slots were free measured
-    the producer, and says nothing about the engine.
+    Anything the engine refused, failed or could not keep up with decides
+    first: a failed request, a partially rejected one, and the engine-side
+    reasons a topology adds (`engine_reasons`: the durable buffer's growing
+    write-ahead log, its ingest failures and permanently rejected bundles).
+    The engine did not sustain the rate, whatever the producer did. Only
+    without any of them does a trial whose sends fell behind their targets
+    while in-flight slots were free measure the producer, and say nothing
+    about the engine.
     """
-    reasons = []
-    if not failed_requests and late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO:
+    late = late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO
+    engine = []
+    if failed_requests:
+        engine.append(f"{failed_requests} requests failed")
+    if partial_requests:
+        engine.append(f"{partial_requests} requests partially rejected")
+    engine.extend(engine_reasons)
+    if not engine and late:
         return {
             "verdict": "producer_limited",
             "reasons": [
@@ -275,6 +286,7 @@ def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
                 f"{PRODUCER_LATE_S}s late with an in-flight slot free"
             ],
         }
+    reasons = []
     if tail_durable < DURABLE_RATIO_FLOOR * offered:
         reasons.append(
             f"durable rate over the last {STABILITY_TAIL_S}s {tail_durable:.0f} < "
@@ -285,13 +297,63 @@ def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
             f"backlog grows {backlog_slope_records_per_s:.0f} records/s > "
             f"{BACKLOG_SLOPE_LIMIT_RATIO:.0%} of offered"
         )
-    if failed_requests:
-        reasons.append(f"{failed_requests} requests failed")
-        if late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO:
-            reasons.append(f"{late_unblocked_ratio:.3%} of sends also started late with a slot free")
-    if partial_requests:
-        reasons.append(f"{partial_requests} requests partially rejected")
+    reasons.extend(engine)
+    if engine and late:
+        reasons.append(f"{late_unblocked_ratio:.3%} of sends also started late with a slot free")
     return {"verdict": "unsustainable" if reasons else "sustainable", "reasons": reasons}
+
+
+def judge_trial(*, offered, tail_durable, backlog_slope_records_per_s, late_unblocked_ratio,
+                failed_requests, partial_requests, engine_reasons=(), stored_window=None,
+                stored_floor=None) -> dict:
+    """A trial's verdict: the stability rule, then the stored-rows floor.
+
+    The values rows the exporter wrote over the interval corroborate the
+    acknowledgements; falling short of the floor makes a sustainable trial
+    unsustainable. A live trial and a stored one are judged by this one path.
+    """
+    verdict = stability_verdict(
+        offered=offered, tail_durable=tail_durable,
+        backlog_slope_records_per_s=backlog_slope_records_per_s,
+        late_unblocked_ratio=late_unblocked_ratio, failed_requests=failed_requests,
+        partial_requests=partial_requests, engine_reasons=engine_reasons,
+    )
+    if stored_window is not None and verdict["verdict"] == "sustainable" and \
+            stored_window < stored_floor:
+        verdict = {"verdict": "unsustainable", "reasons": [
+            f"values rows written over the interval {stored_window:.0f} < "
+            f"{stored_floor:.0f}, the offered rate less one window and one "
+            f"reporting interval"
+        ]}
+    return verdict
+
+
+def rejudge_stored(result) -> dict:
+    """The verdict `judge_trial` gives a stored trial, from what it recorded.
+
+    The producer's outcome counts give the failed and partial requests, the
+    buffer view its engine-side reasons, and the metrics the durable tail,
+    the backlog slope and the stored rows.
+    """
+    capacity = result["capacity"]
+    metrics = result["metrics"]
+    producer = capacity["producer"]
+    outcomes = producer.get("outcomes") or {}
+    offered = float(capacity["offered_records_per_s"])
+    stored_rate = capacity.get("stored_rows_window_records_per_s")
+    measure_s = (capacity["window_monotonic_ns"][1] - capacity["window_monotonic_ns"][0]) / 1e9
+    return judge_trial(
+        offered=offered, tail_durable=metrics["durable_tail_records_per_s"],
+        backlog_slope_records_per_s=metrics["backlog_slope_ratio"] * offered,
+        late_unblocked_ratio=producer["late_unblocked_ratio"],
+        failed_requests=sum(outcomes.get(name, 0) for name in (
+            measurement.OUTCOME_RETRYABLE, measurement.OUTCOME_PERMANENT,
+            measurement.OUTCOME_LOCAL, "unanswered")),
+        partial_requests=outcomes.get(measurement.OUTCOME_PARTIAL, 0),
+        engine_reasons=(capacity.get("buffer") or {}).get("reasons", ()),
+        stored_window=stored_rate * measure_s if stored_rate is not None else None,
+        stored_floor=capacity.get("stored_rows_floor_records"),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1765,23 +1827,16 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     failed = sum(1 for code in sends["code"] if code in (2, 3, 4) or code < 0)
     partial = sum(1 for code in sends["code"] if code == 1)
     permanent = sum(1 for code in sends["code"] if code == 3)
-    verdict = stability_verdict(
+    buffer = buffer_view(samples, window, trial, stats) if trial["topology"] == "buffered" \
+        else None
+    verdict = judge_trial(
         offered=trial["rate"], tail_durable=tail_durable,
         backlog_slope_records_per_s=slope,
         late_unblocked_ratio=stats["late_unblocked_ratio"],
         failed_requests=failed, partial_requests=partial,
+        engine_reasons=(buffer or {}).get("reasons", ()),
+        stored_window=stored_window, stored_floor=stored_floor,
     )
-    buffer = buffer_view(samples, window, trial, stats) if trial["topology"] == "buffered" \
-        else None
-    if buffer and buffer["reasons"] and verdict["verdict"] == "sustainable":
-        verdict = {"verdict": "unsustainable", "reasons": buffer["reasons"]}
-    if stored_window is not None and verdict["verdict"] == "sustainable" and \
-            stored_window < stored_floor:
-        verdict = {"verdict": "unsustainable", "reasons": [
-            f"values rows written over the interval {stored_window:.0f} < "
-            f"{stored_floor:.0f}, the offered rate less one window and one "
-            f"reporting interval"
-        ]}
     # Warm-up: before the window, the engine completed a flush, and every
     # worker that had accepted a request had acknowledged one. A worker the
     # connection hashing gave no request yet has nothing to warm.
