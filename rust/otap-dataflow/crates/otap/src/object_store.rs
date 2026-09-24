@@ -217,9 +217,27 @@ pub enum StorageType {
         /// Set to false for S3-compatible stores that require path-style.
         virtual_hosted_style_request: Option<bool>,
 
+        /// Whether requests are signed with SigV4 `UNSIGNED-PAYLOAD` instead
+        /// of a SHA-256 of every uploaded byte. Unset, it is on for a TLS
+        /// endpoint, which protects the payload, and off for plain HTTP;
+        /// see [`unsigned_payload_default`].
+        unsigned_payload: Option<bool>,
+
         /// The auth settings, see [cloud_auth::aws::AuthMethod]
         auth: cloud_auth::aws::AuthMethod,
     },
+}
+
+/// Whether an S3 store signs `UNSIGNED-PAYLOAD` when `unsigned_payload` is
+/// unset: exactly when its requests go over TLS, that is when the endpoint,
+/// or without one the base URI, is not a plain `http://` URL. The AWS
+/// endpoints an `s3://` base URI resolves to are HTTPS.
+#[cfg(feature = "aws")]
+#[must_use]
+pub fn unsigned_payload_default(base_uri: &str, endpoint: Option<&str>) -> bool {
+    let url = endpoint.unwrap_or(base_uri);
+    !url.get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
 }
 
 impl StorageType {
@@ -442,11 +460,16 @@ pub fn from_storage_type_with_retry_and_token_provider(
             endpoint,
             allow_http,
             virtual_hosted_style_request,
+            unsigned_payload,
             auth,
         } => {
             use object_store::aws::AmazonS3Builder;
 
-            let mut builder = AmazonS3Builder::from_env().with_url(base_uri);
+            let unsigned = unsigned_payload
+                .unwrap_or_else(|| unsigned_payload_default(base_uri, endpoint.as_deref()));
+            let mut builder = AmazonS3Builder::from_env()
+                .with_url(base_uri)
+                .with_unsigned_payload(unsigned);
 
             if let Some(region) = region {
                 builder = builder.with_region(region);
@@ -867,6 +890,7 @@ mod test {
                 endpoint: None,
                 allow_http: None,
                 virtual_hosted_style_request: None,
+                unsigned_payload: None,
                 auth: cloud_auth::aws::AuthMethod::Default,
             };
             assert_eq!(s3.kind(), "s3");
@@ -898,6 +922,7 @@ mod test {
                 endpoint: None,
                 allow_http: None,
                 virtual_hosted_style_request: None,
+                unsigned_payload: None,
                 auth: cloud_auth::aws::AuthMethod::Default,
             };
             assert!(!s3.requires_bearer_token_provider());
@@ -939,6 +964,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -958,6 +984,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -1019,6 +1046,52 @@ mod test {
         assert!(serde_json::from_str::<StorageType>(&json).is_err());
     }
 
+    /// Scenario: S3 storage configs that set `unsigned_payload` or leave it
+    /// unset, against AWS, an HTTPS endpoint and a plain HTTP endpoint.
+    /// Guarantees: the option parses; unset, `UNSIGNED-PAYLOAD` is signed
+    /// exactly when the requests go over TLS, whatever the scheme's case.
+    #[test]
+    #[cfg(feature = "aws")]
+    fn unsigned_payload_is_parsed_and_defaults_on_for_tls_only() {
+        let json = json!({
+            "s3": {
+                "base_uri": "s3://my-bucket/telemetry",
+                "unsigned_payload": false,
+                "auth": { "type": "default" }
+            }
+        })
+        .to_string();
+        let expected = StorageType::S3 {
+            base_uri: "s3://my-bucket/telemetry".to_string(),
+            region: None,
+            endpoint: None,
+            allow_http: None,
+            virtual_hosted_style_request: None,
+            unsigned_payload: Some(false),
+            auth: cloud_auth::aws::AuthMethod::Default,
+        };
+        test_deserialize(&json, expected);
+
+        assert!(unsigned_payload_default("s3://my-bucket/telemetry", None));
+        assert!(unsigned_payload_default(
+            "s3://b",
+            Some("https://s3.eu-west-1.amazonaws.com")
+        ));
+        assert!(unsigned_payload_default(
+            "https://b.s3.amazonaws.com/p",
+            None
+        ));
+        assert!(!unsigned_payload_default(
+            "s3://b",
+            Some("http://localhost:9000")
+        ));
+        assert!(!unsigned_payload_default(
+            "s3://b",
+            Some("HTTP://minio:9000")
+        ));
+        assert!(!unsigned_payload_default("http://minio:9000/b", None));
+    }
+
     #[test]
     #[cfg(feature = "aws")]
     fn test_s3_config_with_default_auth() {
@@ -1038,6 +1111,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::Default,
         };
         test_deserialize(&json, expected);
@@ -1069,6 +1143,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -1100,6 +1175,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::WebIdentity {
                 role_arn: Some("arn:aws:iam::123456789012:role/TestRole".to_string()),
                 token_file_path: Some("/var/run/secrets/token".to_string()),
@@ -1131,6 +1207,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::AssumeRole {
                 role_arn: "arn:aws:iam::123456789012:role/CrossAccountRole".to_string(),
                 external_id: Some("my-external-id".to_string()),

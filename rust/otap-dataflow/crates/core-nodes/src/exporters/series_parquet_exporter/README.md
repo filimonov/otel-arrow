@@ -361,6 +361,15 @@ uses object_store's retry defaults with `retry_timeout` set to half of
 `window.flush_retry_deadline` (30s with the defaults) instead of object_store's
 3m. Local file storage applies no store retry and is not checked.
 
+S3 storage takes `unsigned_payload`. When it is true, requests are signed
+with SigV4 `UNSIGNED-PAYLOAD` instead of a SHA-256 of every uploaded byte,
+which removes most of the upload's CPU: 102.5 instead of 376.4 ns per log
+record against MinIO. The store then no longer checks the body against the
+signature, so integrity in transit rests on TLS alone. Unset, it is true when
+the endpoint, or without one the base URI, is not a plain `http://` URL, and
+false over plain HTTP. An explicit value wins over this default and over the
+`AWS_UNSIGNED_PAYLOAD` environment variable.
+
 `writer_id` must be nonempty and use only letters, digits, `_` and `.`: it
 sits between the `-` separators of every file name, so a hyphen or a slash is
 refused. It names the writer process in file names and file metadata and is
