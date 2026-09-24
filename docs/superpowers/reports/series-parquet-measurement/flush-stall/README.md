@@ -48,3 +48,22 @@ with 7 uncancelled and 20 cancelled writes per fixture.
 Review fix round 3 re-ran the changed build only. `*-round3-head.json` is
 the library and probe at 8f5dddc4a, with 7 uncancelled and 20 cancelled
 writes per fixture. `probe-binaries-round3.sha256` is its executable.
+
+The extraction and write speed changes (S6) re-ran the probe with 7
+uncancelled and 20 cancelled writes per fixture on the same inputs.
+
+- `*-s6-base-rerun.json`: library at cb3562b76, the S6 base, with the probe
+  source of 9d4bc07c0 (it reports rows and pinned bytes per chunk), so the
+  S6 build is compared with a same-day base.
+- `*-s6-capped.json`: library and probe at 956adf0ae, on each input cut to
+  the requests the base block admitted (2096, 3716, 813, 236), so both
+  builds write blocks of the same requests.
+- `*-s6-full.json`: library and probe at 956adf0ae on the whole inputs.
+  Values batches now pin only the capacity they use, so a block admits
+  requests until `window.max_block_bytes` really is reached.
+- `files-capped-956adf0ae.sha256` and `files-head-956adf0ae.sha256`: the
+  files of the capped and the full runs. The capped files hold the same
+  rows in the same order as the base's, read row by row with DuckDB; their
+  bytes differ because the merge sizes chunks from the runs' pinned bytes
+  per row and mostly distinct columns are written without a dictionary.
+- `probe-binaries-s6.sha256`: the two executables.
