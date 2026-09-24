@@ -867,6 +867,8 @@ class CapacitySampler(measurement.Sampler):
                     latest = prints[-1]
                     self.pairs.append({
                         "monotonic_ns": procfs["monotonic_ns"],
+                        "interval_resident_max_bytes": max(
+                            entry["resident_bytes"] for entry in prints),
                         "procfs": {key: procfs[key] for key in (
                             "smaps_rss_bytes", "smaps_anonymous_bytes") if key in procfs},
                         "jemalloc_resident_bytes": latest["resident_bytes"],
@@ -2085,6 +2087,9 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     }
     result["observations"] = {
         "phase": {k: v for k, v in summary.items() if k != "residuals"},
+        "residual_excursions": measurement.residual_excursions(
+            residuals, list(getattr(phase.sampler, "pairs", ())),
+            max((s["process_rss_bytes"] for s in samples), default=0)),
         "residuals": residuals[::PUBLISHED_SAMPLE_STRIDE],
         "allocator_pairs": list(getattr(phase.sampler, "pairs", ()))[::PUBLISHED_SAMPLE_STRIDE],
     }

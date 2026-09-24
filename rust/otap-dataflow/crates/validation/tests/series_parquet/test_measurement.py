@@ -6713,6 +6713,56 @@ class CapacityContracts(unittest.TestCase):
         residuals, _heap = capacity.trial_residuals(samples, samples[0], leaking)
         self.assertEqual(residuals[0]["residual_bytes"], 400 << 20)
 
+    # Scenario: jemalloc purges a 400 MB extent between two prints and the
+    # RSS read after the second print still holds 300 MB of it.
+    # Guarantees: RSS within the larger of the two prints' resident totals
+    # passes; RSS above both by more than the tolerance still fails.
+    def test_band_upper_edge_covers_the_release_after_a_purge(self):
+        before = self.allocator_pair(0, 300 << 20, 250 << 20, 100 << 20)
+        full = self.allocator_pair(10**7, 1000 << 20, 950 << 20, 800 << 20)
+        lagging = self.allocator_pair(3 * 10**7, 850 << 20, 550 << 20, 400 << 20)
+        residuals = measurement.allocator_band_residuals([before, full, lagging])
+        self.assertEqual(residuals[1]["allocator_resident_growth_bytes"], 300 << 20)
+        self.assertEqual(residuals[1]["allocator_resident_held_growth_bytes"], 700 << 20)
+        self.assertEqual(residuals[1]["residual_bytes"], 0)
+        self.assertEqual(measurement.residual_check(residuals, 1000 << 20)["status"],
+                         measurement.STATUS_PASSED)
+        above = self.allocator_pair(3 * 10**7, 1150 << 20, 550 << 20, 400 << 20)
+        residuals = measurement.allocator_band_residuals([before, full, above])
+        self.assertEqual(residuals[1]["residual_bytes"], 150 << 20)
+        self.assertEqual(measurement.residual_check(residuals, 1150 << 20)["status"],
+                         measurement.STATUS_FAILED)
+
+    # Scenario: a stored failed run kept its positive excursion and the pair
+    # before it; another failed run kept none.
+    # Guarantees: the first is re-judged by the current band rule, the
+    # second is reported as not re-judgeable, never passed.
+    def test_rejudge_band_check_from_kept_excursions(self):
+        before = self.allocator_pair(0, 300 << 20, 250 << 20, 100 << 20)
+        full = self.allocator_pair(10**7, 1000 << 20, 950 << 20, 800 << 20)
+        lagging = self.allocator_pair(3 * 10**7, 850 << 20, 550 << 20, 400 << 20)
+        old = dict(lagging)
+        residual = {"monotonic_ns": lagging["monotonic_ns"], "residual_bytes": 300 << 20,
+                    "heap_rss_growth_bytes": 550 << 20,
+                    "allocator_resident_growth_bytes": 300 << 20}
+        result = {
+            "checks": [measurement.check(
+                "rss_reconciliation", measurement.CHECK_HARD, measurement.STATUS_FAILED,
+                "residual range [0, 314572800] bytes over 2 samples; tolerance 104857600 "
+                "bytes; 1 positive and 0 negative beyond it")],
+            "capacity": {"rss_heap_term": {"source": "jemalloc_band"}},
+            "observations": {"residual_excursions": {"events": [{
+                "residual": residual, "beyond_tolerance": True,
+                "pairs": [dict(before, offset=-2), dict(full, offset=-1),
+                          dict(old, offset=0)]}]}},
+        }
+        verdict = measurement.rejudge_band_check(result)
+        self.assertEqual(verdict["rejudged"], measurement.STATUS_PASSED)
+        self.assertEqual(verdict["excursions"][0]["rejudged_residual_bytes"], 0)
+        del result["observations"]["residual_excursions"]
+        verdict = measurement.rejudge_band_check(result)
+        self.assertIsNone(verdict["rejudged"])
+
     # Scenario: jemalloc's live heap exceeds the exporter's accounted bytes
     # by 100 MB plus 1 KB for every values row written.
     # Guarantees: the ledger view reports the difference at the highest fill

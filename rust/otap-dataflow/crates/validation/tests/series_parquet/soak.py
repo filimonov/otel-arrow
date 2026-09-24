@@ -767,9 +767,6 @@ def settle_soak(result, context, observer):
     for key in ("residuals", "allocator_pairs"):
         entries = observations.get(key) or []
         observations[key] = _thin(entries, 10.0)
-    peak_rss = max((row.get("rss_bytes") or 0 for row in rows), default=0)
-    observations["residual_excursions"] = residual_excursions(
-        context["residuals"], context.get("pairs") or [], peak_rss)
     listing_lags = sorted((seen - completed) / 1e9
                           for _size, completed, seen in observer.listed.values())
     result["soak"] = {
@@ -842,37 +839,6 @@ def settle_soak(result, context, observer):
     if buffered:
         hard("buffer_retention_lossless", counters["buffer_loss_records"] == 0,
              f"{counters['buffer_loss_records']} items lost to retention")
-
-
-EXCURSION_NEIGHBOURS = 3
-
-
-def residual_excursions(residuals, pairs, peak_rss_bytes) -> dict:
-    """Every RSS residual beyond half the frozen tolerance, with the
-    allocator pairs around it, kept whole where the rest is thinned.
-
-    `allocator_band_residuals` computes residual `k` from pair `k + 1`, so
-    each excursion shows the prints before and after it: a residual the
-    next pair's allocator totals already cover is a print read before a
-    large allocation it did not yet include.
-    """
-    tolerance = max(measurement.RESIDUAL_FLOOR_BYTES,
-                    measurement.RESIDUAL_PEAK_FRACTION * peak_rss_bytes)
-    flagged = [k for k, entry in enumerate(residuals)
-               if abs(entry["residual_bytes"]) > tolerance / 2]
-    events = []
-    for k in flagged[:50]:
-        low = max(0, k + 1 - EXCURSION_NEIGHBOURS)
-        high = min(len(pairs), k + 2 + EXCURSION_NEIGHBOURS)
-        events.append({
-            "residual": residuals[k],
-            "beyond_tolerance": abs(residuals[k]["residual_bytes"]) > tolerance,
-            "pairs": [dict(pairs[j], offset=j - (k + 1)) for j in range(low, high)],
-        })
-    return {"tolerance_bytes": tolerance, "flagged_count": len(flagged),
-            "beyond_tolerance_count": sum(1 for k in flagged
-                                          if abs(residuals[k]["residual_bytes"]) > tolerance),
-            "events": events}
 
 
 def _thin(entries, period_s) -> list:
@@ -1363,7 +1329,12 @@ def pr_soak_experiment(spec, result, output_dir, controls, *, publishable, prove
     residuals, heap = capacity.trial_residuals(samples, phase.capacity_idle,
                                                getattr(phase.sampler, "pairs", ()))
     summary["residuals"] = residuals
-    result["observations"] = {"phases": [summary]}
+    result["observations"] = {
+        "phases": [summary],
+        "residual_excursions": measurement.residual_excursions(
+            residuals, list(getattr(phase.sampler, "pairs", ())),
+            max((s["process_rss_bytes"] for s in samples), default=0)),
+    }
     result["samples"] = [dict(measurement.compact_sample(s), extras=s.get("extras"))
                          for s in samples[::capacity.PUBLISHED_SAMPLE_STRIDE]]
     oracle = measurement.run_pinned(

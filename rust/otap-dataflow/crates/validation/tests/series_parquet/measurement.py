@@ -2791,29 +2791,51 @@ def rss_residuals(samples, idle) -> list:
     return residuals
 
 
+# The RSS band's rule, recorded in every index that applies it.
+RSS_BAND_RULE = (
+    "the anonymous RSS growth since the first allocator print lies between the growth "
+    "of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held "
+    "resident over the interval the kernel may still be releasing: the maximum of "
+    "`resident` at this print, at any print read with it, and at the previous paired "
+    "print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a "
+    "large purge jemalloc stops counting an extent as resident before the kernel has "
+    "released its pages, so an RSS read milliseconds after the print can still hold "
+    "them (soak-strict r002: five reads 122-234 MB above resident, inside the band at "
+    "the next print 11-49 ms later)"
+)
+
+
+def band_upper_resident(pair, previous) -> int:
+    """The most jemalloc held resident over the interval ending at `pair`:
+    its own print, any print read with it, and the previous paired print."""
+    held = pair.get("interval_resident_max_bytes", pair["jemalloc_resident_bytes"])
+    return max(held, pair["jemalloc_resident_bytes"], previous["jemalloc_resident_bytes"])
+
+
 def allocator_band_residuals(pairs) -> list:
     """The unexplained RSS of allocator prints, each paired with an RSS read.
 
     Each pair holds jemalloc's `allocated` and `resident` totals and the
     process's smaps rollup read milliseconds after the print. The anonymous
     growth since the first pair is the heap as RSS sees it, and two measured
-    totals bound it: at least the live heap, and at most what the allocator
-    holds resident -- the live heap, the freed pages it keeps and capacity
-    reserved but never touched. The residual is how far the growth lies
-    outside that band, signed, zero inside it.
+    totals bound it (`RSS_BAND_RULE`): at least the live heap, and at most
+    what the allocator held resident over the interval the kernel may still
+    be releasing (`band_upper_resident`) -- the live heap, the freed pages
+    it keeps and capacity reserved but never touched. The residual is how
+    far the growth lies outside that band, signed, zero inside it.
     """
     residuals = []
     if not pairs:
         return residuals
     reference = pairs[0]
-    for pair in pairs[1:]:
+    for previous, pair in zip(pairs, pairs[1:]):
         procfs, base = pair["procfs"], reference["procfs"]
         file_growth = (procfs["smaps_rss_bytes"] - procfs["smaps_anonymous_bytes"]) - (
             base["smaps_rss_bytes"] - base["smaps_anonymous_bytes"]
         )
         heap_growth = (procfs["smaps_rss_bytes"] - base["smaps_rss_bytes"]) - file_growth
         lower = pair["jemalloc_allocated_bytes"] - reference["jemalloc_allocated_bytes"]
-        upper = pair["jemalloc_resident_bytes"] - reference["jemalloc_resident_bytes"]
+        upper = band_upper_resident(pair, previous) - reference["jemalloc_resident_bytes"]
         if heap_growth > upper:
             residual = heap_growth - upper
         elif heap_growth < lower:
@@ -2828,7 +2850,9 @@ def allocator_band_residuals(pairs) -> list:
                 "file_growth_bytes": file_growth,
                 "heap_rss_growth_bytes": heap_growth,
                 "allocated_growth_bytes": lower,
-                "allocator_resident_growth_bytes": upper,
+                "allocator_resident_growth_bytes": (
+                    pair["jemalloc_resident_bytes"] - reference["jemalloc_resident_bytes"]),
+                "allocator_resident_held_growth_bytes": upper,
                 "heap_source": "jemalloc_band",
                 "residual_bytes": residual,
             }
@@ -2836,9 +2860,169 @@ def allocator_band_residuals(pairs) -> list:
     return residuals
 
 
+def rejudge_band_index(index_name, output_dir, report_dir=None) -> dict:
+    """Advance one published index to the current `RSS_BAND_RULE`.
+
+    Every run file the index names is re-judged from what it stored
+    (`rejudge_band_check`); nothing is rerun and no run file changes. A run
+    that was its own baseline family and now passes every hard gate writes
+    the baseline it would have written. The advanced index records the rule,
+    every verdict that changed and every run that could not be re-judged,
+    and keeps the index it replaces as an immutable child.
+    """
+    report_dir = resolve_report_dir(report_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    index = json.loads((report_dir / safe_json_name(index_name)).read_text(encoding="ascii"))
+    changes, unjudged, baselines = [], [], []
+    applied = 0
+    for entry in index.get("run_files", []):
+        result = json.loads((report_dir / entry["name"]).read_text(encoding="ascii"))
+        verdict = rejudge_band_check(result)
+        if not verdict.get("applies"):
+            continue
+        applied += 1
+        if verdict["rejudged"] is None:
+            unjudged.append({"run_id": result["run_id"], "recorded": verdict["recorded"],
+                             "reason": verdict["reason"]})
+            continue
+        if verdict["rejudged"] == verdict["recorded"]:
+            continue
+        change = {"run_id": result["run_id"], "recorded": verdict["recorded"],
+                  "rejudged": verdict["rejudged"], "reason": verdict["reason"],
+                  "excursions": verdict.get("excursions", [])}
+        again = json.loads(json.dumps(result))
+        for check_entry in again["checks"]:
+            if check_entry["name"] == "rss_reconciliation":
+                check_entry["status"] = verdict["rejudged"]
+                check_entry["detail"] = f"re-judged by the current band rule: {verdict['reason']}"
+        settle_status(again)
+        change["run_status_rejudged"] = again["status"]
+        if result.get("baseline_decision") is not None and again["status"] == STATUS_PASSED:
+            decision = evaluate_baseline(again, baselines=load_baselines(report_dir,
+                                                                         again["case"]))
+            change["baseline_decision"] = {key: decision.get(key) for key in (
+                "action", "baseline_name", "fingerprint")}
+            if decision["action"] == "created":
+                candidate = again.pop("baseline_candidate")
+                candidate["source"] = (f"{result['run_id']} as recorded, its "
+                                       "rss_reconciliation re-judged by the current band rule")
+                path = write_published_json(output_dir / decision["baseline_name"], candidate)
+                baselines.append(file_entry(path))
+        changes.append(change)
+    advanced = json.loads(json.dumps(index))
+    advanced["rss_band_rule"] = RSS_BAND_RULE
+    advanced["rss_band_rejudgement"] = {
+        "runs_applying_the_band_count": applied,
+        "verdict_changes": changes,
+        "not_rejudged": unjudged,
+        "rule": "only a residual that was positive beyond the tolerance can change; "
+        "each is recomputed from its kept excursion and the pair before it",
+    }
+    if isinstance((advanced.get("capacity") or {}).get("rules"), dict):
+        advanced["capacity"]["rules"]["rss_band"] = RSS_BAND_RULE
+    for name in {entry["name"] for entry in advanced.get("baseline_files", [])}:
+        if not (output_dir / name).is_file():
+            _ = shutil.copyfile(report_dir / name, output_dir / name)
+    advanced["baseline_files"] = list(advanced.get("baseline_files", [])) + baselines
+    previous = archive_published_index(index_name, output_dir, report_dir)
+    advanced["child_indexes"] = [previous] if previous else []
+    advanced["started_utc"] = utc_now()
+    path = write_result(output_dir / safe_json_name(index_name), advanced)
+    _ = publish_result_tree(path, report_dir)
+    return advanced
+
+
 # The plan's frozen diagnostic uncertainty for the RSS reconciliation.
 RESIDUAL_FLOOR_BYTES = 32 * 1024 * 1024
 RESIDUAL_PEAK_FRACTION = 0.10
+EXCURSION_NEIGHBOURS = 3
+
+
+def residual_tolerance(peak_rss_bytes) -> float:
+    """The frozen residual tolerance for one run's peak RSS."""
+    return max(RESIDUAL_FLOOR_BYTES, RESIDUAL_PEAK_FRACTION * peak_rss_bytes)
+
+
+def residual_excursions(residuals, pairs, peak_rss_bytes) -> dict:
+    """Every band residual beyond half the tolerance, with the allocator
+    pairs around it, kept whole where a published run thins the rest.
+
+    `allocator_band_residuals` computes residual `k` from pair `k + 1` and
+    its predecessor, so each excursion keeps what re-judging it takes.
+    """
+    tolerance = residual_tolerance(peak_rss_bytes)
+    flagged = [k for k, entry in enumerate(residuals)
+               if abs(entry["residual_bytes"]) > tolerance / 2]
+    events = []
+    for k in flagged[:50]:
+        low = max(0, k + 1 - EXCURSION_NEIGHBOURS)
+        high = min(len(pairs), k + 2 + EXCURSION_NEIGHBOURS)
+        events.append({
+            "residual": residuals[k],
+            "beyond_tolerance": abs(residuals[k]["residual_bytes"]) > tolerance,
+            "pairs": [dict(pairs[j], offset=j - (k + 1)) for j in range(low, high)],
+        })
+    return {"tolerance_bytes": tolerance, "flagged_count": len(flagged),
+            "beyond_tolerance_count": sum(1 for k in flagged
+                                          if abs(residuals[k]["residual_bytes"]) > tolerance),
+            "events": events}
+
+
+def rejudge_band_check(result) -> dict:
+    """A stored run's `rss_reconciliation` under the current `RSS_BAND_RULE`.
+
+    The upper edge only widens and the lower edge is unchanged, so only a
+    residual that was positive beyond the tolerance can change; each is
+    recomputed from its kept excursion (`residual_excursions`). A failed run
+    whose failing pairs were not kept cannot be re-judged.
+    """
+    recorded = next((entry for entry in result.get("checks", [])
+                     if entry["name"] == "rss_reconciliation"), None)
+    heap = ((result.get("capacity") or {}).get("rss_heap_term")
+            or ((result.get("observations") or {}).get("pr_soak") or {}).get("rss_heap_term")
+            or {})
+    if recorded is None:
+        return {"applies": False, "reason": "no rss_reconciliation check"}
+    if heap.get("source") != "jemalloc_band":
+        return {"applies": False, "recorded": recorded["status"],
+                "reason": f"heap term {heap.get('source')}, not the allocator band"}
+    if recorded["status"] == STATUS_PASSED:
+        return {"applies": True, "recorded": STATUS_PASSED, "rejudged": STATUS_PASSED,
+                "reason": "a wider upper edge cannot add a positive residual"}
+    match = re.search(r"over (\d+) samples; tolerance (\d+) bytes; (\d+) positive and "
+                      r"(\d+) negative beyond it", recorded.get("detail", ""))
+    kept = (result.get("observations") or {}).get("residual_excursions")
+    if not match or not kept:
+        return {"applies": True, "recorded": recorded["status"], "rejudged": None,
+                "reason": "the failing pairs are not in the published samples"}
+    samples, tolerance, positive, negative = (int(value) for value in match.groups())
+    beyond = [event for event in kept["events"]
+              if event["beyond_tolerance"] and event["residual"]["residual_bytes"] > 0]
+    if len(beyond) != positive:
+        return {"applies": True, "recorded": recorded["status"], "rejudged": None,
+                "reason": f"{positive} positive residuals, {len(beyond)} kept"}
+    again = []
+    for event in beyond:
+        pairs = {pair["offset"]: pair for pair in event["pairs"]}
+        if 0 not in pairs or -1 not in pairs:
+            return {"applies": True, "recorded": recorded["status"], "rejudged": None,
+                    "reason": "an excursion lacks its pair or the previous pair"}
+        residual = event["residual"]
+        reference_resident = (pairs[0]["jemalloc_resident_bytes"]
+                              - residual["allocator_resident_growth_bytes"])
+        upper = band_upper_resident(pairs[0], pairs[-1]) - reference_resident
+        again.append({"monotonic_ns": residual["monotonic_ns"],
+                      "recorded_residual_bytes": residual["residual_bytes"],
+                      "rejudged_residual_bytes": max(0, residual["heap_rss_growth_bytes"] - upper)})
+    still = [entry for entry in again if entry["rejudged_residual_bytes"] > tolerance]
+    persistent = negative * 2 > samples
+    status = STATUS_FAILED if still or persistent else STATUS_PASSED
+    return {"applies": True, "recorded": recorded["status"], "rejudged": status,
+            "tolerance_bytes": tolerance, "negative_beyond_count": negative,
+            "excursions": again,
+            "reason": f"{len(still)} of {positive} positive residuals still beyond the "
+            f"tolerance; {negative} negative beyond it of {samples}"}
 
 
 def residual_check(residuals, peak_rss_bytes) -> dict:
@@ -2848,7 +3032,7 @@ def residual_check(residuals, peak_rss_bytes) -> dict:
     A positive residual beyond it in any sample fails; a negative one fails
     when it persists, that is in more than half of the samples.
     """
-    tolerance = max(RESIDUAL_FLOOR_BYTES, RESIDUAL_PEAK_FRACTION * peak_rss_bytes)
+    tolerance = residual_tolerance(peak_rss_bytes)
     if not residuals:
         return check(
             "rss_reconciliation", CHECK_HARD, STATUS_FAILED,

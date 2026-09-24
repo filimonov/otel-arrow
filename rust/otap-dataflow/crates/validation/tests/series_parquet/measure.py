@@ -1334,6 +1334,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = soak.add_argument("--output-dir", required=True, type=Path)
     _ = soak.add_argument("--option", action="append", default=[])
+    rejudge = sub.add_parser(
+        "rejudge-band",
+        help="advance published indexes to the current RSS band rule, from stored runs",
+    )
+    _ = rejudge.add_argument("--index", action="append", required=True)
+    _ = rejudge.add_argument("--output-dir", required=True, type=Path)
     rescrub = sub.add_parser(
         "rescrub",
         help="scrub one published evidence tree in place and re-hash it",
@@ -1395,6 +1401,15 @@ def main(argv=None) -> int:
             "SERIES_MEASURE_LONG=1 to opt in\n"
         )
         return 2
+    if arguments.command == "rejudge-band":
+        for name in arguments.index:
+            advanced = measurement.rejudge_band_index(name, arguments.output_dir)
+            block = advanced["rss_band_rejudgement"]
+            sys.stderr.write(
+                f"{name}: {block['runs_applying_the_band_count']} runs on the band; "
+                f"changes {json.dumps([(c['run_id'], c['recorded'], c['rejudged']) for c in block['verdict_changes']])}; "
+                f"not re-judged {json.dumps([u['run_id'] for u in block['not_rejudged']])}\n")
+        return 0
     if arguments.command == "rescrub":
         for name in measurement.rescrub_tree(arguments.index):
             sys.stderr.write(f"rescrubbed {name}\n")

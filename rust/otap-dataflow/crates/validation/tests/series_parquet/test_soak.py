@@ -210,13 +210,13 @@ class SoakAnalysis(unittest.TestCase):
         pairs = [{"monotonic_ns": k, "jemalloc_allocated_bytes": k} for k in range(10001)]
         residuals = [{"monotonic_ns": k + 1, "residual_bytes": 0} for k in range(10000)]
         residuals[5000]["residual_bytes"] = 200 << 20
-        kept = soak.residual_excursions(residuals, pairs, 1 << 30)
+        kept = measurement.residual_excursions(residuals, pairs, 1 << 30)
         self.assertEqual(kept["beyond_tolerance_count"], 1)
         self.assertEqual(len(kept["events"]), 1)
         offsets = [pair["offset"] for pair in kept["events"][0]["pairs"]]
-        self.assertEqual(offsets, list(range(-soak.EXCURSION_NEIGHBOURS,
-                                             soak.EXCURSION_NEIGHBOURS + 1)))
-        self.assertEqual(kept["events"][0]["pairs"][soak.EXCURSION_NEIGHBOURS]["monotonic_ns"],
+        self.assertEqual(offsets, list(range(-measurement.EXCURSION_NEIGHBOURS,
+                                             measurement.EXCURSION_NEIGHBOURS + 1)))
+        self.assertEqual(kept["events"][0]["pairs"][measurement.EXCURSION_NEIGHBOURS]["monotonic_ns"],
                          5001)
 
 

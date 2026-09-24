@@ -355,8 +355,20 @@ blocking pool. The engine prints jemalloc's statistics every 64 MiB of
 allocation (`MALLOC_CONF`, recorded in each trial and index); a thread
 reads each print within 5 ms and pairs it with the smaps rollup read at
 once, and the anonymous growth must lie between the allocator's live heap
-and its resident total, within the frozen tolerance
-(`measurement.allocator_band_residuals`). Each trial also reports the
+and the most it held resident over the interval the kernel may still be
+releasing, within the frozen tolerance (`measurement.allocator_band_residuals`).
+The band's upper edge is the largest `resident` of the print, of any print
+read with it and of the previous paired print: after a large purge jemalloc
+stops counting an extent as resident before the kernel has released its
+pages, so an RSS read milliseconds after the print can still hold them
+(soak-strict r002 read 122-234 MB above resident five times, each back inside
+the band at the next print 11-49 ms later). The lower edge and the tolerance
+are unchanged, and growth above both prints' resident still fails. Every
+residual beyond half the tolerance is kept with the pairs around it
+(`residual_excursions`), and `measure rejudge-band --index NAME --output-dir
+DIR` advances a published index to the current rule from the stored runs,
+recording every verdict that changes (`rss_band_rejudgement`) and the rule
+(`rss_band_rule`). Each trial also reports the
 exporter's `memory.accounted` against jemalloc's `allocated`, at its
 highest fill and as a slope per values row written, which a heap leak
 inside the exporter would show. `stats_off` repeats the shipped winning

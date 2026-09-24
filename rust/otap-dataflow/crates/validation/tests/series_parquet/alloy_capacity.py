@@ -987,6 +987,9 @@ def settle_alloy(plan, trial, spec, result, run_dir, phase, feed, readings, wind
         for sample in samples[::capacity.PUBLISHED_SAMPLE_STRIDE]
     ]
     result["samples_published_stride"] = capacity.PUBLISHED_SAMPLE_STRIDE
+    result["observations"] = {"residual_excursions": measurement.residual_excursions(
+        residuals, list(getattr(phase.sampler, "pairs", ())),
+        max((s["process_rss_bytes"] for s in samples), default=0))}
     checks = result["checks"]
     checks.append(measurement.check(
         "delivery", measurement.CHECK_HARD,
