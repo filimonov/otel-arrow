@@ -78,6 +78,10 @@ CONFIRMATION_FRACTION = 0.8
 # The producer: spawned processes on the producer's physical cores, each
 # owning a share of the client connections, sending prebuilt requests.
 PRODUCER_PROCESSES = 4
+# Where the senders run: the host's CPUs outside the harness's own affinity
+# (the campaign pins the harness, engine and store to 0-7,16-23), one
+# sender process per physical core.
+PRODUCER_CPUS = "8-15,24-31"
 SEARCH_CONNECTIONS = 256
 FAN_IN_CONNECTIONS = (1, 8, 64, 256)
 PRODUCER_TIMEOUT_S = 180.0
@@ -503,10 +507,21 @@ def connection_plan(request_count, connections, processes) -> list:
     return plans
 
 
+def confine_threads(cpus):
+    """Confine every thread of this process to `cpus`.
+
+    The affinity call binds one thread; threads the process already started
+    (the gRPC runtime's among them) keep the mask they were born with.
+    """
+    for task in Path("/proc/self/task").iterdir():
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError):
+            os.sched_setaffinity(int(task.name), set(cpus))
+
+
 def _sender_process(pipe, config):
     """One producer process: connect, wait for the start, send, report."""
     try:
-        os.sched_setaffinity(0, set(config["cpus"]))
+        confine_threads(config["cpus"])
         grpc = test_e2e.grpc
         pool = CapacityPool(config["pool_dir"], measurement.Workload(**config["workload"]))
         options = [
@@ -520,6 +535,7 @@ def _sender_process(pipe, config):
         ]
         for channel in channels:
             grpc.channel_ready_future(channel).result(timeout=SENDER_READY_DEADLINE_S)
+        confine_threads(config["cpus"])
         calls = [
             {
                 signal: channel.unary_unary(
@@ -669,7 +685,7 @@ class SenderFleet:
             parent, child = context.Pipe()
             config = {
                 "target": target,
-                "cpus": list(cpus),
+                "cpus": list(cpus[number % len(cpus)]),
                 "pool_dir": str(pool.directory),
                 "workload": pool.workload.as_json(),
                 "connections": plan["connections"],
@@ -1094,6 +1110,40 @@ class TrialLedger:
 # --------------------------------------------------------------------------
 # One trial
 # --------------------------------------------------------------------------
+
+
+def producer_placement(spec, sibling_groups, allocation) -> list:
+    """The producer's physical cores, one CPU set of SMT siblings each.
+
+    `spec` is a kernel CPU list, or `allocated` to keep the producer on the
+    cores the role allocation gave it. Each sender process is confined to
+    one of the returned sets, so a sender owns a whole physical core. The
+    CPUs may lie outside the harness's own affinity; none may share a
+    physical core with another role.
+    """
+    if spec in (None, "", "allocated"):
+        return []
+    try:
+        from . import host_monitor
+    except ImportError:
+        import host_monitor
+    wanted = set(host_monitor.parse_core_list(str(spec)))
+    taken = {int(core) for role, cores in allocation.items() if role != "producer"
+             for core in cores}
+    groups = []
+    for group in sibling_groups:
+        members = sorted(set(int(core) for core in group) & wanted)
+        if not members:
+            continue
+        if set(int(core) for core in group) & taken:
+            raise AssertionError(
+                f"producer CPUs {members} share physical core {list(group)} with another role"
+            )
+        groups.append(members)
+    missing = wanted - {core for group in groups for core in group}
+    if missing:
+        raise AssertionError(f"producer CPUs {sorted(missing)} are not on this host")
+    return groups
 
 
 def whole_core_roles(allocation, sibling_groups) -> dict:
@@ -1626,6 +1676,11 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
     result["environment"]["build"] = plan["provenance"]["build"]
     result["environment"]["git"] = plan["provenance"]["git"]
     result["environment"]["ledger_filesystem"] = plan["ledger_filesystem"]
+    result["environment"]["producer"] = {
+        "cpus": plan["allocation"]["producer"],
+        "processes": plan["producer_processes"],
+        "cpu_set_per_process": plan["producer_cpu_sets"],
+    }
     result["ephemeral_values"] = dict(plan["ephemeral"])
     pool = plan["pools"][trial["workload_id"]]
     workload = spec.workload
@@ -1651,11 +1706,12 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
             target=f"127.0.0.1:{engine.grpc_port}", pool=pool, workload=workload,
             indexes=indexes, rate=trial["rate"], connections=trial["connections"],
             processes=plan["producer_processes"], in_flight=spec.max_in_flight,
-            cpus=plan["allocation"]["producer"], directory=run_dir / "senders",
+            cpus=plan["producer_cpu_sets"], directory=run_dir / "senders",
         )
         observed["senders_ready"] = fleet.ready()
         for number, pid in enumerate(fleet.pids()):
-            controls.register(f"producer_{number}", pid, plan["allocation"]["producer"])
+            controls.register(f"producer_{number}", pid, plan["producer_cpu_sets"][
+                number % len(plan["producer_cpu_sets"])])
         if trial["topology"] == "noop":
             phase = NoopPhase(engine, spec, controls, command.SAMPLE_PERIOD_S)
         else:
@@ -2321,6 +2377,11 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
         roles=measurement.CASE_ROLES["capacity"],
     )
     allocation = whole_core_roles(allocation, topology["sibling_groups"])
+    producer_groups = producer_placement(
+        options.get("producer_cpus", PRODUCER_CPUS), topology["sibling_groups"], allocation
+    )
+    if producer_groups:
+        allocation["producer"] = sorted(core for group in producer_groups for core in group)
     ledger_fs = performance.memory_ledger_dir(
         options.get("ledger_dir") or f"/tmp/series-capacity-ledgers-{os.getpid()}"
     )
@@ -2331,7 +2392,9 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
         "cores": list(cores),
         "allocation": allocation,
         "oracle_cores": performance.oracle_cores(allocation, topology["sibling_groups"]),
-        "producer_processes": int(options.get("producer_processes", PRODUCER_PROCESSES)),
+        "producer_processes": int(options.get(
+            "producer_processes", len(producer_groups) or PRODUCER_PROCESSES)),
+        "producer_cpu_sets": producer_groups or [allocation["producer"]],
         "provenance": command.prepare_build(),
         "ledger_filesystem": ledger_fs,
         "ledger_dir": ledger_fs["directory"],

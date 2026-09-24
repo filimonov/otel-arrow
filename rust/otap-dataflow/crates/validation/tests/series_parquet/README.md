@@ -243,9 +243,12 @@ state (`capacity-state.json`) lets a later invocation resume or add steps.
 `capacity-rustfs.json`, each with its trials, each cell's aggregate and its
 baseline.
 
-A trial offers a fixed rate from an open-loop producer: four spawned
-processes on the producer's two physical cores (both SMT threads; the store
-owns its core likewise), each owning a share of the client connections
+A trial offers a fixed rate from an open-loop producer: one spawned process
+per physical core of `--option producer_cpus` (default `8-15,24-31`, the
+host's CPUs outside the campaign pin, so eight processes; `allocated` keeps
+the two physical cores of the role allocation instead), every thread of
+each confined to its core's two SMT threads (the store owns its core
+likewise), each owning a share of the client connections
 (`grpc.use_local_subchannel_pool`, so each channel is its own TCP
 connection) and sending prebuilt requests at monotonic target times, with
 in-flight requests bounded by the receivers' summed capacity. A send is

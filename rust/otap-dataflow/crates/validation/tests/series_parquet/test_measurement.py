@@ -6437,6 +6437,27 @@ class CapacityContracts(unittest.TestCase):
         self.assertEqual(worker["exporter_nacks_by_class"], {"storage": 12})
         self.assertEqual(worker["requests_accepted_count"], 600)
 
+    # Scenario: the producer is placed on CPUs 8-9 and 24-25 of a host whose
+    # SMT siblings are i and i+16, beside an engine on core 1 and a store on
+    # core 7, and then on the store's core.
+    # Guarantees: each sender gets one whole physical core, the placement
+    # passes the run's role check, and a producer CPU on another role's
+    # physical core is refused.
+    def test_the_producer_owns_whole_physical_cores_of_its_own(self):
+        groups = [[core, core + 16] for core in range(16)]
+        allocation = {"engine_observability": [0], "engine": [1], "store": [7, 23]}
+        placed = capacity.producer_placement("8-9,24-25", groups, allocation)
+        self.assertEqual(placed, [[8, 24], [9, 25]])
+        result = {"environment": {}, "events": []}
+        controls = measurement.RunControls(result)
+        with mock.patch.object(measurement, "core_topology",
+                               return_value={"sibling_groups": groups}):
+            controls.allocate(dict(allocation, producer=[8, 9, 24, 25]))
+        self.assertEqual(result["environment"]["core_allocation"]["producer"], [8, 9, 24, 25])
+        with self.assertRaisesRegex(AssertionError, "shares? physical core"):
+            _ = capacity.producer_placement("7", groups, allocation)
+        self.assertEqual(capacity.producer_placement("allocated", groups, allocation), [])
+
     # Scenario: 128 receiver slots, 1000-record requests, held one second or
     # sixteen seconds (a 15 s window plus the flush).
     # Guarantees: the strict admission ceiling is slots times records over
