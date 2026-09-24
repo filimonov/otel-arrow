@@ -343,25 +343,18 @@ impl AnyValueColumns {
     }
 }
 
-/// Decode the CBOR cell at `row` of `a`, charging the tree below its root to
-/// `budget` as it is built; a failed decode gives its charge back.
+/// Decode the CBOR cell at `row` of `a`, holding the tree below its root in
+/// `budget` as it is built; a failed decode rolls the budget back.
 fn decode_charged(
     a: &ArrayRef,
     row: usize,
     limits: DecodeLimits,
     budget: &mut Budget,
 ) -> Result<Option<Value>> {
-    let mut reserved = 0_usize;
-    let decoded = bytes_cell(a, row, |b| {
-        decode_cbor_reserving(b, limits, &mut |bytes| {
-            budget.charge_decoded(bytes)?;
-            reserved += bytes;
-            Ok(())
-        })
-    })
-    .transpose();
+    let mark = budget.mark();
+    let decoded = bytes_cell(a, row, |b| decode_cbor_reserving(b, limits, budget)).transpose();
     if decoded.is_err() {
-        budget.uncharge(reserved);
+        budget.rollback(mark);
     }
     decoded
 }

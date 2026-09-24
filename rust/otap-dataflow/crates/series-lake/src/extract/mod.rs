@@ -291,6 +291,31 @@ impl Budget {
     pub(crate) fn uncharge(&mut self, bytes: usize) {
         self.used = self.used.saturating_sub(bytes);
     }
+
+    /// The point to return to with [`Budget::rollback`].
+    pub(crate) fn mark(&self) -> Mark {
+        Mark(self.used)
+    }
+
+    /// Return to `mark`, undoing every charge and release made since.
+    pub(crate) fn rollback(&mut self, mark: Mark) {
+        self.used = mark.0;
+    }
+}
+
+/// A position of a [`Budget`], taken before work that may fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Mark(usize);
+
+/// Decoded attribute values reserve through the request budget.
+impl crate::value::Reservations for Budget {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        self.charge_decoded(bytes)
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.uncharge(bytes);
+    }
 }
 
 /// Approximate retained bytes of one denormalized cell.

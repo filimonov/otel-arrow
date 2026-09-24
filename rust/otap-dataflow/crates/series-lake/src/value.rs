@@ -62,19 +62,49 @@ pub enum Value {
 /// `limits.max_depth` as `TooDeep`, and a malformed payload, a tag other than
 /// a bignum, an integer outside `i64` or a duplicate key as invalid content.
 pub fn decode_cbor(bytes: &[u8], limits: DecodeLimits) -> Result<Value> {
-    decode_cbor_reserving(bytes, limits, &mut |_| Ok(()))
+    decode_cbor_reserving(bytes, limits, &mut Unbounded)
 }
 
-/// [`decode_cbor`], calling `reserve` with the bytes of every node below the
-/// root and of every string, byte and key content before allocating them.
+/// Memory a decode may use: reserved before it is allocated, released after
+/// it is freed.
+pub trait Reservations {
+    /// Reserve `bytes`, or refuse them.
+    ///
+    /// # Errors
+    /// Whatever refusal the implementation chooses; the decode stops with it.
+    fn reserve(&mut self, bytes: usize) -> Result<()>;
+
+    /// Give back `bytes` reserved earlier.
+    fn release(&mut self, bytes: usize);
+}
+
+/// Reservations without a limit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Unbounded;
+
+impl Reservations for Unbounded {
+    fn reserve(&mut self, _bytes: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn release(&mut self, _bytes: usize) {}
+}
+
+/// [`decode_cbor`], holding every allocation it makes within `reservations`.
 ///
-/// The calls add up to the result's [`value_bytes`] less one
+/// Each buffer's capacity is reserved before it is allocated, a growing or
+/// shrinking buffer's old and new capacity together while both exist, and a
+/// successful decode holds exactly the result's [`value_bytes`] less one
 /// [`VALUE_NODE_BYTES`], the root node, which lives in its caller's storage.
-/// An error from `reserve` stops the decode and is returned as it is.
-pub(crate) fn decode_cbor_reserving(
+/// A refused reservation stops the decode; the caller rolls back what the
+/// failed decode held.
+///
+/// # Errors
+/// As [`decode_cbor`], and the refusal of a reservation as it is.
+pub fn decode_cbor_reserving(
     bytes: &[u8],
     limits: DecodeLimits,
-    reserve: &mut dyn FnMut(usize) -> Result<()>,
+    reservations: &mut dyn Reservations,
 ) -> Result<Value> {
     if bytes.len() > limits.max_cell_bytes {
         return Err(Error::too_large(
@@ -89,25 +119,25 @@ pub(crate) fn decode_cbor_reserving(
         decoder: ciborium_ll::Decoder::from(bytes),
         len: bytes.len(),
         max_depth: limits.max_depth,
-        reserve,
+        reservations,
     };
     reader.item(limits.max_depth)
 }
 
-/// A streaming CBOR reader that builds a [`Value`] directly, reserving each
-/// allocation before it is made.
+/// A streaming CBOR reader that builds a [`Value`] directly.
 struct CborReader<'a, 'r> {
     decoder: ciborium_ll::Decoder<&'a [u8]>,
     len: usize,
     max_depth: usize,
-    reserve: &'r mut dyn FnMut(usize) -> Result<()>,
+    reservations: &'r mut dyn Reservations,
 }
-
-/// The bytes one key/value entry occupies inline in its list.
-const ENTRY_NODE_BYTES: usize = BUFFER_HEADER_BYTES + VALUE_NODE_BYTES;
 
 fn malformed<E: std::fmt::Debug>(e: ciborium_ll::Error<E>) -> Error {
     Error::invalid(format!("cbor decode: {e:?}"))
+}
+
+fn overflow() -> Error {
+    Error::invalid("cbor decode: size overflow")
 }
 
 impl CborReader<'_, '_> {
@@ -120,17 +150,57 @@ impl CborReader<'_, '_> {
         self.len.saturating_sub(self.decoder.offset())
     }
 
-    /// Reserve `count` items of `each` bytes, refusing a count the rest of the
-    /// input cannot hold at `min_encoded` bytes per item.
-    fn reserve_items(&mut self, count: usize, each: usize, min_encoded: usize) -> Result<()> {
-        if count.saturating_mul(min_encoded) > self.remaining() {
-            return Err(Error::invalid("cbor decode: truncated container"));
+    /// Refuse `count` items the rest of the input cannot hold at
+    /// `min_encoded` bytes each.
+    fn fits_input(&mut self, count: usize, min_encoded: usize) -> Result<()> {
+        let needed = count.checked_mul(min_encoded).ok_or_else(overflow)?;
+        if needed > self.remaining() {
+            return Err(Error::invalid("cbor decode: truncated item"));
         }
-        (self.reserve)(count.saturating_mul(each))
+        Ok(())
     }
 
-    /// One item whose own node the caller has reserved; `depth_left` more
-    /// container levels may open below this point.
+    /// Make room in `v` for `additional` more elements. A declared length
+    /// grows to exactly what it needs, data of unknown length doubles.
+    fn make_room<T>(&mut self, v: &mut Vec<T>, additional: usize, exact: bool) -> Result<()> {
+        let needed = v.len().checked_add(additional).ok_or_else(overflow)?;
+        let old = v.capacity();
+        if needed <= old {
+            return Ok(());
+        }
+        let target = if exact {
+            needed
+        } else {
+            old.checked_mul(2)
+                .map_or(needed, |doubled| doubled.max(needed).max(8))
+        };
+        // The old buffer lives until the new one holds its elements.
+        let new_bytes = target.checked_mul(size_of::<T>()).ok_or_else(overflow)?;
+        self.reservations.reserve(new_bytes)?;
+        v.try_reserve_exact(target - v.len())
+            .map_err(|_| Error::internal("cbor decode: allocation failed"))?;
+        self.reservations.release(old * size_of::<T>());
+        self.reservations
+            .reserve((v.capacity() - target) * size_of::<T>())?;
+        Ok(())
+    }
+
+    /// Shrink `v` to its length, giving back the spare capacity.
+    fn trim<T>(&mut self, v: &mut Vec<T>) -> Result<()> {
+        let old = v.capacity();
+        if old == v.len() {
+            return Ok(());
+        }
+        self.reservations.reserve(v.len() * size_of::<T>())?;
+        v.shrink_to_fit();
+        self.reservations.release(old * size_of::<T>());
+        self.reservations
+            .reserve((v.capacity() - v.len()) * size_of::<T>())?;
+        Ok(())
+    }
+
+    /// One item whose own node the caller holds; `depth_left` more container
+    /// levels may open below this point.
     fn item(&mut self, depth_left: usize) -> Result<Value> {
         use ciborium_ll::{Header, simple, tag};
         Ok(match self.header()? {
@@ -148,8 +218,14 @@ impl CborReader<'_, '_> {
             Header::Simple(_) | Header::Break => {
                 return Err(Error::invalid("cbor decode: unexpected simple value"));
             }
-            Header::Bytes(len) => Value::Bytes(self.bytes(len)?),
-            Header::Text(len) => Value::Str(self.text(len)?),
+            Header::Bytes(len) => Value::Bytes(self.content(len, false)?),
+            Header::Text(len) => {
+                let bytes = self.content(len, true)?;
+                Value::Str(
+                    String::from_utf8(bytes)
+                        .map_err(|_| Error::invalid("cbor decode: text is not UTF-8"))?,
+                )
+            }
             Header::Tag(t @ (tag::BIGPOS | tag::BIGNEG)) => self.bignum(t == tag::BIGNEG)?,
             Header::Tag(_) => return Err(Error::invalid("unsupported cbor value")),
             Header::Array(len) => {
@@ -159,18 +235,18 @@ impl CborReader<'_, '_> {
                 let mut items = Vec::new();
                 match len {
                     Some(n) => {
-                        self.reserve_items(n, VALUE_NODE_BYTES, 1)?;
-                        items.reserve_exact(n);
+                        self.fits_input(n, 1)?;
+                        self.make_room(&mut items, n, true)?;
                         for _ in 0..n {
                             items.push(self.item(depth_left)?);
                         }
                     }
                     None => {
                         while !self.at_break()? {
-                            self.reserve_items(1, VALUE_NODE_BYTES, 1)?;
+                            self.make_room(&mut items, 1, false)?;
                             items.push(self.item(depth_left)?);
                         }
-                        items.shrink_to_fit();
+                        self.trim(&mut items)?;
                     }
                 }
                 Value::Array(items)
@@ -182,8 +258,8 @@ impl CborReader<'_, '_> {
                 let mut entries: Vec<(String, Value)> = Vec::new();
                 match len {
                     Some(n) => {
-                        self.reserve_items(n, ENTRY_NODE_BYTES, 2)?;
-                        entries.reserve_exact(n);
+                        self.fits_input(n, 2)?;
+                        self.make_room(&mut entries, n, true)?;
                         for _ in 0..n {
                             let key = self.key()?;
                             entries.push((key, self.item(depth_left)?));
@@ -191,11 +267,11 @@ impl CborReader<'_, '_> {
                     }
                     None => {
                         while !self.at_break()? {
-                            self.reserve_items(1, ENTRY_NODE_BYTES, 2)?;
+                            self.make_room(&mut entries, 1, false)?;
                             let key = self.key()?;
                             entries.push((key, self.item(depth_left)?));
                         }
-                        entries.shrink_to_fit();
+                        self.trim(&mut entries)?;
                     }
                 }
                 sort_kvlist(&mut entries)?;
@@ -219,70 +295,72 @@ impl CborReader<'_, '_> {
     fn key(&mut self) -> Result<String> {
         use ciborium_ll::{Header, simple};
         match self.header()? {
-            Header::Text(len) => self.text(len),
+            Header::Text(len) => {
+                let bytes = self.content(len, true)?;
+                String::from_utf8(bytes)
+                    .map_err(|_| Error::invalid("cbor decode: text is not UTF-8"))
+            }
             Header::Simple(simple::NULL | simple::UNDEFINED) => Ok(String::new()),
             _ => Err(Error::invalid("cbor map key is not text")),
         }
     }
 
-    fn bytes(&mut self, len: Option<usize>) -> Result<Vec<u8>> {
+    /// The content of a bytes or text item whose header gave `len`.
+    ///
+    /// An indefinite item is a sequence of chunks of its own kind up to a
+    /// break; like ciborium, a nested indefinite chunk is flattened into it.
+    /// Each text chunk must be UTF-8 on its own.
+    fn content(&mut self, len: Option<usize>, text: bool) -> Result<Vec<u8>> {
+        use ciborium_ll::Header;
         let mut out = Vec::new();
-        let mut scratch = [0_u8; 4096];
-        let remaining = self.remaining();
-        let reserve = &mut *self.reserve;
-        let mut segments = self.decoder.bytes(len);
-        while let Some(mut segment) = segments.pull().map_err(malformed)? {
-            if segment.left() > remaining {
-                return Err(Error::invalid("cbor decode: truncated bytes"));
+        let Some(len) = len else {
+            let mut open = 1_usize;
+            while open > 0 {
+                match (self.header()?, text) {
+                    (Header::Break, _) => open -= 1,
+                    (Header::Bytes(None), false) | (Header::Text(None), true) => open += 1,
+                    (Header::Bytes(Some(n)), false) | (Header::Text(Some(n)), true) => {
+                        self.chunk(&mut out, n, text, false)?;
+                    }
+                    _ => return Err(Error::invalid("cbor decode: malformed chunk")),
+                }
             }
-            reserve(segment.left())?;
-            out.reserve_exact(segment.left());
-            while let Some(chunk) = segment.pull(&mut scratch).map_err(malformed)? {
-                out.extend_from_slice(chunk);
-            }
-        }
-        out.shrink_to_fit();
+            self.trim(&mut out)?;
+            return Ok(out);
+        };
+        self.chunk(&mut out, len, text, true)?;
         Ok(out)
     }
 
-    fn text(&mut self, len: Option<usize>) -> Result<String> {
-        let mut out = String::new();
-        let mut scratch = [0_u8; 4096];
-        let remaining = self.remaining();
-        let reserve = &mut *self.reserve;
-        let mut segments = self.decoder.text(len);
-        while let Some(mut segment) = segments.pull().map_err(malformed)? {
-            if segment.left() > remaining {
-                return Err(Error::invalid("cbor decode: truncated text"));
-            }
-            reserve(segment.left())?;
-            out.reserve_exact(segment.left());
-            while let Some(chunk) = segment.pull(&mut scratch).map_err(malformed)? {
-                out.push_str(chunk);
-            }
+    /// Append one chunk of `n` bytes to `out`.
+    fn chunk(&mut self, out: &mut Vec<u8>, n: usize, text: bool, exact: bool) -> Result<()> {
+        use ciborium_io::Read as _;
+        self.fits_input(n, 1)?;
+        self.make_room(out, n, exact)?;
+        let start = out.len();
+        out.resize(start + n, 0);
+        self.decoder
+            .read_exact(&mut out[start..])
+            .map_err(|_| Error::invalid("cbor decode: truncated chunk"))?;
+        if text && std::str::from_utf8(&out[start..]).is_err() {
+            return Err(Error::invalid("cbor decode: text is not UTF-8"));
         }
-        out.shrink_to_fit();
-        Ok(out)
+        Ok(())
     }
 
     /// A tag 2 or 3 bignum of at most 16 bytes, as an `i64`; any other tagged
     /// item is unsupported.
     fn bignum(&mut self, negative: bool) -> Result<Value> {
+        use ciborium_io::Read as _;
         let len = match self.header()? {
             ciborium_ll::Header::Bytes(Some(len)) if len <= 16 => len,
             _ => return Err(Error::invalid("unsupported cbor value")),
         };
         let mut digits = [0_u8; 16];
-        let mut scratch = [0_u8; 16];
-        let mut read = 0;
-        let mut segments = self.decoder.bytes(Some(len));
-        while let Some(mut segment) = segments.pull().map_err(malformed)? {
-            while let Some(chunk) = segment.pull(&mut scratch).map_err(malformed)? {
-                digits[read..read + chunk.len()].copy_from_slice(chunk);
-                read += chunk.len();
-            }
-        }
-        let raw = digits[..read]
+        self.decoder
+            .read_exact(&mut digits[..len])
+            .map_err(|_| Error::invalid("cbor decode: truncated bignum"))?;
+        let raw = digits[..len]
             .iter()
             .fold(0_u128, |acc, &b| (acc << 8) | u128::from(b));
         let raw = i64::try_from(raw).map_err(|_| Error::invalid("cbor int out of i64"))?;
@@ -291,8 +369,11 @@ impl CborReader<'_, '_> {
 }
 
 /// Sort a key/value list by raw key bytes and refuse duplicate keys.
+///
+/// The sort is in place: with unique keys an unstable sort orders exactly as a
+/// stable one, and a list with a repeated key is refused either way.
 pub fn sort_kvlist(list: &mut [(String, Value)]) -> Result<()> {
-    list.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    list.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     if list.windows(2).any(|w| w[0].0 == w[1].0) {
         return Err(Error::invalid("duplicate attribute key"));
     }
@@ -548,20 +629,44 @@ mod tests {
         }
     }
 
-    /// A reservation callback that refuses a running total past `limit`.
-    fn counter(limit: usize) -> impl FnMut(usize) -> Result<()> {
-        let mut reserved = 0_usize;
-        move |bytes| {
-            let next = reserved.saturating_add(bytes);
-            if next > limit {
+    /// Reservations refusing a running total past `limit`, recording every
+    /// request and the largest total held.
+    struct Counter {
+        limit: usize,
+        held: usize,
+        peak: usize,
+        requests: Vec<usize>,
+    }
+
+    impl Counter {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                held: 0,
+                peak: 0,
+                requests: Vec::new(),
+            }
+        }
+    }
+
+    impl Reservations for Counter {
+        fn reserve(&mut self, bytes: usize) -> Result<()> {
+            self.requests.push(bytes);
+            let next = self.held + bytes;
+            if next > self.limit {
                 return Err(Error::too_large(
                     crate::error::SizeBudget::Table,
                     next,
-                    limit,
+                    self.limit,
                 ));
             }
-            reserved = next;
+            self.held = next;
+            self.peak = self.peak.max(next);
             Ok(())
+        }
+
+        fn release(&mut self, bytes: usize) {
+            self.held -= bytes;
         }
     }
 
@@ -586,65 +691,54 @@ mod tests {
             n
         ]));
         assert_eq!(buf.len(), 1 << 20);
-        let mut requests = Vec::new();
-        let mut limit = counter(16 << 20);
-        let result = decode_cbor_reserving(&buf, DecodeLimits::new(32, 1 << 20), &mut |bytes| {
-            requests.push(bytes);
-            limit(bytes)
-        });
+        let mut counter = Counter::new(16 << 20);
+        let result = decode_cbor_reserving(&buf, DecodeLimits::new(32, 1 << 20), &mut counter);
         assert!(matches!(
             result,
             Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
-        assert_eq!(requests, vec![n * VALUE_NODE_BYTES]);
+        assert_eq!(counter.requests, vec![n * VALUE_NODE_BYTES]);
+        assert_eq!(counter.held, 0);
     }
 
     /// Scenario: a CBOR array of 200 000 singleton arrays `[0]`, two encoded
     /// bytes each and 64 decoded, against a 4 MiB reservation limit, and a
     /// singleton chain nested exactly to the depth limit.
     /// Guarantees: the wide cell is refused once its reservations reach the
-    /// limit, never holding more than the limit, and the chain reserves
-    /// exactly its decoded size.
+    /// limit, never holding more than the limit, and the chain holds exactly
+    /// its decoded size.
     #[test]
     fn singleton_nesting_is_reserved_node_by_node() {
         let one = ciborium::Value::Array(vec![ciborium::Value::Integer(0.into())]);
         let wide = encode(&ciborium::Value::Array(vec![one; 200_000]));
-        let mut granted = 0_usize;
-        let mut limit = counter(4 << 20);
-        let result = decode_cbor_reserving(&wide, DecodeLimits::new(32, usize::MAX), &mut |b| {
-            limit(b)?;
-            granted += b;
-            Ok(())
-        });
+        let mut counter = Counter::new(4 << 20);
+        let result = decode_cbor_reserving(&wide, DecodeLimits::new(32, usize::MAX), &mut counter);
         assert!(matches!(
             result,
             Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
         ));
-        assert!(granted <= 4 << 20);
+        assert!(counter.peak <= 4 << 20);
 
         let mut chain = ciborium::Value::Integer(0.into());
         for _ in 0..32 {
             chain = ciborium::Value::Array(vec![chain]);
         }
-        let mut reserved = 0;
+        let mut counter = Counter::new(usize::MAX);
         let v = decode_cbor_reserving(
             &encode(&chain),
             DecodeLimits::new(32, usize::MAX),
-            &mut |b| {
-                reserved += b;
-                Ok(())
-            },
+            &mut counter,
         )
         .expect("at the depth limit");
-        assert_eq!(reserved + VALUE_NODE_BYTES, value_bytes(&v));
+        assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
         assert_eq!(value_bytes(&v), 33 * VALUE_NODE_BYTES);
     }
 
     /// Scenario: a hand-encoded payload using indefinite-length text, bytes,
     /// array and map, a null map key, `undefined`, a half float, a negative
     /// integer and a tag-2 bignum.
-    /// Guarantees: every form decodes to the expected value, and the
-    /// reservations add up to its [`value_bytes`] less the root node.
+    /// Guarantees: every form decodes to the expected value, and what the
+    /// decode holds afterwards is its [`value_bytes`] less the root node.
     #[test]
     fn reservations_add_up_to_the_decoded_size() {
         let buf: Vec<u8> = [
@@ -658,12 +752,9 @@ mod tests {
             &[0xff],
         ]
         .concat();
-        let mut reserved = 0;
-        let v = decode_cbor_reserving(&buf, DecodeLimits::new(32, usize::MAX), &mut |b| {
-            reserved += b;
-            Ok(())
-        })
-        .expect("decode");
+        let mut counter = Counter::new(usize::MAX);
+        let v = decode_cbor_reserving(&buf, DecodeLimits::new(32, usize::MAX), &mut counter)
+            .expect("decode");
         assert_eq!(
             v,
             Value::KvList(vec![
@@ -679,7 +770,65 @@ mod tests {
                 ("z".into(), Value::Int(256)),
             ])
         );
-        assert_eq!(reserved + VALUE_NODE_BYTES, value_bytes(&v));
+        assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
+    }
+
+    /// Scenario: a one-MiB indefinite byte string of one-byte chunks, and an
+    /// indefinite array of 200 000 ints.
+    /// Guarantees: buffers grow by doubling, so the reservations number a few
+    /// dozen rather than one per chunk or item (linear time), each growth
+    /// holds the old and new buffer together, and what is held afterwards is
+    /// the decoded size.
+    #[test]
+    fn indefinite_items_grow_geometrically_within_their_reservations() {
+        let chunks = (1 << 20) / 2 - 1;
+        let mut bytes = vec![0x5f];
+        for i in 0..chunks {
+            bytes.extend_from_slice(&[0x41, i as u8]);
+        }
+        bytes.push(0xff);
+        let mut counter = Counter::new(usize::MAX);
+        let v = decode_cbor_reserving(&bytes, DecodeLimits::new(32, 1 << 20), &mut counter)
+            .expect("decode");
+        assert!(matches!(&v, Value::Bytes(b) if b.len() == chunks));
+        assert!(counter.requests.len() < 64, "{}", counter.requests.len());
+        assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
+        // The last growth held both buffers: more than the final content.
+        assert!(counter.peak > chunks);
+
+        let mut array = vec![0x9f];
+        array.extend(std::iter::repeat_n(0x01, 200_000));
+        array.push(0xff);
+        let mut counter = Counter::new(usize::MAX);
+        let v = decode_cbor_reserving(&array, DecodeLimits::new(32, usize::MAX), &mut counter)
+            .expect("decode");
+        assert!(counter.requests.len() < 128, "{}", counter.requests.len());
+        assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
+    }
+
+    /// Scenario: an indefinite byte string whose second chunk declares more
+    /// bytes than the input still holds, and a definite array declaring
+    /// `u64::MAX` items.
+    /// Guarantees: both are refused as invalid before the declared size is
+    /// reserved or allocated: the checks use the bytes remaining at that
+    /// chunk and checked arithmetic.
+    #[test]
+    fn declared_sizes_are_checked_against_the_remaining_input() {
+        let mut counter = Counter::new(usize::MAX);
+        let chunk = [0x5f, 0x41, 0x00, 0x5a, 0x00, 0x10, 0x00, 0x00, 0x00, 0xff];
+        assert!(matches!(
+            decode_cbor_reserving(&chunk, DecodeLimits::new(32, usize::MAX), &mut counter),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        assert!(counter.requests.iter().all(|&r| r < 1 << 10));
+
+        let mut counter = Counter::new(usize::MAX);
+        let huge = [0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert!(matches!(
+            decode_cbor_reserving(&huge, DecodeLimits::new(32, usize::MAX), &mut counter),
+            Err(Error::Refused(RefuseReason::Invalid(_)))
+        ));
+        assert!(counter.requests.is_empty());
     }
 
     /// Scenario: render_v1 over every scalar kind and a nested kvlist.
