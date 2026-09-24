@@ -22,9 +22,9 @@
 //! `OtapPayload::validate_otlp_framing`), refusing a repeated singular field
 //! as well, because the byte views would store one occurrence where prost
 //! keeps another. Invalid UTF-8 is not refused: the conversion stores it with
-//! U+FFFD. Nesting deeper than any accepted `ingress.max_nesting_depth` is
-//! refused by the same walk, before the conversion's recursive value encoder
-//! runs.
+//! U+FFFD, counted in `repaired.invalid_utf8`. Nesting deeper than any
+//! accepted `ingress.max_nesting_depth` is refused by the same walk, before
+//! the conversion's recursive value encoder runs.
 //!
 //! Logs and metrics are admitted through the same state machine and the same
 //! single extraction call; traces have no lake schema and are refused on the
@@ -62,6 +62,7 @@ use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::engine_metrics::SeriesMemoryAccounting;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
+use otel_arrow_dfe_pdata::encode::count_utf8_repairs;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::{OtapPayload, OtlpProtoBytes, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
@@ -168,6 +169,9 @@ pub(super) struct Pending {
     pub(super) token: AckToken,
     /// Wall-clock second the request was prepared at, for window alignment.
     pub(super) admission_secs: i64,
+    /// String values the conversion stored with U+FFFD in place of invalid
+    /// UTF-8.
+    pub(super) utf8_repairs: u64,
 }
 
 /// What preparing one request produced.
@@ -428,7 +432,7 @@ impl Worker {
         {
             return Prepared::Failed(token, error);
         }
-        let extracted = match self.extract(payload) {
+        let (extracted, utf8_repairs) = match self.extract(payload) {
             Ok(extracted) => extracted,
             Err(error) => return Prepared::Failed(token, error),
         };
@@ -436,6 +440,7 @@ impl Worker {
             extracted,
             token,
             admission_secs: nanos_to_secs(self.wall.now_unix_nanos()),
+            utf8_repairs,
         })
     }
 
@@ -469,15 +474,20 @@ impl Worker {
             })
     }
 
-    /// Convert one payload and extract its rows, dropping the conversion.
+    /// Convert one payload and extract its rows, dropping the conversion;
+    /// also returns how many string values the conversion repaired.
     ///
     /// Split out so the record batches the conversion produced go out of scope
     /// with the call rather than living as long as the extraction does.
-    fn extract(&self, payload: OtapPayload) -> lake::Result<Extracted> {
-        let mut records: OtapArrowRecords = payload
-            .try_into_with_default()
-            .map_err(|e| lake::Error::invalid(format!("undecodable pdata: {e}")))?;
-        lake::extract::extract(&mut records, &self.cfg.lake)
+    fn extract(&self, payload: OtapPayload) -> lake::Result<(Extracted, u64)> {
+        let (records, repaired): (Result<OtapArrowRecords, _>, u64) =
+            count_utf8_repairs(|| payload.try_into_with_default());
+        let mut records =
+            records.map_err(|e| lake::Error::invalid(format!("undecodable pdata: {e}")))?;
+        Ok((
+            lake::extract::extract(&mut records, &self.cfg.lake)?,
+            repaired,
+        ))
     }
 
     /// Take ownership of one request's completion and try to admit its rows.
@@ -496,6 +506,7 @@ impl Worker {
                 // reported can be counted twice.
                 if let Some(metrics) = &mut self.metrics {
                     metrics.extracted(&pending.extracted.stats);
+                    metrics.repaired(pending.token.signal(), pending.utf8_repairs);
                 }
                 self.offer(pending);
             }

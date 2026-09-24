@@ -930,6 +930,7 @@ Labelled sets, each with one closed enumeration:
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary` |
 | `dropped.exemplars` | `{exemplar}` | `signal` | `metrics` |
+| `repaired.invalid_utf8` | `{value}` | `signal` | `logs`, `metrics` |
 | `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |
 
 Each `*_too_large` value of `nacks` names the setting it exceeded:
@@ -1117,9 +1118,11 @@ become null; a negative converted timestamp becomes null and increments
   refused too, although protobuf allows it, because the byte views would
   store one occurrence where prost keeps another; the file, parquet and otap
   exporters accept it. String fields are not checked for UTF-8: invalid bytes
-  are stored as U+FFFD. Invalid UTF-8 inside an array or key-value list
-  attribute value is refused as undecodable instead, unlike a top-level
-  string, which is repaired.
+  are stored as U+FFFD and each repaired value is counted in
+  `repaired.invalid_utf8{signal}`, so two strings that differ only in their
+  invalid bytes can share a series id. Invalid UTF-8 inside an array or
+  key-value list attribute value is refused as undecodable instead, unlike a
+  top-level string, which is repaired.
 - Dictionary-encoded OTAP Arrow columns are read through their dictionary,
   never expanded first. Every attribute key and value is charged as it is
   read: one longer than `ingress.max_row_bytes`, or an attribute table whose

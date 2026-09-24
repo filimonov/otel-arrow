@@ -679,13 +679,9 @@ async fn metrics_are_admitted_like_logs() {
         .await;
 }
 
-/// Scenario: an OTLP logs request whose record body is a string holding bytes
-/// that are not UTF-8 (`caf` then a lone `0xc3`).
-/// Guarantees: it is prepared for admission, not refused, and its body is
-/// extracted with U+FFFD in place of the invalid byte, as the OTAP conversion
-/// stores it.
-#[tokio::test(flavor = "current_thread")]
-async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
+/// An OTLP logs request of one record whose string body is `caf` then a lone
+/// `0xc3`, which is not UTF-8.
+fn invalid_utf8_body_pdata() -> OtapPdata {
     let len_field = |field: u32, payload: &[u8]| {
         let mut out = Vec::new();
         prost::encoding::encode_key(field, prost::encoding::WireType::LengthDelimited, &mut out);
@@ -698,14 +694,23 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     record.extend(len_field(5, &len_field(1, b"caf\xc3")));
     let body = len_field(1, &len_field(2, &len_field(2, &record)));
     let payload = otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+    let mut context = Context::default();
+    context.set_source_node(7);
+    OtapPdata::new(context, payload.into())
+}
 
+/// Scenario: an OTLP logs request whose record body is a string holding bytes
+/// that are not UTF-8 (`caf` then a lone `0xc3`).
+/// Guarantees: it is prepared for admission, not refused, and its body is
+/// extracted with U+FFFD in place of the invalid byte, as the OTAP conversion
+/// stores it.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let (handler, _rx) = effects(2);
     let wall = Arc::new(lake::clock::TestWallClock::new(0));
     let worker = Worker::new(worker_config(), store, wall, handler);
-    let mut context = Context::default();
-    context.set_source_node(7);
-    match worker.prepare(OtapPdata::new(context, payload.into())) {
+    match worker.prepare(invalid_utf8_body_pdata()) {
         Prepared::Ready(pending) => {
             assert_eq!(pending.extracted.stats.rows, 1);
             let values = format!("{:?}", pending.extracted.values);
@@ -714,6 +719,48 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
         }
         Prepared::Failed(_, failure) => panic!("refused: {failure:?}"),
     }
+}
+
+/// Scenario: with telemetry registered, the logs request whose body holds a
+/// byte that is not UTF-8 is admitted, then a well-formed logs request.
+/// Guarantees: `repaired.invalid_utf8{signal=logs}` counts the one repaired
+/// value and the well-formed request adds nothing; no `metrics` bucket is
+/// touched.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repaired_log_body_is_counted_by_signal() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(4);
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(lake::clock::TestWallClock::new(0)),
+        handler,
+    );
+    worker.metrics = Some(super::super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    ));
+    worker.admit(invalid_utf8_body_pdata());
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.tokens.len(), 2, "both requests are admitted");
+    let metrics = worker.metrics.as_ref().expect("registered");
+    let repaired = |signal| super::super::metrics::SignalAttrs { signal };
+    assert_eq!(
+        metrics
+            .repaired
+            .get(repaired(SignalType::Logs))
+            .invalid_utf8
+            .get(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .repaired
+            .get(repaired(SignalType::Metrics))
+            .invalid_utf8
+            .get(),
+        0
+    );
 }
 
 /// Scenario: OTLP logs requests whose record attribute value is an array, or
@@ -1217,7 +1264,7 @@ async fn an_exemplar_is_dropped_and_counted_by_default_and_refused_when_asked() 
             assert_eq!(
                 metrics
                     .exemplars
-                    .get(super::super::metrics::ExemplarAttrs {
+                    .get(super::super::metrics::SignalAttrs {
                         signal: SignalType::Metrics
                     })
                     .dropped_exemplars

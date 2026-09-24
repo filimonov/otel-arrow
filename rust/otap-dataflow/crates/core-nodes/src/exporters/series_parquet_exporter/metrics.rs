@@ -284,21 +284,33 @@ pub(super) struct DroppedMetrics {
     pub dropped_unsupported: Counter<u64>,
 }
 
-/// The signal a dropped exemplar belonged to.
+/// The signal of the request a count belongs to.
 #[attribute_set(item, measurement)]
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ExemplarAttrs {
-    /// Source signal; only `metrics` points carry exemplars.
+pub(super) struct SignalAttrs {
+    /// Source signal, `logs` or `metrics`.
     pub signal: SignalType,
 }
 
-/// Exemplars dropped under `metrics.exemplars: drop`, split by signal.
-#[metric_set(name = "exporter.series_parquet", measurement_attributes = ExemplarAttrs)]
+/// Exemplars dropped under `metrics.exemplars: drop`, split by signal; only
+/// `metrics` points carry exemplars.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = SignalAttrs)]
 #[derive(Debug, Default, Clone)]
 pub(super) struct ExemplarMetrics {
     /// Exemplars of stored or dropped points that no dataset keeps.
     #[metric(name = "dropped.exemplars", unit = "{exemplar}")]
     pub dropped_exemplars: Counter<u64>,
+}
+
+/// String values stored with U+FFFD in place of invalid UTF-8, split by
+/// signal.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = SignalAttrs)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct RepairedMetrics {
+    /// String values of admitted requests the OTLP conversion repaired; a
+    /// dictionary value counts once per row that references it.
+    #[metric(name = "repaired.invalid_utf8", unit = "{value}")]
+    pub invalid_utf8: Counter<u64>,
 }
 
 /// One configured denormalized physical column.
@@ -339,6 +351,8 @@ pub(super) struct Metrics {
     pub dropped: MeasurementMetricSet<DroppedMetrics>,
     /// Dropped exemplars, by signal.
     pub exemplars: MeasurementMetricSet<ExemplarMetrics>,
+    /// Repaired invalid UTF-8 string values, by signal.
+    pub repaired: MeasurementMetricSet<RepairedMetrics>,
     /// One set per configured denormalized column.
     columns: BTreeMap<String, MetricSet<ColumnMetrics>>,
     /// The shared `exporter.exports` set every exporter registers, so this
@@ -384,6 +398,7 @@ impl Metrics {
             emitted: EmittedMetrics::register(ctx),
             dropped: DroppedMetrics::register(ctx),
             exemplars: ExemplarMetrics::register(ctx),
+            repaired: RepairedMetrics::register(ctx),
             columns,
             exports: Some(ExporterExportMetrics::register(ctx)),
         }
@@ -420,7 +435,7 @@ impl Metrics {
         // Exemplars exist only on metric points.
         if stats.dropped_exemplars != 0 {
             self.exemplars
-                .with(ExemplarAttrs {
+                .with(SignalAttrs {
                     signal: SignalType::Metrics,
                 })
                 .dropped_exemplars
@@ -430,6 +445,17 @@ impl Metrics {
             if let Some(metrics) = self.columns.get_mut(column) {
                 metrics.mismatch.add(*count);
             }
+        }
+    }
+
+    /// Record the string values the conversion of one admitted request of
+    /// `signal` repaired; called with [`Metrics::extracted`].
+    pub(super) fn repaired(&mut self, signal: SignalType, count: u64) {
+        if count != 0 {
+            self.repaired
+                .with(SignalAttrs { signal })
+                .invalid_utf8
+                .add(count);
         }
     }
 
@@ -445,6 +471,7 @@ impl Metrics {
         let _ = reporter.report_measurement(&mut self.emitted);
         let _ = reporter.report_measurement(&mut self.dropped);
         let _ = reporter.report_measurement(&mut self.exemplars);
+        let _ = reporter.report_measurement(&mut self.repaired);
         for metrics in self.columns.values_mut() {
             let _ = reporter.report(metrics);
         }
@@ -462,6 +489,7 @@ impl Metrics {
         out.extend(self.emitted.terminal_snapshots());
         out.extend(self.dropped.terminal_snapshots());
         out.extend(self.exemplars.terminal_snapshots());
+        out.extend(self.repaired.terminal_snapshots());
         for metrics in self.columns.values_mut() {
             out.extend(metrics.terminal_snapshots());
         }
@@ -690,7 +718,7 @@ mod tests {
 
         metrics
             .exemplars
-            .with(ExemplarAttrs {
+            .with(SignalAttrs {
                 signal: SignalType::Metrics,
             })
             .dropped_exemplars
@@ -702,6 +730,17 @@ mod tests {
             &[("dropped.exemplars", "{exemplar}")],
             &[("signal", "metrics")],
         );
+
+        for (signal, label) in [(SignalType::Logs, "logs"), (SignalType::Metrics, "metrics")] {
+            metrics.repaired(signal, 1);
+            let snapshots = metrics.repaired.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(
+                &snapshots[0],
+                &[("repaired.invalid_utf8", "{value}")],
+                &[("signal", label)],
+            );
+        }
 
         assert_eq!(
             metrics
@@ -802,7 +841,7 @@ mod tests {
         assert_eq!(
             metrics
                 .exemplars
-                .get(ExemplarAttrs {
+                .get(SignalAttrs {
                     signal: SignalType::Metrics
                 })
                 .dropped_exemplars
