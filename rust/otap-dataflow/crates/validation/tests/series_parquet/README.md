@@ -419,6 +419,13 @@ not measure validly (the overload starved the build monitor) steers the
 bisection from above but never becomes the unsustainable bound, so a
 search bounded only by it reports a lower bound.
 
+Each store's index also carries `capacity.rejudgement`: every trial judged
+again from what it stored by the current rules (`capacity.judge_trial` for
+the verdict, the generator read-back's aggregate equalities, and the Alloy
+read-back's `judge_read_back`), with the verdicts, read-backs and search
+decisions that change, and the trials whose figures do not allow it. An index
+that replaces a published one lists the old one in `child_indexes`.
+
 The remaining subcommands (`soak`, `failures`, `buffered`, `remediate`,
 `report`) are named here so the command line is one contract; each is
 implemented by its own task.

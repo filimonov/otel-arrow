@@ -6544,6 +6544,68 @@ class CapacityContracts(unittest.TestCase):
         stored["capacity"]["stored_rows_window_records_per_s"] = 50_000
         self.assertEqual(capacity.rejudge_stored(stored)["verdict"], "unsustainable")
 
+    # Scenario: a search whose winning-rate trial was recorded producer-limited
+    # although a request was partially rejected, another whose read-back
+    # recorded a pass with a duplicated record, and an Alloy read-back that
+    # recorded a pass with a line stored twice.
+    # Guarantees: the index's re-judgement names each changed verdict and read-
+    # back, and the search decision the corrected verdicts give.
+    def test_rejudgement_names_changed_verdicts_and_decisions(self):
+        output = temporary_directory(self)
+
+        def trial(run_id, rate, verdict, *, late=0.0, outcomes=None, coverage=None):
+            capacity_block = {
+                "verdict": verdict, "offered_records_per_s": rate,
+                "window_monotonic_ns": [0, 60_000_000_000],
+                "producer": {"late_unblocked_ratio": late,
+                             "outcomes": outcomes or {"ack": 100}},
+                "buffer": None, "stored_rows_window_records_per_s": rate,
+                "stored_rows_floor_records": rate * 50,
+                "oracle": {"passed": True, "signals": {"logs": dict({
+                    "expected_record_count": 100, "stored_record_count": 100,
+                    "distinct_record_count": 100, "stored_failed_records_count": 0,
+                    "seq_sum": 4950, "expected_seq_sum_of_acknowledged": 4950},
+                    **(coverage or {}))}},
+            }
+            document = {"run_id": run_id, "status": measurement.STATUS_PASSED, "checks": [],
+                        "capacity": capacity_block,
+                        "metrics": {"durable_tail_records_per_s": rate,
+                                    "backlog_slope_ratio": 0.0}}
+            (output / f"{run_id}.json").write_text(json.dumps(document), encoding="ascii")
+            return {"run_id": run_id, "cell": "local-c1", "workload_id": "mixed-1k-hot",
+                    "purpose": "search", "rate": rate, "verdict": verdict}
+
+        entries = [
+            trial("r1", 1000, "sustainable"),
+            trial("r2", 2000, "producer_limited", late=0.05,
+                  outcomes={"ack": 99, "partial_rejection": 1}),
+            trial("r3", 1500, "sustainable", coverage={"stored_record_count": 101,
+                                                       "seq_sum": 4955}),
+        ]
+        alloy = {"run_id": "a1", "status": measurement.STATUS_PASSED, "checks": [],
+                 "capacity": {"verdict": "sustainable", "oracle": {
+                     "passed": True, "expected_lines": 3, "total_rows": 4,
+                     "multiplicity_histogram": {"1": 2, "2": 1},
+                     "files": {"/input/events.log": {
+                         "e2e_source": "alloy-file", "rows": 4, "distinct_lines": 3,
+                         "first_seq": 0, "last_seq": 2, "malformed_rows": 0,
+                         "producer_ids": ["alloy-producer"], "clickhouse_rows": 4}}}}}
+        (output / "a1.json").write_text(json.dumps(alloy), encoding="ascii")
+        entries.append({"run_id": "a1", "cell": "local-c1", "workload_id": "alloy-file",
+                        "purpose": "alloy_shipped", "rate": 3, "verdict": "sustainable"})
+        state = capacity.FamilyState(output)
+        state.document["trials"] = [dict(entry) for entry in entries]
+        report = capacity.rejudgement(state, output, entries)
+        self.assertEqual([(c["run_id"], c["recorded"], c["rejudged"])
+                          for c in report["verdict_changes"]],
+                         [("r2", "producer_limited", "unsustainable")])
+        self.assertEqual(sorted(c["run_id"] for c in report["oracle_changes"]), ["a1", "r3"])
+        (decision,) = report["decision_changes"]
+        self.assertEqual(decision["recorded"]["sustainable_records_per_s"], 1500)
+        self.assertEqual(decision["recorded"]["kind"], "lower_bound_producer_limited")
+        self.assertEqual(decision["rejudged"]["sustainable_records_per_s"], 1000)
+        self.assertEqual(decision["rejudged"]["unsustainable_records_per_s"], 2000)
+
     # Scenario: the durable tail rate is 97% of offered, or the backlog grows
     # by 3% of the offered rate, or a request failed.
     # Guarantees: each alone makes the trial unsustainable, with its reason.

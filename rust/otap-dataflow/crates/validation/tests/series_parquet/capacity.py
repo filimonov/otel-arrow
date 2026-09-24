@@ -2925,6 +2925,119 @@ def trial_row(output_dir, entry) -> dict:
     }
 
 
+REJUDGEMENT_RULES = (
+    "every trial judged again from what it stored: the verdict through `judge_trial` "
+    "(engine-side failures -- failed, refused and partially rejected requests, the "
+    "durable buffer's growing log, ingest failures and rejected bundles -- outrank "
+    "producer lateness), the generator read-back's aggregate equalities (stored rows "
+    "less stored failed-request rows equal the acknowledged records, every stored "
+    "record once, the sequence sum when no failed request's rows were stored), and "
+    "the Alloy read-back through `judge_read_back` (a duplicate fails it)"
+)
+
+
+def stored_oracle_equalities(result) -> tuple:
+    """The aggregate equalities a stored generator read-back can still be held to.
+
+    The stored coverage keeps the counts and the global sequence sum; the sum
+    is checkable only when no failed request's rows were stored (their
+    sequences are not in the record), which is said.
+    """
+    oracle = (result.get("capacity") or {}).get("oracle") or {}
+    problems, unchecked = [], []
+    for signal, coverage in (oracle.get("signals") or {}).items():
+        expected = coverage["expected_record_count"]
+        stored = coverage["stored_record_count"]
+        failed_stored = coverage["stored_failed_records_count"]
+        if stored - failed_stored != expected:
+            problems.append(f"{signal}: rows beyond the acknowledged and failed records "
+                            f"{stored - failed_stored}, expected {expected}")
+        if coverage["distinct_record_count"] != stored:
+            problems.append(f"{signal}: distinct stored records "
+                            f"{coverage['distinct_record_count']} of {stored}")
+        if failed_stored == 0:
+            if coverage["seq_sum"] != coverage["expected_seq_sum_of_acknowledged"]:
+                problems.append(f"{signal}: sequence sum {coverage['seq_sum']}, expected "
+                                f"{coverage['expected_seq_sum_of_acknowledged']}")
+        else:
+            unchecked.append(f"{signal}: sequence sum not checkable, {failed_stored} "
+                             f"failed-request records stored")
+    return problems, unchecked
+
+
+def rejudgement(state, output_dir, entries) -> dict:
+    """Every trial of `entries` judged again by the current rules, and the
+    search decisions those verdicts give next to the recorded ones."""
+    try:
+        from . import alloy_capacity
+    except ImportError:
+        import alloy_capacity
+    output_dir = Path(output_dir)
+    verdict_changes, oracle_changes, unchecked = [], [], []
+    rejudged = {}
+    for entry in entries:
+        result = load_result(output_dir, entry["run_id"])
+        block = result.get("capacity")
+        if not block or "producer" not in block and entry["workload_id"] != \
+                alloy_capacity.WORKLOAD_ID:
+            unchecked.append({"run_id": entry["run_id"],
+                              "reason": f"no stored trial figures ({result.get('status')})"})
+            continue
+        if entry["workload_id"] == alloy_capacity.WORKLOAD_ID:
+            oracle = block.get("oracle") or {}
+            if not oracle.get("files"):
+                unchecked.append({"run_id": entry["run_id"], "reason": "nothing was stored"})
+                continue
+            again = alloy_capacity.rejudge_stored_read_back(oracle)
+            if again["passed"] != oracle.get("passed"):
+                oracle_changes.append({"run_id": entry["run_id"], "recorded": oracle.get("passed"),
+                                       "rejudged": again["passed"],
+                                       "problems": again["problems"]})
+            continue
+        verdict = rejudge_stored(result)
+        if verdict["verdict"] != block["verdict"]:
+            verdict_changes.append({"run_id": entry["run_id"], "purpose": entry["purpose"],
+                                    "recorded": block["verdict"], "rejudged": verdict["verdict"],
+                                    "reasons": verdict["reasons"]})
+        problems, not_checked = stored_oracle_equalities(result)
+        unchecked += [{"run_id": entry["run_id"], "reason": reason} for reason in not_checked]
+        oracle = block.get("oracle")
+        status = result["status"]
+        if oracle is not None and problems:
+            status = measurement.STATUS_FAILED
+            if oracle.get("passed"):
+                oracle_changes.append({"run_id": entry["run_id"], "recorded": True,
+                                       "rejudged": False, "problems": problems})
+        rejudged[entry["run_id"]] = trial_verdict(
+            dict(result, status=status, capacity=dict(block, verdict=verdict["verdict"])))
+    again = FamilyState.__new__(FamilyState)
+    again.path = None
+    again.document = {"trials": [
+        dict(entry, verdict=rejudged.get(entry["run_id"], entry["verdict"]))
+        for entry in state.document["trials"]]}
+    keys = ("sustainable_records_per_s", "unsustainable_records_per_s", "kind",
+            "flip_rates_records_per_s")
+    decisions = []
+    for cell in sorted({entry["cell"] for entry in entries}):
+        for variant in SEARCH_PURPOSES:
+            if not state.trials(cell, SEARCH_PURPOSES[variant]):
+                continue
+            recorded = winning(state, cell, variant=variant)
+            now = winning(again, cell, variant=variant)
+            if any(recorded.get(key) != now.get(key) for key in keys):
+                decisions.append({"cell": cell, "variant": variant,
+                                  "recorded": {key: recorded.get(key) for key in keys},
+                                  "rejudged": {key: now.get(key) for key in keys}})
+    return {
+        "rules": REJUDGEMENT_RULES,
+        "trials_count": len(entries),
+        "verdict_changes": verdict_changes,
+        "oracle_changes": oracle_changes,
+        "decision_changes": decisions,
+        "unchecked": unchecked,
+    }
+
+
 def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
     """One store's index: every trial, each cell's aggregate and bracket."""
     output_dir = Path(output_dir)
@@ -3035,11 +3148,15 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
             "at 100 records per request with 128-request blocks",
         },
     }
+    index["capacity"]["rejudgement"] = rejudgement(state, output_dir, entries)
     index["status"] = (
         measurement.STATUS_PASSED
         if aggregates and all(agg["status"] == measurement.STATUS_PASSED for agg in aggregates)
         else measurement.STATUS_FAILED
     )
+    # The index this one replaces stays published, as an immutable child.
+    previous = measurement.archive_published_index(f"{run_id}.json", output_dir, report_dir)
+    index["child_indexes"] = [previous] if previous else []
     index["elapsed_s"] = 0.0
     path = measurement.write_result(output_dir / f"{run_id}.json", index)
     _ = measurement.publish_result_tree(path, report_dir)

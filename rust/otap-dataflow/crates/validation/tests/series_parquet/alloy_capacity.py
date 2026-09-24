@@ -734,6 +734,25 @@ def judge_read_back(rows, *, multiplicity, total, joined, clickhouse_rows, writt
     }
 
 
+def rejudge_stored_read_back(oracle) -> dict:
+    """`judge_read_back` over what a stored read-back recorded."""
+    files = oracle.get("files") or {}
+    rows = [(name, entry["e2e_source"], entry["rows"], entry["distinct_lines"],
+             entry["first_seq"], entry["last_seq"], entry["malformed_rows"],
+             entry["producer_ids"]) for name, entry in files.items()]
+    producer = test_e2e.alloy_producer_id()
+    return judge_read_back(
+        rows, multiplicity=oracle.get("multiplicity_histogram") or {},
+        total=oracle.get("total_rows", 0),
+        joined=(oracle.get("total_rows", 0), [producer]),
+        clickhouse_rows={(name, entry["e2e_source"]): entry["clickhouse_rows"]
+                         for name, entry in files.items()},
+        written=oracle.get("expected_lines", 0), producer=producer,
+        problems=[problem for problem in oracle.get("problems", [])
+                  if "latest-descriptor" in problem or "descriptor host.id" in problem],
+    )
+
+
 def rate_between(polled, key, start_ns, end_ns):
     """A polled counter's rate between two instants, by interpolation."""
     points = [(p["monotonic_ns"], p[key]) for p in polled if p.get(key) is not None]
