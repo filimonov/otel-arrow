@@ -136,7 +136,9 @@ CAPACITY_WORKLOADS = {
             series=10000, metrics_every=5, series_scope="record",
         ),
         "first_index": 0,
-        "description": "the 8KiB-body variant of mixed-1k-hot",
+        "description": "the 8KiB-body variant of mixed-1k-hot; its 8 MB log requests "
+        "exceed the receiver's default 4 MiB decoding limit, so it runs with 16 MiB",
+        "max_decoding_message_size": "16MiB",
     },
     "mixed-1k-churn": {
         "workload": measurement.Workload(
@@ -1521,8 +1523,15 @@ def trial_spec(plan, trial) -> measurement.RunSpec:
 def engine_settings(plan, trial, root):
     """The engine constructor arguments of one trial."""
     capacity = trial["receiver_capacity"]
+    grpc = {"max_concurrent_requests": capacity}
+    # A workload whose requests exceed the receiver's default decoding
+    # limit names the limit it needs; a trial may name one of its own.
+    decoding = trial.get("max_decoding_message_size") or CAPACITY_WORKLOADS.get(
+        trial["workload_id"], {}).get("max_decoding_message_size")
+    if decoding:
+        grpc["max_decoding_message_size"] = decoding
     merge = {
-        "receiver": {"protocols": {"grpc": {"max_concurrent_requests": capacity}}},
+        "receiver": {"protocols": {"grpc": grpc}},
         "pipeline_policies": {"channel_capacity": {"pdata": capacity}},
     }
     if trial.get("buffer_config") and trial["topology"] == "buffered":

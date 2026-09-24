@@ -370,6 +370,10 @@ record (`Workload.series_scope = "record"`) over 10k slots; `logs-1k-hot`,
 confirmations at 80 percent of the searched capacity, bracketed on their own
 when they fail there; `metrics-1k-unique` gives every point a unique
 attribute value against `metrics-1k-hot`, for the series-to-point ratio.
+A thousand 8 KiB log records make an 8 MB request, twice the receiver's
+default 4 MiB `max_decoding_message_size`, which refuses it with
+`OUT_OF_RANGE`; `mixed-8k-hot` therefore runs with a 16 MiB limit, the one
+setting it changes, named in its workload entry.
 
 Series identity is the full attribute set, by OTel semantics, so an
 attribute that is unique per point (a request id) makes every point a new

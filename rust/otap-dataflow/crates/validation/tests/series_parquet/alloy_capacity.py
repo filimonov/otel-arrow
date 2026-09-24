@@ -501,9 +501,6 @@ def alloy_experiment(plan, trial, spec, result, run_dir, controls):
     root = run_dir / "engine"
     root.mkdir(parents=True, exist_ok=True)
     settings = capacity.engine_settings(plan, trial, root)
-    if trial.get("max_decoding_message_size"):
-        grpc_merge = settings["merge"]["receiver"]["protocols"]["grpc"]
-        grpc_merge["max_decoding_message_size"] = trial["max_decoding_message_size"]
     with capacity.malloc_conf(capacity.JEMALLOC_STATS_CONF):
         engine = test_e2e.Engine(root, **settings)
     phase = None

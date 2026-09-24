@@ -6312,6 +6312,25 @@ class CapacityContracts(unittest.TestCase):
             ]
             self.assertEqual(capacity.default_window_rate(state, "minio-c1"), 8500)
 
+    # Scenario: the 8 KiB workload's 8 MB log requests, and a trial that names
+    # its own limit, against the receiver's default 4 MiB decoding limit.
+    # Guarantees: only a workload or trial that names a limit changes it.
+    def test_receiver_decoding_limit_follows_the_workload(self):
+        plan = {"store": None, "cores": [1],
+                "provenance": {"build": {"binary": "/nonexistent/df_engine"}}}
+
+        def grpc(**trial):
+            trial = dict({"receiver_capacity": 128, "topology": "strict",
+                          "upload_concurrency": 2, "interval_s": 1}, **trial)
+            settings = capacity.engine_settings(plan, trial, Path("/tmp/run/engine"))
+            return settings["merge"]["receiver"]["protocols"]["grpc"]
+
+        self.assertNotIn("max_decoding_message_size", grpc(workload_id="mixed-1k-hot"))
+        self.assertEqual(grpc(workload_id="mixed-8k-hot")["max_decoding_message_size"], "16MiB")
+        self.assertEqual(grpc(workload_id="alloy-file", max_decoding_message_size="16MiB")
+                         ["max_decoding_message_size"], "16MiB")
+        self.assertNotIn("max_decoding_message_size", grpc(workload_id="alloy-file"))
+
     # Scenario: two workers complete 12,000 unique records and 3MB of objects in 3s.
     # Guarantees: records, input bytes and output bytes retain distinct denominators.
     def test_capacity_units(self):
