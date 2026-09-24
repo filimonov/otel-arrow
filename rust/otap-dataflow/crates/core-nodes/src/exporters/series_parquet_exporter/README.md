@@ -128,7 +128,10 @@ No block-atomic snapshot is provided: series files complete before their
 values files, but readers can observe a subset of a block, including rows of a
 request that was later nacked, so read values first, then descriptors. There
 is no write-ahead log and no spill; a restart writes new file names under a
-new boot UUID.
+new boot UUID. An hour partition receives no write later than
+`window.interval + 2 * (window.flush_retry_deadline + upload.abort_timeout)`
+after it ends, 145s at the defaults, except an upload the store completes
+after the writer gave up (FORMAT.md, "Partition lateness bound").
 
 ### Shutdown waits for the current window
 
@@ -460,7 +463,8 @@ overrides it.
 ## What this exporter does not keep
 
 For data this exporter accepts, this is the complete loss list; losses before
-it and behind `durable_buffer` are in the two sections above.
+it and behind `durable_buffer` are in "Producers" and "Running behind
+durable_buffer".
 
 | What | Kept instead | How it shows |
 | --- | --- | --- |
