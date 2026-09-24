@@ -245,8 +245,23 @@ impl AnyValueColumns {
     /// # Errors
     /// Returns [`Error::Refused`] for an unknown type tag, for a map or slice
     /// whose `ser` payload is missing, for a malformed CBOR payload, for an
-    /// oversized cell and for a value past the budget.
+    /// oversized cell and for a value past the budget; the budget is then
+    /// back where it was.
     pub(crate) fn value_at(
+        &mut self,
+        row: usize,
+        limits: DecodeLimits,
+        budget: &mut Budget,
+    ) -> Result<Value> {
+        let mark = budget.mark();
+        let value = self.read_value(row, limits, budget);
+        if value.is_err() {
+            budget.rollback(mark);
+        }
+        value
+    }
+
+    fn read_value(
         &mut self,
         row: usize,
         limits: DecodeLimits,
@@ -344,19 +359,14 @@ impl AnyValueColumns {
 }
 
 /// Decode the CBOR cell at `row` of `a`, holding the tree below its root in
-/// `budget` as it is built; a failed decode rolls the budget back.
+/// `budget` as it is built.
 fn decode_charged(
     a: &ArrayRef,
     row: usize,
     limits: DecodeLimits,
     budget: &mut Budget,
 ) -> Result<Option<Value>> {
-    let mark = budget.mark();
-    let decoded = bytes_cell(a, row, |b| decode_cbor_reserving(b, limits, budget)).transpose();
-    if decoded.is_err() {
-        budget.rollback(mark);
-    }
-    decoded
+    bytes_cell(a, row, |b| decode_cbor_reserving(b, limits, budget)).transpose()
 }
 
 fn required(batch: &RecordBatch, name: &str, to: &DataType) -> Result<ArrayRef> {
@@ -375,12 +385,22 @@ impl AttrTable {
     /// Refuses the batch when `parent_id` is missing or null, a required
     /// column is absent, an attribute type or CBOR payload is malformed, a
     /// parent has a duplicate attribute key, a cell is longer than
-    /// `limits.max_cell_bytes`, or the budget is exhausted.
+    /// `limits.max_cell_bytes`, or the budget is exhausted; the budget is then
+    /// back where it was.
     pub(crate) fn from_batch(
         batch: &RecordBatch,
         limits: DecodeLimits,
         budget: &mut Budget,
     ) -> Result<Self> {
+        let mark = budget.mark();
+        let table = Self::read(batch, limits, budget);
+        if table.is_err() {
+            budget.rollback(mark);
+        }
+        table
+    }
+
+    fn read(batch: &RecordBatch, limits: DecodeLimits, budget: &mut Budget) -> Result<Self> {
         let parent_ids = read_parent_ids(batch)?;
         let keys = required(batch, ATTRIBUTE_KEY, &DataType::Utf8)?;
         let mut any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned())?;
@@ -713,6 +733,104 @@ mod tests {
         assert!(refused_by_table(&refused), "{refused:?}");
         let t = AttrTable::from_batch(&batch, limits, &mut budget(64 << 20)).expect("fits");
         assert!(t.bytes > VALUE_NODE_BYTES * ((1 << 20) - 5));
+    }
+
+    /// A request budget of `limit` bytes already holding `held`, and its mark.
+    fn held_budget(limit: usize, held: usize) -> (Budget, crate::extract::Mark) {
+        let mut b = budget(limit);
+        b.charge(held).expect("fits");
+        let mark = b.mark();
+        (b, mark)
+    }
+
+    /// One attribute row of type `tag` whose only value column is `column`.
+    fn one_row(tag: u8, column: Option<(&str, ArrayRef)>) -> RecordBatch {
+        let mut fields = vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(vec![0u16])),
+            Arc::new(StringArray::from(vec!["k"])),
+            Arc::new(UInt8Array::from(vec![tag])),
+        ];
+        if let Some((name, col)) = column {
+            fields.push(Field::new(name, col.data_type().clone(), true));
+            cols.push(col);
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
+    }
+
+    /// Scenario: `value_at` fails for each reason it can -- an unknown type
+    /// tag, a map without its `ser` payload, a string past the budget,
+    /// malformed CBOR after some of it was reserved, and a dictionary value
+    /// whose kept copy does not fit -- on a budget already holding 1000 bytes.
+    /// Guarantees: every failure leaves the budget exactly at its mark.
+    #[test]
+    fn a_failed_value_leaves_the_budget_at_its_mark() {
+        let ser = |bytes: &[u8]| -> Option<(&str, ArrayRef)> {
+            Some(("ser", Arc::new(BinaryArray::from(vec![bytes])) as ArrayRef))
+        };
+        let long = "s".repeat(4096);
+        let cases: Vec<(&str, RecordBatch, usize)> = vec![
+            ("unknown type tag", one_row(42, None), 1 << 20),
+            ("missing ser", one_row(5, None), 1 << 20),
+            (
+                "string past the budget",
+                one_row(
+                    1,
+                    Some(("str", Arc::new(StringArray::from(vec![long.as_str()])))),
+                ),
+                2048,
+            ),
+            (
+                "malformed cbor",
+                one_row(6, ser(&[0x9f, 0x00, 0x00])),
+                1 << 20,
+            ),
+        ];
+        for (name, batch, limit) in cases {
+            let (mut budget, mark) = held_budget(limit, 1000);
+            let mut any =
+                AnyValueColumns::new(&|n| batch.column_by_name(n).cloned()).expect("cols");
+            assert!(any.value_at(0, limits(), &mut budget).is_err(), "{name}");
+            assert_eq!(budget.mark(), mark, "{name}");
+        }
+
+        // Two rows share one dictionary value: the first decode fits, its
+        // kept copy does not.
+        let value = cbor_zeros(1000);
+        let batch = ser_dictionary_batch(&[&value], &[0, 0]);
+        let (mut budget, mark) =
+            held_budget(1000 + 2 * VALUE_NODE_BYTES + 1000 * VALUE_NODE_BYTES, 1000);
+        let mut any = AnyValueColumns::new(&|n| batch.column_by_name(n).cloned()).expect("cols");
+        assert!(any.value_at(0, limits(), &mut budget).is_err(), "memo copy");
+        assert_eq!(budget.mark(), mark, "memo copy");
+    }
+
+    /// Scenario: an attribute batch whose first row decodes and whose second
+    /// row carries an unknown type tag.
+    /// Guarantees: the refused table leaves the budget exactly at its mark,
+    /// the first row's charge included.
+    #[test]
+    fn a_failed_table_leaves_the_budget_at_its_mark() {
+        let schema = Schema::new(vec![
+            Field::new("parent_id", DataType::UInt16, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::UInt8, false),
+            Field::new("str", DataType::Utf8, true),
+        ]);
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt16Array::from(vec![0u16, 1])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(UInt8Array::from(vec![1u8, 42])),
+            Arc::new(StringArray::from(vec!["x", "y"])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(schema), cols).expect("batch");
+        let (mut budget, mark) = held_budget(1 << 20, 1000);
+        assert!(AttrTable::from_batch(&batch, limits(), &mut budget).is_err());
+        assert_eq!(budget.mark(), mark);
     }
 
     /// Scenario: a small dictionary-encoded batch -- parent ids, keys and
