@@ -232,7 +232,7 @@ SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
   python3 -m crates.validation.tests.series_parquet.measure capacity \
   --output-dir /var/tmp/series-capacity \
   --option 'stores=["local","minio","rustfs"]' --option 'core_counts=[1,4]' \
-  --option 'steps=["calibrate","search","search_raised","default_window","buffered","fan_in","workloads","high_cardinality","publish"]'
+  --option 'steps=["calibrate","search","search_raised","stats_off","default_window","buffered","fan_in","workloads","high_cardinality","publish"]'
 ```
 
 The output directory holds Parquet and logs of tens of gigabytes per trial,
@@ -287,6 +287,20 @@ pipeline's pdata channel capacity, so a raised limit raises both. The
 harness engine configuration drops unsupported points (`unsupported:
 drop`); the object stores are plain HTTP, where series_parquet signs every
 payload (unsigned payloads are its default over TLS only).
+
+A capacity trial's RSS reconciliation reads the allocator, not the
+pipelines' `memory.usage`, which credits a free only to the allocating
+thread and so grows with every byte the local store writes from its
+blocking pool. The engine prints jemalloc's statistics every 64 MiB of
+allocation (`MALLOC_CONF`, recorded in each trial and index); a thread
+reads each print within 5 ms and pairs it with the smaps rollup read at
+once, and the anonymous growth must lie between the allocator's live heap
+and its resident total, within the frozen tolerance
+(`measurement.allocator_band_residuals`). Each trial also reports the
+exporter's `memory.accounted` against jemalloc's `allocated`, at its
+highest fill and as a slope per values row written, which a heap leak
+inside the exporter would show. `stats_off` repeats the shipped winning
+rate without the prints.
 
 A send that waits for an in-flight slot delays the sends behind it; those
 are counted as `late_behind_in_flight_wait`, the engine's lateness, and

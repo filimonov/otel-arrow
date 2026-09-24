@@ -6364,6 +6364,27 @@ class CapacityContracts(unittest.TestCase):
         residuals, _heap = capacity.trial_residuals(samples, samples[0], leaking)
         self.assertEqual(residuals[0]["residual_bytes"], 400 << 20)
 
+    # Scenario: jemalloc's live heap exceeds the exporter's accounted bytes
+    # by 100 MB plus 1 KB for every values row written.
+    # Guarantees: the ledger view reports the difference at the highest fill
+    # and its growth per record, so a heap leak the RSS band cannot see is
+    # visible.
+    def test_unaccounted_heap_growth_per_record_is_reported(self):
+        samples, pairs = [], []
+        for k in range(10):
+            written = k * 1000
+            accounted = (50 + 10 * (k % 3)) << 20
+            samples.append({"monotonic_ns": k * 10**9, "extras": {"w": {
+                "memory.accounted": accounted, "block.active": accounted,
+                "block.flushing": 0, "rows.written": {"values": written}}}})
+            pairs.append({"monotonic_ns": k * 10**9 + 1000,
+                          "jemalloc_allocated_bytes": accounted + (100 << 20) + 1024 * written})
+        view = capacity.accounted_against_allocated(samples, pairs)
+        self.assertAlmostEqual(view["difference_slope_bytes_per_record"], 1024.0)
+        self.assertAlmostEqual(view["difference_growth_over_run_bytes"], 1024.0 * 9000)
+        self.assertEqual(view["at_highest_fill"]["accounted_bytes"], 70 << 20)
+        self.assertEqual(view["difference_min_bytes"], 100 << 20)
+
     # Scenario: the capacity subcommand is asked for without the long opt-in.
     # Guarantees: it is gated as a long measurement.
     def test_capacity_is_a_long_subcommand(self):

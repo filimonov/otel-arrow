@@ -1189,6 +1189,52 @@ def trial_residuals(samples, idle, pairs=()) -> tuple:
     return measurement.rss_residuals(samples, idle), {"source": "pipeline_memory_usage"}
 
 
+def accounted_against_allocated(samples, pairs) -> dict:
+    """The exporter's accounted bytes against jemalloc's live heap.
+
+    Each allocator pair is matched with the telemetry sample nearest to it
+    in time. The difference `allocated - accounted` is the heap the exporter
+    does not account for; its least-squares slope against the values rows
+    written says whether it grows with the records a trial wrote, which a
+    heap leak inside the exporter would show and the RSS band cannot, since
+    such a leak lives inside `allocated`.
+    """
+    usable = [s for s in samples if s.get("extras")]
+    if not usable or not pairs:
+        return {}
+    times = [s["monotonic_ns"] for s in usable]
+    points = []
+    for pair in pairs:
+        at = bisect.bisect_left(times, pair["monotonic_ns"])
+        near = min((i for i in (at - 1, at) if 0 <= i < len(usable)),
+                   key=lambda i: abs(times[i] - pair["monotonic_ns"]))
+        sample = usable[near]
+        accounted = extras_total(sample, "memory.accounted")
+        written = extras_total(sample, "rows.written", "values")
+        fill = extras_total(sample, "block.active") + extras_total(sample, "block.flushing")
+        points.append((written, pair["jemalloc_allocated_bytes"], accounted, fill))
+    differences = sorted(allocated - accounted for _w, allocated, accounted, _f in points)
+    fill_point = max(points, key=lambda point: point[3])
+    slope = backlog_slope([(written, allocated - accounted)
+                           for written, allocated, accounted, _f in points])
+    written_total = max(point[0] for point in points)
+    return {
+        "at_highest_fill": {
+            "block_fill_bytes": fill_point[3],
+            "accounted_bytes": fill_point[2],
+            "allocated_bytes": fill_point[1],
+            "difference_bytes": fill_point[1] - fill_point[2],
+        },
+        "difference_p50_bytes": differences[len(differences) // 2],
+        "difference_max_bytes": differences[-1],
+        "difference_min_bytes": differences[0],
+        "difference_slope_bytes_per_record": slope,
+        "difference_growth_over_run_bytes": slope * written_total,
+        "values_rows_written_count": written_total,
+        "points_count": len(points),
+    }
+
+
 def memory_at_fill(samples, jemalloc) -> dict:
     """RSS, accounted and budget at the trial's highest block fill."""
     usable = [s for s in samples if s.get("extras")]
@@ -1846,6 +1892,8 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         "admission": admission,
         "flush_reasons": flush_reasons,
         "memory": memory,
+        "accounted_against_allocated": accounted_against_allocated(
+            samples, list(getattr(phase.sampler, "pairs", ()))),
         "schedule": {
             "workers": schedule["workers"],
             "other_threads_on_cpu_s": schedule["other_threads_on_cpu_s"],
@@ -2439,6 +2487,17 @@ def step_high_cardinality(plan, state, output_dir, report_dir, cell, options):
         ), output_dir, report_dir, cell)
 
 
+def step_stats_off(plan, state, output_dir, report_dir, cell, options):
+    """The shipped winning rate without jemalloc's statistics prints, to show
+    the prints the residual reads cost nothing measurable."""
+    rate = winning(state, cell)["sustainable_records_per_s"]
+    if rate is None:
+        return
+    _ = execute(plan, state, make_trial(
+        plan, rate=rate, purpose="stats_off", jemalloc_stats=False,
+    ), output_dir, report_dir, cell)
+
+
 def step_trial(plan, state, output_dir, report_dir, cell, options):
     """One trial with explicit settings, for a rehearsal or a named check."""
     settings = dict(options.get("trial") or {})
@@ -2454,6 +2513,7 @@ STEPS = {
     "buffered": step_buffered,
     "fan_in": step_fan_in,
     "search_raised": step_search_raised,
+    "stats_off": step_stats_off,
     "workloads": step_workloads,
     "high_cardinality": step_high_cardinality,
 }
@@ -2667,6 +2727,8 @@ def trial_row(output_dir, entry) -> dict:
         "admission": capacity.get("admission"),
         "flush_reasons": capacity.get("flush_reasons"),
         "memory": memory,
+        "accounted_against_allocated": capacity.get("accounted_against_allocated"),
+        "rss_heap_term": capacity.get("rss_heap_term"),
         "objects_per_s": capacity.get("objects_per_s"),
         "total_s_first_send_to_final_completion": capacity.get(
             "total_s_first_send_to_final_completion"),
