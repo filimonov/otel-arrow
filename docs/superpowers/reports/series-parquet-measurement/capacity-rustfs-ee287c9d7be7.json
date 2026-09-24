@@ -463,7 +463,7 @@
         "shipped": 128
       },
       "records_per_request": 1000,
-      "rss_band": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the larger of `resident` at this paired print and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
+      "rss_band": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
       "search_connections": 256,
       "search_floor_rule": "a cell after the first may start at half of min(the one-worker ceiling on the same store times the workers, the shipped-slot formula ceiling), rounded down to the doubling grid; an unsustainable first trial halves until one passes",
       "search_floors": {},
@@ -10177,9 +10177,9 @@
   "checks": [],
   "child_indexes": [
     {
-      "name": "capacity-rustfs-ee287c9d7be7.json",
-      "sha256": "ee287c9d7be78a0aaee01f7ecdf6748ad13975443414969e9d02c434ca75a7ba",
-      "size_bytes": 618228
+      "name": "capacity-rustfs-61294f72df77.json",
+      "sha256": "61294f72df77d6e8ccded4c4a072915fdd2d30f970406fb7eac2ad5fe29a2c46",
+      "size_bytes": 616576
     }
   ],
   "config": {
@@ -19432,7 +19432,7 @@
     "runs_applying_the_band_count": 38,
     "verdict_changes": []
   },
-  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the larger of `resident` at this paired print and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
+  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
   "run_dir": "<host-path>/series-capacity",
   "run_files": [
     {
@@ -19654,7 +19654,7 @@
   "run_id": "capacity-rustfs",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T21:49:14Z",
+  "started_utc": "2026-09-24T21:33:05Z",
   "status": "failed",
   "workload": {}
 }

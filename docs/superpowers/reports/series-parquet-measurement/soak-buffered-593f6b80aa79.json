@@ -72,9 +72,9 @@
   ],
   "child_indexes": [
     {
-      "name": "soak-buffered-593f6b80aa79.json",
-      "sha256": "593f6b80aa797ab0fe7fb3bf462c37afc137de00dce45186c548e9dc0695c77c",
-      "size_bytes": 41142
+      "name": "soak-buffered-a8209b432e67.json",
+      "sha256": "a8209b432e6704aff0365789d59d3197cb2e7430feb2594b3e4ec4c3aff8011a",
+      "size_bytes": 40181
     }
   ],
   "children": [
@@ -1320,7 +1320,7 @@
     "runs_applying_the_band_count": 9,
     "verdict_changes": []
   },
-  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the larger of `resident` at this paired print and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
+  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
   "run_files": [
     {
       "name": "soak-buffered-buffered-minio-c1-w15-r003.json",
@@ -1371,7 +1371,7 @@
   "run_id": "soak-buffered",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T21:49:15Z",
+  "started_utc": "2026-09-24T21:33:07Z",
   "status": "passed",
   "workload": {}
 }

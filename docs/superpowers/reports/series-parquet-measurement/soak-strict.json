@@ -48,9 +48,9 @@
   ],
   "child_indexes": [
     {
-      "name": "soak-strict-de9670d9d8f4.json",
-      "sha256": "de9670d9d8f48d90fe2227f12ea57a5746bb20666f79a0c6fdc809c73dd48b09",
-      "size_bytes": 32826
+      "name": "soak-strict-dfe394456cbf.json",
+      "sha256": "dfe394456cbfbdbac48f4a27bc31b2ee5b3e589366f37dbe27f7177246a79401",
+      "size_bytes": 35510
     }
   ],
   "children": [
@@ -1177,7 +1177,7 @@
     "verdict_changes": [
       {
         "baseline_decision": {
-          "action": "created",
+          "action": "compared",
           "baseline_name": "baseline-soak-strict-5cb03bef4ffc17fe.json",
           "fingerprint": "5cb03bef4ffc17fe88374b4da855936c3961a43cc855bf71c40aa9438f555edf"
         },
@@ -1216,7 +1216,7 @@
       }
     ]
   },
-  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
+  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the larger of `resident` at this paired print and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
   "run_files": [
     {
       "name": "soak-strict-strict-minio-c1-w15-r001.json",
@@ -1247,7 +1247,7 @@
   "run_id": "soak-strict",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T21:33:37Z",
+  "started_utc": "2026-09-24T21:49:15Z",
   "status": "failed",
   "workload": {}
 }

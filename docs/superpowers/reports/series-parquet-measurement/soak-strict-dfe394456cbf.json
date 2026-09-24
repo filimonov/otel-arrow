@@ -3,391 +3,241 @@
   "artifacts": [],
   "baseline_files": [
     {
-      "name": "baseline-soak-buffered-0cdc375094eee478.json",
-      "sha256": "1e27beada32a464dc9dd9547b711b4497404ce5409219a48255682a5d37d8249",
-      "size_bytes": 3436
+      "name": "baseline-pr-soak-strict-f7af59b2dd635790.json",
+      "sha256": "bddc50c803cfb96b092f0a15e40ac712891b93957228184e387438f64b56b85e",
+      "size_bytes": 1287
     },
     {
-      "name": "baseline-pr-soak-buffered-9c59b3479f127bd2.json",
-      "sha256": "e6d2bdac9dd02d84c8d5169332c5114dfb49a7e11a58fb9fd65d3ffd288e4b04",
-      "size_bytes": 1294
+      "name": "baseline-soak-strict-5cb03bef4ffc17fe.json",
+      "sha256": "bed469105b0db8bd87386dbdcd56e721e4135df9c466048304cea4a3c6fe8d0f",
+      "size_bytes": 3374
     }
   ],
-  "case": "soak-buffered",
+  "case": "soak-strict",
   "checks": [
     {
-      "detail": "soak-buffered-buffered-minio-c1-w15-r003: passed",
+      "detail": "soak-strict-strict-minio-c1-w15-r001: failed",
       "kind": "hard",
-      "name": "child_soak-buffered-buffered-minio-c1-w15-r003",
+      "name": "child_soak-strict-strict-minio-c1-w15-r001",
+      "status": "failed"
+    },
+    {
+      "detail": "soak-strict-strict-minio-c1-w15-r002: failed",
+      "kind": "hard",
+      "name": "child_soak-strict-strict-minio-c1-w15-r002",
+      "status": "failed"
+    },
+    {
+      "detail": "pr-soak-strict-strict-minio-c1-w1-r001: passed",
+      "kind": "hard",
+      "name": "child_pr-soak-strict-strict-minio-c1-w1-r001",
       "status": "passed"
     },
     {
-      "detail": "pr-soak-buffered-buffered-minio-c1-w1-r001: passed",
+      "detail": "capacity-alloy-file-strict-minio-c1-w1-r294: failed",
       "kind": "hard",
-      "name": "child_pr-soak-buffered-buffered-minio-c1-w1-r001",
-      "status": "passed"
+      "name": "child_capacity-alloy-file-strict-minio-c1-w1-r294",
+      "status": "failed"
     },
     {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r287: passed",
+      "detail": "capacity-alloy-file-strict-minio-c1-w1-r295: passed",
       "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r287",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r288: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r288",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r289: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r289",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r290: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r290",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r291: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r291",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r292: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r292",
-      "status": "passed"
-    },
-    {
-      "detail": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r293: passed",
-      "kind": "hard",
-      "name": "child_capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r293",
+      "name": "child_capacity-alloy-file-strict-minio-c1-w1-r295",
       "status": "passed"
     }
   ],
   "child_indexes": [
     {
-      "name": "soak-buffered-593f6b80aa79.json",
-      "sha256": "593f6b80aa797ab0fe7fb3bf462c37afc137de00dce45186c548e9dc0695c77c",
-      "size_bytes": 41142
+      "name": "soak-strict-de9670d9d8f4.json",
+      "sha256": "de9670d9d8f48d90fe2227f12ea57a5746bb20666f79a0c6fdc809c73dd48b09",
+      "size_bytes": 32826
     }
   ],
   "children": [
     {
       "baseline_decision": {
-        "action": "created",
-        "baseline_name": "baseline-soak-buffered-0cdc375094eee478.json",
-        "detail": "no committed baseline describes this machine, configuration, workload and build profile",
-        "fingerprint": "0cdc375094eee47852c15ce1876e5cf43409124df83b0f8f17a106c7c3527a36",
-        "hard_gate_failures": [],
+        "action": "rejected",
+        "fingerprint": null,
+        "hard_gate_failures": [
+          "rss_reconciliation"
+        ],
         "limit": 0.25,
         "regressions": {}
       },
-      "failed_checks": [],
+      "failed_checks": [
+        "rss_reconciliation"
+      ],
       "metrics": {
-        "accounted_peak_bytes": 923871409.0,
-        "ack_latency_p50_s": 0.02311236,
-        "ack_latency_p99_s": 0.868732005,
-        "acked_records_per_s": 72799.44444444444,
-        "buffer_loss_records": 0.0,
-        "committed_records_per_s": 72761.66666666667,
+        "accounted_peak_bytes": 988786439.0,
+        "ack_latency_p50_s": 3.550330656,
+        "ack_latency_p99_s": 5.580632676,
+        "acked_records_per_s": 130900.55555555556,
+        "buffer_loss_records": 0,
+        "committed_records_per_s": 130900.55555555556,
         "descriptor_violations_count": 0,
         "duplicate_records": 0,
-        "engine_cpu_ns_per_record": 5849.007473805508,
-        "fd_peak_count": 304,
-        "final_acked_records_per_s": 72800.0,
-        "final_committed_records_per_s": 72756.66666666667,
-        "freshness_p99_s": 8.290648963,
-        "input_bytes_per_s": 64247528.8,
-        "input_phase_s": 1800.0000341497364,
+        "engine_cpu_ns_per_record": 4820.204676662946,
+        "fd_peak_count": 302,
+        "final_acked_records_per_s": 130916.66666666667,
+        "final_committed_records_per_s": 130916.66666666667,
+        "input_bytes_per_s": 115521394.96277778,
+        "input_phase_s": 1800.0057612797652,
         "missing_acked_records": 0,
         "missing_intended_records": 0,
-        "object_bytes_per_s": 44294604.01388889,
-        "offered_records_per_s": 72800.0,
+        "object_bytes_per_s": 79678372.50277779,
+        "offered_records_per_s": 130899.0,
         "permanent_rejections_count": 0,
         "reader_disagreements_count": 0,
-        "rss_peak_bytes": 1743835136,
-        "rss_post_warmup_median_ratio": 1.0348606171392238,
-        "sample_coverage_ratio": 1.0,
-        "wal_peak_bytes": 619506375.0
+        "rss_peak_bytes": 1359716352,
+        "rss_post_warmup_median_ratio": 1.0127174063761295,
+        "sample_coverage_ratio": 1.0
       },
-      "run_id": "soak-buffered-buffered-minio-c1-w15-r003",
-      "status": "passed",
-      "topology": "buffered"
+      "run_id": "soak-strict-strict-minio-c1-w15-r001",
+      "status": "failed",
+      "topology": "strict"
+    },
+    {
+      "baseline_decision": {
+        "action": "rejected",
+        "fingerprint": null,
+        "hard_gate_failures": [
+          "rss_reconciliation"
+        ],
+        "limit": 0.25,
+        "regressions": {}
+      },
+      "failed_checks": [
+        "rss_reconciliation"
+      ],
+      "metrics": {
+        "accounted_peak_bytes": 988731126.0,
+        "ack_latency_p50_s": 3.543338061,
+        "ack_latency_p99_s": 5.556987174,
+        "acked_records_per_s": 130898.88888888889,
+        "buffer_loss_records": 0,
+        "committed_records_per_s": 130898.88888888889,
+        "descriptor_violations_count": 0,
+        "duplicate_records": 0,
+        "engine_cpu_ns_per_record": 4837.517896132723,
+        "fd_peak_count": 301,
+        "final_acked_records_per_s": 130903.33333333333,
+        "final_committed_records_per_s": 130903.33333333333,
+        "input_bytes_per_s": 115521394.96277778,
+        "input_phase_s": 1800.0058323767653,
+        "missing_acked_records": 0,
+        "missing_intended_records": 0,
+        "object_bytes_per_s": 79677525.64611112,
+        "offered_records_per_s": 130899.0,
+        "permanent_rejections_count": 0,
+        "reader_disagreements_count": 0,
+        "rss_peak_bytes": 1308807168,
+        "rss_post_warmup_median_ratio": 1.01268484019467,
+        "sample_coverage_ratio": 1.0
+      },
+      "purpose": "diagnostic rerun after a5bc8b083 to keep the RSS residual excursions whole, which the thinned residuals of r001 had dropped; r001 and r002 together are the result",
+      "run_id": "soak-strict-strict-minio-c1-w15-r002",
+      "status": "failed",
+      "topology": "strict"
     },
     {
       "baseline_decision": {
         "action": "created",
-        "baseline_name": "baseline-pr-soak-buffered-9c59b3479f127bd2.json",
+        "baseline_name": "baseline-pr-soak-strict-f7af59b2dd635790.json",
         "detail": "no committed baseline describes this machine, configuration, workload and build profile",
-        "fingerprint": "9c59b3479f127bd267ae29eff3138de6d0301bca400ba237ff85d2e3e36c8f1c",
+        "fingerprint": "f7af59b2dd6357902ddac8d50f2edc83d50c29d21443377c72b019dcc558031f",
         "hard_gate_failures": [],
         "limit": 0.25,
         "regressions": {}
       },
       "failed_checks": [],
       "metrics": {
-        "accounted_peak_bytes": 1357027.0,
+        "accounted_peak_bytes": 1612029.0,
         "corrupt_records": 0,
         "missing_records": 0,
-        "oldest_unacked_age_max_s": 4.875599741,
-        "peak_rss_bytes": 104304640,
+        "oldest_unacked_age_max_s": 4.642516371,
+        "peak_rss_bytes": 89862144,
         "records_acked_records": 130000,
         "unexpected_records": 0
       },
-      "run_id": "pr-soak-buffered-buffered-minio-c1-w1-r001",
+      "run_id": "pr-soak-strict-strict-minio-c1-w1-r001",
       "status": "passed",
-      "topology": "buffered"
+      "topology": "strict"
+    },
+    {
+      "baseline_decision": null,
+      "failed_checks": [
+        "delivery"
+      ],
+      "metrics": {
+        "accounted_peak_bytes": 672.0,
+        "ack_latency_p50_s": 0.477987764,
+        "ack_latency_p99_s": 0.510515744,
+        "alloy_consumer_ceiling_records_per_s": 334736.6021695903,
+        "alloy_cpu_s": 53.294438428,
+        "alloy_read_records_per_s": 20023.685744752547,
+        "alloy_sent_records_per_s": 19912.808497285474,
+        "alloy_sent_tail_records_per_s": 19839.211927817763,
+        "durable_records_per_s": 20000.0,
+        "engine_core_occupancy_ratio": 0.09647723088687656,
+        "engine_cpu_ns_per_record": 4823.862160833333,
+        "engine_cpu_s": 5.788634593,
+        "feeder_cpu_s": 2.244612271,
+        "offered_records_per_s": 20000.0,
+        "peak_rss_bytes": 130781184.0,
+        "request_max_bytes": 7960000,
+        "request_max_records": 20000,
+        "request_p50_bytes": 7960000,
+        "request_p50_records": 20000,
+        "request_p95_bytes": 7960000,
+        "request_p95_records": 20000,
+        "slot_formula_ceiling_per_worker_records_per_s": 2462700.060704433,
+        "slot_formula_ceiling_records_per_s": 2462700.060704433,
+        "written_records_per_s": 20000.001293954312
+      },
+      "run_id": "capacity-alloy-file-strict-minio-c1-w1-r294",
+      "status": "failed",
+      "topology": "strict"
     },
     {
       "baseline_decision": null,
       "failed_checks": [],
       "metrics": {
-        "accounted_peak_bytes": 751659995.0,
-        "accounted_to_budget_ratio": 0.45832540189612453,
-        "ack_latency_p50_s": 0.014837972,
-        "ack_latency_p95_s": 0.505859269,
-        "ack_latency_p99_s": 0.808749548,
-        "average_object_bytes": 57793739.53125,
-        "backlog_slope_ratio": -0.000625,
-        "block_fill_peak_bytes": 592410976.0,
-        "compression_ratio": 0.6893378774675348,
-        "drain_s": -0.003318238,
-        "durable_records_per_s": 64033.333333333336,
-        "durable_tail_records_per_s": 64023.33333333334,
-        "engine_core_occupancy_ratio": 0.37991875090153804,
-        "engine_cpu_ns_per_record": 5933.140296199896,
-        "engine_cpu_s": 22.795125018,
-        "input_bytes_per_s": 56481344.0,
-        "object_bytes": 3698799330.0,
-        "object_bytes_per_s": 38932051.18333333,
-        "objects_count": 64.0,
-        "offered_records_per_s": 64000.0,
-        "peak_rss_bytes": 1783066624.0,
-        "producer_cpu_s": 4.754883922,
-        "records_per_s_per_core": 64033.333333333336,
-        "store_cpu_s": 5.010701232,
-        "total_object_bytes_per_s": 34994020.11597033
+        "accounted_peak_bytes": 12738596.0,
+        "ack_latency_p50_s": 0.498039346,
+        "ack_latency_p99_s": 0.521607759,
+        "alloy_consumer_ceiling_records_per_s": 321259.7584609309,
+        "alloy_cpu_s": 52.768163824,
+        "alloy_read_records_per_s": 19987.71443465665,
+        "alloy_sent_records_per_s": 19904.48399879771,
+        "alloy_sent_tail_records_per_s": 19837.931250595477,
+        "durable_records_per_s": 20000.0,
+        "engine_core_occupancy_ratio": 0.09593084976656016,
+        "engine_cpu_ns_per_record": 4796.5436925,
+        "engine_cpu_s": 5.755852431,
+        "feeder_cpu_s": 2.262628931,
+        "offered_records_per_s": 20000.0,
+        "peak_rss_bytes": 137969664.0,
+        "request_max_bytes": 7960000,
+        "request_max_records": 20000,
+        "request_p50_bytes": 7960000,
+        "request_p50_records": 20000,
+        "request_p95_bytes": 7960000,
+        "request_p95_records": 20000,
+        "slot_formula_ceiling_per_worker_records_per_s": 2461649.705697835,
+        "slot_formula_ceiling_records_per_s": 2461649.705697835,
+        "written_records_per_s": 20000.000441001263
       },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r287",
+      "purpose": "rerun after 8e9c0f18c: the read-back of r294 ignored the S3 store, a harness fault, so its delivery check could not pass",
+      "run_id": "capacity-alloy-file-strict-minio-c1-w1-r295",
       "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 836044705.0,
-        "accounted_to_budget_ratio": 0.5097790596428533,
-        "ack_latency_p50_s": 0.912924923,
-        "ack_latency_p95_s": 1.935764045,
-        "ack_latency_p99_s": 2.278350076,
-        "average_object_bytes": 61674994.375,
-        "backlog_slope_ratio": 0.06364583333333333,
-        "block_fill_peak_bytes": 636463760.0,
-        "compression_ratio": 0.6896547650550913,
-        "drain_s": 7.448403364,
-        "durable_records_per_s": 117783.33333333333,
-        "durable_tail_records_per_s": 127318.33333333334,
-        "engine_core_occupancy_ratio": 0.661958378168056,
-        "engine_cpu_ns_per_record": 5620.134155936041,
-        "engine_cpu_s": 39.71748808,
-        "input_bytes_per_s": 103970131.15,
-        "object_bytes": 7400999325.0,
-        "object_bytes_per_s": 71847168.15,
-        "objects_count": 120.0,
-        "offered_records_per_s": 128000.0,
-        "peak_rss_bytes": 1946701824.0,
-        "producer_cpu_s": 9.63577362,
-        "records_per_s_per_core": 117783.33333333333,
-        "store_cpu_s": 8.921933344,
-        "total_object_bytes_per_s": 70285128.07630469
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r288",
-      "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 788996963.0,
-        "accounted_to_budget_ratio": 0.4810916538957174,
-        "ack_latency_p50_s": 0.045100774,
-        "ack_latency_p95_s": 0.731894538,
-        "ack_latency_p99_s": 1.010611208,
-        "average_object_bytes": 55507461.65,
-        "backlog_slope_ratio": 0.0004166666666666667,
-        "block_fill_peak_bytes": 638468668.0,
-        "compression_ratio": 0.6896543514734116,
-        "drain_s": 0.083331156,
-        "durable_records_per_s": 95950.0,
-        "durable_tail_records_per_s": 96183.33333333334,
-        "engine_core_occupancy_ratio": 0.5549717184581389,
-        "engine_cpu_ns_per_record": 5783.967469167969,
-        "engine_cpu_s": 33.29830072,
-        "input_bytes_per_s": 84722016.0,
-        "object_bytes": 5550746165.0,
-        "object_bytes_per_s": 58340472.3,
-        "objects_count": 100.0,
-        "offered_records_per_s": 96000.0,
-        "peak_rss_bytes": 1737523200.0,
-        "producer_cpu_s": 8.406476653,
-        "records_per_s_per_core": 95950.0,
-        "store_cpu_s": 7.37944338,
-        "total_object_bytes_per_s": 52886252.19385082
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r289",
-      "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 797916873.0,
-        "accounted_to_budget_ratio": 0.4865305775617657,
-        "ack_latency_p50_s": 0.366965328,
-        "ack_latency_p95_s": 1.337618956,
-        "ack_latency_p99_s": 1.852568678,
-        "average_object_bytes": 62266358.817307696,
-        "backlog_slope_ratio": -0.0056547619047619055,
-        "block_fill_peak_bytes": 629558324.0,
-        "compression_ratio": 0.6896363314083485,
-        "drain_s": 0.547830484,
-        "durable_records_per_s": 112816.66666666667,
-        "durable_tail_records_per_s": 108921.66666666667,
-        "engine_core_occupancy_ratio": 0.6445476445224109,
-        "engine_cpu_ns_per_record": 5713.230862904417,
-        "engine_cpu_s": 38.672859711,
-        "input_bytes_per_s": 99228187.2,
-        "object_bytes": 6475701317.0,
-        "object_bytes_per_s": 73145927.85,
-        "objects_count": 104.0,
-        "offered_records_per_s": 112000.0,
-        "peak_rss_bytes": 2011631616.0,
-        "producer_cpu_s": 9.029727793,
-        "records_per_s_per_core": 112816.66666666667,
-        "store_cpu_s": 9.689400683,
-        "total_object_bytes_per_s": 61289436.33654746
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r290",
-      "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 807907832.0,
-        "accounted_to_budget_ratio": 0.4926225743814218,
-        "ack_latency_p50_s": 0.109309766,
-        "ack_latency_p95_s": 0.924885324,
-        "ack_latency_p99_s": 1.149513072,
-        "average_object_bytes": 57828654.740384616,
-        "backlog_slope_ratio": -0.0014102564102564101,
-        "block_fill_peak_bytes": 685873552.0,
-        "compression_ratio": 0.6897543304666209,
-        "drain_s": 0.421340912,
-        "durable_records_per_s": 104233.33333333333,
-        "durable_tail_records_per_s": 104693.33333333334,
-        "engine_core_occupancy_ratio": 0.5997619165945871,
-        "engine_cpu_ns_per_record": 5754.031929804924,
-        "engine_cpu_s": 35.985715689,
-        "input_bytes_per_s": 91782184.0,
-        "object_bytes": 6014180093.0,
-        "object_bytes_per_s": 63430162.016666666,
-        "objects_count": 104.0,
-        "offered_records_per_s": 104000.0,
-        "peak_rss_bytes": 1821200384.0,
-        "producer_cpu_s": 8.826617933,
-        "records_per_s_per_core": 104233.33333333333,
-        "store_cpu_s": 8.060013113,
-        "total_object_bytes_per_s": 57176240.948773086
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r291",
-      "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 815066423.0,
-        "accounted_to_budget_ratio": 0.49698753210021723,
-        "ack_latency_p50_s": 0.141788677,
-        "ack_latency_p95_s": 1.013486451,
-        "ack_latency_p99_s": 1.25763621,
-        "average_object_bytes": 57822837.990384616,
-        "backlog_slope_ratio": -0.004423076923076923,
-        "block_fill_peak_bytes": 630345996.0,
-        "compression_ratio": 0.6896849508741031,
-        "drain_s": 1.121638196,
-        "durable_records_per_s": 104500.0,
-        "durable_tail_records_per_s": 104501.66666666669,
-        "engine_core_occupancy_ratio": 0.5870091071947874,
-        "engine_cpu_ns_per_record": 5617.312819617225,
-        "engine_cpu_s": 35.220551379,
-        "input_bytes_per_s": 91782184.0,
-        "object_bytes": 6013575151.0,
-        "object_bytes_per_s": 64286158.21666667,
-        "objects_count": 104.0,
-        "offered_records_per_s": 104000.0,
-        "peak_rss_bytes": 1775214592.0,
-        "producer_cpu_s": 8.547537913,
-        "records_per_s_per_core": 104500.0,
-        "store_cpu_s": 7.95259872,
-        "total_object_bytes_per_s": 57242592.7805471
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r292",
-      "status": "passed",
-      "topology": "buffered"
-    },
-    {
-      "baseline_decision": null,
-      "failed_checks": [],
-      "metrics": {
-        "accounted_peak_bytes": 816474857.0,
-        "accounted_to_budget_ratio": 0.49784632608072454,
-        "ack_latency_p50_s": 0.081931463,
-        "ack_latency_p95_s": 0.700942263,
-        "ack_latency_p99_s": 0.960704592,
-        "average_object_bytes": 57826007.115384616,
-        "backlog_slope_ratio": 0.0030128205128205124,
-        "block_fill_peak_bytes": 616700720.0,
-        "compression_ratio": 0.6897227507797443,
-        "drain_s": 0.141062771,
-        "durable_records_per_s": 104066.66666666667,
-        "durable_tail_records_per_s": 103391.66666666667,
-        "engine_core_occupancy_ratio": 0.5860791957912419,
-        "engine_cpu_ns_per_record": 5630.195065983344,
-        "engine_cpu_s": 35.154937992,
-        "input_bytes_per_s": 91782184.0,
-        "object_bytes": 6013904740.0,
-        "object_bytes_per_s": 63540895.93333333,
-        "objects_count": 104.0,
-        "offered_records_per_s": 104000.0,
-        "peak_rss_bytes": 1816707072.0,
-        "producer_cpu_s": 8.798056823,
-        "records_per_s_per_core": 104066.66666666667,
-        "store_cpu_s": 7.91864869,
-        "total_object_bytes_per_s": 57196609.34769477
-      },
-      "run_id": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r293",
-      "status": "passed",
-      "topology": "buffered"
+      "topology": "strict"
     }
   ],
   "config": {
     "effective": {},
     "requested": {}
   },
-  "elapsed_s": 0.009668898,
+  "elapsed_s": 0.009273799,
   "environment": {
     "end": {
       "absent_roles": {},
@@ -418,7 +268,7 @@
         10.82
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 353143719789202,
+      "monotonic_ns": 353143577593537,
       "observed_utc": "2026-09-24T21:20:17Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
@@ -492,7 +342,7 @@
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 0,
+          "last_cpu": 1,
           "name": "python3",
           "nspid": "3031002",
           "observed_utc": "2026-09-24T21:20:17Z",
@@ -876,7 +726,7 @@
         10.82
       ],
       "logical_core_count": 32,
-      "monotonic_ns": 353143711769351,
+      "monotonic_ns": 353143570584873,
       "observed_utc": "2026-09-24T21:20:17Z",
       "physical_core_count": 16,
       "ram_bytes": 98401574912,
@@ -950,7 +800,7 @@
         {
           "cpus_allowed_list": "0-7,16-23",
           "expected_cores": [],
-          "last_cpu": 0,
+          "last_cpu": 1,
           "name": "python3",
           "nspid": "3031002",
           "observed_utc": "2026-09-24T21:20:17Z",
@@ -1308,70 +1158,96 @@
     "children_passed_count"
   ],
   "metrics": {
-    "children_count": 9,
-    "children_passed_count": 9
+    "children_count": 5,
+    "children_passed_count": 2
   },
   "metrics_unavailable": {},
   "publishable": true,
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
   "rss_band_rejudgement": {
-    "not_rejudged": [],
+    "not_rejudged": [
+      {
+        "reason": "the failing pairs are not in the published samples",
+        "recorded": "failed",
+        "run_id": "soak-strict-strict-minio-c1-w15-r001"
+      }
+    ],
     "rule": "only a residual that was positive beyond the tolerance can change; each is recomputed from its kept excursion and the pair before it",
-    "runs_applying_the_band_count": 9,
-    "verdict_changes": []
+    "runs_applying_the_band_count": 5,
+    "verdict_changes": [
+      {
+        "baseline_decision": {
+          "action": "created",
+          "baseline_name": "baseline-soak-strict-5cb03bef4ffc17fe.json",
+          "fingerprint": "5cb03bef4ffc17fe88374b4da855936c3961a43cc855bf71c40aa9438f555edf"
+        },
+        "excursions": [
+          {
+            "monotonic_ns": 347742217065302,
+            "recorded_residual_bytes": 135917568,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 347832261877208,
+            "recorded_residual_bytes": 149614592,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 347971873424617,
+            "recorded_residual_bytes": 153317376,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 348147280233081,
+            "recorded_residual_bytes": 144281600,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 348822211284269,
+            "recorded_residual_bytes": 244928512,
+            "rejudged_residual_bytes": 0
+          }
+        ],
+        "reason": "0 of 5 positive residuals still beyond the tolerance; 0 negative beyond it of 66846",
+        "recorded": "failed",
+        "rejudged": "passed",
+        "run_id": "soak-strict-strict-minio-c1-w15-r002",
+        "run_status_rejudged": "passed"
+      }
+    ]
   },
-  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the larger of `resident` at this paired print and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
+  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
   "run_files": [
     {
-      "name": "soak-buffered-buffered-minio-c1-w15-r003.json",
-      "sha256": "b44eb3e236147600b998baf7200a5e5a96a37b5544d5bfe71734d0a278e66110",
-      "size_bytes": 2921372
+      "name": "soak-strict-strict-minio-c1-w15-r001.json",
+      "sha256": "d9942bf46ef5a9064fc3a5d893a5ab8a26a53e2c988be3ee29dace6b228ff4e6",
+      "size_bytes": 2569095
     },
     {
-      "name": "pr-soak-buffered-buffered-minio-c1-w1-r001.json",
-      "sha256": "dedd090b6c2abbf58c2534a9f5dc64fcdab2f377c43d3f2541464e2fe5b10dc5",
-      "size_bytes": 497275
+      "name": "soak-strict-strict-minio-c1-w15-r002.json",
+      "sha256": "40bacdf54a42e63486604a785686248a1ff183533f879b316e3d9af25d5aadb5",
+      "size_bytes": 2697795
     },
     {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r287.json",
-      "sha256": "7e583b0aa9978fbb1443d88f2c16c4aef6f5f5654b98790b55e43422a5336d63",
-      "size_bytes": 1372774
+      "name": "pr-soak-strict-strict-minio-c1-w1-r001.json",
+      "sha256": "561f9dece5f8df2c538830d0088583130324c923be46db0bd5447d08ecfda7d1",
+      "size_bytes": 413047
     },
     {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r288.json",
-      "sha256": "0693d400c7b784471b4329f093bcf87b832286341559892e9131522fa1817550",
-      "size_bytes": 1614255
+      "name": "capacity-alloy-file-strict-minio-c1-w1-r294.json",
+      "sha256": "2dd5ad8425407319865b43560aec70177d2341c7eda120d7c19b95dbb59ccd6d",
+      "size_bytes": 465897
     },
     {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r289.json",
-      "sha256": "d5cdce7b023f0d8b6f85add157b600941518049fbcc7de74e906f1454d8938d4",
-      "size_bytes": 1566998
-    },
-    {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r290.json",
-      "sha256": "19b32479f01603801a77fb54b5fb0ffee323f492c1bb0f37c9cfd8c7ebedf3d4",
-      "size_bytes": 1588118
-    },
-    {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r291.json",
-      "sha256": "4ea4b5431e52108c46a4e219c6455cf931034e7cb0ff9649b3dd2c8f1f626e5e",
-      "size_bytes": 1599342
-    },
-    {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r292.json",
-      "sha256": "fdb060a99170701795d88e9d2a7328198ce2e2970eed390644db2c749605a395",
-      "size_bytes": 1539515
-    },
-    {
-      "name": "capacity-mixed-1k-hot-churn1-buffered-minio-c1-w15-r293.json",
-      "sha256": "dcb635d58cd20971a2afbb6f58dc97f737472d1110187d05cbd84cfcf44ae84c",
-      "size_bytes": 1528681
+      "name": "capacity-alloy-file-strict-minio-c1-w1-r295.json",
+      "sha256": "6738402cd62c0f47e5c0df7d4830847fa55fe6465732f9c628433582c30cc9e7",
+      "size_bytes": 468757
     }
   ],
-  "run_id": "soak-buffered",
+  "run_id": "soak-strict",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T21:49:15Z",
-  "status": "passed",
+  "started_utc": "2026-09-24T21:33:37Z",
+  "status": "failed",
   "workload": {}
 }
