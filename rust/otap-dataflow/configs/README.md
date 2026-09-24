@@ -256,8 +256,9 @@ Requires a binary built with `--features series-parquet`. Create the base
 directory before starting. An OK OTLP response means the request's rows are
 already durable, so clients should retry timeouts and transient failures and
 tolerate duplicates. Logs and metric number and histogram points are stored;
-traces are refused, and exponential histograms and summaries are refused
-unless `unsupported: drop` is set.
+traces are refused, and exponential histogram and summary points are dropped
+and counted (`unsupported: drop`, the default) or, under `unsupported: reject`,
+refuse their whole request.
 
 ### `series-parquet-s3.yaml`
 
