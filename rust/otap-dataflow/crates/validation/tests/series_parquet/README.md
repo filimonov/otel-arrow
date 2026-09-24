@@ -85,10 +85,16 @@ cargo build --profile profiling --no-default-features -p otel-arrow-dfe \
   --bin df_engine --features core-nodes,crypto-ring,dhat-heap
 ```
 
-The `bench-heap` feature installs DHAT's global allocator in the
-`measurement` bench executable only, so a timed sample is never measured
-through an allocation tracker; the two builds carry different fingerprints
-and are never compared with each other. The `dhat-heap` engine is the
+Stage timings run on jemalloc like the engine: the timing builds of both
+benches install it with the engine's compiled-in background thread, and
+their `--describe` names the allocator. The harness refuses a timing bench
+on any other allocator and records the described one in every child's
+fingerprint. Stage families published before `stages-spot-jemalloc` timed
+on the system allocator (glibc malloc), so their baselines are never
+compared with a jemalloc run. The `bench-heap` feature installs DHAT's
+global allocator instead, so a timed sample is never measured through an
+allocation tracker; the two builds carry different fingerprints and are
+never compared with each other. The `dhat-heap` engine is the
 paired allocation profile of the pipeline baseline, and its run directory
 keeps the `dhat-heap.json` it writes. `stages` takes
 `--option configs='["logs-1k-stable"]'`, `--option stages='["extract"]'` and

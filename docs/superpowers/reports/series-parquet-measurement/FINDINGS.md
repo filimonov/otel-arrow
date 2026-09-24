@@ -38,10 +38,17 @@ is merge plus encode plus store for one sealed block.
 | Pin | `taskset -c 0-7,16-23`, physical cores 0-7 with both SMT threads |
 | Other load | a TLA+ model checker (TLC) session pinned to 8-15,24-31, 8 workers, nice 10 |
 | Engine builds | `release` with jemalloc; `profiling` with the DHAT heap profiler |
-| Bench builds | profile `bench` (release plus fat LTO); a timing build on the system allocator and a heap build with the `bench-heap` feature |
+| Bench builds | profile `bench` (release plus fat LTO); a timing build on jemalloc with the engine's background thread, and a heap build with the `bench-heap` feature (DHAT) |
 | Host lease | an exclusive file lock; a measured run holds it for its whole window |
 | Build monitor | a run is invalidated if cargo, rustc, cc1 or ld runs inside a measured window |
 | Snapshots | every child records the host at start and end: load, affinity, heaviest other processes |
+
+Stage timings run on jemalloc, configured as the engine is, from commit
+d7320d681 and the family `stages-spot-jemalloc` on. Every earlier stage
+family, including all of Task 3 and slice S6, timed on glibc malloc; its
+baselines carry the `system` allocator in their fingerprint and are never
+compared with a jemalloc run. The two S6 families recorded with
+`GLIBC_TUNABLES` stay committed as glibc evidence.
 
 SMT means simultaneous multithreading. The pin exists because a TLC thread
 on the SMT sibling of a bench core slowed the Task 3 benches by 8 to 47
