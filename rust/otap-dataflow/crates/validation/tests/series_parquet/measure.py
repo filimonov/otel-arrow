@@ -1304,6 +1304,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = memory.add_argument("--output-dir", type=Path)
     _ = memory.add_argument("--option", action="append", default=[])
+    capacity = sub.add_parser(
+        "capacity",
+        help="search the maximum sustainable throughput and durable write speed",
+    )
+    _ = capacity.add_argument("--output-dir", required=True, type=Path)
+    _ = capacity.add_argument("--option", action="append", default=[])
     rescrub = sub.add_parser(
         "rescrub",
         help="scrub one published evidence tree in place and re-hash it",
@@ -1405,6 +1411,20 @@ def main(argv=None) -> int:
                 f"{index['run_id']}: {index['status']} "
                 f"{json.dumps(index['metrics'], sort_keys=True)}\n"
             )
+        return 0 if all(
+            index["status"] == measurement.STATUS_PASSED for index in indexes
+        ) else 1
+    if arguments.command == "capacity":
+        try:
+            from . import capacity
+        except ImportError:
+            import capacity
+        options = parse_options(arguments.option)
+        indexes = capacity.run_capacity(
+            arguments.output_dir, options.pop("report_dir", None), **options
+        )
+        for index in indexes:
+            sys.stderr.write(f"{index['run_id']}: {index['status']}\n")
         return 0 if all(
             index["status"] == measurement.STATUS_PASSED for index in indexes
         ) else 1

@@ -23,17 +23,20 @@ import unittest
 from unittest import mock
 
 try:  # Imported as a package module by `python3 -m crates...`.
+    from . import capacity
     from . import measurement
     from . import measure
     from . import memory
     from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
+    import capacity
     import measurement
     import measure
     import memory
     import performance
 
 Ledger = measurement.Ledger
+rates = capacity.rates
 RunSpec = measurement.RunSpec
 Workload = measurement.Workload
 assert_records = measurement.assert_records
@@ -6151,6 +6154,137 @@ class AttributionContracts(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True):
             self.assertEqual(
                 measure.main(["attribution", "--output-dir", str(temporary_directory(self))]),
+                2,
+            )
+
+
+class CapacityContracts(unittest.TestCase):
+    """The arithmetic and the decisions of the capacity family."""
+
+    # Scenario: two workers complete 12,000 unique records and 3MB of objects in 3s.
+    # Guarantees: records, input bytes and output bytes retain distinct denominators.
+    def test_capacity_units(self):
+        measured = rates(12000, 12000000, 3000000, 3.0, 2)
+        self.assertEqual(measured["records_per_s"], 4000)
+        self.assertEqual(measured["records_per_s_per_core"], 2000)
+        self.assertEqual(measured["input_bytes_per_s"], 4000000)
+        self.assertEqual(measured["object_bytes_per_s"], 1000000)
+
+    # Scenario: a rate is computed over a zero duration or zero workers.
+    # Guarantees: the arithmetic refuses rather than dividing by zero.
+    def test_capacity_units_refuse_empty_denominators(self):
+        with self.assertRaises(ValueError):
+            _ = rates(1, 1, 1, 0.0, 1)
+        with self.assertRaises(ValueError):
+            _ = rates(1, 1, 1, 1.0, 0)
+
+    # Scenario: a search doubles from 1,000 records/s, fails at 64,000 and
+    # bisects the bracket.
+    # Guarantees: it doubles while sustainable, bisects between the highest
+    # sustainable and lowest unsustainable rate, and stops at a 10% bracket.
+    def test_search_doubles_then_bisects_to_ten_percent(self):
+        trials = []
+        ceiling = 45_000
+        while True:
+            rate = capacity.next_search_rate(trials)
+            if rate is None:
+                break
+            trials.append((rate, "sustainable" if rate <= ceiling else "unsustainable"))
+        rates_run = [rate for rate, _verdict in trials]
+        self.assertEqual(rates_run[:7], [1000, 2000, 4000, 8000, 16000, 32000, 64000])
+        decision = capacity.search_decision(trials)
+        self.assertTrue(decision["bracketed"])
+        self.assertEqual(decision["kind"], "maximum")
+        self.assertLessEqual(decision["bracket_width_ratio"], 0.10)
+        self.assertLessEqual(decision["sustainable_records_per_s"], ceiling)
+        self.assertGreater(decision["unsustainable_records_per_s"], ceiling)
+
+    # Scenario: every one of the twelve doubling trials is sustainable.
+    # Guarantees: the search stops and reports a lower bound, never a maximum.
+    def test_an_unbracketed_search_is_a_lower_bound(self):
+        trials = []
+        while True:
+            rate = capacity.next_search_rate(trials)
+            if rate is None:
+                break
+            trials.append((rate, "sustainable"))
+        self.assertEqual(len(trials), capacity.DOUBLING_TRIALS)
+        decision = capacity.search_decision(trials)
+        self.assertEqual(decision["kind"], "lower_bound")
+        self.assertFalse(decision["bracketed"])
+
+    # Scenario: a trial's producer fell behind with in-flight slots free.
+    # Guarantees: the search ends there and the trial is producer-limited,
+    # not an unsustainable bracket of the engine.
+    def test_a_producer_limited_trial_ends_the_search(self):
+        verdict = capacity.stability_verdict(
+            offered=100_000, tail_durable=60_000, backlog_slope_records_per_s=10_000,
+            late_unblocked_ratio=0.2, failed_requests=0, partial_requests=0,
+        )
+        self.assertEqual(verdict["verdict"], "producer_limited")
+        self.assertIsNone(capacity.next_search_rate([(1000, "sustainable"),
+                                                     (2000, "producer_limited")]))
+
+    # Scenario: the durable tail rate is 97% of offered, or the backlog grows
+    # by 3% of the offered rate, or a request failed.
+    # Guarantees: each alone makes the trial unsustainable, with its reason.
+    def test_the_stability_rule_is_the_plan_row(self):
+        base = dict(offered=100_000, tail_durable=100_000,
+                    backlog_slope_records_per_s=0, late_unblocked_ratio=0.0,
+                    failed_requests=0, partial_requests=0)
+        self.assertEqual(capacity.stability_verdict(**base)["verdict"], "sustainable")
+        for change in ({"tail_durable": 97_000},
+                       {"backlog_slope_records_per_s": 3_000},
+                       {"failed_requests": 1}):
+            verdict = capacity.stability_verdict(**dict(base, **change))
+            self.assertEqual(verdict["verdict"], "unsustainable", change)
+            self.assertTrue(verdict["reasons"])
+
+    # Scenario: a backlog that grows by 500 records every second.
+    # Guarantees: the least-squares slope reads 500 records/s.
+    def test_backlog_slope_is_least_squares(self):
+        points = [(t, 1000 + 500 * t) for t in range(10)]
+        self.assertAlmostEqual(capacity.backlog_slope(points), 500.0)
+
+    # Scenario: 10 requests over 4 connections and 3 processes, and over one
+    # connection.
+    # Guarantees: every request is sent once, each connection belongs to one
+    # process, and one connection uses one process only.
+    def test_connections_are_spread_over_processes(self):
+        plans = capacity.connection_plan(10, 4, 3)
+        self.assertEqual(len(plans), 3)
+        positions = sorted(p for plan in plans for p in plan["positions"])
+        self.assertEqual(positions, list(range(10)))
+        for plan in plans:
+            for position, local in zip(plan["positions"], plan["local"]):
+                self.assertEqual(plan["connections"][local], position % 4)
+        self.assertEqual(len(capacity.connection_plan(10, 1, 4)), 1)
+
+    # Scenario: a record-scope workload builds one logs request.
+    # Guarantees: each record carries its own series slot, the default scope
+    # is unchanged, and a default workload records no new field.
+    def test_record_scope_varies_series_per_record(self):
+        workload = Workload(requests=3, records_per_request=4, series=10,
+                            metrics_every=100, series_scope="record")
+        loggers = {measurement.logger_name(workload, 1, point) for point in range(4)}
+        self.assertEqual(len(loggers), 4)
+        self.assertEqual(measurement.logger_name(Workload(), 7, 3),
+                         measurement.logger_name(Workload(), 7, 0))
+        self.assertNotIn("series_scope", Workload().as_json())
+        self.assertEqual(workload.as_json()["series_scope"], "record")
+        self.assertEqual(Workload(**workload.as_json()), workload)
+        with self.assertRaises(ValueError):
+            _ = Workload(series_scope="window")
+
+    # Scenario: the capacity subcommand is asked for without the long opt-in.
+    # Guarantees: it is gated as a long measurement.
+    def test_capacity_is_a_long_subcommand(self):
+        self.assertIn("capacity", measure.LONG_COMMANDS)
+        environment = dict(os.environ)
+        environment.pop("SERIES_MEASURE_LONG", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                measure.main(["capacity", "--output-dir", str(temporary_directory(self))]),
                 2,
             )
 

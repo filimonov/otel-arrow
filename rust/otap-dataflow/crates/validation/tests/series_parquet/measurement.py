@@ -221,11 +221,16 @@ class Workload:
     body_bytes: int = 1024
     series: int = 100
     metrics_every: int = 5
+    # Whether series identity varies per request (one logs series and one
+    # slot per request) or per record, cycling through `series` slots.
+    series_scope: str = "request"
 
     def __post_init__(self):
         for name in ("requests", "records_per_request", "series", "metrics_every"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.series_scope not in SERIES_SCOPES:
+            raise ValueError(f"series_scope must be one of {SERIES_SCOPES}")
         if self.body_bytes < ID_FIXED_WIDTH + len(LOG_KIND):
             raise ValueError(
                 f"body_bytes must hold the stable id: "
@@ -236,9 +241,31 @@ class Workload:
         """Which signal request `request_index` carries."""
         return "metrics" if request_index % self.metrics_every == 0 else "logs"
 
+    def slot(self, request_index: int, point: int) -> int:
+        """The series slot of one record under `series_scope`."""
+        if self.series_scope == "record":
+            return (request_index * self.records_per_request + point) % self.series
+        return request_index % self.series
+
     def as_json(self) -> dict:
-        """The workload as a plain dictionary for a result file."""
-        return dataclasses.asdict(self)
+        """The workload as a plain dictionary for a result file.
+
+        A field at its default in `OPTIONAL_WORKLOAD_FIELDS` is omitted, so
+        a workload that predates it keeps its recorded form and fingerprint.
+        """
+        fields = dataclasses.asdict(self)
+        for name, default in OPTIONAL_WORKLOAD_FIELDS.items():
+            if fields[name] == default:
+                del fields[name]
+        return fields
+
+
+# The per-request and per-record series identities a workload may use.
+SERIES_SCOPES = ("request", "record")
+
+# Workload fields added after results were published, with the default an
+# older result implies by omitting them.
+OPTIONAL_WORKLOAD_FIELDS = {"series_scope": "request"}
 
 
 # The topologies a run may declare. `strict` and `buffered` are the two
@@ -405,7 +432,7 @@ def metric_point(workload: Workload, request_index: int, point: int) -> dict:
         "kind": kind,
         "record_id": stable_id(workload.seed, request_index, point, kind),
         "time_unix_nano": METRIC_BASE_TIME_NS + ordinal * METRIC_TIME_STEP_NS,
-        "slot": request_index % workload.series,
+        "slot": workload.slot(request_index, point),
         "value_int": None,
         "value_double": None,
         "count": None,
@@ -484,15 +511,16 @@ def payload_sha256(payload: str) -> str:
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
-def logger_name(workload: Workload, request_index: int) -> str:
-    """The series-identifying attribute of one logs request.
+def logger_name(workload: Workload, request_index: int, point: int = 0) -> str:
+    """The series-identifying attribute of one logs record.
 
     `logger.name` is the configured logs series attribute, so varying it by
-    request is what creates distinct series. The record id is deliberately
-    not part of it: putting an id into series identity would make every
-    record its own series and measure nothing the deployment does.
+    request, or by record under the record scope, is what creates distinct
+    series. The record id is deliberately not part of it: putting an id into
+    series identity would make every record its own series and measure
+    nothing the deployment does.
     """
-    return f"series.logger.{request_index % workload.series:06d}"
+    return f"series.logger.{workload.slot(request_index, point):06d}"
 
 
 def build_request(workload: Workload, request_index: int):
@@ -517,8 +545,8 @@ def build_request(workload: Workload, request_index: int):
         ).value.string_value = "series-e2e-service"
         scope = resource.scope_logs.add()
         scope.scope.name = "series-e2e"
-        logger = logger_name(workload, request_index)
         for point in range(workload.records_per_request):
+            logger = logger_name(workload, request_index, point)
             record_id = stable_id(workload.seed, request_index, point, LOG_KIND)
             width = workload.body_bytes - len(record_id)
             body = record_id + _padding(workload.seed, request_index, point, width)
@@ -1277,6 +1305,10 @@ CASE_ROLES = {
     "memory": (("producer", 2), ("reader", 1)),
     # A memory pair on an object store gives up one producer core to it.
     "memory_store": (("producer", 1), ("store", 1), ("reader", 1)),
+    # A capacity trial reads back only after its engine stopped, as an
+    # attribution does, so a four-worker engine fits beside the producer and
+    # the store; the local store keeps the same placement.
+    "capacity": (("producer", 2), ("store", 1)),
 }
 
 
@@ -4141,6 +4173,8 @@ def fingerprint_material(result) -> dict:
     config = _required(result.get("config", {}).get("effective"), "config.effective")
     workload = _required(result.get("workload"), "workload")
     for field in dataclasses.fields(Workload):
+        if field.name in OPTIONAL_WORKLOAD_FIELDS and field.name not in workload:
+            continue
         _ = _required(workload.get(field.name), f"workload.{field.name}")
     schedule = _required(result.get("workload_schedule"), "workload_schedule")
     for key in ("duration_s", "rate_requests_per_s", "max_in_flight"):

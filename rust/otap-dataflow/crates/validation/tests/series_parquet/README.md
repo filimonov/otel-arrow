@@ -221,9 +221,89 @@ SERIES_MEASURE_LONG=1 python3 -m crates.validation.tests.series_parquet.measure 
   memory --output-dir /tmp/series-memory
 ```
 
-The remaining subcommands (`capacity`, `soak`, `failures`, `buffered`,
-`remediate`, `report`) are named here so the command line is one contract;
-each is implemented by its own task.
+### Capacity
+
+`capacity` (`SERIES_MEASURE_LONG=1`, `capacity.py`) searches the highest
+offered record rate the strict engine sustains, per store and worker count,
+and measures its durable write speed:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure capacity \
+  --output-dir /var/tmp/series-capacity \
+  --option 'stores=["local","minio","rustfs"]' --option 'core_counts=[1,4]' \
+  --option 'steps=["calibrate","search","default_window","buffered","fan_in","admission","workloads","high_cardinality","publish"]'
+```
+
+The output directory holds Parquet and logs of tens of gigabytes per trial,
+so it belongs on a disk, not on the tmpfs `/tmp`. Each trial is one fresh
+release engine and one JSON file, named like every run file; the family
+state (`capacity-state.json`) lets a later invocation resume or add steps.
+`publish` writes `capacity-local.json`, `capacity-minio.json` and
+`capacity-rustfs.json`, each with its trials, each cell's aggregate and its
+baseline.
+
+A trial offers a fixed rate from an open-loop producer: four spawned
+processes on the producer's two physical cores (both SMT threads; the store
+owns its core likewise), each owning a share of the client connections
+(`grpc.use_local_subchannel_pool`, so each channel is its own TCP
+connection) and sending prebuilt requests at monotonic target times, with
+in-flight requests bounded by the receivers' summed capacity. A send is
+never retried and never silently re-timed: its target, send and response
+instants are all kept, and a send that starts over 50 ms late with a slot
+free marks the trial `producer_limited`. Requests come from a pool built
+once in segments (`/var/tmp/series-capacity-pools`); a request's bytes
+depend only on the workload and its index, so a larger trial extends the
+pool without rebuilding it. The ledger lives on tmpfs, keeps the pool
+prefix's records across trials and takes each trial's requests and
+attempts, so the oracle's acknowledged scope is exactly the trial's; stored
+rows of requests a trial never sent are counted and must be zero.
+
+A trial is a 15 s warm-up (at least two windows plus 5 s) and a 60 s
+measured interval, then the drain proof, the read-back by both readers and
+deletion of the objects. It is sustainable when, over the interval's last
+30 s, the durable acknowledgement rate and the values rows the exporter
+reports written are each at least 98 percent of the offered rate, the
+backlog (due minus durably acknowledged) grows by at most 2 percent of it,
+and no request failed. A search starts at 1,000 records/s, doubles while
+sustainable (at most 12 trials; an unbracketed search is a lower bound),
+bisects until the bracket is at most 10 percent wide and repeats the
+winning rate until three independent trials measured it; its aggregate is
+the median durable rate with a 15 percent coefficient-of-variation gate.
+
+Deliberate overrides, recorded in every trial: one-second windows for the
+search (the shipped window is 15 s; `default_window` repeats the winning
+rate with it, upload concurrency 2 and 1, and jemalloc's statistics print);
+1000 records per request; 256 connections. The receiver's
+`max_concurrent_requests` is clamped by the engine to the pipeline's pdata
+channel capacity, so a raised limit (`admission`, 4096) raises both. The
+harness engine configuration drops unsupported points (`unsupported:
+drop`); the object stores are plain HTTP, where series_parquet signs every
+payload (unsigned payloads are its default over TLS only).
+
+Workloads (`capacity.CAPACITY_WORKLOADS`): `mixed-1k-hot` is the searched
+one, 80/20 logs/metric points with 1 KiB bodies and series slots cycled per
+record (`Workload.series_scope = "record"`) over 10k slots; `logs-1k-hot`,
+`mixed-8k-hot` and `mixed-1k-churn` (new series with every request) are
+confirmations at 80 percent of the searched capacity, bracketed on their own
+when they fail there; `metrics-1k-unique` gives every point a unique
+attribute value against `metrics-1k-hot`, for the series-to-point ratio.
+
+Series identity is the full attribute set, by OTel semantics, so an
+attribute that is unique per point (a request id) makes every point a new
+series and the descriptor dataset grows like the values dataset. The
+exporter cannot drop such an attribute without merging distinct streams;
+filter or aggregate it upstream (an OTel View, or `processor:attribute`).
+
+Options: `stores`, `core_counts`, `steps`, `rehearsal=true` with its own
+`report_dir` (six-second intervals, nothing published to the report
+directory), `trial={...}` for the `trial` step, `fan_in`, `rows`,
+`high_cardinality_rate`, `upload_concurrencies`, `pool_dir`, `ledger_dir`,
+`build_processes`, `lease_wait_s`, `family_ordinal`.
+
+The remaining subcommands (`soak`, `failures`, `buffered`, `remediate`,
+`report`) are named here so the command line is one contract; each is
+implemented by its own task.
 
 ## Reference deployment
 

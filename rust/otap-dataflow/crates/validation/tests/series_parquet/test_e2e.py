@@ -291,8 +291,9 @@ def engine_config(
     inserts the durable buffer between the receiver and the exporter,
     `cores` pins one worker to each named core through a `core_set`, and
     `merge` deep-merges nested maps into the named nodes' configurations
-    (`engine` into the engine section and `policies` into the top-level
-    policies). The result is what gets hashed
+    (`engine` into the engine section, `policies` into the top-level
+    policies and `pipeline_policies` into the measured pipeline's own, which
+    holds the channel capacities). The result is what gets hashed
     and recorded, so nothing is changed after it is returned. `grpc_host`
     is the address the receiver binds: a launcher that runs the engine in
     its own network namespace binds every address there, and reaches it
@@ -377,6 +378,8 @@ def engine_config(
             deep_merge(config["engine"], patch)
         elif name == "policies":
             deep_merge(config["policies"], patch)
+        elif name == "pipeline_policies":
+            deep_merge(pipeline.setdefault("policies", {}), patch)
         elif name in nodes:
             deep_merge(nodes[name].setdefault("config", {}), patch)
         else:
