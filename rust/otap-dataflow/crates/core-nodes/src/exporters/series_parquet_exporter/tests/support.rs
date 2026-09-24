@@ -523,6 +523,10 @@ pub(super) enum Fault {
     /// Every write is refused as `PermissionDenied`, the way a store answers
     /// credentials it does not accept.
     Denied,
+    /// A `values` multipart upload is completed in the underlying store, and
+    /// the completion call then never returns, the way a store that commits
+    /// the upload and loses its response looks to the writer.
+    LostComplete,
 }
 
 /// How long one write takes to fail under [`Fault::SlowFail`].
@@ -573,6 +577,37 @@ pub(super) struct Faults {
     pub(super) parts: Arc<AtomicUsize>,
     /// Aborts attempted against a wedged multipart upload.
     pub(super) aborts: Arc<AtomicUsize>,
+    /// Uploads completed in the underlying store under
+    /// [`Fault::LostComplete`].
+    pub(super) completes: Arc<AtomicUsize>,
+}
+
+/// A real multipart upload whose completion lands and whose response is then
+/// lost: the call completes the upload in the underlying store and never
+/// returns.
+#[derive(Debug)]
+pub(super) struct LostCompleteUpload {
+    /// The upload the underlying store really initiated.
+    pub(super) inner: Box<dyn MultipartUpload>,
+    /// Completions that landed, shared with the store the test holds.
+    pub(super) completes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for LostCompleteUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let _ = self.inner.complete().await?;
+        let _ = self.completes.fetch_add(1, SeqCst);
+        std::future::pending().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
 }
 
 /// A real multipart upload that is initiated and then never progresses.
@@ -736,6 +771,12 @@ impl StoreHooks for Faults {
                 _inner: upload,
                 parts: Arc::clone(&self.parts),
                 aborts: Arc::clone(&self.aborts),
+            });
+        }
+        if self.mode() == Fault::LostComplete && path.as_ref().contains("dataset=values/") {
+            return Box::new(LostCompleteUpload {
+                inner: upload,
+                completes: Arc::clone(&self.completes),
             });
         }
         upload

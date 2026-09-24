@@ -75,6 +75,14 @@ bucket or path), `cancelled`, `encoding failed` or `internal error`. The
 store's error is logged with `series_parquet.flush.attempt_failed` and
 `series_parquet.flush.failed`.
 
+A failed block can still leave its files behind: the store may finish an
+upload after the write was cancelled, or commit one and lose the response.
+After such an ambiguous end the cleanup sends one HEAD per frozen object name,
+bounded by the same cleanup cutoff. When every object exists the flush is a
+late commit (`flush.late_commits`, INFO `series_parquet.flush.cleanup` naming
+the file). Its requests are still nacked, so its rows may be stored twice once
+the producers retry.
+
 Delivery is at-least-once. Producers must retain and retry a request on a
 retryable failure or a timeout, and a retry can duplicate rows an earlier
 attempt already committed.
@@ -918,7 +926,7 @@ Unlabelled worker state and totals:
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
 | `flush.abort_failures` | `{flush}` | Cancelled writes of decided flushes whose multipart abort failed or that did not unwind by the cleanup cutoff; each may leave an upload to the bucket's lifecycle rule. |
-| `flush.late_commits` | `{flush}` | Writes of decided flushes that completed while being cancelled; their files hold rows whose requests were nacked. |
+| `flush.late_commits` | `{flush}` | Failed flushes whose every object exists after all: the write completed while being cancelled, or a probe after an ambiguous failure found every object. Their requests were nacked, so their rows may be stored twice once the producers retry. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -997,7 +1005,7 @@ window interval means the destination, not the producers, is the limit.
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
 | `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
-| `series_parquet.flush.cleanup` | WARN, INFO for a late commit | How the cancelled write of a decided flush unwound: `outcome` (`abort_failed` with `abort_error`, or `late_commit`), `seq`, `attempt`, `file`. A clean abort is DEBUG. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
 | `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
 | `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |

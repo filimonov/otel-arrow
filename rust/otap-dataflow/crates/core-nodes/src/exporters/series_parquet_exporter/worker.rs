@@ -46,7 +46,7 @@
 
 use super::super::log_gate::LogGate;
 use super::config::Config;
-use super::flush::{self, FlushDone, FlushJob, FlushTally};
+use super::flush::{self, FlushDone, FlushJob, FlushShared};
 use super::metrics::{
     DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs,
 };
@@ -265,9 +265,9 @@ pub(super) struct Worker {
     /// the exporters account for from the one process RSS sample it already
     /// takes; dropping the worker withdraws its bytes and its registration.
     pub(super) accounting: SeriesMemoryAccounting,
-    /// What every flush task counts as it happens, moved into the metrics on
-    /// each sample.
-    flush_tally: Rc<FlushTally>,
+    /// The store every flush task probes, and what the tasks count as it
+    /// happens, moved into the metrics on each sample.
+    flush_shared: Rc<FlushShared>,
 }
 
 /// A test that drops a worker still holding completions tears them down with
@@ -312,7 +312,7 @@ impl Worker {
         let naming = lake::sink::FileNaming::new(&cfg.lake.writer_id);
         let boot_id = naming.boot_id.clone();
         let sink = Rc::new(lake::sink::Sink::new(
-            store,
+            Arc::clone(&store),
             cfg.lake.clone(),
             naming,
             |timeout| clock::sleep_until(flush::deadline_at(clock::now(), timeout)),
@@ -348,7 +348,10 @@ impl Worker {
             abandoned: 0,
             metrics: None,
             accounting: SeriesMemoryAccounting::register(),
-            flush_tally: Rc::default(),
+            flush_shared: Rc::new(FlushShared {
+                store,
+                tally: flush::FlushTally::default(),
+            }),
         }
     }
 
@@ -795,7 +798,7 @@ impl Worker {
             old.emitted,
             self.cfg.window.flush_retry_deadline,
             self.cfg.lake.upload.abort_timeout,
-            Rc::clone(&self.flush_tally),
+            Rc::clone(&self.flush_shared),
         );
         if let Some(deadline) = self.deadline {
             job.cut_to(deadline);
@@ -1132,7 +1135,7 @@ impl Worker {
         if let Some(metrics) = &mut self.metrics {
             // Credited by the flush tasks as they happen, so an outage shows
             // its retries while it lasts.
-            let tally = &self.flush_tally;
+            let tally = &self.flush_shared.tally;
             metrics.worker.flush_retries.add(tally.retries.take());
             metrics
                 .worker

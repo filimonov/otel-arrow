@@ -39,15 +39,19 @@
 //! very poll the deadline expired in if the owner has stopped listening. Such
 //! a file holds rows whose requests were nacked, which the producer's retry
 //! then writes again -- a duplicate that at-least-once delivery permits, never
-//! a loss; how each cancelled write unwound is reported by
-//! [`Trace::cleaned_up`]. What the deadline does guarantee is that a write that has finished
-//! when it is polled is reported as the success it is, see [`write_until`].
+//! a loss; [`Trace::cleaned_up`] reports how each cancelled write unwound,
+//! probing the objects when it cannot tell. What the deadline does guarantee
+//! is that a write that has finished when it is polled is reported as the
+//! success it is, see [`write_until`].
 
 use super::token::AckToken;
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_series_lake as lake;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -200,13 +204,14 @@ async fn write_until(
         // counted instead.
         let remaining = limit.at().saturating_duration_since(clock::now());
         if attempts > 1 {
-            trace.tally.retries.set(trace.tally.retries.get() + 1);
+            let retries = &trace.shared.tally.retries;
+            retries.set(retries.get() + 1);
             otel_info!(
                 "series_parquet.flush.attempt",
                 seq = trace.seq,
                 attempt = attempts,
                 file = &*trace.file,
-                objects = trace.objects,
+                objects = trace.paths.len(),
                 deadline_remaining = ?remaining
             );
         } else {
@@ -215,7 +220,7 @@ async fn write_until(
                 seq = trace.seq,
                 attempt = attempts,
                 file = &*trace.file,
-                objects = trace.objects,
+                objects = trace.paths.len(),
                 deadline_remaining = ?remaining
             );
         }
@@ -253,7 +258,7 @@ async fn write_until(
                     result = &mut write => Some(result),
                     () = clock::sleep_until(cutoff) => None,
                 };
-                trace.cleaned_up(attempts, unwound);
+                trace.cleaned_up(attempts, unwound, cutoff).await;
                 // Dropping the write after the bound releases the last task-owned
                 // resources even if the object store future never cooperates.
                 return;
@@ -292,7 +297,18 @@ async fn write_until(
                 delay = delay.saturating_mul(2).min(MAX_BACKOFF);
             }
             Err(error) => {
+                // A storage failure of the last attempt may be a response the
+                // store lost after committing, so the objects are probed
+                // within the same cutoff a decided write is given.
+                let ambiguous = error.is_retryable();
+                let abort_error = abort_failure(&error).map(str::to_owned);
                 let _ = result_tx.send(done(attempts, Err(error)));
+                if let Some(abort_error) = abort_error {
+                    trace.abort_failed(attempts, &abort_error);
+                } else if ambiguous {
+                    let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
+                    trace.probe(attempts, cutoff).await;
+                }
                 return;
             }
         }
@@ -305,11 +321,60 @@ async fn write_until(
 pub(super) struct FlushTally {
     /// Write attempts started beyond the first of their flush.
     pub(super) retries: Cell<u64>,
-    /// Cleanups of a decided write that may have left a multipart upload
-    /// behind: the abort failed, or the write did not unwind in time.
+    /// Failed flushes that may have left a multipart upload behind: the
+    /// abort failed, or the write did not unwind in time.
     pub(super) abort_failures: Cell<u64>,
-    /// Decided writes that completed anyway while being cancelled.
+    /// Failed flushes whose every object exists after all.
     pub(super) late_commits: Cell<u64>,
+}
+
+/// What every flush task of one worker shares with it.
+pub(super) struct FlushShared {
+    /// The store the sink writes to, which a cleanup probes for a late commit.
+    pub(super) store: Arc<dyn ObjectStore>,
+    /// Counts the tasks record as they happen.
+    pub(super) tally: FlushTally,
+}
+
+/// What a probe of every frozen object of a failed block found.
+#[derive(Debug, PartialEq, Eq)]
+enum Presence {
+    /// Every object exists: the block's rows are stored although its
+    /// requests were nacked.
+    All,
+    /// Only this many of the objects exist.
+    Some(usize),
+    /// No object exists.
+    None,
+    /// A HEAD failed or the cleanup cutoff passed first.
+    Unknown(String),
+}
+
+/// HEAD every path, each bounded by `cutoff`.
+///
+/// Objects are atomic on the stores this writes to, so a path that exists
+/// holds a finished file.
+async fn presence(store: &dyn ObjectStore, paths: &[Path], cutoff: Instant) -> Presence {
+    let mut present = 0;
+    for path in paths {
+        let head = tokio::select! {
+            biased;
+            head = store.head(path) => head,
+            () = clock::sleep_until(cutoff) => {
+                return Presence::Unknown("the cleanup cutoff passed before the probe finished".into());
+            }
+        };
+        match head {
+            Ok(_) => present += 1,
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Presence::Unknown(error.to_string()),
+        }
+    }
+    match present {
+        0 => Presence::None,
+        n if n == paths.len() => Presence::All,
+        n => Presence::Some(n),
+    }
 }
 
 /// What one flush task reports its attempts and its cleanup under.
@@ -317,27 +382,27 @@ pub(super) struct Trace {
     /// The file name every object of the block shares; each object differs
     /// only in its dataset directory.
     pub(super) file: Rc<str>,
-    /// Objects one attempt writes.
-    objects: usize,
+    /// Every object one attempt writes.
+    paths: Vec<Path>,
     /// The block's per-worker sequence.
     seq: u64,
     /// Attempts the task has started so far, the one in flight included.
     attempts: Cell<u64>,
-    /// Where the counts go.
-    tally: Rc<FlushTally>,
+    /// The store to probe and where the counts go.
+    shared: Rc<FlushShared>,
 }
 
 #[cfg(test)]
 impl Trace {
-    /// A trace for block `seq` writing `file`, for a test that reports a
+    /// A trace for block `seq` writing `paths`, for a test that reports a
     /// cleanup without running a flush.
-    pub(super) fn for_test(file: &str, seq: u64, tally: Rc<FlushTally>) -> Self {
+    pub(super) fn for_test(paths: Vec<Path>, seq: u64, shared: Rc<FlushShared>) -> Self {
         Self {
-            file: file.into(),
-            objects: 2,
+            file: paths.first().and_then(Path::filename).unwrap_or("").into(),
+            paths,
             seq,
             attempts: Cell::new(0),
-            tally,
+            shared,
         }
     }
 }
@@ -359,56 +424,85 @@ impl Trace {
     }
 
     /// Report how the cancelled write of an already decided flush unwound:
-    /// `None` when it had not by the cleanup cutoff.
+    /// `None` when it had not by `cutoff`.
     ///
-    /// A write that completed anyway committed files whose requests were
-    /// nacked, which the producer's retry writes again. One whose abort
+    /// A write that completed anyway is a late commit. One whose abort
     /// failed, or that never unwound, may have left a multipart upload to the
-    /// bucket's lifecycle rule.
-    pub(super) fn cleaned_up(
+    /// bucket's lifecycle rule. Any other cancellation is ambiguous -- the
+    /// store may have finished the upload and lost its response -- so the
+    /// objects are probed until `cutoff`.
+    pub(super) async fn cleaned_up(
         &self,
         attempt: u64,
         unwound: Option<lake::Result<lake::sink::FlushReport>>,
+        cutoff: Instant,
     ) {
-        let abort_error = match &unwound {
-            Some(Ok(_)) => {
-                self.tally
-                    .late_commits
-                    .set(self.tally.late_commits.get() + 1);
-                otel_info!(
-                    "series_parquet.flush.cleanup",
-                    outcome = "late_commit",
-                    seq = self.seq,
-                    attempt = attempt,
-                    file = &*self.file,
-                    message = "a decided write completed while it was cancelled; its files \
-                               hold rows whose requests were nacked"
-                );
-                return;
-            }
+        match &unwound {
+            Some(Ok(_)) => self.late_commit(attempt),
             Some(Err(error)) => match abort_failure(error) {
-                Some(abort_error) => abort_error.to_owned(),
-                None => {
-                    otel_debug!(
-                        "series_parquet.flush.cleanup",
-                        outcome = "aborted",
-                        seq = self.seq,
-                        attempt = attempt,
-                        file = &*self.file
-                    );
-                    return;
-                }
+                Some(abort_error) => self.abort_failed(attempt, abort_error),
+                None => self.probe(attempt, cutoff).await,
             },
-            None => "the write did not unwind by the cleanup cutoff".to_owned(),
-        };
-        self.abort_failed(attempt, &abort_error);
+            None => self.abort_failed(attempt, "the write did not unwind by the cleanup cutoff"),
+        }
+    }
+
+    /// Probe the block's objects until `cutoff` and report what was found.
+    ///
+    /// Every object present is a late commit; none is a clean abort; some,
+    /// or a probe that failed, is reported without counting a late commit.
+    async fn probe(&self, attempt: u64, cutoff: Instant) {
+        match presence(&*self.shared.store, &self.paths, cutoff).await {
+            Presence::All => self.late_commit(attempt),
+            Presence::None => otel_debug!(
+                "series_parquet.flush.cleanup",
+                outcome = "aborted",
+                seq = self.seq,
+                attempt = attempt,
+                file = &*self.file
+            ),
+            Presence::Some(present) => otel_info!(
+                "series_parquet.flush.cleanup",
+                outcome = "partial",
+                seq = self.seq,
+                attempt = attempt,
+                file = &*self.file,
+                present = present,
+                objects = self.paths.len(),
+                message = "some objects of a failed block exist; their rows may be stored twice \
+                           once the producer retries"
+            ),
+            Presence::Unknown(probe_error) => otel_warn!(
+                "series_parquet.flush.cleanup",
+                outcome = "unknown",
+                seq = self.seq,
+                attempt = attempt,
+                file = &*self.file,
+                probe_error = probe_error.as_str(),
+                message = "could not tell whether a failed block's objects exist"
+            ),
+        }
+    }
+
+    /// Count and log a failed block whose every object exists.
+    fn late_commit(&self, attempt: u64) {
+        let late = &self.shared.tally.late_commits;
+        late.set(late.get() + 1);
+        otel_info!(
+            "series_parquet.flush.cleanup",
+            outcome = "late_commit",
+            seq = self.seq,
+            attempt = attempt,
+            file = &*self.file,
+            message = "a failed block's objects exist although its requests were nacked; its \
+                       rows may be stored twice once the producer retries"
+        );
     }
 
     /// Count and log a cleanup that may have left a multipart upload behind.
     pub(super) fn abort_failed(&self, attempt: u64, abort_error: &str) {
-        self.tally
-            .abort_failures
-            .set(self.tally.abort_failures.get() + 1);
+        let failures = &self.shared.tally.abort_failures;
+        failures.set(failures.get() + 1);
         otel_warn!(
             "series_parquet.flush.cleanup",
             outcome = "abort_failed",
@@ -416,7 +510,7 @@ impl Trace {
             attempt = attempt,
             file = &*self.file,
             abort_error = abort_error,
-            message = "a multipart upload of a decided write may be left to the bucket \
+            message = "a multipart upload of a failed block may be left to the bucket \
                        lifecycle rule"
         );
     }
@@ -495,25 +589,21 @@ impl FlushJob {
         emitted: [u64; 3],
         retry_deadline: Duration,
         abort_timeout: Duration,
-        tally: Rc<FlushTally>,
+        shared: Rc<FlushShared>,
     ) -> Self {
         let cancel = CancellationToken::new();
         let bytes = data.bytes;
         let window_start_secs = data.window_start_secs;
         let seq = data.seq;
         // Every object of a block shares one file name and differs only in
-        // its dataset directory, so the name and the count are the whole set.
-        let planned = sink.planned_paths(&data);
+        // its dataset directory, so the name and the paths are the whole set.
+        let paths = sink.planned_paths(&data);
         let trace = Rc::new(Trace {
-            file: planned
-                .first()
-                .and_then(object_store::path::Path::filename)
-                .unwrap_or("")
-                .into(),
-            objects: planned.len(),
+            file: paths.first().and_then(Path::filename).unwrap_or("").into(),
+            paths,
             seq,
             attempts: Cell::new(0),
-            tally,
+            shared,
         });
         let started = clock::now();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();

@@ -1025,66 +1025,139 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
     );
 }
 
-/// Scenario: the cleanup of a decided write is reported for every way it can
-/// unwind: the write completed anyway, it was aborted cleanly, its abort
-/// timed out inside the sink, its abort failed after a write error, and it
-/// did not unwind by the cleanup cutoff.
-/// Guarantees: a late commit is one INFO `series_parquet.flush.cleanup` with
-/// `outcome=late_commit` and counts in `flush.late_commits`; a clean abort is
-/// DEBUG and counts nothing; each of the other three is a WARN with
-/// `outcome=abort_failed` and its abort error, and counts in
-/// `flush.abort_failures`.
-#[test]
-fn every_cleanup_outcome_is_logged_and_counted() {
+/// A cleanup trace for block 7 over the two objects of `part-x.parquet`, on
+/// `store`.
+fn cleanup_trace(
+    store: Arc<dyn ObjectStore>,
+) -> (
+    super::super::flush::Trace,
+    std::rc::Rc<super::super::flush::FlushShared>,
+    Vec<object_store::path::Path>,
+) {
+    let paths: Vec<object_store::path::Path> = ["dataset=series", "dataset=values"]
+        .into_iter()
+        .map(|dir| object_store::path::Path::from(format!("{dir}/part-x.parquet")))
+        .collect();
+    let shared = std::rc::Rc::new(super::super::flush::FlushShared {
+        store,
+        tally: super::super::flush::FlushTally::default(),
+    });
+    let trace = super::super::flush::Trace::for_test(paths.clone(), 7, std::rc::Rc::clone(&shared));
+    (trace, shared, paths)
+}
+
+/// Scenario: the cleanup of a failed block is reported for every way it can
+/// end: the write completed anyway; it was cancelled with no object, with
+/// one of the two objects, and with both objects in the store; its abort
+/// timed out inside the sink; its abort failed after a write error; it did
+/// not unwind by the cleanup cutoff; and the probe itself could not finish
+/// by the cutoff.
+/// Guarantees: a completed write and a cancellation that left every object
+/// are INFO `outcome=late_commit` and count in `flush.late_commits`; no
+/// object is DEBUG `aborted`; one object is INFO `partial` with the count;
+/// the three abort failures are WARN `abort_failed` with their abort error
+/// and count in `flush.abort_failures`; an unfinished probe is WARN
+/// `unknown` and counts nothing. Every event names the block's sequence,
+/// attempt and file.
+#[tokio::test(flavor = "current_thread")]
+async fn every_cleanup_outcome_is_logged_and_counted() {
     let events = capture();
-    let tally = std::rc::Rc::new(super::super::flush::FlushTally::default());
-    let trace =
-        super::super::flush::Trace::for_test("part-x.parquet", 7, std::rc::Rc::clone(&tally));
-    trace.cleaned_up(2, Some(Ok(lake::sink::FlushReport { files: Vec::new() })));
-    trace.cleaned_up(2, Some(Err(lake::Error::cancelled(None))));
-    trace.cleaned_up(
-        2,
-        Some(Err(lake::Error::cancelled(Some("abort timed out".into())))),
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let (trace, shared, paths) = cleanup_trace(store.clone());
+    let later = || clock::now() + Duration::from_secs(60);
+    let cancelled = || Some(Err(lake::Error::cancelled(None)));
+    trace
+        .cleaned_up(
+            2,
+            Some(Ok(lake::sink::FlushReport { files: Vec::new() })),
+            later(),
+        )
+        .await;
+    trace.cleaned_up(2, cancelled(), later()).await;
+    let _ = store
+        .put(&paths[0], PutPayload::from_static(b"series"))
+        .await
+        .expect("put");
+    trace.cleaned_up(2, cancelled(), later()).await;
+    let _ = store
+        .put(&paths[1], PutPayload::from_static(b"values"))
+        .await
+        .expect("put");
+    trace.cleaned_up(2, cancelled(), later()).await;
+    trace
+        .cleaned_up(
+            2,
+            Some(Err(lake::Error::cancelled(Some("abort timed out".into())))),
+            later(),
+        )
+        .await;
+    trace
+        .cleaned_up(
+            2,
+            Some(Err(lake::Error::Transient(
+                lake::TransientError::AbortFailed {
+                    source: Box::new(lake::Error::internal("encode")),
+                    abort_error: "abort refused".into(),
+                },
+            ))),
+            later(),
+        )
+        .await;
+    trace.cleaned_up(2, None, later()).await;
+    // A store whose HEAD takes an hour, probed with a cutoff that has
+    // already passed.
+    let slow = object_store::throttle::ThrottledStore::new(
+        object_store::memory::InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_get_per_call: Duration::from_secs(3600),
+            ..Default::default()
+        },
     );
-    trace.cleaned_up(
-        2,
-        Some(Err(lake::Error::Transient(
-            lake::TransientError::AbortFailed {
-                source: Box::new(lake::Error::internal("encode")),
-                abort_error: "abort refused".into(),
-            },
-        ))),
-    );
-    trace.cleaned_up(2, None);
-    assert_eq!(tally.late_commits.get(), 1);
-    assert_eq!(tally.abort_failures.get(), 3);
+    let (slow_trace, slow_shared, _) = cleanup_trace(Arc::new(slow));
+    slow_trace.cleaned_up(2, cancelled(), clock::now()).await;
+
+    assert_eq!(shared.tally.late_commits.get(), 2);
+    assert_eq!(shared.tally.abort_failures.get(), 3);
+    assert_eq!(slow_shared.tally.late_commits.get(), 0);
+    assert_eq!(slow_shared.tally.abort_failures.get(), 0);
     let logged = events.named("series_parquet.flush.cleanup");
     let summary: Vec<_> = logged
         .iter()
         .map(|event| {
-            (
-                event.level,
-                event.fields.get("outcome").map(|v| v.text().to_owned()),
-                event.fields.get("abort_error").map(|v| v.text().to_owned()),
-            )
+            let text = |name: &str| event.fields.get(name).map(|v| v.text().to_owned());
+            (event.level, text("outcome"), text("abort_error"))
         })
         .collect();
-    let warn = |abort: &str| {
-        (
-            tracing::Level::WARN,
-            Some("abort_failed".to_owned()),
-            Some(abort.to_owned()),
-        )
+    let event = |level, outcome: &str, abort: Option<&str>| {
+        (level, Some(outcome.to_owned()), abort.map(str::to_owned))
     };
+    use tracing::Level;
     assert_eq!(
         summary,
         [
-            (tracing::Level::INFO, Some("late_commit".to_owned()), None),
-            (tracing::Level::DEBUG, Some("aborted".to_owned()), None),
-            warn("abort timed out"),
-            warn("abort refused"),
-            warn("the write did not unwind by the cleanup cutoff"),
+            event(Level::INFO, "late_commit", None),
+            event(Level::DEBUG, "aborted", None),
+            event(Level::INFO, "partial", None),
+            event(Level::INFO, "late_commit", None),
+            event(Level::WARN, "abort_failed", Some("abort timed out")),
+            event(Level::WARN, "abort_failed", Some("abort refused")),
+            event(
+                Level::WARN,
+                "abort_failed",
+                Some("the write did not unwind by the cleanup cutoff")
+            ),
+            event(Level::WARN, "unknown", None),
         ]
+    );
+    assert_eq!(logged[2].fields.get("present"), Some(&FieldValue::U64(1)));
+    assert_eq!(logged[2].fields.get("objects"), Some(&FieldValue::U64(2)));
+    assert!(
+        logged[7]
+            .fields
+            .get("probe_error")
+            .is_some_and(|error| error.text().contains("cutoff")),
+        "{:?}",
+        logged[7]
     );
     for event in &logged {
         assert_eq!(event.fields.get("seq"), Some(&FieldValue::U64(7)));
@@ -1094,6 +1167,86 @@ fn every_cleanup_outcome_is_logged_and_counted() {
             Some("part-x.parquet")
         );
     }
+}
+
+/// Scenario: a values multipart upload whose CompleteMultipartUpload lands in
+/// the store and whose response is then lost (the call never returns), so
+/// the flush's retry deadline expires with the upload finalized, through the
+/// real sink.
+/// Guarantees: the block is nacked as retryable storage, and the cleanup
+/// probes the frozen objects, finds both, and reports a late commit: one INFO
+/// `series_parquet.flush.cleanup` with `outcome=late_commit` naming the file,
+/// and `flush.late_commits` reads 1 while `flush.abort_failures` reads 0.
+#[tokio::test(flavor = "current_thread")]
+async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = fault_store();
+            store.hooks().set(Fault::LostComplete);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            // Past validation on purpose, as in the wedged-upload test: a
+            // small part size puts the values file on the multipart path at
+            // a block size a unit test can build.
+            cfg.lake.upload.part_bytes = 4096;
+            cfg.lake.upload.concurrency = 1;
+            cfg.lake.parquet.row_group_bytes = 4096;
+            cfg.lake.sorting.merge_chunk_bytes = 4096;
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            until("the values upload is completed in the store", || {
+                store.hooks().completes.load(SeqCst) > 0
+            })
+            .await;
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(
+                done.as_ref().expect("the flush resolves").result.is_err(),
+                "the lost response fails the block"
+            );
+            worker.complete(done);
+            assert_eq!(worker.notify.outcomes()[Outcome::Storage as usize], 1);
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            job.cleanup().await.expect("the cleanup is bounded");
+            drop(job);
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
+            assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
+        })
+        .await;
+    let cleanup = events.named("series_parquet.flush.cleanup");
+    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+    assert_eq!(cleanup[0].level, tracing::Level::INFO);
+    assert_eq!(
+        cleanup[0].fields.get("outcome"),
+        Some(&FieldValue::Str("late_commit".into()))
+    );
+    assert!(
+        cleanup[0]
+            .fields
+            .get("file")
+            .is_some_and(|file| file.text().ends_with(".parquet")),
+        "{cleanup:?}"
+    );
 }
 
 /// Scenario: one request is admitted, its block is written to an in-memory
