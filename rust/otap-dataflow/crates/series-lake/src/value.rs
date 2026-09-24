@@ -945,21 +945,35 @@ mod tests {
         assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
     }
 
-    /// Scenario: an indefinite byte string whose second chunk declares more
-    /// bytes than the input still holds, and a definite array declaring
+    /// Scenario: an indefinite byte string of 1018 bytes whose second chunk
+    /// declares 1010 bytes -- fewer than the item held when it started, more
+    /// than the 1001 left at that chunk -- and a definite array declaring
     /// `u64::MAX` items.
     /// Guarantees: both are refused as invalid before the declared size is
-    /// reserved or allocated: the checks use the bytes remaining at that
-    /// chunk and checked arithmetic.
+    /// reserved or allocated: a chunk is checked against the bytes remaining
+    /// where it starts, and counts use checked arithmetic.
     #[test]
     fn declared_sizes_are_checked_against_the_remaining_input() {
         let mut counter = Counter::new(usize::MAX);
-        let chunk = [0x5f, 0x41, 0x00, 0x5a, 0x00, 0x10, 0x00, 0x00, 0x00, 0xff];
+        let chunk = [
+            &[0x5f, 0x4a][..],
+            &[0; 10],
+            &[0x5a],
+            &1010_u32.to_be_bytes(),
+            &[0; 1000],
+            &[0xff],
+        ]
+        .concat();
+        assert_eq!(chunk.len(), 1018);
         assert!(matches!(
             decode_cbor_reserving(&chunk, DecodeLimits::new(32, usize::MAX), &mut counter),
             Err(Error::Refused(RefuseReason::Invalid(_)))
         ));
-        assert!(counter.requests.iter().all(|&r| r < 1 << 10));
+        assert!(
+            counter.requests.iter().all(|&r| r < 1010),
+            "{:?}",
+            counter.requests
+        );
 
         let mut counter = Counter::new(usize::MAX);
         let huge = [0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
