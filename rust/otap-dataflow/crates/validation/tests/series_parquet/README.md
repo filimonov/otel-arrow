@@ -377,10 +377,34 @@ series and the descriptor dataset grows like the values dataset. The
 exporter cannot drop such an attribute without merging distinct streams;
 filter or aggregate it upstream (an OTel View, or `processor:attribute`).
 
+The `alloy` step (`alloy_capacity.py`) asks whether a real producer sees the
+same engine as the generator. Grafana Alloy runs the reference River config
+unchanged (its batching, eight consumers and the 180s attempt timeout the
+config falls back to) on six producer cores and tails one file into the
+strict shipped engine (128 slots, one-second window) on the cell's workers.
+A feeder process on the last two producer cores appends fixed-width
+100-byte lines, `alloy <12-digit seq> x...`, at 80 percent of the cell's
+strict shipped ceiling (`alloy_rate=` overrides), never more than one
+million lines ahead of what Alloy has read, so a producer slower than the
+offered rate is measured at its own maximum (`limited_by_alloy`). Alloy
+exports to a recording tap in the same process, which forwards each request
+unchanged to the engine over one upstream connection per Alloy connection
+and returns the engine's response or status as it came; the tap is what
+measures the request records and bytes, the connections and the engine's
+response time. Alloy's own queue-batch histograms cannot: they record the
+one-record requests the Loki bridge enqueues before the batcher merges them.
+The oracle is the end-to-end suite's read-back, not the sequence oracle:
+rows per source file and `e2e.source` from DuckDB and ClickHouse, the
+latest-descriptor join, and every written sequence number present, with
+duplicates counted (Alloy delivers at least once). `alloy_variants` names
+the trials: `shipped` keeps the receiver's default 4 MiB decoding limit and
+`decoding_16mib` raises it, the one setting the second trial changes.
+
 Options: `stores`, `core_counts`, `steps`, `rehearsal=true` with its own
 `report_dir` (six-second intervals, nothing published to the report
 directory), `trial={...}` for the `trial` step, `fan_in`, `rows`,
-`high_cardinality_rate`, `upload_concurrencies`, `producer_cpus`,
+`high_cardinality_rate`, `upload_concurrencies`, `alloy_rate`, `alloy_variants`,
+`producer_cpus`,
 `producer_processes`, `archive_dir`, `lease_wait_s`, `family_ordinal`, and
 `unmeasurable_above={"cell": [rate]}`: a rate whose trials the host could
 not measure validly (the overload starved the build monitor) steers the

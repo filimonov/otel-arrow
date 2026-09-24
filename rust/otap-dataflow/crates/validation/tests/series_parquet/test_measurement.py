@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 try:  # Imported as a package module by `python3 -m crates...`.
+    from . import alloy_capacity
     from . import capacity
     from . import generator
     from . import measurement
@@ -30,6 +31,7 @@ try:  # Imported as a package module by `python3 -m crates...`.
     from . import memory
     from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
+    import alloy_capacity
     import capacity
     import generator
     import measurement
@@ -6605,6 +6607,124 @@ class CapacityContracts(unittest.TestCase):
                 measure.main(["capacity", "--output-dir", str(temporary_directory(self))]),
                 2,
             )
+
+
+class AlloyContracts(unittest.TestCase):
+    """The Alloy-as-producer confirmation's own arithmetic and its tap."""
+
+    def test_line_is_fixed_width_and_carries_its_sequence(self):
+        for seq in (0, 7, 123456789):
+            body = alloy_capacity.line(seq)
+            self.assertEqual(len(body), alloy_capacity.BODY_BYTES)
+            self.assertEqual(alloy_capacity.seq_of(body), seq)
+        self.assertIsNone(alloy_capacity.seq_of("warmup"))
+        self.assertIsNone(alloy_capacity.seq_of(alloy_capacity.line(3)[:-1]))
+
+    def test_writer_holds_a_bounded_backlog_ahead_of_alloy(self):
+        # On schedule while Alloy keeps up; held at reads + bound when not.
+        self.assertEqual(alloy_capacity.writer_allowance(1.0, 1000, 900, 500), (1000, False))
+        self.assertEqual(alloy_capacity.writer_allowance(2.0, 1000, 100, 500), (600, True))
+
+    def test_metrics_read_only_the_series_logs_exporter(self):
+        exporter = 'component_id="otelcol.exporter.otlp.series"'
+        other = 'component_id="otelcol.exporter.otlp.other"'
+        method = 'rpc_method="opentelemetry.proto.collector.logs.v1.LogsService/Export"'
+        body = "\n".join([
+            "# HELP ignored",
+            'loki_source_file_read_lines_total{component_id="loki.source.file.series",'
+            'path="/input/events.log"} 5000',
+            f"otelcol_exporter_sent_log_records_total{{{exporter},server_port=\"1\"}} 4000",
+            f"otelcol_exporter_sent_log_records_total{{{other}}} 99",
+            f'otelcol_exporter_queue_size{{{exporter},data_type="logs"}} 1000',
+            f'otelcol_exporter_queue_size{{{exporter},data_type="metrics"}} 7',
+            f'rpc_client_call_duration_seconds_bucket{{{exporter},{method},'
+            'rpc_response_status_code="OK",le="0.5"} 1',
+            f'rpc_client_call_duration_seconds_bucket{{{exporter},{method},'
+            'rpc_response_status_code="OK",le="1"} 3',
+            f'rpc_client_call_duration_seconds_bucket{{{exporter},{method},'
+            'rpc_response_status_code="OK",le="+Inf"} 4',
+            f'rpc_client_call_duration_seconds_count{{{exporter},{method},'
+            'rpc_response_status_code="OK"} 4',
+        ])
+        found = alloy_capacity.parse_metrics(body)
+        self.assertEqual(found["read_lines"], 5000)
+        self.assertEqual(found["sent_records"], 4000)
+        self.assertEqual(found["queue_size_records"], 1000)
+        self.assertEqual(found["calls"], {"OK": 4})
+        buckets = found["call_buckets"]["OK"]
+        self.assertEqual(alloy_capacity.bucket_quantile(buckets, 0.25), 0.5)
+        self.assertEqual(alloy_capacity.bucket_quantile(buckets, 0.5), 1.0)
+        self.assertEqual(alloy_capacity.bucket_quantile(buckets, 0.99), float("inf"))
+
+    def test_nearest_rank_quantiles(self):
+        values = list(range(1, 11))
+        self.assertEqual(alloy_capacity.quantile(values, 0.5), 5)
+        self.assertEqual(alloy_capacity.quantile(values, 0.95), 10)
+        self.assertEqual(alloy_capacity.distribution([4, 4])["max"], 4)
+        self.assertIsNone(alloy_capacity.quantile([], 0.5))
+
+    def test_counter_rate_interpolates_between_polls(self):
+        polled = [{"monotonic_ns": 0, "sent": 0}, {"monotonic_ns": 2_000_000_000, "sent": 200}]
+        self.assertAlmostEqual(
+            alloy_capacity.rate_between(polled, "sent", 500_000_000, 1_500_000_000), 100.0)
+
+    def test_tap_forwards_requests_and_refusals_unchanged(self):
+        grpc = alloy_capacity.test_e2e.grpc
+        logs_pb = alloy_capacity.test_e2e.logs_pb
+        from concurrent import futures
+        seen = []
+
+        def export(raw, context):
+            request = logs_pb.ExportLogsServiceRequest.FromString(raw)
+            seen.append(len(raw))
+            if len(request.resource_logs) > 2:
+                context.abort(grpc.StatusCode.OUT_OF_RANGE, "too large")
+            return logs_pb.ExportLogsServiceResponse().SerializeToString()
+
+        upstream = grpc.server(futures.ThreadPoolExecutor(4))
+        upstream.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+            "opentelemetry.proto.collector.logs.v1.LogsService",
+            {"Export": grpc.unary_unary_rpc_method_handler(
+                export, request_deserializer=None, response_serializer=None)}),))
+        port = upstream.add_insecure_port("127.0.0.1:0")
+        upstream.start()
+        tap = alloy_capacity.RequestTap(f"127.0.0.1:{port}")
+        tap_port = tap.start()
+        try:
+            def request(resources):
+                message = logs_pb.ExportLogsServiceRequest()
+                for number in range(resources):
+                    record = message.resource_logs.add().scope_logs.add().log_records.add()
+                    record.body.string_value = alloy_capacity.line(number)
+                return message.SerializeToString()
+
+            with grpc.insecure_channel(f"127.0.0.1:{tap_port}") as channel:
+                call = channel.unary_unary(
+                    "/" + alloy_capacity.EXPORT_METHOD, request_serializer=None,
+                    response_deserializer=None)
+                small = request(2)
+                _ = call(small, timeout=10)
+                with self.assertRaises(grpc.RpcError) as refused:
+                    _ = call(request(3), timeout=10)
+                self.assertEqual(refused.exception.code(), grpc.StatusCode.OUT_OF_RANGE)
+                self.assertEqual(refused.exception.details(), "too large")
+        finally:
+            tap.stop()
+            upstream.stop(0)
+        self.assertEqual(seen[0], len(small))
+        self.assertEqual([r["code"] for r in tap.requests], ["OK", "OUT_OF_RANGE"])
+        self.assertEqual([r["records"] for r in tap.requests], [2, 3])
+        self.assertEqual(tap.requests[0]["bytes"], len(small))
+        # One client connection, one upstream connection.
+        self.assertEqual(len(tap.channels), 1)
+
+    def test_feeder_and_alloy_never_share_a_core(self):
+        groups = [[8, 24], [9, 25], [10, 26], [11, 27]]
+        alloy, feeder = alloy_capacity.split_producer_cpus(groups)
+        self.assertEqual(alloy, [8, 9, 24, 25])
+        self.assertEqual(feeder, [10, 11, 26, 27])
+        with self.assertRaises(AssertionError):
+            alloy_capacity.split_producer_cpus(groups[:2])
 
 
 if __name__ == "__main__":

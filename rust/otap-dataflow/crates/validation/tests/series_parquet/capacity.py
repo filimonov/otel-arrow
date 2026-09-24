@@ -164,6 +164,17 @@ CAPACITY_WORKLOADS = {
         "description": "metric points only, one attribute unique per point, "
         "so every point is a new series",
     },
+    # The Alloy confirmation (alloy_capacity.py): Alloy, not the generator,
+    # builds the requests; the request size is its minimum batch.
+    "alloy-file": {
+        "workload": measurement.Workload(
+            requests=1, records_per_request=20000, body_bytes=100,
+            series=1, metrics_every=10**9,
+        ),
+        "first_index": 0,
+        "description": "Grafana Alloy tailing one file of 100-byte lines through the "
+        "reference River config, batches of 20000 to 50000 records",
+    },
 }
 PRIMARY_WORKLOAD = "mixed-1k-hot"
 
@@ -2037,14 +2048,15 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     result["status"] = measurement.STATUS_PASSED
 
 
-def run_trial(plan, trial, output_dir, report_dir):
+def run_trial(plan, trial, output_dir, report_dir, experiment_fn=None):
     """One trial under the host controls; its failure is recorded, not raised."""
     command = _command()
     spec = trial_spec(plan, trial)
     run_dir = Path(output_dir) / spec.run_id
+    experiment_fn = experiment_fn or trial_experiment
 
     def experiment(spec, result, directory, controls):
-        trial_experiment(plan, trial, spec, result, directory, controls)
+        experiment_fn(plan, trial, spec, result, directory, controls)
 
     for attempt in range(1, performance.BUILD_RETRIES + 2):
         if measurement.build_activity():
@@ -2237,10 +2249,10 @@ def make_trial(plan, *, workload_id=PRIMARY_WORKLOAD, rate, purpose,
     }
 
 
-def execute(plan, state, trial, output_dir, report_dir, cell):
+def execute(plan, state, trial, output_dir, report_dir, cell, experiment=None):
     """Run one trial, record it in the family state and return its result."""
     started = time.monotonic()
-    result = run_trial(plan, trial, output_dir, report_dir)
+    result = run_trial(plan, trial, output_dir, report_dir, experiment)
     state.add(result, trial, cell)
     sys.stderr.write(
         f"{result['run_id']}: {result['status']} {trial_verdict(result)} "
@@ -2598,7 +2610,17 @@ def step_trial(plan, state, output_dir, report_dir, cell, options):
     _ = execute(plan, state, make_trial(plan, **settings), output_dir, report_dir, cell)
 
 
+def step_alloy(plan, state, output_dir, report_dir, cell, options):
+    """The Alloy-as-producer confirmation; see `alloy_capacity`."""
+    try:
+        from . import alloy_capacity
+    except ImportError:
+        import alloy_capacity
+    alloy_capacity.step_alloy(plan, state, output_dir, report_dir, cell, options)
+
+
 STEPS = {
+    "alloy": step_alloy,
     "trial": step_trial,
     "calibrate": step_calibrate,
     "search": step_search,
