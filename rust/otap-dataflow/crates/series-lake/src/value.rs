@@ -180,6 +180,8 @@ impl CborReader<'_, '_> {
         v.try_reserve_exact(target - v.len())
             .map_err(|_| Error::internal("cbor decode: allocation failed"))?;
         self.reservations.release(old * size_of::<T>());
+        // `capacity()` is charged as soon as it is known; an allocator surplus
+        // beyond it is not visible to Rust.
         self.reservations
             .reserve((v.capacity() - target) * size_of::<T>())?;
         Ok(())
@@ -194,6 +196,7 @@ impl CborReader<'_, '_> {
         self.reservations.reserve(v.len() * size_of::<T>())?;
         v.shrink_to_fit();
         self.reservations.release(old * size_of::<T>());
+        // As in `make_room`: what `capacity()` reports beyond the length.
         self.reservations
             .reserve((v.capacity() - v.len()) * size_of::<T>())?;
         Ok(())
