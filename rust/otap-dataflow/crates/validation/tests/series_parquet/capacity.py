@@ -217,6 +217,8 @@ def search_decision(trials) -> dict:
         "bracketed": low is not None and high is not None,
         "bracket_width_ratio": (high - low) / low if low and high else None,
         "producer_limited_records_per_s": min(limited) if limited else None,
+        # Rates measured both ways: the band where verdicts flip.
+        "flip_rates_records_per_s": sorted(set(sustainable) & set(unsustainable)),
         "kind": (
             "maximum" if low is not None and high is not None
             else "lower_bound" if low is not None else "none"
@@ -835,6 +837,14 @@ def telemetry_extras(document) -> dict:
             values = [value for value in entities.values() if isinstance(value, (int, float))]
             if values:
                 entry[name] = values[0]
+        # The flush wall-time distribution, cumulative over the lifetime.
+        flush = next(iter((worker["metrics"].get(performance.FLUSH_METRIC) or {}).values()),
+                     None)
+        if isinstance(flush, dict):
+            entry["flush.duration"] = {
+                "sum": float(flush.get("sum") or 0.0), "count": int(flush.get("count") or 0),
+                "max": float(flush.get("max") or 0.0),
+            }
         for name, (metric_set, label) in EXTRA_LABELLED.items():
             entities = worker["labelled"].get(f"{metric_set}:{name}") or {}
             totals = collections.Counter()
@@ -1190,6 +1200,59 @@ def trial_residuals(samples, idle, pairs=()) -> tuple:
             "resident_peak_bytes": max(pair["jemalloc_resident_bytes"] for pair in pairs),
         }
     return measurement.rss_residuals(samples, idle), {"source": "pipeline_memory_usage"}
+
+
+def degradation(samples, window, interval_s, schedule) -> dict:
+    """What each worker did over the measured interval, from its telemetry.
+
+    Per worker: requests accepted, flushes and their mean and cumulative
+    maximum wall time against the window, flushes by rotation reason, the
+    time admission was closed (a rotation waits while the previous block
+    still flushes) and its closures, the exporter's nacks by refusal class
+    and the receiver's refusals by class, with the worker's time on CPU.
+    """
+    usable = [s for s in samples if s.get("extras")]
+    if not usable:
+        return {}
+    first = max((s for s in usable if s["monotonic_ns"] <= window[0]),
+                key=lambda s: s["monotonic_ns"], default=usable[0])
+    last = min((s for s in usable if s["monotonic_ns"] >= window[1]),
+               key=lambda s: s["monotonic_ns"], default=usable[-1])
+    on_cpu = sorted(w["on_cpu_ratio"] for w in (schedule.get("workers") or {}).values())
+
+    def delta(key, name):
+        a = (first["extras"].get(key) or {}).get(name)
+        b = (last["extras"].get(key) or {}).get(name)
+        if isinstance(b, dict):
+            a = a or {}
+            return {label: b[label] - a.get(label, 0) for label in b if b[label] - a.get(label, 0)}
+        return (b or 0) - (a or 0)
+
+    workers = {}
+    for key in sorted(last["extras"]):
+        before = (first["extras"].get(key) or {}).get("flush.duration") or {}
+        after = (last["extras"].get(key) or {}).get("flush.duration") or {}
+        count = after.get("count", 0) - before.get("count", 0)
+        wall = after.get("sum", 0.0) - before.get("sum", 0.0)
+        workers[key] = {
+            "requests_accepted_count": sum((delta(key, "accepted") or {}).values()),
+            "flush_count": count,
+            "flush_mean_s": wall / count if count else None,
+            "flush_mean_to_window_ratio": (wall / count / interval_s) if count else None,
+            "flush_max_lifetime_s": after.get("max"),
+            "flushes_by_reason": delta(key, "flushes"),
+            "admission_closed_s": delta(key, "admission.closed.duration"),
+            "admission_closures_count": delta(key, "admission.closures"),
+            "exporter_nacks_by_class": delta(key, "nacks"),
+            "receiver_refusals_by_class": delta(key, "rejected"),
+        }
+    accepted = [w["requests_accepted_count"] for w in workers.values()]
+    mean = sum(accepted) / len(accepted) if accepted else 0
+    return {
+        "workers": workers,
+        "accepted_max_to_mean_ratio": max(accepted) / mean if mean else None,
+        "worker_on_cpu_ratios": on_cpu,
+    }
 
 
 def accounted_against_allocated(samples, pairs) -> dict:
@@ -1895,6 +1958,7 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
         "admission": admission,
         "flush_reasons": flush_reasons,
         "memory": memory,
+        "degradation": degradation(samples, window, trial["interval_s"], schedule),
         "accounted_against_allocated": accounted_against_allocated(
             samples, list(getattr(phase.sampler, "pairs", ()))),
         "schedule": {
@@ -2297,11 +2361,14 @@ def close_plan(plan):
 def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dict:
     """The search decision of one cell, from its recorded trials.
 
-    The `raised` variant is seeded with the shipped search's sustainable
-    rate, which a larger receiver capacity can only make easier.
+    Its search trials and its repetitions count alike, so a rate that one
+    repetition could not sustain is unsustainable and the search goes on
+    below it. The `raised` variant is seeded with the shipped search's
+    sustainable rate, which a larger receiver capacity can only make easier.
     """
     trials = [(entry["rate"], entry["verdict"])
-              for entry in state.trials(cell, SEARCH_PURPOSES[variant], workload_id)]
+              for entry in state.trials(
+                  cell, (SEARCH_PURPOSES[variant], REPETITION_PURPOSES[variant]), workload_id)]
     if variant == "raised":
         shipped = winning(state, cell, workload_id)["sustainable_records_per_s"]
         if shipped is not None:
@@ -2378,31 +2445,28 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
             return
     while True:
         own = [(entry["rate"], entry["verdict"])
-               for entry in state.trials(cell, purpose, workload_id)]
+               for entry in state.trials(
+                   cell, (purpose, REPETITION_PURPOSES[variant]), workload_id)]
         if any(verdict == "failed" for _rate, verdict in own):
             sys.stderr.write(f"{cell}: a failed trial stops the {variant} search\n")
             return
         if variant == "raised" and not own and shipped["unsustainable_records_per_s"]:
-            rate = shipped["unsustainable_records_per_s"]
+            rate, trial_purpose = shipped["unsustainable_records_per_s"], purpose
         else:
-            rate = next_search_rate(winning(state, cell, workload_id, variant)["trials"])
-        if rate is None:
-            break
+            decision = winning(state, cell, workload_id, variant)
+            rate, trial_purpose = next_search_rate(decision["trials"]), purpose
+            if rate is None:
+                # Decided: repeat the winner until three trials measured it;
+                # a repetition that fails moves the search below that rate.
+                rate = decision["sustainable_records_per_s"]
+                if rate is None:
+                    return
+                measured = sum(1 for r, verdict in own if r == rate and verdict == "sustainable")
+                if measured >= REPETITIONS:
+                    return
+                trial_purpose = REPETITION_PURPOSES[variant]
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
-                                            purpose=purpose, receiver_capacity=capacity,
-                                            interval_s=VARIANT_INTERVAL_S[variant]),
-                    output_dir, report_dir, cell)
-    decision = winning(state, cell, workload_id, variant)
-    if decision["sustainable_records_per_s"] is None:
-        return
-    rate = decision["sustainable_records_per_s"]
-    done = [entry for entry in state.trials(
-                cell, (purpose, REPETITION_PURPOSES[variant]), workload_id)
-            if entry["rate"] == rate and entry["verdict"] in ("sustainable", "unsustainable")]
-    for _ in range(max(0, REPETITIONS - len(done))):
-        _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
-                                            purpose=REPETITION_PURPOSES[variant],
-                                            receiver_capacity=capacity,
+                                            purpose=trial_purpose, receiver_capacity=capacity,
                                             interval_s=VARIANT_INTERVAL_S[variant]),
                     output_dir, report_dir, cell)
 
@@ -2755,6 +2819,8 @@ def trial_row(output_dir, entry) -> dict:
         "admission": capacity.get("admission"),
         "flush_reasons": capacity.get("flush_reasons"),
         "memory": memory,
+        "degradation": capacity.get("degradation"),
+        "client_refusals": [p.get("details") for p in capacity.get("producer_processes") or []],
         "accounted_against_allocated": capacity.get("accounted_against_allocated"),
         "rss_heap_term": capacity.get("rss_heap_term"),
         "objects_per_s": capacity.get("objects_per_s"),

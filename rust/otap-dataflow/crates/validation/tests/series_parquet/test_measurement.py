@@ -6231,6 +6231,18 @@ class CapacityContracts(unittest.TestCase):
         self.assertLessEqual(decision["sustainable_records_per_s"], ceiling)
         self.assertGreater(decision["unsustainable_records_per_s"], ceiling)
 
+    # Scenario: a search settled on 320,000 records/s, then a repetition
+    # there was unsustainable.
+    # Guarantees: the rate counts as unsustainable, its flip is recorded,
+    # and the search bisects below it rather than keeping it as the winner.
+    def test_a_failed_repetition_moves_the_search_below(self):
+        trials = [(256_000, "sustainable"), (320_000, "sustainable"),
+                  (352_000, "unsustainable"), (320_000, "unsustainable")]
+        self.assertEqual(capacity.next_search_rate(trials), 288_000)
+        decision = capacity.search_decision(trials)
+        self.assertEqual(decision["sustainable_records_per_s"], 256_000)
+        self.assertEqual(decision["flip_rates_records_per_s"], [320_000])
+
     # Scenario: every one of the twelve doubling trials is sustainable.
     # Guarantees: the search stops and reports a lower bound, never a maximum.
     def test_an_unbracketed_search_is_a_lower_bound(self):
@@ -6396,6 +6408,28 @@ class CapacityContracts(unittest.TestCase):
         self.assertAlmostEqual(view["difference_growth_over_run_bytes"], 1024.0 * 9000)
         self.assertEqual(view["at_highest_fill"]["accounted_bytes"], 70 << 20)
         self.assertEqual(view["difference_min_bytes"], 100 << 20)
+
+    # Scenario: over a measured interval one worker flushed 60 times for 90 s
+    # of wall time at one-second windows, with admission closed 30 s and 12
+    # requests nacked as storage failures.
+    # Guarantees: the per-worker view reports the flush time against the
+    # window, the admission closure and the nacks by class as deltas.
+    def test_degradation_is_the_interval_delta_per_worker(self):
+        def sample(t, flushes, wall, closed, nacks, accepted):
+            return {"monotonic_ns": t, "extras": {"w": {
+                "flush.duration": {"sum": wall, "count": flushes, "max": 2.5},
+                "admission.closed.duration": closed, "admission.closures": flushes,
+                "nacks": {"storage": nacks}, "accepted": {"grpc": accepted},
+                "flushes": {"time": flushes}, "rejected": {"concurrency_limit": 0}}}}
+        samples = [sample(0, 5, 5.0, 1.0, 0, 50), sample(100, 65, 95.0, 31.0, 12, 650)]
+        view = capacity.degradation(samples, (10, 90), 1, {"workers": {
+            "1": {"on_cpu_ratio": 0.5}}})
+        worker = view["workers"]["w"]
+        self.assertEqual(worker["flush_count"], 60)
+        self.assertAlmostEqual(worker["flush_mean_to_window_ratio"], 1.5)
+        self.assertAlmostEqual(worker["admission_closed_s"], 30.0)
+        self.assertEqual(worker["exporter_nacks_by_class"], {"storage": 12})
+        self.assertEqual(worker["requests_accepted_count"], 600)
 
     # Scenario: 128 receiver slots, 1000-record requests, held one second or
     # sixteen seconds (a 15 s window plus the flush).
