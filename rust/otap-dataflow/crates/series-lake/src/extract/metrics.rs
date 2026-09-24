@@ -27,14 +27,12 @@ use otel_arrow_dfe_pdata::schema::consts::{
 };
 
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, RowSink, SharedLists, ValuesRow,
-    attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at, identity, plain,
-    producer_id, str_at, struct_child, timestamp_pair, typed_col,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, RowSink, SharedLists,
+    ValuesRow, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row, flags_at,
+    hash_kv, identity, kv_eq, plain, producer_id, str_at, struct_child, timestamp_pair, typed_col,
 };
 use crate::attrs::{AttrTable, bool_at, prim_at};
-use crate::canonical::{
-    Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality, canonical_double_bits,
-};
+use crate::canonical::{Descriptor, MetricDescriptor, MetricKind, SeriesId, Signal, Temporality};
 use crate::config::{ExemplarPolicy, LakeConfig, UnsupportedPolicy};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, denorm_columns};
@@ -68,11 +66,8 @@ struct MetricRow {
 /// never hit. The attribute list is borrowed from the point kind's attribute
 /// table, which lives as long as that kind's loop, so the memo is one per
 /// point kind. A metric has exactly one kind, so no series spans the two
-/// memos. Equality and hashing both compare doubles by
-/// [`canonical_double_bits`], the bits the canonical encoding writes, so two
-/// lists are one key exactly when they encode to the same identity: `0.0`
-/// and `-0.0` are one key, every NaN is one key and equals itself, and a hash
-/// collision can never merge two series because equality is exact.
+/// memos. Equality and hashing follow the canonical value rules of
+/// [`kv_eq`].
 #[derive(Debug, Clone, Copy)]
 struct MemoKey<'t> {
     metric_id: u32,
@@ -85,89 +80,12 @@ impl PartialEq for MemoKey<'_> {
     }
 }
 
-/// Attribute lists equal under the canonical encoding's value rules.
-fn kv_eq(a: &[(String, Value)], b: &[(String, Value)]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|((ka, va), (kb, vb))| ka == kb && value_eq(va, vb))
-}
-
-/// Values equal under the canonical encoding's value rules: doubles by
-/// [`canonical_double_bits`], so the relation is reflexive for NaN and
-/// treats both zeros as one value, exactly as [`hash_value`] hashes them.
-fn value_eq(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Null, Value::Null) => true,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Bytes(x), Value::Bytes(y)) => x == y,
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Double(x), Value::Double(y)) => {
-            canonical_double_bits(*x) == canonical_double_bits(*y)
-        }
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q))
-        }
-        (Value::KvList(x), Value::KvList(y)) => kv_eq(x, y),
-        _ => false,
-    }
-}
-
 impl Eq for MemoKey<'_> {}
 
 impl std::hash::Hash for MemoKey<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.metric_id.hash(state);
-        self.attrs.len().hash(state);
-        for (key, value) in self.attrs {
-            key.hash(state);
-            hash_value(value, state);
-        }
-    }
-}
-
-/// Hash one attribute value consistently with [`value_eq`]: equal values hash
-/// alike, a double by its canonical bits.
-fn hash_value<H: std::hash::Hasher>(value: &Value, state: &mut H) {
-    use std::hash::Hash;
-    match value {
-        Value::Null => 0_u8.hash(state),
-        Value::Str(s) => {
-            1_u8.hash(state);
-            s.hash(state);
-        }
-        Value::Bytes(b) => {
-            2_u8.hash(state);
-            b.hash(state);
-        }
-        Value::Int(i) => {
-            3_u8.hash(state);
-            i.hash(state);
-        }
-        Value::Double(d) => {
-            4_u8.hash(state);
-            canonical_double_bits(*d).hash(state);
-        }
-        Value::Bool(b) => {
-            5_u8.hash(state);
-            b.hash(state);
-        }
-        Value::Array(items) => {
-            6_u8.hash(state);
-            items.len().hash(state);
-            for item in items {
-                hash_value(item, state);
-            }
-        }
-        Value::KvList(entries) => {
-            7_u8.hash(state);
-            entries.len().hash(state);
-            for (key, value) in entries {
-                key.hash(state);
-                hash_value(value, state);
-            }
-        }
+        hash_kv(self.attrs.iter(), state);
     }
 }
 
@@ -316,7 +234,7 @@ impl Common<'_> {
     /// `stats.denorm_type_mismatch` counts series rather than points.
     fn series_for<'t>(
         &mut self,
-        memo: &mut HashMap<MemoKey<'t>, SeriesId>,
+        memo: &mut HashMap<MemoKey<'t>, SeriesId, MemoHasher>,
         metric_id: u32,
         attrs: &'t [(String, Value)],
         budget: &mut Budget,
@@ -387,7 +305,7 @@ impl Common<'_> {
     ) -> Result<()> {
         let metrics = self.metrics;
         let (resource_attrs, scope_attrs) = (self.resource_attrs, self.scope_attrs);
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::with_hasher(MemoHasher::default());
         for row in 0..rows {
             let metric_id = prim_at::<UInt16Type>(&columns.parent, row)
                 .map(u32::from)
@@ -1785,7 +1703,7 @@ mod tests {
     #[test]
     fn memo_keys_follow_the_canonical_double_rules() {
         use std::hash::BuildHasher;
-        let hasher = std::collections::hash_map::RandomState::new();
+        let hasher = MemoHasher::default();
         let list = |v: Value| vec![("x".to_owned(), v)];
         let pairs = [
             (Value::Double(0.0), Value::Double(-0.0)),

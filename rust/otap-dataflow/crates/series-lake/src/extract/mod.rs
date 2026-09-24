@@ -7,6 +7,7 @@
 pub mod logs;
 pub mod metrics;
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -16,12 +17,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use arrow::record_batch::RecordBatch;
+use otel_arrow_dfe_pdata::arrays::StringArrayAccessor;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 
 use crate::attrs::{AnyValueColumns, AttrTable, bytes_cell, prim_at, readable, str_cell};
-use crate::canonical::{Descriptor, SeriesId, Signal};
+use crate::canonical::{Descriptor, SeriesId, Signal, canonical_double_bits};
 use crate::config::{DenormSource, DenormType, Denormalize, LakeConfig};
 use crate::error::{Error, RefuseReason, Result};
 use crate::schema::{Dataset, dataset_schema, denorm_columns};
@@ -424,6 +426,112 @@ pub(crate) fn producer_id(resource: &[(String, Value)], attribute: &str) -> Stri
     lookup(resource, attribute)
         .and_then(map_string)
         .unwrap_or_default()
+}
+
+/// The hasher of the per-request series memos, seeded once per process so
+/// request content cannot choose its collisions.
+pub(crate) type MemoHasher = hashbrown::DefaultHashBuilder;
+
+/// Attribute lists equal under the canonical encoding's value rules (see
+/// [`value_eq`]), so equal lists always encode to the same identity.
+pub(crate) fn kv_eq(a: &[(String, Value)], b: &[(String, Value)]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| entry_eq(x, y))
+}
+
+/// One attribute entry equal under the canonical encoding's value rules.
+pub(crate) fn entry_eq((ka, va): &(String, Value), (kb, vb): &(String, Value)) -> bool {
+    ka == kb && value_eq(va, vb)
+}
+
+/// Values equal under the canonical encoding's value rules: doubles by
+/// [`canonical_double_bits`], so the relation is reflexive for NaN and
+/// treats both zeros as one value, exactly as [`hash_value`] hashes them.
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Bytes(x), Value::Bytes(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Double(x), Value::Double(y)) => {
+            canonical_double_bits(*x) == canonical_double_bits(*y)
+        }
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q))
+        }
+        (Value::KvList(x), Value::KvList(y)) => kv_eq(x, y),
+        _ => false,
+    }
+}
+
+/// Hash an attribute list consistently with [`kv_eq`].
+pub(crate) fn hash_kv<'a, H: Hasher>(
+    entries: impl ExactSizeIterator<Item = &'a (String, Value)>,
+    state: &mut H,
+) {
+    entries.len().hash(state);
+    for (key, value) in entries {
+        key.hash(state);
+        hash_value(value, state);
+    }
+}
+
+/// Hash one attribute value consistently with [`value_eq`]: equal values hash
+/// alike, a double by its canonical bits.
+fn hash_value<H: Hasher>(value: &Value, state: &mut H) {
+    match value {
+        Value::Null => 0_u8.hash(state),
+        Value::Str(s) => {
+            1_u8.hash(state);
+            s.hash(state);
+        }
+        Value::Bytes(b) => {
+            2_u8.hash(state);
+            b.hash(state);
+        }
+        Value::Int(i) => {
+            3_u8.hash(state);
+            i.hash(state);
+        }
+        Value::Double(d) => {
+            4_u8.hash(state);
+            canonical_double_bits(*d).hash(state);
+        }
+        Value::Bool(b) => {
+            5_u8.hash(state);
+            b.hash(state);
+        }
+        Value::Array(items) => {
+            6_u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::KvList(entries) => {
+            7_u8.hash(state);
+            hash_kv(entries.iter(), state);
+        }
+    }
+}
+
+/// A `Utf8` column whose cells are borrowed for the whole request.
+pub(crate) struct StrCol<'a>(Option<StringArrayAccessor<'a>>);
+
+impl<'a> StrCol<'a> {
+    /// The cells of a [`readable`] `Utf8` column, or of an absent one.
+    pub(crate) fn new(a: &'a Option<ArrayRef>) -> Result<Self> {
+        a.as_ref()
+            .map(StringArrayAccessor::try_new)
+            .transpose()
+            .map(Self)
+            .map_err(|e| Error::invalid(format!("string column: {e}")))
+    }
+
+    /// The string at `row`, empty when null or absent, as [`str_at`] reads it.
+    pub(crate) fn at(&self, row: usize) -> &str {
+        self.0.as_ref().and_then(|a| a.str_at(row)).unwrap_or("")
+    }
 }
 
 /// A typed cell of a values row, in dataset schema order.

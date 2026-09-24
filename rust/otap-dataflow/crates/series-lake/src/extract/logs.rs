@@ -3,8 +3,8 @@
 
 //! Logs extraction.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use arrow::datatypes::{DataType, Int32Type, TimeUnit, TimestampNanosecondType, UInt16Type};
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
@@ -14,11 +14,13 @@ use otel_arrow_dfe_pdata::schema::consts::{
     SEVERITY_NUMBER, SEVERITY_TEXT, SPAN_ID, TIME_UNIX_NANO, TRACE_ID, VERSION,
 };
 
+use hashbrown::HashTable;
+
 use super::{
-    Budget, Col, DescriptorRow, ExtractStats, Extracted, Rendering, RowSink, SharedLists,
-    ValuesRow, any_value_col, attr_table, attrs_of, denorm_bytes, denorm_lookup, descriptor_row,
-    fixed_at, flags_at, identity, map_cell_reserving, plain, producer_id, str_at, struct_child,
-    timestamp_pair,
+    Budget, Col, DescriptorRow, ExtractStats, Extracted, MemoHasher, Rendering, RowSink,
+    SharedLists, StrCol, ValuesRow, any_value_col, attr_table, attrs_of, denorm_bytes,
+    denorm_lookup, descriptor_row, entry_eq, fixed_at, flags_at, hash_kv, identity,
+    map_cell_reserving, plain, producer_id, str_at, struct_child, timestamp_pair,
 };
 use crate::attrs::prim_at;
 use crate::canonical::{Descriptor, SeriesId, Signal};
@@ -27,21 +29,67 @@ use crate::error::{Error, Result};
 use crate::schema::{Dataset, denorm_columns};
 use crate::value::{DecodeLimits, Value, body_string_reserving, value_bytes};
 
-/// Memo key for a logs series.
+/// Memo key for a logs series, borrowed from the request.
 ///
 /// `(resource_id, scope_id)` alone is not enough: the row-level scope and schema
 /// strings are part of the identity, and two rows can share a resource and scope
 /// id while carrying different scope names or schema URLs. `None` ids are part
 /// of the key too, so a record without attributes never collapses into parent 0.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MemoKey {
+/// The identity attributes are compared by content under the canonical value
+/// rules of [`entry_eq`], so two keys are equal only when their descriptors
+/// encode to the same identity.
+#[derive(Debug, Clone, Copy)]
+struct MemoKey<'k, 't> {
     resource_id: Option<u32>,
     scope_id: Option<u32>,
-    resource_schema_url: String,
-    scope_name: String,
-    scope_version: String,
-    scope_schema_url: String,
-    identity_attrs: Vec<u8>,
+    /// Resource schema URL, scope name, scope version and scope schema URL.
+    strings: [&'t str; 4],
+    identity: &'k [&'t (String, Value)],
+}
+
+impl MemoKey<'_, '_> {
+    fn same(&self, other: &MemoKey<'_, '_>) -> bool {
+        self.resource_id == other.resource_id
+            && self.scope_id == other.scope_id
+            && self.strings == other.strings
+            && self.identity.len() == other.identity.len()
+            && self
+                .identity
+                .iter()
+                .zip(other.identity)
+                .all(|(a, b)| entry_eq(a, b))
+    }
+
+    fn hash_with(&self, hasher: &MemoHasher) -> u64 {
+        let mut state = hasher.build_hasher();
+        self.resource_id.hash(&mut state);
+        self.scope_id.hash(&mut state);
+        self.strings.hash(&mut state);
+        hash_kv(self.identity.iter().copied(), &mut state);
+        state.finish()
+    }
+}
+
+/// One memo entry: the key's owned identity list, its other parts, the
+/// series and the key's hash.
+struct MemoEntry<'t> {
+    resource_id: Option<u32>,
+    scope_id: Option<u32>,
+    strings: [&'t str; 4],
+    identity: Box<[&'t (String, Value)]>,
+    series_id: SeriesId,
+    hash: u64,
+}
+
+impl<'t> MemoEntry<'t> {
+    fn key(&self) -> MemoKey<'_, 't> {
+        MemoKey {
+            resource_id: self.resource_id,
+            scope_id: self.scope_id,
+            strings: self.strings,
+            identity: &self.identity,
+        }
+    }
 }
 
 pub(crate) fn extract_logs(
@@ -88,10 +136,19 @@ pub(crate) fn extract_logs(
     let mut sink = RowSink::new(Dataset::LogsValues, cfg)?;
     let mut descriptors: Vec<DescriptorRow> = Vec::new();
     let mut seen: HashSet<SeriesId> = HashSet::new();
-    let mut memo: HashMap<MemoKey, SeriesId> = HashMap::new();
     let mut resources = SharedLists::default();
     let mut scopes = SharedLists::default();
     let series_columns = cfg.series_columns(Signal::Logs);
+    let key_strings = [
+        StrCol::new(&res_schema)?,
+        StrCol::new(&scope_name)?,
+        StrCol::new(&scope_version)?,
+        StrCol::new(&scope_schema)?,
+    ];
+    let hasher = MemoHasher::default();
+    let mut memo: HashTable<MemoEntry<'_>> = HashTable::new();
+    let mut identity_attrs: Vec<&(String, Value)> = Vec::new();
+    let is_identity = |k: &String| allow.iter().any(|a| a == k);
 
     for row in 0..logs.num_rows() {
         let rid = prim_at::<UInt16Type>(&res_id, row).map(u32::from);
@@ -100,43 +157,34 @@ pub(crate) fn extract_logs(
         let resource = attrs_of(&resource_attrs, rid);
         let scope = attrs_of(&scope_attrs, sid);
         let all_attrs = attrs_of(&log_attrs, lid);
-        let (identity_refs, residual): (Vec<&(String, Value)>, Vec<&(String, Value)>) = all_attrs
-            .iter()
-            .partition(|(k, _)| allow.iter().any(|a| a == k));
-        let identity_attrs: Vec<(String, Value)> = identity_refs.into_iter().cloned().collect();
-        let identity_key = crate::canonical::canonical_bytes(&Descriptor {
-            signal: Signal::Logs,
-            resource_attrs: Arc::from([]),
-            resource_schema_url: String::new(),
-            scope_name: String::new(),
-            scope_version: String::new(),
-            scope_schema_url: String::new(),
-            scope_attrs: Arc::from([]),
-            metric: None,
-            attrs: identity_attrs.clone(),
-        });
+        identity_attrs.clear();
+        identity_attrs.extend(all_attrs.iter().filter(|(k, _)| is_identity(k)));
         let key = MemoKey {
             resource_id: rid,
             scope_id: sid,
-            resource_schema_url: str_at(&res_schema, row),
-            scope_name: str_at(&scope_name, row),
-            scope_version: str_at(&scope_version, row),
-            scope_schema_url: str_at(&scope_schema, row),
-            identity_attrs: identity_key,
+            strings: key_strings.each_ref().map(|col| col.at(row)),
+            identity: &identity_attrs,
         };
-        let series_id = match memo.get(&key) {
-            Some(id) => *id,
+        let hash = key.hash_with(&hasher);
+        let series_id = match memo.find(hash, |entry| entry.key().same(&key)) {
+            Some(entry) => entry.series_id,
             None => {
+                let [
+                    resource_schema_url,
+                    scope_name,
+                    scope_version,
+                    scope_schema_url,
+                ] = key.strings.map(str::to_owned);
                 let descriptor = Descriptor {
                     signal: Signal::Logs,
                     resource_attrs: resources.get(&resource_attrs, rid, budget)?,
-                    resource_schema_url: key.resource_schema_url.clone(),
-                    scope_name: key.scope_name.clone(),
-                    scope_version: key.scope_version.clone(),
-                    scope_schema_url: key.scope_schema_url.clone(),
+                    resource_schema_url,
+                    scope_name,
+                    scope_version,
+                    scope_schema_url,
                     scope_attrs: scopes.get(&scope_attrs, sid, budget)?,
                     metric: None,
-                    attrs: identity_attrs.clone(),
+                    attrs: identity_attrs.iter().map(|&entry| entry.clone()).collect(),
                 };
                 // Two memo keys can name the same series; the identity is
                 // checked before the row is built, so a duplicate is neither
@@ -154,7 +202,15 @@ pub(crate) fn extract_logs(
                         budget,
                     )?);
                 }
-                let _ = memo.insert(key, id);
+                let entry = MemoEntry {
+                    resource_id: rid,
+                    scope_id: sid,
+                    strings: key.strings,
+                    identity: identity_attrs.as_slice().into(),
+                    series_id: id,
+                    hash,
+                };
+                let _ = memo.insert_unique(hash, entry, |entry| entry.hash);
                 id
             }
         };
@@ -187,6 +243,7 @@ pub(crate) fn extract_logs(
         let mut approx = 16 + 8 * 6 + 24 + 8;
         approx += body_str.as_ref().map_or(0, String::len);
         approx += severity_text_str.len() + event_name_str.len() + producer.len();
+        let residual = all_attrs.iter().filter(|(k, _)| !is_identity(k));
         let (residual_cell, residual_bytes) = map_cell_reserving(residual, approx, budget)?;
         approx += residual_bytes;
         let severity = prim_at::<Int32Type>(&severity_number, row).unwrap_or(0);
@@ -406,6 +463,117 @@ mod tests {
         assert!(out.pinned_bytes > 0);
         // descriptor denorm: only the identity-path column (service_name)
         assert_eq!(out.descriptors[0].denorm.len(), 1);
+    }
+
+    /// Scenario: memo keys whose identity attribute is `0.0` against `-0.0`,
+    /// two NaNs with different bits, and keys differing only in one scope
+    /// string or in the resource id.
+    /// Guarantees: keys the canonical encoding cannot tell apart are the same
+    /// key and hash alike; keys it can tell apart are different keys.
+    #[test]
+    fn memo_keys_follow_the_canonical_identity() {
+        let hasher = MemoHasher::default();
+        let entry = |v: f64| ("logger.name".to_owned(), Value::Double(v));
+        let (zero, minus_zero) = (entry(0.0), entry(-0.0));
+        let (nan, other_nan) = (
+            entry(f64::NAN),
+            entry(f64::from_bits(0xFFF8_0000_0000_0001)),
+        );
+        let key = |identity: &[&(String, Value)], version: &'static str, rid: u32| {
+            MemoKey {
+                resource_id: Some(rid),
+                scope_id: Some(0),
+                strings: ["", "scope", version, ""],
+                identity,
+            }
+            .hash_with(&hasher)
+        };
+        let same = |a: &[&(String, Value)], b: &[&(String, Value)]| {
+            let k = |identity| MemoKey {
+                resource_id: Some(1),
+                scope_id: Some(0),
+                strings: ["", "scope", "1", ""],
+                identity,
+            };
+            k(a).same(&k(b))
+        };
+        assert!(same(&[&zero], &[&minus_zero]));
+        assert_eq!(key(&[&zero], "1", 1), key(&[&minus_zero], "1", 1));
+        assert!(same(&[&nan], &[&other_nan]));
+        assert_eq!(key(&[&nan], "1", 1), key(&[&other_nan], "1", 1));
+        assert!(!same(&[&zero], &[&nan]));
+        assert!(!same(&[&zero], &[]));
+        let versioned = |version, rid| MemoKey {
+            resource_id: Some(rid),
+            scope_id: Some(0),
+            strings: ["", "scope", version, ""],
+            identity: &[],
+        };
+        assert!(!versioned("1", 1).same(&versioned("2", 1)));
+        assert!(!versioned("1", 1).same(&versioned("1", 2)));
+        assert!(versioned("1", 1).same(&versioned("1", 1)));
+    }
+
+    /// Scenario: eight log records in two scopes that differ only in their
+    /// version; per scope, the identity attribute is `0.0`, `-0.0` and two
+    /// NaNs, and every record carries its own residual `request_id`.
+    /// Guarantees: the memo gives four series, one per scope and canonical
+    /// identity value, each the series id of its own descriptor.
+    #[test]
+    fn the_logs_memo_resolves_series_by_canonical_content() {
+        let double = |k: &str, v: f64| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::DoubleValue(v)),
+            }),
+        };
+        let scope = |version: &str| ScopeLogs {
+            scope: Some(
+                otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::InstrumentationScope {
+                    name: "scope".into(),
+                    version: version.into(),
+                    ..Default::default()
+                },
+            ),
+            log_records: [0.0, -0.0, f64::NAN, f64::from_bits(0xFFF8_0000_0000_0001)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| LogRecord {
+                    time_unix_nano: 1_000 + i as u64,
+                    attributes: vec![double("logger.name", v), kv("request_id", &format!("r{i}"))],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let data = LogsData {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv("host.id", "h1")],
+                    ..Default::default()
+                }),
+                scope_logs: vec![scope("1"), scope("2")],
+                ..Default::default()
+            }],
+        };
+        let mut records = encode_logs(&data);
+        let out = extract(&mut records, &cfg()).expect("extract");
+        assert_eq!(out.descriptors.len(), 4);
+        for d in &out.descriptors {
+            assert_eq!(identity(&d.descriptor).1, d.series_id);
+        }
+        let (_, batches) = &out.values[0];
+        let ids = batches[0]
+            .column_by_name("series_id")
+            .expect("series_id")
+            .as_fixed_size_binary();
+        let distinct: HashSet<&[u8]> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        assert_eq!(ids.len(), 8);
+        assert_eq!(distinct.len(), 4);
+        assert_eq!(ids.value(0), ids.value(1));
+        assert_eq!(ids.value(2), ids.value(3));
+        assert_ne!(ids.value(0), ids.value(2));
+        assert_ne!(ids.value(0), ids.value(4));
     }
 
     /// Scenario: a descriptor row set is turned into a series batch.
