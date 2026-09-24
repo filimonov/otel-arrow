@@ -2519,6 +2519,7 @@ FAULT_LISTING_PERIOD_S = 1.0
 # the lead before that.
 STRADDLE_ARM_BEFORE_END_S = 10
 STRADDLE_LEAD_S = 90
+STRADDLE_MAX_WAIT_S = 3600 + STRADDLE_LEAD_S
 # A request NGINX logged at least this long under the slow fault was delayed by it.
 SLOW_DELAY_FLOOR_S = SLOW_LATENCY_MS / 1000.0 * 0.9
 SHIPPED_S3_CONFIG = test_e2e.WORKSPACE / "configs/series-parquet-s3.yaml"
@@ -3349,11 +3350,10 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
     controls.register("harness", os.getpid())
     result["environment"]["build"] = provenance["build"]
     result["environment"]["git"] = provenance["git"]
-    arm_at = straddle_arm_instant(time.time()) if options.get("straddle_hour") else None
+    arm_at = options.get("arm_at_unix_s")
     if arm_at is not None:
         result["config"]["straddle"] = {"arm_at_unix_s": arm_at,
                                         "arm_before_hour_end_s": STRADDLE_ARM_BEFORE_END_S}
-        _ = await_wall_clock(arm_at - STRADDLE_LEAD_S, "the straddling cell's start")
     ledger = measurement.Ledger(output_dir / "ledger.sqlite")
     record = {}
     engine = phase = case = lister = None
@@ -3413,7 +3413,10 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                 try:
                     if case.attempt(case.await_baseline):
                         if arm_at is not None:
+                            sys.stderr.write(f"{spec.run_id}: arming at {arm_at} (unix s)\n")
                             _ = await_wall_clock(arm_at, "the straddling fault's arming instant")
+                            result["config"]["straddle"]["armed_before_hour_end"] = \
+                                time.time() < arm_at + STRADDLE_ARM_BEFORE_END_S
                         case.arm(options.get("fault_parameters"))
                         case.attempt(case.await_condition)
                         # The fault is removed whether or not it showed its condition.
@@ -3739,6 +3742,17 @@ def failure_case(family: str, fault: str, topology: str, store: str, output_dir:
     spec = failure_spec(family, fault, topology, store, ordinal=ordinal,
                         cores=options.get("cores"))
     run_dir = output_dir / spec.run_id
+    if options.pop("straddle_hour", False):
+        # The wait for the hour happens before the lease, so the host stays free.
+        arm_at = straddle_arm_instant(time.time())
+        if arm_at - time.time() > STRADDLE_MAX_WAIT_S:
+            raise AssertionError(f"{spec.run_id}: the straddled hour end is more than "
+                                 f"{STRADDLE_MAX_WAIT_S} s away")
+        sys.stderr.write(f"{spec.run_id}: waiting without the lease until "
+                         f"{arm_at - STRADDLE_LEAD_S} (unix s), {STRADDLE_LEAD_S} s before "
+                         f"arming {STRADDLE_ARM_BEFORE_END_S} s before the hour ends\n")
+        _ = await_wall_clock(arm_at - STRADDLE_LEAD_S, "the straddling cell's start")
+        options["arm_at_unix_s"] = arm_at
 
     def experiment(spec_, result, directory, controls):
         failure_experiment(spec_, result, directory, controls, provenance=provenance,
@@ -3762,7 +3776,8 @@ FAILURE_STATE = "failures-state.json"
 
 
 def run_failures(output_dir, report_dir=None, *, family="s3", faults=None, topologies=None,
-                 stores=None, purposes=None, straddle_cells=(), **options) -> dict:
+                 stores=None, only_cells=None, purposes=None, straddle_cells=(),
+                 **options) -> dict:
     """`measure failures`: every requested cell of one family, then its index.
 
     The family state in the output directory remembers the latest run of
@@ -3777,9 +3792,10 @@ def run_failures(output_dir, report_dir=None, *, family="s3", faults=None, topol
     state = json.loads(state_path.read_text()) if state_path.is_file() else {}
     cells = state.setdefault(family, {})
     reasons = state.setdefault("purposes", {})
-    matrix = [f"{fault}-{topology}-{store}" for fault in faults or FAILURE_FAMILIES[family]
-              for topology in topologies or FAILURE_TOPOLOGIES
-              for store in stores or PREFLIGHT_STORES]
+    matrix = list(only_cells or (
+        f"{fault}-{topology}-{store}" for fault in faults or FAILURE_FAMILIES[family]
+        for topology in topologies or FAILURE_TOPOLOGIES
+        for store in stores or PREFLIGHT_STORES))
     # A straddling cell waits for an hour end, so it runs after the others.
     matrix.sort(key=lambda cell: cell in straddle_cells)
     for cell in matrix:

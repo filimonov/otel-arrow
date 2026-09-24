@@ -937,6 +937,18 @@ class FaultCaseContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "duplicates"):
             faults.fault_check(result)
 
+    # Scenario: a straddling cell is scheduled at several instants of an hour.
+    # Guarantees: it arms ten seconds before an hour end that leaves it the
+    # full start lead, and never waits more than one hour plus that lead.
+    def test_straddle_arms_before_the_first_reachable_hour_end(self):
+        hour = 1790290800
+        for now in (hour - 3600, hour - 101, hour - 99, hour - 1):
+            with self.subTest(now=now):
+                arm = faults.straddle_arm_instant(now)
+                self.assertEqual((arm + faults.STRADDLE_ARM_BEFORE_END_S) % 3600, 0)
+                self.assertGreaterEqual(arm - now, faults.STRADDLE_LEAD_S)
+                self.assertLessEqual(arm - now, faults.STRADDLE_MAX_WAIT_S)
+
     # Scenario: the lateness bound is computed from the exporter settings.
     # Guarantees: it is FORMAT.md's L = interval + 2 * (flush_retry_deadline +
     # abort_timeout): 145 s at the defaults.
