@@ -232,7 +232,7 @@ SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
   python3 -m crates.validation.tests.series_parquet.measure capacity \
   --output-dir /var/tmp/series-capacity \
   --option 'stores=["local","minio","rustfs"]' --option 'core_counts=[1,4]' \
-  --option 'steps=["calibrate","search","default_window","buffered","fan_in","admission","workloads","high_cardinality","publish"]'
+  --option 'steps=["calibrate","search","search_raised","default_window","buffered","fan_in","workloads","high_cardinality","publish"]'
 ```
 
 The output directory holds Parquet and logs of tens of gigabytes per trial,
@@ -274,12 +274,24 @@ the median durable rate with a 15 percent coefficient-of-variation gate.
 Deliberate overrides, recorded in every trial: one-second windows for the
 search (the shipped window is 15 s; `default_window` repeats the winning
 rate with it, upload concurrency 2 and 1, and jemalloc's statistics print);
-1000 records per request; 256 connections. The receiver's
-`max_concurrent_requests` is clamped by the engine to the pipeline's pdata
-channel capacity, so a raised limit (`admission`, 4096) raises both. The
+1000 records per request; 256 connections. A strict request holds its
+receiver slot until its block is durable, so with the shipped 128 slots per
+worker the search can end at the receiver's admission limit rather than the
+exporter's; `search_raised` searches again with 4096 slots, starting from
+the shipped bracket (its sustainable rate is taken as sustainable, its first
+trial is the shipped unsustainable rate); `buffered`, `fan_in` and
+`workloads` then run at the raised ceiling with the raised slots, and
+`default_window` at the shipped winning rate with the shipped slots. The
+receiver's `max_concurrent_requests` is clamped by the engine to the
+pipeline's pdata channel capacity, so a raised limit raises both. The
 harness engine configuration drops unsupported points (`unsupported:
 drop`); the object stores are plain HTTP, where series_parquet signs every
 payload (unsigned payloads are its default over TLS only).
+
+A send that waits for an in-flight slot delays the sends behind it; those
+are counted as `late_behind_in_flight_wait`, the engine's lateness, and
+only a late send with a free slot and no such wait before it counts
+against the producer.
 
 Workloads (`capacity.CAPACITY_WORKLOADS`): `mixed-1k-hot` is the searched
 one, 80/20 logs/metric points with 1 KiB bodies and series slots cycled per

@@ -516,6 +516,9 @@ def _sender_process(pipe, config):
         finish = array.array("q", [0]) * count
         code = array.array("b", [-1]) * count
         blocked = array.array("b", [0]) * count
+        # Whether a send was still behind schedule because an earlier send
+        # waited for an in-flight slot: the lateness is the engine's.
+        behind = array.array("b", [0]) * count
         outstanding_at_send = array.array("i", [0]) * count
         details = {}
         slots = threading.Semaphore(config["in_flight"])
@@ -552,14 +555,21 @@ def _sender_process(pipe, config):
         cpu_before = os.times()
         wake = threading.Event()
         interval_ns = config["interval_ns"]
+        late_ns = int(PRODUCER_LATE_S * 1e9)
+        catching_up = False
         for position in range(count):
             due = start_ns + config["positions"][position] * interval_ns
             target[position] = due
             now = time.monotonic_ns()
             if due > now:
                 _ = wake.wait((due - now) / 1e9)
+                catching_up = False
+            elif now - due <= late_ns:
+                catching_up = False
+            behind[position] = 1 if catching_up else 0
             if not slots.acquire(blocking=False):
                 blocked[position] = 1
+                catching_up = True
                 _ = slots.acquire()
             index = indexes[position]
             signal, wire = pool.wire(index)
@@ -582,6 +592,7 @@ def _sender_process(pipe, config):
             "finish": list(finish),
             "code": list(code),
             "blocked": list(blocked),
+            "behind": list(behind),
             "outstanding_at_send": list(outstanding_at_send),
             "details": details,
             "schedule_end_ns": schedule_end,
@@ -670,7 +681,7 @@ class SenderFleet:
         for entry in self.processes:
             part = json.loads(Path(entry["config"]["result_path"]).read_text(encoding="ascii"))
             for key in ("indexes", "target", "sent", "finish", "code", "blocked",
-                        "outstanding_at_send"):
+                        "behind", "outstanding_at_send"):
                 merged[key].extend(part[key])
             processes.append(
                 {key: part[key] for key in ("pid", "count", "complete", "cpu_user_s",
@@ -698,9 +709,14 @@ def send_statistics(sends, *, window, rate, records_per_request, wire_bytes_of) 
         (sends["sent"][k] - sends["target"][k]) / 1e9 for k in range(count)
     ]
     blocked = sum(sends["blocked"])
+    behind = sends.get("behind") or [0] * count
+    late_behind = sum(
+        1 for k in range(count)
+        if not sends["blocked"][k] and behind[k] and lateness[k] > PRODUCER_LATE_S
+    )
     late_unblocked = sum(
         1 for k in range(count)
-        if not sends["blocked"][k] and lateness[k] > PRODUCER_LATE_S
+        if not sends["blocked"][k] and not behind[k] and lateness[k] > PRODUCER_LATE_S
     )
     outcomes = collections.Counter(OUTCOME_CODES.get(code, "unanswered") for code in sends["code"])
     latencies = sorted(
@@ -713,6 +729,8 @@ def send_statistics(sends, *, window, rate, records_per_request, wire_bytes_of) 
         "requests_scheduled_count": count,
         "outcomes": dict(outcomes),
         "blocked_on_in_flight_count": blocked,
+        "late_behind_in_flight_wait_count": late_behind,
+        "blocked_or_behind_ratio": (blocked + late_behind) / count if count else 0.0,
         "late_unblocked_count": late_unblocked,
         "late_unblocked_ratio": late_unblocked / count if count else 0.0,
         "lateness_p50_s": measurement.percentile(sorted(lateness), 0.50) if count else None,
@@ -2111,13 +2129,28 @@ def close_plan(plan):
         pool.close()
 
 
-def winning(state, cell, workload_id=PRIMARY_WORKLOAD) -> dict:
-    """The search decision of one cell, from its recorded trials."""
+def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dict:
+    """The search decision of one cell, from its recorded trials.
+
+    The `raised` variant is seeded with the shipped search's sustainable
+    rate, which a larger receiver capacity can only make easier.
+    """
     trials = [(entry["rate"], entry["verdict"])
-              for entry in state.trials(cell, "search", workload_id)]
+              for entry in state.trials(cell, SEARCH_PURPOSES[variant], workload_id)]
+    if variant == "raised":
+        shipped = winning(state, cell, workload_id)["sustainable_records_per_s"]
+        if shipped is not None:
+            trials = [(shipped, "sustainable")] + trials
     decision = search_decision(trials)
     decision["trials"] = trials
+    decision["variant"] = variant
     return decision
+
+
+# The trial purposes of each search variant: its search and its repetitions.
+SEARCH_PURPOSES = {"shipped": "search", "raised": "search_raised"}
+REPETITION_PURPOSES = {"shipped": "repetition", "raised": "repetition_raised"}
+VARIANT_CAPACITY = {"shipped": SHIPPED_RECEIVER_CAPACITY, "raised": RAISED_RECEIVER_CAPACITY}
 
 
 def step_calibrate(plan, state, output_dir, report_dir, cell, options):
@@ -2148,31 +2181,52 @@ def sender_capacity(state, core_count) -> dict:
     }
 
 
-def step_search(plan, state, output_dir, report_dir, cell, options):
-    """Double, then bisect, then repeat the winner until three repetitions."""
+def step_search(plan, state, output_dir, report_dir, cell, options, variant="shipped"):
+    """Double, then bisect, then repeat the winner until three repetitions.
+
+    The `raised` variant runs with the receiver capacity raised and starts
+    from the shipped search's bracket: its first trial is the rate the
+    shipped capacity could not sustain.
+    """
     workload_id = options.get("workload_id", PRIMARY_WORKLOAD)
-    while True:
-        trials = [(entry["rate"], entry["verdict"])
-                  for entry in state.trials(cell, "search", workload_id)]
-        if any(verdict == "failed" for _rate, verdict in trials):
-            sys.stderr.write(f"{cell}: a failed trial stops the search\n")
+    purpose = SEARCH_PURPOSES[variant]
+    capacity = VARIANT_CAPACITY[variant]
+    if variant == "raised":
+        shipped = winning(state, cell, workload_id)
+        if shipped["sustainable_records_per_s"] is None:
             return
-        rate = next_search_rate(trials)
+    while True:
+        own = [(entry["rate"], entry["verdict"])
+               for entry in state.trials(cell, purpose, workload_id)]
+        if any(verdict == "failed" for _rate, verdict in own):
+            sys.stderr.write(f"{cell}: a failed trial stops the {variant} search\n")
+            return
+        if variant == "raised" and not own and shipped["unsustainable_records_per_s"]:
+            rate = shipped["unsustainable_records_per_s"]
+        else:
+            rate = next_search_rate(winning(state, cell, workload_id, variant)["trials"])
         if rate is None:
             break
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
-                                            purpose="search"),
+                                            purpose=purpose, receiver_capacity=capacity),
                     output_dir, report_dir, cell)
-    decision = winning(state, cell, workload_id)
+    decision = winning(state, cell, workload_id, variant)
     if decision["sustainable_records_per_s"] is None:
         return
     rate = decision["sustainable_records_per_s"]
-    done = [entry for entry in state.trials(cell, ("search", "repetition"), workload_id)
+    done = [entry for entry in state.trials(
+                cell, (purpose, REPETITION_PURPOSES[variant]), workload_id)
             if entry["rate"] == rate and entry["verdict"] in ("sustainable", "unsustainable")]
     for _ in range(max(0, REPETITIONS - len(done))):
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
-                                            purpose="repetition"),
+                                            purpose=REPETITION_PURPOSES[variant],
+                                            receiver_capacity=capacity),
                     output_dir, report_dir, cell)
+
+
+def step_search_raised(plan, state, output_dir, report_dir, cell, options):
+    """The search with the receiver capacity raised, from the shipped bracket."""
+    step_search(plan, state, output_dir, report_dir, cell, options, variant="raised")
 
 
 def step_confirm_default_window(plan, state, output_dir, report_dir, cell, options):
@@ -2189,40 +2243,38 @@ def step_confirm_default_window(plan, state, output_dir, report_dir, cell, optio
         ), output_dir, report_dir, cell)
 
 
+def ceiling(state, cell) -> tuple:
+    """The exporter's sustainable rate for a cell and the receiver capacity
+    it was measured with: the raised search when it ran, else the shipped."""
+    raised = winning(state, cell, variant="raised")
+    if state.trials(cell, SEARCH_PURPOSES["raised"]) and raised["sustainable_records_per_s"]:
+        return raised["sustainable_records_per_s"], RAISED_RECEIVER_CAPACITY
+    return winning(state, cell)["sustainable_records_per_s"], SHIPPED_RECEIVER_CAPACITY
+
+
 def step_buffered(plan, state, output_dir, report_dir, cell, options):
     """The buffered topology at 80 percent of the strict ceiling."""
-    rate = winning(state, cell)["sustainable_records_per_s"]
+    rate, capacity = ceiling(state, cell)
     if rate is None:
         return
     _ = execute(plan, state, make_trial(
         plan, rate=int(rate * CONFIRMATION_FRACTION), purpose="buffered",
-        topology="buffered",
+        topology="buffered", receiver_capacity=capacity,
     ), output_dir, report_dir, cell)
 
 
 def step_fan_in(plan, state, output_dir, report_dir, cell, options):
-    """The winning rate from 1, 8, 64 and 256 client connections."""
-    rate = winning(state, cell)["sustainable_records_per_s"]
+    """The ceiling rate from 1, 8, 64 and 256 client connections."""
+    rate, capacity = ceiling(state, cell)
     if rate is None:
         return
     for connections in options.get("fan_in", FAN_IN_CONNECTIONS):
-        if connections == SEARCH_CONNECTIONS and state.trials(cell, "repetition"):
+        if connections == SEARCH_CONNECTIONS:
             continue
         _ = execute(plan, state, make_trial(
             plan, rate=rate, purpose=f"fan_in_{connections}", connections=connections,
+            receiver_capacity=capacity,
         ), output_dir, report_dir, cell)
-
-
-def step_admission(plan, state, output_dir, report_dir, cell, options):
-    """The unsustainable bracket rate with the receiver capacity raised."""
-    decision = winning(state, cell)
-    rate = decision["unsustainable_records_per_s"]
-    if rate is None:
-        return
-    _ = execute(plan, state, make_trial(
-        plan, rate=rate, purpose="admission_raised",
-        receiver_capacity=RAISED_RECEIVER_CAPACITY,
-    ), output_dir, report_dir, cell)
 
 
 def step_workloads(plan, state, output_dir, report_dir, cell, options):
@@ -2231,13 +2283,14 @@ def step_workloads(plan, state, output_dir, report_dir, cell, options):
     A row that fails there is bracketed on its own by halving and then
     bisecting; it is never labelled a maximum of the primary search.
     """
-    base = winning(state, cell)["sustainable_records_per_s"]
+    base, capacity = ceiling(state, cell)
     if base is None:
         return
     for workload_id in options.get("rows", ("logs-1k-hot", "mixed-1k-churn", "mixed-8k-hot")):
         rate = int(base * CONFIRMATION_FRACTION)
         result = execute(plan, state, make_trial(
             plan, workload_id=workload_id, rate=rate, purpose="confirmation",
+            receiver_capacity=capacity,
         ), output_dir, report_dir, cell)
         if trial_verdict(result) != "unsustainable":
             continue
@@ -2256,6 +2309,7 @@ def step_workloads(plan, state, output_dir, report_dir, cell, options):
                 next_rate = (low + high) // 2
             result = execute(plan, state, make_trial(
                 plan, workload_id=workload_id, rate=next_rate, purpose="confirmation_bracket",
+                receiver_capacity=capacity,
             ), output_dir, report_dir, cell)
             verdict = trial_verdict(result)
             if verdict not in ("sustainable", "unsustainable"):
@@ -2286,7 +2340,7 @@ STEPS = {
     "default_window": step_confirm_default_window,
     "buffered": step_buffered,
     "fan_in": step_fan_in,
-    "admission": step_admission,
+    "search_raised": step_search_raised,
     "workloads": step_workloads,
     "high_cardinality": step_high_cardinality,
 }
@@ -2340,20 +2394,21 @@ def load_result(output_dir, run_id) -> dict:
     return json.loads((Path(output_dir) / f"{run_id}.json").read_text(encoding="ascii"))
 
 
-def aggregate_cell(state, cell, output_dir, report_dir, family_ordinal) -> dict:
+def aggregate_cell(state, cell, output_dir, report_dir, family_ordinal,
+                   variant="shipped") -> dict:
     """A cell's winning rate as the median of three independent repetitions."""
-    decision = winning(state, cell)
+    decision = winning(state, cell, variant=variant)
     rate = decision["sustainable_records_per_s"]
-    entries = [entry for entry in state.trials(cell, ("search", "repetition"))
+    entries = [entry for entry in state.trials(
+                   cell, (SEARCH_PURPOSES[variant], REPETITION_PURPOSES[variant]))
                if entry["rate"] == rate and entry["workload_id"] == PRIMARY_WORKLOAD]
     children = [load_result(output_dir, entry["run_id"]) for entry in entries]
     first = children[0]
     store_kind, cores = cell.rsplit("-c", 1)
-    run_id = (f"capacity-{PRIMARY_WORKLOAD}-strict-{store_kind}-c{cores}"
-              f"-w{SEARCH_INTERVAL_S}-f{family_ordinal:03d}")
+    case = f"capacity-{PRIMARY_WORKLOAD}-{variant}"
+    run_id = f"{case}-strict-{store_kind}-c{cores}-w{SEARCH_INTERVAL_S}-f{family_ordinal:03d}"
     result = measurement.new_result(
-        {"run_id": run_id, "case": f"capacity-{PRIMARY_WORKLOAD}"},
-        artifact_kind="capacity_aggregate",
+        {"run_id": run_id, "case": case}, artifact_kind="capacity_aggregate",
     )
     environment = first.get("environment") or {}
     result["environment"] = {
@@ -2433,6 +2488,8 @@ def aggregate_cell(state, cell, output_dir, report_dir, family_ordinal) -> dict:
     result["checks"] = checks
     result["capacity"] = {
         "cell": cell,
+        "variant": variant,
+        "receiver_capacity_per_worker": VARIANT_CAPACITY[variant],
         "decision": decision,
         "repetitions": [
             {"run_id": child["run_id"], "verdict": trial_verdict(child),
@@ -2523,9 +2580,17 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
                     if entry not in entries]
     aggregates = []
     for cell in cells:
-        decision = winning(state, cell)
-        if decision["sustainable_records_per_s"] is not None:
-            aggregates.append(aggregate_cell(state, cell, output_dir, report_dir, ordinal))
+        for variant in SEARCH_PURPOSES:
+            if not state.trials(cell, SEARCH_PURPOSES[variant]):
+                continue
+            decision = winning(state, cell, variant=variant)
+            if decision["sustainable_records_per_s"] is not None and any(
+                entry["rate"] == decision["sustainable_records_per_s"]
+                for entry in state.trials(
+                    cell, (SEARCH_PURPOSES[variant], REPETITION_PURPOSES[variant]))
+            ):
+                aggregates.append(aggregate_cell(state, cell, output_dir, report_dir,
+                                                 ordinal, variant))
     rows = [trial_row(output_dir, entry) for entry in entries]
     index["run_dir"] = str(output_dir)
     index["run_files"] = [
@@ -2543,20 +2608,23 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
     }
     summary = {}
     for cell in cells:
-        decision = winning(state, cell)
-        aggregate = next((agg for agg in aggregates if agg["capacity"]["cell"] == cell), None)
-        summary[cell] = {
-            "decision": decision,
-            "aggregate": aggregate["run_id"] if aggregate else None,
-            "aggregate_status": aggregate["status"] if aggregate else None,
-            "aggregate_metrics": aggregate["metrics"] if aggregate else None,
-            "sender_capacity": sender_capacity(state, int(cell.rsplit("-c", 1)[1])),
-        }
+        summary[cell] = {"sender_capacity": sender_capacity(state, int(cell.rsplit("-c", 1)[1]))}
+        for variant in SEARCH_PURPOSES:
+            aggregate = next((agg for agg in aggregates if agg["capacity"]["cell"] == cell
+                              and agg["capacity"]["variant"] == variant), None)
+            summary[cell][variant] = {
+                "decision": winning(state, cell, variant=variant),
+                "aggregate": aggregate["run_id"] if aggregate else None,
+                "aggregate_status": aggregate["status"] if aggregate else None,
+                "aggregate_metrics": aggregate["metrics"] if aggregate else None,
+            }
     for cell in cells:
-        if cell.endswith("-c4"):
-            one = summary.get(cell.replace("-c4", "-c1")) or {}
-            four = summary[cell]
-            if (one.get("aggregate_metrics") and four.get("aggregate_metrics")):
+        if not cell.endswith("-c4"):
+            continue
+        for variant in SEARCH_PURPOSES:
+            one = (summary.get(cell.replace("-c4", "-c1")) or {}).get(variant) or {}
+            four = summary[cell][variant]
+            if one.get("aggregate_metrics") and four.get("aggregate_metrics"):
                 single = one["aggregate_metrics"]["sustainable_records_per_s"]
                 quad = four["aggregate_metrics"]["sustainable_records_per_s"]
                 four["scaling_efficiency_ratio"] = quad / (4 * single) if single else None
@@ -2581,6 +2649,10 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
             "search_interval_override": "one-second windows instead of the shipped 15 s, "
             "so a bounded producer concurrency does not cap the strict hold time",
             "search_connections": SEARCH_CONNECTIONS,
+            "receiver_capacity_per_worker": dict(VARIANT_CAPACITY),
+            "raised_search_seed": "the raised search starts from the shipped search's "
+            "bracket: its sustainable rate is taken as sustainable and its first trial "
+            "is the shipped unsustainable rate",
             "records_per_request": RECORDS_PER_REQUEST,
             "workloads": {key: dict(value["workload"].as_json(),
                                     description=value["description"],
