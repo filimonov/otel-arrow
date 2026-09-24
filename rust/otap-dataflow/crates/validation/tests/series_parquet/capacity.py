@@ -2465,16 +2465,37 @@ def step_search_default_window(plan, state, output_dir, report_dir, cell, option
     step_search(plan, state, output_dir, report_dir, cell, options, variant="default_window")
 
 
+def default_window_rate(state, cell):
+    """The rate the upload-concurrency comparison runs at with the 15 s
+    window: the default-window search's winner.
+
+    The one-second search's winner is no rate for a 15 s window: the strict
+    admission ceiling falls with the hold time (about 8k records/s per
+    worker at 128 slots), so a trial there only measures an overload and its
+    producer never finishes. Without a default-window search there is no
+    rate to confirm.
+    """
+    if not state.trials(cell, SEARCH_PURPOSES["default_window"]):
+        return None
+    return winning(state, cell, variant="default_window")["sustainable_records_per_s"]
+
+
 def step_confirm_default_window(plan, state, output_dir, report_dir, cell, options):
-    """The winning rate with the shipped 15 s window, upload concurrency 2 and 1."""
-    decision = winning(state, cell)
-    rate = decision["sustainable_records_per_s"]
-    if rate is None:
-        return
-    for concurrency in options.get("upload_concurrencies", (2, 1)):
+    """Upload concurrency 2 and 1 with the shipped 15 s window at its own
+    ceiling, and concurrency 1 at the cell's one-second strict ceiling,
+    where the search ran concurrency 2."""
+    rate = default_window_rate(state, cell)
+    if rate is not None:
+        for concurrency in options.get("upload_concurrencies", (2, 1)):
+            _ = execute(plan, state, make_trial(
+                plan, rate=rate, purpose=f"default_window_upload{concurrency}",
+                interval_s=DEFAULT_INTERVAL_S, upload_concurrency=concurrency,
+            ), output_dir, report_dir, cell)
+    base, capacity = ceiling(state, cell)
+    if base is not None:
         _ = execute(plan, state, make_trial(
-            plan, rate=rate, purpose=f"default_window_upload{concurrency}",
-            interval_s=DEFAULT_INTERVAL_S, upload_concurrency=concurrency,
+            plan, rate=base, purpose="ceiling_upload1", upload_concurrency=1,
+            receiver_capacity=capacity,
         ), output_dir, report_dir, cell)
 
 

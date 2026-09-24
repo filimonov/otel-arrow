@@ -292,16 +292,19 @@ winning rate until three independent trials measured it; its aggregate is
 the median durable rate with a 15 percent coefficient-of-variation gate.
 
 Deliberate overrides, recorded in every trial: one-second windows for the
-search (the shipped window is 15 s; `default_window` repeats the winning
-rate with it, upload concurrency 2 and 1, and jemalloc's statistics print);
+search (the shipped window is 15 s, searched on its own by
+`search_default_window`; jemalloc's statistics print);
 1000 records per request; 256 connections. A strict request holds its
 receiver slot until its block is durable, so with the shipped 128 slots per
 worker the search can end at the receiver's admission limit rather than the
 exporter's; `search_raised` searches again with 4096 slots, starting from
 the shipped bracket (its sustainable rate is taken as sustainable, its first
 trial is the shipped unsustainable rate); `buffered`, `fan_in` and
-`workloads` then run at the raised ceiling with the raised slots, and
-`default_window` at the shipped winning rate with the shipped slots. The
+`workloads` then run at the raised ceiling with the raised slots.
+`default_window` compares upload concurrency 2 and 1 at the default-window
+search's winner (never at the one-second winner, which a 15 s window cannot
+admit), and runs concurrency 1 once at the cell's one-second ceiling, where
+the search ran 2. The
 receiver's `max_concurrent_requests` is clamped by the engine to the
 pipeline's pdata channel capacity, so a raised limit raises both. The
 harness engine configuration drops unsupported points (`unsupported:

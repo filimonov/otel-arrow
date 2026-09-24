@@ -6288,6 +6288,28 @@ class GeneratorContracts(unittest.TestCase):
 class CapacityContracts(unittest.TestCase):
     """The arithmetic and the decisions of the capacity family."""
 
+    # Scenario: a cell's one-second search won 128k and its 15 s search 8.5k.
+    # Guarantees: the default-window confirmation runs at 8.5k, never at the
+    # one-second winner, and without a 15 s search it has no rate.
+    def test_default_window_confirmation_runs_at_the_default_window_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = capacity.FamilyState(directory)
+
+            def entry(purpose, rate, verdict):
+                return {"run_id": f"r{rate}", "cell": "minio-c1",
+                        "workload_id": capacity.PRIMARY_WORKLOAD, "purpose": purpose,
+                        "rate": rate, "verdict": verdict}
+
+            state.document["trials"] = [
+                entry("search", 128000, "sustainable"), entry("search", 136000, "unsustainable")]
+            self.assertIsNone(capacity.default_window_rate(state, "minio-c1"))
+            state.document["trials"] += [
+                entry("search_default_window", 8000, "sustainable"),
+                entry("search_default_window", 9000, "unsustainable"),
+                entry("search_default_window", 8500, "sustainable"),
+            ]
+            self.assertEqual(capacity.default_window_rate(state, "minio-c1"), 8500)
+
     # Scenario: two workers complete 12,000 unique records and 3MB of objects in 3s.
     # Guarantees: records, input bytes and output bytes retain distinct denominators.
     def test_capacity_units(self):
