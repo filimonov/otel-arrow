@@ -708,6 +708,9 @@ METRIC_LIST_SHAPE = {
 # failure are different observations: only the first is evidence about the
 # server, and confusing them would let a broken client look like a healthy
 # one.
+# The longest refusal text one ledgered attempt keeps.
+ATTEMPT_DETAIL_LIMIT = 300
+
 OUTCOME_ACK = "ack"
 OUTCOME_RETRYABLE = "retryable_nack"
 OUTCOME_PERMANENT = "permanent_nack"
@@ -2551,7 +2554,9 @@ class Producer:
                 if code in test_e2e.RETRYABLE_CODES
                 else OUTCOME_PERMANENT
             )
-            self.ledger.attempt(index, ordinal, start, finish, outcome, str(code))
+            # The status message is kept whole enough to classify the refusal.
+            detail = f"{code}: {error.details() or ''}"[:ATTEMPT_DETAIL_LIMIT]
+            self.ledger.attempt(index, ordinal, start, finish, outcome, detail)
             return outcome
         except Exception as error:
             finish = time.monotonic_ns()
@@ -2590,17 +2595,18 @@ class Producer:
             "outcomes": dict(outcomes),
         }
 
-    def send_paced(self, indexes, rate_requests_per_s) -> dict:
+    def send_paced(self, indexes, rate_requests_per_s, stop=None) -> dict:
         """Start request `k` of `indexes` at `k / rate` seconds, open loop.
 
         At most `max_in_flight` requests are outstanding; a start that has to
         wait for one is late, and the lateness is recorded rather than
-        re-timed.
+        re-timed. Setting the `stop` event ends the schedule: no request
+        starts after it, and every started one still finishes.
         """
         indexes = list(indexes)
         workers = max(1, min(self.max_in_flight, len(indexes)))
         slots = threading.BoundedSemaphore(workers)
-        wake = threading.Event()
+        wake = stop if stop is not None else threading.Event()
         started = time.monotonic_ns()
         period_ns = int(1e9 / rate_requests_per_s)
         late_ns = []
@@ -2614,6 +2620,8 @@ class Producer:
                 now = time.monotonic_ns()
                 if due > now:
                     _ = wake.wait((due - now) / 1e9)
+                if stop is not None and stop.is_set():
+                    break
                 _ = slots.acquire()
                 late_ns.append(max(0, time.monotonic_ns() - due))
                 future = pool.submit(self.send_one, index)
@@ -2621,7 +2629,7 @@ class Producer:
                 futures.append(future)
             outcomes = collections.Counter(future.result() for future in futures)
         return {
-            "requests": len(indexes),
+            "requests": len(futures),
             "concurrency": workers,
             "rate_requests_per_s": rate_requests_per_s,
             "started_ns": started,

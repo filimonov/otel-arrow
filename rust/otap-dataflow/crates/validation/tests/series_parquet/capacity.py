@@ -743,7 +743,7 @@ EXTRA_GAUGES = (
     "block.active", "block.flushing", "flush.workspace", "memory.accounted",
     "memory.budget", "series_cache.entries", "series_cache.hits",
     "series_cache.misses", "series_cache.evictions", "flush.retries",
-    "flush.failures",
+    "flush.failures", "flush.cancelled", "flush.abort_failures", "flush.late_commits",
 )
 # The durable buffer's unlabelled metrics kept per worker, by extras key.
 BUFFER = "processor.durable_buffer"

@@ -1345,6 +1345,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="scrub one published evidence tree in place and re-hash it",
     )
     _ = rescrub.add_argument("--index", required=True, type=Path)
+    failures = sub.add_parser(
+        "failures",
+        help="run one family's fault cases against real stores and record its index",
+    )
+    _ = failures.add_argument("--family", required=True, choices=["s3"])
+    _ = failures.add_argument("--output-dir", required=True, type=Path)
+    _ = failures.add_argument("--option", action="append", default=[])
     preflight = sub.add_parser(
         "fault-preflight",
         help="probe the disposable fault tools and record fault-preflight.json",
@@ -1416,6 +1423,17 @@ def main(argv=None) -> int:
         return 0
     if arguments.command == "fault-preflight":
         return fault_preflight(arguments)
+    if arguments.command == "failures":
+        try:
+            from . import faults
+        except ImportError:
+            import faults
+        options = parse_options(arguments.option)
+        index = faults.run_failures(arguments.output_dir, options.pop("report_dir", None),
+                                    family=arguments.family, **options)
+        sys.stderr.write(f"{index['run_id']}: {index['status']} "
+                         f"{json.dumps(index['metrics'], sort_keys=True)}\n")
+        return 0 if index["status"] == measurement.STATUS_PASSED else 1
     if arguments.command == "stage-results":
         measurement.stage_run_files(arguments.index)
         return 0

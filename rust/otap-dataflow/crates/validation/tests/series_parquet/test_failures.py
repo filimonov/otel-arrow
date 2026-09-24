@@ -201,7 +201,8 @@ class Privileges(unittest.TestCase):
             name="series-fault-x-engine-1", cidfile="/s/engine-1.cid", owner=self.OWNER,
             image="tools", run_id="x", argv=["/bin/df_engine", "--config", "/r/p.yaml"],
             mounts=[("/bin/df_engine", "ro"), ("/repo", "ro"), ("/r", "rw")],
-            user="1000:1000", env={"RUST_LOG": "info", "AWS_SECRET_ACCESS_KEY": "s"},
+            user="1000:1000", env={"RUST_LOG": "info", "AWS_SECRET_ACCESS_KEY": "s",
+                                   "MALLOC_CONF": "stats_interval:1"},
         )
         store = test_e2e.DockerStore("minio")
         store.port = 40003
@@ -244,11 +245,13 @@ class Privileges(unittest.TestCase):
         self.assertIn("127.0.0.1:40001:40001", published)
 
     # Scenario: the harness environment carries credentials.
-    # Guarantees: the engine container inherits logging settings only, and
-    # its binary and repository are read-only while its run directory is not.
+    # Guarantees: the engine container inherits logging and allocator settings
+    # only, and its binary and repository are read-only while its run
+    # directory is not.
     def test_engine_container_mounts_and_environment(self):
         engine = self.argvs()["engine"]
         self.assertIn("RUST_LOG=info", engine)
+        self.assertIn("MALLOC_CONF=stats_interval:1", engine)
         self.assertFalse(any("SECRET" in word for word in engine), engine)
         self.assertIn("/bin/df_engine:/bin/df_engine:ro", engine)
         self.assertIn("/repo:/repo:ro", engine)
@@ -375,11 +378,15 @@ class ToolContracts(unittest.TestCase):
             "1.5 PUT /b/otel/v=1/signal=logs/dataset=values/x.parquet 200 200 0.1 0.1 0\n"
             "1.6 PUT /b/otel/v=1/signal=logs/dataset=series/y.parquet 503 - 0.0 - 0\n"
             "truncated line\n"
+            "1.7 PUT /b/otel/v=1/signal=logs/dataset=values/x.parquet 200 200 0.1 0.1 0 "
+            "5243392 /b/otel/v=1/signal=logs/dataset=values/x.parquet?partNumber=1&uploadId=u\n"
         )
         entries = faults.parse_access_log(path)
         self.assertEqual(entries[0]["status"], "200")
         self.assertEqual(entries[1]["upstream_status"], "-")
         self.assertEqual(entries[2], {"raw": "truncated line"})
+        self.assertEqual(entries[3]["request_length"], "5243392")
+        self.assertTrue(entries[3]["request_uri"].endswith("?partNumber=1&uploadId=u"))
         self.assertEqual(faults.backend_of(entries[0]["uri"]), "values")
         self.assertEqual(faults.backend_of(entries[1]["uri"]), "general")
 
@@ -894,6 +901,276 @@ class LiveRigSlice(unittest.TestCase):
                 self.assertEqual(rig.evidence()["store"]["running_image_id"], store.image_id)
             self.assertTrue(rig.cleanup_report["clean"], rig.cleanup_report)
             self.assertIsNone(store.network_address(rig.network_id))
+
+
+def passing_fault_result(**metrics):
+    """A fault case result whose every required check passed."""
+    checks = [measurement.check(name, measurement.CHECK_HARD, measurement.STATUS_PASSED)
+              for name in faults.FAULT_CHECKS]
+    return {"checks": checks, "metrics": dict({"missing_acked_records": 0}, **metrics),
+            "observations": {"fault": {"multiplicity_histogram": {"1": 2000},
+                                       "numbers": {"duplicate_records": 0}}}}
+
+
+class FaultCaseContracts(unittest.TestCase):
+    """How a fault case reads its evidence and decides its verdicts, without Docker."""
+
+    # Scenario: a fault case result is judged.
+    # Guarantees: every required check must have passed, an acknowledged
+    # record may not be missing, and the duplicates must have been measured.
+    def test_fault_check_requires_every_check_and_no_missing_record(self):
+        faults.fault_check(passing_fault_result())
+        for name in faults.FAULT_CHECKS:
+            result = passing_fault_result()
+            next(entry for entry in result["checks"] if entry["name"] == name)["status"] = \
+                measurement.STATUS_FAILED
+            with self.subTest(check=name), self.assertRaisesRegex(AssertionError, name):
+                faults.fault_check(result)
+        with self.assertRaisesRegex(AssertionError, "acknowledged supported record missing"):
+            faults.fault_check(passing_fault_result(missing_acked_records=3))
+        result = passing_fault_result()
+        result["observations"]["fault"]["multiplicity_histogram"] = None
+        with self.assertRaisesRegex(AssertionError, "histogram"):
+            faults.fault_check(result)
+        result = passing_fault_result()
+        result["observations"]["fault"]["numbers"]["duplicate_records"] = None
+        with self.assertRaisesRegex(AssertionError, "duplicates"):
+            faults.fault_check(result)
+
+    # Scenario: the lateness bound is computed from the exporter settings.
+    # Guarantees: it is FORMAT.md's L = interval + 2 * (flush_retry_deadline +
+    # abort_timeout): 145 s at the defaults.
+    def test_lateness_bound_follows_the_format_rule(self):
+        settings = {"window": {"interval": "15s", "flush_retry_deadline": "60s"},
+                    "upload": {"abort_timeout": "5s"}}
+        self.assertEqual(faults.lateness_bound_s(settings), 145.0)
+        settings["window"]["interval"] = "5s"
+        self.assertEqual(faults.lateness_bound_s(settings), 135.0)
+        self.assertEqual(faults.duration_s("200ms"), 0.2)
+
+    # Scenario: objects of one partition hour become visible before, just
+    # after and long after the hour ended.
+    # Guarantees: only an object visible more than L after its hour's end is a
+    # violation, by the store's LastModified or by the first listing that saw it.
+    def test_partition_lateness_flags_only_objects_beyond_the_bound(self):
+        end = faults.partition_hour("otel/v=1/signal=logs/dataset=values/date=2026-09-25/"
+                                    "hour=03/a.parquet")[1]
+        key = "otel/v=1/signal=logs/dataset=values/date=2026-09-25/hour=03/{}.parquet"
+        objects = [
+            {"key": key.format("early"), "last_modified_unix_s": end - 30,
+             "first_listed_unix_s": end - 29},
+            {"key": key.format("late"), "last_modified_unix_s": end + 40,
+             "first_listed_unix_s": None},
+        ]
+        report = faults.partition_lateness(objects, 135.0)
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["objects_visible_after_hour_end_count"], 1)
+        self.assertEqual(report["hours"]["2026-09-25T03"]["latest_last_modified_after_end_s"], 40)
+        objects[0]["first_listed_unix_s"] = end + 136
+        self.assertEqual(faults.partition_lateness(objects, 135.0)["violations"],
+                         ["2026-09-25T03"])
+
+    # Scenario: NGINX logs the exporter's multipart upload and plain requests.
+    # Guarantees: each S3 operation is named from the method and the query of
+    # the full request URI, and only the exporter's prefix counts.
+    def test_s3_operations_are_named_from_the_query(self):
+        base = "/b/otel/v=1/signal=logs/dataset=values/x.parquet"
+        cases = {
+            ("POST", base + "?uploads"): "create_multipart_upload",
+            ("PUT", base + "?partNumber=2&uploadId=u"): "upload_part",
+            ("POST", base + "?uploadId=u"): "complete_multipart_upload",
+            ("DELETE", base + "?uploadId=u"): "abort_multipart_upload",
+            ("PUT", base): "put_object",
+            ("HEAD", base): "head_object",
+            ("GET", "/b?list-type=2&prefix=otel%2F"): "list_objects",
+        }
+        for (method, uri), expected in cases.items():
+            with self.subTest(uri=uri):
+                entry = {"method": method, "uri": uri.partition("?")[0], "request_uri": uri}
+                self.assertEqual(faults.s3_operation(entry), expected)
+        entries = [{"method": "PUT", "uri": "/b/fault-preflight/k", "request_uri": "/b/fault-preflight/k"},
+                   {"method": "PUT", "uri": base, "request_uri": base}]
+        self.assertEqual([entry["uri"] for entry in faults.engine_requests(entries, "b")], [base])
+
+    # Scenario: the route saw a multipart upload but the store holds only
+    # single-part objects, and then both sides agree.
+    # Guarantees: multipart counts as exercised only with every step answered
+    # 2xx and a stored object above one part carrying a multipart ETag.
+    def test_multipart_evidence_needs_both_sides(self):
+        requests = [{"operation": op, "status": "200"} for op in (
+            "create_multipart_upload", "upload_part", "upload_part",
+            "complete_multipart_upload")]
+        single = [{"key": "k", "size_bytes": 7 << 20, "etag": '"' + "a" * 32 + '"'}]
+        multi = [{"key": "k", "size_bytes": 7 << 20, "etag": '"' + "a" * 32 + '-2"'}]
+        self.assertFalse(faults.multipart_evidence(requests, single, 5 << 20)["exercised"])
+        evidence = faults.multipart_evidence(requests, multi, 5 << 20)
+        self.assertTrue(evidence["exercised"])
+        self.assertEqual(evidence["parts_per_object"], [2])
+        self.assertFalse(faults.multipart_evidence(requests[:2], multi, 5 << 20)["exercised"])
+
+    # Scenario: the producer ledgered storage nacks, a receiver refusal, a
+    # client deadline and acknowledgements.
+    # Guarantees: the exporter's storage sentence is counted by class, apart
+    # from producer-local timeouts and from other retryable refusals.
+    def test_ledger_attempts_classify_storage_nacks_and_local_timeouts(self):
+        ledger = measurement.Ledger(temporary_directory(self) / "ledger.sqlite")
+        self.addCleanup(ledger.close)
+        retryable = measurement.OUTCOME_RETRYABLE
+        ledger.attempt(0, 1, 10, 11, retryable, "StatusCode.UNAVAILABLE: could not write to "
+                       "object storage (unavailable); retry the request")
+        ledger.attempt(0, 2, 12, 13, measurement.OUTCOME_ACK)
+        ledger.attempt(1, 1, 10, 11, retryable, "StatusCode.DEADLINE_EXCEEDED: Deadline Exceeded")
+        ledger.attempt(2, 1, 10, 11, retryable, "StatusCode.RESOURCE_EXHAUSTED: too many")
+        report = faults.ledger_attempts(ledger)
+        self.assertEqual(report["storage_nacks_count"], 1)
+        self.assertEqual(report["storage_nack_classes"], {"unavailable": 1})
+        self.assertEqual(report["local_timeouts_count"], 1)
+        self.assertEqual(report["by_code"]["RESOURCE_EXHAUSTED"], 1)
+        self.assertEqual(faults.ledger_attempts(ledger, since_ns=12)["by_outcome"],
+                         {measurement.OUTCOME_ACK: 1})
+
+    # Scenario: records are stored twice, some from a request the producer
+    # resent and some from a request it sent once.
+    # Guarantees: duplicates outside the producer's resent requests are
+    # counted apart, so they cannot hide among expected replays.
+    def test_duplicate_attribution_splits_resent_requests(self):
+        ledger = measurement.Ledger(temporary_directory(self) / "ledger.sqlite")
+        self.addCleanup(ledger.close)
+        for request, rows in ((0, ["a", "b"]), (1, ["c"])):
+            ledger.add_request(request, "logs", b"wire%d" % request,
+                               [(row, "log", "h") for row in rows], send_ns=1)
+        ledger.attempt(0, 1, 1, 2, measurement.OUTCOME_RETRYABLE, "x")
+        ledger.attempt(0, 2, 3, 4, measurement.OUTCOME_ACK)
+        ledger.attempt(1, 1, 1, 2, measurement.OUTCOME_ACK)
+        measurement._load_actual(ledger, iter([(row, "logs", "h")
+                                               for row in ("a", "a", "b", "c", "c", "c")]))
+        report = faults.duplicate_attribution(ledger)
+        self.assertEqual(report["duplicated_records"], 2)
+        self.assertEqual(report["extra_copies_records"], 3)
+        self.assertEqual(report["duplicated_in_resent_requests_records"], 1)
+        self.assertEqual(report["duplicated_outside_resent_requests_records"], 1)
+        self.assertEqual(report["resent_requests_count"], 1)
+
+    # Scenario: the engine log carries cleanup, failure and commit events with
+    # colour codes.
+    # Guarantees: flush events are counted by name and outcome, and other
+    # events are ignored.
+    def test_engine_events_count_cleanup_outcomes(self):
+        log = (
+            "\x1b[2m2026\x1b[0m  \x1b[33mWARN \x1b[0m \x1b[1motel.exporter.series_parquet::"
+            "series_parquet.flush.cleanup\x1b[0m: [outcome=abort_failed, seq=4, attempt=3]\n"
+            "2026  INFO otel.exporter.series_parquet::series_parquet.flush.cleanup: "
+            "a failed block's objects exist [outcome=late_commit, seq=5, file=p-5.parquet]\n"
+            "2026  ERROR otel.exporter.series_parquet::series_parquet.flush.failed: "
+            "[window_start=1, seq=5, file=p-5.parquet, requests=2]\n"
+            "2026  WARN otel.exporter.series_parquet::series_parquet.flush.attempt_failed: "
+            "[seq=5, attempt=1]\n"
+            "2026  INFO otel.exporter.series_parquet::series_parquet.block_committed: [files=2]\n"
+        )
+        events = faults.engine_events(log)
+        self.assertEqual(events["counts"], {
+            "series_parquet.flush.attempt_failed": 1,
+            "series_parquet.flush.cleanup{abort_failed}": 1,
+            "series_parquet.flush.cleanup{late_commit}": 1,
+            "series_parquet.flush.failed": 1,
+        })
+        self.assertEqual(events["failed_files"], ["p-5.parquet"])
+        self.assertEqual(events["cleanup_files"], {"late_commit": ["p-5.parquet"]})
+        objects = [{"key": "otel/v=1/signal=logs/dataset=values/date=d/hour=h/p-5.parquet"},
+                   {"key": "otel/v=1/signal=logs/dataset=values/date=d/hour=h/p-6.parquet"}]
+        self.assertEqual(faults.failed_block_objects(events, objects),
+                         {"p-5.parquet": [objects[0]["key"]]})
+
+    # Scenario: each fault's intended condition is judged from partial evidence.
+    # Guarantees: a 503 or an outage counts only with the exporter's nack and
+    # its retry (an outage also past the flush deadline), and slow storage
+    # only with a measured delay, a flush with work behind it and backpressure.
+    def test_fault_conditions_need_every_part(self):
+        case = mock.Mock(flush_deadline_s=60.0)
+        seen = {"http_503_writes_count": 2, "flush_retries_count": 1,
+                "storage_nacks_count": 1, "retried": True}
+        self.assertTrue(faults.FAULT_CONDITIONS["http503"](case, seen))
+        self.assertFalse(faults.FAULT_CONDITIONS["http503"](case, dict(seen, retried=False)))
+        outage = {"elapsed_s": 61.0, "flush_failures_count": 1, "storage_nacks_count": 1,
+                  "retried": True}
+        self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, outage))
+        self.assertFalse(faults.FAULT_CONDITIONS["store_outage"](case, dict(outage,
+                                                                           elapsed_s=59.0)))
+        slow = {"delayed_requests_count": 1, "throttled_uploads_count": 1,
+                "flushing_with_work_samples_count": 3, "admission_closed_s": 5.5,
+                "receiver_rejections_count": 0, "buffer_in_flight_plateau": False}
+        self.assertTrue(faults.FAULT_CONDITIONS["slow"](case, slow))
+        self.assertFalse(faults.FAULT_CONDITIONS["slow"](case, dict(slow, admission_closed_s=1.0)))
+        self.assertFalse(faults.FAULT_CONDITIONS["slow"](case, dict(slow,
+                                                                   throttled_uploads_count=0)))
+
+
+class FailurePrerequisites(unittest.TestCase):
+    """How a fault case treats missing tools before traffic and errors after it."""
+
+    def run_case(self, **env):
+        """failure_case with the fault-tools image absent, the case body refused."""
+        missing = mock.patch.object(faults, "image_provenance", return_value=None)
+        docker = mock.patch.object(faults, "run_command", return_value=ok_command("27.0"))
+        body = mock.patch.object(measure, "run_case",
+                                 side_effect=AssertionError("the case body ran"))
+        with environment(**env), missing, docker, body as run_case:
+            try:
+                faults.failure_case("s3", "http503", "strict", "minio",
+                                    temporary_directory(self))
+            finally:
+                self.assertFalse(run_case.called)
+
+    # Scenario: a fault case starts where the fault-tools image is absent and
+    # the tools are optional.
+    # Guarantees: the case skips cleanly before any lease or traffic.
+    def test_missing_prerequisite_skips_an_optional_lane(self):
+        with self.assertRaisesRegex(unittest.SkipTest, "absent"):
+            self.run_case()
+
+    # Scenario: the same case where the fault tools are required.
+    # Guarantees: the missing image fails the case instead of skipping it.
+    def test_missing_prerequisite_fails_a_required_lane(self):
+        with self.assertRaisesRegex(AssertionError, "absent"):
+            self.run_case(SERIES_REQUIRE_FAULT_TOOLS="1")
+
+    # Scenario: after a successful preflight, arming the case's fault raises a
+    # skip in a lane that does not require the tools.
+    # Guarantees: the case fails; a post-preflight activation error is never a skip.
+    def test_activation_error_after_preflight_is_a_failure(self):
+        with mock.patch.object(faults, "require_fault_images", return_value={}):
+            rig = FakeRig(temporary_directory(self))
+        spec = faults.failure_spec("s3", "http503", "strict", "minio", cores=(1,))
+        settings = {"window": {"flush_retry_deadline": "60s"}}
+        phase = mock.Mock()
+        phase.sampler.samples = []
+        case = faults.FaultCase(spec, rig, mock.Mock(), None, phase, None, None, settings)
+
+        def vanished(_rig, _parameters):
+            raise unittest.SkipTest("control directory vanished")
+
+        with environment(), mock.patch.dict(faults.FAULTS, {"http503": (vanished, None)}):
+            with self.assertRaisesRegex(AssertionError, "activating http503 after preflight"):
+                case.arm()
+        self.assertIsNone(case.at("armed"))
+
+
+class S3FailureTests(measurement.MeasurementTestCase):
+    """A real S3 fault reaches each topology on each store, and it recovers."""
+
+    # Scenario: a real S3 HTTP 503 reaches each topology before service recovers.
+    # Guarantees: recovery preserves every ACKed ID and reports replay multiplicities.
+    def test_http503_recovery(self):
+        measurement.require_long()
+        for topology in ("strict", "buffered"):
+            for store in ("minio", "rustfs"):
+                with self.subTest(topology=topology, store=store):
+                    result = faults.failure_case("s3", "http503", topology, store,
+                                                 self.output_dir, report_dir=self.output_dir,
+                                                 archive_dir=self.output_dir / "archive")
+                    self.assertGreater(
+                        result["observations"]["fault"]["numbers"]["http_503_responses_count"], 0)
+                    faults.fault_check(result)
 
 
 if __name__ == "__main__":

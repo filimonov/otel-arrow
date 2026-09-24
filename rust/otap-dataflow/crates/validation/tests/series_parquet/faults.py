@@ -33,29 +33,42 @@ always a failure.
 Nothing here pulls or builds an image: provisioning is a separate step
 (README, "Fault tools"), finished before the host lease is taken.
 """
+import collections
+import dataclasses
+import datetime
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import select
+import shutil
 import signal
 import subprocess
+import sys
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
+import yaml
 
 try:  # Imported as a package module by `python3 -m crates...`.
+    from . import capacity
     from . import measurement
+    from . import performance
     from . import test_e2e
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
+    import capacity
     import measurement
+    import performance
     import test_e2e
 
 HERE = Path(__file__).resolve().parent
@@ -533,9 +546,10 @@ def toxiproxy_argv(*, name, cidfile, owner, image, run_id, cores=()) -> list:
     ] + _cpuset(cores) + [image, "-host=0.0.0.0", f"-port={TOXIPROXY_API_PORT}"]
 
 
-# The environment an engine container inherits from the harness: logging
-# and backtraces only, never the harness's whole environment.
-ENGINE_ENVIRONMENT = ("RUST_LOG", "RUST_BACKTRACE")
+# The environment an engine container inherits from the harness: logging,
+# backtraces and the allocator's statistics setting, never the harness's
+# whole environment.
+ENGINE_ENVIRONMENT = ("RUST_LOG", "RUST_BACKTRACE", "MALLOC_CONF")
 
 
 def engine_argv(*, name, cidfile, owner, image, run_id, argv, mounts, user,
@@ -706,7 +720,6 @@ class ContainerLauncher:
         config = Path(argv[argv.index("--config") + 1]).resolve()
         writable = [config.parent, self.rig.root.resolve(), *self.extra_mounts]
         try:
-            import yaml
             document = yaml.safe_load(config.read_text()) or {}
             for group in (document.get("groups") or {}).values():
                 for pipeline in (group.get("pipelines") or {}).values():
@@ -937,6 +950,12 @@ register_fault("store_outage", _activate_store_outage, _recover_store_outage)
 # The rig
 # --------------------------------------------------------------------------
 
+# The fields of `fault-nginx.conf`'s log format, in order.
+ACCESS_LOG_FIELDS = ("msec", "method", "uri", "status", "upstream_status",
+                     "request_time", "upstream_response_time", "body_bytes_sent",
+                     "request_length", "request_uri")
+
+
 def parse_access_log(path) -> list:
     """NGINX's fault log, one dict per request, in the configured format."""
     entries = []
@@ -944,14 +963,13 @@ def parse_access_log(path) -> list:
         lines = Path(path).read_text(errors="replace").splitlines()
     except OSError:
         return entries
-    fields = ("msec", "method", "uri", "status", "upstream_status",
-              "request_time", "upstream_response_time", "body_bytes_sent")
     for line in lines:
         parts = line.split()
-        if len(parts) != len(fields):
+        # Eight fields is the format before the request length and URI were logged.
+        if len(parts) in (len(ACCESS_LOG_FIELDS), len(ACCESS_LOG_FIELDS) - 2):
+            entries.append(dict(zip(ACCESS_LOG_FIELDS, parts)))
+        else:
             entries.append({"raw": line})
-            continue
-        entries.append(dict(zip(fields, parts)))
     return entries
 
 
@@ -2456,3 +2474,1327 @@ def preflight_fault_tools(required: bool, *, output_dir=None, report_dir=None,
     for probe in probes:
         require_probe(probe, required=required)
     return result
+
+
+# --------------------------------------------------------------------------
+# Fault cases: `measure failures`
+# --------------------------------------------------------------------------
+
+# Each family's faults; a matrix cell is one fault, topology and store.
+FAILURE_FAMILIES = {"s3": ("slow", "http503", "store_outage")}
+FAILURE_TOPOLOGIES = ("strict", "buffered")
+
+# A finite mixed-signal producer: 20 requests of 100 one-KiB records a
+# second, every tenth a metrics request. It stops on the case's schedule;
+# the request cap only bounds a case that never gets there.
+FAULT_RATE_REQUESTS_PER_S = 20
+FAULT_MAX_REQUESTS = FAULT_RATE_REQUESTS_PER_S * 900
+FAULT_WORKLOAD = measurement.Workload(
+    requests=FAULT_MAX_REQUESTS, records_per_request=100, body_bytes=1024, series=100,
+    metrics_every=10,
+)
+# Five-second windows of that input hold about 6.8 MB of compressed logs
+# values, above the S3 minimum part size of 5 MiB, so every case uploads
+# its logs values files as multipart uploads.
+FAULT_INTERVAL_S = 5
+FAULT_EXPORTER_MERGE = {"upload": {"part_bytes": "5MiB"}}
+# Input before the fault is armed: two windows plus five seconds.
+FAULT_BASELINE_S = 2 * FAULT_INTERVAL_S + 5
+# Input after the exporter resumed, before the producer stops.
+FAULT_AFTER_S = 20
+# How long each fault may take to show its intended condition.
+FAULT_OBSERVE_DEADLINE_S = {"slow": 180, "http503": 240, "store_outage": 240}
+# Everything after the endpoint is healthy again -- resumption, the rest of
+# the input and the drain -- must finish within this.
+RECOVERY_DEADLINE_S = 300
+ENDPOINT_HEALTH_DEADLINE_S = 120
+# The producer resends a retryable refusal with the same bytes until it is
+# acknowledged; the attempts outlast any fault plus the recovery deadline.
+FAULT_PRODUCER_ATTEMPTS = 2000
+FAULT_PRODUCER_TIMEOUT_S = 180.0
+FAULT_LISTING_PERIOD_S = 1.0
+# A cell run with `straddle_hour` arms its fault this long before a
+# partition hour ends, so the hour's last blocks are written under the
+# fault and the lateness bound is exercised; its engine starts at least
+# the lead before that.
+STRADDLE_ARM_BEFORE_END_S = 10
+STRADDLE_LEAD_S = 90
+# A request NGINX logged at least this long under the slow fault was delayed by it.
+SLOW_DELAY_FLOOR_S = SLOW_LATENCY_MS / 1000.0 * 0.9
+SHIPPED_S3_CONFIG = test_e2e.WORKSPACE / "configs/series-parquet-s3.yaml"
+FAULT_ARCHIVE_DIR = measurement.REPO_ROOT / ".measurement-artifacts" / "failures"
+STORAGE_NACK_SENTENCE = "could not write to object storage ("
+# The compared metrics: memory and the correctness counts. Durations and
+# counts depend on where in a window the fault landed and are recorded only.
+FAULT_DIRECTIONS = {
+    "peak_rss_bytes": measurement.LOWER_IS_BETTER,
+    "accounted_peak_bytes": measurement.LOWER_IS_BETTER,
+    "buffer_storage_peak_bytes": measurement.LOWER_IS_BETTER,
+    "missing_acked_records": measurement.LOWER_IS_BETTER,
+    "missing_records": measurement.LOWER_IS_BETTER,
+    "unexpected_records": measurement.LOWER_IS_BETTER,
+    "corrupt_records": measurement.LOWER_IS_BETTER,
+}
+# The checks `fault_check` requires of every fault case, in every family.
+FAULT_CHECKS = ("fault_observed", "recovered", "drained", "at_least_once",
+                "descriptor_coverage", "reader_agreement", "bounded_resources")
+
+
+def shipped_s3_retry() -> dict:
+    """The store retry section `configs/series-parquet-s3.yaml` ships."""
+    document = yaml.safe_load(SHIPPED_S3_CONFIG.read_text())
+    return dict(document["groups"]["default"]["pipelines"]["main"]["nodes"]["exporter"]
+                ["config"]["retry"])
+
+
+def duration_s(text) -> float:
+    """A humantime duration such as `60s` or `200ms`, in seconds."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)\s*", str(text))
+    if not match:
+        raise ValueError(f"not a duration: {text!r}")
+    return float(match[1]) * {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}[match[2]]
+
+
+def exporter_settings(engine_config) -> dict:
+    """The effective exporter settings of one launched configuration."""
+    return engine_config["groups"]["default"]["pipelines"]["main"]["nodes"]["exporter"]["config"]
+
+
+def lateness_bound_s(settings) -> float:
+    """FORMAT.md's partition lateness bound for these exporter settings.
+
+    `L = window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)`.
+    """
+    window = settings["window"]
+    return duration_s(window["interval"]) + 2 * (
+        duration_s(window["flush_retry_deadline"])
+        + duration_s(settings["upload"]["abort_timeout"]))
+
+
+PARTITION = re.compile(r"/date=(\d{4}-\d{2}-\d{2})/hour=(\d{2})/")
+
+
+def partition_hour(key):
+    """The partition hour of an object key and the instant it ends, or None."""
+    match = PARTITION.search("/" + key)
+    if not match:
+        return None
+    start = datetime.datetime.strptime(match[1], "%Y-%m-%d").replace(
+        hour=int(match[2]), tzinfo=datetime.timezone.utc)
+    return f"{match[1]}T{match[2]}", (start + datetime.timedelta(hours=1)).timestamp()
+
+
+def partition_lateness(objects, bound_s) -> dict:
+    """The latest visibility in each partition hour against the hour's end.
+
+    Each object carries the store's `last_modified_unix_s` and the first
+    time a direct listing showed it, `first_listed_unix_s` (None when no
+    listing saw it before the final one). An hour is violated when either
+    instant of any of its objects lies more than `bound_s` after the hour
+    ended.
+    """
+    fields = (("last_modified_unix_s", "latest_last_modified_after_end_s"),
+              ("first_listed_unix_s", "latest_first_listed_after_end_s"))
+    hours = {}
+    after_end = 0
+    for item in objects:
+        found = partition_hour(item["key"])
+        if found is None:
+            continue
+        hour, end = found
+        entry = hours.setdefault(hour, {"hour_end_unix_s": end, "objects_count": 0,
+                                        **{name: None for _field, name in fields}})
+        entry["objects_count"] += 1
+        late_any = False
+        for field, name in fields:
+            if item.get(field) is None:
+                continue
+            late = round(item[field] - end, 3)
+            late_any |= late > 0
+            if entry[name] is None or late > entry[name]:
+                entry[name] = late
+        after_end += late_any
+    violations = sorted(hour for hour, entry in hours.items()
+                        if any(entry[name] is not None and entry[name] > bound_s
+                               for _field, name in fields))
+    return {"bound_s": bound_s, "hours": dict(sorted(hours.items())),
+            "violations": violations, "objects_visible_after_hour_end_count": after_end}
+
+
+def s3_operation(entry) -> str:
+    """The S3 operation of one NGINX log entry, named from method and query."""
+    method = entry.get("method") or ""
+    uri = entry.get("request_uri") or entry.get("uri") or ""
+    query = urllib.parse.parse_qs(uri.partition("?")[2], keep_blank_values=True)
+    if "uploads" in query and method == "POST":
+        return "create_multipart_upload"
+    if "uploadId" in query:
+        return {"PUT": "upload_part" if "partNumber" in query else "put_object",
+                "POST": "complete_multipart_upload", "DELETE": "abort_multipart_upload",
+                "GET": "list_parts"}.get(method, "unknown")
+    if method == "GET" and ("list-type" in query or "prefix" in query):
+        return "list_objects"
+    return {"PUT": "put_object", "HEAD": "head_object", "GET": "get_object",
+            "DELETE": "delete_object", "POST": "post"}.get(method, "unknown")
+
+
+def engine_requests(entries, bucket) -> list:
+    """The access log entries of the exporter's own requests, each with its operation."""
+    found = []
+    for entry in entries:
+        uri = entry.get("request_uri") or entry.get("uri") or ""
+        if f"/{bucket}/otel/" in uri or (uri.startswith(f"/{bucket}") and "prefix=otel" in uri):
+            found.append(dict(entry, operation=s3_operation(entry)))
+    return found
+
+
+def _within(entry, start_unix, end_unix) -> bool:
+    """Whether a log entry completed inside [start, end); no end is open."""
+    try:
+        instant = float(entry["msec"])
+    except (KeyError, ValueError):
+        return False
+    return start_unix <= instant and (end_unix is None or instant < end_unix)
+
+
+def _float(value):
+    """A logged number, or None for NGINX's `-`."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def route_summary(requests, start_unix=None, end_unix=None) -> dict:
+    """Counts, statuses, latencies and upload bandwidth of the logged requests.
+
+    With `start_unix`, only requests that completed in [start, end) count.
+    """
+    chosen = [entry for entry in requests
+              if start_unix is None or _within(entry, start_unix, end_unix)]
+    by_operation = collections.defaultdict(collections.Counter)
+    latency = collections.defaultdict(list)
+    uploaded = 0.0
+    upload_time = 0.0
+    for entry in chosen:
+        by_operation[entry["operation"]][entry.get("status", "?")] += 1
+        seconds = _float(entry.get("request_time"))
+        if seconds is not None:
+            latency[entry["operation"]].append(seconds)
+        size = _float(entry.get("request_length"))
+        if entry["operation"] in ("put_object", "upload_part") and size and seconds:
+            uploaded += size
+            upload_time += seconds
+    return {
+        "requests_count": len(chosen),
+        "status_by_operation": {op: dict(counts) for op, counts in sorted(by_operation.items())},
+        "request_time_max_s_by_operation": {op: max(values)
+                                            for op, values in sorted(latency.items())},
+        "request_time_p50_s_by_operation": {
+            op: measurement.percentile(sorted(values), 0.5)
+            for op, values in sorted(latency.items())},
+        "http_503_writes_count": sum(1 for entry in chosen if entry.get("status") == "503"
+                                     and entry.get("method") in ("PUT", "POST")),
+        "upload_bytes": int(uploaded),
+        "upload_bytes_per_s": uploaded / upload_time if upload_time else None,
+    }
+
+
+MULTIPART_ETAG = re.compile(r'"?[0-9a-f]{32}-(\d+)"?')
+
+
+def multipart_evidence(requests, objects, part_bytes) -> dict:
+    """Whether the multipart path ran against the store, seen from both sides.
+
+    The route's trace must show CreateMultipartUpload, at least two
+    UploadPart and a CompleteMultipartUpload answered 2xx, and the store
+    must hold an object above `part_bytes` with a multipart ETag
+    (`"<md5>-<parts>"`). `applicable` says whether the store holds any
+    object above one part at all.
+    """
+    ok = collections.Counter(entry["operation"] for entry in requests
+                             if str(entry.get("status", "")).startswith("2"))
+    large = [item for item in objects if (item.get("size_bytes") or 0) > part_bytes]
+    multipart = [item for item in large if MULTIPART_ETAG.fullmatch(item.get("etag") or "")]
+    return {
+        "part_bytes": part_bytes,
+        "applicable": bool(large),
+        "exercised": (ok["create_multipart_upload"] >= 1 and ok["upload_part"] >= 2
+                      and ok["complete_multipart_upload"] >= 1 and bool(multipart)),
+        "create_multipart_upload_ok_count": ok["create_multipart_upload"],
+        "upload_part_ok_count": ok["upload_part"],
+        "complete_multipart_upload_ok_count": ok["complete_multipart_upload"],
+        "abort_multipart_upload_ok_count": ok["abort_multipart_upload"],
+        "objects_above_part_bytes_count": len(large),
+        "multipart_etag_objects_count": len(multipart),
+        "parts_per_object": sorted({int(MULTIPART_ETAG.fullmatch(item["etag"])[1])
+                                    for item in multipart}),
+        "example": ({key: multipart[0][key] for key in ("key", "size_bytes", "etag")}
+                    if multipart else None),
+    }
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+EVENT_LINE = re.compile(
+    r"\b(TRACE|DEBUG|INFO|WARN|ERROR)\s+\S*?(series_parquet\.[a-z_.]+): ([^\[]*)\[(.*)\]")
+
+
+def engine_events(log_text) -> dict:
+    """The exporter's flush, request and upload events, counted by name and outcome.
+
+    `failed_files` names the block file of every `flush.failed` event and
+    `cleanup_files` that of every `flush.cleanup` event, by outcome.
+    """
+    counts = collections.Counter()
+    samples = collections.defaultdict(list)
+    failed = []
+    cleanup = collections.defaultdict(list)
+    for line in log_text.splitlines():
+        match = EVENT_LINE.search(ANSI.sub("", line))
+        if not match:
+            continue
+        level, name, message, fields = match.groups()
+        if not name.startswith(("series_parquet.flush", "series_parquet.request",
+                                "series_parquet.upload")):
+            continue
+        outcome = re.search(r"\boutcome=([A-Za-z_]+)", fields)
+        key = f"{name}{{{outcome[1]}}}" if outcome else name
+        counts[key] += 1
+        if len(samples[key]) < 3:
+            samples[key].append(f"{level} {message.strip()} [{fields}]"[:400])
+        file = re.search(r"\bfile=([^,\s\]]+)", fields)
+        if file and name == "series_parquet.flush.failed":
+            failed.append(file[1])
+        elif file and name == "series_parquet.flush.cleanup":
+            cleanup[outcome[1] if outcome else "unknown"].append(file[1])
+    return {"counts": dict(sorted(counts.items())), "samples": dict(sorted(samples.items())),
+            "failed_files": failed, "cleanup_files": dict(sorted(cleanup.items()))}
+
+
+def failed_block_objects(events, objects) -> dict:
+    """The stored objects of every block whose flush failed, by block file name.
+
+    A failed block can leave some or all of its objects behind; their rows
+    are stored again when the nacked requests are resent.
+    """
+    return {name: sorted(item["key"] for item in objects if item["key"].endswith("/" + name))
+            for name in events["failed_files"]}
+
+
+def flat_totals(sample) -> dict:
+    """One sample's exporter gauges and counters, summed over its workers.
+
+    A labelled counter appears as its total and as `name.label` per label.
+    """
+    flat = collections.Counter()
+    for worker in (sample.get("workers") or {}).values():
+        for name, value in (worker.get("gauges") or {}).items():
+            if isinstance(value, (int, float)):
+                flat[name] += value
+    scalars = set(flat)
+    for entry in (sample.get("extras") or {}).values():
+        for name, value in entry.items():
+            if isinstance(value, (int, float)) and name not in scalars:
+                flat[name] += value
+            elif isinstance(value, dict) and name != "flush.duration":
+                for label, count in value.items():
+                    if isinstance(count, (int, float)):
+                        flat[name] += count
+                        flat[f"{name}.{label}"] += count
+    return dict(flat)
+
+
+def ledger_attempts(ledger, since_ns=0) -> dict:
+    """The producer's attempts started since `since_ns`, by outcome and status code.
+
+    A storage nack is a retryable attempt whose status message is the
+    exporter's storage sentence; a producer-local timeout is
+    DEADLINE_EXCEEDED, which the client raises itself.
+    """
+    with ledger.lock:
+        rows = ledger.connection.execute(
+            "SELECT outcome, detail, count(*) FROM attempts WHERE start_ns >= ? "
+            "GROUP BY outcome, detail", (int(since_ns),)).fetchall()
+    by_code = collections.Counter()
+    by_outcome = collections.Counter()
+    classes = collections.Counter()
+    for outcome, detail, count in rows:
+        detail = detail or ""
+        by_outcome[outcome] += count
+        by_code[detail.split(":", 1)[0].replace("StatusCode.", "") or "OK"] += count
+        if STORAGE_NACK_SENTENCE in detail:
+            classes[detail.split(STORAGE_NACK_SENTENCE, 1)[1].split(")", 1)[0]] += count
+    return {"by_outcome": dict(sorted(by_outcome.items())),
+            "by_code": dict(sorted(by_code.items())),
+            "storage_nacks_count": sum(classes.values()),
+            "storage_nack_classes": dict(classes),
+            "local_timeouts_count": by_code.get("DEADLINE_EXCEEDED", 0)}
+
+
+def ledger_acks(ledger) -> list:
+    """Every acknowledged request's acknowledgement instant, sorted."""
+    with ledger.lock:
+        return [row[0] for row in ledger.connection.execute(
+            "SELECT ack_ns FROM requests WHERE ack_ns IS NOT NULL ORDER BY ack_ns")]
+
+
+def duplicate_attribution(ledger) -> dict:
+    """Stored duplicates, split by whether the producer ever resent their request.
+
+    Runs after `read_oracle` loaded the stored rows into the ledger's
+    `actual` table.
+    """
+    with ledger.lock:
+        row = ledger.connection.execute(
+            "SELECT count(*), coalesce(sum(d.copies - 1), 0), "
+            "coalesce(sum(CASE WHEN t.n > 1 THEN 1 ELSE 0 END), 0) FROM ("
+            "SELECT e.record_id, e.request_id, count(a.record_id) AS copies "
+            "FROM records e JOIN actual a ON a.record_id = e.record_id "
+            "GROUP BY e.record_id HAVING count(a.record_id) > 1) d "
+            "JOIN (SELECT request_id, count(*) AS n FROM attempts GROUP BY request_id) t "
+            "ON t.request_id = d.request_id").fetchone()
+        resent = ledger.connection.execute(
+            "SELECT count(*) FROM (SELECT request_id FROM attempts GROUP BY request_id "
+            "HAVING count(*) > 1)").fetchone()[0]
+    duplicated, extra, replayed = (int(value) for value in row)
+    return {"duplicated_records": duplicated, "extra_copies_records": extra,
+            "duplicated_in_resent_requests_records": replayed,
+            "duplicated_outside_resent_requests_records": duplicated - replayed,
+            "resent_requests_count": int(resent)}
+
+
+class StoreLister:
+    """Lists the store directly every second and keeps each object's first sighting.
+
+    The listing bypasses NGINX and Toxiproxy, so it sees what the store
+    holds; a listing that fails while the store is stopped is counted.
+    """
+
+    def __init__(self, store, period_s=FAULT_LISTING_PERIOD_S):
+        self.store = store
+        self.period_s = period_s
+        self.first_listed = {}
+        self.errors = 0
+        self.listings = 0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def list_once(self) -> dict:
+        """Every object under the exporter prefix, with size, ETag and LastModified."""
+        found = {}
+        for page in self.store.client.get_paginator("list_objects_v2").paginate(
+                Bucket=self.store.bucket, Prefix="otel/"):
+            for item in page.get("Contents", []):
+                found[item["Key"]] = {
+                    "key": item["Key"], "size_bytes": int(item["Size"]),
+                    "etag": item.get("ETag"),
+                    "last_modified_unix_s": item["LastModified"].timestamp(),
+                }
+        return found
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                listed = self.list_once()
+                self.listings += 1
+                now = time.time()
+                for key in listed:
+                    self.first_listed.setdefault(key, now)
+            except Exception:  # noqa: BLE001 - a stopped store refuses; counted
+                self.errors += 1
+            _ = self._stop.wait(self.period_s)
+
+    def start(self):
+        """Start listing in a thread of its own."""
+        self._thread = threading.Thread(target=self._run, name="store-lister", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        """Stop listing."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30)
+
+    def objects(self) -> list:
+        """The final listing, each object with its first sighting."""
+        return [dict(item, first_listed_unix_s=self.first_listed.get(key))
+                for key, item in sorted(self.list_once().items())]
+
+
+def orphaned_uploads(store) -> list:
+    """The bucket's incomplete multipart uploads, read from the store directly."""
+    found = []
+    for page in store.client.get_paginator("list_multipart_uploads").paginate(
+            Bucket=store.bucket):
+        for upload in page.get("Uploads", []) or []:
+            found.append({"key": upload["Key"], "upload_id": upload["UploadId"],
+                          "initiated_unix_s": upload["Initiated"].timestamp()})
+    return found
+
+
+def failure_spec(family, fault, topology, store, *, ordinal=1, cores=None) -> measurement.RunSpec:
+    """The immutable inputs of one matrix cell."""
+    if fault not in FAILURE_FAMILIES.get(family, ()):
+        raise AssertionError(f"family {family} has no fault {fault}: {FAILURE_FAMILIES}")
+    command = capacity._command()
+    cores = tuple(cores or command.default_engine_cores(1))
+    case = f"failure-{family}-{fault}"
+    return measurement.RunSpec(
+        run_id=measurement.RunSpec.build_run_id(case, topology, store, cores,
+                                                FAULT_INTERVAL_S, int(ordinal)),
+        case=case, topology=topology, store=store, cores=cores, workload=FAULT_WORKLOAD,
+        interval_s=FAULT_INTERVAL_S,
+        duration_s=FAULT_MAX_REQUESTS // FAULT_RATE_REQUESTS_PER_S,
+        producer_timeout_s=FAULT_PRODUCER_TIMEOUT_S, max_in_flight=128,
+        overrides={
+            "rate_requests_per_s": FAULT_RATE_REQUESTS_PER_S,
+            "retry": shipped_s3_retry(), "exporter": FAULT_EXPORTER_MERGE,
+            "fault": fault, "producer_attempts": FAULT_PRODUCER_ATTEMPTS,
+            "baseline_s": FAULT_BASELINE_S, "after_s": FAULT_AFTER_S,
+            "observe_deadline_s": FAULT_OBSERVE_DEADLINE_S[fault],
+            "recovery_deadline_s": RECOVERY_DEADLINE_S,
+        },
+    )
+
+
+class FaultCase:
+    """One fault case as an observable state machine.
+
+    Every state is recorded with its monotonic and wall-clock instant and
+    the evidence that moved the case into it: `input_started`; `baseline`,
+    a completed values object HEADed in the store, a nonempty ACTIVE block
+    and live input; `armed`; `observed`, the fault's intended condition
+    (`FAULT_CONDITIONS`); `fault_removed`; `endpoint_healthy`, a signed HEAD
+    through the route answered; `resumed`, a values file written and a
+    request acknowledged after the removal; `input_stopped`; `drained`.
+    """
+
+    def __init__(self, spec, rig, store, engine, phase, ledger, lister, settings):
+        self.spec = spec
+        self.rig = rig
+        self.store = store
+        self.engine = engine
+        self.phase = phase
+        self.ledger = ledger
+        self.lister = lister
+        self.settings = settings
+        self.buffered = spec.topology == "buffered"
+        self.fault = spec.overrides["fault"]
+        self.flush_deadline_s = duration_s(settings["window"]["flush_retry_deadline"])
+        self.states = []
+        self.problems = []
+
+    def transition(self, state, evidence=None):
+        """Enter `state`, recording when and why."""
+        self.states.append({"state": state, "monotonic_ns": time.monotonic_ns(),
+                            "unix_s": time.time(), "evidence": evidence or {}})
+        sys.stderr.write(f"{self.spec.run_id}: {state}\n")
+
+    def at(self, state):
+        """The record of `state`, or None when the case never reached it."""
+        return next((entry for entry in self.states if entry["state"] == state), None)
+
+    def samples_since(self, monotonic_ns):
+        """The sampler's samples taken at or after `monotonic_ns`."""
+        return [sample for sample in list(self.phase.sampler.samples)
+                if sample["monotonic_ns"] >= monotonic_ns]
+
+    def totals(self):
+        """The latest sample's exporter totals."""
+        samples = list(self.phase.sampler.samples)
+        return flat_totals(samples[-1]) if samples else {}
+
+    def route_requests(self):
+        """The exporter's requests NGINX logged so far."""
+        return engine_requests(parse_access_log(self.rig.artifact_dir / ACCESS_LOG),
+                               self.store.bucket)
+
+    def delta(self, name, since_state):
+        """How much a total grew since `since_state` was entered."""
+        base = (self.at(since_state) or {}).get("evidence", {}).get("totals", {})
+        return self.totals().get(name, 0) - base.get(name, 0)
+
+    def retry_evidence(self, since_ns):
+        """The topology's evidence that a storage nack was retried.
+
+        Strict: the producer received the exporter's storage sentence as a
+        retryable refusal, and resends the same bytes. Buffered: the buffer
+        scheduled a retry of a nacked bundle.
+        """
+        if self.buffered:
+            scheduled = self.delta("buffer.retries.scheduled", "armed")
+            return {"buffer_retries_scheduled_count": scheduled, "retried": scheduled > 0}
+        attempts = ledger_attempts(self.ledger, since_ns)
+        return {"producer_storage_nacks_count": attempts["storage_nacks_count"],
+                "producer_local_timeouts_count": attempts["local_timeouts_count"],
+                "retried": attempts["storage_nacks_count"] > 0}
+
+    def observe_condition(self):
+        """What the armed fault has shown so far."""
+        armed = self.at("armed")
+        requests = [entry for entry in self.route_requests()
+                    if _within(entry, armed["unix_s"], None)]
+        observed = {
+            "elapsed_s": (time.monotonic_ns() - armed["monotonic_ns"]) / 1e9,
+            "flush_retries_count": self.delta("flush.retries", "armed"),
+            "flush_failures_count": self.delta("flush.failures.by_class", "armed"),
+            "storage_nacks_count": self.delta("nacks.storage", "armed"),
+            "http_503_writes_count": sum(1 for entry in requests if entry.get("status") == "503"
+                                         and entry.get("method") in ("PUT", "POST")),
+        }
+        if self.fault == "slow":
+            totals = [flat_totals(sample) for sample in self.samples_since(armed["monotonic_ns"])]
+            # Only requests that started under the fault show its delay.
+            started = [entry for entry in requests
+                       if float(entry["msec"]) - (_float(entry.get("request_time")) or 0)
+                       >= armed["unix_s"]]
+            observed["delayed_requests_count"] = sum(
+                1 for entry in started
+                if (_float(entry.get("request_time")) or 0) >= SLOW_DELAY_FLOOR_S)
+            observed["throttled_uploads_count"] = sum(
+                1 for entry in started
+                if entry["operation"] in ("put_object", "upload_part")
+                and (_float(entry.get("request_length")) or 0) >= PROBE_TRANSFER_BYTES
+                and (_float(entry.get("request_length")) or 0)
+                / max(_float(entry.get("request_time")) or 0, 1e-3)
+                <= 2 * SLOW_RATE_KBPS * 1000)
+            observed["flushing_with_work_samples_count"] = sum(
+                1 for entry in totals if entry.get("block.flushing", 0) > 0 and (
+                    entry.get("block.active", 0) > 0 or entry.get("block.pending", 0) > 0
+                    or entry.get("block.requests_pending", 0) > 0))
+            observed["admission_closed_s"] = self.delta("admission.closed.duration", "armed")
+            observed["receiver_rejections_count"] = self.delta("rejected", "armed")
+            in_flight = [entry.get("buffer.in.flight", 0) for entry in totals[-12:]]
+            observed["buffer_in_flight_plateau"] = bool(
+                self.buffered and len(in_flight) == 12 and min(in_flight) > 0
+                and max(in_flight) == min(in_flight)
+                and totals[-1].get("admission.closed", 0) > 0)
+        else:
+            observed.update(self.retry_evidence(armed["monotonic_ns"]))
+        return observed
+
+    def await_baseline(self):
+        """A durable baseline and live input, before any fault is armed."""
+        started = self.at("input_started")["monotonic_ns"]
+
+        def observe():
+            values = sorted(key for key in self.lister.first_listed if "dataset=values/" in key)
+            head = None
+            if values:
+                try:
+                    head = self.store.client.head_object(
+                        Bucket=self.store.bucket, Key=values[0]).get("ContentLength")
+                except ClientError:
+                    head = None
+            acks = ledger_acks(self.ledger)
+            totals = self.totals()
+            return {
+                "input_s": (time.monotonic_ns() - started) / 1e9,
+                "values_objects_count": len(values), "headed_values_bytes": head,
+                "block_active_bytes": totals.get("block.active", 0),
+                "requests_acked_count": len(acks),
+                "last_ack_age_s": (time.monotonic_ns() - acks[-1]) / 1e9 if acks else None,
+                "totals": totals,
+            }
+
+        evidence = measurement.wait_until(
+            observe, lambda seen: seen["input_s"] >= FAULT_BASELINE_S
+            and bool(seen["headed_values_bytes"]) and seen["block_active_bytes"] > 0
+            and seen["last_ack_age_s"] is not None
+            and seen["last_ack_age_s"] < 2 * FAULT_INTERVAL_S,
+            deadline_ns=started + 6 * FAULT_BASELINE_S * 10**9,
+            description="a HEADed values object, a nonempty ACTIVE block and live input",
+        )
+        self.transition("baseline", evidence)
+
+    def arm(self, parameters=None):
+        """Activate the fault, recording the totals it is measured against."""
+        totals = self.totals()
+        self.rig.activate(self.fault, parameters or {})
+        self.transition("armed", {"totals": totals, "activation": self.rig.activations[-1]})
+
+    def await_condition(self):
+        """Hold the fault until its intended condition is observed."""
+        armed = self.at("armed")
+        evidence = measurement.wait_until(
+            self.observe_condition, lambda seen: FAULT_CONDITIONS[self.fault](self, seen),
+            deadline_ns=armed["monotonic_ns"] + FAULT_OBSERVE_DEADLINE_S[self.fault] * 10**9,
+            description=f"the intended condition of {self.fault}",
+        )
+        evidence["totals"] = self.totals()
+        self.transition("observed", evidence)
+
+    def remove_fault(self, controls, store_cores):
+        """Remove the fault, then wait for a signed HEAD through the route."""
+        self.rig.recover()
+        self.transition("fault_removed", {"totals": self.totals(),
+                                          "recovery": self.rig.activations[-1].get("recovery")})
+        if self.fault == "store_outage":
+            pid = performance.container_pid(self.store.container)
+            if pid:
+                controls.register("store", pid, store_cores)
+        client = self.rig.route_client(read_timeout=10)
+        removed = self.at("fault_removed")
+
+        def observe():
+            try:
+                status = client.head_bucket(Bucket=self.store.bucket)["ResponseMetadata"][
+                    "HTTPStatusCode"]
+            except (ClientError, BotoCoreError) as error:
+                status = type(error).__name__
+            return {"head_bucket_status": status,
+                    "elapsed_s": (time.monotonic_ns() - removed["monotonic_ns"]) / 1e9}
+
+        evidence = measurement.wait_until(
+            observe, lambda seen: seen["head_bucket_status"] == 200,
+            deadline_ns=removed["monotonic_ns"] + ENDPOINT_HEALTH_DEADLINE_S * 10**9,
+            description="a signed HEAD of the bucket through the route",
+        )
+        self.transition("endpoint_healthy", evidence)
+
+    def recovery_deadline_ns(self):
+        """The fixed total deadline of everything after endpoint health."""
+        return self.at("endpoint_healthy")["monotonic_ns"] + RECOVERY_DEADLINE_S * 10**9
+
+    def await_resumed(self):
+        """A values file written and a request acknowledged after the removal."""
+        removed = self.at("fault_removed")
+
+        def observe():
+            acks = [ack for ack in ledger_acks(self.ledger) if ack >= removed["monotonic_ns"]]
+            return {"values_files_written_count": self.delta("files.written.values",
+                                                               "fault_removed"),
+                    "exporter_acks_count": self.delta("acks", "fault_removed"),
+                    "producer_acks_count": len(acks)}
+
+        evidence = measurement.wait_until(
+            observe, lambda seen: seen["values_files_written_count"] > 0
+            and seen["exporter_acks_count"] > 0 and seen["producer_acks_count"] > 0,
+            deadline_ns=self.recovery_deadline_ns(),
+            description="a values file and an acknowledgement after the fault's removal",
+        )
+        self.transition("resumed", evidence)
+
+    def await_after_input(self):
+        """FAULT_AFTER_S worth of requests acknowledged after the exporter resumed."""
+        resumed = self.at("resumed")
+        wanted = FAULT_AFTER_S * FAULT_RATE_REQUESTS_PER_S
+
+        def observe():
+            acks = [ack for ack in ledger_acks(self.ledger) if ack >= resumed["monotonic_ns"]]
+            return {"requests_acked_since_resumed_count": len(acks)}
+
+        return measurement.wait_until(
+            observe, lambda seen: seen["requests_acked_since_resumed_count"] >= wanted,
+            deadline_ns=self.recovery_deadline_ns(),
+            description=f"{wanted} requests acknowledged after the exporter resumed",
+        )
+
+    def attempt(self, step, *args):
+        """Run one step; a failure is recorded and ends the fault sequence."""
+        try:
+            step(*args)
+            return True
+        except AssertionError as error:
+            self.problems.append(f"{step.__name__}: {error}"[:2000])
+            sys.stderr.write(f"{self.spec.run_id}: {step.__name__} failed: {error}\n"[:2000])
+            return False
+
+
+def _slow_met(case, seen) -> bool:
+    """Slow: a delayed response and a throttled upload that both started under
+    the fault, a flush with work behind it, and backpressure: the exporter
+    closed admission for at least a window, the receiver refused, or the
+    buffer's in-flight bundles held still while admission was closed."""
+    backpressure = (seen["admission_closed_s"] >= FAULT_INTERVAL_S
+                    or seen["receiver_rejections_count"] > 0
+                    or seen["buffer_in_flight_plateau"])
+    return (seen["delayed_requests_count"] > 0 and seen["throttled_uploads_count"] > 0
+            and seen["flushing_with_work_samples_count"] > 0 and backpressure)
+
+
+def _http503_met(case, seen) -> bool:
+    """503: a write answered 503, the exporter retried and nacked, and the nack was retried."""
+    return (seen["http_503_writes_count"] > 0 and seen["flush_retries_count"] > 0
+            and seen["storage_nacks_count"] > 0 and seen["retried"])
+
+
+def _outage_met(case, seen) -> bool:
+    """Outage: a flush failed past the flush deadline, was nacked, and the nack retried."""
+    return (seen["elapsed_s"] >= case.flush_deadline_s and seen["flush_failures_count"] > 0
+            and seen["storage_nacks_count"] > 0 and seen["retried"])
+
+
+FAULT_CONDITIONS = {"slow": _slow_met, "http503": _http503_met, "store_outage": _outage_met}
+
+
+def phase_throughput(acks_ns, objects, case) -> dict:
+    """Acknowledged records and object bytes per second before, during and after the fault."""
+    edges = {
+        "before": ("input_started", "armed"),
+        "during": ("armed", "endpoint_healthy"),
+        "after": ("endpoint_healthy", "input_stopped"),
+    }
+    rows = case.spec.workload.records_per_request
+    report = {}
+    for name, (first_state, last_state) in edges.items():
+        first, last = case.at(first_state), case.at(last_state)
+        if not first or not last:
+            report[name] = None
+            continue
+        seconds = (last["monotonic_ns"] - first["monotonic_ns"]) / 1e9
+        acked = sum(1 for ack in acks_ns if first["monotonic_ns"] <= ack < last["monotonic_ns"])
+        written = sum(item["size_bytes"] for item in objects
+                      if first["unix_s"] <= (item.get("first_listed_unix_s") or 0) < last["unix_s"])
+        report[name] = {"duration_s": seconds,
+                        "acked_records_per_s": acked * rows / seconds if seconds > 0 else None,
+                        "object_bytes_per_s": written / seconds if seconds > 0 else None}
+    return report
+
+
+def resource_bounds(samples, settings, buffered, baseline_oldest_s) -> dict:
+    """The retained-state invariants over every sample of one case.
+
+    ACTIVE and FLUSHING within `window.max_block_bytes`, the series cache
+    within its capacity, at most one pending slot, accounted memory within
+    the budget, the buffer within its cap with nothing lost, and the oldest
+    unacknowledged age back at its baseline once drained.
+    """
+    block_limit = soak_byte_size(settings["window"]["max_block_bytes"])
+    cache_limit = int(settings["series_cache"]["max_entries"])
+    problems = set()
+    peaks = collections.Counter()
+    for sample in samples:
+        totals = flat_totals(sample)
+        for name in ("block.active", "block.flushing", "block.pending", "memory.accounted",
+                     "series_cache.entries", "block.pending_slot_occupied",
+                     "buffer.storage.bytes.used", "oldest_unacked.age", "admission.closed"):
+            peaks[name] = max(peaks[name], totals.get(name, 0))
+        peaks["process_rss_bytes"] = max(peaks["process_rss_bytes"],
+                                         sample.get("process_rss_bytes") or 0)
+        if totals.get("memory.accounted", 0) > totals.get("memory.budget", float("inf")):
+            problems.add("accounted over budget")
+        for name in ("block.active", "block.flushing"):
+            if totals.get(name, 0) > block_limit:
+                problems.add(f"{name} over {block_limit} bytes")
+        if totals.get("series_cache.entries", 0) > cache_limit:
+            problems.add("series cache over its capacity")
+        if totals.get("block.pending_slot_occupied", 0) > 1:
+            problems.add("more than one pending slot")
+        cap = totals.get("buffer.storage.bytes.cap")
+        if buffered and cap and totals.get("buffer.storage.bytes.used", 0) > cap:
+            problems.add("buffer over its size cap")
+    final = flat_totals(samples[-1]) if samples else {}
+    losses = {name: value for name, value in final.items()
+              if name.startswith("buffer.loss.items") and value}
+    if losses:
+        problems.add(f"buffer loss {losses}")
+    if final.get("buffer.bundles.resolved.permanently_rejected"):
+        problems.add("bundles permanently rejected")
+    if final.get("buffer.ingest.failures"):
+        problems.add("buffer ingest failures")
+    oldest = final.get("oldest_unacked.age")
+    if oldest is None or oldest > max(baseline_oldest_s, 0.0) + FAULT_INTERVAL_S:
+        problems.add(f"oldest unacknowledged age {oldest} s did not return to its baseline "
+                     f"{baseline_oldest_s} s")
+    return {"problems": sorted(problems), "peaks": dict(peaks),
+            "block_limit_bytes": block_limit, "series_cache_limit_entries": cache_limit,
+            "baseline_oldest_unacked_age_s": baseline_oldest_s,
+            "final_oldest_unacked_age_s": oldest}
+
+
+def straddle_arm_instant(now_unix_s) -> float:
+    """When a straddling cell arms: STRADDLE_ARM_BEFORE_END_S before the first
+    hour end that leaves at least STRADDLE_LEAD_S to start the cell."""
+    end = (int(now_unix_s + STRADDLE_LEAD_S + STRADDLE_ARM_BEFORE_END_S) // 3600 + 1) * 3600
+    return end - STRADDLE_ARM_BEFORE_END_S
+
+
+def await_wall_clock(instant_unix_s, description):
+    """Wait until the wall clock reaches `instant_unix_s`, observing it."""
+    return measurement.wait_until(
+        time.time, lambda now: now >= instant_unix_s,
+        deadline_ns=time.monotonic_ns() + int((instant_unix_s - time.time() + 60) * 1e9),
+        description=description,
+    )
+
+
+def failure_prerequisites(store) -> dict:
+    """Docker, both fault images and the store image, before any lease or traffic.
+
+    A missing one skips an optional lane and fails a required one
+    (`tools_unavailable`, `test_e2e.require_docker_image`).
+    """
+    images = require_fault_images()
+    images["store"] = test_e2e.require_docker_image(store)
+    return images
+
+
+def failure_experiment(spec, result, output_dir, controls, *, provenance, options):
+    """One fault case: baseline, fault, recovery, drain, read-back and verdicts."""
+    command = capacity._command()
+    output_dir = Path(output_dir)
+    buffered = spec.topology == "buffered"
+    topology = measurement.core_topology()
+    allocation = measurement.role_allocation(
+        topology["sibling_groups"], sorted(os.sched_getaffinity(0)), spec.cores,
+        roles=measurement.CASE_ROLES["faults"],
+    )
+    groups = capacity.producer_placement(options.get("producer_cpus", capacity.PRODUCER_CPUS),
+                                         topology["sibling_groups"], allocation)
+    if groups:
+        allocation["producer"] = sorted(core for group in groups for core in group)
+    controls.allocate(allocation)
+    controls.register("harness", os.getpid())
+    result["environment"]["build"] = provenance["build"]
+    result["environment"]["git"] = provenance["git"]
+    arm_at = straddle_arm_instant(time.time()) if options.get("straddle_hour") else None
+    if arm_at is not None:
+        result["config"]["straddle"] = {"arm_at_unix_s": arm_at,
+                                        "arm_before_hour_end_s": STRADDLE_ARM_BEFORE_END_S}
+        _ = await_wall_clock(arm_at - STRADDLE_LEAD_S, "the straddling cell's start")
+    ledger = measurement.Ledger(output_dir / "ledger.sqlite")
+    record = {}
+    engine = phase = case = lister = None
+    local = output_dir / "store"
+    with test_e2e.DockerStore(spec.store, by_image_id=True) as store:
+        store_cores = allocation.get("store", [])
+        pinned = performance.pin_container(store.container, store_cores)
+        store_pid = performance.container_pid(store.container)
+        if store_pid and store_cores:
+            controls.register("store", store_pid, store_cores)
+        result["ephemeral_values"] = {"<store_endpoint>": store.endpoint}
+        rig = FaultRig(store, output_dir / "rig", cores=allocation.get("fault_tools") or None)
+        with rig:
+            root = output_dir / "engine-1"
+            root.mkdir(parents=True, exist_ok=True)
+            with capacity.malloc_conf(capacity.JEMALLOC_STATS_CONF):
+                engine = test_e2e.Engine(
+                    root, storage=rig.storage, launcher=rig.launcher,
+                    overrides={"retry": spec.overrides["retry"]},
+                    interval=f"{spec.interval_s}s", topology=spec.topology,
+                    buffer_path=output_dir / "buffer" if buffered else None,
+                    cores=list(spec.cores), merge={"exporter": spec.overrides["exporter"]},
+                    binary=Path(provenance["build"]["binary"]),
+                )
+            try:
+                settings = exporter_settings(engine.config)
+                result["config"]["effective"] = engine.config
+                result["config"]["effective_sha256"] = engine.config_sha256
+                result["config"]["edges"] = [list(edge) for edge in engine.edges]
+                result["config"]["malloc_conf"] = capacity.JEMALLOC_STATS_CONF
+                result["config"]["store_pinned"] = pinned
+                result["ephemeral_values"]["<receiver_listening_addr>"] = \
+                    f"127.0.0.1:{engine.grpc_port}"
+                command.record_graph(result, engine, spec.topology)
+                phase = capacity.CapacityPhase(command, "engine-1", engine, spec, controls,
+                                               buffered)
+                phase.ready("start")
+                lister = StoreLister(store).start()
+                producer = measurement.Producer(
+                    engine.channel, ledger, spec.workload, cores=allocation.get("producer", []),
+                    timeout_s=spec.producer_timeout_s, max_in_flight=spec.max_in_flight,
+                    retry_attempts=FAULT_PRODUCER_ATTEMPTS,
+                )
+                case = FaultCase(spec, rig, store, engine, phase, ledger, lister, settings)
+                _ = command.await_window_start(spec.interval_s)
+                controls.raise_if_invalid()
+                stop = threading.Event()
+                sent = {}
+
+                def produce():
+                    sent["outcome"] = producer.send_paced(
+                        range(spec.workload.requests), FAULT_RATE_REQUESTS_PER_S, stop=stop)
+
+                sender = threading.Thread(target=produce, name="fault-producer")
+                case.transition("input_started")
+                sender.start()
+                try:
+                    if case.attempt(case.await_baseline):
+                        if arm_at is not None:
+                            _ = await_wall_clock(arm_at, "the straddling fault's arming instant")
+                        case.arm(options.get("fault_parameters"))
+                        case.attempt(case.await_condition)
+                        # The fault is removed whether or not it showed its condition.
+                        if case.attempt(case.remove_fault, controls, store_cores) \
+                                and case.attempt(case.await_resumed):
+                            case.attempt(case.await_after_input)
+                finally:
+                    if rig.active:
+                        rig.recover()
+                    stop.set()
+                    sender.join()
+                case.transition("input_stopped", {"outcome": sent.get("outcome")})
+                if "outcome" not in sent:
+                    raise AssertionError("the producer did not finish")
+                phase.inputs.append(sent["outcome"])
+                controls.raise_if_invalid()
+                if case.attempt(phase.drained):
+                    case.transition("drained", {"drain": phase.drain})
+                record["final_totals"] = flat_totals(phase.sampler.samples[-1])
+                _ = controls.snapshot(
+                    "end", {"engine": (engine.pid, list(spec.cores))},
+                    workers=phase.workers, requested_cores=list(spec.cores),
+                )
+                controls.unwatch_workers()
+                engine.shutdown(command.SHUTDOWN_DEADLINE_S)
+                command.record_event(result, "engine_shut_down", str(engine.pid))
+            finally:
+                controls.unwatch_workers()
+                if phase is not None and phase.sampler is not None:
+                    phase.sampler.stop()
+                if lister is not None:
+                    lister.stop()
+                engine.close()
+            record["residual_state"] = rig.residual_state()
+            record["requests"] = case.route_requests()
+            record["events"] = engine_events(Path(engine.log.name).read_text(errors="replace"))
+        record["rig"] = rig.evidence()
+        record["rig_cleanup_clean"] = bool((rig.cleanup_report or {}).get("clean"))
+        record["objects"] = lister.objects()
+        record["listing"] = {"listings_count": lister.listings, "errors_count": lister.errors}
+        try:
+            record["orphans"] = orphaned_uploads(store)
+        except (ClientError, BotoCoreError) as error:
+            record["orphans"] = f"{type(error).__name__}: {error}"
+        store.download(local)
+    samples = list(phase.sampler.samples)
+    summary = phase.summary()
+    residuals, heap = capacity.trial_residuals(samples, phase.capacity_idle,
+                                               getattr(phase.sampler, "pairs", ()))
+    summary["residuals"] = residuals
+    result["observations"] = {
+        "phases": [summary],
+        "residual_excursions": measurement.residual_excursions(
+            residuals, list(getattr(phase.sampler, "pairs", ())),
+            max((s["process_rss_bytes"] for s in samples), default=0)),
+        "rss_heap_term": heap,
+    }
+    result["samples"] = [dict(measurement.compact_sample(s), extras=s.get("extras"))
+                         for s in samples[::capacity.PUBLISHED_SAMPLE_STRIDE * 4]]
+    oracle_error = None
+    try:
+        oracle = measurement.run_pinned(
+            performance.oracle_cores(allocation, topology["sibling_groups"])
+            or sorted(os.sched_getaffinity(0)),
+            measurement.read_oracle, local, ledger, require_all=True, healthy=False,
+            workload=spec.workload,
+        )
+        acked_scope = measurement._compare(ledger, require_all=False, healthy=False)
+        record["duplicates"] = duplicate_attribution(ledger)
+    except AssertionError as error:
+        oracle_error = str(error)[:2000]
+        oracle = {"passed": False, "problems": [oracle_error], "readers": {},
+                  "multiplicity_histogram": {}, "missing_record_count": None,
+                  "unexpected_record_count": None, "corrupt_record_count": None}
+        acked_scope = {"missing_record_count": None}
+        record["duplicates"] = None
+    shutil.rmtree(local, ignore_errors=True)
+    counts = ledger.counts()
+    latencies = ledger.acknowledgement_latencies_s()
+    record["acks_ns"] = ledger_acks(ledger)
+    record["attempts"] = ledger_attempts(ledger)
+    ledger.close()
+    sent_spec = dataclasses.replace(spec, workload=dataclasses.replace(
+        spec.workload, requests=counts["requests_attempted_count"]))
+    # The producer stops on the case's own schedule, so what it sent is what it intended.
+    command.settle_local_result(result, sent_spec, [phase], oracle, counts, latencies,
+                                output_dir)
+    settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts)
+
+
+def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts):
+    """The fault checks, metrics and observations beside the common ones."""
+    checks = result["checks"]
+    metrics = result["metrics"]
+    observations = result["observations"]
+    samples = list(case.phase.sampler.samples)
+    final = record.get("final_totals") or {}
+
+    def hard(name, passed, detail):
+        checks.append(measurement.check(
+            name, measurement.CHECK_HARD,
+            measurement.STATUS_PASSED if passed else measurement.STATUS_FAILED,
+            str(detail)[:1500]))
+
+    def span(first, last):
+        a, b = case.at(first), case.at(last)
+        return (b["monotonic_ns"] - a["monotonic_ns"]) / 1e9 if a and b else None
+
+    observed = case.at("observed")
+    hard("fault_observed", observed is not None,
+         json.dumps({key: value for key, value in observed["evidence"].items()
+                     if key != "totals"}) if observed
+         else "; ".join(case.problems) or "the condition was never observed")
+    recovered_s = span("endpoint_healthy", "drained")
+    hard("recovered", case.at("resumed") is not None and recovered_s is not None
+         and recovered_s <= RECOVERY_DEADLINE_S,
+         f"endpoint healthy to drained {recovered_s} s against {RECOVERY_DEADLINE_S} s; "
+         f"resumed {bool(case.at('resumed'))}; problems {case.problems}")
+    drain = case.phase.drain or {}
+    hard("drained", bool(drain.get("drained")), f"drain {drain}")
+    missing_acked = acked_scope.get("missing_record_count")
+    all_acked = counts["requests_acked_count"] == counts["requests_attempted_count"]
+    hard("at_least_once", oracle.get("passed") is True and missing_acked == 0 and all_acked,
+         f"missing acked {missing_acked}; missing sent {oracle.get('missing_record_count')}; "
+         f"unexpected {oracle.get('unexpected_record_count')}; corrupt "
+         f"{oracle.get('corrupt_record_count')}; acked {counts['requests_acked_count']}/"
+         f"{counts['requests_attempted_count']} requests; histogram "
+         f"{oracle.get('multiplicity_histogram')}")
+    readers_disagree = bool(oracle_error and "reader disagreement" in oracle_error)
+    hard("descriptor_coverage", oracle_error is None or readers_disagree,
+         oracle_error or f"{oracle.get('descriptor_identity_count')} descriptor identities "
+         "cover every values row in its partition and writer")
+    hard("reader_agreement", oracle_error is None and bool(oracle.get("readers")),
+         oracle_error or f"DuckDB and clickhouse-local agree: {oracle.get('readers')}")
+    baseline = (case.at("baseline") or {}).get("evidence", {}).get("totals", {})
+    bounds = resource_bounds(samples, case.settings, case.buffered,
+                             baseline.get("oldest_unacked.age", 0.0))
+    rss = next((entry for entry in checks if entry["name"] == "rss_reconciliation"), None)
+    hard("bounded_resources", not bounds["problems"],
+         "; ".join(bounds["problems"]) or f"peaks {bounds['peaks']}; rss reconciliation "
+         f"{rss and rss['status']}")
+    part_bytes = soak_byte_size(case.settings["upload"]["part_bytes"])
+    multipart = multipart_evidence(record["requests"], record["objects"], part_bytes)
+    hard("multipart_exercised", multipart["exercised"], json.dumps(
+        {key: value for key, value in multipart.items() if key != "example"}))
+    abort_failures = int(final.get("flush.abort_failures", 0))
+    orphans = record["orphans"]
+    if isinstance(orphans, list):
+        unexpected = max(0, len(orphans) - abort_failures)
+        hard("orphaned_uploads_expected", unexpected == 0,
+             f"{len(orphans)} incomplete multipart uploads; {abort_failures} reported abort "
+             f"failures may each leave one; unexpected {unexpected}: {orphans[:5]}")
+    else:
+        hard("orphaned_uploads_expected", False, f"the uploads could not be listed: {orphans}")
+    lateness = partition_lateness(record["objects"], lateness_bound_s(case.settings))
+    hard("partition_lateness_bound", not lateness["violations"],
+         f"bound {lateness['bound_s']} s; violations {lateness['violations']}; hours "
+         f"{lateness['hours']}")
+    duplicates = record.get("duplicates") or {}
+    nacked_records = int(final.get("nacks", 0)) * case.spec.workload.records_per_request
+    if case.buffered:
+        explained = duplicates.get("extra_copies_records", 0) <= nacked_records
+        why = (f"{duplicates.get('extra_copies_records')} extra copies against "
+               f"{nacked_records} records in bundles the exporter nacked")
+    else:
+        explained = duplicates.get("duplicated_outside_resent_requests_records", 0) == 0
+        why = (f"{duplicates.get('duplicated_outside_resent_requests_records')} duplicated "
+               f"records outside the {duplicates.get('resent_requests_count')} resent requests")
+    hard("duplicates_explained", bool(duplicates) and explained, why)
+    hard("fault_rig_clean", record["residual_state"].get("clean") and record["rig_cleanup_clean"],
+         f"residual {record['residual_state'].get('clean')}; cleanup "
+         f"{record['rig_cleanup_clean']}")
+    armed = case.at("armed")
+    removed = case.at("fault_removed")
+    during = route_summary(record["requests"], armed and armed["unix_s"],
+                           removed and removed["unix_s"]) if armed else None
+    # Only memory and the correctness counts are compared metrics; every
+    # other number depends on where in a window the fault landed.
+    for name in list(metrics):
+        if name not in FAULT_DIRECTIONS:
+            observations[name] = metrics.pop(name)
+    accounted = [capacity.extras_total(s, "memory.accounted") for s in samples]
+    buffer_used = [flat_totals(s).get("buffer.storage.bytes.used", 0) for s in samples]
+    metrics["accounted_peak_bytes"] = max(accounted) if accounted else None
+    metrics["missing_acked_records"] = missing_acked
+    if case.buffered:
+        metrics["buffer_storage_peak_bytes"] = max(buffer_used) if buffer_used else None
+    numbers = {
+        "records_offered_records": counts["records_attempted_count"],
+        "records_acked_records": counts["records_acked_count"],
+        "records_stored_records": oracle.get("actual_row_count"),
+        "requests_offered_count": counts["requests_attempted_count"],
+        "duplicate_records": duplicates.get("duplicated_records"),
+        "duplicate_extra_copies_records": duplicates.get("extra_copies_records"),
+        "http_503_responses_count": (sum(
+            count for statuses in during["status_by_operation"].values()
+            for status, count in statuses.items() if status == "503") if during else None),
+        "fault_duration_s": span("armed", "fault_removed"),
+        "time_to_condition_s": span("armed", "observed"),
+        "recovery_s": span("endpoint_healthy", "resumed"),
+        "endpoint_healthy_to_drained_s": recovered_s,
+        "drain_s": span("input_stopped", "drained"),
+        "flush_retries_count": final.get("flush.retries"),
+        "flush_failures_count": final.get("flush.failures.by_class", 0),
+        "flush_failures_by_class": {key.split(".", 3)[-1]: value for key, value in final.items()
+                                    if key.startswith("flush.failures.by_class.")},
+        "flush_abort_failures_count": final.get("flush.abort_failures"),
+        "flush_late_commits_count": final.get("flush.late_commits"),
+        "exporter_nacks_by_class": {key.split(".", 1)[1]: value for key, value in final.items()
+                                    if key.startswith("nacks.") and value},
+        "producer_storage_nacks_count": record["attempts"]["storage_nacks_count"],
+        "producer_local_timeouts_count": record["attempts"]["local_timeouts_count"],
+        "producer_resent_requests_count": duplicates.get("resent_requests_count"),
+        "buffer_retries_scheduled_count": (final.get("buffer.retries.scheduled", 0)
+                                           if case.buffered else None),
+        "orphaned_uploads_count": len(orphans) if isinstance(orphans, list) else None,
+        "multipart_uploads_count": multipart["complete_multipart_upload_ok_count"],
+        "partition_visibility_max_after_hour_end_s": max(
+            (value for entry in lateness["hours"].values()
+             for value in (entry["latest_last_modified_after_end_s"],
+                           entry["latest_first_listed_after_end_s"]) if value is not None),
+            default=None),
+        "peak_rss_bytes": metrics.get("peak_rss_bytes"),
+        "accounted_peak_bytes": metrics["accounted_peak_bytes"],
+        "buffer_storage_peak_bytes": metrics.get("buffer_storage_peak_bytes"),
+    }
+    for name, value in metrics.items():
+        if value is None:
+            result["metrics_unavailable"][name] = "not observed in this run"
+        else:
+            result["metrics_unavailable"].pop(name, None)
+    for name in list(result["metrics_unavailable"]):
+        if name not in metrics:
+            del result["metrics_unavailable"][name]
+    result["metric_directions"] = {name: FAULT_DIRECTIONS[name] for name in metrics}
+    result["mandatory_metrics"] = sorted(metrics)
+    observations["fault"] = {
+        "fault": case.fault,
+        "numbers": numbers,
+        "failed_block_objects": failed_block_objects(record["events"], record["objects"]),
+        "states": [{key: value for key, value in state.items() if key != "evidence"}
+                   | {"evidence": {k: v for k, v in state["evidence"].items() if k != "totals"}}
+                   for state in case.states],
+        "problems": case.problems,
+        "multiplicity_histogram": oracle.get("multiplicity_histogram"),
+        "duplicates": duplicates,
+        "producer_attempts": record["attempts"],
+        "final_totals": {key: value for key, value in final.items()
+                         if key.startswith(("flush.", "nacks", "acks", "buffer.", "files.",
+                                            "admission.", "oldest", "rejected"))},
+        "route": {
+            "whole": route_summary(record["requests"]),
+            "during_fault": during,
+        },
+        "multipart": multipart,
+        "orphaned_uploads": orphans,
+        "orphaned_uploads_expected_max_count": abort_failures,
+        "partition_lateness": lateness,
+        "engine_events": record["events"],
+        "throughput_by_phase": phase_throughput(record["acks_ns"], record["objects"], case),
+        "resources": bounds,
+        "listing": record["listing"],
+        "objects_count": len(record["objects"]),
+        "recovery_deadline_s": RECOVERY_DEADLINE_S,
+        "rig": {key: record["rig"][key] for key in ("run_id", "store", "images",
+                                                    "toxiproxy_version", "activations",
+                                                    "access_log_requests_count", "cleanup")},
+    }
+    result["artifacts"].append(dict(
+        measurement.file_entry(case.rig.artifact_dir / ACCESS_LOG), kind="access_log",
+        retention=str(case.rig.root)))
+
+
+def soak_byte_size(text) -> int:
+    """A byte size such as `5MiB`, read by the soak's parser."""
+    try:
+        from . import soak
+    except ImportError:
+        import soak
+    return soak.byte_size(text)
+
+
+def fault_check(result: dict) -> None:
+    """Fail unless a fault case proved its fault, recovered and lost nothing.
+
+    Every check in `FAULT_CHECKS` must have passed, no acknowledged record
+    may be missing, and the duplicates must have been measured.
+    """
+    statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
+    for name in FAULT_CHECKS:
+        if statuses.get(name) != measurement.STATUS_PASSED:
+            detail = next((entry["detail"] for entry in result["checks"]
+                           if entry["name"] == name), "never checked")
+            raise AssertionError(f"failed required fault check: {name}: {detail}")
+    if result["metrics"].get("missing_acked_records") != 0:
+        raise AssertionError("acknowledged supported record missing")
+    fault = result.get("observations", {}).get("fault") or {}
+    histogram = fault.get("multiplicity_histogram")
+    if not isinstance(histogram, dict) or not histogram:
+        raise AssertionError("multiplicity histogram absent")
+    if not isinstance((fault.get("numbers") or {}).get("duplicate_records"), int):
+        raise AssertionError("duplicates were not measured")
+
+
+def failure_case(family: str, fault: str, topology: str, store: str, output_dir: Path, *,
+                 report_dir=None, ordinal=None, lease_wait_s=3600.0, archive_dir=None,
+                 **options) -> dict:
+    """Run one matrix cell and return its result.
+
+    Prerequisites are checked before the lease and before any traffic: a
+    missing one skips an optional lane and fails a required one. Anything
+    after that, a fault activation error included, is a failure.
+    """
+    command = capacity._command()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _ = failure_prerequisites(store)
+    provenance = command.prepare_build()
+    if ordinal is None:
+        ordinal = capacity.next_ordinal_factory(
+            measurement.resolve_report_dir(report_dir), output_dir,
+            prefix=f"failure-{family}-{fault}-{topology}-{store}-")()
+    spec = failure_spec(family, fault, topology, store, ordinal=ordinal,
+                        cores=options.get("cores"))
+    run_dir = output_dir / spec.run_id
+
+    def experiment(spec_, result, directory, controls):
+        failure_experiment(spec_, result, directory, controls, provenance=provenance,
+                           options=options)
+
+    try:
+        result = command.run_case(spec, run_dir, experiment=experiment, report_dir=report_dir,
+                                  evaluate=True, lease_wait_s=float(lease_wait_s))
+    except Exception as error:  # noqa: BLE001 - recorded in the result
+        sys.stderr.write(f"{spec.run_id}: {type(error).__name__}: {error}\n")
+        result = json.loads((run_dir / f"{spec.run_id}.json").read_text(encoding="ascii"))
+    for entry in [{"name": f"{spec.run_id}.json"}] + result["baseline_files"]:
+        _ = shutil.copyfile(run_dir / entry["name"], output_dir / entry["name"])
+    capacity.archive_trial({"archive_dir": archive_dir or FAULT_ARCHIVE_DIR}, run_dir)
+    for child in ("buffer", "engine-1/data"):
+        shutil.rmtree(run_dir / child, ignore_errors=True)
+    return result
+
+
+FAILURE_STATE = "failures-state.json"
+
+
+def run_failures(output_dir, report_dir=None, *, family="s3", faults=None, topologies=None,
+                 stores=None, purposes=None, straddle_cells=(), **options) -> dict:
+    """`measure failures`: every requested cell of one family, then its index.
+
+    The family state in the output directory remembers the latest run of
+    every cell, so a later invocation can run some cells again; the index
+    `failure-<family>.json` lists the latest run of each cell, and a rerun
+    names why it was made through `purposes`.
+    """
+    command = capacity._command()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / FAILURE_STATE
+    state = json.loads(state_path.read_text()) if state_path.is_file() else {}
+    cells = state.setdefault(family, {})
+    reasons = state.setdefault("purposes", {})
+    matrix = [f"{fault}-{topology}-{store}" for fault in faults or FAILURE_FAMILIES[family]
+              for topology in topologies or FAILURE_TOPOLOGIES
+              for store in stores or PREFLIGHT_STORES]
+    # A straddling cell waits for an hour end, so it runs after the others.
+    matrix.sort(key=lambda cell: cell in straddle_cells)
+    for cell in matrix:
+        fault, topology, store = cell.rsplit("-", 2)
+        previous = cells.get(cell)
+        result = failure_case(family, fault, topology, store, output_dir,
+                              report_dir=report_dir, straddle_hour=cell in straddle_cells,
+                              **options)
+        cells[cell] = result["run_id"]
+        if previous and (purposes or {}).get(cell):
+            reasons[result["run_id"]] = f"replaces {previous}: {purposes[cell]}"
+        failed = [entry["name"] for entry in result["checks"] if entry["status"] != "passed"]
+        sys.stderr.write(f"{result['run_id']}: {result['status']} failed checks {failed}\n")
+        state_path.write_text(json.dumps(state, indent=2, sort_keys=True))
+    children = [json.loads((output_dir / f"{run_id}.json").read_text(encoding="ascii"))
+                for _cell, run_id in sorted(cells.items())]
+    return command.write_index(f"failure-{family}", output_dir, report_dir, children,
+                               publishable=True, purposes=reasons)
