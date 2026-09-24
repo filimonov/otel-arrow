@@ -353,7 +353,11 @@ Options: `stores`, `core_counts`, `steps`, `rehearsal=true` with its own
 `report_dir` (six-second intervals, nothing published to the report
 directory), `trial={...}` for the `trial` step, `fan_in`, `rows`,
 `high_cardinality_rate`, `upload_concurrencies`, `producer_cpus`,
-`producer_processes`, `archive_dir`, `lease_wait_s`, `family_ordinal`.
+`producer_processes`, `archive_dir`, `lease_wait_s`, `family_ordinal`, and
+`unmeasurable_above={"cell": [rate]}`: a rate whose trials the host could
+not measure validly (the overload starved the build monitor) steers the
+bisection from above but never becomes the unsustainable bound, so a
+search bounded only by it reports a lower bound.
 
 The remaining subcommands (`soak`, `failures`, `buffered`, `remediate`,
 `report`) are named here so the command line is one contract; each is

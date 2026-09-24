@@ -2220,7 +2220,14 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
             rate, trial_purpose = shipped["unsustainable_records_per_s"], purpose
         else:
             decision = winning(state, cell, workload_id, variant)
-            rate, trial_purpose = next_search_rate(decision["trials"]), purpose
+            # A rate the host could not measure validly (the overload it
+            # offers starves the monitor) steers the bisection from above;
+            # it never becomes the decision's unsustainable bound.
+            steering = decision["trials"] + [
+                (int(rate), "unsustainable")
+                for rate in (options.get("unmeasurable_above") or {}).get(cell, ())
+            ]
+            rate, trial_purpose = next_search_rate(steering), purpose
             if rate is None:
                 # Decided: repeat the winner until three trials measured it;
                 # a repetition that fails moves the search below that rate.
