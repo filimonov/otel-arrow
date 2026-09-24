@@ -36,10 +36,18 @@ LONG_COMMANDS = (
 
 def registered_cases() -> dict:
     """Every named case this command line can run today."""
+    try:
+        from . import soak
+    except ImportError:
+        import soak
     return {
         "harness-contracts": harness_contracts_case,
         "harness-local": harness_local_case,
         "launcher-ci": launcher_ci_case,
+        "soak-strict": soak.soak_strict_case,
+        "soak-buffered": soak.soak_buffered_case,
+        "pr-soak-strict": soak.pr_soak_strict_case,
+        "pr-soak-buffered": soak.pr_soak_buffered_case,
     }
 
 
@@ -397,13 +405,16 @@ def engine_binary() -> Path:
 MEASURED_PROFILE = "release"
 
 
-def prepare_build() -> dict:
+def prepare_build(*, require_release=True) -> dict:
     """The engine build and source provenance, gathered before any lease.
 
     Hashing the binary and asking `rustc` for its version are work this
     harness does, and a `rustc` running while the monitor watches is a
     concurrent build; both happen before the host controls open. Any
-    profile other than release is refused here, before anything runs.
+    profile other than release is refused here, before anything runs,
+    unless `require_release` is false: a run that publishes nothing and
+    evaluates no baseline (a CI functional check) may use the fixture
+    suite's debug engine, and records its profile.
     """
     binary = engine_binary()
     if not binary.is_file():
@@ -413,7 +424,7 @@ def prepare_build() -> dict:
             f"--features series-parquet,aws,durable-buffer"
         )
     build = measurement.engine_build(binary)
-    if build["profile"] != MEASURED_PROFILE:
+    if require_release and build["profile"] != MEASURED_PROFILE:
         raise AssertionError(
             f"measured cases require a release df_engine; {binary} is a "
             f"{build['profile']} build. Build with --release, or point "
@@ -1310,6 +1321,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = capacity.add_argument("--output-dir", required=True, type=Path)
     _ = capacity.add_argument("--option", action="append", default=[])
+    soak = sub.add_parser(
+        "soak",
+        help="run the thirty-minute strict and buffered soaks and the PR-tier soaks",
+    )
+    _ = soak.add_argument("--output-dir", required=True, type=Path)
+    _ = soak.add_argument("--option", action="append", default=[])
     rescrub = sub.add_parser(
         "rescrub",
         help="scrub one published evidence tree in place and re-hash it",
@@ -1423,6 +1440,18 @@ def main(argv=None) -> int:
         indexes = capacity.run_capacity(
             arguments.output_dir, options.pop("report_dir", None), **options
         )
+        for index in indexes:
+            sys.stderr.write(f"{index['run_id']}: {index['status']}\n")
+        return 0 if all(
+            index["status"] == measurement.STATUS_PASSED for index in indexes
+        ) else 1
+    if arguments.command == "soak":
+        try:
+            from . import soak
+        except ImportError:
+            import soak
+        options = parse_options(arguments.option)
+        indexes = soak.run_soak(arguments.output_dir, options.pop("report_dir", None), **options)
         for index in indexes:
             sys.stderr.write(f"{index['run_id']}: {index['status']}\n")
         return 0 if all(

@@ -140,6 +140,15 @@ CAPACITY_WORKLOADS = {
         "exceed the receiver's default 4 MiB decoding limit, so it runs with 16 MiB",
         "max_decoding_message_size": "16MiB",
     },
+    "mixed-1k-hot-churn1": {
+        "workload": measurement.Workload(
+            requests=1, records_per_request=RECORDS_PER_REQUEST, body_bytes=1024,
+            series=10000, metrics_every=5, series_scope="record", churn_every=100,
+        ),
+        "first_index": 0,
+        "description": "mixed-1k-hot with every hundredth record on a series no "
+        "other record uses: 10k hot series and 1 percent deterministic churn",
+    },
     "mixed-1k-churn": {
         "workload": measurement.Workload(
             requests=1, records_per_request=RECORDS_PER_REQUEST, body_bytes=1024,
@@ -741,6 +750,8 @@ BUFFER = "processor.durable_buffer"
 EXTRA_BUFFER_GAUGES = {
     "buffer.storage.bytes.used": (BUFFER, "storage.bytes.used"),
     "buffer.in.flight": (BUFFER, "in.flight"),
+    "buffer.storage.bytes.cap": (BUFFER, "storage.bytes.cap"),
+    "buffer.retries.scheduled": (BUFFER, "retries.scheduled"),
 }
 # Labelled metrics kept per worker by extras key: (metric set, metric,
 # label), summed over the label's values.
@@ -758,6 +769,8 @@ EXTRA_LABELLED = {
     "buffer.items.rejected": (f"{BUFFER}.items", "rejected", "signal"),
     "buffer.ingest.failures": (f"{BUFFER}.ingest", "failures", "failure"),
     "buffer.bundles.resolved": (f"{BUFFER}.bundles", "resolved", "outcome"),
+    "buffer.loss.items": (f"{BUFFER}.loss", "items", "reason"),
+    "flush.failures.by_class": (EXPORTER, "flush.failures", "error.type"),
 }
 
 
@@ -1180,19 +1193,15 @@ def buffer_view(samples, window, trial, stats) -> dict:
     }
 
 
-def freshness(db_root, rpr, sends, objects, epoch_offset_ns) -> dict:
-    """Acknowledgement to object-visible lag per acknowledged request.
+def request_visibility(db_root, rpr, objects) -> dict:
+    """When each stored request became visible, in epoch nanoseconds.
 
     A request is visible when the last object holding any of its records
-    has completed; the lag is that completion less the producer's
-    acknowledgement. Negative means the acknowledgement came after the
-    object, as it does in the strict topology.
+    has completed.
     """
     import duckdb
 
     completion = {key: t for key, _size, t in objects}
-    acked = {index: finish for index, finish, code in
-             zip(sends["indexes"], sends["finish"], sends["code"]) if code == 0}
     visible = {}
     with duckdb.connect() as db:
         for signal in ("logs", "metrics"):
@@ -1209,6 +1218,18 @@ def freshness(db_root, rpr, sends, objects, epoch_offset_ns) -> dict:
                 at = completion.get(key)
                 if at is not None:
                     visible[int(request)] = max(visible.get(int(request), 0), at)
+    return visible
+
+
+def freshness(visible, sends, epoch_offset_ns) -> dict:
+    """Acknowledgement to object-visible lag per acknowledged request.
+
+    The lag is the request's visibility (`request_visibility`) less the
+    producer's acknowledgement. Negative means the acknowledgement came
+    after the object, as it does in the strict topology.
+    """
+    acked = {index: finish for index, finish, code in
+             zip(sends["indexes"], sends["finish"], sends["code"]) if code == 0}
     lags = sorted((visible[index] - epoch_offset_ns - finish) / 1e9
                   for index, finish in acked.items() if index in visible)
     if not lags:
@@ -1628,8 +1649,13 @@ def engine_settings(plan, trial, root):
     }
 
 
-def trial_experiment(plan, trial, spec, result, run_dir, controls):
-    """One trial: engine, producer fleet, measured interval, drain, oracle."""
+def trial_experiment(plan, trial, spec, result, run_dir, controls, extension=None):
+    """One trial: engine, producer fleet, measured interval, drain, oracle.
+
+    An `extension` observes a longer run: `start(engine, fleet, window)` once
+    the producers are released and `stop()` after the drain, then
+    `settle_trial` hands it the read-back.
+    """
     command = _command()
     run_dir = Path(run_dir)
     controls.coverage_gaps_hard = True
@@ -1692,6 +1718,8 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
                   start_ns + int((trial["warmup_s"] + trial["measure_s"]) * 1e9))
         _ = performance.reset_peak_rss(engine.pid)
         fleet.go(start_ns)
+        if extension is not None:
+            extension.start(engine=engine, fleet=fleet, window=window)
         readings = {}
         wake = threading.Event()
         for label, at in (("start", window[0]), ("end", window[1])):
@@ -1715,6 +1743,8 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
         observed["last_response_ns"] = max(sends["finish"], default=0)
         controls.raise_if_invalid()
         _ = phase.drained()
+        if extension is not None:
+            extension.stop()
         observed["peak_rss_bytes"] = performance.procfs_peak_rss(engine.pid)
         _ = controls.snapshot(
             "end", {"engine": (engine.pid, list(spec.cores))},
@@ -1726,13 +1756,15 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
         command.record_event(result, "engine_shut_down", str(engine.pid))
     finally:
         controls.unwatch_workers()
+        if extension is not None:
+            extension.stop()
         if phase is not None and phase.sampler is not None:
             phase.sampler.stop()
         if fleet is not None:
             fleet.close()
         engine.close()
     settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, window,
-                 worker_tids, observed, start_ns, engine)
+                 worker_tids, observed, start_ns, engine, extension=extension)
 
 
 def established_connections(port) -> dict:
@@ -1781,8 +1813,13 @@ def worker_distribution(samples, window) -> dict:
 
 
 def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, window,
-                 worker_tids, observed, start_ns, engine):
-    """Oracle, metrics, verdict and checks of one trial."""
+                 worker_tids, observed, start_ns, engine, extension=None):
+    """Oracle, metrics, verdict and checks of one trial.
+
+    An `extension` moves the objects out of the store itself
+    (`download(store, directory)`) and completes the result (`finalize`)
+    with the stored requests' visibility.
+    """
     command = _command()
     workload = spec.workload
     source = requests_generator.TemplateRequests(workload)
@@ -1867,21 +1904,28 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     failed = [index for index, code in zip(sends["indexes"], sends["code"]) if code != 0]
     oracle_s = None
     fresh = {}
+    visible = {}
+    download_s = None
     try:
         if trial["topology"] != "noop":
             if store is not None:
-                store.download(local)
+                started = time.monotonic_ns()
+                if extension is not None:
+                    extension.download(store, local)
+                else:
+                    store.download(local)
                 downloaded_bytes = sum(path.stat().st_size for path in local.rglob("*.parquet"))
+                download_s = (time.monotonic_ns() - started) / 1e9
             started = time.monotonic_ns()
             oracle = measurement.run_pinned(
                 plan["oracle_cores"], requests_generator.aggregate_oracle, local, source,
                 acked, failed,
             )
             oracle_s = (time.monotonic_ns() - started) / 1e9
-            fresh = measurement.run_pinned(
-                plan["oracle_cores"], freshness, local, rpr, sends, objects,
-                time.time_ns() - time.monotonic_ns(),
+            visible = measurement.run_pinned(
+                plan["oracle_cores"], request_visibility, local, rpr, objects,
             )
+            fresh = freshness(visible, sends, time.time_ns() - time.monotonic_ns())
             duplication = measurement.run_pinned(
                 plan["oracle_cores"], descriptor_duplication, local
             )
@@ -2110,12 +2154,28 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     ]
     result["trial"] = dict(trial)
     result["status"] = measurement.STATUS_PASSED
+    if extension is not None:
+        extension.finalize(result, {
+            "samples": samples, "sends": sends, "objects": objects, "visible": visible,
+            "window": window, "observed": observed, "stats": stats, "oracle": oracle,
+            "residuals": residuals, "start_ns": start_ns, "trial": trial, "spec": spec,
+            "epoch_offset_ns": epoch_offset_ns, "buffer": buffer,
+            "download_s": download_s, "oracle_s": oracle_s, "memory": memory,
+            "source": source, "summary": summary,
+        })
 
 
-def run_trial(plan, trial, output_dir, report_dir, experiment_fn=None):
-    """One trial under the host controls; its failure is recorded, not raised."""
+def run_trial(plan, trial, output_dir, report_dir, experiment_fn=None, *, spec_fn=None,
+              evaluate=False):
+    """One trial under the host controls; its failure is recorded, not raised.
+
+    `spec_fn` builds the run's spec in place of `trial_spec`; `evaluate`
+    applies the baseline policy to this run alone, for a run that is its own
+    family.
+    """
     command = _command()
-    spec = trial_spec(plan, trial)
+    spec_fn = spec_fn or trial_spec
+    spec = spec_fn(plan, trial)
     run_dir = Path(output_dir) / spec.run_id
     experiment_fn = experiment_fn or trial_experiment
 
@@ -2128,7 +2188,7 @@ def run_trial(plan, trial, output_dir, report_dir, experiment_fn=None):
         try:
             result = command.run_case(
                 spec, run_dir, experiment=experiment, report_dir=report_dir,
-                evaluate=False, lease_wait_s=plan.get("lease_wait_s", 0.0),
+                evaluate=evaluate, lease_wait_s=plan.get("lease_wait_s", 0.0),
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -2141,7 +2201,7 @@ def run_trial(plan, trial, output_dir, report_dir, experiment_fn=None):
             break
         plan["invalidated"].append(spec.run_id)
         trial = dict(trial, ordinal=plan["next_ordinal"]())
-        spec = trial_spec(plan, trial)
+        spec = spec_fn(plan, trial)
         run_dir = Path(output_dir) / spec.run_id
     archive_trial(plan, run_dir)
     return result
@@ -2263,14 +2323,15 @@ class FamilyState:
         ]
 
 
-def next_ordinal_factory(*directories):
-    """A counter past every published or local capacity trial ordinal."""
+def next_ordinal_factory(*directories, prefix="capacity-"):
+    """A counter past every published or local run ordinal of the runs
+    whose file names start with `prefix`."""
     highest = 0
     for directory in directories:
         directory = Path(directory)
         if not directory.is_dir():
             continue
-        for path in directory.glob("capacity-*-r[0-9][0-9][0-9].json"):
+        for path in directory.glob(f"{prefix}*-r[0-9][0-9][0-9].json"):
             with contextlib.suppress(IndexError, ValueError):
                 highest = max(highest, int(path.stem.rsplit("-r", 1)[1]))
     counter = {"value": highest}
@@ -2419,20 +2480,25 @@ def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dic
 
 
 # The search variants: their trial purposes, receiver slots per worker and
-# window. `default_window` is the shipped configuration as it ships.
+# window. `default_window` is the shipped configuration as it ships;
+# `buffered_default_window` is the buffered topology with it.
 SEARCH_PURPOSES = {"shipped": "search", "raised": "search_raised",
                    "default_window": "search_default_window",
-                   "buffered": "search_buffered"}
+                   "buffered": "search_buffered",
+                   "buffered_default_window": "search_buffered_default_window"}
 REPETITION_PURPOSES = {"shipped": "repetition", "raised": "repetition_raised",
                        "default_window": "repetition_default_window",
-                       "buffered": "repetition_buffered"}
+                       "buffered": "repetition_buffered",
+                       "buffered_default_window": "repetition_buffered_default_window"}
 VARIANT_CAPACITY = {"shipped": SHIPPED_RECEIVER_CAPACITY, "raised": RAISED_RECEIVER_CAPACITY,
                     "default_window": SHIPPED_RECEIVER_CAPACITY,
-                    "buffered": SHIPPED_RECEIVER_CAPACITY}
+                    "buffered": SHIPPED_RECEIVER_CAPACITY,
+                    "buffered_default_window": SHIPPED_RECEIVER_CAPACITY}
 VARIANT_INTERVAL_S = {"shipped": SEARCH_INTERVAL_S, "raised": SEARCH_INTERVAL_S,
-                      "default_window": DEFAULT_INTERVAL_S, "buffered": SEARCH_INTERVAL_S}
+                      "default_window": DEFAULT_INTERVAL_S, "buffered": SEARCH_INTERVAL_S,
+                      "buffered_default_window": DEFAULT_INTERVAL_S}
 VARIANT_TOPOLOGY = {"shipped": "strict", "raised": "strict", "default_window": "strict",
-                    "buffered": "buffered"}
+                    "buffered": "buffered", "buffered_default_window": "buffered"}
 
 
 def admission_ceiling(slots_per_worker, records_per_request, hold_s) -> float:
@@ -2534,6 +2600,12 @@ def step_search_raised(plan, state, output_dir, report_dir, cell, options):
 def step_search_buffered(plan, state, output_dir, report_dir, cell, options):
     """The search of the buffered topology at the shipped receiver slots."""
     step_search(plan, state, output_dir, report_dir, cell, options, variant="buffered")
+
+
+def step_search_buffered_default_window(plan, state, output_dir, report_dir, cell, options):
+    """The search of the buffered topology with the shipped 15 s window."""
+    step_search(plan, state, output_dir, report_dir, cell, options,
+                variant="buffered_default_window")
 
 
 def step_search_default_window(plan, state, output_dir, report_dir, cell, options):
@@ -2695,6 +2767,7 @@ STEPS = {
     "stats_off": step_stats_off,
     "search_default_window": step_search_default_window,
     "search_buffered": step_search_buffered,
+    "search_buffered_default_window": step_search_buffered_default_window,
     "workloads": step_workloads,
     "high_cardinality": step_high_cardinality,
 }

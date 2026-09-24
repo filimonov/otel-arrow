@@ -14,6 +14,7 @@ helpers live in `test_e2e.py` and are extended, never duplicated.
 """
 import collections
 import concurrent.futures
+import contextlib
 import dataclasses
 import datetime
 import fcntl
@@ -224,6 +225,9 @@ class Workload:
     # Whether series identity varies per request (one logs series and one
     # slot per request) or per record, cycling through `series` slots.
     series_scope: str = "request"
+    # With per-record identity, every `churn_every`-th record takes a slot
+    # beyond the `series` hot slots that no other record ever uses; 0 is none.
+    churn_every: int = 0
 
     def __post_init__(self):
         for name in ("requests", "records_per_request", "series", "metrics_every"):
@@ -231,6 +235,10 @@ class Workload:
                 raise ValueError(f"{name} must be positive")
         if self.series_scope not in SERIES_SCOPES:
             raise ValueError(f"series_scope must be one of {SERIES_SCOPES}")
+        if self.churn_every < 0 or self.churn_every == 1:
+            raise ValueError("churn_every must be 0 or at least 2")
+        if self.churn_every and self.series_scope != "record":
+            raise ValueError("churn_every needs per-record series identity")
         if self.body_bytes < ID_FIXED_WIDTH + len(LOG_KIND):
             raise ValueError(
                 f"body_bytes must hold the stable id: "
@@ -244,7 +252,10 @@ class Workload:
     def slot(self, request_index: int, point: int) -> int:
         """The series slot of one record under `series_scope`."""
         if self.series_scope == "record":
-            return (request_index * self.records_per_request + point) % self.series
+            seq = request_index * self.records_per_request + point
+            if self.churn_every and seq % self.churn_every == self.churn_every - 1:
+                return self.series + seq // self.churn_every
+            return seq % self.series
         return request_index % self.series
 
     def as_json(self) -> dict:
@@ -265,7 +276,7 @@ SERIES_SCOPES = ("request", "record")
 
 # Workload fields added after results were published, with the default an
 # older result implies by omitting them.
-OPTIONAL_WORKLOAD_FIELDS = {"series_scope": "request"}
+OPTIONAL_WORKLOAD_FIELDS = {"series_scope": "request", "churn_every": 0}
 
 
 # The topologies a run may declare. `strict` and `buffered` are the two
@@ -1333,6 +1344,9 @@ CASE_ROLES = {
     # attribution does, so a four-worker engine fits beside the producer and
     # the store; the local store keeps the same placement.
     "capacity": (("producer", 2), ("store", 1)),
+    # A PR-tier soak sends twenty small requests a second, which one
+    # producer core carries, and reads back through its reader core.
+    "pr_soak": (("producer", 1), ("store", 1), ("reader", 1)),
 }
 
 
@@ -2283,6 +2297,22 @@ def procfs_process_sample(pid: int) -> dict:
     return sample
 
 
+def process_tree_rss(pid) -> int:
+    """The resident bytes of a process and of all its descendants."""
+    total = 0
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        if not Path(f"/proc/{current}/status").exists():
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            total += test_e2e.rss_bytes(current)
+        for task in Path(f"/proc/{current}/task").glob("*/children"):
+            with contextlib.suppress(OSError, ValueError):
+                pending.extend(int(child) for child in task.read_text().split())
+    return total
+
+
 def directory_bytes(path) -> int:
     """Allocated disk bytes below one directory, blocks rather than length."""
     total = 0
@@ -2461,13 +2491,15 @@ class Producer:
     The wire bytes `build_request` produced are what is sent: the call
     passes them through without re-serializing, so the ledger's wire hash is
     the hash of the bytes on the wire. Sender threads are confined to the
-    producer's cores. There is no retry: a healthy measurement requires
-    multiplicity exactly one, and a failed attempt is recorded with its
-    classification and left failed.
+    producer's cores. By default there is no retry: a healthy measurement
+    requires multiplicity exactly one, and a failed attempt is recorded with
+    its classification and left failed. `retry_attempts` above one resends a
+    retryably refused request with the same bytes, each attempt ledgered
+    under its own ordinal, as an at-least-once producer does.
     """
 
     def __init__(self, channel, ledger, workload, *, cores, timeout_s, max_in_flight,
-                 source=None):
+                 source=None, retry_attempts=1, retry_backoff_s=0.5):
         self.channel = channel
         self.ledger = ledger
         self.workload = workload
@@ -2477,6 +2509,8 @@ class Producer:
         self.cores = set(cores)
         self.timeout_s = timeout_s
         self.max_in_flight = max_in_flight
+        self.retry_attempts = max(1, int(retry_attempts))
+        self.retry_backoff_s = retry_backoff_s
         self.calls = {
             signal: channel.unary_unary(
                 method,
@@ -2492,8 +2526,19 @@ class Producer:
             os.sched_setaffinity(0, self.cores)
 
     def send_one(self, index):
-        """Send request `index` once and record what happened."""
+        """Send request `index`, resending a retryable refusal, and record
+        every attempt."""
         signal, wire, rows = self.source(index)
+        wake = threading.Event()
+        for ordinal in range(1, self.retry_attempts + 1):
+            outcome = self._attempt(index, ordinal, signal, wire, rows)
+            if outcome != OUTCOME_RETRYABLE or ordinal == self.retry_attempts:
+                return outcome
+            _ = wake.wait(self.retry_backoff_s)
+        return outcome
+
+    def _attempt(self, index, ordinal, signal, wire, rows):
+        """One delivery attempt of request `index` and its ledger entry."""
         start = time.monotonic_ns()
         _ = self.ledger.add_request(index, signal, wire, rows, send_ns=start)
         try:
@@ -2506,12 +2551,12 @@ class Producer:
                 if code in test_e2e.RETRYABLE_CODES
                 else OUTCOME_PERMANENT
             )
-            self.ledger.attempt(index, 1, start, finish, outcome, str(code))
+            self.ledger.attempt(index, ordinal, start, finish, outcome, str(code))
             return outcome
         except Exception as error:
             finish = time.monotonic_ns()
             self.ledger.attempt(
-                index, 1, start, finish, OUTCOME_LOCAL, f"{type(error).__name__}"
+                index, ordinal, start, finish, OUTCOME_LOCAL, f"{type(error).__name__}"
             )
             return OUTCOME_LOCAL
         finish = time.monotonic_ns()
@@ -2520,10 +2565,10 @@ class Producer:
         )
         if rejected:
             self.ledger.attempt(
-                index, 1, start, finish, OUTCOME_PARTIAL, f"rejected={rejected}"
+                index, ordinal, start, finish, OUTCOME_PARTIAL, f"rejected={rejected}"
             )
             return OUTCOME_PARTIAL
-        self.ledger.attempt(index, 1, start, finish, OUTCOME_ACK)
+        self.ledger.attempt(index, ordinal, start, finish, OUTCOME_ACK)
         self.ledger.ack(index, finish)
         return OUTCOME_ACK
 
@@ -2542,6 +2587,46 @@ class Producer:
             "concurrency": workers,
             "started_ns": started,
             "finished_ns": time.monotonic_ns(),
+            "outcomes": dict(outcomes),
+        }
+
+    def send_paced(self, indexes, rate_requests_per_s) -> dict:
+        """Start request `k` of `indexes` at `k / rate` seconds, open loop.
+
+        At most `max_in_flight` requests are outstanding; a start that has to
+        wait for one is late, and the lateness is recorded rather than
+        re-timed.
+        """
+        indexes = list(indexes)
+        workers = max(1, min(self.max_in_flight, len(indexes)))
+        slots = threading.BoundedSemaphore(workers)
+        wake = threading.Event()
+        started = time.monotonic_ns()
+        period_ns = int(1e9 / rate_requests_per_s)
+        late_ns = []
+        futures = []
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, initializer=self._pin,
+            thread_name_prefix="producer",
+        ) as pool:
+            for position, index in enumerate(indexes):
+                due = started + position * period_ns
+                now = time.monotonic_ns()
+                if due > now:
+                    _ = wake.wait((due - now) / 1e9)
+                _ = slots.acquire()
+                late_ns.append(max(0, time.monotonic_ns() - due))
+                future = pool.submit(self.send_one, index)
+                future.add_done_callback(lambda _done: slots.release())
+                futures.append(future)
+            outcomes = collections.Counter(future.result() for future in futures)
+        return {
+            "requests": len(indexes),
+            "concurrency": workers,
+            "rate_requests_per_s": rate_requests_per_s,
+            "started_ns": started,
+            "finished_ns": time.monotonic_ns(),
+            "lateness_max_s": max(late_ns, default=0) / 1e9,
             "outcomes": dict(outcomes),
         }
 

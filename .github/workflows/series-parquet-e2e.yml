@@ -106,6 +106,14 @@ jobs:
         run: |
           export PATH="/tmp/series-parquet-venv/bin:$PATH"
           python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
+      # The soak's analysis contracts and the two one-minute PR-tier soaks:
+      # the debug engine through a MinIO outage, publishing nothing (the CI
+      # mode); the thirty-minute soaks skip without SERIES_MEASURE_LONG.
+      - name: PR-tier soaks
+        run: |
+          export PATH="/tmp/series-parquet-venv/bin:$PATH"
+          DF_ENGINE="$PWD/target/debug/df_engine" \
+            python3 -m unittest crates.validation.tests.series_parquet.test_soak -v
       # Only the classes that start no container, engine or build; the live
       # rig slice needs Docker and the host lease and belongs to the earlier
       # E2E step instead.

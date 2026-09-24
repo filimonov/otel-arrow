@@ -426,9 +426,121 @@ read-back's `judge_read_back`), with the verdicts, read-backs and search
 decisions that change, and the trials whose figures do not allow it. An index
 that replaces a published one lists the old one in `child_indexes`.
 
-The remaining subcommands (`soak`, `failures`, `buffered`, `remediate`,
-`report`) are named here so the command line is one contract; each is
-implemented by its own task.
+### Soak
+
+`soak` (`SERIES_MEASURE_LONG=1`, `soak.py`) holds one worker at 70 percent
+of a measured ceiling for thirty minutes of input, in each topology, on
+MinIO, and runs the two PR-tier soaks:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
+  python3 -m crates.validation.tests.series_parquet.measure soak \
+  --output-dir /var/tmp/series-soak
+```
+
+Its steps (`--option 'steps=[...]'`, all by default, in this order) are
+`strict`, `bracket`, `buffered`, `pr_strict`, `pr_buffered`, `alloy` and
+`publish`; `soak-state.json` in the output directory records the run each
+step produced, so a later invocation can run the remaining steps. `publish`
+writes `soak-strict.json` (the strict soak, its PR-tier soak and the Alloy
+trial) and `soak-buffered.json` (the buffered soak, its PR-tier soak and the
+bracket's trials). Each soak is its own family: its first valid run writes
+its baseline. The objects of a soak are tens to hundreds of gigabytes, so
+the output directory belongs on a disk.
+
+The conditions:
+
+- `soak-strict`: 70 percent of the MinIO one-worker raised-slot ceiling, read
+  from the committed `capacity-minio.json`; 4096 receiver slots and the
+  shipped 15 s window, so blocks rotate on `max_block_bytes` and the
+  exporter's retained memory reaches its budget.
+- `soak-buffered`: the shipped 128 slots and 15 s window, the durable
+  buffer's write-ahead log in the run's engine directory on the host disk,
+  at 70 percent of the one-worker buffered rate that `bracket` searches with
+  the same configuration (the "Capacity" search rules, from 64k records/s;
+  `--option buffered_rate=...` overrides the fraction, `bracket_floor=...`
+  the start).
+- Both: workload `mixed-1k-hot-churn1`, which is `mixed-1k-hot` with every
+  hundredth record on a series no other record uses (`Workload.churn_every`),
+  1000-record requests, 256 connections, the capacity producer placement,
+  the template generator and aggregate oracle, and the allocator-band RSS
+  reconciliation.
+- The producer schedules a warm-up cohort (two windows plus 5 s) and a
+  measured cohort of `ceil(rate * 1800 / 1000)` requests.
+  `metrics.input_phase_s` is the measured cohort's active time, first send
+  to last send plus one request interval, and must be at least 1800 s; an
+  early end fails it rather than counting idle time. `--option input_s=...`
+  shortens a rehearsal.
+
+The result's `samples` hold one row per second, second 0 the first of the
+input phase:
+
+- from the producer's sends: records attempted and acknowledged, wire bytes,
+  requests and bytes in flight (sent and unanswered, which is what the
+  receiver holds), and the age of the oldest unanswered request;
+- from the read-back: records committed, a request counting in the second
+  the last object holding its records completed, and object bytes by
+  completion;
+- from the last telemetry sample of the second: values rows written (the
+  provisional physical-row rate), ACTIVE, FLUSHING and pending bytes,
+  pending requests, queued notifications, the exporter's oldest unacked
+  age, series cache entries, accounted bytes and budget, flush workspace,
+  admission closed, RSS, anonymous bytes, descriptors, threads, jemalloc's
+  allocated and resident bytes and, buffered, the write-ahead log's bytes,
+  queued items, bundles in flight and scheduled retries;
+- from the soak's own reads each second: store and producer RSS and,
+  buffered, the log's size on disk.
+
+A second without a sample every worker answered is `observed: false`; the
+sample coverage is the share of input seconds observed. While input runs
+the store is listed every 10 s, which only shows completed objects, and the
+listing lag is recorded; nothing is read back until the engine has drained
+and stopped. Then each object is downloaded and deleted from the store, so
+the objects are held once, and the oracle reads them.
+
+`soak` in the result holds the per-minute view, the drift of RSS,
+descriptors, cache entries, accounted bytes, jemalloc's allocated bytes,
+allocated minus accounted, store and producer RSS and the write-ahead log
+(slope, first and last five-minute medians and their ratio), the backlog at
+stop and the time and rate of its drain (acknowledgement and storage),
+memory at the highest block fill beside the budget, the full-run and final
+five-minute rates, and the capacity trial's own metrics. The checks add
+`input_duration`, `sample_coverage` (at least 99 percent), `rate_sustained`
+(the capacity stability rule over the last 30 s), `backlog_drained`,
+`duplicate_free` and, buffered, `buffer_retention_lossless`.
+`soak.soak_checks` requires every correctness counter to be zero -- a
+strict soak's `buffer_loss_records` is an explicit zero tagged
+`not_applicable: no_buffer`, and an absent counter is an instrumentation
+error -- the sample coverage, and the Controller baseline policy. The RSS
+slope is an observation, not a compared metric: near zero its relative
+change is noise, while the compared last-to-first median ratio sits near
+one.
+
+The PR-tier soaks (`measure run --case pr-soak-strict`, `pr-soak-buffered`)
+send 65 s of 100-record requests at 20 requests/s, every tenth a metrics
+request, into one worker on MinIO with 1 s windows, `max_block_bytes: 640KiB`
+and `max_requests_per_block: 6`, so blocks rotate both on bytes and on
+requests, and `flush_retry_deadline: 3s` with the store's own retry below
+it. The store is stopped once it holds a completed object and the ACTIVE
+block is nonempty, and recovered once the exporter has reported a failed
+flush and the deadline has passed since the stop. The strict producer
+resends a retryably refused request with its original bytes; the run
+requires a deadline flush failure, storage NACKs and retryable producer
+attempts. The buffered run requires the buffer's scheduled retries. Both
+require every intended record stored (the ledger oracle, duplicates
+counted), both rotation reasons, the retained-state caps (accounted within
+the budget, ACTIVE within `max_block_bytes`, the log within its cap) and
+the RSS reconciliation; memory, the oldest unacked age and the correctness
+counts are the compared metrics. `--option publish=false` is the CI mode of
+`launcher-ci`, which may run the fixture suite's debug engine; the unit
+tests always run it.
+
+The `alloy` step runs the "Capacity" Alloy trial on the soak's store at
+20,000 lines/s with the receiver's 16 MiB decoding limit.
+
+The remaining subcommands (`failures`, `buffered`, `remediate`, `report`)
+are named here so the command line is one contract; each is implemented by
+its own task.
 
 ## Reference deployment
 

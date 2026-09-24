@@ -553,6 +553,7 @@ def alloy_experiment(plan, trial, spec, result, run_dir, controls):
                 "engine_cpu_ns": performance.procfs_cpu_ns(engine.pid),
                 "threads": performance.thread_times(engine.pid),
                 "alloy_cpu_ns": performance.procfs_cpu_ns(alloy_pid),
+                "alloy_rss_bytes": measurement.process_tree_rss(alloy_pid),
                 "feeder_cpu_ns": performance.procfs_cpu_ns(feeder.pid),
                 "diskstats": capacity.diskstats(),
                 "alloy_to_tap": capacity.established_connections(ready["tap_port"]),
@@ -942,6 +943,8 @@ def settle_alloy(plan, trial, spec, result, run_dir, phase, feed, readings, wind
         "body_bytes": BODY_BYTES,
         "written_lines": written,
         "drained": observed.get("alloy_drained"),
+        "alloy_rss_bytes": {label: readings[label].get("alloy_rss_bytes")
+                            for label in ("start", "middle", "end")},
         "drain_s": (observed["alloy_drained_ns"] - window[1]) / 1e9,
         "final": {k: v for k, v in alloy_final.items() if k != "call_buckets"},
         "call_duration_buckets_ok": [[json_bound(le), count] for le, count in call_buckets],
@@ -993,6 +996,12 @@ def settle_alloy(plan, trial, spec, result, run_dir, phase, feed, readings, wind
         measurement.STATUS_PASSED if feed.get("complete") and observed.get("alloy_pinned")
         else measurement.STATUS_FAILED,
         f"feeder complete {feed.get('complete')}; Alloy pinned {observed.get('alloy_pinned')}",
+    ))
+    enqueue_failed = alloy_final.get("enqueue_failed_records")
+    checks.append(measurement.check(
+        "no_enqueue_loss", measurement.CHECK_HARD,
+        measurement.STATUS_PASSED if enqueue_failed == 0 else measurement.STATUS_FAILED,
+        f"otelcol_exporter_enqueue_failed_log_records_total {enqueue_failed}",
     ))
     result["artifacts"] = [
         dict(measurement.file_entry(path), kind=kind, retention=str(run_dir))
