@@ -55,8 +55,32 @@ pub(super) enum Outcome {
     Internal,
 }
 
-/// Number of [`Outcome`] variants, and so the width of the counter array.
-pub(super) const OUTCOMES: usize = <Outcome as AttributeEnum>::CARDINALITY;
+impl Outcome {
+    /// Every outcome, indexed by its discriminant; the length is the derived
+    /// variant count, so a variant left out does not compile.
+    pub(super) const ALL: [Outcome; <Outcome as AttributeEnum>::CARDINALITY] = [
+        Outcome::Ack,
+        Outcome::Storage,
+        Outcome::RequestTooLarge,
+        Outcome::ExtractedTooLarge,
+        Outcome::RowTooLarge,
+        Outcome::BlockTooLarge,
+        Outcome::TooDeep,
+        Outcome::Invalid,
+        Outcome::Unsupported,
+        Outcome::Shutdown,
+        Outcome::Internal,
+    ];
+}
+
+// `ALL[o as usize] == o`, which the per-outcome counter arrays index by.
+const _: () = {
+    let mut i = 0;
+    while i < Outcome::ALL.len() {
+        assert!(Outcome::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// Longest detail an error may contribute to a nack reason, in bytes.
 ///

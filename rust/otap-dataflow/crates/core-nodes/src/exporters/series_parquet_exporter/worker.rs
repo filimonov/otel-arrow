@@ -1118,7 +1118,7 @@ impl Worker {
             metrics.worker.notify_token_bytes.set(notify_bytes);
             metrics.worker.notify_failures.observe(failures);
             metrics.worker.acks.observe(outcomes[Outcome::Ack as usize]);
-            for error_type in NackAttrs::ERROR_TYPES {
+            for error_type in NackAttrs::error_types() {
                 metrics
                     .nacks
                     .with(NackAttrs { error_type })

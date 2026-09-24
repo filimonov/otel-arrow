@@ -16,7 +16,7 @@
 //! the value is republished rather than accumulated twice. Gauges report the
 //! worker's state at the moment it was sampled.
 
-use super::outcome::{OUTCOMES, Outcome};
+use super::outcome::Outcome;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::context::PipelineContext;
 use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
@@ -165,24 +165,14 @@ pub(super) struct NackAttrs {
     pub error_type: Outcome,
 }
 
-// Every outcome but `Ack` is a nack label, so the list cannot fall behind the
-// enum without failing to compile.
-const _: () = assert!(NackAttrs::ERROR_TYPES.len() + 1 == OUTCOMES);
-
 impl NackAttrs {
-    /// Every outcome a nack can carry, in label order.
-    pub(super) const ERROR_TYPES: [Outcome; 10] = [
-        Outcome::Storage,
-        Outcome::RequestTooLarge,
-        Outcome::ExtractedTooLarge,
-        Outcome::RowTooLarge,
-        Outcome::BlockTooLarge,
-        Outcome::TooDeep,
-        Outcome::Invalid,
-        Outcome::Unsupported,
-        Outcome::Shutdown,
-        Outcome::Internal,
-    ];
+    /// Every outcome a nack can carry, in label order: every outcome but
+    /// `Ack`.
+    pub(super) fn error_types() -> impl Iterator<Item = Outcome> {
+        Outcome::ALL
+            .into_iter()
+            .filter(|outcome| *outcome != Outcome::Ack)
+    }
 }
 
 /// Requests refused, split by the rule that refused them.
@@ -626,7 +616,7 @@ mod tests {
             "shutdown",
             "internal",
         ];
-        for (error_type, label) in NackAttrs::ERROR_TYPES.into_iter().zip(labels) {
+        for (error_type, label) in NackAttrs::error_types().zip(labels) {
             metrics
                 .nacks
                 .with(NackAttrs { error_type })

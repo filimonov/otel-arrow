@@ -16,7 +16,7 @@
 //! branch safe. Dropping a poll never drops a token, so no request can lose
 //! its decision because the exporter was busy elsewhere.
 
-use super::outcome::{OUTCOMES, Outcome};
+use super::outcome::Outcome;
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::control::{AckMsg, NackMsg};
 use otel_arrow_dfe_engine::error::Error;
@@ -171,7 +171,7 @@ pub(super) struct Notifier {
     /// block or the parking slot until they are pushed here.
     capacity: usize,
     /// Count of completions pushed, per [`Outcome`].
-    outcomes: [u64; OUTCOMES],
+    outcomes: [u64; Outcome::ALL.len()],
     /// Completions the engine would not accept.
     failures: u64,
     /// Largest single token observed, for capacity reporting.
@@ -193,7 +193,7 @@ impl Notifier {
             queue: VecDeque::new(),
             sending: None,
             capacity,
-            outcomes: [0; OUTCOMES],
+            outcomes: [0; Outcome::ALL.len()],
             failures: 0,
             token_high_water: 0,
             exports: None,
@@ -262,7 +262,7 @@ impl Notifier {
     }
 
     /// Counters of pushed completions, indexed by [`Outcome`].
-    pub(super) fn outcomes(&self) -> &[u64; OUTCOMES] {
+    pub(super) fn outcomes(&self) -> &[u64; Outcome::ALL.len()] {
         &self.outcomes
     }
 
