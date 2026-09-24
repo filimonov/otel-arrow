@@ -5,9 +5,7 @@ identity, extraction of `series` and values datasets from OTAP Arrow
 records, a bounded series cache, sorted block buffers and a Parquet sink
 over `object_store`.
 
-The storage format is specified in [docs/FORMAT.md](docs/FORMAT.md). The
-design is in `docs/superpowers/specs/2026-09-21-series-parquet-exporter-design.md`
-at the repository root.
+The storage format is specified in [docs/FORMAT.md](docs/FORMAT.md).
 
 This crate is engine-independent: it never depends on the Dataflow engine.
 The `core-nodes` exporter `exporter:series_parquet` adapts it into a Dataflow
@@ -27,64 +25,45 @@ pipeline; see its
 ## Producer id contract
 
 Every writer that shares a lake must set `producer_id_attribute` to the same
-resource attribute, and that attribute must be present and stable on every
-request. It stays part of the series identity and is additionally projected
-into the `producer_id` column of every values row, so that a reader can tell
-which producer a row came from without joining the `series` dataset. A
-request whose resource lacks the attribute gets an empty `producer_id`, which
-is a distinct producer as far as readers are concerned.
+resource attribute, and every producer must send that attribute on every
+request with a value that is stable for the producer and unique to it. It
+stays part of the series identity and is also projected into the
+`producer_id` column of every values row, so a reader can tell which producer
+a row came from without joining the `series` dataset. Two producers sending
+the same value are one producer to readers, and a request whose resource
+lacks the attribute gets an empty `producer_id`.
 
 `writer_id` is a different thing: it identifies the writer process in file
 names and file metadata and is never part of the identity.
 
 ## Limitations in version 1
 
-Descriptors become bounded series runs during request admission. Final sealing
-replaces only the emitted_at column of those runs with the block timestamp,
-sharing every other column; old/new timestamp storage is at most eight
-additional bytes per series row. A values dataset additionally finalizes
-whatever is still buffered into one run bounded by run_target_bytes. The
-first successful seal timestamp remains fixed across flush retries.
+Format-level limitations (unsupported points, exemplars, lossy attribute maps,
+a zero `sum` read as null, traces) are listed in
+[FORMAT.md](docs/FORMAT.md#limitations-of-version-1). The writer adds these:
 
-- Exponential histograms and summaries are not stored (`unsupported` decides
-  between rejecting the request and dropping the points; drops are counted
-  one per dropped data point row).
-- Exemplars are not stored; their rows are counted as dropped, and their own
-  attributes are never read.
-- Metric metadata attributes and exemplar attribute payloads are never read,
-  so duplicate keys inside them are not detected. Duplicate-key rejection
-  only covers the lists this writer decodes: resource, scope, the log
-  record's own attributes, and a supported data point's attributes.
-- `attrs` maps are lossy: values are rendered to strings, so a string `"42"`
-  and an integer `42` look the same in the map. They are still different
-  series. Bytes values render as padded standard base64 and non-finite
-  doubles as `"NaN"`, `"Infinity"` and `"-Infinity"`, as in OTLP JSON; a
-  dedicated `body_bytes` binary column for the log body is deferred to a
-  later format version.
 - A cancellation that lands after a file's Parquet finalization has begun
-  (for example, exporter shutdown) can leave an orphaned multipart upload;
-  it is reclaimed by a bucket lifecycle rule, not by this crate.
+  (for example, exporter shutdown) cannot abort that file's multipart upload,
+  because `BufWriter::abort` is only safe before finalization starts; the
+  leftover parts are reclaimed by a bucket lifecycle rule, not by this crate.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload.
-- `merge_chunk_bytes` is an average-based approximation: a chunk of rows
-  much wider than the table's average overshoots it, and with sorting
-  disabled it is ignored altogether -- runs go to the writer as they are,
-  each at most `run_target_bytes`.
-- A histogram `sum` of zero is stored as null when no point of the same
-  request has a non-zero sum: the OTAP transport omits a column whose every
-  entry is the type default, so an absent sum and a zero sum arrive the same
-  way. The same holds for any optional metrics column.
+- `merge_chunk_bytes` is an approximation from the table's mean row width, so
+  a chunk of much wider rows overshoots it. With sorting disabled it is
+  ignored, and runs go to the writer as they are, each at most
+  `run_target_bytes`.
+- Sealing replaces only the `emitted_at` column of the series runs, at most
+  eight additional bytes per series row, and keeps the first seal timestamp
+  across flush retries. A values dataset finalizes what is still buffered
+  into one more run, so the seal transient can reach
+  `(V + 1) * run_target_bytes` for V buffered runs.
 - One Parquet row group can start several multipart upload parts at once
-  whatever `upload.concurrency` says; the burst is bounded by
-  `parquet.row_group_bytes`.
-- Number and histogram points share one `metrics/values` dataset, so half the
-  rows of a mixed stream leave `value_double` null and the other half leave
-  `count`, `sum`, `min` and `max` null. Parquet min/max statistics on those
-  columns are correspondingly less selective than they were when each point
-  kind had its own file. The merge exists to keep a mixed metrics stream at
-  one PUT request per window per signal.
-- Traces are refused.
+  whatever `upload.concurrency` says: the object store receives the whole
+  encoded row group. The burst is bounded by `parquet.row_group_bytes`.
+- Number and histogram points share one `metrics/values` dataset, so each
+  kind leaves the other's columns null and their Parquet min/max statistics
+  are less selective.
 
 ## Reading the data
 
@@ -108,6 +87,23 @@ CREATE VIEW logs_series_latest AS
 SELECT v.time, s.resource_attrs, v.body
 FROM logs_values v JOIN logs_series_latest s USING (series_id)
 WHERE v.date = '2026-09-21';
+```
+
+ClickHouse (`clickhouse-local` or the `file()`/`s3()` table functions) has no
+`QUALIFY`, breaks ties on the virtual `_path` column, and does not synthesize
+`date` and `hour` from the path:
+
+```sql
+WITH canonical AS (
+    SELECT * FROM (
+        SELECT *, row_number() OVER (
+            PARTITION BY series_id ORDER BY emitted_at DESC, _path DESC) AS rank
+        FROM file('v=1/signal=logs/dataset=series/**/*.parquet', 'Parquet')
+    ) WHERE rank = 1
+)
+SELECT v.*, s.resource_attrs
+FROM file('v=1/signal=logs/dataset=values/**/*.parquet', 'Parquet') AS v
+INNER JOIN canonical AS s ON v.series_id = s.series_id;
 ```
 
 Spark:
@@ -161,13 +157,22 @@ kinds apart. Do not classify a row by which columns are null: a null list and
 an empty list are distinguishable in DuckDB but not in ClickHouse, which has
 no nullable `Array` and reads a null Parquet list as `[]`.
 
-Both recipes need `union_by_name` / `mergeSchema` because denormalized columns
+The recipes use `union_by_name` / `mergeSchema` because denormalized columns
 may be added over time. To detect an incompatible mix, compare the
 `schema_fingerprint` key (16 lowercase hex digits) in each file's Parquet
 metadata: files of one dataset with different fingerprints disagree on the
-column set, a column's type or nullability, or column order, and a reader
-that ignores this silently drops or misreads columns. See `docs/FORMAT.md` for exactly
-what the fingerprint covers.
+column set, a column's type or nullability, or column order, which can still
+be an additive change. Compare the physical schemas before concluding that
+two files are incompatible; FORMAT.md section 3 defines what the fingerprint
+covers.
+
+```sql
+SELECT file_name, decode(value) AS schema_fingerprint
+FROM parquet_kv_metadata('s3://bucket/**/*.parquet')
+WHERE decode(key) = 'schema_fingerprint';
+SELECT file_name, name, type, logical_type
+FROM parquet_schema('s3://bucket/**/*.parquet');
+```
 
 ## Testing
 
