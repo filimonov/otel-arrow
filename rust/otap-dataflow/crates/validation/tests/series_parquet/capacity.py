@@ -1515,6 +1515,10 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
     workload = spec.workload
     first = CAPACITY_WORKLOADS[trial["workload_id"]]["first_index"]
     indexes = list(range(first, workload.requests))
+    # Every trial sends the same request indexes, so objects a trial that
+    # was aborted left behind would read as duplicates of this one's.
+    if plan["store"] is not None:
+        result["capacity_store_cleared_objects_count"] = performance.clear_store(plan["store"])
     root = run_dir / "engine"
     root.mkdir(parents=True, exist_ok=True)
     settings = engine_settings(plan, trial, root)
