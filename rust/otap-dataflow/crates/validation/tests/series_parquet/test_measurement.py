@@ -6385,6 +6385,14 @@ class CapacityContracts(unittest.TestCase):
         self.assertEqual(view["at_highest_fill"]["accounted_bytes"], 70 << 20)
         self.assertEqual(view["difference_min_bytes"], 100 << 20)
 
+    # Scenario: 128 receiver slots, 1000-record requests, held one second or
+    # sixteen seconds (a 15 s window plus the flush).
+    # Guarantees: the strict admission ceiling is slots times records over
+    # the hold: 128,000 and 8,000 records/s per worker.
+    def test_the_strict_admission_ceiling(self):
+        self.assertEqual(capacity.admission_ceiling(128, 1000, 1.0), 128000)
+        self.assertEqual(capacity.admission_ceiling(128, 1000, 16.0), 8000)
+
     # Scenario: the capacity subcommand is asked for without the long opt-in.
     # Guarantees: it is gated as a long measurement.
     def test_capacity_is_a_long_subcommand(self):

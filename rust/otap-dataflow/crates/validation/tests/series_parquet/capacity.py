@@ -2309,10 +2309,26 @@ def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dic
     return decision
 
 
-# The trial purposes of each search variant: its search and its repetitions.
-SEARCH_PURPOSES = {"shipped": "search", "raised": "search_raised"}
-REPETITION_PURPOSES = {"shipped": "repetition", "raised": "repetition_raised"}
-VARIANT_CAPACITY = {"shipped": SHIPPED_RECEIVER_CAPACITY, "raised": RAISED_RECEIVER_CAPACITY}
+# The search variants: their trial purposes, receiver slots per worker and
+# window. `default_window` is the shipped configuration as it ships.
+SEARCH_PURPOSES = {"shipped": "search", "raised": "search_raised",
+                   "default_window": "search_default_window"}
+REPETITION_PURPOSES = {"shipped": "repetition", "raised": "repetition_raised",
+                       "default_window": "repetition_default_window"}
+VARIANT_CAPACITY = {"shipped": SHIPPED_RECEIVER_CAPACITY, "raised": RAISED_RECEIVER_CAPACITY,
+                    "default_window": SHIPPED_RECEIVER_CAPACITY}
+VARIANT_INTERVAL_S = {"shipped": SEARCH_INTERVAL_S, "raised": SEARCH_INTERVAL_S,
+                      "default_window": DEFAULT_INTERVAL_S}
+
+
+def admission_ceiling(slots_per_worker, records_per_request, hold_s) -> float:
+    """The strict records/s one worker can sustain at most.
+
+    A strict request holds its receiver slot until its block is durable, so
+    at most `slots_per_worker` requests are in flight, each held for about
+    one window plus the flush that makes it durable.
+    """
+    return slots_per_worker * records_per_request / hold_s
 
 
 def step_calibrate(plan, state, output_dir, report_dir, cell, options):
@@ -2370,7 +2386,8 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
         if rate is None:
             break
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
-                                            purpose=purpose, receiver_capacity=capacity),
+                                            purpose=purpose, receiver_capacity=capacity,
+                                            interval_s=VARIANT_INTERVAL_S[variant]),
                     output_dir, report_dir, cell)
     decision = winning(state, cell, workload_id, variant)
     if decision["sustainable_records_per_s"] is None:
@@ -2382,13 +2399,19 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
     for _ in range(max(0, REPETITIONS - len(done))):
         _ = execute(plan, state, make_trial(plan, workload_id=workload_id, rate=rate,
                                             purpose=REPETITION_PURPOSES[variant],
-                                            receiver_capacity=capacity),
+                                            receiver_capacity=capacity,
+                                            interval_s=VARIANT_INTERVAL_S[variant]),
                     output_dir, report_dir, cell)
 
 
 def step_search_raised(plan, state, output_dir, report_dir, cell, options):
     """The search with the receiver capacity raised, from the shipped bracket."""
     step_search(plan, state, output_dir, report_dir, cell, options, variant="raised")
+
+
+def step_search_default_window(plan, state, output_dir, report_dir, cell, options):
+    """The search in the configuration as it ships: 15 s windows, 128 slots."""
+    step_search(plan, state, output_dir, report_dir, cell, options, variant="default_window")
 
 
 def step_confirm_default_window(plan, state, output_dir, report_dir, cell, options):
@@ -2514,6 +2537,7 @@ STEPS = {
     "fan_in": step_fan_in,
     "search_raised": step_search_raised,
     "stats_off": step_stats_off,
+    "search_default_window": step_search_default_window,
     "workloads": step_workloads,
     "high_cardinality": step_high_cardinality,
 }
@@ -2579,7 +2603,8 @@ def aggregate_cell(state, cell, output_dir, report_dir, family_ordinal,
     first = children[0]
     store_kind, cores = cell.rsplit("-c", 1)
     case = f"capacity-{PRIMARY_WORKLOAD}-{variant}"
-    run_id = f"{case}-strict-{store_kind}-c{cores}-w{SEARCH_INTERVAL_S}-f{family_ordinal:03d}"
+    run_id = (f"{case}-strict-{store_kind}-c{cores}-w{VARIANT_INTERVAL_S[variant]}"
+              f"-f{family_ordinal:03d}")
     result = measurement.new_result(
         {"run_id": run_id, "case": case}, artifact_kind="capacity_aggregate",
     )
@@ -2827,6 +2852,8 @@ def publish_store(store_kind, state, output_dir, report_dir, options) -> dict:
             "so a bounded producer concurrency does not cap the strict hold time",
             "search_connections": SEARCH_CONNECTIONS,
             "receiver_capacity_per_worker": dict(VARIANT_CAPACITY),
+            "admission_ceiling": "strict records/s per worker <= receiver slots x records "
+            "per request / hold time, a window plus the flush that makes a block durable",
             "raised_search_seed": "the raised search starts from the shipped search's "
             "bracket: its sustainable rate is taken as sustainable and its first trial "
             "is the shipped unsustainable rate",

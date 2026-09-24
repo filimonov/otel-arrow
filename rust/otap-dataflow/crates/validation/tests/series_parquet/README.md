@@ -232,7 +232,7 @@ SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 taskset -c 0-7,16-23 \
   python3 -m crates.validation.tests.series_parquet.measure capacity \
   --output-dir /var/tmp/series-capacity \
   --option 'stores=["local","minio","rustfs"]' --option 'core_counts=[1,4]' \
-  --option 'steps=["calibrate","search","search_raised","stats_off","default_window","buffered","fan_in","workloads","high_cardinality","publish"]'
+  --option 'steps=["calibrate","search","search_raised","stats_off","search_default_window","default_window","buffered","fan_in","workloads","high_cardinality","publish"]'
 ```
 
 The output directory holds Parquet and logs of tens of gigabytes per trial,
@@ -287,6 +287,14 @@ pipeline's pdata channel capacity, so a raised limit raises both. The
 harness engine configuration drops unsupported points (`unsupported:
 drop`); the object stores are plain HTTP, where series_parquet signs every
 payload (unsigned payloads are its default over TLS only).
+
+The strict ceiling per worker at a given configuration is at most
+`capacity.admission_ceiling`: receiver slots x records per request / the
+time a request is held, a window plus the flush that makes its block
+durable. `search_default_window` searches the configuration as it ships (15
+s windows, 128 slots), where that bound is far below the exporter's; the
+remedies are more slots, larger requests, a shorter window or the buffered
+topology, whose acknowledgement does not wait for the object store.
 
 A capacity trial's RSS reconciliation reads the allocator, not the
 pipelines' `memory.usage`, which credits a free only to the allocating
