@@ -1,7 +1,23 @@
 {
   "artifact_kind": "capacity_index",
   "artifacts": [],
-  "baseline_files": [],
+  "baseline_files": [
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-4730de202ae0fe22.json",
+      "sha256": "793429c755c61835da47ffc51ec25e984fe068ce23c7260f85a182d735a7976c",
+      "size_bytes": 2004
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-shipped-d3711116c4825a77.json",
+      "sha256": "496a84f06d7b0e674a6dcf0cc78769e44d5cb5dc9520c49cf616a476afddcc8b",
+      "size_bytes": 2004
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-554a41b26162bd17.json",
+      "sha256": "b2209079287dc296ed398f3a62497f4dc562a25333669020cb1ac88a0dc50b77",
+      "size_bytes": 1996
+    }
+  ],
   "capacity": {
     "cells": {
       "rustfs-c1": {
@@ -38,7 +54,7 @@
           }
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-rustfs-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-rustfs-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.372829525,
             "ack_latency_p95_s": 1.834196322,
@@ -136,7 +152,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-rustfs-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-rustfs-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.836595699,
             "ack_latency_p95_s": 1.28581993,
@@ -228,7 +244,7 @@
           }
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-rustfs-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-rustfs-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.238703832,
             "ack_latency_p95_s": 1.700851171,
@@ -337,7 +353,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-rustfs-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-rustfs-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.01527745,
             "ack_latency_p95_s": 1.471700696,
@@ -433,19 +449,6 @@
       }
     },
     "invalidated_by_build": [],
-    "rejudgement": {
-      "decision_changes": [],
-      "oracle_changes": [],
-      "rules": "every trial judged again from what it stored: the verdict through `judge_trial` (engine-side failures -- failed, refused and partially rejected requests, the durable buffer's growing log, ingest failures and rejected bundles -- outrank producer lateness), the generator read-back's aggregate equalities (stored rows less stored failed-request rows equal the acknowledged records, every stored record once, the sequence sum when no failed request's rows were stored), and the Alloy read-back through `judge_read_back` (a duplicate fails it)",
-      "trials_count": 39,
-      "unchecked": [
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-rustfs-c1-w1-r142"
-        }
-      ],
-      "verdict_changes": []
-    },
     "rules": {
       "admission_ceiling": "strict records/s per worker <= receiver slots x records per request / hold time, a window plus the flush that makes a block durable",
       "backlog_slope_limit_ratio": 0.02,
@@ -10174,13 +10177,7 @@
   },
   "case": "capacity",
   "checks": [],
-  "child_indexes": [
-    {
-      "name": "capacity-rustfs-554059f9cc09.json",
-      "sha256": "554059f9cc0997f91b2e4630ff61cae3d97fa11720f109efd60e98e5f04e4b3e",
-      "size_bytes": 616126
-    }
-  ],
+  "child_indexes": [],
   "config": {
     "effective": {},
     "requested": {}
@@ -19623,30 +19620,30 @@
       "size_bytes": 2303172
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-rustfs-c1-w1-f002.json",
-      "sha256": "156d462298d4663260935cfe03b36235ad2fbb1105095bc8fd1d9ca14a2e85ec",
+      "name": "capacity-mixed-1k-hot-shipped-strict-rustfs-c1-w1-f001.json",
+      "sha256": "d6d7ef7ef21f0e01f176b30b80c3d1d11368f531247b58898665310a103a84d3",
       "size_bytes": 308718
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-rustfs-c1-w1-f002.json",
-      "sha256": "76b29bd90e6fe54ab65052b484e62baaf77dbb18d79e878aa552bcd7dac07b47",
-      "size_bytes": 305116
+      "name": "capacity-mixed-1k-hot-raised-strict-rustfs-c1-w1-f001.json",
+      "sha256": "48cc305bf9460dc8f013d0caaf5f4931c0444579d685fb9390844733d8cfef6c",
+      "size_bytes": 302857
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-rustfs-c4-w1-f002.json",
-      "sha256": "d3e931fe6405493e5bc324d1e30e55dbe28c2af3123d05dc7cde94e0d4c74052",
-      "size_bytes": 415505
+      "name": "capacity-mixed-1k-hot-shipped-strict-rustfs-c4-w1-f001.json",
+      "sha256": "eb011382dc3b77b7001123694c96df99a4b9f36425d32e06d9ec73eae6c34a05",
+      "size_bytes": 413251
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-rustfs-c4-w1-f002.json",
-      "sha256": "b95859f1b57166fd5eb78ea5e66820e2e1debe46b4e47d5e8a4fc07c981a363a",
-      "size_bytes": 527429
+      "name": "capacity-mixed-1k-hot-raised-strict-rustfs-c4-w1-f001.json",
+      "sha256": "c91ed5253e71ff01d1211750c54bdc658ff3681789267638d64384dbe07215ff",
+      "size_bytes": 525186
     }
   ],
   "run_id": "capacity-rustfs",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T18:19:19Z",
+  "started_utc": "2026-09-24T17:55:17Z",
   "status": "failed",
   "workload": {}
 }

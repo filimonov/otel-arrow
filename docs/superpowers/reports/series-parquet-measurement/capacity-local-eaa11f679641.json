@@ -1,7 +1,28 @@
 {
   "artifact_kind": "capacity_index",
   "artifacts": [],
-  "baseline_files": [],
+  "baseline_files": [
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-59bf7748cc064412.json",
+      "sha256": "a90ada4ecae20af60589e8082df3d2d47ba606bffff0d02ad03d197b8b3b2ff7",
+      "size_bytes": 2024
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-shipped-764c973301f90941.json",
+      "sha256": "af1faf2d445c2e849a29964a8b304f22673f7f27e473464a251437c2ef85bc2a",
+      "size_bytes": 2006
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-bc13688369d6cbfe.json",
+      "sha256": "55112b816b8b6456bd49392d5a24b6c346d271b0361a548cab96130992f45afd",
+      "size_bytes": 1999
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-buffered-49e511ba3231dae4.json",
+      "sha256": "3f458d95ffeaf26e5a8dedc446dd03a1a8a6f3b44c19ad047b13e8907fd71df1",
+      "size_bytes": 2006
+    }
+  ],
   "capacity": {
     "cells": {
       "local-c1": {
@@ -38,7 +59,7 @@
           }
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-local-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-local-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.571586727,
             "ack_latency_p95_s": 2.375603408,
@@ -136,7 +157,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-local-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-local-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.776097071,
             "ack_latency_p95_s": 1.015155197,
@@ -228,7 +249,7 @@
       },
       "local-c4": {
         "buffered": {
-          "aggregate": "capacity-mixed-1k-hot-buffered-buffered-local-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-buffered-buffered-local-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.055722823,
             "ack_latency_p95_s": 0.869140884,
@@ -312,7 +333,7 @@
           }
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-local-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-local-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.207340514,
             "ack_latency_p95_s": 1.903813517,
@@ -437,7 +458,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-local-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-local-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.692267781,
             "ack_latency_p95_s": 1.144764476,
@@ -548,75 +569,6 @@
       }
     },
     "invalidated_by_build": [],
-    "rejudgement": {
-      "decision_changes": [],
-      "oracle_changes": [],
-      "rules": "every trial judged again from what it stored: the verdict through `judge_trial` (engine-side failures -- failed, refused and partially rejected requests, the durable buffer's growing log, ingest failures and rejected bundles -- outrank producer lateness), the generator read-back's aggregate equalities (stored rows less stored failed-request rows equal the acknowledged records, every stored record once, the sequence sum when no failed request's rows were stored), and the Alloy read-back through `judge_read_back` (a duplicate fails it)",
-      "trials_count": 133,
-      "unchecked": [
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c1-w1-r023"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c1-w1-r024"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c1-w1-r026"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c4-w1-r027"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c1-w1-r034"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c4-w1-r069"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c4-w1-r076"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c4-w1-r083"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-buffered-local-c4-w1-r206"
-        },
-        {
-          "reason": "nothing was stored",
-          "run_id": "capacity-alloy-file-strict-local-c4-w1-r279"
-        }
-      ],
-      "verdict_changes": [
-        {
-          "purpose": "superseded",
-          "reasons": [],
-          "recorded": "unsustainable",
-          "rejudged": "sustainable",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c1-w1-r011"
-        },
-        {
-          "purpose": "superseded",
-          "reasons": [
-            "durable rate over the last 30s 423083 < 98% of offered 512000",
-            "backlog grows 85545 records/s > 2% of offered",
-            "6219 requests failed",
-            "2.914% of sends also started late with a slot free"
-          ],
-          "recorded": "producer_limited",
-          "rejudged": "unsustainable",
-          "run_id": "capacity-mixed-1k-hot-strict-local-c4-w1-r067"
-        }
-      ]
-    },
     "rules": {
       "admission_ceiling": "strict records/s per worker <= receiver slots x records per request / hold time, a window plus the flush that makes a block durable",
       "backlog_slope_limit_ratio": 0.02,
@@ -26233,13 +26185,7 @@
   },
   "case": "capacity",
   "checks": [],
-  "child_indexes": [
-    {
-      "name": "capacity-local-eaa11f679641.json",
-      "sha256": "eaa11f6796410d88429e6cc013e2e32d7292cb91653c0eda889d58ce54fb36e8",
-      "size_bytes": 1240214
-    }
-  ],
+  "child_indexes": [],
   "config": {
     "effective": {},
     "requested": {}
@@ -32056,35 +32002,35 @@
       "size_bytes": 612818
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-local-c1-w1-f002.json",
-      "sha256": "85d9ba0624c19a21f167fb7c5687d4788498555d71588a5fe47214a306df29d6",
+      "name": "capacity-mixed-1k-hot-shipped-strict-local-c1-w1-f001.json",
+      "sha256": "55361a4f5454f3584152ce320917084dbea8f651cfd6bcd342ef78c93709e6d4",
       "size_bytes": 142920
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-local-c1-w1-f002.json",
-      "sha256": "ffb3fcf594f5759f89bbaca89803cfb3647a1c3ef6680272615e35006710e0d2",
-      "size_bytes": 145011
+      "name": "capacity-mixed-1k-hot-raised-strict-local-c1-w1-f001.json",
+      "sha256": "861b8af6941554369c31f3b10b36254de27cf8f6310699e14f52f24e3351faae",
+      "size_bytes": 142710
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-local-c4-w1-f002.json",
-      "sha256": "92b6ca37569c9b23a2ca1c16e6118ea73bd3524630d363c2a6324a57682d0e22",
-      "size_bytes": 156286
+      "name": "capacity-mixed-1k-hot-shipped-strict-local-c4-w1-f001.json",
+      "sha256": "2f5f103f315b7371075c0fb45668efacce3c5435be042e995f85d7bad7f9188d",
+      "size_bytes": 154026
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-local-c4-w1-f002.json",
-      "sha256": "2b7c59593356c0f30e75a016bfc972085c3357591043c051b3328c593cc132dc",
-      "size_bytes": 225793
+      "name": "capacity-mixed-1k-hot-raised-strict-local-c4-w1-f001.json",
+      "sha256": "d345990ecbf659e19c29cefd4b00080524b06cd68b2ee53a61a5bebf1fafb565",
+      "size_bytes": 223542
     },
     {
-      "name": "capacity-mixed-1k-hot-buffered-buffered-local-c4-w1-f002.json",
-      "sha256": "868a54b8f2c7f6d65d00a8b230ce60d79884485e7031e9301b8a08ef29d563b7",
-      "size_bytes": 226826
+      "name": "capacity-mixed-1k-hot-buffered-buffered-local-c4-w1-f001.json",
+      "sha256": "6ec94ee27c88ea06b14e33b8f8e238a00328776ad917e85f5f110b60809e301e",
+      "size_bytes": 224575
     }
   ],
   "run_id": "capacity-local",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T18:19:13Z",
+  "started_utc": "2026-09-24T17:55:12Z",
   "status": "failed",
   "workload": {}
 }

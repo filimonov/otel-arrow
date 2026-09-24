@@ -1,7 +1,43 @@
 {
   "artifact_kind": "capacity_index",
   "artifacts": [],
-  "baseline_files": [],
+  "baseline_files": [
+    {
+      "name": "baseline-capacity-mixed-1k-hot-shipped-6ff59a6d30d13a7c.json",
+      "sha256": "97c4321d13d31eceb4d78c54e3b47dabd732e532e12c6d9097015e30dcb173ab",
+      "size_bytes": 2002
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-f35baae443329638.json",
+      "sha256": "260c5f8364186146c82af2c42338ee36c19549e209a9f8a90623ec981233d73f",
+      "size_bytes": 2015
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-default_window-3c0f6e2b5e7ad825.json",
+      "sha256": "fd8bd01ad4e8d59d52f34e659cfea5747a6f61dc6b8af597a04e37e428f06865",
+      "size_bytes": 2007
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-shipped-1fb1f4a620798e12.json",
+      "sha256": "9b86a283f4be3bb970737f2b779a403c591e8735f6a9f391d097aa84a77538c8",
+      "size_bytes": 2004
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-raised-55375bb777f86f71.json",
+      "sha256": "0f57b204f035c7b0a5a97e348d90cc23687c646300205a3bae515018ae5c0b44",
+      "size_bytes": 2004
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-default_window-9c72466d3efcfc71.json",
+      "sha256": "2bd6c8751b9c2b844e23602d7a0de0bc72d2e79725265813b01766debaafeff2",
+      "size_bytes": 2020
+    },
+    {
+      "name": "baseline-capacity-mixed-1k-hot-buffered-c5f91477b43bd044.json",
+      "sha256": "c1181b5e5103d90fd099e3b5ee2b9cf9a20c17f36330baa8f2ba1c531cc19673",
+      "size_bytes": 2029
+    }
+  ],
   "capacity": {
     "cells": {
       "minio-c1": {
@@ -22,7 +58,7 @@
           }
         },
         "default_window": {
-          "aggregate": "capacity-mixed-1k-hot-default_window-strict-minio-c1-w15-f002",
+          "aggregate": "capacity-mixed-1k-hot-default_window-strict-minio-c1-w15-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 8.392406194,
             "ack_latency_p95_s": 14.718948185,
@@ -88,7 +124,7 @@
           }
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.295021829,
             "ack_latency_p95_s": 1.76201985,
@@ -200,7 +236,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-minio-c1-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-minio-c1-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.93083742,
             "ack_latency_p95_s": 1.024122653,
@@ -292,7 +328,7 @@
       },
       "minio-c4": {
         "buffered": {
-          "aggregate": "capacity-mixed-1k-hot-buffered-buffered-minio-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-buffered-buffered-minio-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.106949898,
             "ack_latency_p95_s": 1.158094279,
@@ -354,7 +390,7 @@
           }
         },
         "default_window": {
-          "aggregate": "capacity-mixed-1k-hot-default_window-strict-minio-c4-w15-f002",
+          "aggregate": "capacity-mixed-1k-hot-default_window-strict-minio-c4-w15-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 8.546019787,
             "ack_latency_p95_s": 14.873464702,
@@ -419,7 +455,7 @@
           "scaling_efficiency_ratio": 0.8235294117647058
         },
         "raised": {
-          "aggregate": "capacity-mixed-1k-hot-raised-strict-minio-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-raised-strict-minio-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 1.316619918,
             "ack_latency_p95_s": 2.033899145,
@@ -524,7 +560,7 @@
           ]
         },
         "shipped": {
-          "aggregate": "capacity-mixed-1k-hot-shipped-strict-minio-c4-w1-f002",
+          "aggregate": "capacity-mixed-1k-hot-shipped-strict-minio-c4-w1-f001",
           "aggregate_metrics": {
             "ack_latency_p50_s": 0.917946593,
             "ack_latency_p95_s": 1.379198787,
@@ -643,51 +679,6 @@
       }
     },
     "invalidated_by_build": [],
-    "rejudgement": {
-      "decision_changes": [],
-      "oracle_changes": [],
-      "rules": "every trial judged again from what it stored: the verdict through `judge_trial` (engine-side failures -- failed, refused and partially rejected requests, the durable buffer's growing log, ingest failures and rejected bundles -- outrank producer lateness), the generator read-back's aggregate equalities (stored rows less stored failed-request rows equal the acknowledged records, every stored record once, the sequence sum when no failed request's rows were stored), and the Alloy read-back through `judge_read_back` (a duplicate fails it)",
-      "trials_count": 108,
-      "unchecked": [
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c1-w1-r094"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c1-w1-r100"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c4-w1-r134"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c4-w1-r145"
-        },
-        {
-          "reason": "logs: sequence sum not checkable, 7890000 failed-request records stored",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c4-w1-r163"
-        },
-        {
-          "reason": "metrics: sequence sum not checkable, 1999000 failed-request records stored",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c4-w1-r163"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-1k-hot-strict-minio-c4-w1-r164"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-8k-hot-strict-minio-c1-w1-r277"
-        },
-        {
-          "reason": "no stored trial figures (failed)",
-          "run_id": "capacity-mixed-8k-hot-strict-minio-c4-w1-r278"
-        }
-      ],
-      "verdict_changes": []
-    },
     "rules": {
       "admission_ceiling": "strict records/s per worker <= receiver slots x records per request / hold time, a window plus the flush that makes a block durable",
       "backlog_slope_limit_ratio": 0.02,
@@ -26118,13 +26109,7 @@
   },
   "case": "capacity",
   "checks": [],
-  "child_indexes": [
-    {
-      "name": "capacity-minio-0c238bf824a5.json",
-      "sha256": "0c238bf824a55679c710b0df5b76b88b996d0d7e73f5080df6fdb479ac6dbcaf",
-      "size_bytes": 1122720
-    }
-  ],
+  "child_indexes": [],
   "config": {
     "effective": {},
     "requested": {}
@@ -32612,45 +32597,45 @@
       "size_bytes": 1666540
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-minio-c1-w1-f002.json",
-      "sha256": "de6ec587289a08008d67ad3e6cf84845e3020dc76b08c7aa3216ebac2eecbafc",
-      "size_bytes": 231520
+      "name": "capacity-mixed-1k-hot-shipped-strict-minio-c1-w1-f001.json",
+      "sha256": "533047f5658e6ae1938b36b4ad3cb4e2d58741befa9e9f1875787aec7223f84d",
+      "size_bytes": 229268
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f002.json",
-      "sha256": "75636b545223a8c03891dbc9cdaa2b87bca9c2ee733efe162900b2184d400d5a",
-      "size_bytes": 232799
+      "name": "capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f001.json",
+      "sha256": "5ddf87e1dcf8a2b7b48a56f3a4756e2714bf06cd60e25018f4df748daf38ccd8",
+      "size_bytes": 230516
     },
     {
-      "name": "capacity-mixed-1k-hot-default_window-strict-minio-c1-w15-f002.json",
-      "sha256": "825fc686d93352723e1ba2cffa115102ecdf74834591b3202e7b68d6e9f61dc3",
-      "size_bytes": 232886
+      "name": "capacity-mixed-1k-hot-default_window-strict-minio-c1-w15-f001.json",
+      "sha256": "0494a844b7a28ed4550aaa1e7c4a6874be681b397c017e14eeb03dd1709afd33",
+      "size_bytes": 230661
     },
     {
-      "name": "capacity-mixed-1k-hot-shipped-strict-minio-c4-w1-f002.json",
-      "sha256": "e5316b03c1b064bfbf3cb2e31812492a0ac395c5d7fe3696c44fa03cf6d09aec",
-      "size_bytes": 251547
+      "name": "capacity-mixed-1k-hot-shipped-strict-minio-c4-w1-f001.json",
+      "sha256": "955733d16b55759299e74f6807bc3fce3b4969a8e83e2aac650f0c9dc98ae79c",
+      "size_bytes": 249291
     },
     {
-      "name": "capacity-mixed-1k-hot-raised-strict-minio-c4-w1-f002.json",
-      "sha256": "f2306ff5d8391ae7e17186d6c93cfeea394ce5d812607a63ca20c2251046f008",
-      "size_bytes": 254630
+      "name": "capacity-mixed-1k-hot-raised-strict-minio-c4-w1-f001.json",
+      "sha256": "60dbd470fe7daa8d927a614c98a36f6f99ef44b417ec7cc0279b5fbf951077cc",
+      "size_bytes": 252369
     },
     {
-      "name": "capacity-mixed-1k-hot-default_window-strict-minio-c4-w15-f002.json",
-      "sha256": "ff74e39d340450af37857da91f63aacb2f454572eb77d2c16277eb7b5df0b462",
-      "size_bytes": 252028
+      "name": "capacity-mixed-1k-hot-default_window-strict-minio-c4-w15-f001.json",
+      "sha256": "4d5b1b4e537551166084cf831b3ed9f3a4d6cfbd8c6d1fd6cdcaf9a0a512e76d",
+      "size_bytes": 249777
     },
     {
-      "name": "capacity-mixed-1k-hot-buffered-buffered-minio-c4-w1-f002.json",
-      "sha256": "810b5a84587ffb5903ef584127f04bb81698658b0fcc5c80ea66b8813fdd582a",
-      "size_bytes": 266044
+      "name": "capacity-mixed-1k-hot-buffered-buffered-minio-c4-w1-f001.json",
+      "sha256": "aabf235b71dbbc8d0c54ae00dd5847ec98ca4197e4b446285e5ff9b5fc4f3a8a",
+      "size_bytes": 263747
     }
   ],
   "run_id": "capacity-minio",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T18:19:16Z",
+  "started_utc": "2026-09-24T17:55:14Z",
   "status": "passed",
   "workload": {}
 }
