@@ -953,8 +953,13 @@ def run_legacy_suite(output_dir) -> dict:
 LEGACY_TEST_COUNT = 19
 
 
-def write_index(case, output_dir, report_dir, children, *, publishable, legacy=None):
-    """Summarize child runs in one index file and publish the tree."""
+def write_index(case, output_dir, report_dir, children, *, publishable, legacy=None,
+                purposes=None):
+    """Summarize child runs in one index file and publish the tree.
+
+    `purposes` names, by run id, why a child was run, for a run that is not
+    the first of its kind.
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic_ns()
@@ -1022,6 +1027,8 @@ def write_index(case, output_dir, report_dir, children, *, publishable, legacy=N
             ),
             "baseline_decision": child.get("baseline_decision"),
             "metrics": child["metrics"],
+            **({"purpose": purposes[child["run_id"]]}
+               if child["run_id"] in (purposes or {}) else {}),
         }
         for child in children
     ]

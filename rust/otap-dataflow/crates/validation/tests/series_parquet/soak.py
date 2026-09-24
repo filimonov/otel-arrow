@@ -938,6 +938,14 @@ class FamilyState:
         self.document["runs"][step] = value
         _ = measurement.write_json_atomic(self.path, self.document)
 
+    def purpose(self, run_id, text):
+        """Record why a run was made, for a run that repeats a step."""
+        self.document.setdefault("purposes", {})[run_id] = text
+        _ = measurement.write_json_atomic(self.path, self.document)
+
+    def purposes(self) -> dict:
+        return dict(self.document.get("purposes") or {})
+
     def history(self, step) -> list:
         """Every run a step produced, the failed ones included, in order."""
         recorded = list((self.document.get("history") or {}).get(step) or [])
@@ -1029,6 +1037,8 @@ def run_soak(output_dir, report_dir=None, **options) -> list:
         raise AssertionError(f"unknown soak steps {unknown}; known {list(SOAK_STEPS)}")
     input_s = int(options.pop("input_s", SOAK_INPUT_S))
     state = FamilyState(output_dir)
+    for run_id, purpose in (options.pop("purposes", None) or {}).items():
+        state.purpose(run_id, purpose)
     measured = [step for step in steps if step in ("strict", "bracket", "buffered", "alloy")]
     if measured:
         plan = open_soak_plan(output_dir, dict(options, report_dir=report_dir))
@@ -1114,7 +1124,7 @@ def publish(state, output_dir, report_dir) -> list:
         if not children:
             continue
         indexes.append(command.write_index(case, output_dir, report_dir, children,
-                                           publishable=True))
+                                           publishable=True, purposes=state.purposes()))
     return indexes
 
 
