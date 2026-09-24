@@ -693,6 +693,32 @@ fn a_bare_cargo_bench_run_skips() -> Result<()> {
     }
 }
 
+// Scenario: the executable reads back the allocator it runs on.
+// Guarantees: a glibc Linux timing build runs on jemalloc with its background
+// thread on, as the engine does, and a heap build on DHAT; an inherited
+// `MALLOC_CONF` may override the option, so the check is skipped under one.
+fn the_bench_runs_on_the_engine_allocator() -> Result<()> {
+    let name = super::allocator::name();
+    if cfg!(feature = "bench-heap") {
+        return ensure(name == "dhat", format!("heap build allocator {name}"));
+    }
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return Ok(());
+    }
+    if let Some(conf) = std::env::var_os("MALLOC_CONF") {
+        use std::io::Write as _;
+        writeln!(
+            std::io::stderr(),
+            "allocator self-test skipped: MALLOC_CONF={conf:?} overrides the default"
+        )?;
+        return Ok(());
+    }
+    ensure(
+        name == "jemalloc+background_thread",
+        format!("timing build allocator {name}"),
+    )
+}
+
 // Scenario: merge fixtures from sealed logs and metrics blocks, and an extract
 // fixture from one-record logs requests.
 // Guarantees: the merge reports resident sort keys (nonzero, below the block's
@@ -765,6 +791,7 @@ pub fn run() -> Result<()> {
     let holder = tempfile::tempdir()?;
     let root = holder.path();
     a_bare_cargo_bench_run_skips()?;
+    the_bench_runs_on_the_engine_allocator()?;
     stage_names_are_the_contract()?;
     input_file_round_trips(root)?;
     input_generation_is_excluded_from_timing()?;

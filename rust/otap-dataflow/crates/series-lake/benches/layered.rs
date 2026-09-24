@@ -18,6 +18,8 @@
 //! a JSON file describing the untimed verification run of each group, and
 //! `SERIES_STAGE_HANDSHAKE=1` to wait for the harness before measuring.
 
+#[path = "measurement/allocator.rs"]
+mod allocator;
 #[path = "measurement/stages.rs"]
 mod stages;
 
@@ -96,7 +98,7 @@ fn describe() -> serde_json::Value {
     serde_json::json!({
         "bench": "layered",
         "bench_heap": cfg!(feature = "bench-heap"),
-        "allocator": "system",
+        "allocator": allocator::name(),
         "debug_assertions": cfg!(debug_assertions),
         "handshake": true,
         "stages": StageName::LAYERS.iter().map(|stage| stage.as_str()).collect::<Vec<_>>(),

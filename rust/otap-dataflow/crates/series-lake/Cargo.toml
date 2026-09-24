@@ -18,8 +18,8 @@ default = []
 # measure the fixtures the series_parquet measurement harness writes. Off by
 # default, so a workspace-wide `cargo bench` does not build them.
 bench-harness = []
-# Installs DHAT's global allocator in the `measurement` bench executable,
-# for its heap profile only. No library code uses it.
+# Installs DHAT's global allocator in the bench executables in place of
+# jemalloc, for the `measurement` heap profile only. No library code uses it.
 bench-heap = ["bench-harness"]
 
 [dependencies]
@@ -63,6 +63,11 @@ object_store = { workspace = true, features = ["aws", "fs"] }
 otel-arrow-dfe-otap = { workspace = true, features = ["aws", "crypto-ring"] }
 prost.workspace = true
 sha2.workspace = true
+
+# The timing benches' global allocator, as the engine's (benches/measurement/allocator.rs).
+[target.'cfg(not(windows))'.dev-dependencies]
+tikv-jemallocator.workspace = true
+tikv-jemalloc-ctl.workspace = true
 
 [[bench]]
 name = "measurement"

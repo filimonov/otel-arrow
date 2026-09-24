@@ -27,16 +27,17 @@
 //!
 //! A timing process runs at least `--iterations` samples and one second of
 //! measured work, capped by a sixty-second deadline after which the result
-//! is marked incomplete. A heap process is built with the `bench-heap`
-//! feature, which installs DHAT's global allocator in this executable only;
-//! the timing build uses the system allocator, so allocation tracking never
-//! distorts a timed sample.
+//! is marked incomplete. The timing build runs on the engine's jemalloc
+//! configuration; a heap process is built with the `bench-heap` feature,
+//! which installs DHAT's global allocator instead (see `allocator.rs`).
 //!
 //! With `--handshake` the process writes `SERIES_STAGE_READY` once its
 //! fixtures exist and waits for one line on stdin before it measures, then
 //! writes `SERIES_STAGE_DONE` after its output file and waits for stdin to
 //! close, so that the harness can snapshot the live process at both edges.
 
+#[path = "measurement/allocator.rs"]
+mod allocator;
 #[path = "measurement/flush_stall.rs"]
 mod flush_stall;
 #[path = "measurement/series_cost.rs"]
@@ -58,10 +59,6 @@ use stages::{
     BenchConfig, Clock, Observation, Result, Stage, StageName, Timing, timed, timed_process,
 };
 
-#[cfg(feature = "bench-heap")]
-#[global_allocator]
-static ALLOCATOR: dhat::Alloc = dhat::Alloc;
-
 /// Least measured work a timing process accumulates.
 const MINIMUM_MEASURED: Duration = Duration::from_secs(1);
 
@@ -81,7 +78,7 @@ const MAX_STORED_SAMPLES: usize = 2000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Profile {
-    /// Wall and CPU time with the system allocator.
+    /// Wall and CPU time on the engine's allocator.
     Timing,
     /// DHAT heap statistics; never a source of throughput.
     Heap,
@@ -125,7 +122,8 @@ enum Command {
 ///
 /// The harness locates prebuilt executables and asks each one what it is,
 /// since asking cargo would build the target. `bench_heap` says whether
-/// DHAT's allocator is installed, and `debug_assertions` marks a debug build.
+/// DHAT's allocator is installed, `allocator` names the installed one
+/// ([`allocator::name`]), and `debug_assertions` marks a debug build.
 #[derive(Debug, Serialize)]
 struct Description {
     bench: &'static str,
@@ -140,11 +138,7 @@ fn describe() -> Description {
     Description {
         bench: "measurement",
         bench_heap: cfg!(feature = "bench-heap"),
-        allocator: if cfg!(feature = "bench-heap") {
-            "dhat"
-        } else {
-            "system"
-        },
+        allocator: allocator::name(),
         debug_assertions: cfg!(debug_assertions),
         handshake: true,
         stages: StageName::ALL.iter().map(|stage| stage.as_str()).collect(),
