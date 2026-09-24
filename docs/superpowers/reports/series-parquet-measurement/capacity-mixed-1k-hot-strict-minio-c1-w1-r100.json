@@ -1,0 +1,1381 @@
+{
+  "artifact_kind": "run",
+  "artifacts": [],
+  "baseline_files": [],
+  "case": "capacity-mixed-1k-hot",
+  "checks": [
+    {
+      "detail": "strict: [['receiver', 'exporter']]",
+      "kind": "hard",
+      "name": "graph_edges",
+      "status": "passed"
+    },
+    {
+      "detail": "0 build processes seen in 20 scans; builder container starts 0",
+      "kind": "hard",
+      "name": "no_concurrent_build",
+      "status": "passed"
+    },
+    {
+      "detail": "20 ticks, largest gap 0.064117127s",
+      "kind": "hard",
+      "name": "build_monitor_coverage",
+      "status": "passed"
+    },
+    {
+      "detail": "<host-path>/series-parquet-host-measurement.lock",
+      "kind": "hard",
+      "name": "host_lease_held",
+      "status": "passed"
+    },
+    {
+      "detail": "taken: []",
+      "kind": "hard",
+      "name": "environment_snapshots_complete",
+      "status": "failed"
+    },
+    {
+      "detail": "a start and an end snapshot are both required",
+      "kind": "hard",
+      "name": "environment_matched",
+      "status": "failed"
+    },
+    {
+      "detail": "worker affinity was not observed at both edges",
+      "kind": "hard",
+      "name": "affinity_matched",
+      "status": "failed"
+    },
+    {
+      "detail": "None physical cores available to the run, 8 required; the machine has None",
+      "kind": "hard",
+      "name": "physical_cores_sufficient",
+      "status": "failed"
+    }
+  ],
+  "child_indexes": [],
+  "config": {
+    "edges": [
+      [
+        "receiver",
+        "exporter"
+      ]
+    ],
+    "effective": {
+      "engine": {
+        "telemetry": {
+          "reporting_interval": "1s"
+        }
+      },
+      "groups": {
+        "default": {
+          "pipelines": {
+            "main": {
+              "connections": [
+                {
+                  "from": "receiver",
+                  "to": "exporter"
+                }
+              ],
+              "nodes": {
+                "exporter": {
+                  "config": {
+                    "ingress": {
+                      "max_extracted_bytes": "32MiB",
+                      "max_nesting_depth": 32,
+                      "max_request_bytes": "16MiB",
+                      "max_row_bytes": "1MiB"
+                    },
+                    "logs": {
+                      "denormalize": [
+                        "resource.service.name"
+                      ],
+                      "series_attributes": [
+                        "logger.name"
+                      ],
+                      "values_sort": [
+                        {
+                          "column": "series_id",
+                          "order": "asc"
+                        },
+                        {
+                          "column": "time_unix_nano",
+                          "nulls": "last",
+                          "order": "asc"
+                        }
+                      ]
+                    },
+                    "metrics": {
+                      "denormalize": [
+                        "resource.service.name"
+                      ],
+                      "values_sort": [
+                        {
+                          "column": "series_id",
+                          "order": "asc"
+                        },
+                        {
+                          "column": "time_unix_nano",
+                          "order": "asc"
+                        }
+                      ]
+                    },
+                    "notify_batch": 64,
+                    "parquet": {
+                      "compression": "zstd",
+                      "row_group_bytes": "64MiB",
+                      "writer_limit_bytes": "96MiB"
+                    },
+                    "producer_id_attribute": "host.id",
+                    "retry": {
+                      "backoff_base": 2.0,
+                      "init_backoff": "200ms",
+                      "max_backoff": "2s",
+                      "max_retries": 3,
+                      "retry_timeout": "20s"
+                    },
+                    "series_cache": {
+                      "max_entries": 200000
+                    },
+                    "sorting": {
+                      "enabled": true,
+                      "merge_chunk_bytes": "16MiB",
+                      "run_target_bytes": "8MiB"
+                    },
+                    "storage": {
+                      "s3": {
+                        "allow_http": true,
+                        "auth": {
+                          "access_key_id": "<redacted>",
+                          "secret_access_key": "<redacted>",
+                          "type": "static_credentials"
+                        },
+                        "base_uri": "s3://series-test/otel",
+                        "endpoint": "http://127.0.0.1:43183",
+                        "region": "us-east-1",
+                        "virtual_hosted_style_request": false
+                      }
+                    },
+                    "unsupported": "drop",
+                    "upload": {
+                      "abort_timeout": "5s",
+                      "concurrency": 2,
+                      "part_bytes": "8MiB"
+                    },
+                    "window": {
+                      "flush_retry_deadline": "60s",
+                      "interval": "1s",
+                      "max_block_bytes": "500MiB",
+                      "max_requests_per_block": 4096
+                    },
+                    "writer_id": "local_1"
+                  },
+                  "type": "exporter:series_parquet"
+                },
+                "receiver": {
+                  "config": {
+                    "protocols": {
+                      "grpc": {
+                        "listening_addr": "127.0.0.1:41909",
+                        "max_concurrent_requests": 128,
+                        "timeout": "180s",
+                        "wait_for_result": true
+                      }
+                    }
+                  },
+                  "type": "receiver:otlp"
+                }
+              },
+              "policies": {
+                "channel_capacity": {
+                  "control": {
+                    "completion": 100,
+                    "node": 100,
+                    "pipeline": 100
+                  },
+                  "pdata": 128
+                }
+              }
+            }
+          }
+        }
+      },
+      "policies": {
+        "resources": {
+          "core_allocation": {
+            "set": [
+              {
+                "end": 1,
+                "start": 1
+              }
+            ],
+            "type": "core_set"
+          }
+        }
+      },
+      "version": "otel_dataflow/v1"
+    },
+    "effective_sha256": "5764ca7b14fb733099fcbe7416efad8d0000f149fa905351ea8f868228121433",
+    "malloc_conf": "stats_interval:67108864,stats_interval_opts:Jgmdablxeh",
+    "requested": {
+      "case": "capacity-mixed-1k-hot",
+      "cores": [
+        1
+      ],
+      "duration_s": 75,
+      "interval_s": 1,
+      "max_in_flight": 128,
+      "overrides": {
+        "connections": 256,
+        "first_index": 0,
+        "measure_s": 60,
+        "offered_records_per_s": 32000,
+        "pdata_channel_capacity": 128,
+        "producer_processes": 8,
+        "purpose": "search",
+        "rate_requests_per_s": 32.0,
+        "receiver": {
+          "max_concurrent_requests": 128
+        },
+        "receiver_per_worker_max_concurrent_requests": 128,
+        "upload_concurrency": 2,
+        "warmup_s": 15
+      },
+      "producer_timeout_s": 180.0,
+      "run_id": "capacity-mixed-1k-hot-strict-minio-c1-w1-r100",
+      "store": "minio",
+      "topology": "strict"
+    }
+  },
+  "elapsed_s": 1.01417478,
+  "environment": {
+    "build": {
+      "allocator": "jemalloc",
+      "binary": "<repo>/rust/otap-dataflow/target/release/df_engine",
+      "binary_sha256": "494f83c67d25f98d86978305bd07cd46c5b0b2abdf421bb916a62322adbf0d1a",
+      "binary_size_bytes": 764239688,
+      "features": "default,series-parquet,aws,durable-buffer",
+      "profile": "release",
+      "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)"
+    },
+    "build_monitor": {
+      "affinity_failure_count": 0,
+      "affinity_failures": [],
+      "coverage": {
+        "gaps_over_limit": [],
+        "gaps_over_limit_count": 0,
+        "interval_s": 0.05,
+        "limit_s": 0.1,
+        "max_gap_s": 0.064117127,
+        "ticks": 20
+      },
+      "detected": false,
+      "docker": {
+        "end": {
+          "available": true,
+          "builders": [
+            {
+              "id": "23367b01804b",
+              "image": "moby/buildkit:buildx-stable-1",
+              "name": "buildx_buildkit_clickhouse-regression-builder"
+            }
+          ],
+          "observable": true
+        },
+        "events": {
+          "builder_starts": [],
+          "container_start_count": 0,
+          "observable": true
+        },
+        "start": {
+          "available": true,
+          "builders": [
+            {
+              "id": "23367b01804b",
+              "image": "moby/buildkit:buildx-stable-1",
+              "name": "buildx_buildkit_clickhouse-regression-builder"
+            }
+          ],
+          "observable": true
+        }
+      },
+      "observation_count": 0,
+      "observations": [],
+      "scans": 20,
+      "visibility": {
+        "complete": true,
+        "hidepid": null,
+        "other_processes_visible": true,
+        "proc_root": "/proc"
+      }
+    },
+    "core_allocation": {
+      "engine": [
+        1
+      ],
+      "engine_observability": [
+        0
+      ],
+      "engine_reserved": [
+        2,
+        3,
+        4
+      ],
+      "producer": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "store": [
+        7,
+        23
+      ]
+    },
+    "end": {
+      "absent_roles": {},
+      "available_cores": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "available_physical_core_count": 8,
+      "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+      "fallback": "the experiment did not reach this edge; this is the harness process only",
+      "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+      "load_average_1_5_15": [
+        1.63,
+        4.67,
+        5.57
+      ],
+      "logical_core_count": 32,
+      "monotonic_ns": 319377368458188,
+      "observed_utc": "2026-09-24T11:57:31Z",
+      "physical_core_count": 16,
+      "ram_bytes": 98401574912,
+      "sibling_groups": [
+        [
+          0,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          2,
+          18
+        ],
+        [
+          3,
+          19
+        ],
+        [
+          4,
+          20
+        ],
+        [
+          5,
+          21
+        ],
+        [
+          6,
+          22
+        ],
+        [
+          7,
+          23
+        ],
+        [
+          8,
+          24
+        ],
+        [
+          9,
+          25
+        ],
+        [
+          10,
+          26
+        ],
+        [
+          11,
+          27
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          30
+        ],
+        [
+          15,
+          31
+        ]
+      ],
+      "thread_affinity": [
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 16,
+          "name": "python3",
+          "nspid": "434360",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434360
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 17,
+          "name": "python3",
+          "nspid": "434362",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434362
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 4,
+          "name": "python3",
+          "nspid": "434363",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434363
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "434364",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434364
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "434365",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434365
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "434366",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434366
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 4,
+          "name": "python3",
+          "nspid": "434367",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434367
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434368",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434368
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "434369",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434369
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434370",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434370
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434371",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434371
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 18,
+          "name": "python3",
+          "nspid": "434372",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434372
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 16,
+          "name": "python3",
+          "nspid": "434373",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434373
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434374",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434374
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434375",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434375
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 1,
+          "name": "python3",
+          "nspid": "434376",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434376
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434377",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434377
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 18,
+          "name": "python3",
+          "nspid": "434378",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434378
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434379",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434379
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434380",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434380
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434381",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434381
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "434382",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434382
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434383",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434383
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "434384",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434384
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 21,
+          "name": "python3",
+          "nspid": "434385",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434385
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434386",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434386
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434387",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434387
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "434388",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434388
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434389",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434389
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 17,
+          "name": "python3",
+          "nspid": "434390",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434390
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434391",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434391
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "434392",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434392
+        }
+      ]
+    },
+    "git": {
+      "dirty": true,
+      "revision": "df3ead940d56bb5435d788f00279d88cc81132b0"
+    },
+    "lease": {
+      "acquired_utc": "2026-09-24T11:57:30Z",
+      "owner": "434360-371762e4828c431bbc68ba10988cfd27",
+      "path": "<host-path>/series-parquet-host-measurement.lock",
+      "pid": 434360,
+      "released_utc": "2026-09-24T11:57:31Z",
+      "run_id": "capacity-mixed-1k-hot-strict-minio-c1-w1-r100"
+    },
+    "machine_identity_sha256": "5f95bfd263ecc79d6a58b132a0e4c62b8ad24560a98752b900cf7d285d8e2e5a",
+    "producer": {
+      "cpu_set_per_process": [
+        [
+          8,
+          24
+        ],
+        [
+          9,
+          25
+        ],
+        [
+          10,
+          26
+        ],
+        [
+          11,
+          27
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          30
+        ],
+        [
+          15,
+          31
+        ]
+      ],
+      "cpus": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31
+      ],
+      "processes": 8
+    },
+    "start": {
+      "absent_roles": {},
+      "available_cores": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "available_physical_core_count": 8,
+      "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+      "fallback": "the experiment did not reach this edge; this is the harness process only",
+      "kernel": "Linux-6.14.0-37-generic-x86_64-with-glibc2.41",
+      "load_average_1_5_15": [
+        1.63,
+        4.67,
+        5.57
+      ],
+      "logical_core_count": 32,
+      "monotonic_ns": 319377366302545,
+      "observed_utc": "2026-09-24T11:57:31Z",
+      "physical_core_count": 16,
+      "ram_bytes": 98401574912,
+      "sibling_groups": [
+        [
+          0,
+          16
+        ],
+        [
+          1,
+          17
+        ],
+        [
+          2,
+          18
+        ],
+        [
+          3,
+          19
+        ],
+        [
+          4,
+          20
+        ],
+        [
+          5,
+          21
+        ],
+        [
+          6,
+          22
+        ],
+        [
+          7,
+          23
+        ],
+        [
+          8,
+          24
+        ],
+        [
+          9,
+          25
+        ],
+        [
+          10,
+          26
+        ],
+        [
+          11,
+          27
+        ],
+        [
+          12,
+          28
+        ],
+        [
+          13,
+          29
+        ],
+        [
+          14,
+          30
+        ],
+        [
+          15,
+          31
+        ]
+      ],
+      "thread_affinity": [
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434360",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434360
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 17,
+          "name": "python3",
+          "nspid": "434362",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434362
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 4,
+          "name": "python3",
+          "nspid": "434363",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434363
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "434364",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434364
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 6,
+          "name": "python3",
+          "nspid": "434365",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434365
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 22,
+          "name": "python3",
+          "nspid": "434366",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434366
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 4,
+          "name": "python3",
+          "nspid": "434367",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434367
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434368",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434368
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "434369",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434369
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434370",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434370
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434371",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434371
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 18,
+          "name": "python3",
+          "nspid": "434372",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434372
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 16,
+          "name": "python3",
+          "nspid": "434373",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434373
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434374",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434374
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434375",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434375
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 1,
+          "name": "python3",
+          "nspid": "434376",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434376
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434377",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434377
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 18,
+          "name": "python3",
+          "nspid": "434378",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434378
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434379",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434379
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 2,
+          "name": "python3",
+          "nspid": "434380",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434380
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434381",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434381
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 23,
+          "name": "python3",
+          "nspid": "434382",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434382
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434383",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434383
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 5,
+          "name": "python3",
+          "nspid": "434384",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434384
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 21,
+          "name": "python3",
+          "nspid": "434385",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434385
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 0,
+          "name": "python3",
+          "nspid": "434386",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434386
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 20,
+          "name": "python3",
+          "nspid": "434387",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434387
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "434388",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434388
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434389",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434389
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 17,
+          "name": "python3",
+          "nspid": "434390",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434390
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 19,
+          "name": "python3",
+          "nspid": "434391",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434391
+        },
+        {
+          "cpus_allowed_list": "0-7,16-23",
+          "expected_cores": [],
+          "last_cpu": 7,
+          "name": "python3",
+          "nspid": "434392",
+          "observed_utc": "2026-09-24T11:57:31Z",
+          "pid": 434360,
+          "role": "harness",
+          "tid": 434392
+        }
+      ]
+    }
+  },
+  "ephemeral_values": {
+    "<receiver_listening_addr>": "127.0.0.1:41909",
+    "<store_endpoint>": "http://127.0.0.1:43183"
+  },
+  "events": [
+    {
+      "detail": "434360-371762e4828c431bbc68ba10988cfd27",
+      "kind": "host_controls_opened",
+      "monotonic_ns": 319376386118044,
+      "observed_utc": "2026-09-24T11:57:30Z"
+    },
+    {
+      "detail": "{\"engine\": [1], \"engine_observability\": [0], \"engine_reserved\": [2, 3, 4], \"producer\": [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31], \"store\": [7, 23]}",
+      "kind": "core_allocation",
+      "monotonic_ns": 319376386680807,
+      "observed_utc": "2026-09-24T11:57:30Z"
+    },
+    {
+      "detail": "KeyboardInterrupt: ",
+      "kind": "failed",
+      "monotonic_ns": 319377319529872,
+      "observed_utc": "2026-09-24T11:57:31Z"
+    },
+    {
+      "detail": "",
+      "kind": "host_controls_closed",
+      "monotonic_ns": 319377364661615,
+      "observed_utc": "2026-09-24T11:57:31Z"
+    }
+  ],
+  "mandatory_metrics": [],
+  "metrics": {},
+  "metrics_unavailable": {},
+  "report_dir": "docs/superpowers/reports/series-parquet-measurement",
+  "run_dir": "<host-path>/capacity-mixed-1k-hot-strict-minio-c1-w1-r100",
+  "run_files": [],
+  "run_id": "capacity-mixed-1k-hot-strict-minio-c1-w1-r100",
+  "samples": [],
+  "schema_version": 1,
+  "started_utc": "2026-09-24T11:57:30Z",
+  "status": "failed",
+  "workload": {
+    "body_bytes": 1024,
+    "metrics_every": 5,
+    "records_per_request": 1000,
+    "requests": 2400,
+    "seed": 20260922,
+    "series": 10000,
+    "series_scope": "record"
+  },
+  "workload_schedule": {
+    "duration_s": 75,
+    "max_in_flight": 128,
+    "rate_requests_per_s": 32.0
+  }
+}
