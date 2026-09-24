@@ -332,15 +332,74 @@ impl Display for InvalidContent<'_> {
     }
 }
 
-/// A storage failure while handling one request.
-struct StorageFailed<'a>(&'a lake::Error);
+/// Why a write to object storage failed, in a closed classification: the
+/// class a producer is told and a failed flush is counted under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, AttributeEnum)]
+pub(super) enum WriteFailure {
+    /// The store kept failing, or did not answer, until the retry deadline.
+    Deadline,
+    /// The store refused the write for a reason no retry cures: credentials,
+    /// permissions, or a missing bucket or path.
+    PermanentStorage,
+    /// The write was cancelled.
+    Cancelled,
+    /// Encoding the block failed.
+    Encode,
+    /// A writer invariant failed, or the write task was lost.
+    Internal,
+}
+
+impl WriteFailure {
+    /// The class of a failed write.
+    ///
+    /// A retryable storage error that ends a flush is one the retry deadline
+    /// stopped. The Parquet writer's `External` error is how it wraps what the
+    /// store returned, so it is a storage failure, never an encoding one.
+    pub(super) fn of(error: &lake::Error) -> Self {
+        match error {
+            error if error.is_cancelled() => Self::Cancelled,
+            lake::Error::Transient(lake::TransientError::DeadlineExceeded { .. }) => Self::Deadline,
+            lake::Error::Transient(lake::TransientError::AbortFailed { source, .. }) => {
+                Self::of(source)
+            }
+            error if error.is_retryable() => Self::Deadline,
+            lake::Error::Transient(_)
+            | lake::Error::Internal(lake::InternalError::Parquet(
+                parquet::errors::ParquetError::External(_),
+            )) => Self::PermanentStorage,
+            lake::Error::Internal(
+                lake::InternalError::Arrow(_) | lake::InternalError::Parquet(_),
+            ) => Self::Encode,
+            lake::Error::Internal(lake::InternalError::Invariant(_)) | lake::Error::Refused(_) => {
+                Self::Internal
+            }
+        }
+    }
+
+    /// The words a producer is told in place of the store's own error text,
+    /// which names the endpoint, bucket and key layout.
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::Deadline => "unavailable",
+            Self::PermanentStorage => "rejected by the store",
+            Self::Cancelled => "cancelled",
+            Self::Encode => "encoding failed",
+            Self::Internal => "internal error",
+        }
+    }
+}
+
+/// A failed write to object storage, told to the requests it held: a fixed
+/// sentence and the [`WriteFailure`] class. The error itself is logged, never
+/// sent.
+pub(super) struct StorageFailed<'a>(pub(super) &'a lake::Error);
 
 impl Display for StorageFailed<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "object storage failed: {}; retry the request",
-            sanitized(&self.0.to_string())
+            "could not write to object storage ({}); retry the request",
+            WriteFailure::of(self.0).phrase()
         )
     }
 }
@@ -353,20 +412,6 @@ impl Display for InternalFailure<'_> {
         write!(
             f,
             "series_parquet internal error: {}; the request is not at fault, retry it",
-            sanitized(&self.0.to_string())
-        )
-    }
-}
-
-/// The failed write of a whole block, told to every request it held.
-pub(super) struct BlockWriteFailed<'a>(pub(super) &'a lake::Error);
-
-impl Display for BlockWriteFailed<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "writing the block holding this request to object storage failed: {}; retry the \
-             request",
             sanitized(&self.0.to_string())
         )
     }
@@ -546,15 +591,13 @@ mod tests {
     /// Scenario: the reason sentence is built for one error of every shape a
     /// sender can be told about: each size budget, with and without a
     /// measured size; traces, exemplars and an unsupported point kind; excess
-    /// nesting; invalid content spanning two lines; a storage failure; an
-    /// internal failure; a block-scoped refusal that reached a sender; and a
-    /// failed block write.
-    /// Guarantees: every sentence is byte for byte the one producers have
-    /// been told so far, so moving how sentences are built never changes the
-    /// status message a producer logs, and a detail taken from the error stays
-    /// on one line.
+    /// nesting; invalid content spanning two lines; two storage failures; an
+    /// internal failure; and a block-scoped refusal that reached a sender.
+    /// Guarantees: every sentence is byte for byte the pinned one, so moving
+    /// how sentences are built never changes the status message a producer
+    /// logs, and a detail taken from the error stays on one line.
     #[test]
-    fn every_reason_sentence_is_unchanged() {
+    fn every_reason_sentence_is_pinned() {
         let sized = |budget, observed| {
             lake::Error::Refused(lake::RefuseReason::RequestTooLarge(lake::Excess {
                 budget,
@@ -614,14 +657,14 @@ mod tests {
             ),
             (
                 lake::Error::cancelled(None),
-                "object storage failed: cancelled; retry the request",
+                "could not write to object storage (cancelled); retry the request",
             ),
             (
                 lake::Error::Transient(lake::TransientError::DeadlineExceeded {
                     attempts: 2,
                     last: None,
                 }),
-                "object storage failed: flush retry deadline exceeded after 2 attempt(s); no attempt returned before the deadline; retry the request",
+                "could not write to object storage (unavailable); retry the request",
             ),
             (
                 lake::Error::internal("a\nb"),
@@ -639,9 +682,98 @@ mod tests {
         for (error, sentence) in &cases {
             assert_eq!(Outcome::explain(error), *sentence, "{error:?}");
         }
+    }
+
+    /// Scenario: a failed write of every [`WriteFailure`] class, each built
+    /// from errors whose text names an endpoint, a bucket and a key: a
+    /// retryable store error, an expired deadline after one, a cancellation,
+    /// a cancellation whose abort failed, refused credentials, a missing
+    /// bucket, a store error the Parquet writer wrapped, an abort failure
+    /// around a permanent one, an encoding failure and an invariant.
+    /// Guarantees: each is classified as listed and the sentence a producer is
+    /// told is byte for byte the fixed one with that class; no text of the
+    /// store's error reaches it.
+    #[test]
+    fn a_failed_write_is_told_as_a_fixed_sentence_and_a_class() {
+        let secret = "http://10.0.0.7:9000/bucket/v=1/signal=logs/key.parquet";
+        let generic = || {
+            lake::Error::from(object_store::Error::Generic {
+                store: "S3",
+                source: format!("{secret}: 503 SlowDown").into(),
+            })
+        };
+        let denied = || object_store::Error::PermissionDenied {
+            path: secret.into(),
+            source: "AccessDenied".into(),
+        };
+        let cases: Vec<(lake::Error, WriteFailure, &str)> = vec![
+            (generic(), WriteFailure::Deadline, "unavailable"),
+            (
+                lake::Error::Transient(lake::TransientError::DeadlineExceeded {
+                    attempts: 3,
+                    last: Some(Box::new(generic())),
+                }),
+                WriteFailure::Deadline,
+                "unavailable",
+            ),
+            (
+                lake::Error::cancelled(None),
+                WriteFailure::Cancelled,
+                "cancelled",
+            ),
+            (
+                lake::Error::cancelled(Some(secret.into())),
+                WriteFailure::Cancelled,
+                "cancelled",
+            ),
+            (
+                lake::Error::from(denied()),
+                WriteFailure::PermanentStorage,
+                "rejected by the store",
+            ),
+            (
+                lake::Error::from(object_store::Error::NotFound {
+                    path: secret.into(),
+                    source: "NoSuchBucket".into(),
+                }),
+                WriteFailure::PermanentStorage,
+                "rejected by the store",
+            ),
+            (
+                lake::Error::from(parquet::errors::ParquetError::External(Box::new(denied()))),
+                WriteFailure::PermanentStorage,
+                "rejected by the store",
+            ),
+            (
+                lake::Error::Transient(lake::TransientError::AbortFailed {
+                    source: Box::new(lake::Error::from(denied())),
+                    abort_error: secret.into(),
+                }),
+                WriteFailure::PermanentStorage,
+                "rejected by the store",
+            ),
+            (
+                lake::Error::from(parquet::errors::ParquetError::General(secret.into())),
+                WriteFailure::Encode,
+                "encoding failed",
+            ),
+            (
+                lake::Error::internal(secret),
+                WriteFailure::Internal,
+                "internal error",
+            ),
+        ];
+        for (error, class, phrase) in &cases {
+            assert_eq!(WriteFailure::of(error), *class, "{error:?}");
+            assert_eq!(
+                StorageFailed(error).to_string(),
+                format!("could not write to object storage ({phrase}); retry the request"),
+                "{error:?}"
+            );
+        }
         assert_eq!(
-            BlockWriteFailed(&lake::Error::cancelled(None)).to_string(),
-            "writing the block holding this request to object storage failed: cancelled; retry the request"
+            StorageFailed(&generic()).to_string(),
+            "could not write to object storage (unavailable); retry the request"
         );
     }
 }

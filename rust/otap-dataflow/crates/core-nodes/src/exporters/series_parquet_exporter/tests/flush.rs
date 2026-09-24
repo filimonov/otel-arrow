@@ -486,13 +486,9 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
             match rx.recv().await.expect("a nack") {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(!nack.permanent);
-                    assert!(
-                        nack.reason.contains(
-                            "flush retry deadline exceeded after 1 attempt(s); no attempt \
-                             returned before the deadline"
-                        ),
-                        "reason: {}",
-                        nack.reason
+                    assert_eq!(
+                        nack.reason,
+                        "could not write to object storage (unavailable); retry the request"
                     );
                 }
                 other => panic!("expected a nack, got {other:?}"),
@@ -509,11 +505,12 @@ async fn a_hung_write_expires_the_flush_deadline_as_its_own_outcome() {
 /// a cloud store retrying one request internally until its own
 /// `retry_timeout` -- under a sixty-second flush deadline.
 /// Guarantees: the flush retries the block until the deadline, counts every
-/// attempt in `flush.retries`, and nacks the block retryably with the
-/// destination's last error in the reason, so an outage is visible to the
-/// producer and to the operator with its cause rather than as a bare
-/// "cancelled" with zero retries. Each of the two attempts that returned is
-/// logged at WARN as retryable with its attempt number and the store's error.
+/// attempt in `flush.retries`, and nacks the block retryably with the fixed
+/// sentence classifying the store as unavailable, while the
+/// `series_parquet.flush.failed` ERROR carries the destination's last error,
+/// so an outage is visible with its cause rather than as a bare "cancelled"
+/// with zero retries. Each of the two attempts that returned is logged at
+/// WARN as retryable with its attempt number and the store's error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
     let events = capture();
@@ -567,11 +564,9 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             match rx.recv().await.expect("a nack") {
                 PipelineCompletionMsg::DeliverNack { nack } => {
                     assert!(!nack.permanent);
-                    assert!(
-                        nack.reason.contains("after 3 attempt(s); last error:")
-                            && nack.reason.contains("injected store failure"),
-                        "reason: {}",
-                        nack.reason
+                    assert_eq!(
+                        nack.reason,
+                        "could not write to object storage (unavailable); retry the request"
                     );
                 }
                 other => panic!("expected a nack, got {other:?}"),
@@ -583,6 +578,16 @@ async fn a_slowly_failing_store_surfaces_its_last_error_at_the_deadline() {
             drop(ticker);
         })
         .await;
+    let failed = events.named("series_parquet.flush.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].fields.get("error").is_some_and(|error| {
+            let text = error.text();
+            text.contains("after 3 attempt(s); last error:")
+                && text.contains("injected store failure")
+        }),
+        "{failed:?}"
+    );
     let logged = events.named("series_parquet.flush.attempt_failed");
     assert_eq!(
         logged.len(),
@@ -653,8 +658,10 @@ fn retry_classifier_distinguishes_encoding_from_storage() {
 /// Scenario: every write is refused as `PermissionDenied` under a
 /// sixty-second flush deadline.
 /// Guarantees: the block fails on its first attempt instead of being retried
-/// until the deadline, so refused credentials are reported at once with the
-/// store's own error rather than a minute later as a deadline expiry.
+/// until the deadline, so refused credentials are reported at once rather
+/// than a minute later as a deadline expiry; the producer is told the fixed
+/// sentence classifying the write as rejected by the store, without the
+/// store's error text or the object path.
 #[tokio::test(flavor = "current_thread")]
 async fn a_permission_error_is_not_retried_until_the_deadline() {
     tokio::task::LocalSet::new()
@@ -663,7 +670,7 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
             let _clock_guard = sim.install();
             let store = fault_store();
             store.hooks().set(Fault::Denied);
-            let (handler, _rx) = effects(8);
+            let (handler, mut rx) = effects(8);
             let mut cfg = worker_config();
             cfg.window.flush_retry_deadline = Duration::from_secs(60);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
@@ -683,6 +690,21 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
             assert_eq!(finished.attempts, 1, "a refused credential is not retried");
             let error = finished.result.as_ref().expect_err("the write is refused");
             assert!(error.to_string().contains("access denied"), "{error}");
+            worker.complete(done);
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a nack") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(
+                        nack.reason,
+                        "could not write to object storage (rejected by the store); retry the \
+                         request"
+                    );
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            assert_no_more_completions(&mut rx);
+            drain_cleanup(&mut worker).await;
         })
         .await;
 }

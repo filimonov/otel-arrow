@@ -50,7 +50,7 @@ use super::flush::{self, FlushDone, FlushJob};
 use super::metrics::{
     DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs,
 };
-use super::outcome::{self, BlockWriteFailed, Outcome};
+use super::outcome::{self, Outcome, StorageFailed};
 use super::token::{AckToken, Notifier};
 use super::window::Window;
 use lake::buffer::Block;
@@ -907,7 +907,7 @@ impl Worker {
                             attempts = finished.attempts,
                             message = "Block failed before durable completion"
                         );
-                        reason = Some(Rc::from(BlockWriteFailed(error).to_string()));
+                        reason = Some(Rc::from(StorageFailed(error).to_string()));
                         self.failed_outcome()
                     }
                 }

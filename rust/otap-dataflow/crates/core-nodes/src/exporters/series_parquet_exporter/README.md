@@ -53,20 +53,27 @@ A storage failure is retried against the identical sealed block, with the same
 file names and the same bytes, until an absolute deadline taken when the block
 was sealed (`window.flush_retry_deadline`). Every failed attempt is logged at
 WARN as `series_parquet.flush.attempt_failed` with the error the destination
-returned. At that deadline every request of the block is nacked as retryable
-with a reason that carries the last attempt's error, the flush is reported as
-a deadline expiry rather than as a cancellation, and the abandoned write is
-cancelled and
+returned. At that deadline every request of the block is nacked as retryable,
+the flush is reported as a deadline expiry rather than as a cancellation, and
+the abandoned write is cancelled and
 given at most `upload.abort_timeout` to unwind; the flush slot stays occupied
 until that cleanup finishes. An encoding failure is not retried at all: only
 an object-store or I/O error is, so a bug in encoding fails the block on its
 first attempt instead of repeating it until the deadline. Refused credentials
 and a missing bucket or path are not retried either, because no retry of the
 same write can cure them. A write that has finished by the moment the
-deadline expires is reported as the success it is. Its requests are
-still nacked as retryable, because the producer holds the only copy of rows
-that are not durable. Only a fully successful write marks the descriptor
+deadline expires is reported as the success it is, and its requests are
+acknowledged. Only a fully successful write marks the descriptor
 cache, so the cache never claims durability for rows that were not stored.
+
+A nacked request's reason is a fixed sentence with a closed class, never the
+store's error text, which names the endpoint, bucket and key layout:
+`could not write to object storage (<class>); retry the request`, where the
+class is `unavailable` (the store kept failing or did not answer until the
+deadline), `rejected by the store` (credentials, permissions, or a missing
+bucket or path), `cancelled`, `encoding failed` or `internal error`. The
+store's error is logged with `series_parquet.flush.attempt_failed` and
+`series_parquet.flush.failed`.
 
 Delivery is at-least-once. Producers must retain and retry a request on a
 retryable failure or a timeout, and a retry can duplicate rows an earlier
