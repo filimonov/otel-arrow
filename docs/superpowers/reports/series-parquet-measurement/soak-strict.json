@@ -6,6 +6,11 @@
       "name": "baseline-pr-soak-strict-f7af59b2dd635790.json",
       "sha256": "bddc50c803cfb96b092f0a15e40ac712891b93957228184e387438f64b56b85e",
       "size_bytes": 1287
+    },
+    {
+      "name": "baseline-soak-strict-5cb03bef4ffc17fe.json",
+      "sha256": "bed469105b0db8bd87386dbdcd56e721e4135df9c466048304cea4a3c6fe8d0f",
+      "size_bytes": 3374
     }
   ],
   "case": "soak-strict",
@@ -43,9 +48,9 @@
   ],
   "child_indexes": [
     {
-      "name": "soak-strict-d319525e9c60.json",
-      "sha256": "d319525e9c60d6b6ccfcd7fc82cd2d082fff7193417519e5ae9fe0ea3b4f0cfd",
-      "size_bytes": 30618
+      "name": "soak-strict-de9670d9d8f4.json",
+      "sha256": "de9670d9d8f48d90fe2227f12ea57a5746bb20666f79a0c6fdc809c73dd48b09",
+      "size_bytes": 32826
     }
   ],
   "children": [
@@ -1159,6 +1164,59 @@
   "metrics_unavailable": {},
   "publishable": true,
   "report_dir": "docs/superpowers/reports/series-parquet-measurement",
+  "rss_band_rejudgement": {
+    "not_rejudged": [
+      {
+        "reason": "the failing pairs are not in the published samples",
+        "recorded": "failed",
+        "run_id": "soak-strict-strict-minio-c1-w15-r001"
+      }
+    ],
+    "rule": "only a residual that was positive beyond the tolerance can change; each is recomputed from its kept excursion and the pair before it",
+    "runs_applying_the_band_count": 5,
+    "verdict_changes": [
+      {
+        "baseline_decision": {
+          "action": "created",
+          "baseline_name": "baseline-soak-strict-5cb03bef4ffc17fe.json",
+          "fingerprint": "5cb03bef4ffc17fe88374b4da855936c3961a43cc855bf71c40aa9438f555edf"
+        },
+        "excursions": [
+          {
+            "monotonic_ns": 347742217065302,
+            "recorded_residual_bytes": 135917568,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 347832261877208,
+            "recorded_residual_bytes": 149614592,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 347971873424617,
+            "recorded_residual_bytes": 153317376,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 348147280233081,
+            "recorded_residual_bytes": 144281600,
+            "rejudged_residual_bytes": 0
+          },
+          {
+            "monotonic_ns": 348822211284269,
+            "recorded_residual_bytes": 244928512,
+            "rejudged_residual_bytes": 0
+          }
+        ],
+        "reason": "0 of 5 positive residuals still beyond the tolerance; 0 negative beyond it of 66846",
+        "recorded": "failed",
+        "rejudged": "passed",
+        "run_id": "soak-strict-strict-minio-c1-w15-r002",
+        "run_status_rejudged": "passed"
+      }
+    ]
+  },
+  "rss_band_rule": "the anonymous RSS growth since the first allocator print lies between the growth of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held resident over the interval the kernel may still be releasing: the maximum of `resident` at this print, at any print read with it, and at the previous paired print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a large purge jemalloc stops counting an extent as resident before the kernel has released its pages, so an RSS read milliseconds after the print can still hold them (soak-strict r002: five reads 122-234 MB above resident, inside the band at the next print 11-49 ms later)",
   "run_files": [
     {
       "name": "soak-strict-strict-minio-c1-w15-r001.json",
@@ -1189,7 +1247,7 @@
   "run_id": "soak-strict",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-24T21:20:17Z",
+  "started_utc": "2026-09-24T21:33:37Z",
   "status": "failed",
   "workload": {}
 }
