@@ -398,6 +398,14 @@ of Task 3, and the total reference is that baseline plus `otlp_minio`.
 
 ## Task 6: memory model
 
+Superseded in part (slice S6, 2026-09-24): until slice S6 the extracted
+batches pinned their builders' default 1024-row capacity and `Block::reserve`
+charged it, so a block at the default limits held only about half of
+`max_block_bytes` (logs 2503.9 bytes/record charged, metrics 1439.4). After
+S6 the charge is what the batch holds (1255.9 and 250.7). The retained
+memory figures below were measured under the old overcharge; Tasks 5 and 7
+measure memory at the real fill.
+
 ### Question
 
 What makes up the engine's RSS, how does it relate to the exporter's own
@@ -777,6 +785,72 @@ percent to the changed code.
   (f003).
 - `campaign/reports/task-3i-report.md`.
 
+## Slice S6: extraction and write speed (Task 5a)
+
+### Question
+
+Which cheap changes lower CPU per record without changing schema, data,
+sort order or golden fingerprints?
+
+### Method
+
+Each change was measured with a stage spot family (3 repetitions, release
+bench binaries, taskset -c 0-7,16-23, the host lease) before and after, and
+kept only if CPU per record fell beyond noise. The engine was attributed
+once per workload at the end, as in Task 4. The builder-sizing families ran
+with `GLIBC_TUNABLES=glibc.malloc.trim_threshold=1073741824:glibc.malloc.mmap_threshold=1073741824`
+on both sides: without it the bench's glibc allocator trims and refaults
+memory and the sort_seal logs iterations split into two modes (about 215
+and 355 ns/record). The engine runs on jemalloc.
+
+### Results: stages, CPU ns/record, median of 3
+
+| Stage | Logs before -> after | Metrics before -> after |
+| --- | --- | --- |
+| extract | 1177.4 -> 817.4 | 766.4 -> 513.9 |
+| sort_seal | 429.6 -> 227.4 | 340.3 -> 321.7 |
+| merge | 99.4 -> 76.4 | 123.5 -> 70.2 |
+| encode zstd | 1582.6 -> 1550.7 | 229.4 -> 226.7 |
+| upload, MinIO | 376.4 -> 102.5 | 15.7 -> 6.5 |
+
+The upload gain comes from UNSIGNED-PAYLOAD, which series_parquet uses by
+default over TLS only. With equal allocator conditions, builder sizing alone
+gives sort_seal -13.7 percent logs and -8.3 percent metrics, merge -12.0 and
+-21.6 percent; the earlier sort_seal figure overstated it because part of
+the "before" cost was the glibc slow mode.
+
+### Results: engine attribution
+
+| | Task 4 | After S6 |
+| --- | --- | --- |
+| Logs engine CPU, ns/record | 5,345 | 4,205 (-21.3%) |
+| Metrics engine CPU, ns/record | 2,453 | 2,155 (-12.1%) |
+| Logs throughput, one core, records/s | | 113,150 |
+| Metrics throughput, one core, records/s | | 253,458 |
+| Logs allocator share | 12.6% | 6.6% |
+
+Encoding is now 39.1 percent of logs CPU; conversion (OTLP to Arrow) is the
+largest metrics category at 24.4 percent. Stored bytes changed by less than
+0.1 percent; the flush-stall probe files are row-for-row identical by a
+DuckDB join. Tried and not adopted: ZSTD level 3 (+57 percent encode CPU, no
+byte gain), a SmallVec for row cells.
+
+### Consequences
+
+- Blocks now fill to `max_block_bytes` for real. At the default limits the
+  flush-stall worst case is 32.8 ms longest stretch (logs-1k, 477.8 MB block,
+  874 ms whole-flush CPU) and 28.4 ms (logs-512k), against a same-day base
+  2-5 ms above the Task 3i figures.
+- The largest metrics merge chunk is 1.1 percent above `merge_chunk_bytes`,
+  the documented approximation; chunks are sized from the average pinned
+  bytes per row, so clustered wide rows can overshoot more (Task 12).
+
+### Evidence
+
+- `stages-spot-s6-*.json`, `attribution-*-f003.json`, `attribution.json`.
+- `flush-stall/*-s6-*.json` and the `files-*-956adf0ae.sha256` manifests.
+- `campaign/reports/slice-S6-report.md`.
+
 ## Other tasks
 
 - Task 1, harness and result contract: found that a worker that does not
@@ -824,6 +898,30 @@ percent to the changed code.
   One step was reverted: arrow's `make_builder` put a type downcast on
   every extracted cell. See `campaign/reports/task-3f-report.md`.
 
+- Slice S1: a closed pdata channel releases the latched Shutdown with its
+  own deadline instead of a synthesized now + 1 s one.
+- Slice S2: the OTLP framing check no longer checks UTF-8; file, parquet and
+  otap accept repeated singular fields as before the campaign, series_parquet
+  refuses them; top-level invalid UTF-8 is stored as U+FFFD in parquet, otap
+  and series_parquet (counted in `repaired.invalid_utf8`), refused by the
+  file exporter's JSON encoder as before; the framing walk costs 25 percent
+  of the OTLP-to-OTAP conversion on logs, 22 on metrics, 5 on traces.
+- Slice S5: decoded attribute values are charged to the one request budget
+  before they are allocated, CBOR is decoded straight into the lake value
+  with capacity-charged reservations and rollback, log bodies and residual
+  attribute maps are rendered within the budget. A dictionary value
+  referenced by 47 attributes, which allocated 225 MB before, is refused at
+  the 32 MiB budget plus 2 MiB.
+- Slice S7: forced-drain refusals never take the credit a held block needs
+  (no assert on the shutdown path); after Shutdown an attempt starts only
+  while the latched deadline has not passed, and every cleanup ends by the
+  deadline plus `upload.abort_timeout` (at least 1 s); deciding held
+  requests costs about 1 microsecond each; a proptest state machine pins
+  exactly one decision per request.
+- Slice S8: `unsupported` defaults to drop; a missing retry section derives
+  the retry budget; a storage nack is a fixed sentence and a class; flush
+  cleanup, failure class and per-attempt retries are reported; a late commit
+  is detected by bounded HEAD probes on the frozen names.
 ## Open questions
 
 | Question | Current state | Resolved in |
