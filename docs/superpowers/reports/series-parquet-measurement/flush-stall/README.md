@@ -67,3 +67,5 @@ uncancelled and 20 cancelled writes per fixture on the same inputs.
   bytes differ because the merge sizes chunks from the runs' pinned bytes
   per row and mostly distinct columns are written without a dictionary.
 - `probe-binaries-s6.sha256`: the two executables.
+- 956adf0ae and 9d4bc07c0 are the commits as measured; rebased onto
+  54bc1aa52 they are 14eea415c and f580bcdf0.
