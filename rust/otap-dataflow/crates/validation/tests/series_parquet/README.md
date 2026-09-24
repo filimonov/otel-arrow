@@ -573,9 +573,13 @@ each of them once.
   cannot stretch its schedule. Every 50 ms it scans procfs for compilers,
   linkers and container build clients, and for any process descending from
   a build daemon; an idle `buildkitd` is not a build. On each tick it also
-  enumerates every thread of the engine and requires the threads carrying a
-  worker name to be exactly the mapped worker TIDs, each allowed exactly its
-  own core, so an extra or replacing worker fails even for a single tick. A
+  enumerates every thread of the engine and requires every mapped worker TID
+  to be there, allowed exactly its own core, and every other thread carrying
+  a worker name to be confined to one mapped worker's core, so a replacing
+  worker or a worker-named thread elsewhere fails even for a single tick. A
+  worker runtime's blocking-pool threads take its name and its affinity (the
+  local file store runs its file writes there), so they pass, and a
+  later snapshot maps the worker to the TID the start snapshot mapped. A
   tick gap over 100 ms (recorded as an observation only in `publish=false`
   mode), a procfs that hides other processes, or a Docker that is installed
   but cannot be asked about builder containers makes the coverage incomplete

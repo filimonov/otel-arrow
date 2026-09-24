@@ -2926,6 +2926,38 @@ class WorkerEnumerationContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "TID mapping mismatch"):
             measurement.check_worker_affinity(found, {911: {1}})
 
+    # Scenario: beside the mapped worker, a second thread with the worker's
+    # name is confined to the worker's own core, as a worker runtime's
+    # blocking-pool thread is; then one is confined to another core.
+    # Guarantees: the helper on the worker's core passes, a worker-named
+    # thread anywhere else is a mapping mismatch naming it.
+    def test_a_blocking_pool_thread_on_the_worker_core_passes(self):
+        measurement.check_worker_affinity({911: {1}, 915: {1}}, {911: {1}})
+        with self.assertRaisesRegex(AssertionError, r"\[915\] not confined"):
+            measurement.check_worker_affinity({911: {1}, 915: {2}}, {911: {1}})
+
+    # Scenario: an end snapshot finds two threads with the worker's name
+    # that last ran on its core, with and without the start mapping.
+    # Guarantees: the start snapshot's TID is the worker and the other is
+    # recorded as a same-named helper; without it the mapping is ambiguous.
+    def test_a_later_snapshot_keeps_the_start_worker(self):
+        worker = {"key": "default/main/core1", "group_id": "default",
+                  "pipeline_id": "main", "core_id": 1, "generation": 0}
+        comm = measurement.worker_thread_name("default", "main", 1, 0)[
+            :measurement.COMM_WIDTH]
+        threads = [
+            {"tid": 911, "name": comm, "last_cpu": 1, "cpus_allowed_list": "1"},
+            {"tid": 915, "name": comm, "last_cpu": 1, "cpus_allowed_list": "1"},
+        ]
+        selected, ambiguous = measurement.select_worker_threads(
+            threads, [worker], previous={worker["key"]: 911}
+        )
+        self.assertEqual(ambiguous, [])
+        self.assertEqual(selected[worker["key"]]["tid"], 911)
+        self.assertEqual(selected[worker["key"]]["same_named_on_core_tids"], [915])
+        _selected, ambiguous = measurement.select_worker_threads(threads, [worker])
+        self.assertEqual(len(ambiguous), 1)
+
 
 class ReleaseProfileContracts(unittest.TestCase):
     """A measured case runs the release engine or does not run."""

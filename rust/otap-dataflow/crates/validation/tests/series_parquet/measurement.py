@@ -1046,7 +1046,7 @@ def worker_thread_name(group_id, pipeline_id, core_id, generation) -> str:
 COMM_WIDTH = 15
 
 
-def select_worker_threads(threads, workers):
+def select_worker_threads(threads, workers, previous=None):
     """Map each expected worker to exactly one thread by core evidence.
 
     The truncated name selects the candidate threads; the worker's own core
@@ -1058,7 +1058,14 @@ def select_worker_threads(threads, workers):
     attribute. A thread that last ran on the right core but may run
     elsewhere is still mapped, and its allowed set then fails the per-worker
     comparison in `assert_affinity`.
+
+    `previous` maps a worker key to the TID an earlier snapshot of the same
+    run mapped. Among several candidates on the core, that TID is the worker
+    and the others are its runtime's blocking-pool threads, which take the
+    worker's name and affinity; without it several candidates stay
+    ambiguous.
     """
+    previous = previous or {}
     by_comm = collections.defaultdict(list)
     for thread in threads:
         if thread.get("name"):
@@ -1078,6 +1085,12 @@ def select_worker_threads(threads, workers):
         on_core = [
             thread for thread in candidates if thread.get("last_cpu") == worker["core_id"]
         ]
+        helpers = []
+        if len(on_core) > 1 and worker["key"] in previous:
+            mapped = [thread for thread in on_core if thread["tid"] == previous[worker["key"]]]
+            if mapped:
+                helpers = [thread["tid"] for thread in on_core if thread is not mapped[0]]
+                on_core = mapped
         evidence = {
             "worker": worker["key"],
             "thread_name": full,
@@ -1113,11 +1126,13 @@ def select_worker_threads(threads, workers):
             continue
         claimed[thread["tid"]] = worker["key"]
         selected[worker["key"]] = dict(thread, core_id=worker["core_id"])
+        if helpers:
+            selected[worker["key"]]["same_named_on_core_tids"] = helpers
     return selected, ambiguous
 
 
 def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None,
-                        pinned=()) -> dict:
+                        pinned=(), previous_workers=None) -> dict:
     """A start or end environment snapshot.
 
     `roles` maps a role name to a process id, or to `(pid, cores)`, or to
@@ -1133,6 +1148,9 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
     instance. Each such thread is compared with the role's cores by exactly
     the same rule as a worker thread, so an engine-less run's affinity is
     asserted rather than merely recorded.
+
+    `previous_workers` is the worker mapping of this run's start snapshot,
+    for `select_worker_threads`.
     """
     if hasattr(roles, "pid") and hasattr(roles, "launcher"):
         # An engine stands for its own role, on its requested cores.
@@ -1198,17 +1216,23 @@ def environment_snapshot(roles, *, workers=(), requested_cores=None, absent=None
         snapshot["pinned_roles"] = sorted(set(pinned))
         snapshot["worker_threads"] = sorted(pinned_threads, key=lambda item: item["key"])
     if workers:
-        selected, ambiguous = select_worker_threads(threads, workers)
+        selected, ambiguous = select_worker_threads(
+            threads, workers, previous=previous_workers
+        )
         snapshot["worker_threads"] = sorted(
             (
-                {
-                    "key": key,
-                    "tid": thread["tid"],
-                    "name": thread["name"],
-                    "cpus_allowed_list": thread["cpus_allowed_list"],
-                    "last_cpu": thread.get("last_cpu"),
-                    "expected_cores": [thread["core_id"]],
-                }
+                dict(
+                    {
+                        "key": key,
+                        "tid": thread["tid"],
+                        "name": thread["name"],
+                        "cpus_allowed_list": thread["cpus_allowed_list"],
+                        "last_cpu": thread.get("last_cpu"),
+                        "expected_cores": [thread["core_id"]],
+                    },
+                    **({"same_named_on_core_tids": thread["same_named_on_core_tids"]}
+                       if "same_named_on_core_tids" in thread else {}),
+                )
                 for key, thread in selected.items()
             ),
             key=lambda item: item["key"],
@@ -3755,9 +3779,14 @@ class RunControls:
                 f"the {edge} snapshot asserts no affinity; an engine-less run "
                 f"must name the pinned role it measured"
             )
+        start = self.result["environment"].get("start") or {}
+        previous = (
+            {thread["key"]: thread["tid"] for thread in start.get("worker_threads", [])}
+            if edge != "start" else None
+        )
         return environment_snapshot(
             merged, workers=workers or (), requested_cores=requested_cores,
-            pinned=pinned,
+            pinned=pinned, previous_workers=previous,
         )
 
     def snapshot(self, edge, roles=None, *, workers=(), requested_cores=None,

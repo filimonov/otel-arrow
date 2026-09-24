@@ -10,7 +10,7 @@ and starts in milliseconds.
 The parent writes one JSON configuration line to its stdin, then commands
 (`watch`, `unwatch`, `stop`), one JSON object per line. The monitor ticks on
 schedule: each tick scans procfs for builds, enumerates the watched
-engine's threads and requires exactly the mapped worker threads, each on
+engine's threads and requires every mapped worker thread, each on
 exactly its allowed cores. A detection is written to stdout at once as
 one JSON line; at `stop` it performs a last tick and writes its report. It
 never stops or signals any other process.
@@ -45,16 +45,26 @@ def parse_core_list(text: str):
 def check_worker_affinity(observed, expected) -> None:
     """Abort unless every mapped worker thread may run on exactly its cores.
 
-    Both arguments map a worker TID to a set of core ids. The TIDs must be
-    the same set -- a worker that vanished or appeared is a changed mapping,
-    not a pinned one -- and each observed allowed set must equal the
-    expected one exactly, so a worker that may also run on an SMT sibling or
-    any other core fails.
+    Both arguments map a worker TID to a set of core ids. Every mapped TID
+    must still be there -- a worker that vanished or was replaced is a
+    changed mapping, not a pinned one -- and each observed allowed set must
+    equal the expected one exactly, so a worker that may also run on an SMT
+    sibling or any other core fails. A further thread with a worker's name
+    passes only when it is confined to exactly one mapped worker's cores:
+    a worker runtime's blocking-pool threads take its name and its affinity
+    (the local file store runs its file writes there); any other
+    worker-named thread is a changed mapping.
     """
-    if observed.keys() != expected.keys():
+    wanted_sets = [set(cores) for cores in expected.values()]
+    extra = [
+        tid for tid in sorted(set(observed) - set(expected))
+        if observed[tid] is not None and observed[tid] not in wanted_sets
+    ]
+    if set(expected) - set(observed) or extra:
         raise AssertionError(
             f"affinity: worker TID mapping mismatch: observed "
             f"{sorted(observed)} expected {sorted(expected)}"
+            + (f"; {extra} not confined to a mapped worker's cores" if extra else "")
         )
     for tid, wanted in sorted(expected.items()):
         if observed[tid] != set(wanted):
