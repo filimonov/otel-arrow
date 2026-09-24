@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Built only with the `bench-harness` feature. Run with no measurement
-//! argument at all -- as `cargo bench` runs every bench -- it prints a skip
+//! argument at all, as `cargo bench` runs every bench, it prints a skip
 //! message and exits 0.
 //!
 //! The input is deterministic length-prefixed OTLP requests of one signal
@@ -74,8 +74,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// measured work only after millions of samples, which no result file can
 /// carry. Once the kept samples reach this many, every second one is
 /// dropped and the stride doubles, so the file holds a uniform thinning of
-/// the whole loop rather than its first samples. The reported sample count
-/// is always the true one.
+/// the whole loop. The reported sample count is always the true one.
 const MAX_STORED_SAMPLES: usize = 2000;
 
 /// Which kind of measurement a process makes.
@@ -125,9 +124,8 @@ enum Command {
 /// What this executable is, for a harness that must not build anything.
 ///
 /// The harness locates prebuilt executables and asks each one what it is,
-/// instead of asking cargo -- which would build the target it was asked
-/// about. `bench_heap` says whether DHAT's allocator is installed, and
-/// `debug_assertions` is how a debug build gives itself away.
+/// since asking cargo would build the target. `bench_heap` says whether
+/// DHAT's allocator is installed, and `debug_assertions` marks a debug build.
 #[derive(Debug, Serialize)]
 struct Description {
     bench: &'static str,
@@ -482,7 +480,7 @@ fn measure_timing(stage: &Stage, args: &Args, report: &mut Report) -> Result<()>
     // a single steady-state iteration is what one iteration's profiled
     // heap workspace can be reconciled with. The loop's own growth also
     // holds whatever the allocator retained over every earlier iteration,
-    // which is recorded above rather than attributed to the stage.
+    // which is recorded above, not attributed to the stage.
     reset_peak_rss()?;
     let steady_start = status_bytes("VmRSS")?;
     let input = stage.prepare()?;

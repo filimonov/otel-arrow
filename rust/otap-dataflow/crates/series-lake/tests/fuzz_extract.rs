@@ -40,9 +40,9 @@ fn attr_key() -> impl Strategy<Value = String> {
     "[a-z.]{1,4}"
 }
 
-/// Scalar values, weighted so that the encoding boundaries are common rather than
-/// astronomically rare: the empty string, the empty byte string, both zeros,
-/// subnormals and the integer extremes.
+/// Scalar values, weighted so that the encoding boundaries are common: the
+/// empty string, the empty byte string, both zeros, subnormals and the integer
+/// extremes.
 fn leaf_value() -> impl Strategy<Value = AnyValue> {
     prop_oneof![
         // The unset value: distinct from every default, and must stay distinct.
@@ -134,7 +134,7 @@ fn kvs(attrs: &[Attr]) -> Vec<KeyValue> {
     attrs.iter().map(kv).collect()
 }
 
-/// Split records at generated boundaries rather than at a fixed chunk size.
+/// Split records at generated boundaries.
 fn split<T: Clone>(items: &[T], sizes: &[usize]) -> Vec<Vec<T>> {
     let mut out = Vec::new();
     let mut idx = 0;
@@ -314,11 +314,9 @@ fn records_with_permutation(min: usize, max: usize) -> impl Strategy<Value = Per
 proptest! {
     #![proptest_config(ProptestConfig { cases: 48, .. ProptestConfig::default() })]
 
-    /// Scenario: random OTLP logs, gauge points and histogram points whose attributes
-    /// cover every value variant, including unset, empty, both zeros, subnormals, the
-    /// integer extremes and bounded nested arrays and key/value lists.
-    /// Guarantees: extraction never panics for any signal, and never produces more
-    /// distinct identities than there are rows.
+    /// Scenario: random OTLP logs, gauge and histogram points covering every attribute value
+    /// variant and bounded nesting.
+    /// Guarantees: extraction never panics and never yields more identities than rows.
     #[test]
     fn extract_never_panics(
         resource in attr_list(5),
@@ -330,12 +328,9 @@ proptest! {
         }
     }
 
-    /// Scenario: the same records with every attribute list permuted by proptest, and
-    /// the same records delivered as one request or split at generated boundaries, for
-    /// logs, gauge points and histogram points alike.
-    /// Guarantees: the set of series ids is identical in all three cases and for all
-    /// three signals, so neither attribute order nor request framing reaches the
-    /// identity.
+    /// Scenario: the same records with attribute lists permuted, and delivered whole or split, for
+    /// all three signals.
+    /// Guarantees: the set of series ids is identical in every case.
     #[test]
     fn identity_is_independent_of_attribute_order_and_framing(
         (resource, shuffled_resource, records, shuffled) in records_with_permutation(2, 8),
@@ -425,13 +420,9 @@ fn default_and_other() -> Vec<(&'static str, AnyValue, AnyValue)> {
     ]
 }
 
-/// Scenario: a record whose only identity attribute holds its type's default value,
-/// extracted alone and then again alongside a record holding a non-default value of
-/// the same type. One case per default: empty string, int zero, double zero, double
-/// negative zero and the empty byte string.
-/// Guarantees: the record keeps the same series id either way, so an identity never
-/// depends on what else happens to share its request. This is the minimal case
-/// proptest shrank the framing property down to before the decoder was fixed.
+/// Scenario: a record whose identity attribute is its type's default, alone and beside a
+/// non-default value, for each default.
+/// Guarantees: the series id is the same either way.
 #[test]
 fn default_valued_attribute_identity_does_not_depend_on_request_framing() {
     for (name, default, other) in default_and_other() {
@@ -444,12 +435,8 @@ fn default_valued_attribute_identity_does_not_depend_on_request_framing() {
     }
 }
 
-/// Scenario: the same default values, compared against an attribute that is unset and
-/// against a record carrying no attribute at all.
-/// Guarantees: a default value is not a null value. The canonical encoding keeps them
-/// distinct -- the `empty_string_attr` and `null_value` golden vectors have different
-/// series ids -- so collapsing a default into null would silently merge two different
-/// series.
+/// Scenario: the same defaults against an unset attribute and against no attribute.
+/// Guarantees: a default value is a different series from a null one.
 #[test]
 fn default_valued_attribute_differs_from_an_unset_or_absent_one() {
     let unset = single_id(AnyValue { value: None });
@@ -470,10 +457,8 @@ fn default_valued_attribute_differs_from_an_unset_or_absent_one() {
     }
 }
 
-/// Scenario: the two signed zeros as an attribute value, through the real extraction
-/// path rather than the canonical encoder alone.
-/// Guarantees: they share one series id, because the sign of a zero cannot survive OTAP
-/// transport and the canonical encoding normalizes -0.0 to +0.0 (FORMAT.md section 1).
+/// Scenario: the two signed zeros as an attribute value through the real extraction path.
+/// Guarantees: they share one series id (FORMAT.md section 1).
 #[test]
 fn both_signed_zeros_share_one_identity() {
     assert_eq!(

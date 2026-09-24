@@ -58,9 +58,9 @@ const SEQ: u64 = 1;
 
 /// What a completed write means in every stage that stores an object.
 ///
-/// The store has reported the object written -- a completed multipart
-/// upload or `PUT` on S3, a closed file on the local backend -- and the
-/// stage has read it back and compared its size and bytes. It is not a
+/// The store has reported the object written (a completed multipart upload
+/// or `PUT` on S3, a closed file on the local backend) and the stage has read
+/// it back and compared its size and bytes. It is not a
 /// claim about host power-loss durability: `object_store` does not fsync
 /// its local backend, and no backend used here promises the bytes survive
 /// a power cut.
@@ -521,8 +521,7 @@ const CRITERION_NAME_LEN: usize = 64;
 /// Criterion's own directory name for one component of a benchmark id.
 ///
 /// Copied from `criterion::report::make_filename_safe`, so an artifact is
-/// read back from the directory Criterion actually wrote rather than from
-/// the id as the caller spelled it.
+/// read back from the directory Criterion actually wrote.
 #[must_use]
 pub fn criterion_directory_name(component: &str) -> String {
     let mut name = component.replace(CRITERION_UNSAFE, "_");
@@ -693,15 +692,8 @@ fn block_rows(block: &Block) -> (usize, usize) {
 
 /// Write bytes through a `BufWriter` exactly as the sink's upload path does.
 ///
-/// What completion means here: the future resolves once the writer has
-/// shut down, which is the point at which the object store reports the
-/// object written -- a completed multipart upload or `PUT` on S3, and a
-/// closed file on the local backend. Every iteration then reads the object
-/// back and compares its size and hash, so completion means the object is
-/// visible in the store and holds the bytes that were written. It is not a
-/// claim about host power-loss durability: `object_store`'s local backend
-/// does not fsync, and no backend here promises the bytes survive a power
-/// cut.
+/// Completion means the writer has shut down, the store reports the object
+/// written, and the read-back size and hash match; see [`COMPLETION_SEMANTICS`].
 async fn put_buffered(
     store: Arc<dyn ObjectStore>,
     path: Path,
@@ -827,9 +819,8 @@ pub struct Output {
 /// What a run hands back only so that its teardown is not timed.
 ///
 /// The exporter keeps one series cache and one sink across every block it
-/// writes, so tearing either down is never part of the per-block cost. A
-/// run that dropped them would time a destructor the production path
-/// never runs -- for a large cache, far more than the admission itself.
+/// writes, so tearing either down is never part of the per-block cost; for a
+/// large cache the destructor costs far more than the admission.
 #[derive(Default)]
 pub struct Kept {
     /// The series cache the run admitted into.

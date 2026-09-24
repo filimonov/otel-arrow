@@ -322,7 +322,7 @@ fn input_generation_is_excluded_from_timing() -> Result<()> {
 // Scenario: an input file is written in the length-prefixed format, read
 // back, and then read again after its last byte has been cut off.
 // Guarantees: every request comes back byte for byte, and a truncated file
-// or a stale sidecar hash is refused rather than read as a shorter input.
+// or a stale sidecar hash is refused.
 fn input_file_round_trips(root: &Path) -> Result<()> {
     let requests: Vec<Bytes> = (0..3).map(|r| logs_request(r, 5, 10)).collect();
     let path = root.join("round-trip.otlp");
@@ -346,16 +346,11 @@ fn input_file_round_trips(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// Scenario: every stage prepares one iteration's input and then runs it,
-// with each piece of per-iteration setup counted: every wire clone,
-// prepared conversion, warmed cache, sink, destination path set, object
-// set and output buffer set.
-// Guarantees: `prepare` builds exactly the setup each stage is specified
-// to be handed -- so setup moved into `run` lowers the count and fails --
-// and `run` builds none, so a clone, conversion or allocation reintroduced
-// inside the timed call advances the counter and fails. Two preparations
-// of a stage that writes name different destinations, so no iteration can
-// overwrite what an earlier one wrote.
+// Scenario: every stage prepares one iteration and runs it, each piece of
+// per-iteration setup counted.
+// Guarantees: `prepare` builds exactly the setup each stage is specified to be
+// handed and `run` builds none; two preparations of a writing stage name
+// different destinations.
 fn run_never_builds_its_own_setup(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     let expected: [(StageName, u64); 15] = [
@@ -459,18 +454,12 @@ const WEIGHT_CACHE_ENTRIES: usize = 300_000;
 /// Synthetic committed ids the heavy fixture adds.
 const WEIGHT_EXTRA_SERIES: usize = 200_000;
 
-// Scenario: the sort-and-seal stage is sampled twice through the real
-// sampling loop with its own `prepare` and `run`, once with its ordinary
-// fixture and once with a cache warm-up two hundred thousand entries
-// heavier. The cache has room for every id in both runs, and the
-// synthetic ids are inserted before the real ones, so the timed admission
-// sees exactly the same resident committed ids.
-// Guarantees: the timed work is identical -- every sample of both runs
-// records the same cache hits and misses and no eviction -- the
-// preparation really did get more than three times heavier, the loop
-// prepares once per sample, and the measured per-iteration time stays
-// below 1.25 times the light fixture's: the fixture is built outside the
-// timer.
+// Scenario: the sort-and-seal stage sampled with its ordinary fixture and with
+// a cache warm-up 200,000 entries heavier, synthetic ids inserted first so the
+// timed admission sees the same committed ids.
+// Guarantees: identical cache hits and misses, a preparation over three times
+// heavier, one preparation per sample, and a per-iteration time under 1.25
+// times the light one.
 fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     let input = fixture_inputs(root)?.remove(0);
@@ -566,9 +555,8 @@ fn a_heavier_fixture_does_not_move_the_measurement(root: &Path) -> Result<()> {
 
 // Scenario: the artifacts of two Criterion attempts of one layer, written
 // under the ids those attempts ran with, are read back.
-// Guarantees: each attempt is read under its own id, an id whose artifact
-// is missing is a loud error naming it rather than another attempt's
-// numbers, and Criterion's own sanitization of an id is applied.
+// Guarantees: each attempt is read under its own id, a missing artifact is an
+// error naming its id, and Criterion's sanitization of an id is applied.
 fn criterion_artifacts_are_read_per_attempt(root: &Path) -> Result<()> {
     let home = root.join("criterion-home");
     let write = |function: &str, times: &[f64]| -> Result<()> {
@@ -707,19 +695,11 @@ fn a_bare_cargo_bench_run_skips() -> Result<()> {
     }
 }
 
-/// Run every self-test; the first failure ends the process nonzero.
-///
-/// # Errors
-/// Returns the first failed check or error.
-// Scenario: the merge stage's fixture is built from a sealed logs block
-// and from a sealed metrics block, and the extract stage's fixture from
-// one-record logs requests.
-// Guarantees: the merge fixture reports the sort keys its merge keeps
-// resident beside the block -- nonzero, below the block's own pinned bytes
-// for the default two-column keys, and consistent between the peak table
-// and the total -- and the extract fixture reports that a one-row request
-// pins far more values bytes than its row occupies, so the two memory
-// terms the memory ledger charges are observed on the production path.
+// Scenario: merge fixtures from sealed logs and metrics blocks, and an extract
+// fixture from one-record logs requests.
+// Guarantees: the merge reports resident sort keys (nonzero, below the block's
+// pinned bytes, peak consistent with total), and a one-row request pins far
+// more values bytes than its row occupies.
 fn memory_terms_are_reported(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     for input in fixture_inputs(root)? {
@@ -779,6 +759,10 @@ fn memory_terms_are_reported(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run every self-test; the first failure ends the process nonzero.
+///
+/// # Errors
+/// Returns the first failed check or error.
 pub fn run() -> Result<()> {
     let holder = tempfile::tempdir()?;
     let root = holder.path();

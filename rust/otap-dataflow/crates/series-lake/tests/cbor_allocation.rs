@@ -44,14 +44,10 @@ impl Reservations for Held {
 /// the decode has stopped reserving.
 const ERROR_SLACK: usize = 1024;
 
-/// Scenario: flat, nested, indefinite and chunked payloads -- a definite array
-/// of 100 000 ints, an indefinite one, an indefinite byte string of one-byte
-/// chunks, an indefinite map whose keys repeat, chunked text and 50 000
-/// singleton arrays -- decoded under dhat's heap profiler, unbounded and
+/// Scenario: flat, nested, indefinite and chunked payloads decoded under dhat, unbounded and
 /// against limits that refuse them part way.
-/// Guarantees: the heap the decode allocates at its peak never exceeds the
-/// peak it held in reservations, growth and shrinking included; a successful
-/// decode holds exactly its decoded size less the root node.
+/// Guarantees: the heap peak never exceeds the reservation peak, and a successful decode holds its
+/// decoded size less the root node.
 #[test]
 fn a_decode_never_allocates_more_than_it_reserved() {
     let _serial = SERIAL
@@ -110,11 +106,10 @@ fn a_decode_never_allocates_more_than_it_reserved() {
     }
 }
 
-/// Scenario: log bodies -- a large bytes value, a long raw string and a
-/// nested value of escaped strings and doubles -- rendered under dhat's heap
-/// profiler, unbounded and against a limit below their size.
-/// Guarantees: rendering never allocates more than it reserved, and a
-/// rendering that does not fit is refused before its string is allocated.
+/// Scenario: a large bytes body, a long string and a nested escaped body rendered under dhat,
+/// unbounded and against a smaller limit.
+/// Guarantees: rendering never allocates more than it reserved, and an oversized one is refused
+/// before allocating.
 #[test]
 fn a_body_rendering_never_allocates_more_than_it_reserved() {
     let _serial = SERIAL
@@ -150,13 +145,10 @@ fn a_body_rendering_never_allocates_more_than_it_reserved() {
     }
 }
 
-/// Scenario: one log record with 47 attributes, each the same 600 000
-/// control-character string inside an array -- about 28 MiB decoded, under
-/// the default 32 MiB extraction budget, and 3.6 MB each once rendered with
-/// JSON escapes -- extracted under dhat's heap profiler at the default limits.
-/// Guarantees: the request is refused as a row that passes `max_row_bytes`,
-/// after rendering one value rather than all 47 (about 170 MB), and the heap
-/// the extraction allocates stays within its budget plus a small constant.
+/// Scenario: a record with 47 attributes each holding a 600 000 control-character string (3.6 MB
+/// each rendered), extracted under dhat at the default limits.
+/// Guarantees: the request is refused as too large a row after rendering one value, and the heap
+/// stays within the budget plus a constant.
 #[test]
 fn a_residual_map_is_refused_before_it_is_rendered_past_the_budget() {
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::{

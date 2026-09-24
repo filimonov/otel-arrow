@@ -77,8 +77,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
 
     /// Scenario: arbitrary value trees round-trip through CBOR.
-    /// Guarantees: decode never panics and reproduces the tree (NaN payloads excepted, which CBOR
-    /// may collapse), so OTAP-converted and original descriptors hash identically.
+    /// Guarantees: decode never panics and reproduces the tree (NaN payloads excepted).
     #[test]
     fn cbor_round_trip_never_panics(v in value_strategy()) {
         let mut buf = Vec::new();
@@ -89,10 +88,8 @@ proptest! {
         prop_assert_eq!(a, b);
     }
 
-    /// Scenario: arbitrary byte strings, and truncated prefixes of a well-formed encoding,
-    /// handed straight to the CBOR decoder.
-    /// Guarantees: the decoder never panics on hostile input -- it returns a value or an
-    /// error -- and whatever it does return re-encodes into canonical bytes without panicking.
+    /// Scenario: arbitrary bytes and truncated well-formed encodings fed to the CBOR decoder.
+    /// Guarantees: it never panics, and what it returns re-encodes without panicking.
     #[test]
     fn cbor_decoder_survives_arbitrary_bytes(
         junk in prop::collection::vec(any::<u8>(), 0..64),
@@ -114,14 +111,9 @@ proptest! {
         let _ = decode_cbor(&buf, DecodeLimits::new(0, usize::MAX));
     }
 
-    /// Scenario: an attribute list of at least two distinct keys, handed to the encoder
-    /// twice -- once already sorted, once in a proptest-generated shuffle that is
-    /// rejected unless it really is a different order, then normalized by `sort_kvlist`
-    /// as the extractor does.
-    /// Guarantees: the two encodings and their series ids are byte-identical, so key
-    /// order in the input never reaches the identity. The two-distinct-key floor and the
-    /// explicit order-differs assertion are what stop the test from silently comparing a
-    /// list with itself and proving nothing.
+    /// Scenario: an attribute list of two or more distinct keys, encoded sorted and as a verified
+    /// different shuffle normalized by `sort_kvlist`.
+    /// Guarantees: both encodings and series ids are byte-identical.
     #[test]
     fn encoding_is_order_independent(
         (sorted, shuffled) in prop::collection::vec((any::<String>(), value_strategy()), 2..7)
@@ -261,13 +253,9 @@ fn raw_cbor_strategy() -> impl Strategy<Value = ciborium::Value> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 512, .. ProptestConfig::default() })]
 
-    /// Scenario: arbitrary CBOR trees -- tags, bignums, non-text and duplicate
-    /// keys, nesting around a depth limit of 4 -- plus arbitrary bytes and
-    /// truncations, decoded by `decode_cbor` and by the ciborium-tree decoder
-    /// it replaced.
-    /// Guarantees: both accept exactly the same payloads and produce the same
-    /// value, doubles bit for bit, so identities and rendered cells are
-    /// unchanged.
+    /// Scenario: arbitrary CBOR trees near a depth limit of 4, plus arbitrary bytes and
+    /// truncations, decoded by `decode_cbor` and the ciborium-tree decoder.
+    /// Guarantees: both accept the same payloads and give the same value, doubles bit for bit.
     #[test]
     fn decode_cbor_agrees_with_the_ciborium_tree_decoder(
         raw in raw_cbor_strategy(),
@@ -316,13 +304,9 @@ fn reference_render(v: &Value) -> serde_json::Value {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
 
-    /// Scenario: arbitrary value trees -- every scalar, arbitrary Unicode and
-    /// control characters in strings and keys, any double bit pattern --
-    /// rendered by `map_string` and by the serde_json tree it replaced, and
-    /// by the reserving body entry point.
-    /// Guarantees: the renderings are identical, so stored cells and log
-    /// bodies do not change, the reserving entry point returns the same
-    /// string, and `rendered_len` measures it exactly.
+    /// Scenario: arbitrary value trees rendered by `map_string`, the serde_json tree and the
+    /// reserving body entry point.
+    /// Guarantees: the renderings are identical and `rendered_len` measures them exactly.
     #[test]
     fn map_string_agrees_with_the_serde_json_tree(v in value_strategy()) {
         let expected = match &v {
@@ -600,15 +584,11 @@ fn raw_strategy() -> impl Strategy<Value = Raw> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 2048, .. ProptestConfig::default() })]
 
-    /// Scenario: hand-laid CBOR -- indefinite arrays and maps, chunked and
-    /// nested-chunked text and bytes, chunks of the wrong kind, text cut
-    /// inside a character, bignums around the `i64` and `u64` limits, half,
-    /// single and double floats, simple values, stray breaks and non-minimal
-    /// lengths -- whole, truncated, and with one byte changed, decoded at depth
-    /// limits 4 and 32 by `decode_cbor` and by the ciborium-tree decoder it
-    /// replaced.
-    /// Guarantees: both accept exactly the same payloads and produce the same
-    /// value, doubles bit for bit.
+    /// Scenario: hand-laid CBOR (indefinite items, chunks, bignums at the limits, floats, simple
+    /// values, stray breaks, non-minimal lengths), whole, truncated and mutated, at depth limits 4
+    /// and 32.
+    /// Guarantees: `decode_cbor` and the ciborium-tree decoder accept the same payloads and give
+    /// the same value.
     #[test]
     fn decode_cbor_agrees_with_the_ciborium_tree_decoder_on_raw_encodings(
         raw in raw_strategy(),

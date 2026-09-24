@@ -149,12 +149,8 @@ fn golden_vectors_match() {
     }
 }
 
-/// Scenario: the vector pair that differs only in the sign of a zero double.
-/// Guarantees: -0.0 and +0.0 produce identical canonical bytes and the same
-/// series id, so the sign of a zero never reaches the identity. OTAP drops a
-/// value column whose entries are all zero, so the sign does not survive
-/// conversion and an identity that depended on it would change with request
-/// batching (FORMAT.md section 1).
+/// Scenario: the vector pair differing only in the sign of a zero double.
+/// Guarantees: identical canonical bytes and series id (FORMAT.md section 1).
 #[test]
 fn zero_sign_does_not_change_identity() {
     let raw = include_str!("golden/canonical_v1.json");
@@ -242,13 +238,9 @@ fn schema_vectors() -> Vec<(String, Dataset, LakeConfig, String, String)> {
         .collect()
 }
 
-/// Scenario: the schema rendering and fingerprint of all four datasets under the
-/// default configuration and of logs/values with one denormalized column of each
-/// type, as computed by the independent Python generator from FORMAT.md.
-/// Guarantees: the Rust schema of each dataset renders to exactly the documented
-/// text in the crate's own type vocabulary, and hashes to the pinned
-/// fingerprint, so no Arrow upgrade or accidental column change can move a
-/// persisted `schema_fingerprint` without failing this test.
+/// Scenario: the four default datasets and logs/values with one denormalized column of each type,
+/// as the Python generator computes them.
+/// Guarantees: each schema renders to the documented text and hashes to the pinned fingerprint.
 #[test]
 fn schema_fingerprints_match_the_golden_vectors() {
     let vectors = schema_vectors();
@@ -275,11 +267,8 @@ fn schema_fingerprints_match_the_golden_vectors() {
     }
 }
 
-/// Scenario: FORMAT.md section 3 lists the rendering and fingerprint of every
-/// golden schema in a labelled text block.
-/// Guarantees: the documented rendering and fingerprint are exactly what the
-/// code produces for each of them, so the normative document cannot drift from
-/// the writer.
+/// Scenario: FORMAT.md section 3 lists every golden schema's rendering and fingerprint.
+/// Guarantees: each documented rendering and fingerprint is what the code produces.
 #[test]
 fn format_md_documents_every_schema_rendering() {
     let doc = include_str!("../docs/FORMAT.md");
@@ -302,18 +291,10 @@ fn format_md_documents_every_schema_rendering() {
     }
 }
 
-/// Scenario: every `render_v1` vector produced by the independent Python
-/// renderer: each scalar kind, finite doubles on both sides of the fixed and
-/// scientific layout limits (1e15 and 1e16, 1e-5 and 1e-7, the largest and the
-/// smallest subnormal), NaN with and without a payload, both infinities, bytes
-/// of every base64 padding length and both non-alphanumeric alphabet
-/// characters, and nested arrays and kvlists holding them.
-/// Guarantees: the attribute-map and log-body entry points produce exactly the
-/// documented strings, so a finite double's layout and exponent spelling
-/// (`1e+16`, `1e-7`, `0.00001`) cannot move with a serde_json or float
-/// formatter upgrade unnoticed, non-finite doubles are spelled `NaN`, `Infinity` and
-/// `-Infinity` and bytes are padded standard base64 at every nesting level, as
-/// in the workspace OTLP JSON encoder.
+/// Scenario: every `render_v1` vector: each scalar kind, doubles around the layout limits, NaN
+/// payloads, infinities, every base64 padding length, nested values.
+/// Guarantees: both entry points give exactly the documented strings, as the OTLP JSON encoder
+/// spells them.
 #[test]
 fn render_v1_matches_the_golden_vectors() {
     let raw = include_str!("golden/render_v1.json");

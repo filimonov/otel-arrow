@@ -343,7 +343,7 @@ fn i32_at(b: &RecordBatch, name: &str, row: usize) -> i32 {
 }
 
 /// A double's bit pattern, so that the sign of a zero and every NaN payload
-/// are compared exactly rather than by `f64` equality.
+/// are compared exactly.
 fn bits(d: f64) -> String {
     format!("{:016x}", d.to_bits())
 }
@@ -1179,20 +1179,17 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("rt")
 }
 
-/// Every generated dataset is run twice, once with sorting off and once on,
-/// rather than on a random coin flip, so no case escapes either mode.
+/// Every generated dataset is run twice, with sorting off and on, so no case
+/// escapes either mode.
 const SORTING_MODES: [bool; 2] = [false, true];
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
 
-    /// Scenario: random log records over several resources and scopes, split into
-    /// random requests, run with sorting off and then on.
-    /// Guarantees: the values file equals the independently computed model as a multiset of
-    /// (series_id, time, body), and the whole descriptor map -- keyed by the series id the
-    /// file itself carries -- equals the model field by field, including resource and scope
-    /// attributes, all three schema urls, the identity attributes and the denormalized
-    /// columns; with sorting on the file is globally ordered.
+    /// Scenario: random log records over several resources and scopes in random requests, sorting
+    /// off and on.
+    /// Guarantees: values rows and every descriptor field equal the independent model; sorted files
+    /// are globally ordered.
     #[test]
     fn oracle_logs(
         recs in prop::collection::vec(log_rec(), 1..40),
@@ -1203,15 +1200,10 @@ proptest! {
         }
     }
 
-    /// Scenario: random gauge and sum data points, of both temporalities and both
-    /// monotonicities, over several resources and scopes, split into random requests,
-    /// run with sorting off and then on.
-    /// Guarantees: the number file equals the independently computed model as a multiset of
-    /// complete rows -- series id, producer id, metric name, both time columns, both start
-    /// time columns, flags, both value columns and both denormalized columns -- with doubles
-    /// compared by bit pattern so the sign of a zero is not lost, and the whole descriptor
-    /// map equals the model field by field, including metric name, unit, type, temporality,
-    /// monotonicity and description.
+    /// Scenario: random gauge and sum points of every temporality and monotonicity in random
+    /// requests, sorting off and on.
+    /// Guarantees: complete rows (doubles by bit pattern) and every descriptor field equal the
+    /// model.
     #[test]
     fn oracle_metric_numbers(
         recs in prop::collection::vec(num_rec(), 1..30),
@@ -1222,13 +1214,10 @@ proptest! {
         }
     }
 
-    /// Scenario: random histogram points of both temporalities over several resources and
-    /// scopes, split into random requests, run with sorting off and then on.
-    /// Guarantees: the histogram file equals the independently computed model as a multiset
-    /// of complete rows -- series id, producer id, metric name, both time columns, both start
-    /// time columns, flags, count, sum, min, max, the bucket count and explicit bound lists
-    /// and both denormalized columns -- with doubles compared by bit pattern, and the whole
-    /// descriptor map equals the model field by field.
+    /// Scenario: random histogram points of both temporalities in random requests, sorting off and
+    /// on.
+    /// Guarantees: complete rows (doubles by bit pattern) and every descriptor field equal the
+    /// model.
     #[test]
     fn oracle_metric_histograms(
         recs in prop::collection::vec(hist_rec(), 1..30),

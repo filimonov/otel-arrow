@@ -165,9 +165,9 @@ fn metrics_for(d: &serde_json::Value) -> MetricsData {
                 ..Default::default()
             }],
         }),
-        // The two kinds format v1 cannot store are still built here, so that
-        // `unsupported_kinds_are_dropped_or_rejected` can put them through the real
-        // extraction path rather than the test simply looking away from them.
+        // The two kinds format v1 cannot store are still built, so
+        // `unsupported_kinds_are_dropped_or_rejected` can run them through the
+        // real extraction path.
         "exp_histogram" => metric::Data::ExponentialHistogram(ExponentialHistogram {
             aggregation_temporality: temporality,
             data_points: vec![ExponentialHistogramDataPoint {
@@ -268,11 +268,8 @@ fn deviating_vectors() -> Vec<String> {
     deviations
 }
 
-/// Scenario: every golden vector rebuilt as OTLP, converted to OTAP by pdata and
-/// run through the real extraction path.
-/// Guarantees: the converted representation produces exactly the `series_id` the
-/// independent Python generator recorded, for every vector, so conversion is
-/// identity preserving (FORMAT.md section 1; README.md, "Testing").
+/// Scenario: every golden vector rebuilt as OTLP, converted by pdata and extracted.
+/// Guarantees: each yields the `series_id` the Python generator recorded.
 #[test]
 fn all_golden_vectors_survive_otlp_to_otap_conversion() {
     assert_eq!(
@@ -300,11 +297,8 @@ fn unsupported_vector_requests() -> Vec<(String, MetricsData)> {
         .collect()
 }
 
-/// Scenario: the two golden vectors the round trip skips, exponential histogram and
-/// summary, run through the real extraction path under both unsupported policies.
-/// Guarantees: they are skipped because format v1 genuinely cannot carry them, not
-/// because the test looks away. Under `Drop` extraction succeeds, emits no descriptor
-/// at all and counts the discarded points; under `Reject` it refuses the request.
+/// Scenario: the exponential histogram and summary vectors under both unsupported policies.
+/// Guarantees: `Drop` succeeds with no descriptor and counts the points; `Reject` refuses.
 #[test]
 fn unsupported_kinds_are_dropped_or_rejected() {
     let requests = unsupported_vector_requests();
