@@ -1249,6 +1249,91 @@ async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
     );
 }
 
+/// Scenario: a values multipart upload whose CompleteMultipartUpload lands in
+/// the store and then fails with a retryable store error in place of its
+/// response, through the real sink; the flush waits to retry, and its retry
+/// deadline expires during that backoff.
+/// Guarantees: the flush ends as a deadline expiry carrying the store's
+/// error after one attempt, and the cleanup still probes the frozen
+/// objects: one INFO `series_parquet.flush.cleanup` with
+/// `outcome=late_commit`, and `flush.late_commits` reads 1.
+#[tokio::test(flavor = "current_thread")]
+async fn a_completed_upload_that_errors_is_a_late_commit_when_the_deadline_ends_the_backoff() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = fault_store();
+            store.hooks().set(Fault::FailedComplete);
+            let (handler, _rx) = effects(8);
+            let mut cfg = worker_config();
+            cfg.window.flush_retry_deadline = Duration::from_millis(20);
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            // Past validation on purpose, as in the wedged-upload test.
+            cfg.lake.upload.part_bytes = 4096;
+            cfg.lake.upload.concurrency = 1;
+            cfg.lake.parquet.row_group_bytes = 4096;
+            cfg.lake.sorting.merge_chunk_bytes = 4096;
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+            worker.metrics = Some(super::super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            until("the first attempt fails after its upload landed", || {
+                !events
+                    .named("series_parquet.flush.attempt_failed")
+                    .is_empty()
+            })
+            .await;
+            assert_eq!(store.hooks().completes.load(SeqCst), 1);
+            // The first retry waits 200 ms; the deadline is 20 ms away.
+            sim.advance(Duration::from_millis(20));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let finished = done.as_ref().expect("the flush resolves");
+            assert_eq!(finished.attempts, 1, "no retry started");
+            assert!(
+                matches!(
+                    finished.result,
+                    Err(lake::Error::Transient(
+                        lake::TransientError::DeadlineExceeded {
+                            attempts: 1,
+                            last: Some(_)
+                        }
+                    ))
+                ),
+                "{:?}",
+                finished.result.as_ref().err()
+            );
+            worker.complete(done);
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            job.cleanup().await.expect("the cleanup is bounded");
+            drop(job);
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
+            assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
+        })
+        .await;
+    let cleanup = events.named("series_parquet.flush.cleanup");
+    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+    assert_eq!(cleanup[0].level, tracing::Level::INFO);
+    assert_eq!(
+        cleanup[0].fields.get("outcome"),
+        Some(&FieldValue::Str("late_commit".into()))
+    );
+}
+
 /// Scenario: one request is admitted, its block is written to an in-memory
 /// store on the first attempt, and the worker completes it.
 /// Guarantees: the commit is logged once as `series_parquet.block.committed`

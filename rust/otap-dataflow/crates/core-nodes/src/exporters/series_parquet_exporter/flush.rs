@@ -180,13 +180,19 @@ async fn write_until(
         result,
     };
     loop {
-        if cancel.is_cancelled() {
-            let error = last.take().unwrap_or(lake::Error::cancelled(None));
+        let cancelled = cancel.is_cancelled();
+        if cancelled || clock::now() >= limit.at() {
+            // Ended during the backoff after a retryable failure, which may
+            // be a response the store lost after committing.
+            let settle = last.as_ref().map_or(Settle::Nothing, Settle::after);
+            let error = if cancelled {
+                last.take().unwrap_or(lake::Error::cancelled(None))
+            } else {
+                expired(attempts, last.take())
+            };
             let _ = result_tx.send(done(attempts, Err(error)));
-            return;
-        }
-        if clock::now() >= limit.at() {
-            let _ = result_tx.send(done(attempts, Err(expired(attempts, last.take()))));
+            let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
+            trace.settle(attempts, settle, cutoff).await;
             return;
         }
         attempts += 1;
@@ -297,18 +303,10 @@ async fn write_until(
                 delay = delay.saturating_mul(2).min(MAX_BACKOFF);
             }
             Err(error) => {
-                // A storage failure of the last attempt may be a response the
-                // store lost after committing, so the objects are probed
-                // within the same cutoff a decided write is given.
-                let ambiguous = error.is_retryable();
-                let abort_error = abort_failure(&error).map(str::to_owned);
+                let settle = Settle::after(&error);
                 let _ = result_tx.send(done(attempts, Err(error)));
-                if let Some(abort_error) = abort_error {
-                    trace.abort_failed(attempts, &abort_error);
-                } else if ambiguous {
-                    let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
-                    trace.probe(attempts, cutoff).await;
-                }
+                let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
+                trace.settle(attempts, settle, cutoff).await;
                 return;
             }
         }
@@ -513,6 +511,41 @@ impl Trace {
             message = "a multipart upload of a failed block may be left to the bucket \
                        lifecycle rule"
         );
+    }
+}
+
+/// What a flush that ended on an attempt's own error still owes its cleanup
+/// report, decided before the error is handed to the owner.
+enum Settle {
+    /// The attempt's multipart abort failed.
+    AbortFailed(String),
+    /// A retryable storage failure, which may be a response the store lost
+    /// after committing: the objects are probed.
+    Probe,
+    /// Nothing the store could have kept.
+    Nothing,
+}
+
+impl Settle {
+    /// What the cleanup of a flush ended by `error` must do.
+    fn after(error: &lake::Error) -> Self {
+        match abort_failure(error) {
+            Some(abort_error) => Self::AbortFailed(abort_error.to_owned()),
+            None if error.is_retryable() => Self::Probe,
+            None => Self::Nothing,
+        }
+    }
+}
+
+impl Trace {
+    /// Report the cleanup of a flush that ended on an attempt's own error,
+    /// probing until `cutoff` when that error is ambiguous.
+    async fn settle(&self, attempt: u64, settle: Settle, cutoff: Instant) {
+        match settle {
+            Settle::AbortFailed(abort_error) => self.abort_failed(attempt, &abort_error),
+            Settle::Probe => self.probe(attempt, cutoff).await,
+            Settle::Nothing => {}
+        }
     }
 }
 

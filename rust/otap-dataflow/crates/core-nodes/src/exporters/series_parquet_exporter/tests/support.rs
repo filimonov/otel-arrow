@@ -527,6 +527,11 @@ pub(super) enum Fault {
     /// the completion call then never returns, the way a store that commits
     /// the upload and loses its response looks to the writer.
     LostComplete,
+    /// A `values` multipart upload is completed in the underlying store, and
+    /// the completion call then fails with a retryable store error, the way
+    /// a store that commits the upload and drops the connection looks to the
+    /// writer.
+    FailedComplete,
 }
 
 /// How long one write takes to fail under [`Fault::SlowFail`].
@@ -583,14 +588,16 @@ pub(super) struct Faults {
 }
 
 /// A real multipart upload whose completion lands and whose response is then
-/// lost: the call completes the upload in the underlying store and never
-/// returns.
+/// lost: the call completes the upload in the underlying store and then
+/// never returns, or fails with a retryable store error when `fails`.
 #[derive(Debug)]
 pub(super) struct LostCompleteUpload {
     /// The upload the underlying store really initiated.
     pub(super) inner: Box<dyn MultipartUpload>,
     /// Completions that landed, shared with the store the test holds.
     pub(super) completes: Arc<AtomicUsize>,
+    /// Whether the lost response is an error rather than no answer.
+    pub(super) fails: bool,
 }
 
 #[async_trait::async_trait]
@@ -602,6 +609,12 @@ impl MultipartUpload for LostCompleteUpload {
     async fn complete(&mut self) -> object_store::Result<PutResult> {
         let _ = self.inner.complete().await?;
         let _ = self.completes.fetch_add(1, SeqCst);
+        if self.fails {
+            return Err(object_store::Error::Generic {
+                store: "series-test",
+                source: Box::new(std::io::Error::other("connection reset after complete")),
+            });
+        }
         std::future::pending().await
     }
 
@@ -773,10 +786,14 @@ impl StoreHooks for Faults {
                 aborts: Arc::clone(&self.aborts),
             });
         }
-        if self.mode() == Fault::LostComplete && path.as_ref().contains("dataset=values/") {
+        let mode = self.mode();
+        if matches!(mode, Fault::LostComplete | Fault::FailedComplete)
+            && path.as_ref().contains("dataset=values/")
+        {
             return Box::new(LostCompleteUpload {
                 inner: upload,
                 completes: Arc::clone(&self.completes),
+                fails: mode == Fault::FailedComplete,
             });
         }
         upload
