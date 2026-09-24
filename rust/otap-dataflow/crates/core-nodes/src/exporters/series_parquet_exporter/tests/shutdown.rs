@@ -771,6 +771,129 @@ async fn a_slow_failure_does_not_stop_the_attempts_after_it() {
         .await;
 }
 
+/// A worker whose one block is FLUSHING in a values multipart upload that
+/// wedges, parts and abort alike, with a 10 s `upload.abort_timeout`, a 10 s
+/// shutdown deadline latched, and the engine clock then moved 5 s past that
+/// deadline before the flush task has run. Returns the worker, its
+/// completions, and the absolute cutoff: the deadline plus the abort timeout.
+async fn deadline_observed_late(
+    sim: &clock::SimClock,
+) -> (
+    Worker,
+    PipelineCompletionMsgReceiver<OtapPdata>,
+    std::time::Instant,
+) {
+    let store = fault_store();
+    store.hooks().set(Fault::MultipartWedge);
+    let (handler, rx) = effects(8);
+    let mut cfg = worker_config();
+    cfg.lake.upload.abort_timeout = Duration::from_secs(10);
+    cfg.lake.upload.part_bytes = 4096;
+    cfg.lake.upload.concurrency = 1;
+    cfg.lake.parquet.row_group_bytes = 4096;
+    // Small chunks keep the writer blocked on a wedged part, in the phase
+    // where a cancelled upload is aborted, when the deadline expires.
+    cfg.lake.sorting.merge_chunk_bytes = 4096;
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+    worker.admit(bulk_logs_pdata(20_000));
+    worker.rotate();
+    until("the wedged upload takes a part", || {
+        store.hooks().parts.load(SeqCst) > 0
+    })
+    .await;
+    let deadline = clock::now() + Duration::from_secs(10);
+    worker.shutdown(deadline);
+    sim.advance(Duration::from_secs(15));
+    (worker, rx, deadline + Duration::from_secs(10))
+}
+
+/// Whether `future` is still pending after the runtime has had several turns.
+async fn still_pending<F: Future + Unpin>(future: &mut F) -> bool {
+    for _ in 0..32 {
+        if futures::poll!(&mut *future).is_ready() {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+/// Scenario: the flush task observes its expiry 5 s after the latched
+/// deadline, while the upload it cancels never finishes aborting.
+/// Guarantees: the task still releases the write at the latched deadline plus
+/// `upload.abort_timeout`, an absolute cutoff, not that long after the moment
+/// the expiry was observed; the block is nacked as a retryable shutdown.
+#[tokio::test(flavor = "current_thread")]
+async fn a_late_expiry_is_cleaned_up_by_the_absolute_cutoff() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (mut worker, mut rx, cutoff) = deadline_observed_late(&sim).await;
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            worker.complete(done);
+            worker.notify.next().await.expect("the nack is sent");
+            expect_shutdown_nack(&mut rx).await;
+
+            let mut job = worker.cleaning.take().expect("the cleanup slot");
+            {
+                let mut cleanup = std::pin::pin!(job.cleanup());
+                sim.advance_to(cutoff - Duration::from_millis(100));
+                assert!(
+                    still_pending(&mut cleanup).await,
+                    "the wedged abort holds the task until the cutoff"
+                );
+                sim.advance_to(cutoff);
+                assert!(
+                    !still_pending(&mut cleanup).await,
+                    "the task is released at the absolute cutoff"
+                );
+            }
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
+/// Scenario: the node's deadline branch runs 5 s after the latched deadline,
+/// before the flush task has observed its own expiry, and the upload it
+/// cancels never finishes aborting.
+/// Guarantees: `abandon` decides the block at once and returns by the latched
+/// deadline plus `upload.abort_timeout`, not that long after it started, so a
+/// late wake cannot push the node's return past the absolute cutoff.
+#[tokio::test(flavor = "current_thread")]
+async fn a_late_deadline_branch_returns_by_the_absolute_cutoff() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (mut worker, mut rx, cutoff) = deadline_observed_late(&sim).await;
+            {
+                let mut abandoning = std::pin::pin!(worker.abandon());
+                assert!(still_pending(&mut abandoning).await);
+                expect_shutdown_nack(&mut rx).await;
+                sim.advance_to(cutoff - Duration::from_millis(100));
+                assert!(
+                    still_pending(&mut abandoning).await,
+                    "the wedged abort holds the node until the cutoff"
+                );
+                sim.advance_to(cutoff);
+                assert!(
+                    !still_pending(&mut abandoning).await,
+                    "the node returns at the absolute cutoff"
+                );
+            }
+            assert!(worker.is_idle());
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
 /// Scenario: shutdown latches a 60 s deadline while a block's write is
 /// parked, the node learns it from a force-drained request, and upstream drops
 /// its pdata sender while the node is taking a control message; the clock then

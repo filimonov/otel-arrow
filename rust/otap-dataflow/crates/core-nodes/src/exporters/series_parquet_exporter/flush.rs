@@ -76,6 +76,23 @@ pub(super) fn deadline_at(base: Instant, delta: Duration) -> Instant {
         .unwrap_or(base)
 }
 
+/// The instant the cleanup of a write decided by `deadline` must end by.
+///
+/// It is `abort_timeout` after the deadline itself, not after the moment the
+/// expiry is observed, so a late wake or a long synchronous drain cannot
+/// extend it; and it is never more than `abort_timeout` from `now`, which is
+/// the bound when the write is cancelled before any deadline.
+pub(super) fn cleanup_cutoff(
+    now: Instant,
+    deadline: Option<Instant>,
+    abort_timeout: Duration,
+) -> Instant {
+    let fresh = deadline_at(now, abort_timeout);
+    deadline.map_or(fresh, |deadline| {
+        deadline_at(deadline, abort_timeout).min(fresh)
+    })
+}
+
 /// The instant one flush must be decided by, shared by the job and its task.
 ///
 /// It is the block's own retry deadline until shutdown latches; from then on
@@ -135,8 +152,8 @@ pub(super) struct FlushDone {
 ///
 /// The result is published over `result_tx` the moment it is known. The task
 /// returns only once it has released everything it owns: on the deadline path
-/// that means cancelling the attempt in flight and then waiting at most
-/// `abort_timeout` for the sink to unwind it, after which the write future is
+/// that means cancelling the attempt in flight and then waiting for the sink
+/// to unwind it until [`cleanup_cutoff`], after which the write future is
 /// dropped whether or not it cooperated.
 async fn write_until(
     sink: Rc<lake::sink::Sink>,
@@ -230,11 +247,11 @@ async fn write_until(
                 // completions while the attempt is still unwinding.
                 let _ = result_tx.send(done(attempts, Err(decided)));
                 attempt_cancel.cancel();
-                let cleanup_deadline = deadline_at(clock::now(), abort_timeout);
+                let cutoff = cleanup_cutoff(clock::now(), Some(limit.at()), abort_timeout);
                 tokio::select! {
                     biased;
                     _ = &mut write => {}
-                    () = clock::sleep_until(cleanup_deadline) => {}
+                    () = clock::sleep_until(cutoff) => {}
                 }
                 // Dropping the write after the bound releases the last task-owned
                 // resources even if the object store future never cooperates.

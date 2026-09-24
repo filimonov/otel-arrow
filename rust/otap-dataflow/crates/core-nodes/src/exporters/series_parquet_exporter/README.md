@@ -248,9 +248,11 @@ holds, inside that deadline:
   producer sees its own timeout and retries.
 
 The node returns as soon as it holds nothing, and at the latest
-`upload.abort_timeout` after the deadline, which is the bound on unwinding an
-abandoned write. The drain therefore fits any deadline: a short one nacks more
-and a long one commits more, and no setting has to be sized against it.
+`upload.abort_timeout` after the deadline itself, which is the bound on
+unwinding an abandoned write; the bound is absolute, so a deadline the node
+observes late does not extend it. The drain therefore fits any deadline: a
+short one nacks more and a long one commits more, and no setting has to be
+sized against it.
 Committed blocks are never re-exported merely because a notification could not
 be delivered.
 
@@ -269,8 +271,10 @@ deadline plus `upload.abort_timeout`.
 
 On Kubernetes the kubelet sends SIGTERM and kills the container once
 `terminationGracePeriodSeconds` has passed, 30s by default, which is shorter
-than the engine's 60s. Set `terminationGracePeriodSeconds` to at least the
-engine's 60s plus `upload.abort_timeout` and a margin, for example 75. For a
+than the engine's 60s. No attempt runs past the engine's deadline and every
+cleanup ends `upload.abort_timeout` after it, so set
+`terminationGracePeriodSeconds` to at least the engine's 60s plus
+`upload.abort_timeout` and a margin, for example 75. For a
 longer drain, add a `preStop` hook that calls the admin shutdown operation
 with the timeout you want and set `terminationGracePeriodSeconds` above that
 timeout plus `upload.abort_timeout`: the grace period starts before the hook

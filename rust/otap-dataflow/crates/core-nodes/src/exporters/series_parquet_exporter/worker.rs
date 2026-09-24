@@ -1202,14 +1202,14 @@ impl Worker {
     /// request is left undecided whatever the destination is doing.
     ///
     /// Only then are the two slot holders cancelled and released. Both are
-    /// awaited within one shared `upload.abort_timeout`, because a task that is
+    /// awaited until one shared cutoff, `upload.abort_timeout` after the
+    /// latched deadline (see `flush::cleanup_cutoff`), because a task that is
     /// still unwinding owns the block, the sink handle and possibly a multipart
     /// abort in flight; returning while it does would leave that abort to be
     /// cancelled by runtime teardown and the upload to be reclaimed by the
-    /// bucket's lifecycle rule instead. The wait is bounded and ends in an
-    /// abort that is itself awaited, so a destination that never answers cannot
-    /// hold the node open: this costs at most one abort timeout beyond the
-    /// shutdown deadline, and it buys the abort actually being attempted.
+    /// bucket's lifecycle rule instead. The wait ends in an abort that is
+    /// itself awaited, so a destination that never answers cannot hold the
+    /// node open past that cutoff, however late the deadline is observed.
     pub(super) async fn abandon(&mut self) {
         // Phase zero: a flush that has already published its decision is
         // decided by that decision, not by the deadline. The loop's deadline
@@ -1271,7 +1271,11 @@ impl Worker {
         self.notify.drain_now();
         // Phase two: cancel and release, with one shared bound so a node
         // holding a write and a cleanup does not wait twice.
-        let deadline = flush::deadline_at(clock::now(), self.cfg.lake.upload.abort_timeout);
+        let deadline = flush::cleanup_cutoff(
+            clock::now(),
+            self.deadline,
+            self.cfg.lake.upload.abort_timeout,
+        );
         if let Some(job) = &mut flushing {
             job.shutdown(deadline).await;
         }
