@@ -32,9 +32,8 @@ pub struct SeriesCache {
 impl SeriesCache {
     /// Create a cache holding at most `max_entries` ids (at least 1).
     ///
-    /// Nothing is allocated up front: the bound is a configured ceiling, and
-    /// a value written to mean "no practical limit" must not reserve -- or
-    /// fail to reserve -- a table of that size at startup.
+    /// Nothing is allocated up front, so a bound written to mean "no practical
+    /// limit" reserves nothing at startup.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         let cap = NonZeroUsize::new(max_entries.max(1)).expect("max(1) is non-zero");
@@ -71,10 +70,8 @@ impl SeriesCache {
 
     /// Last durable descriptor partition, without changing recency or hit counters.
     ///
-    /// `peek` leaves LRU order untouched, unlike [`SeriesCache::is_committed`],
-    /// so a caller that only wants to know where a descriptor last landed --
-    /// for diagnostics, not an admission decision -- does not itself keep an
-    /// unrelated entry alive at another entry's expense.
+    /// Unlike [`SeriesCache::is_committed`] it leaves LRU order untouched, so
+    /// a caller asking where a descriptor last landed keeps no entry alive.
     #[must_use]
     pub fn last_committed(&self, id: &SeriesId) -> Option<PartitionId> {
         self.inner.peek(id).copied().flatten()
@@ -115,11 +112,8 @@ mod tests {
         [n; 16]
     }
 
-    /// Scenario: the cache is created with `usize::MAX` entries, the value an
-    /// operator writes to mean "no practical limit", and then used.
-    /// Guarantees: creation allocates nothing up front -- it neither aborts
-    /// nor panics on capacity overflow -- and the cache still works, so a
-    /// large configured bound costs only the entries actually held.
+    /// Scenario: a cache created with `usize::MAX` entries, then used.
+    /// Guarantees: creation allocates nothing and the cache works.
     #[test]
     fn an_unbounded_capacity_is_not_preallocated() {
         let mut cache = SeriesCache::new(usize::MAX);
@@ -177,11 +171,9 @@ mod tests {
         );
     }
 
-    /// Scenario: capacity 2, two ids committed in insertion order, the older
-    /// one read with `last_committed`, then a third id committed.
-    /// Guarantees: `last_committed` does not refresh recency -- the peeked id
-    /// is still the least recently used and is the one evicted -- and the
-    /// peek itself left every counter at its default.
+    /// Scenario: capacity 2, two committed ids, the older peeked with `last_committed`, then a
+    /// third committed.
+    /// Guarantees: the peeked id is still evicted first and no counter moved.
     #[test]
     fn last_committed_does_not_refresh_recency() {
         let p = PartitionId { date: 1, hour: 0 };

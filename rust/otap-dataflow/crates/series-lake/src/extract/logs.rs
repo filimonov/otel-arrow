@@ -406,8 +406,8 @@ mod tests {
     }
 
     /// Scenario: three log records, two distinct logger.name values, one zero timestamp.
-    /// Guarantees: two descriptors, three value rows with series ids, allow-listed attrs
-    /// excluded from the residual map, zero timestamp stored as null, denormalized columns filled.
+    /// Guarantees: two descriptors, three values rows, allow-listed attrs out of the residual map,
+    /// a null timestamp and filled denormalized columns.
     #[test]
     fn extracts_logs_descriptors_and_values() {
         let mut records = encode_logs(&logs_data());
@@ -485,11 +485,10 @@ mod tests {
         assert_eq!(out.descriptors[0].denorm.len(), 1);
     }
 
-    /// Scenario: memo keys whose identity attribute is `0.0` against `-0.0`,
-    /// two NaNs with different bits, and keys differing only in one scope
-    /// string or in the resource id.
-    /// Guarantees: keys the canonical encoding cannot tell apart are the same
-    /// key and hash alike; keys it can tell apart are different keys.
+    /// Scenario: memo keys with `0.0` against `-0.0`, NaNs of different bits, and keys differing in
+    /// one scope string or the resource id.
+    /// Guarantees: keys the canonical encoding cannot tell apart are equal and hash alike; others
+    /// differ.
     #[test]
     fn memo_keys_follow_the_canonical_identity() {
         let hasher = MemoHasher::default();
@@ -534,11 +533,9 @@ mod tests {
         assert!(versioned("1", 1).same(&versioned("1", 1)));
     }
 
-    /// Scenario: eight log records in two scopes that differ only in their
-    /// version; per scope, the identity attribute is `0.0`, `-0.0` and two
-    /// NaNs, and every record carries its own residual `request_id`.
-    /// Guarantees: the memo gives four series, one per scope and canonical
-    /// identity value, each the series id of its own descriptor.
+    /// Scenario: eight records in two scopes differing in version, identity `0.0`, `-0.0` and two
+    /// NaNs, each with its own residual `request_id`.
+    /// Guarantees: four series, one per scope and canonical value, each its descriptor's id.
     #[test]
     fn the_logs_memo_resolves_series_by_canonical_content() {
         let double = |k: &str, v: f64| KeyValue {
@@ -596,11 +593,8 @@ mod tests {
         assert_ne!(ids.value(0), ids.value(4));
     }
 
-    /// Scenario: a string log body one byte longer than the cell limit, and
-    /// one exactly at it.
-    /// Guarantees: the body stored from the request's own string column is
-    /// refused as an oversized cell, as a decoded body is, and the body at
-    /// the limit is stored byte for byte.
+    /// Scenario: a string body one byte over the cell limit, and one exactly at it.
+    /// Guarantees: the first is refused as an oversized cell; the second is stored byte for byte.
     #[test]
     fn a_string_body_is_held_to_the_cell_limit() {
         let mut cfg = cfg();
@@ -680,12 +674,9 @@ mod tests {
         ));
     }
 
-    /// Scenario: one log record carries a 900 KiB bytes attribute. The decoded
-    /// value tree is under the default 1 MiB row limit, but `render_v1`
-    /// base64-encodes bytes, so the stored map cell is 1.2 MiB.
-    /// Guarantees: the row limit is applied to the rendered cell, so the request
-    /// is refused instead of being admitted on a tree-sized estimate that the
-    /// stored row then exceeds.
+    /// Scenario: a 900 KiB bytes attribute, under the 1 MiB row limit decoded but 1.2 MiB as
+    /// rendered base64.
+    /// Guarantees: the row limit applies to the rendered cell, so the request is refused.
     #[test]
     fn a_bytes_attribute_is_charged_its_rendered_base64_size() {
         const RAW: usize = 900 << 10;
@@ -733,10 +724,8 @@ mod tests {
         ));
     }
 
-    /// Scenario: the same logs request, once with plain parent ids and once with
-    /// pdata's quasi-delta transport-optimized parent ids on every attribute payload.
-    /// Guarantees: `extract` decodes transport-optimized ids first, so both inputs
-    /// produce the same series ids, the same descriptor count and the same row count.
+    /// Scenario: the same logs request with plain and with transport-optimized parent ids.
+    /// Guarantees: both give the same series ids, descriptor count and row count.
     #[test]
     fn transport_optimized_ids_give_the_same_result() {
         let mut plain_records = encode_logs(&logs_data());
@@ -770,11 +759,8 @@ mod tests {
         assert_eq!(rows(&got), rows(&plain));
     }
 
-    /// Scenario: one log record carries attributes and one carries none, so pdata
-    /// writes a null `id` for the second record.
-    /// Guarantees: the record without attributes gets an empty identity attribute
-    /// list instead of inheriting the attributes of log id 0, so the two records
-    /// land in different series.
+    /// Scenario: one log record with attributes and one without (a null `id`).
+    /// Guarantees: the second gets an empty identity list and its own series.
     #[test]
     fn records_without_attributes_do_not_inherit_log_zero() {
         let data = LogsData {
@@ -824,12 +810,9 @@ mod tests {
         assert_ne!(with_attrs.series_id, without.series_id);
     }
 
-    /// Scenario: the Logs payload's `body` column is replaced by a plain string
-    /// column and handed back to `OtapArrowRecords`.
-    /// Guarantees: pdata validates the OTAP schema on the way in and refuses it,
-    /// so a non-struct body cannot reach `extract` through the public API. The
-    /// checked downcast that backs this up is covered directly by
-    /// `extract::tests::any_value_col_refuses_a_non_struct_body`.
+    /// Scenario: the Logs `body` column replaced by a string column and handed to
+    /// `OtapArrowRecords`.
+    /// Guarantees: pdata refuses it, so it cannot reach `extract` through the public API.
     #[test]
     fn pdata_refuses_a_non_struct_body_column() {
         let mut records = encode_logs(&logs_data());
@@ -850,10 +833,8 @@ mod tests {
         assert!(records.set(ArrowPayloadType::Logs, patched).is_err());
     }
 
-    /// Scenario: the same request extracted with `max_extracted_bytes` set to
-    /// exactly what the run measures, and to one byte less.
-    /// Guarantees: the limit is enforced on the measured extracted output, so a
-    /// values row is charged its estimate or its measurement but never both.
+    /// Scenario: `max_extracted_bytes` exactly at, and one byte under, the measured output.
+    /// Guarantees: the first is accepted and the second refused; a row is never charged twice.
     #[test]
     fn budget_is_enforced_on_the_measured_output() {
         let mut probe = encode_logs(&logs_data());
@@ -894,11 +875,8 @@ mod tests {
         ));
     }
 
-    /// Scenario: a denormalized column declared `int64` over a string resource
-    /// attribute.
-    /// Guarantees: the cell is stored as null, `denorm_type_mismatch` counts it,
-    /// and the per-column breakdown attributes every mismatch to the configured
-    /// physical column name and sums back to the aggregate.
+    /// Scenario: a denormalized `int64` column over a string resource attribute.
+    /// Guarantees: the cell is null and the mismatch is counted per column and in the aggregate.
     #[test]
     fn denorm_type_mismatch_is_counted() {
         let mut cfg = cfg();
@@ -922,10 +900,8 @@ mod tests {
         );
     }
 
-    /// Scenario: a log record whose `time_unix_nano` is above `i64::MAX`, so it
-    /// arrives as a negative nanosecond count.
-    /// Guarantees: both timestamp columns are null and `timestamp_out_of_range`
-    /// counts the record once.
+    /// Scenario: a `time_unix_nano` above `i64::MAX`.
+    /// Guarantees: both timestamp columns are null and `timestamp_out_of_range` counts one.
     #[test]
     fn timestamp_out_of_range_is_counted() {
         let data = LogsData {

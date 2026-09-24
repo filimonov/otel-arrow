@@ -95,12 +95,10 @@ impl Sink {
     ///
     /// Three terms: the chunk the merge is producing or has just produced,
     /// the Parquet encoder's in-progress row group, and the upload bytes the
-    /// store has not acknowledged yet -- the buffered part and the parts in
-    /// flight, each buffer the encoder handed over counted whole until its
-    /// last byte has landed, because a part is a slice of that buffer and
-    /// keeps all of it alive. Zero between tables and outside a write. A
-    /// block's owner adds it to what it accounts for while the block
-    /// flushes.
+    /// store has not acknowledged yet (the buffered part and the parts in
+    /// flight; a part is a slice of an encoder buffer and keeps all of it
+    /// alive, so each buffer counts whole until its last byte has landed).
+    /// Zero between tables and outside a write.
     #[must_use]
     pub fn flush_workspace_bytes(&self) -> usize {
         self.workspace.bytes()

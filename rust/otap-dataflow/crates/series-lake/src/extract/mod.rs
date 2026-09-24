@@ -185,7 +185,7 @@ pub struct Extracted {
     /// Pinned bytes of all values batches.
     pub pinned_bytes: usize,
     /// Decoded bytes of the resource and scope attribute lists the
-    /// descriptors share, charged once per request rather than per row.
+    /// descriptors share, charged once per request.
     ///
     /// Retained with the descriptors until admission drops their trees, so
     /// whoever holds an extraction holds these bytes too.
@@ -253,7 +253,7 @@ impl Budget {
         }
     }
 
-    /// Charge one row -- a values row or a descriptor row.
+    /// Charge one values or descriptor row.
     ///
     /// A single row larger than `max_row_bytes` refuses the request, as does a
     /// running total past `max_extracted_bytes`.
@@ -1028,7 +1028,7 @@ pub(crate) fn struct_child(
 ///
 /// The struct's own validity is applied to its children (see
 /// [`flat_children`]), so a null body row reads as a null type tag and becomes
-/// [`Value::Null`] rather than whatever the child buffers happen to hold.
+/// [`Value::Null`].
 pub(crate) fn any_value_col(batch: &RecordBatch, name: &str) -> Result<Option<AnyValueColumns>> {
     let Some(s) = typed_col::<StructArray>(batch, name, "an AnyValue struct")? else {
         return Ok(None);
@@ -1085,7 +1085,7 @@ pub(crate) fn str_of(a: &Option<ArrayRef>, row: usize) -> &str {
 ///
 /// The flags are a bit set, stored as received; readers interpret the bits. The
 /// storage column is `Int32` for Parquet portability, so the top bit wraps into
-/// the sign bit rather than being lost.
+/// the sign bit.
 #[allow(clippy::cast_possible_wrap)]
 pub(crate) fn flags_at(a: &Option<ArrayRef>, row: usize) -> i32 {
     prim_at::<UInt32Type>(a, row).unwrap_or(0) as i32
@@ -1271,10 +1271,8 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
     }
 
-    /// Scenario: `struct_child` is given a batch whose `resource` column is a
-    /// string column rather than a struct.
-    /// Guarantees: the request is refused as invalid content, not panicked on by
-    /// an unchecked downcast.
+    /// Scenario: `struct_child` on a batch whose `resource` column is a string column.
+    /// Guarantees: the request is refused as invalid content, not panicked on.
     #[test]
     fn struct_child_refuses_a_non_struct_column() {
         let b = batch_with_utf8("resource");
@@ -1290,10 +1288,8 @@ mod tests {
         );
     }
 
-    /// Scenario: `typed_col` is asked for a list where the batch's
-    /// `bucket_counts` column is a string column.
-    /// Guarantees: the request is refused as invalid content, not panicked on by
-    /// an unchecked downcast; an absent column is simply absent.
+    /// Scenario: `typed_col` asked for a list where `bucket_counts` is a string column.
+    /// Guarantees: the request is refused as invalid content; an absent column is absent.
     #[test]
     fn typed_col_refuses_a_column_of_another_type() {
         let b = batch_with_utf8("bucket_counts");
@@ -1308,10 +1304,8 @@ mod tests {
         );
     }
 
-    /// Scenario: `any_value_col` is given a batch whose `body` column is a string
-    /// column rather than the OTAP `AnyValue` struct.
-    /// Guarantees: the request is refused as invalid content, not panicked on by
-    /// an unchecked downcast; a real struct body is accepted.
+    /// Scenario: `any_value_col` on a batch whose `body` column is a string column.
+    /// Guarantees: the request is refused as invalid content; a struct body is accepted.
     #[test]
     fn any_value_col_refuses_a_non_struct_body() {
         assert!(matches!(
@@ -1344,14 +1338,9 @@ mod tests {
         assert!(any_value_col(&b, "absent").expect("absent").is_none());
     }
 
-    /// Scenario: two configured columns that both mismatch, looked up three
-    /// times apiece against an attribute list that cannot satisfy either
-    /// declared type.
-    /// Guarantees: `denorm_type_mismatch_by_column` holds exactly one entry
-    /// per configured column name -- bounded by the number of denormalize
-    /// columns configured at startup, not by how many times a column is
-    /// looked up -- each entry counts its own column's lookups only, and the
-    /// entries sum to the aggregate `denorm_type_mismatch`.
+    /// Scenario: two configured columns that both mismatch, looked up three times each.
+    /// Guarantees: one entry per configured column, each counting its own lookups, summing to the
+    /// aggregate.
     #[test]
     fn denorm_type_mismatch_by_column_is_bounded_by_configured_columns() {
         let a = Denormalize {
@@ -1382,13 +1371,10 @@ mod tests {
         );
     }
 
-    /// Scenario: a residual attribute list of bytes, nested, escaped and
-    /// null values rendered within a budget, and three 600 000-character
-    /// control-character strings -- 3.6 MB each once escaped -- against the
-    /// default 1 MiB row limit.
-    /// Guarantees: the ordinary list renders exactly the cell `map_cell`
-    /// builds and holds exactly its bytes; the large list is refused as a
-    /// row on its first value, with the budget back at its mark.
+    /// Scenario: a residual list of bytes, nested, escaped and null values, and three strings of
+    /// 600 000 control characters (3.6 MB escaped each) under a 1 MiB row limit.
+    /// Guarantees: the ordinary list renders as `map_cell` does and holds its bytes; the large one
+    /// is refused on its first value with the budget at its mark.
     #[test]
     fn a_rendered_map_is_held_and_refused_as_soon_as_the_row_is_too_large() {
         let list = vec![
@@ -1426,12 +1412,8 @@ mod tests {
         assert_eq!(budget.mark(), mark);
     }
 
-    /// Scenario: a `resource` struct and an `AnyValue` `body` struct whose
-    /// second row is null while their child buffers still hold live values --
-    /// a shape a valid Arrow producer is free to emit.
-    /// Guarantees: the parent struct's validity wins. The masked child reads as
-    /// null instead of a fabricated resource id, and the masked body decodes to
-    /// [`Value::Null`] instead of a fabricated log body.
+    /// Scenario: a `resource` and a `body` struct whose second row is null over live child values.
+    /// Guarantees: the parent's validity wins: a null resource and a `Value::Null` body.
     #[test]
     fn null_parent_struct_masks_its_children() {
         let nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false]));

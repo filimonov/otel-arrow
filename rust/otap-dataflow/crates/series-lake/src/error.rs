@@ -291,23 +291,12 @@ impl Error {
     /// Whether a failed write may succeed if the identical block is written
     /// again.
     ///
-    /// Only a failure whose origin is the storage layer can: the bytes are
-    /// already encoded and the file names are frozen, so a second attempt
-    /// differs from the first in nothing but the destination's state. An
-    /// encoding failure would produce the same failure forever, and a
-    /// cancellation or an expired deadline is a decision that has already
-    /// been taken rather than a transient fault.
-    ///
-    /// The Parquet writer wraps whatever the object store returned, so the
-    /// storage origin of a Parquet error is found by walking its source chain
-    /// rather than by its own variant; this lives here, beside the wrapping,
-    /// so a change in how the sink wraps a storage error is caught by this
-    /// crate's own tests.
-    ///
-    /// A storage error that no retry can cure -- the credentials are refused,
-    /// or the bucket or prefix does not exist -- is not retryable either:
-    /// repeating it until a deadline would only delay the same failure and
-    /// hide it behind a timeout.
+    /// Only a storage failure can, since the bytes and file names are frozen;
+    /// an encoding failure repeats forever, and a cancellation or an expired
+    /// deadline is a decision already taken. The storage origin of a Parquet
+    /// error is found by walking its source chain, here beside the wrapping.
+    /// A storage error no retry can cure (refused credentials, a missing
+    /// bucket or prefix) is not retryable either.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -347,15 +336,8 @@ mod tests {
         }
     }
 
-    /// Scenario: one error of every class and of every wrapping the sink
-    /// produces -- a direct object store error, one wrapped by the Parquet
-    /// writer directly or inside an I/O error, a failed abort around each,
-    /// an encoding failure, a cancellation, an expired deadline, an invariant
-    /// and a refusal -- is asked whether the identical write may be retried.
-    /// Guarantees: only a curable storage failure is retryable, however it is
-    /// wrapped; refused credentials and a missing bucket are not, nor is any
-    /// failure that is not storage, so a change in error wrapping cannot flip
-    /// whether a block is retried.
+    /// Scenario: an error of every class and every wrapping the sink produces.
+    /// Guarantees: only a curable storage failure is retryable, however it is wrapped.
     #[test]
     fn only_a_curable_storage_failure_is_retryable() {
         use parquet::errors::ParquetError;
@@ -426,11 +408,9 @@ mod tests {
         }
     }
 
-    /// Scenario: every refusal reason, a size refusal with and without a
-    /// measured size, is rendered through the crate error's `Display`.
-    /// Guarantees: a refusal reads as one sentence rather than as Rust
-    /// `Debug` output, and the two block-scoped refusals keep their variant
-    /// names, which a caller's pinned internal-failure sentence quotes.
+    /// Scenario: every refusal reason rendered through `Display`, sizes with and without a
+    /// measurement.
+    /// Guarantees: each reads as one sentence; the block-scoped ones keep their variant names.
     #[test]
     fn a_refusal_displays_as_text() {
         let cases = [

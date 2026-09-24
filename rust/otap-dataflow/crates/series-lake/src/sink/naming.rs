@@ -75,11 +75,9 @@ pub fn object_path(
 impl Sink {
     /// Object paths this sink will write for `block`, in write order.
     ///
-    /// The names follow from the block's own identity -- its partition, its
-    /// window, its sequence and this sink's writer and boot ids -- and never
-    /// from the attempt that writes them. That is what makes a retry rewrite
-    /// the same objects instead of adding a second copy, and it lets a caller
-    /// name the objects an attempt is about to touch before it touches them.
+    /// The names follow from the block's identity (partition, window,
+    /// sequence, writer and boot ids), never from the attempt, so a retry
+    /// rewrites the same objects and a caller can name them in advance.
     #[must_use]
     pub fn planned_paths(&self, block: &Block) -> Vec<Path> {
         block

@@ -137,7 +137,7 @@ fn metric_rows(
             }
         };
         // Decoded through the proto enum, so an unknown value is unspecified
-        // by the enum's own definition rather than by a local literal.
+        // by the enum's own definition.
         let temporality =
             match prim_at::<Int32Type>(&temporality, row).map(AggregationTemporality::try_from) {
                 Some(Ok(AggregationTemporality::Delta)) => Temporality::Delta,
@@ -214,8 +214,8 @@ struct Common<'a> {
 
 /// The metric a data point belongs to.
 ///
-/// A free function rather than a method on `Common`, so that holding the
-/// borrowed `MetricRow` does not block `&mut c.stats` while building the row.
+/// A free function, not a method on `Common`, so holding the borrowed
+/// `MetricRow` does not block `&mut c.stats` while building the row.
 fn metric_of(metrics: &HashMap<u32, MetricRow>, metric_id: u32) -> Result<&MetricRow> {
     metrics
         .get(&metric_id)
@@ -226,13 +226,11 @@ impl Common<'_> {
     /// Series id for (metric, point attrs), memoized on content before any
     /// encoding or hashing.
     ///
-    /// Without the memo, `canonical_bytes` plus XXH3 would run once per data
-    /// point instead of once per series. On a miss the identity is computed
-    /// from a descriptor whose resource and scope lists are the request's
-    /// shared copies, and it is checked against the series already held
-    /// before the row is built: a duplicate is neither built nor charged, and
-    /// its denormalized columns are not looked up, so
-    /// `stats.denorm_type_mismatch` counts series rather than points.
+    /// `canonical_bytes` and XXH3 run once per series. On a miss the identity
+    /// is computed from a descriptor holding the request's shared resource and
+    /// scope lists and checked against the series already held before the row
+    /// is built, so a duplicate is neither built nor charged and
+    /// `stats.denorm_type_mismatch` counts series, not points.
     fn series_for<'t>(
         &mut self,
         memo: &mut HashMap<MemoKey<'t>, SeriesId, MemoHasher>,
@@ -289,8 +287,8 @@ impl Common<'_> {
     /// denormalized columns are built around the kind's own; and the row is
     /// charged to the request's budget as it enters the sink.
     ///
-    /// `kind` returns the eight per-kind columns of one point -- the other
-    /// kind's columns null, not zero -- and the bytes they retain beyond
+    /// `kind` returns the eight per-kind columns of one point (the other
+    /// kind's columns null, not zero) and the bytes they retain beyond
     /// [`PER_KIND_FIXED_BYTES`]. It runs once the point's series is known and
     /// may refuse the request.
     #[allow(clippy::too_many_arguments)]
@@ -834,13 +832,10 @@ mod tests {
         }
     }
 
-    /// Scenario: forty metrics share one resource carrying a 64 KiB attribute,
-    /// so the descriptors together copy roughly 2.5 MiB of attributes.
-    /// Guarantees: the copies are charged to the extracted budget, one per
-    /// distinct series, and nothing is copied before the charge. Under the
-    /// default 32 MiB budget all forty descriptors are produced; under a 1 MiB
-    /// budget the request is refused as too large instead of allocating forty
-    /// copies first.
+    /// Scenario: forty metrics under one resource with a 64 KiB attribute, at the default and a 1
+    /// MiB budget.
+    /// Guarantees: one charged copy per series, charged before copying: accepted at 32 MiB, refused
+    /// at 1 MiB.
     #[test]
     fn shared_resource_attributes_are_charged_before_they_are_copied() {
         const METRICS: usize = 40;
@@ -863,14 +858,10 @@ mod tests {
         ));
     }
 
-    /// Scenario: one metric under a resource carrying a 256 KiB attribute,
-    /// with `max_extracted_bytes` set just above what the request actually
-    /// retains: its attribute tables, its descriptor rows, its values and its
-    /// one shared resource copy.
-    /// Guarantees: the request is accepted. The shared copy is charged once,
-    /// when it is made, and the descriptor row that holds it charges only its
-    /// own rendering of it, so the two are never counted together and a
-    /// request that fits its budget is not refused transiently.
+    /// Scenario: one metric under a 256 KiB resource attribute with `max_extracted_bytes` just
+    /// above what the request retains.
+    /// Guarantees: the request is accepted: the shared copy and its descriptor rendering are not
+    /// counted together.
     #[test]
     fn the_shared_resource_copy_is_charged_once() {
         // Large enough that the copy outweighs the fixed Arrow builder
@@ -911,11 +902,9 @@ mod tests {
         assert_eq!(out.descriptors.len(), 1);
     }
 
-    /// Scenario: a gauge with two series and a cumulative histogram, each
-    /// point kind carrying one exemplar, under `unsupported: drop`.
-    /// Guarantees: three descriptors, number rows keep int and double separately with
-    /// INT64_MAX intact, histogram lists are stored as signed integers, and
-    /// both exemplars are dropped and counted.
+    /// Scenario: a two-series gauge and a cumulative histogram, each with one exemplar.
+    /// Guarantees: three descriptors, int and double kept apart with INT64_MAX intact, signed
+    /// histogram lists, both exemplars dropped and counted.
     #[test]
     fn extracts_number_and_histogram() {
         let cfg = LakeConfig {
@@ -1180,14 +1169,10 @@ mod tests {
         ));
     }
 
-    /// Scenario: the gauge-and-histogram request, whose number point and
-    /// histogram point each carry an exemplar, under `unsupported: reject`
-    /// with `metrics.exemplars` unset, and under an explicit
-    /// `metrics.exemplars: reject`.
-    /// Guarantees: by default every point is kept and both exemplars are
-    /// counted as dropped, `unsupported: reject` notwithstanding; only the
-    /// explicit reject refuses the whole request, with a reason naming
-    /// exemplars.
+    /// Scenario: points with exemplars under `unsupported: reject` with `metrics.exemplars` unset,
+    /// and under `metrics.exemplars: reject`.
+    /// Guarantees: by default the exemplars are counted as dropped; only the explicit reject
+    /// refuses the request, naming exemplars.
     #[test]
     fn exemplars_are_dropped_by_default_and_refused_only_when_asked() {
         let records = encode_metrics(&gauge_and_hist());
@@ -1210,12 +1195,10 @@ mod tests {
         }
     }
 
-    /// Scenario: an exponential histogram point carrying an exemplar, beside
-    /// a gauge point without one, under `unsupported: drop` and
-    /// `metrics.exemplars: reject`.
-    /// Guarantees: the exemplar goes with the unsupported point it belongs
-    /// to: the request is not refused, the gauge point is kept, and the
-    /// exemplar is counted as dropped beside its point.
+    /// Scenario: an exponential histogram with an exemplar beside a gauge, under `unsupported:
+    /// drop` and `metrics.exemplars: reject`.
+    /// Guarantees: not refused: the gauge is kept and the exemplar is counted dropped with its
+    /// point.
     #[test]
     fn an_exemplar_of_a_dropped_point_is_dropped_with_it() {
         let md = data(vec![
@@ -1261,9 +1244,8 @@ mod tests {
     }
 
     /// Scenario: an exponential histogram under reject and under drop.
-    /// Guarantees: reject refuses the whole request; drop yields zero rows,
-    /// counts one drop in the aggregate and attributes it to the exponential
-    /// histogram counter specifically, leaving the summary counter at zero.
+    /// Guarantees: reject refuses the request; drop yields no rows and counts one exponential
+    /// histogram drop.
     #[test]
     fn exp_histogram_policy() {
         let md = data(vec![Metric {
@@ -1301,11 +1283,9 @@ mod tests {
         assert!(out.values.is_empty());
     }
 
-    /// Scenario: an exponential histogram and a summary, with a different
-    /// point count each, dropped together in one request.
-    /// Guarantees: the two per-kind counters split the aggregate exactly by
-    /// kind rather than merging or double counting, so the domain stays
-    /// closed to the two unsupported point kinds (FORMAT.md section 2).
+    /// Scenario: an exponential histogram and a summary with different point counts, dropped
+    /// together.
+    /// Guarantees: the per-kind counters split the aggregate exactly.
     #[test]
     fn exp_histogram_and_summary_drops_are_split_by_kind() {
         let md = data(vec![
@@ -1358,12 +1338,8 @@ mod tests {
         );
     }
 
-    /// Scenario: a gauge and a summary in the same request under the drop policy.
-    /// Guarantees: the summary never reaches temporality validation (pdata supplies
-    /// no temporality for summaries), the request succeeds, the gauge rows survive,
-    /// the summary points are counted as dropped in the aggregate, and attributed
-    /// to the summary counter specifically, leaving the exponential-histogram
-    /// counter at zero.
+    /// Scenario: a gauge and a summary under drop.
+    /// Guarantees: the summary skips temporality validation and is counted; the gauge rows survive.
     #[test]
     fn summary_is_dropped_without_failing_temporality_validation() {
         let md = data(vec![
@@ -1437,12 +1413,8 @@ mod tests {
         ));
     }
 
-    /// Scenario: two gauge points of the same metric, the first carrying an
-    /// attribute and so becoming attribute parent 0, the second carrying none.
-    /// pdata still numbers the second point, but writes no attribute row for it.
-    /// Guarantees: the point without attributes resolves to an empty attribute
-    /// list rather than inheriting attribute parent 0, so the two points land in
-    /// two distinct series and the memo does not collapse them.
+    /// Scenario: two gauge points, the first with an attribute (parent 0), the second without.
+    /// Guarantees: the second gets an empty attribute list and its own series.
     #[test]
     fn points_without_attributes_do_not_inherit_parent_zero() {
         let md = data(vec![Metric {
@@ -1508,12 +1480,9 @@ mod tests {
         assert_ne!(row_ids.value(0), row_ids.value(1));
     }
 
-    /// Scenario: `bucket_counts` and `explicit_bounds` rows that hold a null
-    /// element, rows that are absent or null altogether, and a valid row
-    /// after them.
-    /// Guarantees: a null element refuses the request as invalid rather than
-    /// being stored as a 0 bucket or a 0.0 bound; an absent or null list row is
-    /// read as the empty list; a later row reads exactly its own items.
+    /// Scenario: list rows with a null element, absent or null rows, and a valid row after them.
+    /// Guarantees: a null element is refused, an absent or null row is empty, and the later row
+    /// reads its own items.
     #[test]
     fn null_list_elements_are_refused() {
         let mut counts = ListBuilder::new(UInt64Builder::new());
@@ -1591,11 +1560,9 @@ mod tests {
         RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), cols).expect("batch")
     }
 
-    /// Scenario: the gauge's `metric_type` cell is null while its value slot
-    /// still holds the gauge tag; pdata's schema check refuses such a batch,
-    /// so `metric_rows` is given it directly.
-    /// Guarantees: the batch is refused as invalid instead of the slot under
-    /// the null being read as the metric's kind.
+    /// Scenario: a null `metric_type` over a gauge tag, given to `metric_rows` directly (pdata
+    /// refuses such a batch).
+    /// Guarantees: the batch is refused as invalid.
     #[test]
     fn a_null_metric_type_is_refused() {
         use arrow::array::UInt8Array;
@@ -1618,11 +1585,8 @@ mod tests {
         ));
     }
 
-    /// Scenario: the gauge and the histogram carry the same metric id, which
-    /// pdata's schema check accepts.
-    /// Guarantees: the request is refused as invalid instead of one metric's
-    /// row replacing the other's and its points being stored under the wrong
-    /// series.
+    /// Scenario: a gauge and a histogram carrying the same metric id.
+    /// Guarantees: the request is refused as invalid.
     #[test]
     fn a_duplicate_metric_id_is_refused() {
         use arrow::array::UInt16Array;
@@ -1691,15 +1655,9 @@ mod tests {
         }
     }
 
-    /// Scenario: 8192 points under one 25-attribute resource at the default
-    /// limits: eight gauges, 512 point attribute sets each, two points per
-    /// set, so 4096 series of two points.
-    /// Guarantees: the request is accepted; the memo answers the second point
-    /// of every series without encoding or hashing it again (4096 hits, 4096
-    /// misses); every series is built once; and the resource list is decoded
-    /// and charged once for the whole request rather than once per series.
-    /// Before the memo was keyed on content and the resource shared, the same
-    /// request was refused as too large for `ingress.max_extracted_bytes`.
+    /// Scenario: 8192 points under one 25-attribute resource, 4096 series of two points each.
+    /// Guarantees: accepted: 4096 memo hits and misses, each series built once, the resource
+    /// decoded and charged once.
     #[test]
     fn many_points_under_a_wide_resource_hit_the_memo_and_fit_the_default_budget() {
         let d = k8s_request(8, 512, 2);
@@ -1735,12 +1693,8 @@ mod tests {
         }
     }
 
-    /// Scenario: memo keys built from attribute lists holding `0.0` and
-    /// `-0.0`, two NaNs with different bit patterns, and a NaN nested in an
-    /// array, compared and hashed with the map's own hasher.
-    /// Guarantees: keys the canonical encoding cannot tell apart are equal
-    /// and hash alike, a NaN key equals itself, and a key with a different
-    /// value is not equal, so the memo honours the `Eq`/`Hash` contract.
+    /// Scenario: memo keys with `0.0` and `-0.0`, NaNs of different bits, and a NaN in an array.
+    /// Guarantees: canonically equal keys are equal and hash alike; a different value is not equal.
     #[test]
     fn memo_keys_follow_the_canonical_double_rules() {
         use std::hash::BuildHasher;
@@ -1810,11 +1764,8 @@ mod tests {
         );
     }
 
-    /// Scenario: one gauge with six points whose only attribute is a double:
-    /// `0.0`, `-0.0`, NaN, a NaN with other bits, `1.5` and `1.5` again.
-    /// Guarantees: the memo answers every point whose value encodes like an
-    /// earlier one, so the memo misses equal the distinct canonical series
-    /// (three) and every other point is a hit.
+    /// Scenario: six gauge points with double attributes `0.0`, `-0.0`, two NaNs and `1.5` twice.
+    /// Guarantees: three misses, one per canonical series; the rest are hits.
     #[test]
     fn signed_zero_and_nan_attributes_hit_the_memo() {
         let values = [

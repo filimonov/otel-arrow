@@ -334,13 +334,9 @@ mod tests {
     }
     use crate::config::{DenormType, Denormalize, LakeConfig};
 
-    /// Scenario: the default `logs_values` schema, whose column set and types
-    /// are frozen for format version 1.
-    /// Guarantees: the fingerprint is exactly this value. A change to any
-    /// column's name, type, nullability or position changes it, so this test
-    /// pins the rendering the readers in `docs/FORMAT.md` are told to compare.
-    /// Every dataset's golden rendering and fingerprint is pinned in
-    /// `tests/golden.rs` against the vectors `tools/gen_golden.py` computes.
+    /// Scenario: the default `logs_values` schema, frozen for format version 1.
+    /// Guarantees: its fingerprint is exactly the pinned value (every dataset is pinned in
+    /// `tests/golden.rs`).
     #[test]
     fn golden_fingerprint_of_the_default_logs_values_schema() {
         let cfg = LakeConfig::default();
@@ -348,11 +344,8 @@ mod tests {
         assert_eq!(fp, 0x0151_2d4e_b446_f355_u64, "{fp:#018x}");
     }
 
-    /// Scenario: every dataset under the default configuration and under a
-    /// configuration with one denormalized column of each type.
-    /// Guarantees: every column type is inside the crate's own vocabulary, so
-    /// no rendering falls back to `Unk<>` and no fingerprint depends on a type
-    /// the format does not name.
+    /// Scenario: every dataset, default and with one denormalized column of each type.
+    /// Guarantees: every column type renders from the crate's vocabulary, never `Unk<>`.
     #[test]
     fn every_dataset_column_type_is_in_the_vocabulary() {
         let mut denorm = LakeConfig::default();
@@ -382,11 +375,8 @@ mod tests {
         }
     }
 
-    /// Scenario: two schemas that differ only in whether one column is
-    /// nullable, and two that differ only in the nullability of a list item.
-    /// Guarantees: nullability is part of the fingerprint at the top level and
-    /// inside nested types, so a required column and a nullable one never
-    /// share a compaction scope.
+    /// Scenario: schemas differing only in a column's, or a list item's, nullability.
+    /// Guarantees: the fingerprints differ.
     #[test]
     fn nullability_changes_the_fingerprint() {
         let one = |nullable| Schema::new(vec![Field::new("a", DataType::Int64, nullable)]);
@@ -411,12 +401,8 @@ mod tests {
         );
     }
 
-    /// Scenario: one string column literally named `a:Str;b`, against two
-    /// string columns named `a` and `b`. Under a `name:type;` join both
-    /// serialize to `a:Str;b:Str;`.
-    /// Guarantees: the length-prefixed serialization keeps them apart, so a
-    /// column name holding the old delimiters cannot forge another schema's
-    /// fingerprint.
+    /// Scenario: one column named `a:Str;b` against columns `a` and `b`.
+    /// Guarantees: the length-prefixed serialization gives different fingerprints.
     #[test]
     fn delimiter_bearing_names_do_not_collide() {
         let one = Schema::new(vec![Field::new("a:Str;b", DataType::Utf8, true)]);
@@ -508,9 +494,7 @@ mod tests {
     }
 
     /// Scenario: the merged `metrics/values` schema under the default config.
-    /// Guarantees: every column that only one point kind fills is nullable, so
-    /// a number row can leave the histogram columns null and a histogram row
-    /// can leave both value columns null in the one dataset.
+    /// Guarantees: every column only one point kind fills is nullable.
     #[test]
     fn metrics_values_per_kind_columns_are_nullable() {
         let cfg = LakeConfig::default();

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Format configuration types: the lake subset of the series_parquet
-//! exporter's configuration (its README, "Configuration").
+//! exporter's configuration.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -241,7 +241,7 @@ impl Default for SignalConfig {
     }
 }
 
-/// Request budgets (series_parquet exporter README, "Configuration").
+/// Request and block budgets.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IngressLimits {
@@ -494,30 +494,8 @@ impl LakeConfig {
             .len()
     }
 
-    /// Validate cross-field constraints (FORMAT.md section 3 for the
-    /// denormalization rules).
-    ///
-    /// Rules enforced: `writer_id` is non-empty and made of `[A-Za-z0-9_.]`
-    /// only (it is interpolated into the file-name segment of
-    /// [`crate::sink::object_path`] between `-` separators, so neither a
-    /// path delimiter nor a `-` may appear in it; the boot id is generated
-    /// internally from a UUIDv4 and is not user-configurable, so it needs no
-    /// such rule); `ingress.max_nesting_depth <= 256`;
-    /// `metrics.series_attributes` is empty (a metric's identity already
-    /// includes every point attribute); no denormalized column is named like
-    /// a partition key of [`PARTITION_KEYS`]; `max_row_bytes <=
-    /// run_target_bytes / 4`; `max_requests_per_block >= 1`; `max_block_bytes
-    /// >= 2 * max_extracted_bytes` (series-row inflation); `upload.part_bytes`
-    /// between 5 MiB and [`MAX_PART_BYTES`] (the S3 multipart part size
-    /// limits, outside which every multipart upload would fail at flush
-    /// time); `upload.concurrency >= 1` (otherwise no part could ever
-    /// be sent); `window_interval` is a whole number of seconds and at least
-    /// 1 s; denormalized and intrinsic column names do not collide
-    /// (case-insensitively) within a dataset and hold no `:` or `;` (the
-    /// schema fingerprint's field separators; intrinsic names never do); each
-    /// signal's `values_sort` columns exist in that signal's values dataset
-    /// schema and have a type Arrow's row converter can sort; and every
-    /// `denormalize` path has a valid `resource.`/`scope.`/`attrs.` prefix.
+    /// Check the cross-field rules; each error names the dotted key it
+    /// refused (FORMAT.md section 3 for the denormalization rules).
     pub fn validate(&self) -> Result<()> {
         if self.writer_id.is_empty() {
             return Err(Error::invalid("writer_id must not be empty"));
@@ -573,18 +551,9 @@ impl LakeConfig {
                 "ingress.max_requests_per_block must be at least 1",
             ));
         }
-        // A block charges a request's series rows at up to twice the estimate
-        // extraction charged them (`DescriptorRow::series_row_bytes`), so a
-        // block of exactly `max_extracted_bytes` could refuse permanently a
-        // request extraction accepted. Twice the extraction budget covers that
-        // inflation. It does not cover the fixed per-series term of
-        // `series_row_fixed_bytes`, which this check cannot bound: it grows
-        // with the number of series in a request, and extraction bounds that
-        // number only through each descriptor's own estimate, so any factor
-        // large enough for a request of many tiny series would refuse the
-        // default configuration. A request whose exact worst-case charge (see
-        // `series_row_fixed_bytes`) exceeds `max_block_bytes` is refused as
-        // too large, consistently, by `Block::reserve`.
+        // Covers the doubled series-row term of a request's worst case; the
+        // per-series fixed term is decided per request (see
+        // `series_row_fixed_bytes`).
         if self.ingress.max_block_bytes / 2 < self.ingress.max_extracted_bytes {
             return Err(Error::invalid(
                 "ingress.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
@@ -593,9 +562,7 @@ impl LakeConfig {
             ));
         }
         // The window boundary arithmetic and the `window_secs` file metadata
-        // both work in whole seconds. A sub-second interval would be silently
-        // rounded in one place and recorded as zero in the other, so refuse it
-        // here rather than letting the two disagree.
+        // both work in whole seconds.
         if self.window_interval.subsec_nanos() != 0 || self.window_interval.as_secs() == 0 {
             return Err(Error::invalid(
                 "window_interval must be a whole number of seconds and at least 1s",
@@ -665,8 +632,7 @@ impl LakeConfig {
                         )));
                     };
                     // Sorting goes through Arrow's row format, which cannot
-                    // encode every type (a Map, for instance). Refuse here
-                    // rather than at the first admission, seal or flush.
+                    // encode every type (a Map, for instance).
                     let sort_field = arrow::row::SortField::new(field.data_type().clone());
                     if !arrow::row::RowConverter::supports_fields(std::slice::from_ref(&sort_field))
                     {
@@ -714,11 +680,8 @@ mod tests {
         assert!(err.to_string().contains("max_requests_per_block"));
     }
 
-    /// Scenario: `values_sort` names the logs `attrs` column, whose Arrow type
-    /// is a Map.
-    /// Guarantees: `validate` refuses it. Arrow's row converter cannot encode a
-    /// Map, so the configuration would otherwise be accepted and then fail at
-    /// the first admission, seal or flush.
+    /// Scenario: `values_sort` names the logs `attrs` column, a Map.
+    /// Guarantees: `validate` refuses it, since Arrow's row converter cannot encode a Map.
     #[test]
     fn a_sort_key_the_row_converter_cannot_sort_is_rejected() {
         let mut cfg = LakeConfig::default();
@@ -735,10 +698,8 @@ mod tests {
         assert!(err.to_string().contains("row converter cannot sort"));
     }
 
-    /// Scenario: `window_interval` set to 500 ms, and to zero.
-    /// Guarantees: both are refused. Boundary arithmetic rounds a sub-second
-    /// interval up to one second while the file metadata records zero, so the
-    /// two would disagree about the window a file belongs to.
+    /// Scenario: `window_interval` of 500 ms, and of zero.
+    /// Guarantees: both are refused.
     #[test]
     fn a_sub_second_window_interval_is_rejected() {
         for interval in [Duration::from_millis(500), Duration::ZERO] {
@@ -756,10 +717,8 @@ mod tests {
         cfg.validate().expect("a one second window is valid");
     }
 
-    /// Scenario: a denormalized column name holding the schema fingerprint's
-    /// field separators.
-    /// Guarantees: `validate` refuses it, so no configuration can produce a
-    /// column name that the fingerprint's serialization has to disambiguate.
+    /// Scenario: a denormalized column name holding the fingerprint's field separators.
+    /// Guarantees: `validate` refuses it.
     #[test]
     fn a_denormalized_column_name_with_fingerprint_separators_is_rejected() {
         for column in ["a:Utf8;b", "a;b", "a:b"] {
@@ -779,12 +738,8 @@ mod tests {
         }
     }
 
-    /// Scenario: `max_block_bytes` is below twice `max_extracted_bytes`, by one
-    /// byte, and exactly twice it.
-    /// Guarantees: `validate` refuses the first and accepts the second: a
-    /// block must hold one request's output including the series-row
-    /// inflation, or a request extraction accepted could be refused by every
-    /// block.
+    /// Scenario: `max_block_bytes` one byte below, and exactly at, twice `max_extracted_bytes`.
+    /// Guarantees: the first is refused and the second accepted.
     #[test]
     fn max_block_bytes_below_twice_extracted_is_rejected() {
         let mut cfg = LakeConfig::default();
@@ -797,11 +752,8 @@ mod tests {
         cfg.validate().expect("exactly twice is enough");
     }
 
-    /// Scenario: `upload.part_bytes` is exactly the S3 multipart maximum part
-    /// size, and one byte above it.
-    /// Guarantees: the maximum is accepted and anything above it is refused at
-    /// config time with a sentence naming the key and the limit, rather than
-    /// failing every multipart upload at flush time.
+    /// Scenario: `upload.part_bytes` at the S3 maximum part size and one byte above.
+    /// Guarantees: the maximum is accepted; above it is refused naming the key and the limit.
     #[test]
     fn upload_part_bytes_above_5gib_is_rejected() {
         let mut cfg = LakeConfig::default();
@@ -815,10 +767,8 @@ mod tests {
         );
     }
 
-    /// Scenario: the parts a whole-block upload takes, with the defaults and
-    /// with a block that is not a whole number of parts.
-    /// Guarantees: the count rounds up, so a configuration whose last part is
-    /// partial is not reported one part short.
+    /// Scenario: whole-block part counts with the defaults and with a partial last part.
+    /// Guarantees: the count rounds up.
     #[test]
     fn parts_per_block_rounds_up() {
         let mut cfg = LakeConfig::default();
@@ -829,9 +779,8 @@ mod tests {
         assert_eq!(cfg.parts_per_block(), 2);
     }
 
-    /// Scenario: `upload.part_bytes` is below the S3 multipart minimum part size.
-    /// Guarantees: `validate` refuses at config time rather than deferring to an
-    /// upload-time failure.
+    /// Scenario: `upload.part_bytes` below the S3 minimum part size.
+    /// Guarantees: `validate` refuses it.
     #[test]
     fn upload_part_bytes_below_5mib_is_rejected() {
         let mut cfg = LakeConfig::default();
@@ -850,11 +799,8 @@ mod tests {
         assert!(err.to_string().contains("concurrency"));
     }
 
-    /// Scenario: every combination of `unsupported` and `metrics.exemplars`,
-    /// the latter unset or set.
-    /// Guarantees: every combination is valid, and `metrics.exemplars` alone
-    /// decides: exemplars are dropped when it is unset or `drop`, whatever
-    /// `unsupported` says, and rejected only when it is `reject`.
+    /// Scenario: every combination of `unsupported` and `metrics.exemplars`, unset or set.
+    /// Guarantees: all are valid, and only `metrics.exemplars: reject` rejects exemplars.
     #[test]
     fn metrics_exemplars_alone_decides_and_defaults_to_drop() {
         for unsupported in [UnsupportedPolicy::Reject, UnsupportedPolicy::Drop] {
@@ -878,9 +824,8 @@ mod tests {
         }
     }
 
-    /// Scenario: `unsupported` omitted from a configuration document, and
-    /// written as `reject` and as `drop`.
-    /// Guarantees: omitted means `drop`, and an explicit value is kept.
+    /// Scenario: `unsupported` omitted, `reject` and `drop`.
+    /// Guarantees: omitted means `drop`; an explicit value is kept.
     #[test]
     fn unsupported_defaults_to_drop() {
         assert_eq!(LakeConfig::default().unsupported, UnsupportedPolicy::Drop);
@@ -901,8 +846,7 @@ mod tests {
     }
 
     /// Scenario: `logs.exemplars` written at all.
-    /// Guarantees: it is refused at startup with a sentence naming the
-    /// setting, because no log record carries exemplars.
+    /// Guarantees: it is refused at startup naming the setting.
     #[test]
     fn logs_exemplars_is_refused() {
         let mut cfg = LakeConfig::default();
@@ -911,9 +855,8 @@ mod tests {
         assert!(err.to_string().contains("logs.exemplars"), "{err}");
     }
 
-    /// Scenario: the exemplar policy written in a configuration document.
-    /// Guarantees: `metrics.exemplars` takes `drop` or `reject` and is unset
-    /// when omitted; any other value is refused.
+    /// Scenario: the exemplar policy in a configuration document.
+    /// Guarantees: `drop` and `reject` parse, omitted is unset, anything else is refused.
     #[test]
     fn metrics_exemplars_parses_from_the_document() {
         let cfg: LakeConfig = serde_json::from_value(serde_json::json!({
@@ -931,16 +874,15 @@ mod tests {
         );
     }
 
-    /// Scenario: the spec-example default configuration.
-    /// Guarantees: `validate` accepts it outright.
+    /// Scenario: the default configuration.
+    /// Guarantees: `validate` accepts it.
     #[test]
     fn default_config_validates() {
         assert!(LakeConfig::default().validate().is_ok());
     }
 
     /// Scenario: `writer_id` is the empty string.
-    /// Guarantees: `validate` refuses it, since it is interpolated into every
-    /// written file name.
+    /// Guarantees: `validate` refuses it.
     #[test]
     fn writer_id_empty_is_rejected() {
         let cfg = LakeConfig {
@@ -952,8 +894,7 @@ mod tests {
     }
 
     /// Scenario: `writer_id` contains a `/`.
-    /// Guarantees: `validate` refuses it, since an unescaped `/` would inject
-    /// extra path segments into `object_path`'s file-name segment.
+    /// Guarantees: `validate` refuses it.
     #[test]
     fn writer_id_with_slash_is_rejected() {
         let cfg = LakeConfig {
@@ -964,12 +905,9 @@ mod tests {
         assert!(err.to_string().contains("writer_id"));
     }
 
-    /// Scenario: `writer_id` holds a hyphen -- the separator of the file-name
-    /// fields it is written between -- a space, a non-ASCII letter, or a
-    /// slash, and then only characters of the allowed class.
-    /// Guarantees: everything outside `[A-Za-z0-9_.]` is refused, so a file
-    /// name always splits back into its documented fields, and the allowed
-    /// class is accepted.
+    /// Scenario: `writer_id` with a hyphen, a space, a non-ASCII letter or a slash, then an allowed
+    /// one.
+    /// Guarantees: everything outside `[A-Za-z0-9_.]` is refused and the allowed class is accepted.
     #[test]
     fn writer_id_outside_its_character_class_is_rejected() {
         for bad in ["local-1", "a b", "w\u{e9}", "team/writer"] {
@@ -987,9 +925,8 @@ mod tests {
         cfg.validate().expect("the allowed class");
     }
 
-    /// Scenario: `max_nesting_depth` is set just above and exactly at 256.
-    /// Guarantees: the first is refused and the second accepted, so the depth
-    /// handed to the CBOR parser's own recursion limit is bounded.
+    /// Scenario: `max_nesting_depth` just above and exactly at 256.
+    /// Guarantees: the first is refused and the second accepted.
     #[test]
     fn max_nesting_depth_is_capped() {
         let mut cfg = LakeConfig::default();
@@ -1000,11 +937,8 @@ mod tests {
         cfg.validate().expect("at the cap");
     }
 
-    /// Scenario: a denormalized column is named like one of the Hive
-    /// partition keys of the layout, in any case.
-    /// Guarantees: it is refused, because a reader that resolves partition
-    /// keys by name would otherwise read the file column and the path key as
-    /// one.
+    /// Scenario: a denormalized column named like a Hive partition key, in any case.
+    /// Guarantees: it is refused.
     #[test]
     fn a_denormalized_column_named_like_a_partition_key_is_rejected() {
         for column in ["v", "signal", "dataset", "date", "Hour"] {
@@ -1025,9 +959,7 @@ mod tests {
     }
 
     /// Scenario: `metrics.series_attributes` is set.
-    /// Guarantees: it is refused rather than accepted and ignored, because a
-    /// metric's identity already includes every point attribute and the
-    /// setting has no effect there.
+    /// Guarantees: it is refused, since metric identity already includes every point attribute.
     #[test]
     fn metrics_series_attributes_is_rejected() {
         let mut cfg = LakeConfig::default();
@@ -1040,8 +972,8 @@ mod tests {
     }
 
     /// Scenario: a denormalized column given as a bare string.
-    /// Guarantees: the path is kept verbatim, the column name defaults to the
-    /// path's last segment, and the type defaults to string.
+    /// Guarantees: the path is kept, the column defaults to its last segment and the type to
+    /// string.
     #[test]
     fn denormalize_deserializes_from_bare_string() {
         let d: Denormalize = serde_json::from_str("\"resource.service.name\"").expect("valid json");
@@ -1074,7 +1006,7 @@ mod tests {
     }
 
     /// Scenario: a sort key given as the full object form with `desc`/`first`.
-    /// Guarantees: both are read from the object rather than defaulted.
+    /// Guarantees: both are read from the object.
     #[test]
     fn sort_key_deserializes_from_object_form() {
         let k: SortKey =
@@ -1085,10 +1017,8 @@ mod tests {
         assert_eq!(k.nulls, Nulls::First);
     }
 
-    /// Scenario: a `LakeConfig` snippet sets `window_interval` and
-    /// `upload.abort_timeout` as humantime strings.
-    /// Guarantees: both parse through `humantime_serde` to the given
-    /// durations, and fields left unset keep their spec defaults.
+    /// Scenario: `window_interval` and `upload.abort_timeout` as humantime strings.
+    /// Guarantees: both parse to the given durations and unset fields keep their defaults.
     #[test]
     fn lake_config_deserializes_humantime_durations() {
         let cfg: LakeConfig = serde_json::from_str(
@@ -1100,12 +1030,9 @@ mod tests {
         assert_eq!(cfg.upload.part_bytes, UploadConfig::default().part_bytes);
     }
 
-    /// Scenario: every byte-valued lake setting is written with units, one is
-    /// written as a plain number, and one as a string the parser cannot read.
-    /// Guarantees: units and numbers parse to the exact byte counts, fields
-    /// left unset keep their defaults, and an unreadable size is refused
-    /// rather than defaulted, so the typed configuration accepts the same
-    /// byte syntax as every other engine setting without a rewriting layer.
+    /// Scenario: byte settings with units, one plain number and one unreadable string.
+    /// Guarantees: units and numbers parse exactly, unset fields keep defaults, and the unreadable
+    /// size is refused.
     #[test]
     fn byte_valued_settings_accept_units() {
         let cfg: LakeConfig = serde_json::from_str(

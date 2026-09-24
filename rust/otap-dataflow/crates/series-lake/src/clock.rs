@@ -17,10 +17,8 @@ pub struct PartitionId {
 impl PartitionId {
     /// Partition of a Unix timestamp in seconds.
     ///
-    /// `secs` below zero (before 1970) is clamped to zero: negative Unix
-    /// timestamps are not a supported wall-clock input for this crate, so
-    /// both `date` and `hour` collapse to the epoch rather than reporting a
-    /// partially-clamped, pre-epoch instant.
+    /// `secs` below zero (before 1970), not a supported wall-clock input, is
+    /// clamped to zero, so both `date` and `hour` collapse to the epoch.
     #[must_use]
     pub fn from_unix_secs(secs: i64) -> Self {
         let clamped = secs.max(0);
@@ -259,11 +257,8 @@ mod tests {
         assert_eq!(c.next_boundary(65), 75);
     }
 
-    /// Scenario: negative wall-clock seconds (before the Unix epoch) are fed
-    /// into `new`, `boundary` and `on_wake`.
-    /// Guarantees: negative input is clamped to zero rather than panicking
-    /// or underflowing; `on_wake` with a negative `now` reports `TooEarly`
-    /// and does not move `last_boundary`.
+    /// Scenario: negative wall-clock seconds fed to `new`, `boundary` and `on_wake`.
+    /// Guarantees: they clamp to zero; `on_wake` reports `TooEarly` without moving `last_boundary`.
     #[test]
     fn negative_seconds_are_clamped_without_panicking() {
         let mut c = WindowClock::new(Duration::from_secs(15), -100);
@@ -305,16 +300,8 @@ mod tests {
         assert_eq!(nanos_to_secs(5_000_000_001), 5);
     }
 
-    /// Scenario: three known dates far from the epoch round-trip through
-    /// `from_unix_secs` then `date_string`: 2026-09-21 (the near-epoch case
-    /// used elsewhere), 2000-02-29 (a century year divisible by 400, so it
-    /// is a leap year in the proleptic Gregorian calendar), and 2100-03-01
-    /// (the day after a century year, 2100, that is *not* leap despite
-    /// being divisible by 100).
-    /// Guarantees: `date_string` produces the exact calendar date for each,
-    /// against independently known literal strings rather than only
-    /// against `chrono`'s own formatting, so the test is a real regression
-    /// net for the `chrono`-backed implementation.
+    /// Scenario: 2026-09-21, 2000-02-29 (a leap century) and 2100-03-01 (after a non-leap century).
+    /// Guarantees: `date_string` matches independently known literal dates.
     #[test]
     fn date_string_round_trips_for_dates_far_from_epoch() {
         let cases: [(i64, &str); 3] = [

@@ -113,8 +113,7 @@ fn normalize_key(col: &ArrayRef) -> ArrayRef {
 /// Every sort column named by the spec must exist in the batch.
 ///
 /// Checked before the short-batch early returns of [`sort_batch`] and
-/// [`is_sorted`], so a misspelled sort key is reported for a one-row batch just
-/// as it is for a large one, rather than silently passing.
+/// [`is_sorted`], so a misspelled sort key is reported for a one-row batch too.
 fn check_columns(batch: &RecordBatch, spec: &SortSpec) -> Result<()> {
     for k in &spec.keys {
         if batch.column_by_name(&k.column).is_none() {
@@ -986,16 +985,13 @@ struct ColumnBuild<'a> {
 ///
 /// A step's budget is [`MERGE_STEP_ROWS`] elements: every row counts one,
 /// and every item of a list row or entry of a map row counts one more.
-/// Each column is first sized -- a string column's value bytes, a list's
-/// items, a map's entries and their key and value bytes are counted, a
-/// bounded number of ranges per step -- and then allocated once, at that
-/// size, so no buffer grows while rows are copied. Rows are then copied
-/// until the budget is spent, a range of rows split wherever its elements
-/// would pass the budget; a single row larger than the whole budget is
-/// copied in a step of its own, and a row is bounded by
-/// `ingress.max_row_bytes`. Completing a column freezes its buffers as they
-/// are. So no step copies more than its budget, finishing included, and no
-/// step reallocates.
+/// Each column is first sized (string value bytes, list items, map entries
+/// and their key and value bytes, a bounded number of ranges per step) and
+/// allocated once at that size. Rows are then copied until the budget is
+/// spent, a range split wherever it would pass the budget; a single row larger
+/// than the budget takes a step of its own, and a row is bounded by
+/// `ingress.max_row_bytes`. Completing a column freezes its buffers, so no
+/// step copies more than its budget and none reallocates.
 ///
 /// Lists and maps are assembled from their own offsets, validity and
 /// presized children, because `MutableArrayData` cannot presize a map's
@@ -1004,9 +1000,9 @@ struct ColumnBuild<'a> {
 ///
 /// The bound holds for the column types of the lake datasets, which
 /// `every_lake_column_is_built_in_bounded_steps` pins. A column of any other
-/// type, a dictionary for one, is interleaved whole by Arrow in one
-/// unbounded step; for some such types, a map with non-string keys for one,
-/// Arrow panics on an `i32` offset overflow instead of returning an error.
+/// type, such as a dictionary, is interleaved whole by Arrow in one unbounded
+/// step, and for some such types (a map with non-string keys) Arrow panics on
+/// an `i32` offset overflow.
 ///
 /// Every column is the same array an interleave of the same rows would
 /// give, so the chunk, and every byte written from it, is unchanged.
@@ -1604,15 +1600,10 @@ mod tests {
         arrow::compute::concat_batches(&chunks[0].schema(), chunks).expect("concat")
     }
 
-    /// Scenario: one key group holds both zero signs and both NaN signs, with the
-    /// tag column as the tie-breaking third sort key; each zero and each NaN is
-    /// tagged so that the tag order is the opposite of the raw `total_cmp` bit
-    /// order.
-    /// Guarantees: -0.0 compares equal to +0.0 and every NaN compares equal to
-    /// every other, so the tag alone decides those pairs. Dropping either
-    /// normalization flips both pairs and fails the assertion. Nulls sort last and
-    /// the payload keeps its original bit patterns, since only the sort columns
-    /// are normalized.
+    /// Scenario: one key group with both zero signs and both NaN signs, tagged against the raw
+    /// `total_cmp` order, the tag the third key.
+    /// Guarantees: -0.0 equals +0.0 and all NaNs are equal, so the tag decides; nulls sort last and
+    /// payload bits are kept.
     #[test]
     fn sort_batch_normalizes_doubles() {
         let b = batch_tagged(
@@ -1643,10 +1634,9 @@ mod tests {
         );
     }
 
-    /// Scenario: every combination of sort direction and null placement over one
-    /// key column that contains a null.
-    /// Guarantees: `sort_batch` produces the order the combination names,
-    /// `is_sorted` accepts that order, and it rejects the exact reverse.
+    /// Scenario: every direction and null placement over one key column holding a null.
+    /// Guarantees: `sort_batch` gives the named order, `is_sorted` accepts it and rejects its
+    /// reverse.
     #[test]
     fn desc_and_nulls_first_orderings_round_trip() {
         let input = batch(vec![Some(1), None, Some(3), Some(2)], vec![0.0; 4], "x");
@@ -1691,8 +1681,7 @@ mod tests {
     }
 
     /// Scenario: two runs sorted descending with nulls first are merged.
-    /// Guarantees: the merge honours the descending direction and the null
-    /// placement, not just the ascending default, across run boundaries.
+    /// Guarantees: the merge keeps the direction and null placement across runs.
     #[test]
     fn desc_nulls_first_merge_is_globally_sorted() {
         let s = one_key_spec(SortOrder::Desc, Nulls::First);
@@ -1751,12 +1740,9 @@ mod tests {
         );
     }
 
-    /// Scenario: the same key value appears several times within one run and
-    /// again in two other runs, with every row carrying a distinct tag.
-    /// Guarantees: the merge emits each input row exactly once, keeps tied rows
-    /// of one run in that run's own order, and orders whole runs among ties by
-    /// run index. Both a one-row chunk budget and a whole-merge budget behave the
-    /// same, so ties are handled across chunk boundaries too.
+    /// Scenario: one key value repeated within a run and in two other runs, every row tagged.
+    /// Guarantees: each row is emitted once, ties keep run order then run index, under one-row and
+    /// whole-merge budgets.
     #[test]
     fn merge_preserves_run_local_order_among_tied_keys() {
         let runs = || {
@@ -1790,13 +1776,8 @@ mod tests {
         }
     }
 
-    /// Scenario: the same three runs merged with a one-row chunk budget and then
-    /// with a budget sized for exactly three rows.
-    /// Guarantees: chunks are filled to the budget-derived row count and no chunk
-    /// exceeds it, so the three-row budget really splits the 8-row merge into
-    /// 3/3/2 rather than trivially fitting everything. In both cases every row
-    /// keeps its own non-key payload, so the output is a permutation of the input
-    /// rows and not merely of the sort keys.
+    /// Scenario: three runs merged with a one-row and then a three-row chunk budget.
+    /// Guarantees: chunks fill to the budget (3/3/2) and every row keeps its payload.
     #[test]
     fn merge_chunks_are_bounded_and_carry_payloads() {
         let runs = || {
@@ -1853,9 +1834,8 @@ mod tests {
         }
     }
 
-    /// Scenario: no runs at all, and a single run that carries no rows.
-    /// Guarantees: the merge iterator is empty in both cases rather than
-    /// producing an empty chunk or failing.
+    /// Scenario: no runs, and one run without rows.
+    /// Guarantees: the merge iterator is empty in both cases.
     #[test]
     fn merge_of_no_runs_yields_no_chunks() {
         assert!(merged(vec![], &spec(), 1 << 20).is_empty());
@@ -1869,9 +1849,8 @@ mod tests {
         );
     }
 
-    /// Scenario: a single already sorted run is handed to the merge.
-    /// Guarantees: its rows come back in their original order with their
-    /// payloads, under both a one-row and a whole-run chunk budget.
+    /// Scenario: one sorted run under a one-row and a whole-run chunk budget.
+    /// Guarantees: its rows come back in order with their payloads.
     #[test]
     fn merge_of_a_single_run_yields_it_unchanged() {
         let r = batch_tagged(
@@ -1890,9 +1869,8 @@ mod tests {
         }
     }
 
-    /// Scenario: runs with no rows are interleaved with runs that have rows.
-    /// Guarantees: the empty runs drop out and the output holds exactly the rows
-    /// of the non-empty ones, globally sorted.
+    /// Scenario: empty runs interleaved with runs that have rows.
+    /// Guarantees: the output holds exactly the non-empty runs' rows, globally sorted.
     #[test]
     fn merge_skips_runs_with_no_rows() {
         let runs = vec![
@@ -1906,9 +1884,8 @@ mod tests {
         assert_eq!(tags_of(&all), strings(&["a", "c", "b"]));
     }
 
-    /// Scenario: runs whose schemas differ are handed to the merge.
-    /// Guarantees: the merge refuses up front with an invalid-content error rather
-    /// than indexing past the end of a narrower run while materializing a chunk.
+    /// Scenario: runs whose schemas differ are merged.
+    /// Guarantees: the merge refuses up front with an invalid-content error.
     #[test]
     fn mismatched_run_schemas_are_refused() {
         let wide = batch(vec![Some(1)], vec![0.0], "a");
@@ -1923,10 +1900,8 @@ mod tests {
         assert!(err.to_string().contains("different schemas"));
     }
 
-    /// Scenario: two runs with identical fields but different schema-level
-    /// metadata.
-    /// Guarantees: the guard looks at the fields only, so the runs merge, and the
-    /// first run's metadata is what the output carries.
+    /// Scenario: two runs with identical fields and different schema metadata.
+    /// Guarantees: they merge and the output carries the first run's metadata.
     #[test]
     fn runs_differing_only_in_schema_metadata_merge() {
         let plain = batch_tagged(vec![Some(2)], vec![0.0], vec!["a"]);
@@ -1953,13 +1928,9 @@ mod tests {
         );
     }
 
-    /// Scenario: two sorted runs of five rows in total, merged by an Int64 and
-    /// a Float64 key, are consumed chunk by chunk.
-    /// Guarantees: the merge reports every row's encoded key -- one null byte
-    /// plus eight value bytes per key column -- and the row offsets as
-    /// resident from the moment it is built until the last chunk, because the
-    /// keys are dropped only with the iterator; unsorted mode encodes no keys
-    /// and reports zero.
+    /// Scenario: two runs merged by an Int64 and a Float64 key, consumed chunk by chunk.
+    /// Guarantees: every row's encoded key and the offsets are reported resident until the last
+    /// chunk; unsorted mode reports zero.
     #[test]
     fn merge_reports_the_keys_it_keeps_resident() {
         let r1 = sort_batch(
@@ -1989,13 +1960,8 @@ mod tests {
         assert_eq!(unsorted.resident_key_bytes(), 0);
     }
 
-    /// Scenario: two runs keyed by a string whose values grow from one byte
-    /// to several hundred bytes as the merge advances, consumed one row at a
-    /// time.
-    /// Guarantees: the reported resident key bytes, taken once when the merge
-    /// is built, are never below what the merge actually holds at any later
-    /// point, and what it holds does not grow with the keys the heap points
-    /// at.
+    /// Scenario: string keys growing from one byte to hundreds as the merge advances.
+    /// Guarantees: the resident figure taken at build time never falls below what the merge holds.
     #[test]
     fn resident_key_bytes_bound_keys_that_grow_during_the_merge() {
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8, false)]));
@@ -2054,11 +2020,8 @@ mod tests {
         );
     }
 
-    /// Scenario: a correctly ordered batch in which every sort key is tied, and a
-    /// batch that is genuinely out of order.
-    /// Guarantees: `is_sorted` accepts the tied batch and rejects the unordered one.
-    /// A permutation-based check would reject the tied batch, because arrow's
-    /// lexicographic sort is unstable and need not return the identity there.
+    /// Scenario: a batch with every key tied, and one out of order.
+    /// Guarantees: `is_sorted` accepts the first and rejects the second.
     #[test]
     fn is_sorted_accepts_tied_keys() {
         let tied = batch(vec![Some(7); 6], vec![1.0; 6], "x");
@@ -2069,10 +2032,8 @@ mod tests {
         assert!(is_sorted(&ordered, &spec()).expect("ordered"));
     }
 
-    /// Scenario: a one-row batch sorted by a misspelled sort column, which the
-    /// short-batch early return would otherwise skip straight past.
-    /// Guarantees: both `sort_batch` and `is_sorted` name the missing column, and
-    /// a one-row batch whose keys do exist is accepted unchanged.
+    /// Scenario: a one-row batch sorted by a misspelled column.
+    /// Guarantees: `sort_batch` and `is_sorted` name the missing column; existing keys pass.
     #[test]
     fn missing_sort_column_is_refused_even_on_short_batches() {
         let one = batch(vec![Some(1)], vec![0.0], "x");
@@ -2170,14 +2131,10 @@ mod tests {
         rows.into_iter().map(|(_, _, tag)| tag).collect()
     }
 
-    /// Scenario: tie-heavy runs with variable-width string keys are merged
-    /// with the default budget and, through `MergeBuild` and `MergeIter::step`,
-    /// with budgets from one row and one key byte per step upwards, and with
-    /// a chunk budget small enough for several chunks.
-    /// Guarantees: however the key encoding and the heap pops are sliced,
-    /// every chunk holds the same rows in the same order as the unsliced
-    /// merge, which is exactly the stable sort of the runs in run order, and
-    /// a small budget really does slice the work into many steps.
+    /// Scenario: tie-heavy runs with string keys merged with the default budget and with budgets
+    /// down to one row and one key byte per step.
+    /// Guarantees: every slicing gives the unsliced merge's chunks, which equal a stable sort in
+    /// run order.
     #[test]
     fn sliced_merge_matches_the_unsliced_merge_and_a_stable_sort() {
         let (runs, spec) = tie_heavy_runs();
@@ -2220,12 +2177,9 @@ mod tests {
         }
     }
 
-    /// Scenario: the tie-heavy runs and the runs with map, list and nullable
-    /// string columns, sorted as several batches, as one batch, and with an
-    /// empty spec.
-    /// Guarantees: sorting several batches gives exactly the batch that
-    /// sorting their concatenation gives, ties included, and an empty spec
-    /// gives the concatenation.
+    /// Scenario: tie-heavy and nested runs sorted as several batches, as one, and with an empty
+    /// spec.
+    /// Guarantees: several batches sort exactly as their concatenation; an empty spec concatenates.
     #[test]
     fn sorting_batches_matches_sorting_their_concatenation() {
         for (runs, spec) in [tie_heavy_runs(), nested_runs()] {
@@ -2322,14 +2276,9 @@ mod tests {
         RecordBatch::try_new(all.schema(), columns).expect("batch")
     }
 
-    /// Scenario: runs with map, list and string columns, merged into one
-    /// chunk with a budget of eight elements per step.
-    /// Guarantees: no step copies more than its budget, measured from the
-    /// builder's own buffers -- the rows, list items and map entries they
-    /// hold before and after the step -- the step that completes a column
-    /// included, and every row, item and entry is copied exactly once. Key
-    /// slices and pops stay within the budget too, and the chunk equals a
-    /// stable sort of the runs.
+    /// Scenario: runs with map, list and string columns merged eight elements per step.
+    /// Guarantees: no step copies more than its budget, finishing included, every element is copied
+    /// once, and the chunk equals a stable sort.
     #[test]
     fn one_merge_step_does_bounded_work() {
         let (runs, spec) = nested_runs();
@@ -2407,12 +2356,8 @@ mod tests {
             + data.child_data().iter().map(capacity_of).sum::<usize>()
     }
 
-    /// Scenario: the nested runs' chunk built eight elements per step, the
-    /// charge of each column read while it is being built.
-    /// Guarantees: from the moment a column's buffers are allocated the
-    /// builder charges what they hold -- maps and lists with their children
-    /// and validity included -- and the charge equals the capacities the
-    /// completed column's buffers really have.
+    /// Scenario: the nested runs' chunk built eight elements per step, the charge read throughout.
+    /// Guarantees: the charge equals the capacities the column's buffers really have.
     #[test]
     fn the_builder_charges_what_its_buffers_allocate() {
         let (runs, spec) = nested_runs();
@@ -2456,12 +2401,9 @@ mod tests {
         );
     }
 
-    /// Scenario: two runs whose dictionary-encoded column uses different
-    /// dictionaries, then two runs whose dictionaries together hold more
-    /// values than an Int8 key can address.
-    /// Guarantees: a dictionary column is merged through the interleave that
-    /// merges dictionaries, so the first merge yields the right values and
-    /// the second returns an error rather than panicking.
+    /// Scenario: dictionary columns with different dictionaries, then more values than an Int8 key
+    /// addresses.
+    /// Guarantees: the first merges correctly and the second is an error, not a panic.
     #[test]
     fn dictionary_columns_merge_or_fail_without_panicking() {
         use arrow::array::{DictionaryArray, Int8Array, StringArray};
@@ -2510,11 +2452,8 @@ mod tests {
         assert!(got.is_err(), "200 dictionary values cannot fit Int8 keys");
     }
 
-    /// Scenario: a string column whose chunk holds more value bytes than
-    /// the offset limit, lowered for the test to 16 bytes.
-    /// Guarantees: the builder refuses the column with an offset overflow
-    /// error before it copies anything, rather than panicking inside the
-    /// copy.
+    /// Scenario: a string column past an offset limit lowered to 16 bytes.
+    /// Guarantees: the builder refuses it with an overflow error before copying.
     #[test]
     fn an_offset_overflow_is_an_error_not_a_panic() {
         let (runs, spec) = tie_heavy_runs();
@@ -2537,12 +2476,7 @@ mod tests {
     }
 
     /// Scenario: the tie-heavy runs' keys encoded two rows per step.
-    /// Guarantees: the build keeps its totals as it goes -- the resident key
-    /// bytes and the heap, seeded with each run's first row as soon as that
-    /// row is encoded -- so neither reporting the keys after a slice nor
-    /// finishing the build scans every key again; the resident figure always
-    /// equals a full recount of the segments and the heap's backing
-    /// allocation.
+    /// Guarantees: resident key bytes and the heap are kept incrementally and equal a full recount.
     #[test]
     fn the_build_keeps_its_totals_as_it_goes() {
         let (runs, spec) = tie_heavy_runs();
@@ -2574,13 +2508,8 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// Scenario: 100 one-row runs, the shape of a series table, merged with
-    /// the default budget.
-    /// Guarantees: a step carries work across runs and columns until its
-    /// budget is spent, so all 100 runs' keys are encoded in one step, the
-    /// whole chunk is popped in one more and built in one more: a small
-    /// table costs its caller three returns to the runtime, not one per run
-    /// and per column.
+    /// Scenario: 100 one-row runs merged with the default budget.
+    /// Guarantees: keys, pops and the build each take one step.
     #[test]
     fn a_small_merge_takes_one_step_per_phase() {
         let runs: Vec<RecordBatch> = (0..100)
@@ -2602,11 +2531,8 @@ mod tests {
         assert!(matches!(merge.step(), MergeStep::Done));
     }
 
-    /// Scenario: every column of the four lake datasets, with a denormalized
-    /// column of every type configured.
-    /// Guarantees: each is built in bounded steps -- as a flat, list or map
-    /// column -- and none falls to the whole-column interleave, which only a
-    /// type the exporter never writes, a dictionary for one, takes.
+    /// Scenario: every column of the four datasets, with a denormalized column of every type.
+    /// Guarantees: each is built in bounded steps, none by the whole-column interleave.
     #[test]
     fn every_lake_column_is_built_in_bounded_steps() {
         use crate::config::{DenormType, Denormalize, LakeConfig};

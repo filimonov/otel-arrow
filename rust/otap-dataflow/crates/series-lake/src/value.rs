@@ -654,10 +654,8 @@ mod tests {
         );
     }
 
-    /// Scenario: an encoded `ser` cell longer than `max_cell_bytes`, holding a
-    /// payload that is otherwise perfectly valid CBOR.
-    /// Guarantees: the cell is refused as too large before it is decoded, so a
-    /// cell that could never fit a row is never expanded into a value tree.
+    /// Scenario: a valid CBOR `ser` cell longer than `max_cell_bytes`.
+    /// Guarantees: it is refused as too large before it is decoded.
     #[test]
     fn decode_cbor_refuses_an_oversized_cell_before_decoding() {
         use crate::error::{Error, RefuseReason};
@@ -710,12 +708,10 @@ mod tests {
         assert!(decode_cbor(&buf, DecodeLimits::new(5, usize::MAX)).is_ok());
     }
 
-    /// Scenario: maps nested one level below, exactly at and one level above
-    /// the depth limit, and an array inside maps at the limit.
-    /// Guarantees: the limit counts every container level alike -- a nested
-    /// map is refused exactly where a nested array would be -- and a payload
-    /// at the limit decodes, so `max_nesting_depth` is the deepest accepted
-    /// nesting, not one less or one more.
+    /// Scenario: maps nested one below, at and one above the depth limit, and an array inside maps
+    /// at the limit.
+    /// Guarantees: every container level counts alike and `max_nesting_depth` is the deepest
+    /// accepted.
     #[test]
     fn decode_cbor_depth_is_exact_for_nested_maps() {
         fn maps(levels: usize, leaf: ciborium::Value) -> Vec<u8> {
@@ -741,12 +737,9 @@ mod tests {
         assert!(decode_cbor(&maps(limit, array), limits).is_err());
     }
 
-    /// Scenario: maps nested one level past the limit, which the conversion
-    /// refuses, and far past it, which ciborium's own recursion limit refuses
-    /// while parsing.
-    /// Guarantees: both are reported as `TooDeep` carrying the configured
-    /// limit, never as invalid content, so the refusal names the setting
-    /// that governs it whichever layer caught it.
+    /// Scenario: maps nested one past the limit and far past it, where ciborium's own recursion
+    /// limit stops the parse.
+    /// Guarantees: both are `TooDeep` with the configured limit, never invalid content.
     #[test]
     fn decode_cbor_reports_excess_depth_as_too_deep() {
         let deep = |levels: usize| {
@@ -815,11 +808,9 @@ mod tests {
         buf
     }
 
-    /// Scenario: a one-MiB flat CBOR array of small ints, 32 MiB once
-    /// decoded, is decoded against a 16 MiB reservation limit.
-    /// Guarantees: the decode is refused on the array's own reservation,
-    /// before any element is allocated: the one request made is the whole
-    /// array's nodes and nothing was granted.
+    /// Scenario: a one-MiB flat CBOR array of small ints (32 MiB decoded) against a 16 MiB
+    /// reservation limit.
+    /// Guarantees: the array's own reservation is refused before any element is allocated.
     #[test]
     fn a_wide_cell_is_refused_before_its_tree_is_built() {
         let n = (1 << 20) - 5;
@@ -840,12 +831,10 @@ mod tests {
         assert_eq!(counter.held, 0);
     }
 
-    /// Scenario: a CBOR array of 200 000 singleton arrays `[0]`, two encoded
-    /// bytes each and 64 decoded, against a 4 MiB reservation limit, and a
-    /// singleton chain nested exactly to the depth limit.
-    /// Guarantees: the wide cell is refused once its reservations reach the
-    /// limit, never holding more than the limit, and the chain holds exactly
-    /// its decoded size.
+    /// Scenario: 200 000 singleton arrays against a 4 MiB limit, and a singleton chain at the depth
+    /// limit.
+    /// Guarantees: the wide cell is refused at the limit without exceeding it; the chain holds its
+    /// decoded size.
     #[test]
     fn singleton_nesting_is_reserved_node_by_node() {
         let one = ciborium::Value::Array(vec![ciborium::Value::Integer(0.into())]);
@@ -873,11 +862,10 @@ mod tests {
         assert_eq!(value_bytes(&v), 33 * VALUE_NODE_BYTES);
     }
 
-    /// Scenario: a hand-encoded payload using indefinite-length text, bytes,
-    /// array and map, a null map key, `undefined`, a half float, a negative
-    /// integer and a tag-2 bignum.
-    /// Guarantees: every form decodes to the expected value, and what the
-    /// decode holds afterwards is its [`value_bytes`] less the root node.
+    /// Scenario: indefinite text, bytes, array and map, a null key, `undefined`, a half float, a
+    /// negative integer and a bignum.
+    /// Guarantees: each decodes as expected and the decode holds its `value_bytes` less the root
+    /// node.
     #[test]
     fn reservations_add_up_to_the_decoded_size() {
         let buf: Vec<u8> = [
@@ -912,12 +900,10 @@ mod tests {
         assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
     }
 
-    /// Scenario: a one-MiB indefinite byte string of one-byte chunks, and an
-    /// indefinite array of 200 000 ints.
-    /// Guarantees: buffers grow by doubling, so the reservations number a few
-    /// dozen rather than one per chunk or item (linear time), each growth
-    /// holds the old and new buffer together, and what is held afterwards is
-    /// the decoded size.
+    /// Scenario: a one-MiB indefinite byte string of one-byte chunks and an indefinite array of 200
+    /// 000 ints.
+    /// Guarantees: buffers double, so reservations are a few dozen, and the decode holds its
+    /// decoded size.
     #[test]
     fn indefinite_items_grow_geometrically_within_their_reservations() {
         let chunks = (1 << 20) / 2 - 1;
@@ -945,13 +931,9 @@ mod tests {
         assert_eq!(counter.held + VALUE_NODE_BYTES, value_bytes(&v));
     }
 
-    /// Scenario: an indefinite byte string of 1018 bytes whose second chunk
-    /// declares 1010 bytes -- fewer than the item held when it started, more
-    /// than the 1001 left at that chunk -- and a definite array declaring
-    /// `u64::MAX` items.
-    /// Guarantees: both are refused as invalid before the declared size is
-    /// reserved or allocated: a chunk is checked against the bytes remaining
-    /// where it starts, and counts use checked arithmetic.
+    /// Scenario: an indefinite byte string whose second chunk declares more than the input left,
+    /// and an array declaring `u64::MAX` items.
+    /// Guarantees: both are refused as invalid before the declared size is reserved.
     #[test]
     fn declared_sizes_are_checked_against_the_remaining_input() {
         let mut counter = Counter::new(usize::MAX);
@@ -984,13 +966,10 @@ mod tests {
         assert!(counter.requests.is_empty());
     }
 
-    /// Scenario: a 3000-byte bytes body, rendered as 4002 characters of quoted
-    /// base64, against a limit one byte short and without one, and a nested
-    /// body of escaped strings and doubles.
-    /// Guarantees: the rendering's bound is reserved before anything is
-    /// allocated, so the short limit refuses it with nothing held; once
-    /// rendered, exactly the string's length stays reserved, the bound was at
-    /// least that, and the string is the one `body_string` gives.
+    /// Scenario: a 3000-byte bytes body (4002 rendered characters) against a limit one byte short
+    /// and none, and a nested body.
+    /// Guarantees: the bound is reserved first, the short limit refuses with nothing held, and the
+    /// string's length stays reserved.
     #[test]
     fn body_rendering_is_reserved_before_it_is_built() {
         let body = Value::Bytes(vec![0xAB; 3000]);

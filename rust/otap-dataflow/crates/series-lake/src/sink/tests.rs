@@ -383,15 +383,10 @@ fn row_group_sorting(root: &std::path::Path, path: &Path) -> Vec<Option<Vec<(i32
         .collect()
 }
 
-/// Scenario: sort specifications over the logs and metrics values schemas:
-/// a key after the two-leaf `attrs` map, a descending nulls-first key, a
-/// list key in the middle of the spec, a list key first, a double key in
-/// the middle and first, and no keys.
-/// Guarantees: `column_idx` is the Parquet leaf index, not the Arrow field
-/// index; order and null placement are carried over; the list stops at the
-/// first list or floating-point key, so the native list never claims an
-/// order no leaf column has or an IEEE 754 total order the normalized
-/// double sort does not produce; and an empty prefix emits no list at all.
+/// Scenario: sort specs over the values schemas: a key after the two-leaf `attrs` map, desc
+/// nulls-first, list and double keys first and in the middle, and none.
+/// Guarantees: `column_idx` is the leaf index, order and nulls carry over, the list stops at the
+/// first list or double key, and an empty prefix emits nothing.
 #[test]
 fn native_sorting_columns_use_leaf_indexes_and_a_primitive_prefix() {
     use crate::config::{DenormType, Denormalize, SortKey};
@@ -459,13 +454,9 @@ fn native_sorting_columns_use_leaf_indexes_and_a_primitive_prefix() {
     );
 }
 
-/// Scenario: a sealed block of 30 log records, whose values table merges
-/// on `series_id` and `time_unix_nano`, is written.
-/// Guarantees: while a table is written the sink reports the heap its
-/// merge holds for the encoded keys -- exactly what the largest table's
-/// merge iterator reports, at least one null byte plus the value bytes of
-/// both keys for every row -- and nothing once the write has returned, so
-/// the exporter can charge the keys for as long as they are resident.
+/// Scenario: a sealed block of 30 log records is written.
+/// Guarantees: during the write the sink reports exactly its largest merge's key heap, and nothing
+/// afterwards.
 #[tokio::test]
 async fn the_sink_reports_the_merge_keys_it_holds() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -499,17 +490,10 @@ async fn the_sink_reports_the_merge_keys_it_holds() {
     );
 }
 
-/// Scenario: a 30-row logs block written with the default sort and with
-/// row groups forced down to a few rows each, then the same block with
-/// values sorting disabled.
-/// Guarantees: every row group of the values file carries the native
-/// `SortingColumn` list of the default `series_id, time_unix_nano` sort
-/// (Parquet leaves 0 and 3, ascending, nulls last) beside the `sort_key`
-/// key/value, every row group of the series file carries `series_id`
-/// ascending, and an unsorted values file carries no native list while its
-/// series file still does. A values sort whose second key is a
-/// denormalized double column declares only `series_id` natively, while
-/// `sort_key` still names all three keys.
+/// Scenario: a 30-row logs block with tiny row groups, sorted by default, unsorted, and with a
+/// denormalized double second key.
+/// Guarantees: every row group carries the native list of the sorted prefix (`series_id`,
+/// `time_unix_nano` by default), none when unsorted, while `sort_key` names every key.
 #[tokio::test]
 async fn every_row_group_carries_the_native_sorting_columns() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -602,13 +586,8 @@ fn object_path_layout() {
     );
 }
 
-/// Scenario: a `writer_id` containing `/` reaches `object_path` despite
-/// `LakeConfig::validate` refusing it (e.g. a caller that skips
-/// validation).
-/// Guarantees: the `/` is encoded into the file-name segment rather than
-/// splitting it into extra path segments: the path still has exactly the
-/// five Hive directory levels plus the file name, and the encoded segment
-/// round-trips back to the original `writer_id` once decoded.
+/// Scenario: a `writer_id` with `/` reaches `object_path` without validation.
+/// Guarantees: the `/` is encoded into one file-name segment that decodes back.
 #[test]
 fn object_path_encodes_slash_in_writer_id_as_one_segment() {
     let p = object_path(
@@ -629,10 +608,9 @@ fn object_path_encodes_slash_in_writer_id_as_one_segment() {
     assert_eq!(parts.len(), 6, "parts: {parts:?}");
 }
 
-/// Scenario: a block with 30 log rows written to a local directory, then read back.
-/// Guarantees: series file exists next to the values file, values are sorted by the spec,
-/// every metadata key of FORMAT.md section 5 carries the expected value, the row count agrees with the
-/// flush report, and the same block rewrites the same names.
+/// Scenario: a 30-row logs block written to a local directory and read back.
+/// Guarantees: series next to values, values sorted, every FORMAT.md section 5 key set, row count
+/// as reported, and a rewrite uses the same names.
 #[tokio::test]
 async fn writes_series_before_values_and_reads_back() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -721,10 +699,8 @@ async fn writes_series_before_values_and_reads_back() {
     assert_eq!(walkdir_count(dir.path()), 2);
 }
 
-/// Scenario: a metrics block carrying both a gauge and a histogram.
-/// Guarantees: the series dataset is written before the single merged values
-/// dataset, the two point kinds share one file rather than costing a second
-/// PUT, and the file's row count matches the flush report.
+/// Scenario: a metrics block with a gauge and a histogram.
+/// Guarantees: series first, then one merged values file with the reported row count.
 #[tokio::test]
 async fn metrics_block_writes_series_before_the_merged_values_dataset() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -826,10 +802,7 @@ async fn empty_block_writes_no_file() {
 }
 
 /// Scenario: a block that was never sealed.
-/// Guarantees: the sink refuses to write a block whose series rows still
-/// carry the placeholder `emitted_at` of zero, which would otherwise publish
-/// unstamped data. The refusal is an error in every build profile, not a
-/// debug assertion.
+/// Guarantees: the sink refuses it in every build profile.
 #[tokio::test]
 async fn write_block_rejects_an_unsealed_block() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -844,9 +817,8 @@ async fn write_block_rejects_an_unsealed_block() {
     assert!(err.to_string().contains("unsealed block"));
 }
 
-/// Scenario: `writer_limit_bytes` and `merge_chunk_bytes` set so low that every
-/// merged chunk closes the current row group.
-/// Guarantees: the file has more than one row group and still holds every row.
+/// Scenario: `writer_limit_bytes` and `merge_chunk_bytes` so low every chunk closes a row group.
+/// Guarantees: the file has several row groups and every row.
 #[tokio::test]
 async fn writer_limit_closes_row_groups() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -897,13 +869,8 @@ async fn cancellation_before_writing_aborts() {
     assert_eq!(walkdir_count(dir.path()), 0);
 }
 
-/// Scenario: a block written to an in-memory object store that is ready the
-/// instant it is asked, on a current-thread runtime, while another task on
-/// that same runtime cancels the token.
-/// Guarantees: the chunk loop yields between chunks, so the cancelling task
-/// gets to run and the write stops as cancelled. Without the yield, a store
-/// that never suspends lets the loop write every chunk of every table before
-/// the runtime ever schedules the cancelling task.
+/// Scenario: a write to an always-ready in-memory store while a task on the same runtime cancels.
+/// Guarantees: the chunk loop yields, so the write stops as cancelled.
 #[tokio::test]
 async fn cancellation_is_observed_with_an_immediately_ready_store() {
     let mut cfg = LakeConfig::default();
@@ -923,10 +890,8 @@ async fn cancellation_is_observed_with_an_immediately_ready_store() {
     canceller.await.expect("cancelling task");
 }
 
-/// Scenario: the store cancels the token the moment the values object is opened,
-/// which happens part way through the chunk loop of a multi-part values file.
-/// Guarantees: every run stops with Cancelled after the series file has been
-/// finalized and before any values object is completed.
+/// Scenario: the store cancels the token as the values object opens, mid chunk loop.
+/// Guarantees: the write stops with Cancelled after the series file and before any values object.
 #[tokio::test]
 async fn cancellation_at_a_chunk_boundary() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -954,11 +919,8 @@ async fn cancellation_at_a_chunk_boundary() {
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }
 
-/// Scenario: cancellation arrives while a real multipart part is in flight, with a
-/// store whose `put_part` never resolves.
-/// Guarantees: the writer is in its `Write` state so the abort takes the real path,
-/// the upload is aborted rather than awaited to completion, `write_block` returns
-/// Cancelled and no values object is completed.
+/// Scenario: cancellation while a multipart part that never resolves is in flight.
+/// Guarantees: the upload is aborted, `write_block` returns Cancelled, no values object completes.
 #[tokio::test]
 async fn cancellation_inside_an_upload() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -999,12 +961,9 @@ async fn cancellation_inside_an_upload() {
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }
 
-/// Scenario: the cancellation lands while the values multipart upload is
-/// still being created, before `BufWriter` has an upload it could abort.
-/// Guarantees: the started creation is allowed to finish within
-/// `upload.abort_timeout`, and the upload it created is then aborted
-/// rather than left orphaned at the store with `abort_error: None`
-/// claiming a clean cleanup; no values object is completed.
+/// Scenario: cancellation while the values multipart upload is still being created.
+/// Guarantees: the creation finishes within `upload.abort_timeout` and the upload is then aborted;
+/// no values object completes.
 #[tokio::test]
 async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1037,10 +996,8 @@ async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }
 
-/// Scenario: a part upload fails while the writer is still writable and the
-/// best-effort abort that follows fails as well.
-/// Guarantees: `AbortFailed` carries both the original write failure and the reason
-/// the cleanup did not succeed, and no values object is completed.
+/// Scenario: a part upload fails and its abort fails too.
+/// Guarantees: `AbortFailed` carries both errors and no values object completes.
 #[tokio::test]
 async fn write_failure_with_a_failing_abort_reports_both() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1081,11 +1038,8 @@ async fn write_failure_with_a_failing_abort_reports_both() {
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }
 
-/// Scenario: a part upload fails and the abort then hangs, with an hour of
-/// `upload.abort_timeout`, on a sink whose abort timer completes at once.
-/// Guarantees: the abort ends when the caller's timer does, not after an
-/// hour of tokio time, so a caller running on a simulated clock governs the
-/// sink's cleanup bound.
+/// Scenario: a hung abort with an hour of `upload.abort_timeout` and a timer that fires at once.
+/// Guarantees: the abort ends with the caller's timer.
 #[tokio::test]
 async fn the_abort_is_bounded_by_the_callers_timer() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1117,10 +1071,8 @@ async fn the_abort_is_bounded_by_the_callers_timer() {
     assert!(abort_error.contains("timed out"), "{abort_error}");
 }
 
-/// Scenario: a part upload fails and the best-effort abort then hangs, with a
-/// one-millisecond `upload.abort_timeout`.
-/// Guarantees: the timeout branch ends the cleanup, and the reported abort error
-/// names the timeout instead of blocking the flush task forever.
+/// Scenario: a hung abort with a one-millisecond `upload.abort_timeout`.
+/// Guarantees: the cleanup ends and the abort error names the timeout.
 #[tokio::test]
 async fn abort_timeout_is_reported() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1172,17 +1124,8 @@ fn values_only_block(cfg: &LakeConfig, n: usize) -> Block {
     b
 }
 
-/// Scenario: a 30,000-row logs block, merged into one chunk, is written
-/// to an in-memory store that is ready the instant it is asked, while a
-/// ticker task on the same current-thread runtime counts how often the
-/// runtime schedules it.
-/// Guarantees: the write returns to the runtime between bounded steps of
-/// its work -- merge-key slices and heap-pop slices of at most
-/// `MERGE_STEP_ROWS` rows, interleaved columns of that much work each,
-/// and between producing a chunk, encoding it and flushing its row
-/// group -- so with a 30,000-row chunk the ticker runs at least once per
-/// pop slice and once per output column.
-/// A write that yields only between chunks lets it run a handful of times.
+/// Scenario: a 30,000-row chunk written to an always-ready store while a ticker counts its turns.
+/// Guarantees: the ticker runs at least once per pop slice and once per output column.
 #[tokio::test]
 async fn the_write_returns_to_the_runtime_between_bounded_slices() {
     let cfg = LakeConfig::default();
@@ -1219,13 +1162,8 @@ async fn the_write_returns_to_the_runtime_between_bounded_slices() {
     );
 }
 
-/// Scenario: a values-only block of 100,000 log rows, whose merge keys
-/// take many slices to encode, is written while a task that the runtime
-/// schedules at the write's first yield cancels the token.
-/// Guarantees: the cancellation is observed between merge-key slices:
-/// the write returns Cancelled having encoded only a fraction of the
-/// keys, as the sink's merge-key high-water mark shows, instead of
-/// encoding the key of every row before it first returns to the runtime.
+/// Scenario: a 100,000-row values block cancelled at the write's first yield.
+/// Guarantees: the write returns Cancelled having encoded only a fraction of the keys.
 #[tokio::test]
 async fn a_cancellation_during_merge_key_building_stops_the_build() {
     let mut cfg = LakeConfig::default();
@@ -1263,15 +1201,9 @@ async fn a_cancellation_during_merge_key_building_stops_the_build() {
     );
 }
 
-/// Scenario: three 10-byte buffers are handed to the upload and cut
-/// into parts of 8, 8, 8 and 6 bytes; the first part stalls while the
-/// second and third land, then the first lands, then the last; and a
-/// single-request put follows.
-/// Guarantees: a buffer is released as soon as every byte of it has
-/// landed, whatever the order the parts land in, so a stalled early part
-/// keeps only the buffers it overlaps charged -- the middle buffer, fully
-/// covered by the two later parts, is released while the first part is
-/// still in flight -- and a put releases everything handed before it.
+/// Scenario: three 10-byte buffers cut into 8, 8, 8 and 6-byte parts landing out of order, then a
+/// put.
+/// Guarantees: each buffer is released once all its bytes landed; the put releases everything.
 #[test]
 fn the_upload_ledger_releases_each_buffer_when_its_bytes_land() {
     let ledger = UploadLedger::default();
@@ -1305,12 +1237,8 @@ fn the_upload_ledger_releases_each_buffer_when_its_bytes_land() {
     assert_eq!(ledger.live(), 0);
 }
 
-/// Scenario: the same runs merged sorted and with sorting disabled, and
-/// each first chunk charged as the flush workspace charges it.
-/// Guarantees: an unsorted chunk is one of the block's own runs, whose
-/// buffers the block already accounts for, so it charges nothing; a
-/// sorted chunk is interleaved into buffers of its own and charges at
-/// least their pinned bytes.
+/// Scenario: the same runs merged sorted and unsorted, first chunks charged as workspace.
+/// Guarantees: the unsorted chunk (a block run) charges nothing; the sorted one its pinned bytes.
 #[test]
 fn only_a_chunk_the_merge_allocated_is_charged() {
     let cfg = LakeConfig::default();
@@ -1385,13 +1313,8 @@ impl StoreHooks for GatedParts {
     }
 }
 
-/// Scenario: a values file larger than one 5 MiB part is written with
-/// one part in flight at a time, and the store holds the first part
-/// until the test releases it.
-/// Guarantees: while the part is held the sink reports a flush
-/// workspace of at least the part's 5 MiB, because the part's buffer is
-/// still allocated; once the write has returned it reports zero, and its
-/// high-water mark keeps the peak.
+/// Scenario: a values file over one 5 MiB part, the first part held by the store.
+/// Guarantees: the workspace reads at least 5 MiB while held and zero after, with the peak kept.
 #[tokio::test]
 async fn the_sink_publishes_the_upload_bytes_a_part_in_flight_holds() {
     let dir = tempfile::tempdir().expect("tmp");
@@ -1427,11 +1350,8 @@ async fn the_sink_publishes_the_upload_bytes_a_part_in_flight_holds() {
     assert!(sink.flush_workspace_high_water_bytes() >= held);
 }
 
-/// Scenario: a writer step is handed an operation that would complete
-/// on its first poll, with a token that has already fired.
-/// Guarantees: the step reports Cancelled without polling the operation
-/// at all, so once the cancellation is there no further writer work runs
-/// before it is acted on.
+/// Scenario: a writer step with an instantly ready operation and an already fired token.
+/// Guarantees: the step reports Cancelled without polling the operation.
 #[tokio::test]
 async fn a_step_whose_token_has_fired_is_not_driven_again() {
     let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -1459,12 +1379,9 @@ async fn a_step_whose_token_has_fired_is_not_driven_again() {
     );
 }
 
-/// Scenario: every leaf column of every dataset schema, and the writer
-/// properties every file is written with.
-/// Guarantees: each high-entropy column names a real leaf and is written
-/// without a dictionary and with chunk statistics only, while `series_id`,
-/// `time_unix_nano` and `metric_name` keep page statistics, which the page
-/// index is built from, and a dictionary.
+/// Scenario: every leaf of every dataset schema and the writer properties.
+/// Guarantees: high-entropy columns are real leaves without dictionary or page statistics; the sort
+/// keys and `metric_name` keep both.
 #[test]
 fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics() {
     use parquet::file::properties::EnabledStatistics;

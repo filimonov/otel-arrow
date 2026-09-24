@@ -1,8 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Sorted run buffers and the ACTIVE/FLUSHING block (series_parquet exporter
-//! README, "Memory model").
+//! Sorted run buffers and the ACTIVE/FLUSHING block.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -78,14 +77,12 @@ impl SortedTableBuffer {
 
     /// Sort and seal the building batches into one run.
     ///
-    /// With sorting disabled the spec is empty and there is nothing to order, so
-    /// the building batches become runs as they are: concatenating them would
-    /// copy every row to no purpose. A sorted seal instead produces exactly one
-    /// run, which is what the k-way merge downstream consumes.
+    /// With sorting disabled the building batches become runs as they are,
+    /// sharing their buffers, since a concatenation would copy every row. A
+    /// sorted seal produces exactly one run for the k-way merge.
     ///
-    /// No re-accounting happens here: recomputing the pinned bytes of every run
-    /// on every seal would be quadratic in the number of runs. `Block::seal`
-    /// performs one deduplicated recount over the whole block instead.
+    /// No re-accounting happens here, which would be quadratic in the number of
+    /// runs; `Block::seal` performs one deduplicated recount instead.
     ///
     /// # Errors
     /// Propagates an Arrow failure from the sort.
@@ -152,11 +149,8 @@ impl SortedTableBuffer {
     /// halved and rebuilt. No block-sized series batch is ever constructed.
     ///
     /// A single row may exceed `run_target` by its Arrow overhead and becomes
-    /// its own oversized run rather than a refusal: `run_target_bytes` is a
-    /// packing target, and the admission limits are `max_row_bytes`, enforced
-    /// during extraction, and `max_block_bytes`, enforced by `reserve`. A
-    /// validated configuration barely reaches this case at all, because
-    /// `validate` requires `max_row_bytes <= run_target_bytes / 4`.
+    /// its own run: `run_target_bytes` is a packing target, and the admission
+    /// limits are `max_row_bytes` and `max_block_bytes`.
     ///
     /// # Errors
     /// Propagates a series-batch or sort failure.
@@ -329,20 +323,17 @@ impl Block {
     /// Compute what admitting `extracted` would add.
     ///
     /// Refuses before touching anything:
-    /// * `RequestTooLarge` when the request's worst case -- every descriptor
-    ///   it carries written by this block, as with a cold cache or reemit on --
-    ///   exceeds `max_block_bytes`. It is a permanent nack, so it is decided
-    ///   on the worst case rather than on what this block and this cache would
-    ///   actually charge: the identical request must be refused again however
-    ///   warm the cache is, and never refused permanently in one block and
-    ///   admitted in the next;
+    /// * `RequestTooLarge` when the request's worst case (every descriptor it
+    ///   carries written by this block; see
+    ///   [`LakeConfig::series_row_fixed_bytes`]) exceeds `max_block_bytes`.
+    ///   A permanent nack, so it never depends on the cache;
     /// * `TooManyRequests` when the block already holds `max_requests_per_block`;
     /// * `BlockFull` when the request does not fit the remaining budget.
     ///
     /// The last two tell the caller to rotate and offer the request to the next
     /// block. The block is never mutated, and the cache is only written (through
     /// `touch`) once the reservation is accepted; the `is_committed` lookups
-    /// above move LRU recency, which is not correctness state (invariant 3).
+    /// move only LRU recency, which is not correctness state.
     ///
     /// # Errors
     /// Returns `Error::Refused` with one of the three reasons above.
@@ -358,16 +349,11 @@ impl Block {
     /// Compute what admitting `extracted` would add, optionally repeating every
     /// descriptor not already pending in this block.
     ///
-    /// With `reemit` false this is exactly [`Block::reserve`]: a descriptor
-    /// already committed in this block's partition is suppressed. With `reemit`
-    /// true, a descriptor is reserved again even when the cache already reports
-    /// it committed here, as long as this block does not already carry it --
-    /// the case a byte-triggered rotation inside one aligned window needs (the
-    /// series_parquet exporter README, "Overview"): the new block starts a new partition-cache suppression window of
-    /// its own only once its descriptors are written, so its series rows must
-    /// be re-emitted rather than assumed present from the block it replaced.
-    /// The cache itself is never disabled or cleared; only this one reservation
-    /// ignores its answer.
+    /// With `reemit` false this is exactly [`Block::reserve`]. With `reemit`
+    /// true, a descriptor the cache reports committed in this partition is
+    /// still reserved unless this block already carries it: a block replacing
+    /// one sealed inside the same window cannot rely on its predecessor's
+    /// descriptors being written. Only this reservation ignores the cache.
     ///
     /// # Errors
     /// Returns `Error::Refused` with one of the three reasons documented on
@@ -504,10 +490,9 @@ impl Block {
     ///
     /// All or nothing. Every replacement batch is prepared before any retained
     /// batch is touched, so a failure leaves every batch, the accounting and the
-    /// seal state exactly as they were, and the block can be sealed again once
-    /// whatever caused the failure is gone. `emitted_at` is committed last, so
-    /// the sink refuses to write a block that never finished sealing rather than
-    /// writing unstamped series rows.
+    /// seal state as they were, and the block can be sealed again. `emitted_at`
+    /// is committed last, so the sink refuses a block that never finished
+    /// sealing.
     ///
     /// Sealing the series tables costs one new eight-byte timestamp per series
     /// row and nothing else: every other column is shared between the old batch
@@ -698,12 +683,9 @@ mod tests {
         }
     }
 
-    /// Scenario: retained series include both completed runs and a final building batch.
-    /// Guarantees: the stamp transaction over the series tables adds at most
-    /// eight bytes per series row plus 64 bytes of buffer slack, and shares
-    /// every non-stamp column with the batch it replaces. The values tables are
-    /// measured separately: finalizing their building run is an ordinary
-    /// sort and is not part of this bound.
+    /// Scenario: retained series in completed runs and a final building batch are sealed.
+    /// Guarantees: the stamp adds at most eight bytes per series row plus 64 bytes of slack and
+    /// shares every other column.
     #[test]
     fn seal_peak_retained_bytes_only_adds_timestamp_values() {
         let cfg = LakeConfig::default();
@@ -765,13 +747,9 @@ mod tests {
         assert_eq!(series.rows(), rows);
     }
 
-    /// Scenario: two requests whose values batches each stay under the run
-    /// target, and then the same two requests under a run target every one of
-    /// them crosses.
-    /// Guarantees: values batches pack across requests -- sub-target requests
-    /// share one building run and become exactly one sorted run at seal, while
-    /// a request that crosses the target seals its own run during admission.
-    /// Sealing never leaves a values batch unsorted or unaccounted.
+    /// Scenario: two sub-target requests, then the same two under a target each crosses.
+    /// Guarantees: sub-target requests share one run sealed at seal; a crossing request seals its
+    /// own run at admission.
     #[test]
     fn values_batches_pack_across_requests_until_the_run_target() {
         let cfg = LakeConfig::default();
@@ -987,16 +965,9 @@ mod tests {
         assert_eq!(block.tables().count(), 0);
     }
 
-    /// Scenario: the same request is reserved against an empty block twice,
-    /// once with a cold cache and once with every one of its descriptors
-    /// already committed in the block's partition, with and without reemit,
-    /// under a block budget one byte short of the request's worst case and
-    /// under one exactly at it.
-    /// Guarantees: the outcome never depends on the cache or on reemit: one
-    /// byte short, every combination is refused as `RequestTooLarge`; exactly
-    /// at the worst case, every combination is admitted. Identical bytes are
-    /// therefore refused again, or never refused permanently, whatever the
-    /// writer happens to have cached.
+    /// Scenario: one request against an empty block, cold and fully committed cache, with and
+    /// without reemit, one byte under and exactly at its worst case.
+    /// Guarantees: every combination is refused one byte short and admitted at the worst case.
     #[test]
     fn a_request_is_decided_alike_cold_and_warm() {
         let cfg = LakeConfig::default();
@@ -1081,19 +1052,10 @@ mod tests {
         }
     }
 
-    /// Scenario: logs requests of one and of many series, with and without a
-    /// denormalized series column, and metrics requests of one and of many
-    /// series, are each reserved against an empty block with a cold cache --
-    /// the worst case, every descriptor written by this block.
-    /// Guarantees: the bytes `reserve` charges equal, exactly,
-    /// `P + T + sum_i (2 * (A_i - D_i) + 128 * C + 8 + Q)`: P the request's
-    /// values bytes, T its token, and per series its extracted estimate A_i,
-    /// its decoded attribute trees D_i, the series columns C (10 for logs, 16
-    /// for metrics, plus one per denormalized series column) and the pending
-    /// entry Q. That makes the fixed per-series term 1352 bytes for logs and
-    /// 2120 for metrics, as `LakeConfig::series_row_fixed_bytes` reports and
-    /// the README documents, and the simple upper bound `2 * E + T + S * F`
-    /// holds. The documented formula changes only together with this test.
+    /// Scenario: logs and metrics requests of one and many series, with and without a denormalized
+    /// column, against an empty block and a cold cache.
+    /// Guarantees: `reserve` charges exactly the worst case documented on
+    /// `LakeConfig::series_row_fixed_bytes` (1352 and 2120 fixed bytes per series).
     #[test]
     fn the_documented_worst_case_block_cost_is_what_reserve_charges() {
         use crate::canonical::Signal;
@@ -1211,14 +1173,9 @@ mod tests {
         assert_eq!(block.request_count(), 1);
     }
 
-    /// Scenario: a request whose values batches carry builder slack is admitted
-    /// into a block, and the block is sealed.
-    /// Guarantees: the seal-time recount deduplicates shared allocations and
-    /// replaces the reservation estimate, so the block's byte count is at most
-    /// the sum of the per-request reservations, is exactly the measured bytes of
-    /// every batch the block retains plus its pending-series and token
-    /// overheads, and still counts at least one logical copy of the admitted
-    /// values data rather than deduplicating it away.
+    /// Scenario: a request whose values batches carry builder slack is admitted and sealed.
+    /// Guarantees: the recount deduplicates shared buffers, never exceeds the reservations, and
+    /// still counts one copy of the data.
     #[test]
     fn seal_recounts_shared_buffers_once() {
         let cfg = LakeConfig::default();
@@ -1257,9 +1214,8 @@ mod tests {
         );
     }
 
-    /// Scenario: the same Arrow batch, cloned, is appended to one buffer twice.
-    /// Guarantees: the clone shares every buffer, so the second append reports
-    /// zero newly retained bytes while both copies of the rows are still counted.
+    /// Scenario: the same batch, cloned, is appended twice.
+    /// Guarantees: the second append adds zero bytes while both copies' rows are counted.
     #[test]
     fn append_counts_shared_buffers_once() {
         let cfg = LakeConfig::default();
@@ -1277,11 +1233,8 @@ mod tests {
         assert_eq!(buf.rows(), batch.num_rows() * 2);
     }
 
-    /// Scenario: a buffer seals a run, then receives a batch built from the very
-    /// buffers the previous run's accounting already saw.
-    /// Guarantees: the dedup set is reset at each seal, so the batch is counted in
-    /// full and `building_bytes` climbs towards `run_target` again. A set that
-    /// survived the seal would report zero here and the next run would never seal.
+    /// Scenario: after a seal, a batch built from buffers the previous run already counted.
+    /// Guarantees: it is counted in full, so the next run can still seal.
     #[test]
     fn seal_resets_the_dedup_set_so_the_next_run_accounts_again() {
         let cfg = LakeConfig::default();
@@ -1302,10 +1255,8 @@ mod tests {
         assert!(buf.building_bytes > 0, "building_bytes grows again");
     }
 
-    /// Scenario: a buffer whose run target is crossed repeatedly, over batches
-    /// that are dropped once their run is sealed.
-    /// Guarantees: every seal is reached, so the run count tracks the appends
-    /// rather than stalling once freed addresses start being reused.
+    /// Scenario: the run target is crossed repeatedly over batches dropped after sealing.
+    /// Guarantees: every seal is reached despite reused addresses.
     #[test]
     fn repeated_seals_keep_firing_on_the_run_target() {
         let cfg = LakeConfig::default();
@@ -1327,9 +1278,8 @@ mod tests {
         assert_eq!(buf.rows(), 32);
     }
 
-    /// Scenario: a buffer with an empty sort spec, as configured when sorting is off.
-    /// Guarantees: sealing keeps the appended batches as separate runs instead of
-    /// concatenating them, and every row survives.
+    /// Scenario: a buffer with an empty sort spec.
+    /// Guarantees: sealing keeps the appended batches as separate runs and every row survives.
     #[test]
     fn unsorted_seal_keeps_batches_as_runs() {
         let cfg = LakeConfig::default();
@@ -1354,11 +1304,10 @@ mod tests {
         );
     }
 
-    /// Scenario: `spec_for` asked for each dataset, with logs and metrics given
-    /// different values sorts and with sorting switched off.
-    /// Guarantees: series datasets always take the fixed series sort, values
-    /// datasets take their own signal's configured keys, and disabling sorting
-    /// empties the values specs without touching the series ones.
+    /// Scenario: `spec_for` per dataset, with different logs and metrics sorts and with sorting
+    /// off.
+    /// Guarantees: series take the fixed sort, values their signal's keys; sorting off empties only
+    /// the values specs.
     #[test]
     fn spec_for_maps_each_dataset_to_its_configured_sort() {
         let mut cfg = LakeConfig::default();
@@ -1403,10 +1352,8 @@ mod tests {
         assert_eq!(block.spec_for(Dataset::LogsSeries), SortSpec::series());
     }
 
-    /// Scenario: the runs a block actually produces, with logs values sorted by
-    /// the configured keys and with sorting disabled.
-    /// Guarantees: `spec_for` is the spec the runs are really sealed under, not
-    /// just a value the block reports.
+    /// Scenario: the runs a block produces, sorted by configured keys and with sorting off.
+    /// Guarantees: they are sealed under the spec `spec_for` reports.
     #[test]
     fn block_runs_are_sealed_under_the_spec_spec_for_reports() {
         let cfg = LakeConfig::default();
@@ -1428,10 +1375,8 @@ mod tests {
         }
     }
 
-    /// Scenario: a request offered to a block that has already been sealed.
-    /// Guarantees: `admit` refuses rather than restamping the descriptor with the
-    /// earlier seal time or adding estimated bytes to the exact recount, and
-    /// reports it as a writer invariant, not as a refusal of the request.
+    /// Scenario: a request offered to a sealed block.
+    /// Guarantees: `admit` refuses it as a writer invariant, not as a refusal of the request.
     #[test]
     fn admit_after_seal_is_rejected() {
         let cfg = LakeConfig::default();

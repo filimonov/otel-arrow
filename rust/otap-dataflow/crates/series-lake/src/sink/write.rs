@@ -347,11 +347,9 @@ pub(super) fn creation_watch(
 
 /// The hooks of a [`CreationWatch`].
 ///
-/// `BufWriter::abort` can only abort an upload whose creation has finished;
-/// while it is still being created there is nothing to abort, and dropping the
-/// creation leaves an upload at the store that no abort is ever sent for. The
-/// count is what lets a cancelled write wait for exactly that creation, and
-/// for nothing else it may be blocked on.
+/// `BufWriter::abort` can only abort an upload whose creation has finished,
+/// and dropping a creation in flight leaves an upload no abort is sent for.
+/// The count lets a cancelled write wait for exactly that creation.
 #[derive(Debug)]
 pub(super) struct Creations {
     state: Arc<CreationState>,
@@ -448,15 +446,12 @@ impl Sink {
 
     /// Run one writable-phase writer step, racing `cancel`.
     ///
-    /// A step that is creating the multipart upload when the token fires is
-    /// not dropped at once: `BufWriter::abort` has nothing to abort until that
-    /// creation has finished, so dropping it would leave an upload at the
-    /// store with no abort ever sent for it. The step keeps being driven until
-    /// the creation has finished or the cleanup deadline -- taken once, at the
-    /// first cancellation, and shared with the abort that follows -- passes. A
-    /// step blocked on anything else, such as a part that does not land, is
-    /// dropped at once so the abort starts with the whole allowance. The step
-    /// reports `Cancelled` either way.
+    /// A step creating the multipart upload when the token fires keeps being
+    /// driven until the creation finishes or the cleanup deadline passes (see
+    /// [`CreationWatch`]); that deadline is taken at the first cancellation
+    /// and shared with the abort. A step blocked on anything else is dropped
+    /// at once, so the abort starts with the whole allowance. Either way the
+    /// step reports `Cancelled`.
     pub(super) async fn step(
         &self,
         op: impl Future<Output = parquet::errors::Result<()>>,

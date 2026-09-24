@@ -50,16 +50,13 @@ pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Op
 /// `col` in a form the cell readers of this crate can read as `to`.
 ///
 /// A column that already is `to` is returned as it is, and so is a
-/// dictionary with `u8` or `u16` keys -- the only key types OTAP uses -- whose
-/// values are `to`, for the string, binary, fixed-size binary and 64-bit
-/// integer types: [`str_cell`], [`bytes_cell`] and [`prim_at`] read
-/// through the dictionary instead. Anything else is cast.
+/// dictionary with `u8` or `u16` keys (the key types OTAP uses) whose values
+/// are `to`, for the string, binary, fixed-size binary and 64-bit integer
+/// types: [`str_cell`], [`bytes_cell`] and [`prim_at`] read through the
+/// dictionary. Anything else is cast.
 ///
-/// Casting a dictionary would expand it before any budget applies: one
-/// large value referenced by every row becomes one copy per row, and the
-/// logical request size a producer is measured against counts that value
-/// once. Reading through it keeps the expansion to the cells actually read,
-/// each of which is charged as it is read.
+/// A cast would expand the dictionary before any budget applies, one copy of a
+/// large value per row; reading through it charges each cell as it is read.
 pub(crate) fn readable(col: ArrayRef, to: &DataType) -> Result<ArrayRef> {
     let through = match col.data_type() {
         t if t == to => true,
@@ -244,19 +241,12 @@ impl AnyValueColumns {
 
     /// Typed value at a row.
     ///
-    /// The type tag decides the variant; the value column only supplies the
-    /// payload. An absent column, or a null cell within it, therefore means
-    /// "this type's default value", not "null": pdata's OTAP encoder omits a
-    /// value column whose every entry is the default, so a batch of nothing but
-    /// empty strings carries no `str` column at all. Reading that back as
-    /// [`Value::Null`] would make a series identity depend on how requests
-    /// happen to be batched, and would collide with a genuinely null attribute,
-    /// which the canonical encoding keeps distinct (`Empty` below, and the
-    /// `null_value` golden vector).
-    ///
-    /// Map and slice values are the exception: they arrive CBOR-encoded, and
-    /// even an empty map is a non-empty CBOR payload, so an absent or null
-    /// `ser` cell under those tags is malformed content rather than a default.
+    /// The type tag decides the variant, so an absent value column, or a null
+    /// cell in it, is the type's default, not null: pdata's OTAP encoder omits
+    /// a column whose every entry is the default, and a series identity must
+    /// not depend on batching (FORMAT.md section 1). Map and slice values are
+    /// the exception: even an empty map is a non-empty CBOR payload, so an
+    /// absent or null `ser` cell under those tags is malformed.
     ///
     /// A string, bytes or CBOR cell longer than `limits.max_cell_bytes` is
     /// refused as too large before it is copied or decoded. The returned
@@ -431,10 +421,10 @@ fn required(batch: &RecordBatch, name: &str, to: &DataType) -> Result<ArrayRef> 
 impl AttrTable {
     /// Build the table from an `attributes_16` or `attributes_32` batch.
     ///
-    /// Keys and values are read through dictionary encoding rather than
-    /// expanded, and each entry's decoded footprint ([`entry_bytes`]) is
-    /// charged to `budget` before it is allocated, so the table draws from the
-    /// same `max_extracted_bytes` as the rest of the request.
+    /// Keys and values are read through their dictionary (see [`readable`]),
+    /// and each entry's decoded footprint ([`entry_bytes`]) is charged to
+    /// `budget` before it is allocated, so the table draws from the request's
+    /// one `max_extracted_bytes`.
     ///
     /// # Errors
     /// Refuses the batch when `parent_id` is missing or null, a required
@@ -496,9 +486,8 @@ impl AttrTable {
 
 /// Read `parent_id` as `u32`, refusing a missing column or a null id.
 ///
-/// The column is read through its dictionary, when it has one, rather than
-/// cast. A null `parent_id` is malformed input, not parent 0: refuse it
-/// rather than silently attributing the row to the first parent.
+/// The column is read through its dictionary when it has one. A null
+/// `parent_id` is malformed input, not parent 0.
 fn read_parent_ids(batch: &RecordBatch) -> Result<Vec<u32>> {
     let col = batch
         .column_by_name(PARENT_ID)
@@ -691,13 +680,8 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
     }
 
-    /// Scenario: an attribute batch whose one two-MiB string value is
-    /// dictionary encoded and referenced by 256 rows -- half a GiB once
-    /// expanded -- is decoded under a one-MiB cell limit.
-    /// Guarantees: the batch is refused as too large on the first cell rather
-    /// than after copying the value once per row, so a request whose logical
-    /// size counts the value once cannot expand into memory before any budget
-    /// applies.
+    /// Scenario: a two-MiB dictionary string referenced by 256 rows under a one-MiB cell limit.
+    /// Guarantees: the batch is refused on the first cell, before any copy per row.
     #[test]
     fn a_large_dictionary_value_is_refused_before_it_is_expanded() {
         let big = "x".repeat(2 << 20);
@@ -709,12 +693,9 @@ mod tests {
         ));
     }
 
-    /// Scenario: a dictionary-encoded string value of half a MiB, under the
-    /// one-MiB cell limit, is referenced by 256 rows, so the decoded table
-    /// would hold 128 MiB against a 32 MiB table budget.
-    /// Guarantees: the table is refused as too large once its decoded content
-    /// passes the budget, so many references to a value that fits one row are
-    /// bounded as well.
+    /// Scenario: a half-MiB dictionary string referenced by 256 rows (128 MiB decoded) against the
+    /// 32 MiB request budget.
+    /// Guarantees: the table is refused once its decoded content passes the budget.
     #[test]
     fn many_references_to_one_dictionary_value_are_bounded() {
         let value = "y".repeat(512 << 10);
@@ -726,11 +707,8 @@ mod tests {
         ));
     }
 
-    /// Scenario: 64 rows reference one dictionary-encoded `ser` value, a
-    /// one-MiB CBOR array of small ints, under the default 1 MiB cell limit and
-    /// 32 MiB request budget.
-    /// Guarantees: the value is decoded once and the table is refused against
-    /// the budget on its first copy, not after 64 decodes of 32 MiB each.
+    /// Scenario: 64 rows reference one one-MiB dictionary `ser` array under the default limits.
+    /// Guarantees: it is decoded once and refused on its first charged copy.
     #[test]
     fn a_dictionary_ser_value_is_decoded_once_and_its_copies_are_charged() {
         let value = one_mib_of_ints();
@@ -745,10 +723,8 @@ mod tests {
         assert_eq!(crate::value::decodes() - before, 1);
     }
 
-    /// Scenario: rows alternate between two dictionary-encoded `ser` arrays
-    /// under a budget that cannot bind.
-    /// Guarantees: each distinct dictionary key is decoded exactly once and
-    /// every row still reads back its own value.
+    /// Scenario: rows alternate between two dictionary `ser` arrays under a loose budget.
+    /// Guarantees: each key is decoded once and every row reads its own value.
     #[test]
     fn each_distinct_dictionary_ser_value_is_decoded_once() {
         let (a, b) = (cbor_zeros(1000), cbor_zeros(2000));
@@ -762,11 +738,8 @@ mod tests {
         }
     }
 
-    /// Scenario: one plain (not dictionary-encoded) `ser` cell holds a one-MiB
-    /// CBOR array of small ints, decoded against a 16 MiB and a 64 MiB budget.
-    /// Guarantees: the table is charged the decoded footprint, about 32 MiB,
-    /// not the encoded length or zero, so it is refused under 16 MiB and
-    /// accepted under 64 MiB.
+    /// Scenario: one plain `ser` cell of a one-MiB CBOR array against 16 MiB and 64 MiB budgets.
+    /// Guarantees: it is charged about 32 MiB decoded: refused under 16 MiB, accepted under 64 MiB.
     #[test]
     fn a_plain_ser_cell_is_charged_its_decoded_footprint() {
         let value = one_mib_of_ints();
@@ -817,11 +790,8 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).expect("batch")
     }
 
-    /// Scenario: `value_at` fails for each reason it can -- an unknown type
-    /// tag, a map without its `ser` payload, a string past the budget,
-    /// malformed CBOR after some of it was reserved, and a dictionary value
-    /// whose kept copy does not fit -- on a budget already holding 1000 bytes.
-    /// Guarantees: every failure leaves the budget exactly at its mark.
+    /// Scenario: `value_at` fails for each reason it can on a budget holding 1000 bytes.
+    /// Guarantees: every failure leaves the budget at its mark.
     #[test]
     fn a_failed_value_leaves_the_budget_at_its_mark() {
         let ser = |bytes: &[u8]| -> Option<(&str, ArrayRef)> {
@@ -864,10 +834,8 @@ mod tests {
         assert_eq!(budget.mark(), mark, "memo copy");
     }
 
-    /// Scenario: an attribute batch whose first row decodes and whose second
-    /// row carries an unknown type tag.
-    /// Guarantees: the refused table leaves the budget exactly at its mark,
-    /// the first row's charge included.
+    /// Scenario: a batch whose first row decodes and whose second has an unknown type tag.
+    /// Guarantees: the refused table leaves the budget at its mark.
     #[test]
     fn a_failed_table_leaves_the_budget_at_its_mark() {
         let schema = Schema::new(vec![
@@ -888,12 +856,9 @@ mod tests {
         assert_eq!(budget.mark(), mark);
     }
 
-    /// Scenario: a small dictionary-encoded batch -- parent ids, keys and
-    /// values all dictionary encoded -- is decoded, and one of its columns is
-    /// prepared for reading.
-    /// Guarantees: every row reads back its parent, key and value through the
-    /// dictionary, and the prepared column keeps its dictionary encoding
-    /// rather than being cast to plain strings.
+    /// Scenario: a batch with dictionary-encoded parent ids, keys and values.
+    /// Guarantees: every row reads back through the dictionary and the prepared column stays
+    /// encoded.
     #[test]
     fn a_dictionary_batch_reads_through_without_expansion() {
         let batch = dictionary_batch(3, "shared");
@@ -998,12 +963,8 @@ mod tests {
         RecordBatch::try_new(Arc::new(schema), cols).expect("batch")
     }
 
-    /// Scenario: a batch whose value columns are all absent, one row per typed
-    /// tag, as pdata emits when every value of a column is that type's default.
-    /// Guarantees: each attribute decodes to its type's default value, never to
-    /// [`Value::Null`]. Reading them as null would make a series identity depend
-    /// on how requests are batched and would collide with a genuinely null
-    /// attribute, which stays [`Value::Null`] under the `Empty` tag.
+    /// Scenario: absent value columns, one row per typed tag, as pdata emits all-default columns.
+    /// Guarantees: each decodes to its type's default, never `Value::Null`.
     #[test]
     fn absent_value_column_decodes_as_the_type_default() {
         // Tags: str, int, double, bool, bytes, empty.
@@ -1022,9 +983,8 @@ mod tests {
         );
     }
 
-    /// Scenario: a typed value column that is present but null in this row.
-    /// Guarantees: a null cell is the type's default too, for the same reason an
-    /// absent column is -- the type tag, not the cell, decides the variant.
+    /// Scenario: a typed value column present but null in this row.
+    /// Guarantees: the cell decodes to the type's default.
     #[test]
     fn null_value_cell_decodes_as_the_type_default() {
         let schema = Schema::new(vec![
@@ -1053,9 +1013,7 @@ mod tests {
     }
 
     /// Scenario: a map or slice attribute whose `ser` payload is absent.
-    /// Guarantees: the batch is refused. Unlike the scalar types, a map has no
-    /// empty encoding to fall back on -- even an empty CBOR map is a non-empty
-    /// payload -- so a missing one is malformed content, not a default.
+    /// Guarantees: the batch is refused as malformed.
     #[test]
     fn map_or_slice_without_a_ser_payload_is_refused() {
         for tag in [5u8, 6] {

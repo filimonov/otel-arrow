@@ -73,8 +73,8 @@ pub(super) const DEFAULT_WINDOW_SECS: i64 = 15;
 
 /// Smallest and largest `time_unix_nano` across the sealed runs of a table.
 ///
-/// A column of an unexpected type is skipped rather than panicked on: the
-/// metadata it feeds is advisory, and no data-derived input may panic here.
+/// A column of an unexpected type is skipped: the metadata is advisory, and
+/// no data-derived input may panic here.
 pub(super) fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) {
     let mut lo = None;
     let mut hi = None;
@@ -97,8 +97,8 @@ pub(super) fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) 
 /// Parquet's native `SortingColumn` list for a file sorted by `spec`.
 ///
 /// The list is written into every row group beside the `sort_key` key/value
-/// (FORMAT.md section 5), so readers that understand the standard field --
-/// DataFusion, DuckDB, ClickHouse -- can use the order without knowing this
+/// (FORMAT.md section 5), so readers that understand the standard field
+/// (DataFusion, DuckDB, ClickHouse) can use the order without knowing this
 /// format. `column_idx` is the index of the column among the Parquet leaf
 /// columns, not the Arrow field index: a map column has two leaves and a list
 /// column one, so every column after a map shifts by one.
@@ -114,7 +114,7 @@ pub(super) fn time_range(batches: &[RecordBatch]) -> (Option<i64>, Option<i64>) 
 ///   `-0.0` equals `+0.0` and every NaN equals every other NaN. Parquet's
 ///   recommended IEEE 754 total order puts `-0.0` before `+0.0` and gives NaN
 ///   payloads distinct positions, so declaring such a column sorted would be
-///   false, and a false declaration is worse than none.
+///   false.
 ///
 /// Nothing after the first excluded key is declared, since the keys after it
 /// are only ordered within its ties. `None` when the prefix is empty,
