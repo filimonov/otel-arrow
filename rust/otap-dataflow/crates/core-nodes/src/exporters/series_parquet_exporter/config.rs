@@ -190,40 +190,47 @@ fn batch() -> usize {
 /// decision (README.md, "The drain").
 const MIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Refuse a store retry budget that one write attempt could spend past the
-/// block's own flush deadline.
+/// Refuse an explicit store retry budget that one write attempt could spend
+/// past the block's own flush deadline.
 ///
 /// A cloud store retries each request internally for up to
-/// `retry.retry_timeout`, three minutes when the section is omitted. If that
-/// is not strictly shorter than `window.flush_retry_deadline`, a single
-/// attempt against a destination that keeps failing is still retrying inside
-/// the store when the block's deadline expires: the flush then ends with no
-/// underlying error to report and no retry of its own ever made, which is the
-/// most common storage incident made invisible. Local file storage applies no
-/// store retry at all, so `retried` is false for it and nothing is checked.
+/// `retry.retry_timeout`. If that is not strictly shorter than
+/// `window.flush_retry_deadline`, a single attempt against a destination that
+/// keeps failing is still retrying inside the store when the block's deadline
+/// expires, and the flush ends with no underlying error to report. Without a
+/// `retry` section the budget is derived instead (see [`derived_retry`]).
+/// Local file storage applies no store retry, so `retried` is false for it and
+/// nothing is checked.
 pub(super) fn check_retry_deadline(
     retried: bool,
     retry: Option<&RetryOptions>,
     flush_retry_deadline: Duration,
 ) -> Result<(), String> {
-    if !retried {
+    let Some(retry) = retry.filter(|_| retried) else {
         return Ok(());
-    }
-    let timeout = RetryOptions::effective_retry_timeout(retry);
+    };
+    let timeout = retry.retry_timeout;
     if timeout < flush_retry_deadline {
         return Ok(());
     }
-    let setting = if retry.is_some() {
-        "retry.retry_timeout"
-    } else {
-        "retry.retry_timeout (the object store default; no retry section is set)"
-    };
     Err(format!(
-        "{setting} ({timeout:?}) must be strictly less than window.flush_retry_deadline \
-         ({flush_retry_deadline:?}), or one write attempt keeps retrying inside the store \
-         past the block deadline; set retry.retry_timeout below the deadline or raise \
-         window.flush_retry_deadline"
+        "retry.retry_timeout ({timeout:?}) must be strictly less than \
+         window.flush_retry_deadline ({flush_retry_deadline:?}), or one write attempt keeps \
+         retrying inside the store past the block deadline; set retry.retry_timeout below \
+         the deadline, raise window.flush_retry_deadline, or omit the retry section"
     ))
+}
+
+/// The store retry options of a cloud store configured without a `retry`
+/// section: object_store's defaults, with `retry_timeout` half of
+/// `window.flush_retry_deadline`, which leaves the block time for a retry of
+/// its own after the store gives up on one attempt.
+fn derived_retry(flush_retry_deadline: Duration) -> Result<RetryOptions, String> {
+    let mut retry: RetryOptions =
+        serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
+            .map_err(|e| format!("retry: {e}"))?;
+    retry.retry_timeout = flush_retry_deadline / 2;
+    Ok(retry)
 }
 
 /// Validated exporter configuration. Storage and scheduling stay outside
@@ -342,14 +349,15 @@ impl TryFrom<RawConfig> for Config {
             e.invalid_detail()
                 .map_or_else(|| e.to_string(), str::to_owned)
         })?;
-        check_retry_deadline(
-            !matches!(raw.storage, StorageType::File { .. }),
-            raw.retry.as_ref(),
-            raw.window.flush_retry_deadline,
-        )?;
+        let retried = !matches!(raw.storage, StorageType::File { .. });
+        check_retry_deadline(retried, raw.retry.as_ref(), raw.window.flush_retry_deadline)?;
+        let retry = match raw.retry {
+            None if retried => Some(derived_retry(raw.window.flush_retry_deadline)?),
+            retry => retry,
+        };
         Ok(Self {
             storage: raw.storage,
-            retry: raw.retry,
+            retry,
             lake,
             window: raw.window,
             cache_entries: raw.series_cache.max_entries,

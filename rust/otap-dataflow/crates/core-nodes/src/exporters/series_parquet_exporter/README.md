@@ -335,12 +335,13 @@ must all be positive, and `upload.abort_timeout` must be at least 1s (see
 "The drain"). A logical input size that cannot be measured is
 refused before conversion. `retry` settings apply to individual storage
 operations; `window.flush_retry_deadline` is the absolute authority for retrying
-a whole sealed block. For cloud storage, `retry.retry_timeout` must be strictly
-less than `window.flush_retry_deadline`, and the rule applies to the object
-store default of 3m when the `retry` section is omitted, so the default 60s
-deadline needs an explicit `retry` section. Otherwise one write attempt keeps
-retrying inside the store past the block's deadline and the flush ends with no
-error to report. Local file storage applies no store retry and is not checked.
+a whole sealed block. For cloud storage, an explicit `retry.retry_timeout`
+must be strictly less than `window.flush_retry_deadline`; otherwise one write
+attempt keeps retrying inside the store past the block's deadline and the flush
+ends with no error to report. When the `retry` section is omitted, the store
+uses object_store's retry defaults with `retry_timeout` set to half of
+`window.flush_retry_deadline` (30s with the defaults) instead of object_store's
+3m. Local file storage applies no store retry and is not checked.
 
 `writer_id` must be nonempty and use only letters, digits, `_` and `.`: it
 sits between the `-` separators of every file name, so a hyphen or a slash is

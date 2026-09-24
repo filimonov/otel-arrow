@@ -251,33 +251,35 @@ fn the_factory_refuses_azure_storage_without_a_token_provider() {
     assert!(err.to_string().contains("bearer_token_provider"), "{err}");
 }
 
-/// Scenario: a cloud store's retry budget -- the three-minute default when no
-/// retry section is set, or an explicit one -- is checked against the block's
-/// flush deadline, and local file storage is checked with the same values.
-/// Guarantees: a store retry budget that is not strictly shorter than
-/// `window.flush_retry_deadline` is refused with both values in the message,
-/// so one write attempt can never retry inside the store past the deadline;
-/// local file storage, which applies no store retry, is never refused for it.
+/// Scenario: an explicit cloud store retry budget equal to, above and below
+/// the block's flush deadline, no retry section, and local file storage with
+/// the same values.
+/// Guarantees: only an explicit `retry.retry_timeout` that is not strictly
+/// shorter than `window.flush_retry_deadline` is refused, with both values in
+/// the message; an absent section and local file storage, which applies no
+/// store retry, are never refused for it.
 #[test]
-fn a_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
+fn an_explicit_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
     let deadline = Duration::from_secs(60);
-    let err = super::super::config::check_retry_deadline(true, None, deadline)
-        .expect_err("the three-minute default outlives the deadline");
-    assert!(err.contains("(180s)"), "{err}");
-    assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
-    assert!(err.contains("object store default"), "{err}");
     let retry = |timeout: &str| -> otel_arrow_dfe_otap::object_store::RetryOptions {
         serde_json::from_value(serde_json::json!({ "retry_timeout": timeout }))
             .expect("retry options")
     };
-    let equal = super::super::config::check_retry_deadline(true, Some(&retry("60s")), deadline)
-        .expect_err("equal is not strictly less");
-    assert!(equal.starts_with("retry.retry_timeout (60s)"), "{equal}");
+    for timeout in ["60s", "3m"] {
+        let err = super::super::config::check_retry_deadline(true, Some(&retry(timeout)), deadline)
+            .expect_err("not strictly less");
+        assert!(err.starts_with("retry.retry_timeout ("), "{err}");
+        assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
+    }
     assert!(
         super::super::config::check_retry_deadline(true, Some(&retry("30s")), deadline).is_ok()
     );
-    assert!(super::super::config::check_retry_deadline(false, None, deadline).is_ok());
-    // The shipped local example keeps loading with no retry section at all.
+    assert!(super::super::config::check_retry_deadline(true, None, deadline).is_ok());
+    assert!(
+        super::super::config::check_retry_deadline(false, Some(&retry("3m")), deadline).is_ok()
+    );
+    // The shipped local example keeps loading with no retry section at all,
+    // and no retry options are made up for a store that applies none.
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "storage": {"file": {"base_uri": "/tmp/series-test"}}
     }))
@@ -285,26 +287,43 @@ fn a_store_retry_budget_must_be_shorter_than_the_flush_deadline() {
     assert!(cfg.retry.is_none());
 }
 
-/// Scenario: a configuration with S3 storage and no `retry` section is loaded
-/// through the factory's own `validate_config`, and then again with a retry
-/// budget shorter than the flush deadline.
-/// Guarantees: the first is refused at load, with a message naming the
-/// three-minute store default and the sixty-second flush deadline, and the
-/// second loads, so the rule is enforced on the path a pipeline actually
-/// starts from and not only by its helper.
+/// Scenario: a minimal S3 configuration with no `retry` section is loaded
+/// through the factory's own `validate_config` and as a `Config`, once with
+/// the default flush deadline and once with `window.flush_retry_deadline: 20s`;
+/// then with an explicit `retry.retry_timeout` of 60s and of 3m against the
+/// default 60s deadline.
+/// Guarantees: the minimal configuration loads, and its effective store retry
+/// budget is half the flush deadline (30s, then 10s) with object_store's other
+/// retry defaults; an explicit budget at or above the deadline is refused at
+/// load naming both values.
 #[test]
-fn an_s3_config_without_a_retry_section_is_refused_at_load() {
+fn a_minimal_s3_config_derives_its_retry_budget_from_the_flush_deadline() {
     let validate = super::super::SERIES_PARQUET.validate_config;
-    let err = validate(&serde_json::json!({"storage": s3_storage()}))
-        .expect_err("the 3m default is not below the 60s deadline")
+    validate(&serde_json::json!({"storage": s3_storage()})).expect("a minimal S3 config loads");
+    for (deadline, derived) in [(None, 30), (Some("20s"), 10)] {
+        let mut doc = serde_json::json!({"storage": s3_storage()});
+        if let Some(deadline) = deadline {
+            doc["window"] = serde_json::json!({"flush_retry_deadline": deadline});
+        }
+        let cfg: Config = serde_json::from_value(doc).expect("valid");
+        let retry = cfg.retry.expect("a cloud store gets derived retry options");
+        assert_eq!(retry.retry_timeout, Duration::from_secs(derived));
+        let defaults: otel_arrow_dfe_otap::object_store::RetryOptions =
+            serde_json::from_value(serde_json::json!({})).expect("defaults");
+        assert_eq!(retry.max_retries, defaults.max_retries);
+        assert_eq!(retry.init_backoff, defaults.init_backoff);
+        assert_eq!(retry.max_backoff, defaults.max_backoff);
+    }
+    for timeout in ["60s", "3m"] {
+        let err = validate(&serde_json::json!({
+            "storage": s3_storage(),
+            "retry": {"retry_timeout": timeout}
+        }))
+        .expect_err("an explicit budget at or above the deadline")
         .to_string();
-    assert!(err.contains("(180s)"), "{err}");
-    assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
-    validate(&serde_json::json!({
-        "storage": s3_storage(),
-        "retry": {"retry_timeout": "30s"}
-    }))
-    .expect("a 30s retry budget fits the 60s deadline");
+        assert!(err.contains("retry.retry_timeout ("), "{err}");
+        assert!(err.contains("window.flush_retry_deadline (60s)"), "{err}");
+    }
 }
 
 /// Scenario: `upload.abort_timeout` is set to 999 ms and to exactly 1 s.
