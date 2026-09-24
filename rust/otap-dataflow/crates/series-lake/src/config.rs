@@ -357,13 +357,17 @@ impl Default for ParquetConfig {
 }
 
 /// Policy for exponential histograms and summaries.
+///
+/// `drop` is the default: one such point in a metrics request would
+/// otherwise refuse the whole request, and a producer drops permanently
+/// refused data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UnsupportedPolicy {
     /// Nack the whole request.
-    #[default]
     Reject,
     /// Drop the unsupported points, keep the rest.
+    #[default]
     Drop,
 }
 
@@ -818,6 +822,28 @@ mod tests {
                     "{unsupported:?} / {exemplars:?}"
                 );
             }
+        }
+    }
+
+    /// Scenario: `unsupported` omitted from a configuration document, and
+    /// written as `reject` and as `drop`.
+    /// Guarantees: omitted means `drop`, and an explicit value is kept.
+    #[test]
+    fn unsupported_defaults_to_drop() {
+        assert_eq!(LakeConfig::default().unsupported, UnsupportedPolicy::Drop);
+        for (doc, expected) in [
+            (serde_json::json!({}), UnsupportedPolicy::Drop),
+            (
+                serde_json::json!({"unsupported": "reject"}),
+                UnsupportedPolicy::Reject,
+            ),
+            (
+                serde_json::json!({"unsupported": "drop"}),
+                UnsupportedPolicy::Drop,
+            ),
+        ] {
+            let cfg: LakeConfig = serde_json::from_value(doc.clone()).expect("parses");
+            assert_eq!(cfg.unsupported, expected, "{doc}");
         }
     }
 

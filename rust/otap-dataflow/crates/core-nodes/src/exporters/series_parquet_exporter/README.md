@@ -327,7 +327,7 @@ silently writing zstd.
 | `parquet.row_group_bytes` | 64MiB |
 | `parquet.writer_limit_bytes` | 96MiB |
 | `notify_batch` | 64 |
-| `unsupported` | reject |
+| `unsupported` | drop |
 | `metrics.exemplars` | drop |
 | `writer_id` | `writer` |
 | `producer_id_attribute` | `host.id` |
@@ -671,7 +671,8 @@ Everything that happens after the WAL acknowledgement is invisible to the
 producer:
 
 - A permanent refusal by this exporter (a damaged OTLP body, a request larger
-  than a block can hold, an unsupported signal or point kind) makes the buffer
+  than a block can hold, a traces request, or an unsupported point kind under
+  `unsupported: reject`) makes the buffer
   drop that bundle. It is counted in the buffer's
   `resolved{outcome="permanently_rejected"}`; without the buffer the same
   request would have received a permanent refusal the producer could act on.
@@ -1067,7 +1068,7 @@ where it cannot.
 | What | Kept instead | How it shows |
 | --- | --- | --- |
 | Traces | Nothing: the request is refused. | `nacks{error.type=unsupported}` |
-| Exponential histogram and summary points | Nothing under `unsupported: reject`: the request is refused. Under `drop`, the request's other points. | `nacks{error.type=unsupported}`, or `dropped.unsupported{kind}` per point |
+| Exponential histogram and summary points | By default the request's other points. Under an explicit `unsupported: reject`, nothing: the request is refused. | `dropped.unsupported{kind}` per point, or `nacks{error.type=unsupported}` |
 | Exemplars, with their filtered attributes, trace and span ids | By default the point, without its exemplars. Under an explicit `metrics.exemplars: reject`, nothing: the request is refused with a reason naming exemplars. | `dropped.exemplars{signal=metrics}` per exemplar, or `nacks{error.type=unsupported}` |
 | Attribute value types in the `attrs`, `resource_attrs` and `scope_attrs` maps | Every value rendered to a string by `render_v1`, so `"42"` and `42` read the same. Identity attributes keep their types in `identity_bytes` and `series_id`, and a typed denormalized column keeps one. Log record attributes outside `logs.series_attributes` keep none. | Documented, by format decision; no counter |
 | The type of a log body that is not a string | The body rendered to JSON text, so a string body `"42"` and an integer body `42` read the same; a bytes body is a quoted base64 string. | Documented; no counter |
@@ -1092,9 +1093,12 @@ writes it again, and `series.emitted{reason}` counts each such row.
 
 Traces have no dataset in the lake and are permanently refused on the signal
 alone, before any conversion. Points of an unsupported kind, namely
-exponential histograms and summaries, are rejected by default;
-`unsupported: drop` drops those points instead and counts them in
-`dropped.unsupported`. The policy decides the whole request atomically.
+exponential histograms and summaries, are dropped by default and counted in
+`dropped.unsupported{kind}`, and the request's other points are stored.
+`unsupported: reject` refuses the whole request instead, permanently; behind
+`durable_buffer` that refusal drops the bundle without the producer seeing it
+(see "Losses the producer never sees"). The policy decides the whole request
+atomically.
 No dataset stores exemplars, and `metrics.exemplars` alone decides what
 happens to them, whatever `unsupported` says. `drop`, the default, keeps the
 points and counts the exemplars in `dropped.exemplars`: most SDKs attach

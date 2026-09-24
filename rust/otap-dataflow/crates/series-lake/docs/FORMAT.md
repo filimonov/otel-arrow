@@ -329,10 +329,10 @@ Unsupported inputs in v1 and their policy:
   any (`nacks{error.type=unsupported}`, a reason naming exemplars). An
   exemplar of a point `unsupported: drop` discards goes with its point and
   is counted.
-- Exponential histogram and summary points: `unsupported: reject` (default)
+- Exponential histogram and summary points: `unsupported: drop` (default)
+  drops those points, counts them and keeps the rest; `unsupported: reject`
   nacks the whole request with `NackCause::Refused`,
-  `nacks{error.type=unsupported}`; `unsupported: drop` drops those points,
-  counts them and keeps the rest. Rejection is atomic per request. A request
+  `nacks{error.type=unsupported}`. Rejection is atomic per request. A request
   that yields zero output rows after drops is acked immediately; a request
   with any output rows is acked only when its block commits.
 - Traces: a traces request is nacked with `NackCause::Refused`,

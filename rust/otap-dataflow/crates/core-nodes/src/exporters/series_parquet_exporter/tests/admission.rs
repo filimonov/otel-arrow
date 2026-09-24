@@ -810,7 +810,7 @@ async fn invalid_utf8_inside_an_array_or_kvlist_value_is_refused_as_undecodable(
 }
 
 /// Scenario: one metrics request carries a supported gauge point next to an
-/// unsupported summary point, under the default `unsupported: reject`.
+/// unsupported summary point, under an explicit `unsupported: reject`.
 /// Guarantees: the whole request is refused as one permanent `unsupported`
 /// nack and the ACTIVE block keeps the bytes and the request count it had, so
 /// the policy is applied atomically and the supported half of a rejected
@@ -823,11 +823,8 @@ async fn a_mixed_metrics_request_is_rejected_atomically() {
             let store = Arc::new(object_store::memory::InMemory::new());
             let (handler, mut rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let cfg = worker_config();
-            assert_eq!(
-                cfg.lake.unsupported,
-                lake::config::UnsupportedPolicy::Reject
-            );
+            let mut cfg = worker_config();
+            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Reject;
             let mut worker = Worker::new(cfg, store, wall, handler);
 
             // A request admitted first, so the assertion is that the rejected
@@ -865,31 +862,42 @@ async fn a_mixed_metrics_request_is_rejected_atomically() {
         .await;
 }
 
-/// Scenario: the same mixed metrics request arrives under
-/// `unsupported: drop`, and the block it lands in is rotated and written.
-/// Guarantees: the gauge point is admitted, the summary point is counted as
-/// dropped rather than stored, and the request is acknowledged only once its
-/// block has been written, so a dropped point does not make the request ack
-/// early or fail.
+/// Scenario: the same mixed metrics request arrives under the default
+/// `unsupported` policy with telemetry registered, and the block it lands in
+/// is rotated and written.
+/// Guarantees: the default is `drop`: the gauge point is admitted, the
+/// summary point is counted in `dropped.unsupported{kind=summary}` rather
+/// than stored, and the request is acknowledged only once its block has been
+/// written, so a dropped point does not make the request ack early or fail.
 #[tokio::test(flavor = "current_thread")]
 async fn a_mixed_metrics_request_drops_only_the_unsupported_points() {
     tokio::task::LocalSet::new()
         .run_until(async {
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let store = Arc::new(object_store::memory::InMemory::new());
             let (handler, mut rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut cfg = worker_config();
-            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Drop;
+            let cfg = worker_config();
+            assert_eq!(cfg.lake.unsupported, lake::config::UnsupportedPolicy::Drop);
             let mut worker = Worker::new(cfg, store, wall, handler);
+            worker.metrics = Some(super::super::metrics::Metrics::register(
+                &context,
+                &worker.cfg.lake,
+            ));
 
-            // Prepared rather than admitted in one step, because the drop
-            // counters live in the extraction and are consumed by admission.
-            let Prepared::Ready(pending) = worker.prepare(mixed_metrics_pdata()) else {
-                panic!("the drop policy admits the supported points");
+            worker.admit(mixed_metrics_pdata());
+            let dropped = |kind| {
+                worker
+                    .metrics
+                    .as_ref()
+                    .expect("registered")
+                    .dropped
+                    .get(super::super::metrics::DroppedAttrs { kind })
+                    .dropped_unsupported
+                    .get()
             };
-            assert_eq!(pending.extracted.stats.dropped_unsupported, 1);
-            assert_eq!(pending.extracted.stats.rows, 1);
-            worker.offer(pending);
+            assert_eq!(dropped(super::super::metrics::DroppedKind::Summary), 1);
+            assert_eq!(dropped(super::super::metrics::DroppedKind::ExpHistogram), 0);
             assert_eq!(worker.active.tokens.len(), 1);
             assert!(!worker.active.data.is_empty());
             assert!(worker.pending.is_none());
@@ -1228,9 +1236,9 @@ async fn refusal_warnings_are_rate_limited() {
 }
 
 /// Scenario: a metrics request whose gauge point carries an exemplar
-/// arrives under the default configuration (`unsupported: reject`,
-/// `metrics.exemplars` unset) with telemetry registered, and again under an
-/// explicit `metrics.exemplars: reject`.
+/// arrives with `metrics.exemplars` unset, even under `unsupported: reject`,
+/// with telemetry registered, and again under an explicit
+/// `metrics.exemplars: reject`.
 /// Guarantees: by default the point is admitted and the exemplar is counted
 /// in `dropped.exemplars{signal=metrics}`; under the explicit reject the
 /// request is refused as a permanent `unsupported` nack whose reason names
@@ -1243,11 +1251,8 @@ async fn an_exemplar_is_dropped_and_counted_by_default_and_refused_when_asked() 
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
             let (handler, _rx) = effects(4);
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let cfg = worker_config();
-            assert_eq!(
-                cfg.lake.unsupported,
-                lake::config::UnsupportedPolicy::Reject
-            );
+            let mut cfg = worker_config();
+            cfg.lake.unsupported = lake::config::UnsupportedPolicy::Reject;
             let mut worker = Worker::new(
                 cfg,
                 Arc::new(object_store::memory::InMemory::new()),

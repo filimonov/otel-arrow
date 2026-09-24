@@ -100,7 +100,7 @@ groups:
               upload: {part_bytes: 8MiB, concurrency: 2, abort_timeout: 5s}
               parquet: {compression: zstd, row_group_bytes: 64MiB, writer_limit_bytes: 96MiB}
               notify_batch: 64
-              unsupported: reject
+              unsupported: drop
               logs:
                 series_attributes: [logger.name]
                 denormalize: [resource.service.name]

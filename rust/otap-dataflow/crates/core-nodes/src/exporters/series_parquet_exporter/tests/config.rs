@@ -49,9 +49,29 @@ fn a_block_budget_written_under_ingress_is_refused() {
     );
 }
 
+/// Scenario: an exporter document with `unsupported` omitted, and with
+/// `unsupported: reject`.
+/// Guarantees: omitted means `drop`, so one unsupported point never refuses
+/// a whole metrics request unless the user asks for it; an explicit `reject`
+/// is kept.
+#[test]
+fn unsupported_defaults_to_drop_and_reject_is_kept() {
+    for (policy, expected) in [
+        (None, lake::config::UnsupportedPolicy::Drop),
+        (Some("reject"), lake::config::UnsupportedPolicy::Reject),
+    ] {
+        let mut doc = serde_json::json!({"storage": {"file": {"base_uri": "/tmp/series-test"}}});
+        if let Some(policy) = policy {
+            doc["unsupported"] = serde_json::json!(policy);
+        }
+        let cfg: Config = serde_json::from_value(doc).expect("valid");
+        assert_eq!(cfg.lake.unsupported, expected, "{policy:?}");
+    }
+}
+
 /// Scenario: the exemplar policy in a user document: `metrics.exemplars:
-/// drop` beside the default `unsupported: reject`, `metrics.exemplars:
-/// reject`, and `logs.exemplars`.
+/// drop` beside the default `unsupported`, `metrics.exemplars: reject`, and
+/// `logs.exemplars`.
 /// Guarantees: the first two are accepted and mean what they say; the
 /// third is refused at startup naming the setting, because log records
 /// carry no exemplars.
