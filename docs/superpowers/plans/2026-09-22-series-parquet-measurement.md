@@ -1641,6 +1641,7 @@ Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as me
 - [ ] The reference Alloy config gains `otelcol.processor.batch` with a size cap that keeps requests well below the receiver limit (for example 4,000 records), with a comment explaining the limit and the slot formula (larger requests raise the strict ceiling).
 - [ ] The shipped series_parquet engine configs set the receiver's `max_decoding_message_size` equal to the exporter's `ingress.max_request_bytes`; at startup the exporter warns when the receiver limit it can see is below `ingress.max_request_bytes` (or states it cannot see it).
 - [ ] An E2E case sends one Alloy batch above 4 MiB and asserts it is stored, so the suite covers large batches, not only 12 lines.
+- [ ] Engine finding for an upstream PR (not the exporter): the OTLP gRPC receiver answers an oversize message with OUT_OF_RANGE (tonic), which OTLP clients retry forever although a retry can never succeed; answer with a non-retryable status and count the refusal in `receiver.otlp.requests.rejected`. Record the evidence and the proposed change; implement it here only if it stays inside the receiver and has its own test.
 
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
