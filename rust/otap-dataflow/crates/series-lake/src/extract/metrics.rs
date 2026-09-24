@@ -1231,9 +1231,9 @@ mod tests {
     }
 
     /// Scenario: the gauge-and-histogram request, whose number point and
-    /// histogram point each carry an exemplar, under the default
-    /// configuration (`unsupported: reject`, `metrics.exemplars` unset) and
-    /// under an explicit `metrics.exemplars: reject`.
+    /// histogram point each carry an exemplar, under `unsupported: reject`
+    /// with `metrics.exemplars` unset, and under an explicit
+    /// `metrics.exemplars: reject`.
     /// Guarantees: by default every point is kept and both exemplars are
     /// counted as dropped, `unsupported: reject` notwithstanding; only the
     /// explicit reject refuses the whole request, with a reason naming
@@ -1241,8 +1241,10 @@ mod tests {
     #[test]
     fn exemplars_are_dropped_by_default_and_refused_only_when_asked() {
         let records = encode_metrics(&gauge_and_hist());
-        let default = LakeConfig::default();
-        assert_eq!(default.unsupported, UnsupportedPolicy::Reject);
+        let default = LakeConfig {
+            unsupported: UnsupportedPolicy::Reject,
+            ..LakeConfig::default()
+        };
         let mut budget = Budget::new(&default);
         let out = extract_metrics(&records, &default, &mut budget).expect("admitted");
         assert_eq!(out.descriptors.len(), 3);
@@ -1327,7 +1329,10 @@ mod tests {
             ..Default::default()
         }]);
         let records = encode_metrics(&md);
-        let reject = LakeConfig::default();
+        let reject = LakeConfig {
+            unsupported: UnsupportedPolicy::Reject,
+            ..LakeConfig::default()
+        };
         let mut budget = Budget::new(&reject);
         assert!(matches!(
             extract_metrics(&records, &reject, &mut budget),
