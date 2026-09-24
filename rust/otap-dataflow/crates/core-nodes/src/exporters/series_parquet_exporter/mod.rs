@@ -186,8 +186,9 @@ fn physical_memory_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Emit the start event, and a warning when every core's memory budget
-/// together exceeds physical memory.
+/// Emit the start event, a warning when every core's memory budget together
+/// exceeds physical memory, and one when a file as large as a block could
+/// need more multipart parts than S3 allows.
 ///
 /// One event carries everything an operator needs to find this worker's
 /// files -- writer id, boot id, storage -- and the budget it runs under.
@@ -213,6 +214,20 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
             physical_memory_bytes = physical,
             message = "every worker's memory budget together exceeds physical memory; lower \
                        the block and ingress budgets or run on fewer cores"
+        );
+    }
+    let cfg = &worker.cfg.lake;
+    let parts = cfg.parts_per_block();
+    if parts > lake::config::MAX_PARTS {
+        otel_warn!(
+            "series_parquet.upload.parts_exceed_limit",
+            max_block_bytes = cfg.ingress.max_block_bytes,
+            part_bytes = cfg.upload.part_bytes,
+            parts = parts,
+            max_parts = lake::config::MAX_PARTS,
+            message = "a file as large as window.max_block_bytes would need more multipart \
+                       parts than S3 allows; raise upload.part_bytes or lower \
+                       window.max_block_bytes"
         );
     }
 }

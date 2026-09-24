@@ -436,6 +436,12 @@ impl Default for LakeConfig {
 /// request exhaust the stack. 256 is the parser's own default.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
+/// Largest accepted `upload.part_bytes`: the S3 multipart maximum part size.
+pub const MAX_PART_BYTES: usize = 5 << 30;
+
+/// Most parts one S3 multipart upload may have.
+pub const MAX_PARTS: usize = 10_000;
+
 /// Hive partition keys of the lake layout, which no file column may be named
 /// like: a reader that resolves partition keys by name would read the file
 /// column and the path key as one.
@@ -452,6 +458,15 @@ impl LakeConfig {
     #[must_use]
     pub fn exemplar_policy(&self) -> ExemplarPolicy {
         self.metrics.exemplars.unwrap_or(ExemplarPolicy::Drop)
+    }
+
+    /// Parts one multipart upload of a file as large as a whole block would
+    /// take; above [`MAX_PARTS`] such an upload is refused by S3.
+    #[must_use]
+    pub fn parts_per_block(&self) -> usize {
+        self.ingress
+            .max_block_bytes
+            .div_ceil(self.upload.part_bytes.max(1))
     }
 
     /// The fixed bytes a block charges per series row, pending entry
@@ -492,9 +507,10 @@ impl LakeConfig {
     /// includes every point attribute); no denormalized column is named like
     /// a partition key of [`PARTITION_KEYS`]; `max_row_bytes <=
     /// run_target_bytes / 4`; `max_requests_per_block >= 1`; `max_block_bytes
-    /// >= 2 * max_extracted_bytes` (series-row inflation); `upload.part_bytes >= 5 MiB` (the S3
-    /// multipart minimum part size, below which every upload would fail at
-    /// flush time); `upload.concurrency >= 1` (otherwise no part could ever
+    /// >= 2 * max_extracted_bytes` (series-row inflation); `upload.part_bytes`
+    /// between 5 MiB and [`MAX_PART_BYTES`] (the S3 multipart part size
+    /// limits, outside which every multipart upload would fail at flush
+    /// time); `upload.concurrency >= 1` (otherwise no part could ever
     /// be sent); `window_interval` is a whole number of seconds and at least
     /// 1 s; denormalized and intrinsic column names do not collide
     /// (case-insensitively) within a dataset and hold no `:` or `;` (the
@@ -542,6 +558,11 @@ impl LakeConfig {
         if self.upload.part_bytes < 5 << 20 {
             return Err(Error::invalid(
                 "upload.part_bytes must be at least 5MiB (S3 multipart minimum)",
+            ));
+        }
+        if self.upload.part_bytes > MAX_PART_BYTES {
+            return Err(Error::invalid(
+                "upload.part_bytes must be at most 5GiB (S3 multipart maximum)",
             ));
         }
         if self.upload.concurrency == 0 {
@@ -774,6 +795,38 @@ mod tests {
         assert!(rule(&err).contains("at least twice ingress.max_extracted_bytes"));
         cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes;
         cfg.validate().expect("exactly twice is enough");
+    }
+
+    /// Scenario: `upload.part_bytes` is exactly the S3 multipart maximum part
+    /// size, and one byte above it.
+    /// Guarantees: the maximum is accepted and anything above it is refused at
+    /// config time with a sentence naming the key and the limit, rather than
+    /// failing every multipart upload at flush time.
+    #[test]
+    fn upload_part_bytes_above_5gib_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.upload.part_bytes = MAX_PART_BYTES;
+        cfg.validate().expect("the maximum part size is accepted");
+        cfg.upload.part_bytes = MAX_PART_BYTES + 1;
+        let err = cfg.validate().expect_err("part_bytes above 5GiB");
+        assert_eq!(
+            err.invalid_detail(),
+            Some("upload.part_bytes must be at most 5GiB (S3 multipart maximum)")
+        );
+    }
+
+    /// Scenario: the parts a whole-block upload takes, with the defaults and
+    /// with a block that is not a whole number of parts.
+    /// Guarantees: the count rounds up, so a configuration whose last part is
+    /// partial is not reported one part short.
+    #[test]
+    fn parts_per_block_rounds_up() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_block_bytes = 500 << 20;
+        cfg.upload.part_bytes = 8 << 20;
+        assert_eq!(cfg.parts_per_block(), 63);
+        cfg.ingress.max_block_bytes = 16 << 20;
+        assert_eq!(cfg.parts_per_block(), 2);
     }
 
     /// Scenario: `upload.part_bytes` is below the S3 multipart minimum part size.

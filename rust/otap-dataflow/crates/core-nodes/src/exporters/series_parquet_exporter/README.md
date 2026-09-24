@@ -335,8 +335,11 @@ silently writing zstd.
 Cross-field rules enforced at startup: `ingress.max_row_bytes` must be at most a
 quarter of `sorting.run_target_bytes`; `window.max_block_bytes` must be at least
 twice `ingress.max_extracted_bytes`, because a block charges a request's series
-rows at up to twice their extracted estimate; `upload.part_bytes` must be at
-least 5MiB for the S3 multipart minimum; request counts, byte and depth budgets,
+rows at up to twice their extracted estimate; `upload.part_bytes` must be
+between 5MiB and 5GiB, the S3 multipart part size limits, and a worker warns
+at start (`series_parquet.upload.parts_exceed_limit`) when a file as large as
+`window.max_block_bytes` would need more than S3's 10,000 parts; request
+counts, byte and depth budgets,
 cache capacity, upload concurrency, `notify_batch` and the retry durations
 must all be positive, and `upload.abort_timeout` must be at least 1s (see
 "The drain"). A logical input size that cannot be measured is
@@ -980,6 +983,7 @@ window interval means the destination, not the producers, is the limit.
 | --- | --- | --- |
 | `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
 | `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
+| `series_parquet.upload.parts_exceed_limit` | WARN | At start, when a file of `window.max_block_bytes` would need more than 10,000 parts of `upload.part_bytes`: `max_block_bytes`, `part_bytes`, `parts`, `max_parts`. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt, with the file name and object count. |
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt, with the error. |
@@ -1167,6 +1171,9 @@ become null; a negative converted timestamp becomes null and increments
   aborted within `upload.abort_timeout`, including one whose creation was
   still in flight when the cancellation came: that creation is allowed to
   finish within the same allowance so the abort has an upload to abort.
+- On a versioned bucket every retry of a block rewrites the same frozen
+  object names, so each attempt that reached the store keeps a noncurrent
+  version until a lifecycle rule expires it.
 - One Parquet row group can start several multipart upload parts at once
   whatever `upload.concurrency` says. The burst is bounded by
   `parquet.row_group_bytes`.

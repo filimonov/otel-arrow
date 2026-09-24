@@ -508,6 +508,57 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     );
 }
 
+/// Scenario: a worker starts with `window.max_block_bytes: 60GiB` and
+/// `upload.part_bytes: 5MiB`, a whole-block file of 12,288 parts, and a
+/// second one with the defaults, 63 parts.
+/// Guarantees: the first start emits one
+/// `series_parquet.upload.parts_exceed_limit` WARN naming both settings, the
+/// part count and the 10,000-part limit; the defaults emit none.
+#[tokio::test(flavor = "current_thread")]
+async fn start_up_warns_when_a_block_could_exceed_the_multipart_part_limit() {
+    let events = capture();
+    let start = |cfg: Config| {
+        let (handler, _rx) = effects(8);
+        let worker = Worker::new(
+            cfg,
+            Arc::new(object_store::memory::InMemory::new()),
+            Arc::new(lake::clock::TestWallClock::new(0)),
+            handler,
+        );
+        super::super::announce(
+            &worker,
+            &super::super::Startup {
+                storage: "file".to_owned(),
+                num_cores: 1,
+            },
+        );
+    };
+    let big: Config = serde_json::from_value(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-unused"}},
+        "window": {"max_block_bytes": "60GiB"},
+        "upload": {"part_bytes": "5MiB"}
+    }))
+    .expect("valid config");
+    start(big);
+    let warned = events.named("series_parquet.upload.parts_exceed_limit");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(warned[0].level, tracing::Level::WARN);
+    let field = |name: &str| warned[0].fields.get(name).cloned();
+    assert_eq!(field("max_block_bytes"), Some(FieldValue::U64(60 << 30)));
+    assert_eq!(field("part_bytes"), Some(FieldValue::U64(5 << 20)));
+    assert_eq!(field("parts"), Some(FieldValue::U64(12_288)));
+    assert_eq!(field("max_parts"), Some(FieldValue::U64(10_000)));
+
+    start(worker_config());
+    assert_eq!(
+        events
+            .named("series_parquet.upload.parts_exceed_limit")
+            .len(),
+        1,
+        "the defaults fit the part limit"
+    );
+}
+
 /// Scenario: a block is rotated into a flush whose first file write is held
 /// at the store gate, and telemetry is sampled while it is held and again
 /// once the flush has completed.
