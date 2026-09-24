@@ -6257,6 +6257,18 @@ class CapacityContracts(unittest.TestCase):
         self.assertIsNone(capacity.next_search_rate([(1000, "sustainable"),
                                                      (2000, "producer_limited")]))
 
+    # Scenario: the receiver shed 6,219 requests as RESOURCE_EXHAUSTED while
+    # 3% of the sends also started late with a slot free.
+    # Guarantees: the engine's refusal decides: the trial is unsustainable,
+    # a bracket, and the producer's lateness is kept as a reason.
+    def test_an_engine_refusal_outranks_producer_lateness(self):
+        verdict = capacity.stability_verdict(
+            offered=512_000, tail_durable=420_000, backlog_slope_records_per_s=0,
+            late_unblocked_ratio=0.03, failed_requests=6219, partial_requests=0,
+        )
+        self.assertEqual(verdict["verdict"], "unsustainable")
+        self.assertTrue(any("late" in reason for reason in verdict["reasons"]))
+
     # Scenario: the durable tail rate is 97% of offered, or the backlog grows
     # by 3% of the offered rate, or a request failed.
     # Guarantees: each alone makes the trial unsustainable, with its reason.

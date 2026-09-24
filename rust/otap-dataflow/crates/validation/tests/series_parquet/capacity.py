@@ -240,12 +240,13 @@ def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
                       late_unblocked_ratio, failed_requests, partial_requests) -> dict:
     """Whether one trial sustained its offered rate, and why not.
 
-    The producer is judged first: a trial whose sends fell behind their
-    targets while in-flight slots were free measured the producer, and says
-    nothing about the engine.
+    A request the engine refused or failed decides first: the engine did
+    not sustain the rate, whatever the producer did. Otherwise a trial whose
+    sends fell behind their targets while in-flight slots were free measured
+    the producer, and says nothing about the engine.
     """
     reasons = []
-    if late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO:
+    if not failed_requests and late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO:
         return {
             "verdict": "producer_limited",
             "reasons": [
@@ -265,6 +266,8 @@ def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
         )
     if failed_requests:
         reasons.append(f"{failed_requests} requests failed")
+        if late_unblocked_ratio > PRODUCER_LATE_LIMIT_RATIO:
+            reasons.append(f"{late_unblocked_ratio:.3%} of sends also started late with a slot free")
     if partial_requests:
         reasons.append(f"{partial_requests} requests partially rejected")
     return {"verdict": "unsustainable" if reasons else "sustainable", "reasons": reasons}
