@@ -2221,6 +2221,12 @@ CALIBRATION_WARMUP_S = 5
 CALIBRATION_MEASURE_S = 20
 CALIBRATION_START_RECORDS_PER_S = 125_000
 POOL_DIR_DEFAULT = "/var/tmp/series-capacity-pools"
+LEDGER_DIR_DEFAULT = "/var/tmp/series-capacity-ledgers"
+# The searched workload's pool lives in memory: read from a disk, the
+# senders fault on pages the engine's own writes pushed out of the page
+# cache. Its size bounds the highest rate a trial can offer.
+POOL_MEMORY_DIR_DEFAULT = "/dev/shm/series-capacity-pools"
+MAX_OFFERED_RECORDS_PER_S = 640_000
 ARCHIVE_DIR_DEFAULT = measurement.REPO_ROOT / ".measurement-artifacts" / "capacity"
 
 
@@ -2329,7 +2335,9 @@ def ensure_pool(plan, workload_id, rate, duration_s):
     end = config["first_index"] + count
     pool = plan["pools"].get(workload_id)
     if pool is None:
-        pool = CapacityPool(Path(plan["pool_dir"]) / workload_id, config["workload"])
+        root = plan["pool_memory_dir"] if workload_id in plan["pool_memory_workloads"] \
+            else plan["pool_dir"]
+        pool = CapacityPool(Path(root) / workload_id, config["workload"])
         plan["pools"][workload_id] = pool
     built = pool.ensure(end, processes=plan["build_processes"])
     if built["segments_built"]:
@@ -2382,9 +2390,11 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
     )
     if producer_groups:
         allocation["producer"] = sorted(core for group in producer_groups for core in group)
-    ledger_fs = performance.memory_ledger_dir(
-        options.get("ledger_dir") or f"/tmp/series-capacity-ledgers-{os.getpid()}"
-    )
+    # The ledger is written after the measured interval, never per request,
+    # so it lives on a disk: on the memory file system its tens of gigabytes
+    # would take the memory the request pool is read from.
+    ledger_dir = Path(options.get("ledger_dir") or f"{LEDGER_DIR_DEFAULT}-{os.getpid()}")
+    ledger_fs = dict(performance.filesystem_of(ledger_dir), directory=str(ledger_dir))
     plan = {
         "store_kind": store_kind,
         "store": None,
@@ -2399,6 +2409,10 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
         "ledger_filesystem": ledger_fs,
         "ledger_dir": ledger_fs["directory"],
         "pool_dir": options.get("pool_dir", POOL_DIR_DEFAULT),
+        "pool_memory_dir": options.get("pool_memory_dir", POOL_MEMORY_DIR_DEFAULT),
+        "pool_memory_workloads": list(options.get("pool_memory_workloads", (PRIMARY_WORKLOAD,))),
+        "max_offered_records_per_s": int(options.get(
+            "max_offered_records_per_s", MAX_OFFERED_RECORDS_PER_S)),
         "build_processes": int(options.get("build_processes", 12)),
         "pools": {},
         "ledgers": {},
@@ -2544,6 +2558,11 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
         else:
             decision = winning(state, cell, workload_id, variant)
             rate, trial_purpose = next_search_rate(decision["trials"]), purpose
+            if rate is not None and rate > plan["max_offered_records_per_s"]:
+                sys.stderr.write(
+                    f"{cell}: {rate} records/s exceeds the pool the host can hold; "
+                    f"the {variant} search stops at a lower bound\n")
+                rate = None
             if rate is None:
                 # Decided: repeat the winner until three trials measured it;
                 # a repetition that fails moves the search below that rate.

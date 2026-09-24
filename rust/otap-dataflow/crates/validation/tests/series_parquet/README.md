@@ -262,7 +262,12 @@ requests about 3 s ahead of their send and reports its major page faults.
 Requests come from a pool built
 once in segments (`/var/tmp/series-capacity-pools`); a request's bytes
 depend only on the workload and its index, so a larger trial extends the
-pool without rebuilding it. The ledger lives on tmpfs, keeps the pool
+pool without rebuilding it. The searched workload's pool is read from
+memory (`/dev/shm/series-capacity-pools`, copied there once): read from
+the disk the engine writes to, the senders stalled on page faults. Its size
+caps the offered rate at 640,000 records/s, above which a search stops at a
+lower bound. The ledger is loaded after the measured interval, so it lives
+on a disk (`/var/tmp/series-capacity-ledgers-<pid>`), keeps the pool
 prefix's records across trials and takes each trial's requests and
 attempts, so the oracle's acknowledged scope is exactly the trial's; stored
 rows of requests a trial never sent are counted and must be zero.
