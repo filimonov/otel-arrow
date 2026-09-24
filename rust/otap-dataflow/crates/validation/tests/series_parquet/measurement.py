@@ -2795,9 +2795,9 @@ def rss_residuals(samples, idle) -> list:
 RSS_BAND_RULE = (
     "the anonymous RSS growth since the first allocator print lies between the growth "
     "of jemalloc `allocated` (lower edge) and the growth of the most jemalloc held "
-    "resident over the interval the kernel may still be releasing: the maximum of "
-    "`resident` at this print, at any print read with it, and at the previous paired "
-    "print (upper edge); a residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a "
+    "resident over the interval the kernel may still be releasing: the larger of "
+    "`resident` at this paired print and at the previous paired print (upper edge); a "
+    "residual beyond max(32 MiB, 0.10 x peak RSS) fails. After a "
     "large purge jemalloc stops counting an extent as resident before the kernel has "
     "released its pages, so an RSS read milliseconds after the print can still hold "
     "them (soak-strict r002: five reads 122-234 MB above resident, inside the band at "
@@ -2807,9 +2807,13 @@ RSS_BAND_RULE = (
 
 def band_upper_resident(pair, previous) -> int:
     """The most jemalloc held resident over the interval ending at `pair`:
-    its own print, any print read with it, and the previous paired print."""
-    held = pair.get("interval_resident_max_bytes", pair["jemalloc_resident_bytes"])
-    return max(held, pair["jemalloc_resident_bytes"], previous["jemalloc_resident_bytes"])
+    the larger of its own print's and the previous paired print's.
+
+    A print read in the same poll but not paired with an RSS read is not an
+    edge: its resident total bounds no RSS read, and taking it would widen
+    the band past what any paired print held.
+    """
+    return max(pair["jemalloc_resident_bytes"], previous["jemalloc_resident_bytes"])
 
 
 def allocator_band_residuals(pairs) -> list:

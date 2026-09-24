@@ -867,6 +867,7 @@ class CapacitySampler(measurement.Sampler):
                     latest = prints[-1]
                     self.pairs.append({
                         "monotonic_ns": procfs["monotonic_ns"],
+                        # Diagnostic only; never an edge of the band.
                         "interval_resident_max_bytes": max(
                             entry["resident_bytes"] for entry in prints),
                         "procfs": {key: procfs[key] for key in (

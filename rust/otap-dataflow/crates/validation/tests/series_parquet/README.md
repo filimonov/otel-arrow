@@ -357,8 +357,10 @@ reads each print within 5 ms and pairs it with the smaps rollup read at
 once, and the anonymous growth must lie between the allocator's live heap
 and the most it held resident over the interval the kernel may still be
 releasing, within the frozen tolerance (`measurement.allocator_band_residuals`).
-The band's upper edge is the largest `resident` of the print, of any print
-read with it and of the previous paired print: after a large purge jemalloc
+The band's upper edge is the larger `resident` of the paired print and of
+the previous paired print (a print read in the same poll but not paired is
+recorded as `interval_resident_max_bytes` and never widens the band): after
+a large purge jemalloc
 stops counting an extent as resident before the kernel has released its
 pages, so an RSS read milliseconds after the print can still hold them
 (soak-strict r002 read 122-234 MB above resident five times, each back inside

@@ -6733,6 +6733,21 @@ class CapacityContracts(unittest.TestCase):
         self.assertEqual(measurement.residual_check(residuals, 1150 << 20)["status"],
                          measurement.STATUS_FAILED)
 
+    # Scenario: the paired prints before and now both hold 100 MiB resident
+    # with allocated flat while RSS grows from 100 to 800 MiB, and a print
+    # read in the same poll but not paired reports 1 GiB resident.
+    # Guarantees: the unpaired print does not widen the band; the growth is
+    # a residual beyond the tolerance and fails.
+    def test_band_ignores_an_unpaired_interval_maximum(self):
+        before = self.allocator_pair(0, 150 << 20, 100 << 20, 50 << 20)
+        grown = dict(self.allocator_pair(10**7, 850 << 20, 100 << 20, 50 << 20),
+                     interval_resident_max_bytes=1 << 30)
+        residuals = measurement.allocator_band_residuals([before, grown])
+        self.assertEqual(residuals[0]["allocator_resident_held_growth_bytes"], 0)
+        self.assertEqual(residuals[0]["residual_bytes"], 700 << 20)
+        self.assertEqual(measurement.residual_check(residuals, 850 << 20)["status"],
+                         measurement.STATUS_FAILED)
+
     # Scenario: a stored failed run kept its positive excursion and the pair
     # before it; another failed run kept none.
     # Guarantees: the first is re-judged by the current band rule, the
