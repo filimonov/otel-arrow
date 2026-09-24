@@ -498,6 +498,9 @@ def alloy_experiment(plan, trial, spec, result, run_dir, controls):
         "feeder_cpus": feeder_cpus, "alloy_image": test_e2e.IMAGE_DEFAULTS["alloy"],
     }
     result["ephemeral_values"] = dict(plan["ephemeral"])
+    # An earlier trial's objects would read back as this one's lines.
+    if plan["store"] is not None:
+        result["capacity_store_cleared_objects_count"] = performance.clear_store(plan["store"])
     root = run_dir / "engine"
     root.mkdir(parents=True, exist_ok=True)
     settings = capacity.engine_settings(plan, trial, root)
@@ -816,14 +819,21 @@ def settle_alloy(plan, trial, spec, result, run_dir, phase, feed, readings, wind
     storage = (engine.config["groups"]["default"]["pipelines"]["main"]["nodes"]["exporter"]
                .get("config", {}).get("storage") or {})
     data_dir = Path((storage.get("file") or {}).get("base_uri") or engine.data)
-    objects = capacity.object_inventory(plan, None, data_dir)
+    store = plan["store"]
+    objects = capacity.object_inventory(plan, store, data_dir)
+    local = data_dir if store is None else Path(run_dir) / "store"
     oracle = None
     oracle_s = None
     try:
+        if store is not None:
+            store.download(local)
         started = time.monotonic_ns()
-        oracle = measurement.run_pinned(plan["oracle_cores"], read_back, data_dir, written)
+        oracle = measurement.run_pinned(plan["oracle_cores"], read_back, local, written)
         oracle_s = (time.monotonic_ns() - started) / 1e9
     finally:
+        if store is not None:
+            _ = performance.clear_store(store)
+            shutil.rmtree(local, ignore_errors=True)
         shutil.rmtree(data_dir, ignore_errors=True)
     jemalloc = capacity.jemalloc_peak(observed["log_path"])
     memory = capacity.memory_at_fill(samples, jemalloc)
