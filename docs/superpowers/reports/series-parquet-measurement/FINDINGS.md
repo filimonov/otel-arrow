@@ -902,6 +902,67 @@ Durable write speed at the ceiling: local 416 MB/s (684k), MinIO 273 MB/s
   children; superseded trials carry their reason.
 - `campaign/reports/task-5-report.md`.
 
+## Task 7: thirty-minute soaks
+
+### Question
+
+Does the exporter hold a high rate for thirty minutes with blocks really
+filling to `max_block_bytes`, without loss, duplication or drift, strict and
+behind the durable buffer?
+
+### Method
+
+One worker, MinIO, the shipped 15 s window, Task 5's producers, generator,
+oracle and allocator band. Strict: receiver slots raised to 4096, offered at
+70 percent of the MinIO one-worker raised ceiling. Buffered: shipped slots,
+offered at 70 percent of a measured one-worker buffered ceiling (104k
+sustainable, 112k not). 1 s samples, one-minute aggregates, drain after
+input stops.
+
+### Results
+
+| | Strict | Buffered |
+| --- | --- | --- |
+| Offered = acknowledged, records/s | 130,899 | 72,800 |
+| Records, objects | 240.2M, 146 GB | 133.6M, 81 GB |
+| Missing, duplicated | 0, 0 | 0, 0 |
+| Exporter accounted at highest fill | 0.99 of 1.64 GB | 0.81 of 1.64 GB |
+| RSS peak | 1.31-1.36 GB | 1.74 GB |
+| RSS median, last to first minute | 1.013 | 1.035 |
+| Receiver in-flight at fill | 340 MB | |
+| WAL peak | | 619 MB of 1 GiB, flat |
+| Ack latency p50 / p99 | 3.55 / 5.58 s | p99 0.87 s |
+| Freshness p50 / p99 | | 4.6 / 8.3 s |
+| Drain after stop | 10.3-10.6 s | 11.0 s |
+
+Blocks rotated on bytes (480) and time (120) in the strict soak; file
+descriptors stayed flat at 301; allocated minus accounted stayed at about
+0.1 GB, no leak signal. The PR-tier soaks (65 s, forced rotations, a 4 s store
+outage) store every record once and run in CI in 163 s with the debug engine.
+
+### The RSS band rule
+
+The strict soak first failed the RSS reconciliation on 2 and 5 samples out of
+about 66,700: each in the second a flushing block completed, the first
+jemalloc print after `resident` had dropped 360-460 MB while the kernel was
+still releasing the pages. The band's upper edge is now the larger `resident`
+of this and the previous paired print; the tolerance is unchanged, and a
+leak outside the allocator still fails. Re-judged from stored samples, the
+second strict run passes and writes the baseline; runs whose failing pairs
+were thinned out before the evidence-keeping fix stay failed.
+
+### Findings for Task 12
+
+- Receiver in-flight memory sits beside the exporter budget at real fill
+  (340 MB at fill in the strict soak).
+- Heap dumps across a soak wait for Task 12's raw-dump mode.
+
+### Evidence
+
+- `soak-strict.json`, `soak-buffered.json` and their children,
+  `pr-soak-*.json`, `baseline-soak-strict-5cb03bef4ffc17fe.json`.
+- `campaign/reports/task-7-report.md`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question

@@ -97,3 +97,10 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 
 **Amendment (user decision 2026-09-23): heap dumps across the soak.** Using the raw-dump profiling mode from the first Task 12 item, each 30-minute soak also runs once with allocation sampling and takes a raw jemalloc dump after warm-up, at the midpoint and at the end of the input phase. `jeprof --base` between the first and last dump names every stack that grew. Growth that the ledger does not explain is a Task 12 finding. The profiled soak is diagnostic and never sets the soak baseline.
 
+
+**Amendment (controller ruling after Task 5, 2026-09-24): soak rates and method.** Task 5 showed the one-worker strict rate at the shipped 15 s window is slot-capped at about 8.5k records/s, where a block fills to a small fraction of `max_block_bytes`; a soak there would not exercise memory at real fill. So:
+- `soak-strict`: one worker, MinIO, the shipped 15 s window, receiver slots raised to 4096, offered at 70 percent of Task 5's MinIO one-worker raised ceiling (187k), about 131k records/s, so blocks rotate on `max_block_bytes` and retained memory reaches the configured budget. Record the receiver's in-flight bytes beside the exporter's accounting.
+- `soak-buffered`: one worker, MinIO, shipped slots (128), the durable buffer with its WAL on the host's disk, offered at 70 percent of the one-worker buffered sustainable rate; measure that rate first with a short bracket if Task 5 has none for one worker, and record it.
+- Both use Task 5's producer placement (senders on CPUs 8-15,24-31), the self-verifying template generator and the aggregate oracle, and the allocator band for the RSS residual (jemalloc stats prints every 64 MiB).
+- The heap dumps of the earlier amendment need Task 12's raw-dump mode, which does not exist yet; this soak records the allocator band and accounted-versus-allocated every second instead, and Task 12 runs one profiled soak with dumps after it builds the mode.
+
