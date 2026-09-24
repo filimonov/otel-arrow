@@ -1053,6 +1053,9 @@ def buffer_view(samples, window, trial, stats) -> dict:
         "wal_growth_allowance_bytes": allowance,
         "in_flight_max": max(extras_total(s, "buffer.in.flight") for s in inside),
         "items_queued_max": max(extras_total(s, "buffer.items.queued") for s in inside),
+        "items_queued_slope_per_s": backlog_slope([
+            ((s["monotonic_ns"] - window[0]) / 1e9, extras_total(s, "buffer.items.queued"))
+            for s in inside]),
         "ingest_failures_count": failures,
         "bundles_permanently_rejected_count": rejected,
         "bundles_acked_count": delta("buffer.bundles.resolved", "acked"),
