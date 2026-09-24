@@ -90,6 +90,30 @@ pub struct BlockShape {
     pub series_rows: usize,
 }
 
+/// The synchronous calls the admission path makes while the block fills,
+/// each timed on its own: none of them yields to the runtime, so each is a
+/// stretch the node loop cannot run.
+#[derive(Debug, Default, Serialize)]
+pub struct AdmissionStretches {
+    /// OTLP-to-Arrow conversion plus extraction of one request, the longest.
+    pub max_extract_ns: u128,
+    /// `Block::reserve` of one request, the longest.
+    pub max_reserve_ns: u128,
+    /// `Block::admit` of one request that sealed no values run, the longest;
+    /// it includes building and sorting the request's new series rows.
+    pub max_admit_ns: u128,
+    /// `Block::admit` of one request that sorted and sealed a run once its
+    /// building batches crossed `sorting.run_target_bytes`, the longest.
+    pub max_admit_sealing_run_ns: u128,
+    /// Admissions that sealed at least one values run.
+    pub admits_sealing_run: usize,
+    /// Rows of the largest values run sealed during admission.
+    pub max_sealed_run_rows: usize,
+    /// `Block::seal`: finalizing the building runs, stamping the series rows
+    /// and the deduplicated recount of every retained buffer.
+    pub seal_ns: u128,
+}
+
 /// One uncancelled write.
 #[derive(Debug, Serialize)]
 pub struct WriteRun {
@@ -205,6 +229,8 @@ pub struct Report {
     pub files: Vec<DumpedFile>,
     /// Where the synchronous work of each table goes.
     pub phases: Vec<TablePhases>,
+    /// The longest synchronous calls of the admission path.
+    pub admission: AdmissionStretches,
 }
 
 /// The probe's command line.
@@ -223,24 +249,63 @@ pub struct Args {
     pub dump: Option<PathBuf>,
 }
 
-/// Build the largest block the input and the configuration allow.
-fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block, BlockShape)> {
+/// Every run the block's values tables have sealed so far, and the largest's
+/// rows. Series runs are built per admitted request and are not counted.
+fn sealed_runs(block: &Block) -> (usize, usize) {
+    block
+        .tables()
+        .filter(|table| !table.dataset().is_series())
+        .fold((0, 0), |(count, rows), table| {
+            let largest = table
+                .runs()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .max()
+                .unwrap_or(0);
+            (count + table.runs().len(), rows.max(largest))
+        })
+}
+
+/// Build the largest block the input and the configuration allow, timing
+/// each synchronous call of the admission path.
+fn build_block(
+    input: &Input,
+    cfg: &BenchConfig,
+) -> Result<(Block, BlockShape, AdmissionStretches)> {
     let mut block = Block::new(cfg.window_start_secs, 1, cfg.lake.clone());
     let mut cache = SeriesCache::new(cfg.cache_entries);
     let mut requests = 0usize;
     let mut refused_as_full = false;
+    let mut stretches = AdmissionStretches::default();
     for bytes in &input.requests {
         let wire = match input.sidecar.signal {
             Signal::Logs => OtlpProtoBytes::ExportLogsRequest(bytes.clone()),
             Signal::Metrics => OtlpProtoBytes::ExportMetricsRequest(bytes.clone()),
         };
+        let started = Instant::now();
         let payload: OtapPayload = wire.into();
         let mut records: OtapArrowRecords = payload.try_into_with_default()?;
         let extracted = extract(&mut records, &cfg.lake)?;
+        stretches.max_extract_ns = stretches.max_extract_ns.max(started.elapsed().as_nanos());
         drop(records);
-        match block.reserve(&extracted, &mut cache, TOKEN_BYTES) {
+        let started = Instant::now();
+        let reserved = block.reserve(&extracted, &mut cache, TOKEN_BYTES);
+        stretches.max_reserve_ns = stretches.max_reserve_ns.max(started.elapsed().as_nanos());
+        match reserved {
             Ok(reservation) => {
+                let (runs_before, _) = sealed_runs(&block);
+                let started = Instant::now();
                 block.admit(extracted, reservation)?;
+                let took = started.elapsed().as_nanos();
+                let (runs_after, largest) = sealed_runs(&block);
+                if runs_after > runs_before {
+                    stretches.admits_sealing_run += 1;
+                    stretches.max_admit_sealing_run_ns =
+                        stretches.max_admit_sealing_run_ns.max(took);
+                    stretches.max_sealed_run_rows = stretches.max_sealed_run_rows.max(largest);
+                } else {
+                    stretches.max_admit_ns = stretches.max_admit_ns.max(took);
+                }
                 requests += 1;
             }
             Err(LakeError::Refused(RefuseReason::BlockFull)) => {
@@ -250,7 +315,9 @@ fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block, BlockShape)> 
             Err(other) => return Err(other.into()),
         }
     }
+    let started = Instant::now();
     block.seal(cfg.seal_at_us)?;
+    stretches.seal_ns = started.elapsed().as_nanos();
     let (mut values_rows, mut series_rows) = (0usize, 0usize);
     for table in block.tables() {
         if table.dataset().is_series() {
@@ -266,7 +333,7 @@ fn build_block(input: &Input, cfg: &BenchConfig) -> Result<(Block, BlockShape)> 
         values_rows,
         series_rows,
     };
-    Ok((block, shape))
+    Ok((block, shape, stretches))
 }
 
 /// A future whose every poll is timed.
@@ -519,7 +586,7 @@ fn phases(block: &Block, cfg: &BenchConfig) -> Result<Vec<TablePhases>> {
 /// Refuses an unreadable input or configuration, and a write that fails
 /// for any reason other than the cancellation the probe asked for.
 pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
-    let (block, shape) = build_block(input, cfg)?;
+    let (block, shape, admission) = build_block(input, cfg)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -651,6 +718,7 @@ pub fn run(args: &Args, input: &Input, cfg: &BenchConfig) -> Result<Report> {
         max_cancel_latency_ns,
         files,
         phases: phases(&block, cfg)?,
+        admission,
     })
 }
 
