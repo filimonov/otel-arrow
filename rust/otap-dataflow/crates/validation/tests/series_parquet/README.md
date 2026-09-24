@@ -257,20 +257,27 @@ instants are all kept, and more than 1 percent of sends starting over 50
 ms late with a slot free marks the trial `producer_limited` (unless the
 engine refused a request, which makes it unsustainable). A producer-limited
 rate bounds the bisection from above, and a search bounded there reports
-`lower_bound_producer_limited`, never a maximum. Each sender reads its
-requests about 3 s ahead of their send and reports its major page faults.
-Requests come from a pool built
-once in segments (`/var/tmp/series-capacity-pools`); a request's bytes
-depend only on the workload and its index, so a larger trial extends the
-pool without rebuilding it. The searched workload's pool is read from
-memory (`/dev/shm/series-capacity-pools`, copied there once): read from
-the disk the engine writes to, the senders stalled on page faults. Its size
-caps the offered rate at 640,000 records/s, above which a search stops at a
-lower bound. The ledger is loaded after the measured interval, so it lives
-on a disk (`/var/tmp/series-capacity-ledgers-<pid>`), keeps the pool
-prefix's records across trials and takes each trial's requests and
-attempts, so the oracle's acknowledged scope is exactly the trial's; stored
-rows of requests a trial never sent are counted and must be zero.
+`lower_bound_producer_limited`, never a maximum. Each sender reports the
+CPU it spent generating requests and its major page faults.
+
+Requests come from `generator.TemplateRequests`: per signal, 97 template
+requests whose per-request fields -- each record's timestamp, the request
+digits of each log record id and each series slot -- have fixed widths and
+known offsets, so a request is its template's fixed parts joined with its
+own fields, about 0.7 ms for a 1 MiB logs request. A record's sequence
+number, `request * records_per_request + position`, is its timestamp on the
+harness time base; padding and point values come from template `request %
+97`. No per-record ledger is kept. `generator.aggregate_oracle` reads the
+stored values with DuckDB and, per signal and per acknowledged request,
+requires every sequence number exactly once, no stored request that was
+never sent, the count and sequence sum of the acknowledged requests, a
+random sample of records equal field by field to the generator's (body and
+logger, or kind, values and slot through the latest descriptor), each
+file's recorded row count, sort order and descriptor hashes, descriptor
+coverage per partition and writer, and clickhouse-local's count and
+sequence sum equal to DuckDB's. A failed request may be stored (it is
+counted apart); a lost, duplicated, foreign or corrupted record fails
+delivery.
 
 A trial is a 15 s warm-up (at least two windows plus 5 s) and a 60 s
 measured interval, then the drain proof, the read-back by both readers and
@@ -345,8 +352,8 @@ filter or aggregate it upstream (an OTel View, or `processor:attribute`).
 Options: `stores`, `core_counts`, `steps`, `rehearsal=true` with its own
 `report_dir` (six-second intervals, nothing published to the report
 directory), `trial={...}` for the `trial` step, `fan_in`, `rows`,
-`high_cardinality_rate`, `upload_concurrencies`, `pool_dir`, `ledger_dir`,
-`build_processes`, `lease_wait_s`, `family_ordinal`.
+`high_cardinality_rate`, `upload_concurrencies`, `producer_cpus`,
+`producer_processes`, `archive_dir`, `lease_wait_s`, `family_ordinal`.
 
 The remaining subcommands (`soak`, `failures`, `buffered`, `remediate`,
 `report`) are named here so the command line is one contract; each is

@@ -24,12 +24,14 @@ from unittest import mock
 
 try:  # Imported as a package module by `python3 -m crates...`.
     from . import capacity
+    from . import generator
     from . import measurement
     from . import measure
     from . import memory
     from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
     import capacity
+    import generator
     import measurement
     import measure
     import memory
@@ -6188,6 +6190,99 @@ class AttributionContracts(unittest.TestCase):
                 measure.main(["attribution", "--output-dir", str(temporary_directory(self))]),
                 2,
             )
+
+
+class GeneratorContracts(unittest.TestCase):
+    """The template requests and the aggregate oracle that reads them."""
+
+    WORKLOAD = Workload(requests=1, records_per_request=4, body_bytes=64, series=10,
+                        metrics_every=3, series_scope="record")
+
+    # Scenario: two requests of each signal are built from their templates.
+    # Guarantees: each record carries its sequence number in its timestamp
+    # (and, for logs, its record id), its series slot as the workload
+    # defines it, and the bytes parse as OTLP.
+    def test_template_requests_carry_their_sequence(self):
+        source = generator.TemplateRequests(self.WORKLOAD)
+        for index in (1, 2, 3, 6):
+            records = generator.expected_records(source, index)
+            self.assertEqual(sorted(records), [index * 4 + point for point in range(4)])
+            for seq, record in records.items():
+                self.assertEqual(record["time_unix_nano"], generator.time_of(seq))
+                slot = self.WORKLOAD.slot(index, seq - index * 4)
+                if "body" in record:
+                    self.assertTrue(record["body"].startswith(
+                        measurement.stable_id(self.WORKLOAD.seed, index, seq - index * 4, "log")))
+                    self.assertEqual(record["logger"], f"series.logger.{slot:012d}")
+                else:
+                    self.assertEqual(record["slot"], f"{slot:012d}")
+        self.assertNotEqual(source.request(1)[1][-200:], source.request(2)[1][-200:])
+
+    def coverage(self, seqs, acked, failed=()):
+        """`request_coverage` over stored sequence numbers `seqs`."""
+        import duckdb
+
+        with duckdb.connect() as db:
+            db.execute("CREATE TABLE s (seq HUGEINT)")
+            db.executemany("INSERT INTO s VALUES (?)", [(seq,) for seq in seqs])
+            return generator.request_coverage(db, "s", 4, list(acked), list(failed))
+
+    # Scenario: three acknowledged requests of four records are stored whole,
+    # then with one request lost, one record duplicated, and a request that
+    # was never sent stored.
+    # Guarantees: each defect is counted on its own and a whole store has
+    # none, with the sequence sum of the acknowledged requests.
+    def test_request_coverage_finds_lost_duplicated_and_foreign_records(self):
+        whole = [r * 4 + p for r in (1, 2, 3) for p in range(4)]
+        report = self.coverage(whole, [1, 2, 3])
+        self.assertEqual((report["missing_record_count"], report["duplicate_record_count"],
+                          report["unexpected_record_count"]), (0, 0, 0))
+        self.assertEqual(report["seq_sum"], report["expected_seq_sum_of_acknowledged"])
+        lost = self.coverage([seq for seq in whole if seq // 4 != 2], [1, 2, 3])
+        self.assertEqual((lost["lost_requests_count"], lost["missing_record_count"]), (1, 4))
+        duplicated = self.coverage(whole + [5], [1, 2, 3])
+        self.assertEqual(duplicated["duplicate_record_count"], 1)
+        foreign = self.coverage(whole + [36, 37], [1, 2, 3])
+        self.assertEqual(foreign["unexpected_record_count"], 2)
+        failed = self.coverage(whole + [36], [1, 2, 3], failed=[9])
+        self.assertEqual((failed["unexpected_record_count"],
+                          failed["stored_failed_records_count"]), (0, 1))
+
+    # Scenario: the stored logs rows of one acknowledged request, whole, and
+    # with one body corrupted.
+    # Guarantees: the field-by-field sample passes the whole rows and names
+    # the corrupted record.
+    def test_a_corrupted_record_fails_the_sample(self):
+        import duckdb
+
+        source = generator.TemplateRequests(self.WORKLOAD)
+        records = generator.expected_records(source, 1)
+        for corrupt in (False, True):
+            root = temporary_directory(self)
+            values = root / "v=1/signal=logs/dataset=values"
+            series = root / "v=1/signal=logs/dataset=series"
+            values.mkdir(parents=True)
+            series.mkdir(parents=True)
+            with duckdb.connect() as db:
+                db.execute("CREATE TABLE v (series_id BLOB, time_unix_nano BIGINT, body VARCHAR)")
+                db.execute("CREATE TABLE s (series_id BLOB, emitted_at BIGINT, "
+                           "attrs MAP(VARCHAR, VARCHAR))")
+                for seq, record in sorted(records.items()):
+                    body = record["body"][:-1] + "!" if corrupt and seq == 5 else record["body"]
+                    key = f"s{seq}".encode("ascii")
+                    db.execute("INSERT INTO v VALUES (?, ?, ?)",
+                               [key, record["time_unix_nano"], body])
+                    db.execute("INSERT INTO s VALUES (?, 1, MAP(['logger.name'], [?]))",
+                               [key, record["logger"]])
+                db.execute(f"COPY v TO '{values / 'part.parquet'}' (FORMAT PARQUET)")
+                db.execute(f"COPY s TO '{series / 'part.parquet'}' (FORMAT PARQUET)")
+                report = generator.compare_sample(db, root, source, [1], "logs", count=40)
+            self.assertEqual(report["sampled_count"], 4)
+            if corrupt:
+                self.assertEqual([m["seq"] for m in report["mismatches"]], [5])
+                self.assertEqual(report["mismatches"][0]["fields"], ["body"])
+            else:
+                self.assertEqual(report["mismatch_count"], 0)
 
 
 class CapacityContracts(unittest.TestCase):

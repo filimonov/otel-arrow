@@ -10,29 +10,27 @@ the highest sustainable rate. See the harness README, "Capacity".
 import array
 import bisect
 import collections
-import concurrent.futures
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import json
 import math
-import mmap
 import multiprocessing
 import os
 from pathlib import Path
 import resource
 import shutil
-import struct
 import subprocess
 import sys
 import threading
 import time
 
 try:  # Imported as a package module by `python3 -m crates...`.
+    from . import generator as requests_generator
     from . import measurement
     from . import performance
 except ImportError:  # Imported by path, e.g. from an ad hoc script.
+    import generator as requests_generator
     import measurement
     import performance
 
@@ -85,8 +83,6 @@ PRODUCER_CPUS = "8-15,24-31"
 SEARCH_CONNECTIONS = 256
 FAN_IN_CONNECTIONS = (1, 8, 64, 256)
 PRODUCER_TIMEOUT_S = 180.0
-# How far ahead of its schedule a sender asks for its requests' pages.
-PREFETCH_AHEAD_S = 3.0
 SENDER_READY_DEADLINE_S = 120
 MESSAGE_LIMIT_BYTES = 64 << 20
 
@@ -287,194 +283,6 @@ def stability_verdict(*, offered, tail_durable, backlog_slope_records_per_s,
 
 
 # --------------------------------------------------------------------------
-# The prebuilt request pool
-# --------------------------------------------------------------------------
-
-POOL_FORMAT = "series-capacity-pool/1"
-POOL_SEGMENT_REQUESTS = 1024
-POOL_CHUNK_REQUESTS = 64
-# One entry per request: index, offset, length, signal, wire SHA-256.
-_POOL_ENTRY = struct.Struct("<QQIB32s")
-_DIGEST_BYTES = 33
-SIGNALS = ("logs", "metrics")
-
-
-def _build_pool_chunk(payload) -> list:
-    """Build one chunk of a pool segment; runs in a worker process."""
-    workload_fields, indexes = payload
-    built = []
-    for index, signal, wire, packed in performance._build_prebuilt_chunk(
-        (workload_fields, indexes)
-    ):
-        built.append((index, signal, wire, packed, hashlib.sha256(wire).digest()))
-    return built
-
-
-class CapacityPool:
-    """A workload's requests, built once in segments and read by index.
-
-    A segment holds `POOL_SEGMENT_REQUESTS` consecutive request indexes of
-    both signals. A request's bytes depend only on the workload and its
-    index, so the pool grows by segments without rebuilding what exists.
-    """
-
-    FILES = ("wire.bin", "entries.bin", "digests.bin")
-
-    def __init__(self, directory, workload):
-        self.directory = Path(directory)
-        self.workload = dataclasses.replace(workload, requests=1)
-        self.segments = {}
-
-    def _segment_dir(self, number) -> Path:
-        return self.directory / f"segment-{number:05d}"
-
-    def _segment_valid(self, number) -> bool:
-        path = self._segment_dir(number) / "sidecar.json"
-        if not path.is_file():
-            return False
-        sidecar = json.loads(path.read_text(encoding="ascii"))
-        return (
-            sidecar.get("format") == POOL_FORMAT
-            and sidecar.get("workload") == self.workload.as_json()
-            and sidecar.get("first") == number * POOL_SEGMENT_REQUESTS
-            and all(
-                (self._segment_dir(number) / name).is_file()
-                and (self._segment_dir(number) / name).stat().st_size
-                == sidecar["sizes"][name]
-                for name in self.FILES
-            )
-        )
-
-    def ensure(self, end_index, *, processes=8) -> dict:
-        """Build every segment below `end_index` that is not built yet."""
-        wanted = range(0, (end_index + POOL_SEGMENT_REQUESTS - 1) // POOL_SEGMENT_REQUESTS)
-        missing = [number for number in wanted if not self._segment_valid(number)]
-        started = time.monotonic_ns()
-        for number in missing:
-            self._build_segment(number, processes)
-        return {
-            "segments_built": len(missing),
-            "segments": len(wanted),
-            "build_s": (time.monotonic_ns() - started) / 1e9,
-        }
-
-    def _build_segment(self, number, processes):
-        """Build one segment in worker processes and write it atomically."""
-        directory = self._segment_dir(number)
-        directory.mkdir(parents=True, exist_ok=True)
-        first = number * POOL_SEGMENT_REQUESTS
-        last = first + POOL_SEGMENT_REQUESTS
-        fields = dataclasses.replace(self.workload, requests=last).as_json()
-        chunks = [
-            (fields, list(range(start, min(last, start + POOL_CHUNK_REQUESTS))))
-            for start in range(first, last, POOL_CHUNK_REQUESTS)
-        ]
-        temporary = {name: directory / f"{name}.partial" for name in self.FILES}
-        offset = 0
-        records = 0
-        with open(temporary["wire.bin"], "wb") as wire, open(
-            temporary["entries.bin"], "wb"
-        ) as entries, open(temporary["digests.bin"], "wb") as digests, \
-                concurrent.futures.ProcessPoolExecutor(
-                    max_workers=processes,
-                    mp_context=multiprocessing.get_context("spawn"),
-                ) as pool:
-            for built in pool.map(_build_pool_chunk, chunks):
-                for index, signal, body, packed, digest in built:
-                    _ = wire.write(body)
-                    _ = entries.write(
-                        _POOL_ENTRY.pack(index, offset, len(body), SIGNALS.index(signal), digest)
-                    )
-                    _ = digests.write(packed)
-                    offset += len(body)
-                    records += len(packed) // _DIGEST_BYTES
-        for name, path in temporary.items():
-            os.replace(path, directory / name)
-        sidecar = {
-            "format": POOL_FORMAT,
-            "workload": self.workload.as_json(),
-            "first": first,
-            "count": POOL_SEGMENT_REQUESTS,
-            "records": records,
-            "wire_bytes": offset,
-            "sizes": {name: (directory / name).stat().st_size for name in self.FILES},
-        }
-        _ = measurement.write_json_atomic(directory / "sidecar.json", sidecar)
-        check = measurement.build_request(
-            dataclasses.replace(self.workload, requests=last), first + 1
-        )
-        if self.request(first + 1)[:2] != check[:2]:
-            raise AssertionError(f"pool segment {number} differs from build_request")
-
-    def _segment(self, number):
-        """The mapped files of one segment."""
-        segment = self.segments.get(number)
-        if segment is None:
-            directory = self._segment_dir(number)
-            handles = [open(directory / name, "rb") for name in self.FILES]
-            maps = [mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
-                    for handle in handles]
-            segment = {"handles": handles, "wire": maps[0], "entries": maps[1],
-                       "digests": maps[2]}
-            self.segments[number] = segment
-        return segment
-
-    def entry(self, index):
-        """(offset, length, signal, wire sha256) of one request."""
-        number, position = divmod(index, POOL_SEGMENT_REQUESTS)
-        segment = self._segment(number)
-        found, offset, length, signal, digest = _POOL_ENTRY.unpack_from(
-            segment["entries"], position * _POOL_ENTRY.size
-        )
-        if found != index:
-            raise AssertionError(f"pool entry {position} of segment {number} is {found}")
-        return offset, length, SIGNALS[signal], digest
-
-    def wire(self, index):
-        """The signal and exact wire bytes of one request."""
-        offset, length, signal, _digest = self.entry(index)
-        segment = self._segment(index // POOL_SEGMENT_REQUESTS)
-        return signal, segment["wire"][offset:offset + length]
-
-    def prefetch(self, index):
-        """Ask the kernel to read one request's bytes ahead, without waiting."""
-        offset, length, _signal, _digest = self.entry(index)
-        wire = self._segment(index // POOL_SEGMENT_REQUESTS)["wire"]
-        start = offset - offset % mmap.PAGESIZE
-        wire.madvise(mmap.MADV_WILLNEED, start, offset + length - start)
-
-    def request(self, index):
-        """Request `index` as `build_request` returns it."""
-        signal, wire = self.wire(index)
-        return signal, wire, list(self.records(index))
-
-    def records(self, index):
-        """(record id, kind, expected sha256) of every record of a request."""
-        number, position = divmod(index, POOL_SEGMENT_REQUESTS)
-        segment = self._segment(number)
-        width = self.workload.records_per_request
-        base = position * width * _DIGEST_BYTES
-        for point in range(width):
-            start = base + point * _DIGEST_BYTES
-            entry = segment["digests"][start:start + _DIGEST_BYTES]
-            kind = measurement.ALL_KINDS[entry[0]]
-            yield (
-                measurement.stable_id(self.workload.seed, index, point, kind),
-                kind,
-                bytes(entry[1:]).hex(),
-            )
-
-    def close(self):
-        """Release every map and file."""
-        for segment in self.segments.values():
-            for name in ("wire", "entries", "digests"):
-                segment[name].close()
-            for handle in segment["handles"]:
-                handle.close()
-        self.segments = {}
-
-
-# --------------------------------------------------------------------------
 # The open-loop producer
 # --------------------------------------------------------------------------
 
@@ -523,7 +331,8 @@ def _sender_process(pipe, config):
     try:
         confine_threads(config["cpus"])
         grpc = test_e2e.grpc
-        pool = CapacityPool(config["pool_dir"], measurement.Workload(**config["workload"]))
+        source = requests_generator.TemplateRequests(
+            measurement.Workload(**config["workload"]))
         options = [
             ("grpc.use_local_subchannel_pool", 1),
             ("grpc.max_send_message_length", MESSAGE_LIMIT_BYTES),
@@ -591,13 +400,11 @@ def _sender_process(pipe, config):
                 if state["done"] == count:
                     finished.set()
 
-        # Requests are read ahead of their send, so a send never waits for
-        # the pool's pages while the engine's writes keep the disk busy.
-        positions = config["positions"]
-        gap = (positions[-1] - positions[0]) / (count - 1) if count > 1 else 1
-        lookahead = max(4, math.ceil(PREFETCH_AHEAD_S * 1e9 / (gap * config["interval_ns"])))
-        for position in range(min(count, lookahead)):
-            pool.prefetch(indexes[position])
+        # Every template is built before the start, so none is built on
+        # the schedule.
+        for index in indexes[:2 * requests_generator.VARIANTS]:
+            _ = source.request(index)
+        generation_ns = 0
         pipe.send({"ready": True, "pid": os.getpid(), "connections": len(channels)})
         start_ns = pipe.recv()["start_ns"]
         cpu_before = os.times()
@@ -621,10 +428,9 @@ def _sender_process(pipe, config):
                 catching_up = True
                 _ = slots.acquire()
             index = indexes[position]
-            if position + lookahead < count:
-                pool.prefetch(indexes[position + lookahead])
-            signal, wire = pool.wire(index)
-            body = bytes(wire)
+            built = time.monotonic_ns()
+            signal, body = source.request(index)
+            generation_ns += time.monotonic_ns() - built
             with lock:
                 outstanding_at_send[position] = state["sent"] - state["done"]
                 state["sent"] += 1
@@ -652,13 +458,13 @@ def _sender_process(pipe, config):
             "cpu_system_s": cpu_after.system - cpu_before.system,
             "major_faults_count": (
                 resource.getrusage(resource.RUSAGE_SELF).ru_majflt - faults_before),
+            "generation_s": generation_ns / 1e9,
             "connections": len(channels),
             "in_flight": config["in_flight"],
         }
         Path(config["result_path"]).write_text(json.dumps(result), encoding="ascii")
         for channel in channels:
             channel.close()
-        pool.close()
         pipe.send({"done": True})
     except BaseException as error:  # noqa: BLE001 - reported to the parent
         with contextlib.suppress(Exception):
@@ -669,7 +475,7 @@ def _sender_process(pipe, config):
 class SenderFleet:
     """The producer processes of one trial, started, released and reaped."""
 
-    def __init__(self, *, target, pool, workload, indexes, rate, connections,
+    def __init__(self, *, target, workload, indexes, rate, connections,
                  processes, in_flight, cpus, directory, timeout_s=PRODUCER_TIMEOUT_S):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -686,8 +492,7 @@ class SenderFleet:
             config = {
                 "target": target,
                 "cpus": list(cpus[number % len(cpus)]),
-                "pool_dir": str(pool.directory),
-                "workload": pool.workload.as_json(),
+                "workload": workload.as_json(),
                 "connections": plan["connections"],
                 "positions": plan["positions"],
                 "local": plan["local"],
@@ -739,6 +544,7 @@ class SenderFleet:
             processes.append(
                 {key: part.get(key) for key in ("pid", "count", "complete", "cpu_user_s",
                                             "cpu_system_s", "connections", "in_flight", "major_faults_count",
+                                            "generation_s",
                                             "details", "schedule_end_ns")}
             )
         order = sorted(range(len(merged["indexes"])), key=lambda k: merged["indexes"][k])
@@ -1014,100 +820,6 @@ def value_at(samples, t_ns, name, label=None):
 
 
 # --------------------------------------------------------------------------
-# The trial ledger
-# --------------------------------------------------------------------------
-
-
-class TrialLedger:
-    """The delivery oracle's ledger, reused by every trial of one workload.
-
-    The records of the pool's prefix are inserted once and kept; each trial
-    replaces the request and attempt tables with what it sent, so the
-    oracle's acknowledged scope is exactly the trial's. Stored rows of
-    requests the trial never sent are counted separately.
-    """
-
-    def __init__(self, path, pool, first_index):
-        self.ledger = measurement.Ledger(path)
-        self.pool = pool
-        self.first_index = first_index
-        with self.ledger.lock:
-            self.ledger.connection.execute(
-                "CREATE TABLE IF NOT EXISTS prefix (end_index INTEGER NOT NULL)"
-            )
-            row = self.ledger.connection.execute("SELECT max(end_index) FROM prefix").fetchone()
-        self.end_index = row[0] if row and row[0] is not None else first_index
-
-    def extend(self, end_index) -> float:
-        """Insert every record of requests below `end_index` not yet present."""
-        if end_index <= self.end_index:
-            return 0.0
-        started = time.monotonic_ns()
-        connection = self.ledger.connection
-        with self.ledger.lock:
-            _ = connection.execute("BEGIN IMMEDIATE")
-            try:
-                for index in range(self.end_index, end_index):
-                    _ = connection.executemany(
-                        "INSERT INTO records (record_id, request_id, kind, expected_sha256) "
-                        "VALUES (?, ?, ?, ?)",
-                        [(record_id, index, kind, digest)
-                         for record_id, kind, digest in self.pool.records(index)],
-                    )
-                _ = connection.execute("INSERT INTO prefix VALUES (?)", (end_index,))
-                _ = connection.execute("COMMIT")
-            except BaseException:
-                _ = connection.execute("ROLLBACK")
-                raise
-        self.end_index = end_index
-        return (time.monotonic_ns() - started) / 1e9
-
-    def load(self, sends):
-        """Replace the request and attempt tables with one trial's sends."""
-        connection = self.ledger.connection
-        rows = []
-        attempts = []
-        for k, index in enumerate(sends["indexes"]):
-            _offset, _length, signal, digest = self.pool.entry(index)
-            code = sends["code"][k]
-            ack = sends["finish"][k] if code == 0 else None
-            rows.append((index, signal, digest.hex(), sends["sent"][k], ack))
-            attempts.append(
-                (index, 1, sends["sent"][k], sends["finish"][k] or sends["sent"][k],
-                 OUTCOME_CODES.get(code, measurement.OUTCOME_LOCAL), "")
-            )
-        with self.ledger.lock:
-            _ = connection.execute("BEGIN IMMEDIATE")
-            try:
-                _ = connection.execute("DELETE FROM requests")
-                _ = connection.execute("DELETE FROM attempts")
-                _ = connection.execute("DROP TABLE IF EXISTS actual")
-                _ = connection.executemany(
-                    "INSERT INTO requests (request_id, signal, wire_sha256, first_send_ns, "
-                    "ack_ns) VALUES (?, ?, ?, ?, ?)", rows,
-                )
-                _ = connection.executemany(
-                    "INSERT INTO attempts (request_id, ordinal, start_ns, finish_ns, outcome, "
-                    "detail) VALUES (?, ?, ?, ?, ?, ?)", attempts,
-                )
-                _ = connection.execute("COMMIT")
-            except BaseException:
-                _ = connection.execute("ROLLBACK")
-                raise
-
-    def stored_from_unsent(self) -> int:
-        """Stored rows whose request this trial never sent."""
-        with self.ledger.lock:
-            return self.ledger.connection.execute(
-                "SELECT count(*) FROM actual a JOIN records r ON r.record_id = a.record_id "
-                "WHERE NOT EXISTS (SELECT 1 FROM requests q WHERE q.request_id = r.request_id)"
-            ).fetchone()[0]
-
-    def close(self):
-        self.ledger.close()
-
-
-# --------------------------------------------------------------------------
 # One trial
 # --------------------------------------------------------------------------
 
@@ -1249,7 +961,7 @@ def jemalloc_peak(log_path) -> dict:
 def trial_residuals(samples, idle, pairs=()) -> tuple:
     """The RSS residuals of one trial and the heap term they used.
 
-    With allocator prints the ledger is the prints, each paired with the RSS
+    With allocator prints the reconciliation reads the prints, each paired with the RSS
     read right after it (`CapacitySampler.watch_allocator`), and the first
     pair is the reference: `measurement.allocator_band_residuals`. A trial
     without prints falls back to the pipeline counter from the idle
@@ -1675,14 +1387,12 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
         controls.register("store", plan["store_pid"], plan["allocation"].get("store", []))
     result["environment"]["build"] = plan["provenance"]["build"]
     result["environment"]["git"] = plan["provenance"]["git"]
-    result["environment"]["ledger_filesystem"] = plan["ledger_filesystem"]
     result["environment"]["producer"] = {
         "cpus": plan["allocation"]["producer"],
         "processes": plan["producer_processes"],
         "cpu_set_per_process": plan["producer_cpu_sets"],
     }
     result["ephemeral_values"] = dict(plan["ephemeral"])
-    pool = plan["pools"][trial["workload_id"]]
     workload = spec.workload
     first = CAPACITY_WORKLOADS[trial["workload_id"]]["first_index"]
     indexes = list(range(first, workload.requests))
@@ -1703,7 +1413,7 @@ def trial_experiment(plan, trial, spec, result, run_dir, controls):
         result["ephemeral_values"]["<receiver_listening_addr>"] = f"127.0.0.1:{engine.grpc_port}"
         command.record_graph(result, engine, trial["topology"])
         fleet = SenderFleet(
-            target=f"127.0.0.1:{engine.grpc_port}", pool=pool, workload=workload,
+            target=f"127.0.0.1:{engine.grpc_port}", workload=workload,
             indexes=indexes, rate=trial["rate"], connections=trial["connections"],
             processes=plan["producer_processes"], in_flight=spec.max_in_flight,
             cpus=plan["producer_cpu_sets"], directory=run_dir / "senders",
@@ -1817,8 +1527,8 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
                  worker_tids, observed, start_ns, engine):
     """Oracle, metrics, verdict and checks of one trial."""
     command = _command()
-    pool = plan["pools"][trial["workload_id"]]
     workload = spec.workload
+    source = requests_generator.TemplateRequests(workload)
     rpr = workload.records_per_request
     store = plan["store"]
     samples = list(phase.sampler.samples)
@@ -1829,7 +1539,7 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     )
     stats = send_statistics(
         sends, window=window, rate=trial["rate"], records_per_request=rpr,
-        wire_bytes_of=lambda index: pool.entry(index)[1],
+        wire_bytes_of=source.size,
     )
     points, acked_between = durable_series(
         sends, rpr, start_ns=window[0], end_ns=window[1], step_s=trial["interval_s"]
@@ -1896,21 +1606,20 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
     oracle = None
     duplication = {}
     downloaded_bytes = None
-    stored_unsent = None
-    ledger_s = None
+    acked = [index for index, code in zip(sends["indexes"], sends["code"]) if code == 0]
+    failed = [index for index, code in zip(sends["indexes"], sends["code"]) if code != 0]
+    oracle_s = None
     try:
         if trial["topology"] != "noop":
             if store is not None:
                 store.download(local)
                 downloaded_bytes = sum(path.stat().st_size for path in local.rglob("*.parquet"))
-            ledger = plan["ledgers"][trial["workload_id"]]
-            ledger_s = ledger.extend(workload.requests)
-            ledger.load(sends)
+            started = time.monotonic_ns()
             oracle = measurement.run_pinned(
-                plan["oracle_cores"], measurement.read_oracle, local, ledger.ledger,
-                require_all=False, healthy=True, workload=workload,
+                plan["oracle_cores"], requests_generator.aggregate_oracle, local, source,
+                acked, failed,
             )
-            stored_unsent = ledger.stored_from_unsent()
+            oracle_s = (time.monotonic_ns() - started) / 1e9
             duplication = measurement.run_pinned(
                 plan["oracle_cores"], descriptor_duplication, local
             )
@@ -2051,8 +1760,10 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
             },
         },
         "rates": measured,
-        "ledger_extend_s": ledger_s,
-        "stored_rows_of_unsent_requests_count": stored_unsent,
+        "oracle_s": oracle_s,
+        "generator": source.as_json(),
+        "acknowledged_request_ranges": request_ranges(acked),
+        "failed_request_ranges": request_ranges(failed),
         "rss_residual_count": len(residuals),
         "rss_heap_term": heap,
         "rss_residual_range_bytes": [
@@ -2080,22 +1791,19 @@ def settle_trial(plan, trial, spec, result, run_dir, phase, sends, readings, win
             f"noop: {stats['outcomes']} of {len(sends['indexes'])} requests",
         ))
     else:
-        passed = bool(oracle and oracle["passed"]) and stored_unsent == 0 and (
+        passed = bool(oracle and oracle["passed"]) and (
             downloaded_bytes is None or downloaded_bytes == object_bytes
         )
         checks.append(measurement.check(
             "delivery", measurement.CHECK_HARD,
             measurement.STATUS_PASSED if passed else measurement.STATUS_FAILED,
             f"acked {stats['outcomes']}; oracle problems {oracle and oracle.get('problems')}; "
-            f"stored rows of unsent requests {stored_unsent}; listed {object_bytes} bytes, "
+            f"listed {object_bytes} bytes, "
             f"downloaded {downloaded_bytes}",
         ))
         result["capacity"]["oracle"] = {
             key: oracle[key] for key in (
-                "passed", "part_file_count", "descriptor_identity_count", "series_cardinality",
-                "actual_row_count", "readers", "expected_record_count", "missing_record_count",
-                "unexpected_record_count", "corrupt_record_count", "multiplicity_histogram",
-                "problems", "stored_rows_by_kind",
+                "passed", "problems", "signals", "files", "series_cardinality", "readers",
             ) if key in oracle
         } if oracle else None
     checks.append(measurement.check(
@@ -2188,6 +1896,17 @@ def archive_trial(plan, run_dir):
         shutil.rmtree(Path(run_dir) / child, ignore_errors=True)
 
 
+def request_ranges(indexes) -> list:
+    """Sorted request indexes as [first, last] runs."""
+    runs = []
+    for index in sorted(indexes):
+        if runs and index == runs[-1][1] + 1:
+            runs[-1][1] = index
+        else:
+            runs.append([index, index])
+    return runs
+
+
 def trial_verdict(result) -> str:
     """The search verdict of a published trial; a failed run is `failed`.
 
@@ -2220,13 +1939,6 @@ STATE_FILE = "capacity-state.json"
 CALIBRATION_WARMUP_S = 5
 CALIBRATION_MEASURE_S = 20
 CALIBRATION_START_RECORDS_PER_S = 125_000
-POOL_DIR_DEFAULT = "/var/tmp/series-capacity-pools"
-LEDGER_DIR_DEFAULT = "/var/tmp/series-capacity-ledgers"
-# The searched workload's pool lives in memory: read from a disk, the
-# senders fault on pages the engine's own writes pushed out of the page
-# cache. Its size bounds the highest rate a trial can offer.
-POOL_MEMORY_DIR_DEFAULT = "/dev/shm/series-capacity-pools"
-MAX_OFFERED_RECORDS_PER_S = 640_000
 ARCHIVE_DIR_DEFAULT = measurement.REPO_ROOT / ".measurement-artifacts" / "capacity"
 
 
@@ -2328,38 +2040,8 @@ def make_trial(plan, *, workload_id=PRIMARY_WORKLOAD, rate, purpose,
     }
 
 
-def ensure_pool(plan, workload_id, rate, duration_s):
-    """The workload's pool and ledger, grown to cover one trial."""
-    config = CAPACITY_WORKLOADS[workload_id]
-    count = trial_requests(rate, duration_s, config["workload"].records_per_request)
-    end = config["first_index"] + count
-    pool = plan["pools"].get(workload_id)
-    if pool is None:
-        root = plan["pool_memory_dir"] if workload_id in plan["pool_memory_workloads"] \
-            else plan["pool_dir"]
-        pool = CapacityPool(Path(root) / workload_id, config["workload"])
-        plan["pools"][workload_id] = pool
-    built = pool.ensure(end, processes=plan["build_processes"])
-    if built["segments_built"]:
-        sys.stderr.write(f"pool {workload_id}: built {built}\n")
-    if workload_id not in plan["ledgers"]:
-        for other in list(plan["ledgers"]):
-            plan["ledgers"].pop(other).close()
-            for suffix in ("", "-wal", "-shm"):
-                with contextlib.suppress(FileNotFoundError):
-                    Path(f"{plan['ledger_dir']}/ledger-{other}.sqlite{suffix}").unlink()
-        Path(plan["ledger_dir"]).mkdir(parents=True, exist_ok=True)
-        plan["ledgers"][workload_id] = TrialLedger(
-            Path(plan["ledger_dir"]) / f"ledger-{workload_id}.sqlite", pool,
-            config["first_index"],
-        )
-    return pool
-
-
 def execute(plan, state, trial, output_dir, report_dir, cell):
     """Run one trial, record it in the family state and return its result."""
-    _ = ensure_pool(plan, trial["workload_id"], trial["rate"],
-                    trial["warmup_s"] + trial["measure_s"])
     started = time.monotonic()
     result = run_trial(plan, trial, output_dir, report_dir)
     state.add(result, trial, cell)
@@ -2390,11 +2072,6 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
     )
     if producer_groups:
         allocation["producer"] = sorted(core for group in producer_groups for core in group)
-    # The ledger is written after the measured interval, never per request,
-    # so it lives on a disk: on the memory file system its tens of gigabytes
-    # would take the memory the request pool is read from.
-    ledger_dir = Path(options.get("ledger_dir") or f"{LEDGER_DIR_DEFAULT}-{os.getpid()}")
-    ledger_fs = dict(performance.filesystem_of(ledger_dir), directory=str(ledger_dir))
     plan = {
         "store_kind": store_kind,
         "store": None,
@@ -2406,16 +2083,6 @@ def open_plan(store_kind, core_count, output_dir, options) -> dict:
             "producer_processes", len(producer_groups) or PRODUCER_PROCESSES)),
         "producer_cpu_sets": producer_groups or [allocation["producer"]],
         "provenance": command.prepare_build(),
-        "ledger_filesystem": ledger_fs,
-        "ledger_dir": ledger_fs["directory"],
-        "pool_dir": options.get("pool_dir", POOL_DIR_DEFAULT),
-        "pool_memory_dir": options.get("pool_memory_dir", POOL_MEMORY_DIR_DEFAULT),
-        "pool_memory_workloads": list(options.get("pool_memory_workloads", (PRIMARY_WORKLOAD,))),
-        "max_offered_records_per_s": int(options.get(
-            "max_offered_records_per_s", MAX_OFFERED_RECORDS_PER_S)),
-        "build_processes": int(options.get("build_processes", 12)),
-        "pools": {},
-        "ledgers": {},
         "ephemeral": {},
         "invalidated": [],
         "archive_dir": str(options.get("archive_dir", ARCHIVE_DIR_DEFAULT)),
@@ -2453,12 +2120,8 @@ def cell_store(plan):
 
 
 def close_plan(plan):
-    for ledger in plan["ledgers"].values():
-        ledger.close()
-    plan["ledgers"] = {}
-    shutil.rmtree(plan["ledger_dir"], ignore_errors=True)
-    for pool in plan["pools"].values():
-        pool.close()
+    """Nothing a cell's trials share outlives the cell but its evidence."""
+    plan["store"] = None
 
 
 def winning(state, cell, workload_id=PRIMARY_WORKLOAD, variant="shipped") -> dict:
@@ -2558,11 +2221,6 @@ def step_search(plan, state, output_dir, report_dir, cell, options, variant="shi
         else:
             decision = winning(state, cell, workload_id, variant)
             rate, trial_purpose = next_search_rate(decision["trials"]), purpose
-            if rate is not None and rate > plan["max_offered_records_per_s"]:
-                sys.stderr.write(
-                    f"{cell}: {rate} records/s exceeds the pool the host can hold; "
-                    f"the {variant} search stops at a lower bound\n")
-                rate = None
             if rate is None:
                 # Decided: repeat the winner until three trials measured it;
                 # a repetition that fails moves the search below that rate.
