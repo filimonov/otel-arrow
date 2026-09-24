@@ -1526,7 +1526,10 @@ def engine_settings(plan, trial, root):
             overrides["retry"] = test_e2e.S3_RETRY
     storage = dict(plan["store"].storage) if plan["store"] is not None else None
     if trial.get("local_store_dir") and plan["store"] is None:
-        storage = {"file": {"base_uri": str(Path(trial["local_store_dir"]) / root.parent.name)}}
+        # The local store needs its base directory to exist.
+        base = Path(trial["local_store_dir"]) / root.parent.name
+        base.mkdir(parents=True, exist_ok=True)
+        storage = {"file": {"base_uri": str(base)}}
     buffer_path = None
     if trial["topology"] == "buffered":
         buffer_path = (Path(trial["wal_dir"]) / root.parent.name) if trial.get("wal_dir") \
