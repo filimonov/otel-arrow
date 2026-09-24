@@ -3,18 +3,10 @@
 
 //! Payload-free completion ownership and bounded asynchronous delivery.
 //!
-//! A request that has been admitted to a block is no longer represented by its
-//! payload: the rows live in the block and the only thing the exporter still
-//! owes the sender is a decision. [`AckToken`] is what the exporter keeps in
-//! the meantime. It holds the routing frames and the signal type, and nothing
-//! else -- the payload is handed back to the caller of [`AckToken::split`] and
-//! the inbound credentials and claims are dropped there.
-//!
-//! [`Notifier`] owns the delivery side. The engine completion channel is
-//! bounded, so a send can block; the future that performs it is stored across
-//! polls rather than recreated, which is what makes a cancelled `select`
-//! branch safe. Dropping a poll never drops a token, so no request can lose
-//! its decision because the exporter was busy elsewhere.
+//! [`AckToken`] is what the exporter keeps for an admitted request: its routing
+//! frames and signal type. [`Notifier`] delivers decided completions over the
+//! bounded engine channel and keeps its one send future across polls, so a
+//! cancelled `select` branch never drops a token.
 
 use super::outcome::Outcome;
 use otel_arrow_dfe_config::SignalType;
@@ -67,8 +59,7 @@ impl AckToken {
     /// Split a request into the completion it owes and its payload.
     ///
     /// The transport headers and the authorization claims derived from them
-    /// are dropped here rather than staying resident for as long as the
-    /// exporter holds the token.
+    /// are dropped here, not held for as long as the exporter holds the token.
     pub(super) fn split(data: OtapPdata) -> (Self, OtapPayload) {
         let (mut context, payload) = data.into_parts();
         let _ = context.take_transport_headers();
@@ -203,9 +194,9 @@ impl Notifier {
     /// Count one decision, once, when it is taken.
     ///
     /// The shared export set records it by signal and by the engine-wide
-    /// outcome class -- `success` for an ack, `refused` for a rule the
-    /// request broke, `failure` for everything the sender may retry -- with
-    /// the time from receipt to decision.
+    /// outcome class (`success` for an ack, `refused` for a rule the request
+    /// broke, `failure` for everything the sender may retry), with the time
+    /// from receipt to decision.
     fn decided(&mut self, token: &AckToken, outcome: Outcome) {
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[outcome as usize] += 1;
@@ -234,10 +225,6 @@ impl Notifier {
         self.len() == 0
     }
 
-    // The counters and size reporting below are read by the node's metrics.
-    // They are built and tested here because the accounting rules they depend
-    // on -- one charge per token, a send future that survives a cancelled poll
-    // -- belong to this module.
     /// Bytes the notifier keeps resident.
     ///
     /// Each token is charged once: a queued token by the queue cell it sits in
@@ -317,10 +304,9 @@ impl Notifier {
     /// completion abandoned at the shutdown deadline and a force-drained
     /// refusal are reported identically.
     ///
-    /// The nack reason is a sentence -- the decision's own when it supplied
-    /// one, the outcome's default otherwise -- because it is the status
-    /// message the producer sees. The machine token of the outcome stays the
-    /// metric label only.
+    /// The nack reason is a sentence, the decision's own or the outcome's
+    /// default, because it is the status message the producer sees; the
+    /// outcome's machine token stays the metric label.
     async fn delivery(
         effects: EffectHandler<OtapPdata>,
         token: AckToken,
@@ -369,12 +355,10 @@ impl Notifier {
 
     /// Start the send of one completion in the single send slot.
     ///
-    /// The future is outside tokio's cooperative budget. A send that is
-    /// polled once and dropped when it reports `Pending` loses the token it
-    /// owns, and the budget reports `Pending` after 128 operations in one task
-    /// poll however much room the completion channel has, so every path that
-    /// polls a send once -- the force-drain refusal and the deadline drain --
-    /// would otherwise decide at most that many requests per poll.
+    /// The future is outside tokio's cooperative budget, which reports
+    /// `Pending` after 128 operations in one task poll whatever room the
+    /// channel has: the force-drain refusal and the deadline drain poll a send
+    /// once, so the budget would cap how many requests they decide per poll.
     fn install(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
         let external = token.external_bytes();
         let received = token.received;
@@ -394,18 +378,14 @@ impl Notifier {
 
     /// Refuse one force-drained request with a retryable `NodeShutdown` nack.
     ///
-    /// Called after shutdown is latched, possibly many times within one poll
-    /// of the node. `held` is the number of completions the caller still owes
-    /// outside the notifier, in a block or the parking slot, each of which
-    /// will be pushed here later. The refusal takes a slot only while it and
-    /// every held completion fit in `capacity`: with the send slot free and
-    /// nothing queued ahead, the send is started and polled once, and one that
-    /// cannot finish yet stays in the slot; otherwise the refusal waits in the
-    /// queue, which the node keeps serving until its deadline. A refusal that
-    /// does not fit is attempted once and, if the channel is full, counted as
-    /// a delivery failure and released, so force-drain never takes the credit
-    /// a held block needs, never grows memory without bound and never stalls
-    /// on a full completion channel.
+    /// Called after shutdown is latched, possibly many times within one poll.
+    /// `held` counts the completions the caller still owes outside the
+    /// notifier. The refusal takes a slot only while it and every held
+    /// completion fit in `capacity`: its send starts at once when the send
+    /// slot is free and nothing is queued, and otherwise it is queued. A
+    /// refusal that does not fit is attempted once and, if the channel is
+    /// full, counted as a delivery failure, so force-drain never takes a held
+    /// block's credit, never grows without bound and never stalls.
     pub(super) fn force_shutdown(&mut self, data: OtapPdata, held: usize) {
         use futures::FutureExt;
 

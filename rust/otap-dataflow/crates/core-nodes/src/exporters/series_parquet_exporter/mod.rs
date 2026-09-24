@@ -1,33 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Series/values Parquet exporter with durable acknowledgements.
+//! `exporter:series_parquet`: the factory and the node's select loop.
 //!
-//! The node owns exactly one ACTIVE block and at most one FLUSHING block. A
-//! request is admitted to the ACTIVE block, and the completion it is owed is
-//! held beside the block until the whole block has been written: an ack means
-//! the request's rows are in object storage, and a failed write nacks every
-//! request of the block as retryable. Admission closes once the ACTIVE block
-//! is waiting to be rotated, which is what stops a third block from being
-//! needed: a request may still join an empty ACTIVE block while the previous
-//! one is being written, but nothing is admitted once that block is itself
-//! waiting for the flush slot. A slow destination therefore becomes
-//! backpressure rather than unbounded memory.
-//!
-//! A request the ACTIVE block cannot take is not refused for it. Its rows are
-//! already extracted, so the extraction is parked, admission closes, and it is
-//! offered to the next block before any newer request. At most one request is
-//! parked, which is what keeps the worker to two blocks and one request.
-//!
-//! Rotation is driven by aligned wall-clock windows: a block covers one
-//! window of the configured interval and is sealed when that window ends, so
-//! the boundary-driven case writes one file set per window rather than one
-//! per request. That is the normal case rather than a guarantee: a block that
-//! fills its byte or request budget is sealed before its window ends, which
-//! puts more than one file set in that window. The
-//! waiting is done on the engine's monotonic clock rather than on an engine
-//! periodic timer, which is cancelled before a node's receivers are drained;
-//! see [`window`] for what that buys.
+//! The block state machine is documented in [`worker`], the window clock in
+//! [`window`], and the operating contract in the README.
 
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -186,12 +163,10 @@ fn physical_memory_bytes() -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Emit the start event, a warning when every core's memory budget together
-/// exceeds physical memory, and one when a file as large as a block could
-/// need more multipart parts than S3 allows.
-///
-/// One event carries everything an operator needs to find this worker's
-/// files -- writer id, boot id, storage -- and the budget it runs under.
+/// Emit the start event (writer id, boot id, storage and budget), a warning
+/// when every core's memory budget together exceeds physical memory, and one
+/// when a file as large as a block could need more multipart parts than S3
+/// allows.
 fn announce(worker: &worker::Worker, startup: &Startup) {
     let budget = worker.budget_bytes();
     let total = budget.saturating_mul(startup.num_cores as u64);
@@ -232,20 +207,7 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
     }
 }
 
-/// Drive one worker until shutdown completes or its deadline elapses.
-///
-/// The branches are ordered: the shutdown deadline outranks everything, so a
-/// node still cancels on time under a boundary that is always ready; then the
-/// window boundary, a resolved flush, completion delivery, the release of a
-/// decided block's flush slot, rotation, and only then a new message.
-/// `accept` is false once the ACTIVE block is waiting to be rotated, which is
-/// what turns a slow destination into backpressure on the channel rather than
-/// a third block. Once shutdown has been latched the node keeps taking
-/// force-drained pdata and refuses each one with a retryable `NodeShutdown`
-/// nack: sent at once when the completion channel has room, and otherwise
-/// queued in the notifier, which the loop keeps serving until the deadline,
-/// as long as it leaves room for every completion the blocks still hold (see
-/// `Notifier::force_shutdown`).
+/// Drive one worker with a test start event; see [`drive`].
 #[cfg(test)]
 async fn run(
     cfg: config::Config,
@@ -305,24 +267,23 @@ fn summarize(worker: &worker::Worker, since: Option<Instant>, deadline_exceeded:
     );
 }
 
-/// The select loop itself, over a worker the caller owns.
+/// Drive one worker until shutdown completes or its deadline elapses.
 ///
-/// Split from [`run`] so a test can inspect the worker the loop drove -- what
-/// it still holds, and how often it was asked to scan itself for telemetry --
-/// after the loop has returned.
+/// The branches are ordered: the shutdown deadline first, so the node cancels
+/// on time under an always-ready boundary; then the window boundary, a
+/// resolved flush, completion delivery, the release of a decided block's
+/// flush slot, rotation, and only then a new message. `accept` is false while
+/// the ACTIVE block waits to be rotated. After the shutdown latch,
+/// force-drained pdata is refused with a retryable `NodeShutdown` nack (see
+/// `Notifier::force_shutdown`). The worker is borrowed so a test can inspect
+/// it after the loop returns.
 async fn drive(
     worker: &mut worker::Worker,
     mut inbox: ExporterInbox<OtapPdata>,
 ) -> Result<TerminalState, Error> {
-    // The Shutdown control message is the end of the inbox, not the start of
-    // the drain: the engine latches it, force-drains the pdata backlog past a
-    // closed admission gate, and releases it only once the upstream channel is
-    // empty and closed, closing the inbox in the same step. So this holds the
-    // deadline it carried, and it is what says both that no further request
-    // can arrive and that receiving again would fail rather than block.
-    // Terminating on an idle worker alone would return while an upstream
-    // sender is still alive, dropping whatever it sends next without a
-    // decision.
+    // The engine releases the Shutdown control message only once the upstream
+    // channel is empty and closed, so its deadline here also means that no
+    // request can arrive and that another receive would fail.
     let mut closed: Option<Instant> = None;
     // When the Shutdown control message arrived, for the drain duration.
     let mut closed_at: Option<Instant> = None;
@@ -331,11 +292,8 @@ async fn drive(
         if let Some(deadline) = closed
             && worker.is_idle()
         {
-            // Sampled here rather than on every turn: the scan is linear in
-            // the number of live requests, so a per-turn sample would cost a
-            // block quadratic time. Telemetry is a collection-time and
-            // terminal-time concern, and the counters that must not be missed
-            // are recorded at the lifecycle transitions themselves.
+            // Sampled at collection and termination only: the scan is linear
+            // in the live requests.
             worker.sample_metrics();
             summarize(worker, closed_at, false);
             return Ok(TerminalState::new(deadline, worker.metric_snapshots()));
@@ -347,7 +305,7 @@ async fn drive(
             biased;
 
             // The deadline outranks every other branch: whatever is still
-            // outstanding is cancelled and decided rather than waited for.
+            // outstanding is cancelled and decided.
             () = async {
                 match deadline {
                     Some(d) => otel_arrow_dfe_engine::clock::sleep_until(d).await,
@@ -373,9 +331,8 @@ async fn drive(
                 notify_turns = 0;
             }
 
-            // A resolved flush is what turns a block's requests into
-            // completions, so it is served before anything that could add to
-            // the next block.
+            // A resolved flush decides a block's requests, so it is served
+            // before anything that could add to the next block.
             done = async {
                 match worker.flushing.as_mut() {
                     Some(job) => job.finish().await,
@@ -401,10 +358,9 @@ async fn drive(
                 notify_turns += 1;
             }
 
-            // A decided block's supervising task still holds the flush slot
-            // until it has released the write it was cancelling, so joining it
-            // is what frees the slot for the next rotation. It owes no
-            // completion, which is why it ranks below the branches that do.
+            // A decided block's task holds the flush slot until it has
+            // released the write it was cancelling; joining it frees the slot.
+            // It owes no completion, so it ranks below the branches that do.
             cleaned = async {
                 match worker.cleaning.as_mut() {
                     Some(job) => job.cleanup().await,
@@ -440,7 +396,7 @@ async fn drive(
                     Ok(Message::PData(data)) => {
                         if let Some(d) = inbox.shutdown_deadline() {
                             // Force-drained: the node is past admission, so the
-                            // request is refused immediately rather than parked.
+                            // request is refused at once.
                             worker.shutdown(d);
                             worker.force_shutdown(data);
                         } else {
@@ -462,23 +418,18 @@ async fn drive(
                     Ok(Message::Control(_)) => {}
                     Err(e) => {
 
-                        // The inbox closes only when it releases the Shutdown
-                        // it latched, so this is the channel failing rather
-                        // than the node shutting down. Nothing more can be
-                        // received and no deadline was granted, so everything
-                        // still held is decided before the error is reported.
+                        // The inbox closes only when it releases the latched
+                        // Shutdown, so this is a channel failure with no
+                        // deadline: everything still held is decided before
+                        // the error is reported.
                         otel_warn!("series_parquet.inbox.failed", error = %e);
                         worker.abandon().await;
                         return Err(e.into());
                     }
                 }
-                // Read after every message the inbox hands over, not only
-                // after the Shutdown control message: the engine latches the
-                // deadline before it releases that message, and anything it
-                // hands over in between -- a force-drained request, a
-                // telemetry collection -- must not leave the worker believing
-                // it still has all the time in the world. The error arm above
-                // returns, so this runs only for a message that arrived.
+                // Read after every message: the engine latches the deadline
+                // before it releases the Shutdown message, and a force-drained
+                // request or a telemetry collection in between must see it.
                 if let Some(deadline) = inbox.shutdown_deadline() {
                     worker.shutdown(deadline);
                 }

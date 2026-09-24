@@ -35,7 +35,7 @@ pub(super) enum Outcome {
     Storage,
     /// The request exceeded `ingress.max_request_bytes`.
     RequestTooLarge,
-    /// The extracted request or one decoded attribute table exceeded
+    /// The extracted request, its decoded attributes included, exceeded
     /// `ingress.max_extracted_bytes`.
     ExtractedTooLarge,
     /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.

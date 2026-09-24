@@ -1,48 +1,13 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! One ACTIVE block, at most one FLUSHING block, and the decisions they owe.
+//! One ACTIVE block, at most one FLUSHING block, one parked request, and the
+//! decisions they owe.
 //!
-//! The worker holds exactly one block open for admission and at most one block
-//! being written. A request is admitted to the ACTIVE block only once
-//! `Block::reserve` has accepted it, so a refusal never leaves the block
-//! mutated. Rotation seals the ACTIVE block and hands it to a
-//! [`FlushJob`](super::flush::FlushJob) together with every completion it
-//! owes; nothing is acknowledged until that write has returned success and the
-//! descriptors it carried have been marked committed against the flushed
-//! block's own partition. A failed write nacks every completion of the block
-//! as retryable, because the rows are not in object storage and the sender is
-//! the only party that still has them.
-//!
-//! There is no third block: while a flush is outstanding the node closes pdata
-//! admission instead of opening another ACTIVE block, so the memory a worker
-//! can hold is bounded by the two blocks and the completions in flight.
-//!
-//! An OTLP request's framing is checked before it is converted (see
-//! `OtapPayload::validate_otlp_framing`), refusing a repeated singular field
-//! as well, because the byte views would store one occurrence where prost
-//! keeps another. Invalid UTF-8 is not refused: the conversion stores it with
-//! U+FFFD, counted in `repaired.invalid_utf8`. Nesting deeper than any
-//! accepted `ingress.max_nesting_depth` is refused by the same walk, before
-//! the conversion's recursive value encoder runs.
-//!
-//! Logs and metrics are admitted through the same state machine and the same
-//! single extraction call; traces have no lake schema and are refused on the
-//! signal alone. A metrics request whose points the lake has no dataset for --
-//! exponential histograms and summaries -- is decided by the configured
-//! `unsupported` policy inside that one extraction call, atomically for the
-//! whole request: `reject` refuses it, `drop` keeps the supported points and
-//! counts the rest. Exemplars, which no dataset stores, are dropped and
-//! counted unless `metrics.exemplars: reject` asks for the request to be
-//! refused. Metadata and exemplar attribute tables are neither read nor
-//! validated, under any policy.
-//!
-//! A block-scoped refusal -- a full block, or one already holding its request
-//! limit -- is not the request's fault, so the request is not nacked for it.
-//! Its extraction is parked in `pending`, admission closes until a block
-//! opens, and the parked request is reserved against that block before any
-//! newer one. Exactly one request is ever parked, so the bound above becomes
-//! two blocks, one request and the completions in flight.
+//! A request is acknowledged only once its block is written and its
+//! descriptors are committed. A block-scoped refusal parks the request instead
+//! of nacking it, and admission closes while a request is parked or a rotation
+//! waits for the flush slot, so the worker never needs a third block.
 
 use super::super::log_gate::LogGate;
 use super::config::Config;
@@ -146,9 +111,8 @@ pub(super) struct OwnedBlock {
     /// Whether this block must repeat descriptors the cache already reports
     /// committed in its partition.
     ///
-    /// True only for the block that replaces one sealed by a byte or request
-    /// threshold inside the same aligned window: that block's descriptors are
-    /// not durable yet, so this one cannot assume them (README.md, "Overview").
+    /// True only for the block that replaces one sealed inside the same aligned
+    /// window (see `Block::reserve_with_reemit`).
     pub(super) reemit: bool,
     /// Descriptor rows admitted to this block, per [`EmitReason`] position.
     ///
@@ -159,9 +123,8 @@ pub(super) struct OwnedBlock {
 
 /// One extracted request waiting for a block that can take it.
 ///
-/// This is what the worker holds instead of the request: the payload and the
-/// record batches the conversion produced are already gone, so parking costs
-/// the extracted rows and the completion and nothing else.
+/// The payload and the conversion's record batches are already gone, so
+/// parking holds only the extracted rows and the completion.
 pub(super) struct Pending {
     /// The rows the request contributed.
     pub(super) extracted: Extracted,
@@ -177,10 +140,8 @@ pub(super) struct Pending {
 /// What preparing one request produced.
 ///
 /// Preparation always decides the request: either its rows are ready to be
-/// offered to a block, or it has failed validation and owes its sender a
-/// refusal. This is an enum rather than a `Result` because neither arm is
-/// propagated -- both are handled at the single call site -- and because a
-/// refusal is a normal outcome of admission, not an error the worker reports.
+/// offered to a block, or it owes its sender a refusal. Both arms are handled
+/// at the single call site, and a refusal is a normal outcome of admission.
 pub(super) enum Prepared {
     /// The request's rows, ready to be offered to a block.
     Ready(Pending),
@@ -213,10 +174,9 @@ pub(super) struct Worker {
     /// The decided block whose supervising task is still releasing what it
     /// owns.
     ///
-    /// This is the same FLUSHING slot, not a third block: it holds no
-    /// completions and no rows the node still owes anything for, only the task
-    /// that has to finish cancelling and aborting an abandoned write before
-    /// another block may be written to the same file names.
+    /// The same FLUSHING slot, not a third block: it owes no completion, and
+    /// holds only the task that must finish cancelling an abandoned write
+    /// before another block may be written to the same file names.
     pub(super) cleaning: Option<FlushJob>,
     /// The one extracted request no block could take yet.
     pub(super) pending: Option<Pending>,
@@ -256,8 +216,8 @@ pub(super) struct Worker {
     pub(super) abandoned: u64,
     /// Registered instruments, once the node has a pipeline context.
     ///
-    /// `None` for a worker driven directly by a test, which keeps every call
-    /// site a no-op rather than requiring a registry.
+    /// `None` for a worker a test drives directly; every call site is then a
+    /// no-op.
     pub(super) metrics: Option<Metrics>,
     /// This worker's share of the process-wide series exporter memory total.
     ///
@@ -317,9 +277,8 @@ impl Worker {
             naming,
             |timeout| clock::sleep_until(flush::deadline_at(clock::now(), timeout)),
         ));
-        // One credit per in-flight request in each of the two blocks a window
-        // pair can hold. Admission stops one short of it, so the last slot is
-        // always free for a force-drained refusal once shutdown is latched.
+        // One credit per request slot of the two blocks (see
+        // `Notifier::has_credit` for the slot kept for shutdown).
         let notify = Notifier::new(effects, 2 * cfg.window.max_requests_per_block);
         let cache = SeriesCache::new(cfg.cache_entries);
         Self {
@@ -381,11 +340,9 @@ impl Worker {
 
     /// Whether one more request may be admitted.
     ///
-    /// Admission stops while a rotation is pending, because the request would
-    /// land in a block that is about to be sealed and the flush slot is
-    /// already spoken for; it stops for good once shutdown has been latched;
-    /// and it stops whenever admitting one more request could leave the
-    /// notifier without the credit it needs to decide it.
+    /// Admission stops while a rotation is pending or a request is parked, for
+    /// good once shutdown has been latched, and whenever one more request
+    /// could leave the notifier without the credit to decide it.
     pub(super) fn accept(&self) -> bool {
         self.deadline.is_none()
             && !self.rotation_requested
@@ -395,20 +352,10 @@ impl Worker {
 
     /// Validate one request, extract its rows and release its payload.
     ///
-    /// The returned value is what the worker may have to hold until the next
-    /// block opens, so nothing of the request's own representation survives
-    /// the call: the pdata is consumed, the transport frames and claims are
-    /// dropped inside [`AckToken::split`], and the conversion records are
-    /// dropped here. Only the extracted rows and the completion remain.
-    ///
-    /// Nothing in here touches a block, so a request that fails validation
-    /// leaves the ACTIVE block exactly as it was.
+    /// Only the extracted rows and the completion survive the call: the
+    /// transport frames and claims are dropped inside [`AckToken::split`] and
+    /// the conversion records here. Nothing here touches a block.
     pub(super) fn prepare(&self, data: OtapPdata) -> Prepared {
-        // The completion is retained across a storage round trip before it is
-        // handed back, so the token keeps only the routing frames: the payload
-        // is taken out here and the inbound credentials and the claims derived
-        // from them are dropped inside `split`, rather than staying resident
-        // for the duration of the write.
         let (token, mut payload) = AckToken::split(data);
         // `num_bytes` is an estimate of the wire representation, so the budget
         // is also enforced on the measured extracted output inside `extract`.
@@ -423,11 +370,8 @@ impl Worker {
                 })),
             );
         }
-        // Logs and metrics share one admission path; traces have no lake
-        // schema at all, so they are refused on the signal alone, before any
-        // conversion. The `unsupported` policy governs unsupported metric
-        // points inside a request the lake does have a schema for, so it does
-        // not apply here.
+        // Traces have no lake schema, so they are refused on the signal alone,
+        // before any conversion and whatever the `unsupported` policy says.
         if payload.signal_type() == otel_arrow_dfe_config::SignalType::Traces {
             return Prepared::Failed(
                 token,
@@ -452,7 +396,8 @@ impl Worker {
     }
 
     /// Refuse an OTLP body whose protobuf framing is broken at any depth, or
-    /// that repeats a singular field (see the module documentation).
+    /// that repeats a singular field (see
+    /// `otel_arrow_dfe_pdata::views::otlp::bytes::validate`).
     ///
     /// A body nesting values deeper than the walk's own bound is deeper than
     /// any `ingress.max_nesting_depth` too, so it is refused as that limit
@@ -484,8 +429,7 @@ impl Worker {
     /// Convert one payload and extract its rows, dropping the conversion;
     /// also returns how many string values the conversion repaired.
     ///
-    /// Split out so the record batches the conversion produced go out of scope
-    /// with the call rather than living as long as the extraction does.
+    /// Split out so the conversion's record batches are dropped with the call.
     fn extract(&self, payload: OtapPayload) -> lake::Result<(Extracted, u64)> {
         let (records, repaired): (Result<OtapArrowRecords, _>, u64) =
             count_utf8_repairs(|| payload.try_into_with_default());
@@ -554,12 +498,10 @@ impl Worker {
             self.active.reemit,
         ) {
             Ok(reservation) => reservation,
-            // The block-scoped refusals judge whichever block happened to
-            // be active, so the request waits for the next one. An empty
-            // block cannot refuse this way -- a request it does not fit is
-            // `RequestTooLarge` -- so parking here can never become an
-            // endless rotation; the guard makes that a checked fact rather
-            // than an inference about `reserve`.
+            // A block-scoped refusal judges whichever block is active, so the
+            // request waits for the next one. An empty block refuses a request
+            // it cannot fit as `RequestTooLarge`, and the guard checks it, so
+            // parking can never become an endless rotation.
             Err(lake::Error::Refused(
                 reason @ (lake::RefuseReason::BlockFull | lake::RefuseReason::TooManyRequests),
             )) if !self.active.data.is_empty() => {
@@ -602,11 +544,8 @@ impl Worker {
                 for (total, count) in self.active.emitted.iter_mut().zip(emitted) {
                     *total += count;
                 }
-                // The window boundary is the normal rotation trigger; these
-                // two only bring it forward, so a burst is written as soon as
-                // it has filled a block rather than held until the boundary.
-                // A rotation that was already owed stays owed: an admission
-                // cannot cancel a boundary that has been consumed.
+                // The thresholds bring the rotation forward; a rotation
+                // already owed for a consumed boundary stays owed.
                 if self.active.data.bytes >= self.cfg.window.max_block_bytes {
                     self.reason = FlushReason::Bytes;
                     self.rotation_requested = true;
@@ -617,10 +556,9 @@ impl Worker {
                 }
             }
             Err(error) => {
-                // A failed admission leaves the block partially updated by
-                // contract, so the whole ACTIVE block is failed rather than
-                // written. The failure is in memory, not in storage, and the
-                // co-tenants are not at fault.
+                // A failed admission leaves the block partially updated, so
+                // the whole ACTIVE block is failed as internal: the failure is
+                // in memory and the co-tenants are not at fault.
                 self.refuse(pending.token, &error);
                 self.fail_active(Outcome::Internal);
             }
@@ -692,16 +630,9 @@ impl Worker {
     /// An empty block for the current window, after the one in hand.
     ///
     /// The window start never moves backwards, so a wall clock that steps back
-    /// cannot make a later block claim an earlier partition.
-    ///
-    /// A parked request also pulls the start forward to its own window, and it
-    /// does so through the same floor: parking one consumed its boundary, so
-    /// the window clock cannot report anything earlier afterwards. Without
-    /// that, a wall clock that steps back between parking a request and opening
-    /// the next block would produce a block the parked request is once again
-    /// too late for: it would be parked again, rotated again, and the node
-    /// would spin opening empty blocks. The parked request is the reason this
-    /// block is being opened, so the block is opened for its window.
+    /// cannot make a later block claim an earlier partition. A parked request
+    /// consumed its boundary when it was parked, so the block opened for it
+    /// covers its window even if the wall clock stepped back since.
     fn new_active(&mut self) -> OwnedBlock {
         let secs = nanos_to_secs(self.wall.now_unix_nanos());
         let start = self
@@ -740,12 +671,10 @@ impl Worker {
     /// Seal the ACTIVE block and start writing it.
     ///
     /// An empty ACTIVE block writes nothing, so it is replaced at once,
-    /// whatever holds the flush slot: waiting for an unrelated write to finish
-    /// would only keep admission closed across a window boundary. Otherwise
-    /// this is a no-op while the flush slot is taken -- by a write, or by the
-    /// cleanup of one that has already been decided: the rotation stays
-    /// requested and is served once the slot frees, which is what keeps the
-    /// worker to two blocks and keeps two writes off the same file names.
+    /// whatever holds the flush slot. Otherwise this is a no-op while the slot
+    /// is taken, by a write or by the cleanup of a decided one: the rotation
+    /// stays requested and is served once the slot frees, so two writes never
+    /// share file names.
     pub(super) fn rotate(&mut self) {
         if self.active.data.is_empty() {
             // A request without rows is acknowledged before it reaches a
@@ -755,9 +684,8 @@ impl Worker {
                 "an empty block holds no completion"
             );
             self.rotation_requested = false;
-            // A parked request may be waiting for a later window than the one
-            // this empty block was opened for, so the block is replaced rather
-            // than kept; otherwise the resume would park it again.
+            // Replaced, not kept: a parked request may be waiting for a later
+            // window than this empty block's.
             self.active = self.new_active();
             return;
         }
@@ -778,8 +706,8 @@ impl Worker {
             self.fail_active(Outcome::Internal);
             return;
         }
-        // Counted here rather than on every rotation call: an empty block is
-        // replaced without a write, so it is not a flush.
+        // Counted here: an empty block is replaced without a write, which is
+        // not a flush.
         if let Some(metrics) = &mut self.metrics {
             metrics
                 .flush
@@ -945,22 +873,19 @@ impl Worker {
         for token in std::mem::take(&mut job.tokens) {
             self.notify.push_with(token, outcome, reason.clone());
         }
-        // The job keeps the FLUSHING slot until its task has released the
-        // block, the sink handle and the write future it owns. It owes no
-        // completion from here on, so nothing a producer waits for is held by
-        // it; what it holds back is the next write to the same file names.
+        // The job keeps the FLUSHING slot, owing no completion, until its task
+        // has released the block, the sink handle and the write future, so no
+        // next write reuses the same file names.
         self.cleaning = Some(job);
     }
 
     /// Bytes this worker's configuration allows it to hold: two blocks, one
     /// parked extraction, a full descriptor cache, a token per request slot,
     /// and the sort, merge, writer, upload and conversion workspaces a flush
-    /// may allocate. Those workspace terms are engineering reservations
-    /// rather than measurements.
+    /// may allocate. The workspace terms are reservations, not measurements.
     ///
-    /// Every term is derived from unbounded configuration values, so the
-    /// arithmetic saturates rather than overflowing: a budget written to mean
-    /// "no practical limit" reports `u64::MAX`, not a panic.
+    /// The arithmetic saturates, so an effectively unlimited configuration
+    /// reports `u64::MAX`.
     pub(super) fn budget_bytes(&self) -> u64 {
         let token = self.token_high_water.max(self.notify.token_high_water()) as u64;
         let cfg = &self.cfg.lake;
@@ -1030,29 +955,22 @@ impl Worker {
     /// Record whether pdata admission is open on this loop turn.
     ///
     /// A gate closed by the latched shutdown is not backpressure, so it ends
-    /// any closure in progress rather than starting one.
+    /// any closure in progress.
     pub(super) fn observe_admission(&mut self, accept: bool) {
         self.admission.observe(accept || self.deadline.is_some());
     }
 
-    /// Publish everything the worker can be asked about right now.
+    /// Publish the gauges and the accounted total, on `CollectTelemetry` and
+    /// before every terminal snapshot.
     ///
-    /// Called on `CollectTelemetry` and before every terminal snapshot, so the
-    /// gauges describe the state the node is actually in at the moment it is
-    /// asked rather than the state it was in when something last happened.
-    ///
-    /// The accounted total is exactly what the worker retains: the ACTIVE
-    /// block, the FLUSHING block with its merge keys and its live flush
-    /// workspace, the one parked request, the completions the notifier
-    /// holds, the bounded descriptor cache, and the spare capacity of the two
-    /// token vectors. The budget is the same shape derived from
-    /// configuration, plus the sort, merge, writer, upload and conversion
-    /// workspaces a flush may allocate. Those workspace terms are engineering
-    /// reservations, not measurements.
+    /// The accounted total is what the worker retains: the ACTIVE block, the
+    /// FLUSHING block with its merge keys and live flush workspace, the parked
+    /// request, the notifier's completions, the descriptor cache and the spare
+    /// capacity of the two token vectors. The budget terms are documented on
+    /// [`Worker::budget_bytes`].
     pub(super) fn sample_metrics(&mut self) {
-        // A worker with no registered instruments -- every worker a test
-        // drives directly -- would compute the whole sample only to discard
-        // it, including the linear scan over the live tokens.
+        // A worker without instruments, one a test drives directly, skips the
+        // scan over the live tokens.
         if self.metrics.is_none() {
             return;
         }
@@ -1091,13 +1009,10 @@ impl Worker {
                 .chain(self.cleaning.iter())
                 .map(|job| job.tokens.capacity().saturating_sub(job.tokens.len()))
                 .sum::<usize>();
-        // The flushing block's merge also holds the encoded sort key of
-        // every row of the table it is writing, for as long as that table's
-        // write lasts; the sink reports those bytes and they are charged here.
+        // The merge keys of the table being written, as the sink reports them.
         let merge_keys = self.sink.merge_key_bytes();
-        // And its merge chunk, encoder buffers and unacknowledged upload
-        // bytes, read live: the write returns to this loop between bounded
-        // steps, so a sample taken during a flush sees what it holds now.
+        // The write's merge chunk, encoder buffers and unacknowledged upload
+        // bytes, read live between its bounded steps.
         let workspace = self.sink.flush_workspace_bytes();
         let accounted = self.active.data.bytes as u64
             + flushing as u64
@@ -1183,10 +1098,8 @@ impl Worker {
 
     /// Serve a window boundary that has fired.
     ///
-    /// The boundary is the trigger of whatever rotation follows it, whatever a
-    /// byte or request threshold asked for earlier: a block sealed because its
-    /// window ended must not be reported under a reason left behind by a
-    /// threshold that never got to rotate.
+    /// The boundary becomes the reason of the rotation that follows, replacing
+    /// a threshold reason that never got to rotate.
     pub(super) fn wake_window(&mut self) {
         if self.window.wake() {
             self.reason = FlushReason::Time;
@@ -1202,8 +1115,7 @@ impl Worker {
     /// The earliest deadline wins, so a second, tighter shutdown cannot extend
     /// the first.
     pub(super) fn shutdown(&mut self, deadline: Instant) {
-        // Nothing will open another block, so the parked request is decided
-        // now rather than waiting for a rotation that will not serve it.
+        // No block will open for the parked request, so it is decided now.
         if let Some(pending) = self.pending.take() {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
@@ -1228,37 +1140,17 @@ impl Worker {
 
     /// Decide everything still owned, once the shutdown deadline has elapsed.
     ///
-    /// A flush that has already published its decision is decided by that
-    /// decision first: the deadline branch outranks the branch that awaits the
-    /// flush result, so it can win the same poll in which a successful write
-    /// finished, and a block whose files exist must be acknowledged rather than
-    /// refused.
-    ///
-    /// The whole decision is taken and delivered before anything is cancelled,
-    /// and it is taken without a single await: the parked write cannot run
-    /// between the two halves, so no completion can be waiting behind the
-    /// unwinding of the write it belongs to. A completion the engine cannot
-    /// take immediately is counted as a delivery failure and released, so no
-    /// request is left undecided whatever the destination is doing.
-    ///
-    /// Only then are the two slot holders cancelled and released. Both are
-    /// awaited until one shared cutoff, `upload.abort_timeout` after the
-    /// latched deadline (see `flush::cleanup_cutoff`), because a task that is
-    /// still unwinding owns the block, the sink handle and possibly a multipart
-    /// abort in flight; returning while it does would leave that abort to be
-    /// cancelled by runtime teardown and the upload to be reclaimed by the
-    /// bucket's lifecycle rule instead. The wait ends in an abort that is
-    /// itself awaited, so a destination that never answers cannot hold the
-    /// node open past that cutoff, however late the deadline is observed.
+    /// A flush that has already published its decision is decided by it (see
+    /// [`FlushJob::try_finish`]). Every other completion is then decided and
+    /// delivered without an await, a completion the engine cannot take being
+    /// counted as a delivery failure. Only then are the two slot holders
+    /// cancelled and awaited until one shared cutoff (see
+    /// [`flush::cleanup_cutoff`]); past it each task is aborted and the abort
+    /// awaited, so an unresponsive destination cannot hold the node open.
     pub(super) async fn abandon(&mut self) {
-        // Phase zero: a flush that has already published its decision is
-        // decided by that decision, not by the deadline. The loop's deadline
-        // branch is biased above the branch that awaits the flush result, so
-        // the deadline can win the very poll in which a successful write
-        // finished; nacking that block would tell the producer to resend rows
-        // whose files already exist. Taking the result here also commits the
-        // descriptors it carried, and moves the job into the cleaning slot
-        // that phase two releases.
+        // Phase zero: a published decision wins over the deadline; taking it
+        // also commits its descriptors and moves the job into the cleaning
+        // slot that phase two releases.
         if let Some(job) = &mut self.flushing
             && let Some(done) = job.try_finish()
         {
@@ -1277,11 +1169,8 @@ impl Worker {
         let mut flushing = self.flushing.take();
         if let Some(job) = &mut flushing {
             abandoned += job.tokens.len() as u64;
-            // Reported exactly as the `Error::Cancelled` completion branch
-            // reports it: the write will not put its block in object storage,
-            // and the reason it will not is that it is about to be cancelled.
-            // Deciding the block here instead of awaiting its result must not
-            // make that flush vanish from the counters.
+            // Counted as the cancelled branch of `complete` counts it, so the
+            // flush does not vanish from the counters.
             if let Some(metrics) = &mut self.metrics {
                 metrics.worker.flush_duration.record(
                     clock::now()

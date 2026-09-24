@@ -3,18 +3,11 @@
 
 //! Bounded operational metrics for one series exporter worker.
 //!
-//! Every label on every instrument here comes from a closed enumeration or
-//! from a physical column name fixed by configuration at startup. Nothing that
-//! a request can influence -- an error string, an object store path, a request
-//! id, a series id or a producer id -- is ever used as a label, so a hostile
-//! or merely unusual workload cannot grow the metric cardinality this node
-//! registers.
-//!
-//! The counters divide into three kinds. Delta counters (`Counter`) report
-//! what happened since the last collection. Observed counters
-//! (`ObserveCounter`) mirror a monotonic total the worker already keeps, so
-//! the value is republished rather than accumulated twice. Gauges report the
-//! worker's state at the moment it was sampled.
+//! Every label comes from a closed enumeration or from a physical column name
+//! fixed by configuration at startup, never from an error string, a path or an
+//! id a request carries. Delta counters report what happened since the last
+//! collection, observed counters republish a total the worker keeps, and
+//! gauges report the state at the moment of sampling.
 
 use super::outcome::{Outcome, WriteFailure};
 use otel_arrow_dfe_config::SignalType;
@@ -442,9 +435,8 @@ impl Metrics {
     ///
     /// Called exactly once per request, when it is extracted; resuming a
     /// parked request never counts its extraction again. A mismatch reported
-    /// for a column that was not configured is ignored rather than registered
-    /// on the spot, which is what keeps the column label bounded by
-    /// configuration.
+    /// for a column that was not configured is ignored, so the column label
+    /// stays bounded by configuration.
     pub(super) fn extracted(&mut self, stats: &ExtractStats) {
         self.worker
             .timestamp_out_of_range

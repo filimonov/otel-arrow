@@ -1,48 +1,12 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The one outstanding flush, split between a task and its owner.
+//! The one outstanding flush, split between a write task and its owner.
 //!
-//! A rotated block becomes a [`FlushJob`]: the sealed data is moved into a
-//! local task that writes it, while the completions the block still owes stay
-//! behind in the job. Both halves remain one logical FLUSHING block. Keeping
-//! the tokens outside the task is what lets the node decide them on a shutdown
-//! deadline without first waiting for a wedged multipart upload to unwind, and
-//! it means a task that panics cannot take the routing contexts with it.
-//!
-//! The task supervises the write rather than performing a single attempt. A
-//! storage failure is retried, with exponential backoff, until an absolute
-//! deadline taken once when the block was sealed -- not a per-attempt timeout,
-//! which a destination that fails slowly could extend without bound. Retries
-//! rewrite the same sealed block, so the file names and the bytes of every
-//! attempt are identical and a retry overwrites whatever a failed attempt left
-//! behind rather than adding a second copy of the same rows.
-//!
-//! Shutdown can only bring that deadline forward, to the latched shutdown
-//! deadline (see [`Limit`]).
-//!
-//! The deadline decides the producer immediately. The block's requests are
-//! told the write failed as soon as the deadline passes, over a oneshot
-//! channel, while the task stays behind to cancel the write and give the sink
-//! its bounded chance to abort a multipart upload. That is why the result
-//! travels separately from the join handle: waiting for the task would tie a
-//! producer's nack to a cleanup that may legitimately take the whole
-//! `upload.abort_timeout`. The job keeps holding the FLUSHING slot until that
-//! cleanup has finished, so a next block never writes while an abandoned
-//! attempt on the same names might still be in flight.
-//!
-//! Dropping the job cancels the write. The sink treats its cancellation token
-//! as a request to abort the upload rather than finish it while the upload is
-//! still writable. That does not make a cancelled or expired block leave no
-//! file behind: an object whose upload was already being finalized when the
-//! token fired may still complete, and so may one whose write finished in the
-//! very poll the deadline expired in if the owner has stopped listening. Such
-//! a file holds rows whose requests were nacked, which the producer's retry
-//! then writes again -- a duplicate that at-least-once delivery permits, never
-//! a loss; [`Trace::cleaned_up`] reports how each cancelled write unwound,
-//! probing the objects when it cannot tell. What the deadline does guarantee
-//! is that a write that has finished when it is polled is reported as the
-//! success it is, see [`write_until`].
+//! A rotated block's rows move into a local task that retries storage errors
+//! until an absolute deadline, while its completions stay in the [`FlushJob`],
+//! so the owner can decide them at a deadline without waiting for the task to
+//! unwind.
 
 use super::token::AckToken;
 use object_store::path::Path;
@@ -65,16 +29,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// Fallback horizon when `base + delta` is not representable.
 const FAR_FUTURE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// `base + delta`, saturated rather than panicking.
-///
-/// `Instant::add` panics on overflow, and every duration here is
-/// user-configurable: a `flush_retry_deadline` or an `abort_timeout` written
-/// as an absurd number of seconds would otherwise take the node down instead
-/// of behaving like the unreachable deadline the user asked for. Saturating
-/// upwards is the safe direction -- a deadline that is further away only means
-/// more retrying -- so the fallback is a year out, and finally `base` itself on
-/// a clock so close to the end of its representable range that even that does
-/// not fit.
+/// `base + delta`, saturating to a year out and then to `base`, because
+/// `Instant::add` panics on overflow and every duration here is
+/// user-configurable.
 pub(super) fn deadline_at(base: Instant, delta: Duration) -> Instant {
     base.checked_add(delta)
         .or_else(|| base.checked_add(FAR_FUTURE))
@@ -137,9 +94,8 @@ pub(super) struct FlushDone {
     /// The sealed block, handed back so its descriptors and partition are
     /// available to the commit that only a successful write may perform.
     ///
-    /// Shared rather than moved, because the supervising task may still be
-    /// unwinding a cancelled attempt over the same block when the decision is
-    /// published.
+    /// Shared: the supervising task may still be unwinding a cancelled attempt
+    /// over the same block when the decision is published.
     pub(super) data: Rc<lake::buffer::Block>,
     /// What the sink returned.
     pub(super) result: lake::Result<lake::sink::FlushReport>,
@@ -150,10 +106,9 @@ pub(super) struct FlushDone {
 /// Write one sealed block, retrying storage failures until the deadline
 /// `limit` holds.
 ///
-/// The write is polled before the cancellation and the deadline: a write that
-/// has finished by the poll in which the deadline also expires is a success
-/// whose files exist, and nacking it would tell the producer to resend rows
-/// that are already durable. No attempt starts at or after the deadline.
+/// The write is polled before the cancellation and the deadline, so a write
+/// that finished in the poll the deadline expires in is reported as a
+/// success. No attempt starts at or after the deadline.
 ///
 /// The result is published over `result_tx` the moment it is known. The task
 /// returns only once it has released everything it owns: on the deadline path
@@ -171,8 +126,7 @@ async fn write_until(
 ) {
     let mut attempts = 0_u64;
     let mut delay = FIRST_BACKOFF;
-    // The failure of the last attempt, so the deadline reports what the
-    // destination actually said rather than the fact that time ran out.
+    // The last attempt's failure, which the deadline error carries.
     let mut last: Option<lake::Error> = None;
     let done = |attempts, result| FlushDone {
         data: Rc::clone(&data),
@@ -197,17 +151,8 @@ async fn write_until(
         }
         attempts += 1;
         trace.attempts.set(attempts);
-        // The names this attempt will write, announced before it writes them,
-        // so an operator can see that a retry rewrites objects rather than
-        // adding any.
-        //
-        // The first attempt of a flush is the ordinary case and says nothing
-        // an operator needs at INFO -- one line per written block already
-        // exists -- so it is emitted at DEBUG. A retry is the event worth
-        // reporting, and it is rare by construction. The file name is a log
-        // field only: it is unbounded in cardinality (window, boot id and
-        // sequence all move) and never labels a metric, where attempts are
-        // counted instead.
+        // DEBUG on the first attempt, INFO on a retry; the file name is a log
+        // field, never a metric label.
         let remaining = limit.at().saturating_duration_since(clock::now());
         if attempts > 1 {
             let retries = &trace.shared.tally.retries;
@@ -270,11 +215,8 @@ async fn write_until(
                 return;
             }
         };
-        // Every failed attempt is reported with what the destination said,
-        // whether or not it is retried, not only the failure the flush finally
-        // ends with: an outage that the next attempt survives would otherwise
-        // leave no trace at all, and a failure that ends the flush at once is
-        // then logged per attempt exactly like a retried one.
+        // Every failed attempt is logged with what the destination said,
+        // retried or not.
         if let Err(error) = &result {
             trace.attempt_failed(attempts, limit.at(), error);
         }
@@ -426,8 +368,8 @@ impl Trace {
     ///
     /// A write that completed anyway is a late commit. One whose abort
     /// failed, or that never unwound, may have left a multipart upload to the
-    /// bucket's lifecycle rule. Any other cancellation is ambiguous -- the
-    /// store may have finished the upload and lost its response -- so the
+    /// bucket's lifecycle rule. Any other cancellation is ambiguous, since the
+    /// store may have finished the upload and lost its response, so the
     /// objects are probed until `cutoff`.
     pub(super) async fn cleaned_up(
         &self,
@@ -565,10 +507,8 @@ fn abort_failure(error: &lake::Error) -> Option<&str> {
 
 /// The outcome of a flush whose retry deadline expired.
 ///
-/// Carries the failure of the last attempt that returned, so the producer
-/// and the log are told what the destination said rather than only that time
-/// ran out, and it is a distinct error rather than a cancellation, so a
-/// storage hang is never counted as a shutdown.
+/// Carries the last attempt's failure, and is distinct from a cancellation so
+/// a storage hang is never counted as a shutdown.
 fn expired(attempts: u64, last: Option<lake::Error>) -> lake::Error {
     lake::Error::Transient(lake::TransientError::DeadlineExceeded {
         attempts,
@@ -687,7 +627,7 @@ impl FlushJob {
     /// Cancellation safe: the decision stays in the channel, so a dropped poll
     /// neither cancels the write nor loses what it returned. This resolves at
     /// the retry deadline even when the attempt in flight has not unwound yet;
-    /// [`FlushJob::cleanup`] is what waits for that.
+    /// [`FlushJob::cleanup`] waits for that.
     pub(super) async fn finish(
         &mut self,
     ) -> Result<FlushDone, tokio::sync::oneshot::error::RecvError> {
@@ -696,12 +636,10 @@ impl FlushJob {
 
     /// Take the flush's decision if it has already been published.
     ///
-    /// Non-blocking, and never waits for the supervising task. The node's
-    /// shutdown-deadline branch is biased above the branch that awaits this
-    /// result, so the deadline can win the very poll in which a successful
-    /// write has already published its report. A block whose files exist has
-    /// to be acknowledged rather than nacked, or the producer is told to
-    /// resend rows that are already durable.
+    /// Non-blocking. The node's shutdown-deadline branch is biased above the
+    /// branch that awaits this result, so the deadline can win the poll in
+    /// which a successful write published its report; taking it here keeps a
+    /// block whose files exist acknowledged.
     ///
     /// `None` also covers a supervising task that died without sending, which
     /// the caller then decides exactly as it decides an unresolved flush.
@@ -719,23 +657,18 @@ impl FlushJob {
     ///
     /// Cancellation safe, and bounded by the sink's `upload.abort_timeout`
     /// once the decision has been published. The FLUSHING slot stays occupied
-    /// until this returns, which is what keeps a next block from writing the
-    /// same file names while an abandoned attempt might still be in flight.
+    /// until this returns, so no next block writes the same file names while
+    /// an abandoned attempt may still be in flight.
     pub(super) async fn cleanup(&mut self) -> Result<(), JoinError> {
         (&mut self.handle).await
     }
 
     /// Cancel the write and release the task, within `deadline`.
     ///
-    /// This is the terminal counterpart of [`FlushJob::cleanup`]: the node has
-    /// stopped serving its loop, so nothing will join the task later and
-    /// returning while it still owns the block, the sink handle and a
-    /// half-finished multipart abort would leave that abort to be cancelled by
-    /// runtime teardown. Waiting is bounded because the destination may be the
-    /// reason the node is shutting down: past `deadline` the task is aborted
-    /// and the abort itself is awaited, so the task is provably gone rather
-    /// than merely asked to stop. An aborted task that had started a write
-    /// is reported as a cleanup whose abort failed.
+    /// The terminal counterpart of [`FlushJob::cleanup`]: nothing joins the
+    /// task later, so it is awaited until `deadline`, then aborted and the
+    /// abort awaited. An aborted task that had started a write is reported as
+    /// a cleanup whose abort failed.
     pub(super) async fn shutdown(&mut self, deadline: Instant) {
         self.cancel.cancel();
         let joined = tokio::select! {
