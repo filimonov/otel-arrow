@@ -250,16 +250,22 @@ OTLP receiver with performance metrics:
 OTLP/gRPC receiver writing a local series/values Parquet lake:
 
 - Receives OTLP logs on `127.0.0.1:4317` with `wait_for_result: true`
-- Writes series and values Parquet datasets under `/tmp/series-parquet`
+- Writes series and values Parquet datasets under
+  `/var/lib/otap/series-parquet`
+- Takes about 7k records/s per worker in requests of 512 records: each OK
+  waits on average half a 15s window plus the flush, and the receiver holds at
+  most 128 requests
+- View metrics at: `http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false`
 
 Requires a binary built with `--features series-parquet`. Create the base
-directory before starting. An OK OTLP response means the request's files are
-in place under the base directory; the local backend does not `fsync`, so they
-survive a crash of the engine, not necessarily of the host. Clients should
-retry timeouts and transient failures and tolerate duplicates. Logs and metric
-number and histogram points are stored; traces are refused, and exponential
-histogram and summary points are dropped and counted (`unsupported: drop`, the
-default) or, under `unsupported: reject`, refuse their whole request.
+directory, owned by the engine's user, before starting. An OK OTLP response
+means the request's files are in place under the base directory; the local
+backend does not `fsync`, so they survive a crash of the engine, not necessarily
+of the host. Clients should retry timeouts and transient failures and tolerate
+duplicates. Logs and metric number and histogram points are stored; traces are
+refused, and exponential histogram and summary points are dropped and counted
+(`unsupported: drop`, the default) or, under `unsupported: reject`, refuse their
+whole request.
 
 ### `series-parquet-s3.yaml`
 
@@ -268,9 +274,12 @@ The same pipeline writing to an S3-compatible object store:
 - Receives OTLP on `127.0.0.1:4317` with `wait_for_result: true`
 - Writes the series and values datasets under `s3://series-test/otel`
 - Retries object-store operations with an explicit backoff schedule
+- View metrics at: `http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false`
 
 Requires a binary built with `--features series-parquet,aws` and an existing
-bucket. The static credentials come from `SERIES_S3_ACCESS_KEY_ID` and
+bucket with a lifecycle rule that aborts incomplete multipart uploads
+(`AbortIncompleteMultipartUpload`, for example after one day). The static
+credentials come from `SERIES_S3_ACCESS_KEY_ID` and
 `SERIES_S3_SECRET_ACCESS_KEY` in the environment and must name the
 credentials of a local MinIO or RustFS container; production deployments use
 the shared AWS auth provider configuration. An OK OTLP response means the
@@ -289,7 +298,8 @@ The reference deployment for Grafana Alloy producers: the S3 pipeline with a
   drain ends within its 60s grace
 
 Requires a binary built with `--features series-parquet,aws,durable-buffer`,
-an existing bucket and the WAL directory. Sizing, alerts and failure behaviour:
+an existing bucket with the same lifecycle rule, and the WAL directory. Metrics
+are served as for `series-parquet-s3.yaml`. Sizing, alerts and failure behaviour:
 the series_parquet exporter README, "Deploying with Alloy".
 
 ### `series-parquet.alloy`

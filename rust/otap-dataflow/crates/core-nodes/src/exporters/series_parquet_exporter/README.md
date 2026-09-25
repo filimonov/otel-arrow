@@ -45,7 +45,7 @@ whose OK means the rows are in the bucket. From `rust/otap-dataflow`:
 
 ```bash
 cargo build -p otel-arrow-dfe --bin df_engine --features series-parquet,aws
-mkdir -p /tmp/series-parquet
+sudo install -d -o "$USER" /var/lib/otap/series-parquet
 ./target/debug/df_engine --config configs/series-parquet-local.yaml --validate-and-exit
 ./target/debug/df_engine --config configs/series-parquet-local.yaml --http-admin-bind 127.0.0.1:8080
 ```

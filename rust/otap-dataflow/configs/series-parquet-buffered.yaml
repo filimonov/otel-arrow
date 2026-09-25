@@ -26,6 +26,14 @@
 # inside that grace; what it has not written stays in the WAL and is sent
 # after the restart.
 #
+# The bucket needs a lifecycle rule that aborts incomplete multipart uploads
+# (AbortIncompleteMultipartUpload, for example after one day): an upload a
+# failed write could not abort is left to it and counted in
+# flush.abort_failures.
+#
+# Metrics: http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false
+# with --http-admin-bind 127.0.0.1:8080.
+#
 # Usage:
 #   df_engine --config configs/series-parquet-buffered.yaml \
 #     --http-admin-bind 127.0.0.1:8080

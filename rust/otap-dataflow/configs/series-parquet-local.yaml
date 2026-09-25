@@ -8,12 +8,21 @@
 # `wait_for_result: true`, so an OK OTLP response means the request's files
 # are in place; the local backend does not fsync, so they survive an engine
 # crash, not necessarily a host crash. Build with
-# `--features series-parquet` and create the base directory before starting.
+# `--features series-parquet` and create the base directory, owned by the
+# engine's user, before starting.
+#
+# Throughput: each OK waits for its block, on average half a window plus the
+# flush (7.5s + 2s), and the receiver holds at most max_concurrent_requests
+# (128) at once, so one worker takes about 128 / 9.5s = 13 requests/s, some
+# 7k records/s at 512 records per request. Raise max_concurrent_requests
+# with the pdata channel for more (series-parquet-s3.yaml shows the formula).
 #
 # Usage:
-#   mkdir -p /tmp/series-parquet
+#   sudo install -d -o "$USER" /var/lib/otap/series-parquet
 #   df_engine --config configs/series-parquet-local.yaml \
 #     --http-admin-bind 127.0.0.1:8080
+#
+# Metrics: http://127.0.0.1:8080/telemetry/metrics?format=prometheus&reset=false
 version: otel_dataflow/v1
 policies:
   resources:
@@ -45,7 +54,7 @@ groups:
           exporter:
             type: exporter:series_parquet
             config:
-              storage: {file: {base_uri: /tmp/series-parquet}}
+              storage: {file: {base_uri: /var/lib/otap/series-parquet}}
               writer_id: local_1
               producer_id_attribute: host.id
               window:
