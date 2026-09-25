@@ -218,9 +218,9 @@ pub enum StorageType {
         virtual_hosted_style_request: Option<bool>,
 
         /// Whether requests are signed with SigV4 `UNSIGNED-PAYLOAD` instead
-        /// of a SHA-256 of every uploaded byte. Unset, payloads are signed,
-        /// unless the exporter resolves the option first
-        /// ([`StorageType::with_unsigned_payload_over_tls`]).
+        /// of a SHA-256 of every uploaded byte. Unset, `AWS_UNSIGNED_PAYLOAD`
+        /// decides, and without it the constructor's
+        /// [`UnsignedPayloadDefault`].
         unsigned_payload: Option<bool>,
 
         /// The auth settings, see [cloud_auth::aws::AuthMethod]
@@ -228,51 +228,19 @@ pub enum StorageType {
     },
 }
 
-/// Whether an S3 store's requests go over TLS: the endpoint, or without one
-/// the base URI, is not a plain `http://` URL. The AWS endpoints an `s3://`
-/// base URI resolves to are HTTPS.
-#[cfg(feature = "aws")]
-#[must_use]
-pub fn s3_uses_tls(base_uri: &str, endpoint: Option<&str>) -> bool {
-    let url = endpoint.unwrap_or(base_uri);
-    !url.get(..7)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+/// What an S3 store does when neither the storage section's
+/// `unsigned_payload` nor `AWS_UNSIGNED_PAYLOAD` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsignedPayloadDefault {
+    /// Every payload is signed.
+    Signed,
+    /// `UNSIGNED-PAYLOAD` unless a request can go over plain HTTP: the
+    /// endpoint resolved from the section and the environment is an
+    /// `http://` URL and HTTP is allowed.
+    OverTls,
 }
 
 impl StorageType {
-    /// The same storage with an unset S3 `unsigned_payload` resolved to
-    /// whether the store uses TLS ([`s3_uses_tls`]); any other storage, and
-    /// an explicit value, unchanged. The shared constructor leaves an unset
-    /// option signed; an exporter that wants the TLS default applies this.
-    #[must_use]
-    pub fn with_unsigned_payload_over_tls(self) -> Self {
-        match self {
-            #[cfg(feature = "aws")]
-            Self::S3 {
-                base_uri,
-                region,
-                endpoint,
-                allow_http,
-                virtual_hosted_style_request,
-                unsigned_payload,
-                auth,
-            } => {
-                let unsigned_payload =
-                    unsigned_payload.or_else(|| Some(s3_uses_tls(&base_uri, endpoint.as_deref())));
-                Self::S3 {
-                    base_uri,
-                    region,
-                    endpoint,
-                    allow_http,
-                    virtual_hosted_style_request,
-                    unsigned_payload,
-                    auth,
-                }
-            }
-            other => other,
-        }
-    }
-
     /// The backend's name, for logs: `file`, `azure` or `s3`.
     ///
     /// Never any of the variant's fields, which may name credentials.
@@ -414,12 +382,14 @@ pub fn required_token_provider(
 /// Retry settings apply only to cloud backends; given for local file
 /// storage they are validated and otherwise ignored, which is logged once
 /// here as `object_store.retry_ignored_for_file_storage` so every exporter
-/// reports it under one event name.
+/// reports it under one event name. `unsigned_payload` applies to S3 storage
+/// that leaves the option unset.
 pub fn exporter_store(
     exporter: otel_arrow_dfe_engine::node::NodeId,
     storage: &StorageType,
     retry: Option<&RetryOptions>,
     token_provider: Option<Box<dyn BearerTokenProvider>>,
+    unsigned_payload: UnsignedPayloadDefault,
 ) -> Result<Arc<dyn ObjectStore>, otel_arrow_dfe_engine::error::Error> {
     if retry.is_some() && matches!(storage, StorageType::File { .. }) {
         otel_arrow_dfe_telemetry::otel_warn!(
@@ -428,7 +398,7 @@ pub fn exporter_store(
             message = "retry settings are not applied to local file storage (invalid values are still rejected)"
         );
     }
-    from_storage_type_with_retry_and_token_provider(storage, retry, token_provider).map_err(|e| {
+    build_store(storage, retry, token_provider, unsigned_payload).map_err(|e| {
         otel_arrow_dfe_engine::error::Error::ExporterError {
             exporter,
             kind: otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration,
@@ -444,8 +414,24 @@ pub fn from_storage_type_with_retry_and_token_provider(
     retry: Option<&RetryOptions>,
     token_provider: Option<Box<dyn BearerTokenProvider>>,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+    build_store(
+        storage,
+        retry,
+        token_provider,
+        UnsignedPayloadDefault::Signed,
+    )
+}
+
+fn build_store(
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+    unsigned_payload: UnsignedPayloadDefault,
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
     #[cfg(not(feature = "azure"))]
     let _ = token_provider;
+    #[cfg(not(feature = "aws"))]
+    let _ = unsigned_payload;
 
     if let Some(retry) = retry {
         retry.validate()?;
@@ -487,19 +473,25 @@ pub fn from_storage_type_with_retry_and_token_provider(
 
         #[cfg(feature = "aws")]
         StorageType::S3 { base_uri, .. } => {
-            let store = s3_builder(storage, retry)?.build()?;
+            let store =
+                s3_builder(storage, retry, std::env::vars_os(), unsigned_payload)?.build()?;
             wrap_with_prefix(store, base_uri)
         }
     }
 }
 
-/// The S3 client builder for `storage`; another backend is an error.
+/// The S3 client builder for `storage` over the `AWS_*` variables of `env`,
+/// read as `AmazonS3Builder::from_env` reads the process environment, with
+/// `unsigned_default` applied only when neither the section nor `env` sets
+/// the option; another backend is an error.
 #[cfg(feature = "aws")]
 fn s3_builder(
     storage: &StorageType,
     retry: Option<&RetryOptions>,
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    unsigned_default: UnsignedPayloadDefault,
 ) -> Result<object_store::aws::AmazonS3Builder, object_store::Error> {
-    use object_store::aws::AmazonS3Builder;
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 
     let StorageType::S3 {
         base_uri,
@@ -516,7 +508,21 @@ fn s3_builder(
             source: "not an S3 storage configuration".into(),
         });
     };
-    let mut builder = AmazonS3Builder::from_env().with_url(base_uri);
+    let mut builder = AmazonS3Builder::new();
+    let mut unsigned_from_env = false;
+    for (key, value) in env {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !key.starts_with("AWS_") {
+            continue;
+        }
+        if let Ok(config_key) = key.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() {
+            unsigned_from_env |= config_key == AmazonS3ConfigKey::UnsignedPayload;
+            builder = builder.with_config(config_key, value);
+        }
+    }
+    let mut builder = builder.with_url(base_uri);
     if let Some(region) = region {
         builder = builder.with_region(region);
     }
@@ -529,13 +535,49 @@ fn s3_builder(
     if let Some(vhost) = virtual_hosted_style_request {
         builder = builder.with_virtual_hosted_style_request(*vhost);
     }
-    if let Some(unsigned) = unsigned_payload {
-        builder = builder.with_unsigned_payload(*unsigned);
+    match unsigned_payload {
+        Some(unsigned) => builder = builder.with_unsigned_payload(*unsigned),
+        None if !unsigned_from_env
+            && unsigned_default == UnsignedPayloadDefault::OverTls
+            && !s3_allows_plain_http(&builder) =>
+        {
+            builder = builder.with_unsigned_payload(true);
+        }
+        None => {}
     }
     if let Some(retry) = retry {
         builder = builder.with_retry(retry.to_object_store_retry_config()?);
     }
     Ok(cloud_auth::aws::configure_builder(builder, auth))
+}
+
+/// Whether a client built by `builder` can send a request over plain HTTP:
+/// its endpoint (`AWS_ENDPOINT_URL_S3`, else the configured one) is an
+/// `http://` URL and HTTP is not refused. Without an endpoint the client
+/// talks to AWS over HTTPS.
+#[cfg(feature = "aws")]
+fn s3_allows_plain_http(builder: &object_store::aws::AmazonS3Builder) -> bool {
+    use object_store::ClientConfigKey;
+    use object_store::aws::AmazonS3ConfigKey;
+
+    let endpoint = builder
+        .get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint));
+    let plain = endpoint.is_some_and(|url| {
+        url.get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+    });
+    // object_store's own spellings of false; anything else it either accepts
+    // as true or refuses at build.
+    let refused = builder
+        .get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp))
+        .is_some_and(|allow| {
+            matches!(
+                allow.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "n"
+            )
+        });
+    plain && !refused
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -578,12 +620,12 @@ mod test {
             index: 0,
             name: "exporter".into(),
         };
-        assert!(exporter_store(id(), &storage, None, None).is_ok());
+        assert!(exporter_store(id(), &storage, None, None, UnsignedPayloadDefault::Signed).is_ok());
 
         let broken = StorageType::File {
             base_uri: dir.path().join("missing").to_string_lossy().into_owned(),
         };
-        match exporter_store(id(), &broken, None, None) {
+        match exporter_store(id(), &broken, None, None, UnsignedPayloadDefault::Signed) {
             Err(otel_arrow_dfe_engine::error::Error::ExporterError { kind, error, .. }) => {
                 assert_eq!(
                     kind,
@@ -1105,11 +1147,17 @@ mod test {
         }
     }
 
-    /// Whether the S3 client `storage` builds signs `UNSIGNED-PAYLOAD`.
+    /// Whether the S3 client `storage` builds over the environment `env`,
+    /// with `default` for an unset option, signs `UNSIGNED-PAYLOAD`.
     #[cfg(feature = "aws")]
-    fn signs_unsigned_payload(storage: &StorageType) -> bool {
+    fn signs_unsigned_payload(
+        storage: &StorageType,
+        env: &[(&str, &str)],
+        default: UnsignedPayloadDefault,
+    ) -> bool {
         use object_store::aws::AmazonS3ConfigKey;
-        s3_builder(storage, None)
+        let env = env.iter().map(|(k, v)| ((*k).into(), (*v).into()));
+        s3_builder(storage, None, env, default)
             .expect("an S3 builder")
             .get_config_value(&AmazonS3ConfigKey::UnsignedPayload)
             .is_some_and(|v| v == "true")
@@ -1117,15 +1165,15 @@ mod test {
 
     /// Scenario: S3 storage configs that set `unsigned_payload` or leave it
     /// unset, against AWS, an HTTPS endpoint and a plain HTTP endpoint, built
-    /// by the shared constructor as they are and after
-    /// `with_unsigned_payload_over_tls`.
-    /// Guarantees: the option parses; the shared constructor signs every
-    /// payload unless the option says otherwise, whatever the endpoint; the
-    /// TLS resolution turns an unset option on exactly over TLS, whatever
-    /// the scheme's case, and keeps an explicit value.
+    /// over an empty environment with each default.
+    /// Guarantees: the option parses; the signed default signs every payload
+    /// unless the option says otherwise, whatever the endpoint; the TLS
+    /// default turns an unset option on exactly when no request can go over
+    /// plain HTTP, whatever the scheme's case, and keeps an explicit value.
     #[test]
     #[cfg(feature = "aws")]
-    fn unsigned_payload_is_signed_unless_set_or_resolved_over_tls() {
+    fn unsigned_payload_is_signed_unless_set_or_defaulted_over_tls() {
+        use UnsignedPayloadDefault::{OverTls, Signed};
         let json = json!({
             "s3": {
                 "base_uri": "s3://my-bucket/telemetry",
@@ -1147,29 +1195,72 @@ mod test {
         let https = Some("https://s3.eu-west-1.amazonaws.com");
         let http = Some("http://localhost:9000");
         for endpoint in [None, https, http] {
-            assert!(!signs_unsigned_payload(&s3("s3://b", endpoint, None)));
-            assert!(signs_unsigned_payload(&s3("s3://b", endpoint, Some(true))));
-            assert!(!signs_unsigned_payload(&s3(
-                "s3://b",
-                endpoint,
-                Some(false)
-            )));
+            let signs = |set| signs_unsigned_payload(&s3("s3://b", endpoint, set), &[], Signed);
+            assert!(!signs(None));
+            assert!(signs(Some(true)));
+            assert!(!signs(Some(false)));
         }
-        let resolved = |base: &str, endpoint, set| {
-            signs_unsigned_payload(&s3(base, endpoint, set).with_unsigned_payload_over_tls())
+        let over_tls = |base: &str, endpoint, set| {
+            signs_unsigned_payload(&s3(base, endpoint, set), &[], OverTls)
         };
-        assert!(resolved("s3://b", None, None));
-        assert!(resolved("s3://b", https, None));
-        assert!(resolved("https://b.s3.amazonaws.com/p", None, None));
-        assert!(!resolved("s3://b", http, None));
-        assert!(!resolved("s3://b", Some("HTTP://minio:9000"), None));
-        assert!(!resolved("http://minio:9000/b", None, None));
-        assert!(!resolved("s3://b", https, Some(false)));
-        assert!(resolved("s3://b", http, Some(true)));
-        let file = StorageType::File {
-            base_uri: "/tmp/x".to_string(),
+        assert!(over_tls("s3://b", None, None));
+        assert!(over_tls("s3://b", https, None));
+        assert!(over_tls("https://b.s3.amazonaws.com/p", None, None));
+        assert!(!over_tls("s3://b", http, None));
+        assert!(!over_tls("s3://b", Some("HTTP://minio:9000"), None));
+        assert!(!over_tls("s3://b", https, Some(false)));
+        assert!(over_tls("s3://b", http, Some(true)));
+        let mut refused = s3("s3://b", http, None);
+        if let StorageType::S3 { allow_http, .. } = &mut refused {
+            *allow_http = Some(false);
+        }
+        assert!(
+            signs_unsigned_payload(&refused, &[], OverTls),
+            "a client that refuses HTTP sends nothing in plaintext"
+        );
+    }
+
+    /// Scenario: an S3 storage section with `unsigned_payload`, the endpoint
+    /// and `allow_http` unset, built with the TLS default over an
+    /// environment that supplies a plain HTTP endpoint, an HTTPS one, or
+    /// `AWS_UNSIGNED_PAYLOAD`.
+    /// Guarantees: a plain HTTP endpoint from `AWS_ENDPOINT_URL` or
+    /// `AWS_ENDPOINT_URL_S3` keeps payloads signed, an HTTPS one does not,
+    /// and the operator's `AWS_UNSIGNED_PAYLOAD` wins over the default in
+    /// both directions.
+    #[test]
+    #[cfg(feature = "aws")]
+    fn unsigned_payload_default_follows_the_environment() {
+        let storage = {
+            let mut storage = s3("s3://b", None, None);
+            if let StorageType::S3 { allow_http, .. } = &mut storage {
+                *allow_http = None;
+            }
+            storage
         };
-        assert_eq!(file.clone().with_unsigned_payload_over_tls(), file);
+        let signs = |env: &[(&str, &str)]| {
+            signs_unsigned_payload(&storage, env, UnsignedPayloadDefault::OverTls)
+        };
+        assert!(!signs(&[
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+        ]));
+        assert!(!signs(&[
+            ("AWS_ENDPOINT_URL_S3", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+        ]));
+        assert!(!signs(&[("AWS_UNSIGNED_PAYLOAD", "false")]));
+        assert!(signs(&[("AWS_ENDPOINT_URL", "https://s3.example.com")]));
+        assert!(signs(&[
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_UNSIGNED_PAYLOAD", "true"),
+        ]));
+        assert!(!signs_unsigned_payload(
+            &storage,
+            &[("AWS_ENDPOINT_URL", "https://s3.example.com")],
+            UnsignedPayloadDefault::Signed
+        ));
     }
 
     #[test]

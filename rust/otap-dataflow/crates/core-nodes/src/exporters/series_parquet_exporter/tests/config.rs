@@ -246,9 +246,11 @@ fn the_factory_creates_file_storage_without_a_capability() {
 }
 
 /// Scenario: S3 `unsigned_payload` unset over AWS, HTTPS and plain HTTP, and set explicitly.
-/// Guarantees: unset is on over TLS and off over plain HTTP; an explicit value is kept.
+/// Guarantees: the validated config keeps the option as written, so the store
+/// constructor resolves an unset one against the endpoint and `AWS_*` variables
+/// it actually uses.
 #[test]
-fn unsigned_payload_defaults_to_on_over_tls_for_series_parquet() {
+fn unsigned_payload_is_left_for_the_store_to_resolve() {
     use otel_arrow_dfe_otap::object_store::StorageType;
     let resolved = |endpoint: Option<&str>, unsigned: Option<bool>| {
         let mut s3 =
@@ -273,9 +275,9 @@ fn unsigned_payload_defaults_to_on_over_tls_for_series_parquet() {
         }
     };
     let (https, http) = (Some("https://s3.example.com"), Some("http://minio:9000"));
-    assert_eq!(resolved(None, None), Some(true));
-    assert_eq!(resolved(https, None), Some(true));
-    assert_eq!(resolved(http, None), Some(false));
+    assert_eq!(resolved(None, None), None);
+    assert_eq!(resolved(https, None), None);
+    assert_eq!(resolved(http, None), None);
     assert_eq!(resolved(https, Some(false)), Some(false));
     assert_eq!(resolved(http, Some(true)), Some(true));
 }

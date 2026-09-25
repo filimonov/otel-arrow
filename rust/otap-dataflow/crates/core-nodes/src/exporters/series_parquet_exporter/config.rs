@@ -354,8 +354,7 @@ impl TryFrom<RawConfig> for Config {
             retry => retry,
         };
         Ok(Self {
-            // An unset `unsigned_payload` is on over TLS for this exporter only.
-            storage: raw.storage.with_unsigned_payload_over_tls(),
+            storage: raw.storage,
             retry,
             lake,
             window: raw.window,

@@ -127,6 +127,7 @@ impl Exporter<OtapPdata> for SeriesParquet {
             &self.config.storage,
             self.config.retry.as_ref(),
             self.token_provider.take(),
+            otel_arrow_dfe_otap::object_store::UnsignedPayloadDefault::OverTls,
         )?;
         #[cfg(test)]
         let store = self.store_override.take().unwrap_or(store);

@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Other exporters keep signed payloads unless the option is set. With it on,
-  the store no longer checks the body against the request signature;
-  integrity in transit rests on TLS. Set `unsigned_payload: false` to keep
-  signed payloads on an HTTPS endpoint.
+  Other exporters keep signed payloads. The default follows the endpoint the
+  store uses, `AWS_ENDPOINT_URL` included, and yields to `AWS_UNSIGNED_PAYLOAD`.
+  A store or bucket policy that refuses UNSIGNED-PAYLOAD answers 403 to every
+  upload; set `unsigned_payload: false`.

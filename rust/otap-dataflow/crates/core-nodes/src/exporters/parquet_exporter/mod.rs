@@ -183,6 +183,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
             &self.config.storage,
             self.config.retry.as_ref(),
             self.token_provider.take(),
+            otel_arrow_dfe_otap::object_store::UnsignedPayloadDefault::Signed,
         )?;
 
         let writer_options = self.config.writer_options.unwrap_or_default();

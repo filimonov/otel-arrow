@@ -298,10 +298,15 @@ Rules enforced at startup:
 S3 storage takes `unsigned_payload`: when true, requests are signed with SigV4
 `UNSIGNED-PAYLOAD` instead of a SHA-256 of every uploaded byte, which removes
 most of the upload CPU (102.5 instead of 376.4 ns per log record against
-MinIO) and leaves integrity in transit to TLS. For this exporter an unset
-value is true unless the endpoint, or without one the base URI, is a plain
-`http://` URL; other exporters sharing the S3 storage section keep signed
-payloads. An explicit value wins over this default and `AWS_UNSIGNED_PAYLOAD`.
+MinIO) and leaves integrity in transit to TLS. The value in the storage
+section wins, then `AWS_UNSIGNED_PAYLOAD`. With neither set, this exporter
+turns it on unless a request can go over plain HTTP: the endpoint the store
+uses (`AWS_ENDPOINT_URL_S3`, else `endpoint` or `AWS_ENDPOINT_URL`) is an
+`http://` URL and HTTP is allowed (`allow_http` or `AWS_ALLOW_HTTP`). Other
+exporters sharing the S3 storage section keep signed payloads. Some
+S3-compatible stores and bucket policies refuse `UNSIGNED-PAYLOAD`; every
+upload then fails with HTTP 403 (`flush.failures` rises, nothing is stored).
+Set `unsigned_payload: false` for such a store.
 
 `producer_id_attribute` projects that resource attribute into the
 `producer_id` column of every values row and stays in the identity (see the
