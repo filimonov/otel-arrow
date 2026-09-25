@@ -27,7 +27,7 @@
 #
 # and `max_concurrent_requests` is rounded up to 2048. A receiver limit below
 # `in_flight` caps throughput at the receiver, where producers see
-# RESOURCE_EXHAUSTED; the exporter's `admission.closed` gauge stays at zero.
+# UNAVAILABLE and retry; the exporter's `admission.closed` gauge stays at zero.
 # The window takes 100000 * 15 / 512 ~= 2930 requests, under
 # `max_requests_per_block: 4096`.
 #
@@ -73,7 +73,7 @@ groups:
                   max_concurrent_requests: 2048
                   # Equal to the exporter's ingress.max_request_bytes: the
                   # receiver's 4MiB default answers a larger request with
-                  # OUT_OF_RANGE, which OTLP clients retry without end.
+                  # INVALID_ARGUMENT, which OTLP clients drop.
                   max_decoding_message_size: 16MiB
           exporter:
             type: exporter:series_parquet

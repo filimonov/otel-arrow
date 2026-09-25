@@ -66,9 +66,9 @@ groups:
                   wait_for_result: true
                   # Above Alloy's 10s attempt timeout, so the producer's deadline ends an attempt first.
                   timeout: 15s
-                  # Must reach the sum of num_consumers of every producer: a request past it gets RESOURCE_EXHAUSTED, which Alloy drops.
+                  # Sized to the sum of num_consumers of every producer: a request past it gets UNAVAILABLE, which Alloy retries, slowing the producer.
                   max_concurrent_requests: 128
-                  # Equal to the exporter's ingress.max_request_bytes: a larger request gets OUT_OF_RANGE, which Alloy retries without end.
+                  # Equal to the exporter's ingress.max_request_bytes: a larger request gets INVALID_ARGUMENT, which Alloy drops.
                   max_decoding_message_size: 16MiB
           buffer:
             type: processor:durable_buffer

@@ -100,9 +100,9 @@ otelcol.exporter.otlp "series" {
     // Parallel exports. One export takes 4000 lines per WAL write, so two
     // carry 2 * 4000 / 0.05s = 160k lines/s at a 50ms acknowledgement. The
     // engine refuses an export beyond its receiver's max_concurrent_requests
-    // (128 per worker) with RESOURCE_EXHAUSTED, which this exporter drops
-    // without retrying, so the num_consumers of every producer that can reach
-    // one worker must sum to at most that: 64 producers here.
+    // (128 per worker) with UNAVAILABLE, which this exporter retries, so the
+    // num_consumers of every producer that can reach one worker should sum to
+    // at most that (64 producers here), or the producers slow each other.
     num_consumers = 2
 
     // Measured in records. An export keeps its records in the queue until it

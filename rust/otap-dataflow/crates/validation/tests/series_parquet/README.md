@@ -391,7 +391,7 @@ when they fail there; `metrics-1k-unique` gives every point a unique
 attribute value against `metrics-1k-hot`, for the series-to-point ratio.
 A thousand 8 KiB log records make an 8 MB request, twice the receiver's
 default 4 MiB `max_decoding_message_size`, which refuses it with
-`OUT_OF_RANGE`; `mixed-8k-hot` therefore runs with a 16 MiB limit, the one
+`INVALID_ARGUMENT`; `mixed-8k-hot` therefore runs with a 16 MiB limit, the one
 setting it changes, named in its workload entry.
 
 Series identity is the full attribute set, by OTel semantics, so an
@@ -953,8 +953,8 @@ whether that ceiling is reachable:
   into one OTLP request, so without `otelcol.processor.batch`
   `records_per_export` stays 1.
 - **A batch must fit the receiver.** An export above the receiver's
-  `max_decoding_message_size` is refused with OUT_OF_RANGE and retried without
-  end; the Loki bridge adds about 300 bytes per line on the wire.
+  `max_decoding_message_size` is refused with INVALID_ARGUMENT and dropped by
+  the producer; the Loki bridge adds about 300 bytes per line on the wire.
 - **Alloy's default `timeout` of 5s is below any usable window.** A producer
   left on it completes nothing against a 15s window and logs a deadline error
   every five seconds.

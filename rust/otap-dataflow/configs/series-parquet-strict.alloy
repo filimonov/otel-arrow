@@ -45,8 +45,8 @@ otelcol.processor.transform "series" {
 // Without a batch every log line is its own OTLP export. The cap keeps one
 // export well below the engine receiver's max_decoding_message_size (16MiB in
 // the shipped engine configs, tonic's 4MiB when unset): a larger message is
-// refused with OUT_OF_RANGE, and the OTLP exporter below retries it without
-// end. The Loki bridge wraps each line in its own ResourceLogs, about 300
+// refused with INVALID_ARGUMENT, and the OTLP exporter below drops it. The
+// Loki bridge wraps each line in its own ResourceLogs, about 300
 // bytes on the wire beyond the line itself, so 4000 lines of 100 bytes are
 // 1.6 MB and lines of up to about 3.9 KB stay under 16MiB.
 //

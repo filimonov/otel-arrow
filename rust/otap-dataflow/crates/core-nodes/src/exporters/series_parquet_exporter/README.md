@@ -71,7 +71,8 @@ synchronous writes, when an ack must survive the host.
 | Durable | OK | none |
 | Content, schema or budget refusal | INVALID_ARGUMENT | fix the request |
 | Storage failure, flush deadline, shutdown, internal error | UNAVAILABLE | retry |
-| Receiver admission exhausted | RESOURCE_EXHAUSTED | retry later |
+| Receiver concurrency limit, rate limit or memory pressure | UNAVAILABLE | retry |
+| Message above the receiver's `max_decoding_message_size`, or above its rate-limit burst | INVALID_ARGUMENT | split the batch or raise the limit |
 | Producer-side timeout | DEADLINE_EXCEEDED | retry; may duplicate |
 
 Every nack's status message names the rule or limit that decided it and what
@@ -346,10 +347,12 @@ throughput at the receiver while `admission.closed` stays at zero.
 requests.
 
 The OTLP gRPC receiver refuses a message above its `max_decoding_message_size`,
-4MiB unless set, with OUT_OF_RANGE, which OTLP clients retry without end, so
-nothing of such a batch is delivered. Set it to `ingress.max_request_bytes`, as
+4MiB unless set, with INVALID_ARGUMENT, which OTLP clients do not retry, so
+such a batch is dropped at the producer and counted in
+`receiver.otlp.requests.rejected{error.type=payload_too_large}`. Set it to
+`ingress.max_request_bytes`, as
 the shipped configurations do (16MiB). The exporter cannot see the receiver's
-setting and says so once per worker at startup
+setting and says so at startup, at INFO for the first worker of the process
 (`series_parquet.receiver_limit.unverified`).
 
 At-least-once begins when a request reaches this exporter: a producer queue
@@ -463,8 +466,11 @@ the wire, so 100-byte lines are about 400 bytes of OTLP each.
   (15 s + 5 s) = 128k lines/s of 100-byte lines, above the per-worker rate.
   Raising `max_in_flight` raises that ceiling and the memory term together.
 - **Producers per worker.** A request past the receiver's
-  `max_concurrent_requests` gets RESOURCE_EXHAUSTED, which Alloy's OTLP
-  exporter treats as permanent and drops. Keep the `num_consumers` of every
+  `max_concurrent_requests` gets UNAVAILABLE (counted in
+  `receiver.otlp.requests.rejected{error.type=concurrency_limit}`), which
+  Alloy retries with backoff, so a full receiver slows producers instead of
+  dropping batches; a request that waits past Alloy's timeout is retried and
+  may be stored twice. For throughput, keep the `num_consumers` of every
   producer that can reach one worker at most that limit: 64 producers at the
   shipped 128 and 2 consumers. For more, raise `max_concurrent_requests` and
   the pipeline's `pdata` channel capacity together (the receiver is clamped
@@ -528,7 +534,9 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 | `flush.late_commits` | `outcome=stored`: a failed block's objects were found after all (its rows may be stored twice); `partial`: only some were; `unknown`: the probe could not tell; `acknowledged`: a lost completion response was probed and the block acknowledged. | `stored`, `partial` or `unknown`: any, for investigation |
 | `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
-| Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as RESOURCE_EXHAUSTED). | any |
+| `receiver.otlp.requests.rejected{error.type=concurrency_limit}` (receiver) | Requests refused UNAVAILABLE at `max_concurrent_requests`, rate limit or memory pressure; Alloy retries them. | sustained |
+| `receiver.otlp.requests.rejected{error.type=payload_too_large}` (receiver) | Messages above `max_decoding_message_size` or the rate-limit burst, refused INVALID_ARGUMENT and dropped by the producer. | any |
+| Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as INVALID_ARGUMENT). | any |
 | Alloy `otelcol_exporter_enqueue_failed_log_records_total` | Records refused by a full queue; stays zero with `block_on_overflow`. | any |
 | Alloy `loki_process_truncated_fields_total{field="line"}` | Lines cut to 512KiB by the truncate stage. | any, for investigation |
 
@@ -553,7 +561,7 @@ RSS (0.47 GB median, 0.72 GB peak) and WAL (0.3 GB).
 | Alloy restart (`docker stop`, 10s grace) | Nothing. | Alloy saves its file positions and its queue on the way down. | All eight producers restarted: no loss, no duplicates. |
 | Alloy SIGKILL with a full queue (engine down) | Nothing. | The file-backed queue survives; lines read after the last saved position (every 10s) are read again. | No loss; 82,963 duplicate lines over eight producers (about 2s of input each). The same kill with the queue in memory lost 40,949 lines (4.4k to 5.7k per producer). |
 | Long lines | Nothing. | Exports are split at 2MiB; a line above 512KiB is cut to 512KiB, suffix included, and counted in Alloy's `loki_process_truncated_fields_total`. Without the cut, a record above `ingress.max_row_bytes` refuses its whole export after the WAL acknowledgement (`resolved{outcome=permanently_rejected}`). | 4000 lines of 8 KiB (34 MB, one batch): 16 exports of 2.09 MB and one of 0.54 MB, every line stored once; three 3 MiB lines stored truncated. With 4 KiB lines through a 150 s store outage: no loss, no duplicates, the backlog replayed at about 50k lines/s (220 MB/s), RSS peak 4.0 GB. |
-| Receiver slots exhausted | RESOURCE_EXHAUSTED, which Alloy drops as permanent (`send_failed`, "Dropping data"). | Lost before the WAL. Keep the producers' `num_consumers` per worker at most `max_concurrent_requests` (see "Sizing"). | Reproduced with a one-slot receiver and three Alloy producers: every refused batch dropped. |
+| Receiver slots exhausted | UNAVAILABLE; Alloy retries with backoff. | Nothing is lost; producers slow down, and an export that waits past Alloy's timeout is resent and may be stored twice. Keep the producers' `num_consumers` per worker at most `max_concurrent_requests` for throughput (see "Sizing"). | One-slot receiver, three Alloy producers, 240s: no batch dropped, every line stored; extra copies from exports that timed out while queued behind the one slot. |
 | A store that applies abandoned requests (RustFS) | Nothing. | A multipart completion held by an intermediary can be applied after the writer gave up and retried; the retry wrote the same names and bytes, so readers see one copy, but a partition can receive a write later than `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)` (55s here). | Seen on RustFS with a completion held in a proxy (FORMAT.md, "Partition lateness bound"); not reproduced here. |
 
 ## Reading and schema changes
