@@ -377,8 +377,9 @@ them; alert on each:
 
 Freshness has no upper bound: with no backlog it is roughly the buffer's
 segment finalisation (up to 1s) and poll (100ms), the rest of this exporter's
-window and the flush; during an outage it is unbounded. Watch
-`oldest_unacked.age` with the buffer's queue age and WAL fill.
+window and the flush; during an outage it is unbounded. The buffer publishes
+no age of its oldest pending bundle; see "Alerts" under
+[Deploying with Alloy](#deploying-with-alloy) for the signals that exist.
 
 Each core runs an independent pipeline with its own receiver, buffer directory
 `<path>/core_<core_id>` and exporter; `retention_size_cap` is divided between
@@ -495,8 +496,10 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 
 | Signal | Meaning | Alert |
 | --- | --- | --- |
-| `oldest_unacked.age` (exporter) | Freshness: age of the oldest request the exporter owes the buffer. Healthy it stays below `window.interval` plus the flush (19 s measured maximum at 15 s windows). | above 2 x `window.interval` for a few minutes |
-| `storage.bytes.used` / `storage.bytes.cap` (buffer), per core | WAL fill; each core's cap is its share. | above 50 percent; UNAVAILABLE to producers at 100 |
+| Newest values object per writer (external) | End-to-end freshness: list the current hour's `dataset=values` prefix; object names carry the writer id, and `max(time)` per `producer_id` over the newest objects gives it per producer. Healthy it stays within `window.interval` plus the flush of now. | older than 2 x `window.interval` plus the flush |
+| `storage.bytes.used` / `storage.bytes.cap` (buffer), per core | WAL fill; each core's cap is its share. Growing while input is steady means the exporter is not keeping up. | above 50 percent; UNAVAILABLE to producers at 100 |
+| `items.queued`, `in.flight` (buffer) | Items waiting in the WAL and bundles handed to the exporter; both grow when the store stalls. | growing for several windows |
+| `oldest_unacked.age` (exporter) | Age of the oldest request the exporter currently owes the buffer. It does not see bundles still waiting in the WAL, and a failed block's requests restart it, so it is not a freshness bound. Healthy it stays below `window.interval` plus the flush (19 s measured maximum at 15 s windows). | above 2 x `window.interval` for a few minutes |
 | `ingest.failures{failure=backpressure}` (buffer) | Requests refused because the WAL is full. | any |
 | `flush.failures` (exporter), `retries.scheduled` (buffer) | Blocks the store did not take; the buffer retries them. | sustained |
 | `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
@@ -506,6 +509,9 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 | Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as RESOURCE_EXHAUSTED). | any |
 | Alloy `otelcol_exporter_enqueue_failed_log_records_total` | Records refused by a full queue; stays zero with `block_on_overflow`. | any |
 | Alloy `loki_process_truncated_fields_total{field="line"}` | Lines cut to 512KiB by the truncate stage. | any, for investigation |
+
+The buffer has no gauge for the age of its oldest pending bundle, which would
+bound freshness from inside the engine; it is a backlog item.
 
 ### Failure behaviour
 
