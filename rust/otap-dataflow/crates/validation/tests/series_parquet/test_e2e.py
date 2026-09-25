@@ -2616,6 +2616,44 @@ class DockerSlice(unittest.TestCase):
     def test_rustfs(self):
         self.exercise("rustfs")
 
+    # Scenario: Docker Alloy tails 4000 lines of 1100 bytes, which its batch
+    # processor sends as one OTLP export of more than 4 MiB, into the shipped
+    # engine receiver and exporter on MinIO.
+    # Guarantees: the export is accepted as one request and every line is
+    # stored exactly once, so the receiver's decoding limit admits every
+    # request the exporter's ingress.max_request_bytes accepts.
+    def test_alloy_batch_above_4mib_is_stored(self):
+        with DockerStore("minio") as store, tempfile.TemporaryDirectory() as directory:
+            with Engine(
+                directory, storage=store.storage, overrides={"retry": S3_RETRY}
+            ) as engine:
+                try:
+                    ids = [f"large-{i:04d}-" + "x" * 1089 for i in range(4000)]
+                    self.assertGreater(sum(len(body) for body in ids), 4 << 20)
+                    with AlloyProducer(directory, engine) as alloy:
+                        alloy.write(ids)
+                        try:
+                            wait_for_alloy(store, directory, ids, timeout=120)
+                        except AssertionError:
+                            print(alloy.logs())
+                            raise
+                    engine.shutdown()
+                    requests = [
+                        int(count)
+                        for count in re.findall(
+                            r"series_parquet\.block\.committed\b.*?\brequests=(\d+)",
+                            engine.engine_log(),
+                        )
+                    ]
+                    self.assertEqual(
+                        sum(requests), 1, "the 4000 lines arrived as one request"
+                    )
+                    _, bodies = stored_bodies(store, directory, "final")
+                    self.assertEqual(sorted(bodies), sorted(ids))
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+
     # Scenario: the object store is stopped while six producers are exporting
     # and is started again, with its data intact, a few seconds later.
     # Guarantees: the outage refuses requests retryably rather than losing

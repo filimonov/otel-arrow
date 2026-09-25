@@ -38,6 +38,27 @@ otelcol.processor.attributes "series" {
     action = "insert"
   }
   output {
+    logs = [otelcol.processor.batch.series.input]
+  }
+}
+
+// Without a batch every log line is its own OTLP export. The cap keeps one
+// export well below the engine receiver's max_decoding_message_size (16MiB in
+// the shipped engine configs, tonic's 4MiB when unset): a larger message is
+// refused with OUT_OF_RANGE, and the OTLP exporter below retries it without
+// end. The Loki bridge wraps each line in its own ResourceLogs, about 300
+// bytes on the wire beyond the line itself, so 4000 lines of 100 bytes are
+// 1.6 MB and lines of up to about 3.9 KB stay under 16MiB.
+//
+// Larger batches raise the strict engine's ceiling: each worker takes at most
+//   receiver_slots * records_per_export / hold_time
+// records per second, the hold time being about a window (128 slots of 4000
+// records: 512k/s at a 1s window, 34k/s at 15s).
+otelcol.processor.batch "series" {
+  send_batch_size     = 4000
+  send_batch_max_size = 4000
+  timeout             = "5s"
+  output {
     logs = [otelcol.exporter.otlp.series.input]
   }
 }
@@ -65,31 +86,23 @@ otelcol.exporter.otlp "series" {
   sending_queue {
     enabled = true
 
-    // The Loki bridge emits one log record per request, so the queue must be
-    // measured in records, not requests. With "requests" the batch can never
-    // grow past queue_size and concurrency collapses to one.
+    // Measured in records. An export keeps its records in the queue until it
+    // completes, so the queue must hold num_consumers full batches:
+    // 32 * 4000 = 128000.
     sizer = "items"
-    queue_size = 120000
+    queue_size = 128000
 
     // Parallel exports. An export is held for half a window plus the flush on
     // average (a whole window at worst), so the exports in flight are
     //   in_flight = rate * (interval / 2 + flush) / records_per_export.
-    // Sized for 10000 records/s from one producer at the 20000-record minimum
-    // batch against the 15s window: 10000 * (7.5s + 2s) / 20000 ~= 4.8, and
-    // 8 leaves room for the whole-window worst case.
-    num_consumers = 8
+    // Sized for 10000 records/s from one producer in 4000-record batches
+    // against the 15s window: 10000 * (7.5s + 2s) / 4000 ~= 24. A whole-window
+    // hold, 10000 * 17s / 4000 ~= 43, needs more consumers and a larger queue.
+    num_consumers = 32
 
     // The source is a file. Backpressure parks the tailer and leaves unread
     // data on disk, which is durable and free. Dropping is neither.
     block_on_overflow = true
-
-    // Without this block every log line is its own OTLP export.
-    batch {
-      sizer = "items"
-      min_size = 20000
-      max_size = 50000
-      flush_timeout = "5s"
-    }
   }
   retry_on_failure {
     enabled = true

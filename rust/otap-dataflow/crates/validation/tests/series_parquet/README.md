@@ -401,7 +401,7 @@ filter or aggregate it upstream (an OTel View, or `processor:attribute`).
 
 The `alloy` step (`alloy_capacity.py`) asks whether a real producer sees the
 same engine as the generator. Grafana Alloy runs the reference River config
-unchanged (its batching, eight consumers and the 180s attempt timeout the
+unchanged (its batching, consumers and the 180s attempt timeout the
 config falls back to) on six producer cores and tails one file into the
 strict shipped engine (128 slots, one-second window) on the cell's workers.
 A feeder process on the last two producer cores appends fixed-width
@@ -916,9 +916,10 @@ producer needs its own value (series-lake README, "Producer id contract").
 The shipped attempt timeout of 180s is the exporter README's attempt-timeout
 rule applied to a 15s window and a 60s flush deadline. The tests run a
 one-second window and set 6s through `SERIES_ALLOY_TIMEOUT`, which the config
-reads, so an expired attempt is visible inside their own waits. The fixture
-writes 12 lines, far below `min_size`, so the batcher releases them on its 5s
-`flush_timeout`.
+reads, so an expired attempt is visible inside their own waits. Most tests
+write 12 lines, far below `send_batch_size`, so the batch processor releases
+them on its 5s `timeout`; `DockerSlice.test_alloy_batch_above_4mib_is_stored`
+writes one full batch of 4000 lines of 1100 bytes, one export above 4MiB.
 
 The producer settings were measured against `grafana/alloy:v1.19.2` with a
 server that holds each export for a fixed time, as the exporter does. A
@@ -930,17 +931,17 @@ records/second = num_consumers * records_per_export / hold_time
 
 where the hold time is at worst a whole window plus the flush: four consumers
 sustained about 5000 records per second at a 15s hold and about 1050 at a 60s
-hold. The shipped file runs eight consumers with a 20000-record minimum
-batch, sized for 10000 records/s from one producer. Three settings decide
+hold. The shipped file runs 32 consumers with batches of 4000 records,
+sized for 10000 records/s from one producer, and the cap keeps an export well
+below the engine receiver's `max_decoding_message_size`. Three settings decide
 whether that ceiling is reachable:
 
 - **Batching must be switched on.** `otelcol.receiver.loki` turns one log line
-  into one OTLP request, and the sending queue's batcher is off without a
-  `batch {}` block, so `records_per_export` stays 1.
-- **The queue must be sized in items.** With the default `sizer = "requests"`
-  the accumulating batch keeps its single-record slots until its export
-  finishes, so a batch never exceeds `queue_size` and concurrency collapses
-  to one.
+  into one OTLP request, so without `otelcol.processor.batch`
+  `records_per_export` stays 1.
+- **A batch must fit the receiver.** An export above the receiver's
+  `max_decoding_message_size` is refused with OUT_OF_RANGE and retried without
+  end; the Loki bridge adds about 300 bytes per line on the wire.
 - **Alloy's default `timeout` of 5s is below any usable window.** A producer
   left on it completes nothing against a 15s window and logs a deadline error
   every five seconds.

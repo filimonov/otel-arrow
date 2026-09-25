@@ -179,12 +179,12 @@ CAPACITY_WORKLOADS = {
     # builds the requests; the request size is its minimum batch.
     "alloy-file": {
         "workload": measurement.Workload(
-            requests=1, records_per_request=20000, body_bytes=100,
+            requests=1, records_per_request=4000, body_bytes=100,
             series=1, metrics_every=10**9,
         ),
         "first_index": 0,
         "description": "Grafana Alloy tailing one file of 100-byte lines through the "
-        "reference River config, batches of 20000 to 50000 records",
+        "reference River config, batches of 4000 records",
     },
 }
 PRIMARY_WORKLOAD = "mixed-1k-hot"

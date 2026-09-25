@@ -477,8 +477,8 @@ def shipped_alloy_settings() -> dict:
     return {
         "num_consumers": number("num_consumers"),
         "queue_size_records": number("queue_size"),
-        "batch_min_size_records": number("min_size"),
-        "batch_max_size_records": number("max_size"),
+        "batch_min_size_records": number("send_batch_size"),
+        "batch_max_size_records": number("send_batch_max_size"),
         "compression": (re.search(r'compression\s*=\s*"([^"]+)"', text) or [None, None])[1],
     }
 
