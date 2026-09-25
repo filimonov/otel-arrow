@@ -1588,7 +1588,7 @@ mod tests {
                             .expect_err("memory-pressure stream should return a gRPC error")
                     }
                 };
-                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                assert_eq!(status.code(), tonic::Code::Unavailable);
                 assert_rejection_telemetry(&ctx, telemetry, "memory_pressure", 1, 0).await;
                 ctx.send_shutdown(Instant::now(), "memory pressure test complete")
                     .await

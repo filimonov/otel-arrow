@@ -234,10 +234,14 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   size.
 - V1 rate limiting measures decompressed request bytes. A request larger than
   the configured burst is rejected as non-retryable while pressure gating is
-  active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
-  pushback.
+  active: HTTP returns 413 without `Retry-After`, and gRPC returns
+  `INVALID_ARGUMENT` with negative retry pushback.
+- A request refused by the rate limit or hard memory pressure can succeed on
+  retry: HTTP returns 503 and gRPC returns `UNAVAILABLE`, which every OTLP
+  client retries, with `Retry-After` or `grpc-retry-pushback-ms` when the delay
+  is known.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
+  This early HTTP 503 or gRPC `UNAVAILABLE` response has no retry hint.
   Exact retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
 - A gRPC request that finds no free `max_concurrent_requests` permit or

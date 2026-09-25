@@ -31,7 +31,11 @@ pub trait ReceiverRejectionMetrics: Send + Sync {
     }
 }
 
-/// Builds a gRPC `resource_exhausted` status with retry pushback metadata.
+/// Builds a retryable gRPC `unavailable` status with retry pushback metadata.
+///
+/// UNAVAILABLE, as for the concurrency limit (see
+/// [`crate::concurrency_shed_layer::grpc_concurrency_limit_status`]); the pushback
+/// stays as a hint for clients that read it.
 #[must_use]
 pub fn grpc_memory_pressure_status(state: &SharedReceiverAdmissionState) -> Status {
     let mut metadata = MetadataMap::new();
@@ -43,7 +47,7 @@ pub fn grpc_memory_pressure_status(state: &SharedReceiverAdmissionState) -> Stat
             .parse()
             .expect("retry pushback metadata should be valid ASCII"),
     );
-    Status::with_metadata(Code::ResourceExhausted, "memory pressure", metadata)
+    Status::with_metadata(Code::Unavailable, "memory pressure", metadata)
 }
 
 impl ReceiverRejectionMetrics for Mutex<OtlpReceiverMetrics> {
@@ -52,7 +56,7 @@ impl ReceiverRejectionMetrics for Mutex<OtlpReceiverMetrics> {
     }
 }
 
-/// Layer that fails fast with `resource_exhausted` before tonic decodes request bodies.
+/// Layer that fails fast with `unavailable` before tonic decodes request bodies.
 ///
 /// This is only enforced at `Hard` pressure. `Soft` remains advisory in the
 /// process-wide state machine for this Phase 1 implementation.
@@ -193,6 +197,9 @@ mod tests {
         }
     }
 
+    /// Scenario: hard memory pressure is active when a gRPC request reaches the layer.
+    /// Guarantees: the layer answers retryable UNAVAILABLE with the configured
+    /// pushback hint, without polling or calling the inner service.
     #[test]
     fn hard_pressure_short_circuits_before_inner_readiness_and_call() {
         let state = MemoryPressureState::default();
@@ -226,7 +233,7 @@ mod tests {
                 .headers()
                 .get("grpc-status")
                 .and_then(|v| v.to_str().ok()),
-            Some("8")
+            Some("14")
         );
         assert_eq!(
             response

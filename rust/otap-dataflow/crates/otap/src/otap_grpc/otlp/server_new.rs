@@ -1316,7 +1316,8 @@ mod tests {
     }
 
     /// Scenario: a non-empty gRPC request exceeds the configured weighted rate-limit burst.
-    /// Guarantees: the request is refused and its shared receiver message and payload bytes are recorded.
+    /// Guarantees: the request is refused with non-retryable INVALID_ARGUMENT and its shared
+    /// receiver message and payload bytes are recorded.
     #[tokio::test]
     async fn weighted_rate_limit_rejection_records_grpc_boundary_metrics() {
         use otel_arrow_dfe_config::policy::{
@@ -1385,7 +1386,7 @@ mod tests {
 
         assert_eq!(
             result.expect_err("request rejected").code(),
-            Code::ResourceExhausted
+            Code::InvalidArgument
         );
         assert!(msg_rx.try_recv().is_err());
         let mut metrics = metrics.lock();
