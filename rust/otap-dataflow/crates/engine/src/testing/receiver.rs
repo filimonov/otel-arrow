@@ -85,6 +85,24 @@ impl<PData> TestContext<PData> {
         .await
     }
 
+    /// Awaits `checks`, sends shutdown even if they panicked, then re-raises the panic.
+    ///
+    /// A scenario that panics before shutdown leaves the receiver serving, and
+    /// `run_validation_concurrent` waits for it forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics with the panic of `checks`, or if shutdown cannot be sent.
+    pub async fn check_then_shutdown<F: Future<Output = ()>>(&self, checks: F) {
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        self.send_shutdown(Instant::now(), "Test complete")
+            .await
+            .expect("Failed to send shutdown");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     /// Sleeps for the specified duration.
     pub async fn sleep(&self, duration: Duration) {
         sleep(duration).await;

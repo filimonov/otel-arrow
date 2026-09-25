@@ -4955,35 +4955,36 @@ mod tests {
 
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let first_endpoint = endpoint.clone();
-                let first = tokio::spawn(async move {
-                    let mut client = LogsServiceClient::connect(first_endpoint).await.unwrap();
-                    client.export(create_logs_service_request()).await
-                });
-                timeout(Duration::from_secs(3), held.notified())
-                    .await
-                    .expect("Timed out waiting for the held request");
+                ctx.check_then_shutdown(async {
+                    let first_endpoint = endpoint.clone();
+                    let first = tokio::spawn(async move {
+                        let mut client = LogsServiceClient::connect(first_endpoint).await.unwrap();
+                        client.export(create_logs_service_request()).await
+                    });
+                    timeout(Duration::from_secs(3), held.notified())
+                        .await
+                        .expect("Timed out waiting for the held request");
 
-                let mut second_client = LogsServiceClient::connect(endpoint.clone())
-                    .await
-                    .expect("Failed to connect a second client");
-                let second = second_client.export(create_logs_service_request()).await;
-                let rejections =
-                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
-                release.notify_one();
-                let first = first.await.unwrap();
-                ctx.send_shutdown(Instant::now(), "Test complete")
-                    .await
-                    .expect("Failed to send shutdown");
+                    let mut second_client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect a second client");
+                    let second = second_client.export(create_logs_service_request()).await;
+                    let rejections =
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                    release.notify_one();
+                    let first = first.await.unwrap();
 
-                let status = second.expect_err("the second request must be refused at the limit");
-                assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
-                assert!(
-                    status.message().contains("max_concurrent_requests"),
-                    "{status:?}"
-                );
-                assert_eq!(rejections, 1);
-                assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                    let status =
+                        second.expect_err("the second request must be refused at the limit");
+                    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+                    assert!(
+                        status.message().contains("max_concurrent_requests"),
+                        "{status:?}"
+                    );
+                    assert_eq!(rejections, 1);
+                    assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                })
+                .await;
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 
@@ -5025,34 +5026,34 @@ mod tests {
 
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let mut body = Vec::new();
-                create_logs_service_request().encode(&mut body).unwrap();
-                let http = tokio::spawn(post_otlp_http(http_listen, "/v1/logs", body));
-                timeout(Duration::from_secs(3), held.notified())
-                    .await
-                    .expect("Timed out waiting for the held HTTP request");
+                ctx.check_then_shutdown(async {
+                    let mut body = Vec::new();
+                    create_logs_service_request().encode(&mut body).unwrap();
+                    let http = tokio::spawn(post_otlp_http(http_listen, "/v1/logs", body));
+                    timeout(Duration::from_secs(3), held.notified())
+                        .await
+                        .expect("Timed out waiting for the held HTTP request");
 
-                let mut client = LogsServiceClient::connect(endpoint.clone())
-                    .await
-                    .expect("Failed to connect");
-                let grpc = client.export(create_logs_service_request()).await;
-                let rejections =
-                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
-                release.notify_one();
-                let http = http.await.unwrap();
-                ctx.send_shutdown(Instant::now(), "Test complete")
-                    .await
-                    .expect("Failed to send shutdown");
+                    let mut client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect");
+                    let grpc = client.export(create_logs_service_request()).await;
+                    let rejections =
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                    release.notify_one();
+                    let http = http.await.unwrap();
 
-                let status = grpc.expect_err("the gRPC request must be refused without a slot");
-                assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
-                assert!(
-                    status.message().contains("max_concurrent_requests"),
-                    "{status:?}"
-                );
-                assert_eq!(rejections, 1);
-                let (http_status, _) = http.expect("HTTP response");
-                assert_eq!(http_status, http::StatusCode::OK);
+                    let status = grpc.expect_err("the gRPC request must be refused without a slot");
+                    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+                    assert!(
+                        status.message().contains("max_concurrent_requests"),
+                        "{status:?}"
+                    );
+                    assert_eq!(rejections, 1);
+                    let (http_status, _) = http.expect("HTTP response");
+                    assert_eq!(http_status, http::StatusCode::OK);
+                })
+                .await;
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 
@@ -5082,42 +5083,42 @@ mod tests {
 
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let client = LogsServiceClient::connect(endpoint.clone())
-                    .await
-                    .expect("Failed to connect");
-                let mut first_client = client.clone();
-                let first = tokio::spawn(async move {
-                    first_client.export(create_logs_service_request()).await
-                });
-                timeout(Duration::from_secs(3), held.notified())
-                    .await
-                    .expect("Timed out waiting for the held request");
+                ctx.check_then_shutdown(async {
+                    let client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect");
+                    let mut first_client = client.clone();
+                    let first = tokio::spawn(async move {
+                        first_client.export(create_logs_service_request()).await
+                    });
+                    timeout(Duration::from_secs(3), held.notified())
+                        .await
+                        .expect("Timed out waiting for the held request");
 
-                let mut second_client = client.clone();
-                let second = tokio::spawn(async move {
-                    second_client.export(create_logs_service_request()).await
-                });
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let finished_early = second.is_finished();
-                release.notify_one();
-                let first = first.await.unwrap();
-                let second = second.await.unwrap();
-                let rejections =
-                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
-                ctx.send_shutdown(Instant::now(), "Test complete")
-                    .await
-                    .expect("Failed to send shutdown");
+                    let mut second_client = client.clone();
+                    let second = tokio::spawn(async move {
+                        second_client.export(create_logs_service_request()).await
+                    });
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let finished_early = second.is_finished();
+                    release.notify_one();
+                    let first = first.await.unwrap();
+                    let second = second.await.unwrap();
+                    let rejections =
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
 
-                assert!(
-                    !finished_early,
-                    "the second request must wait for the connection permit: {second:?}"
-                );
-                assert!(first.is_ok(), "the held request must succeed: {first:?}");
-                assert!(
-                    second.is_ok(),
-                    "the queued request must succeed: {second:?}"
-                );
-                assert_eq!(rejections, 0);
+                    assert!(
+                        !finished_early,
+                        "the second request must wait for the connection permit: {second:?}"
+                    );
+                    assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                    assert!(
+                        second.is_ok(),
+                        "the queued request must succeed: {second:?}"
+                    );
+                    assert_eq!(rejections, 0);
+                })
+                .await;
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 
@@ -5147,36 +5148,36 @@ mod tests {
 
         let scenario = move |ctx: TestContext<OtapPdata>| {
             Box::pin(async move {
-                let mut request = create_logs_service_request();
-                request.resource_logs[0]
-                    .resource
-                    .as_mut()
-                    .unwrap()
-                    .attributes
-                    .push(KeyValue {
-                        key: "x".repeat(8 * 1024),
-                        ..Default::default()
-                    });
-                let client = LogsServiceClient::connect(endpoint.clone())
-                    .await
-                    .expect("Failed to connect");
-                let plain = client.clone().export(request.clone()).await;
-                let compressed = client
-                    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-                    .export(request)
-                    .await;
-                ctx.send_shutdown(Instant::now(), "Test complete")
-                    .await
-                    .expect("Failed to send shutdown");
+                ctx.check_then_shutdown(async {
+                    let mut request = create_logs_service_request();
+                    request.resource_logs[0]
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .attributes
+                        .push(KeyValue {
+                            key: "x".repeat(8 * 1024),
+                            ..Default::default()
+                        });
+                    let client = LogsServiceClient::connect(endpoint.clone())
+                        .await
+                        .expect("Failed to connect");
+                    let plain = client.clone().export(request.clone()).await;
+                    let compressed = client
+                        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                        .export(request)
+                        .await;
 
-                for result in [plain, compressed] {
-                    let status = result.expect_err("an oversized request must be refused");
-                    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
-                }
-                assert_eq!(
-                    grpc_rejections(&metrics, ReceiverRejectionErrorType::PayloadTooLarge),
-                    2
-                );
+                    for result in [plain, compressed] {
+                        let status = result.expect_err("an oversized request must be refused");
+                        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+                    }
+                    assert_eq!(
+                        grpc_rejections(&metrics, ReceiverRejectionErrorType::PayloadTooLarge),
+                        2
+                    );
+                })
+                .await;
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 
