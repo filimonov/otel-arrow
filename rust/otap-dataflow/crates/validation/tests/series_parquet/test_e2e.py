@@ -2477,14 +2477,23 @@ def flush_attempts(engine):
     test compare the names a failed attempt was going to use with the names
     the retry actually wrote.
     """
-    return [
-        (int(attempt), file, int(count))
-        for attempt, file, count in re.findall(
-            r"series_parquet\.flush\.attempt.*?"
-            r"\[attempt=(\d+), file=(\S+), objects=(\d+)\]",
-            engine.engine_log(),
+    return parse_flush_attempts(engine.engine_log())
+
+
+def parse_flush_attempts(log):
+    """`(attempt, file, objects)` of every `series_parquet.flush.attempt` line.
+
+    Each field is read by its name from the event's field list, whatever
+    other fields surround it; `flush.attempt_failed` lines are not attempts.
+    """
+    attempts = []
+    for fields in re.findall(r"series_parquet\.flush\.attempt\b\S*\s*\[([^\]]*)\]", log):
+        named = dict(
+            part.split("=", 1) for part in fields.split(", ") if "=" in part
         )
-    ]
+        if {"attempt", "file", "objects"} <= named.keys():
+            attempts.append((int(named["attempt"]), named["file"], int(named["objects"])))
+    return attempts
 
 
 def wait_for_metrics(engine, names, target, timeout, seed=None):
@@ -3231,6 +3240,29 @@ COHORT_WAIT = 60
 # at-least-once delivery produces a duplicate; this is what makes the standing
 # suite exercise duplicates rather than merely tolerate them.
 CALL_WAIT_SHORT = 1
+
+
+class FlushAttemptLines(unittest.TestCase):
+    """How the retry test reads the exporter's write-attempt announcements."""
+
+    # Scenario: engine log lines of a first attempt and a retry in the current
+    # event layout (`seq` before `attempt`, `deadline_remaining` after
+    # `objects`), and a failed-attempt line that names the same attempt.
+    # Guarantees: both attempts are read with their file and object count,
+    # and the failure line is not taken for an attempt.
+    def test_attempts_are_read_by_field_name(self):
+        name = "part-20260925T094024Z-local_1-3cff9bed-00000000.parquet"
+        log = "\n".join([
+            "\x1b[2m2026-09-25T09:40:25.000Z\x1b[0m  DEBUG "
+            "\x1b[1motel.exporter.series_parquet::series_parquet.flush.attempt\x1b[0m: "
+            f"[seq=0, attempt=1, file={name}, objects=2, "
+            "deadline_remaining=119.99999077s]\x1b[35m entity/pipeline.attrs: core.id=0",
+            "\x1b[1motel.exporter.series_parquet::series_parquet.flush.attempt_failed\x1b[0m: "
+            f"[seq=0, attempt=1, file={name}, retryable=true, error=offline]",
+            "\x1b[1motel.exporter.series_parquet::series_parquet.flush.attempt\x1b[0m: "
+            f"[seq=0, attempt=2, file={name}, objects=2, deadline_remaining=119.8s]",
+        ])
+        self.assertEqual(parse_flush_attempts(log), [(1, name, 2), (2, name, 2)])
 
 
 class AlloyFailureLines(unittest.TestCase):
