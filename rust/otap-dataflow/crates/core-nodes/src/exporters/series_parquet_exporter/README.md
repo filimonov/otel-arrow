@@ -508,6 +508,26 @@ workspace allowance is `4 * ingress.max_request_bytes` (conversion),
 ceilings. `memory.accounted` reports the retained data, tokens, cache and,
 during a flush, the merge keys and `flush.workspace` of the write.
 
+The whole process needs more than the sum of these budgets. The upstream OTLP
+receiver keeps every request it has not answered in memory, bounded by its
+`max_concurrent_requests` slots and not by bytes, and without
+`durable_buffer` it answers only once the request's block is durable. Size a
+strict deployment for
+
+```text
+workers * (memory.budget + receiver slots * maximum request size)
+```
+
+with one worker per core and `ingress.max_request_bytes` as the maximum
+request size. With the shipped 128 slots and 16MiB requests the receiver term
+is at worst 2 GB per worker. Measured at 1.216M records/s with 4096 slots on
+each of four workers, jemalloc held 16.2 GB (RSS 17 GB) while the exporters
+accounted 3.4 GB; the rest was requests held by the receivers, 4096 slots times
+four workers times about 1 MB. Raising `max_concurrent_requests` to lift the
+strict admission ceiling multiplies this term. Behind `durable_buffer` the
+receiver holds a request only until the buffer has written it to its WAL, so
+the term lasts for the WAL write rather than for the window.
+
 The engine also publishes one process-scoped gauge,
 `memory.unaccounted_rss_bytes` =
 `max(0, RSS - sum of every worker's accounted bytes)`, while a worker exists.
