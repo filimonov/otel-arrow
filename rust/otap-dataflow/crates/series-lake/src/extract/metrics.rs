@@ -538,7 +538,6 @@ pub(crate) fn extract_metrics(
 
     let ts_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let mut values = Vec::new();
-    let mut pinned_bytes = 0;
     // Number and histogram points share one dataset (FORMAT.md section 2), so they share
     // one sink; each kind writes the other's columns as null.
     let points = |pt| records.get(pt).map_or(0, |b| b.num_rows());
@@ -676,8 +675,7 @@ pub(crate) fn extract_metrics(
 
     // One sink for both point kinds, so a mixed request still produces a single
     // values file. Number rows precede histogram rows within the request.
-    let (batches, pinned) = sink.finish(budget)?;
-    pinned_bytes += pinned;
+    let (batches, pinned_bytes, merge_key_bytes) = sink.finish(budget)?;
     if !batches.is_empty() {
         values.push((Dataset::MetricsValues, batches));
     }
@@ -689,6 +687,7 @@ pub(crate) fn extract_metrics(
         descriptors,
         values,
         pinned_bytes,
+        merge_key_bytes,
         shared_bytes: c.resources.bytes() + c.scopes.bytes(),
         stats: c.stats,
     })
@@ -889,6 +888,7 @@ mod tests {
             .map(|r| r.approx_bytes)
             .sum::<usize>()
             + out.pinned_bytes
+            + out.merge_key_bytes
             + out.shared_bytes
             + tables;
         // The premise: the copy alone is a large fraction of the retained size,

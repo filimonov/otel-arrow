@@ -114,10 +114,19 @@ A request is judged against `window.max_block_bytes` on its worst case, as if
 every series it carries were new to the block, so it gets the same answer after
 a restart or a cache eviction; one that fits the worst case but not the space
 left waits for the next block. The worst case is `P + T + sum over its series
-of (2 * (A - D) + F)`: values rows P, completion token T, each series'
-extracted estimate A less its decoded attribute trees D, and a fixed F of 232
-bytes per logs series or 328 per metrics series, plus 16 per denormalized
-series column.
+of (2 * (A - D) + F)`: values rows P with their merge keys, completion token T,
+each series' extracted estimate A less its decoded attribute trees D, and a
+fixed F of 232 bytes per logs series or 328 per metrics series, plus 16 per
+denormalized series column.
+
+A table's merge keys exist only while the flush writes it, but they are
+reserved with their rows from admission on, so a block and the keys of the
+table being written stay within `window.max_block_bytes` together. The bound
+per values row is the key's row-format size plus 18 bytes: 44 bytes for the
+default `series_id, time_unix_nano`, and a little over the value's length for a
+string key. A key as wide as the row, such as `body`, therefore halves what a
+block holds. The bound also counts against `ingress.max_extracted_bytes`, and a
+sort key must be a number, timestamp, boolean, id or string column.
 
 F comes from the measured heap of a series row (`measurement --series-cost`,
 `docs/superpowers/reports/series-parquet-measurement/memory-strict-f001.json`):

@@ -308,15 +308,7 @@ impl Block {
     }
 
     fn spec_for(&self, ds: Dataset) -> SortSpec {
-        if ds.is_series() {
-            SortSpec::series()
-        } else if !self.cfg.sorting.enabled {
-            SortSpec::new(vec![])
-        } else if ds.signal() == crate::canonical::Signal::Logs {
-            SortSpec::new(self.cfg.logs.values_sort.clone())
-        } else {
-            SortSpec::new(self.cfg.metrics.values_sort.clone())
-        }
+        SortSpec::for_dataset(ds, &self.cfg)
     }
 
     /// Compute what admitting `extracted` would add.
@@ -367,7 +359,13 @@ impl Block {
         reemit: bool,
     ) -> Result<Reservation> {
         let limits = &self.cfg.ingress;
-        let fixed = extracted.pinned_bytes.saturating_add(token_bytes);
+        // The merge keys exist only while the block's tables are written, but
+        // they are reserved from admission on, so a block and the keys of the
+        // table being written stay within `max_block_bytes` together.
+        let fixed = extracted
+            .pinned_bytes
+            .saturating_add(extracted.merge_key_bytes)
+            .saturating_add(token_bytes);
         let worst = extracted
             .descriptors
             .iter()
@@ -981,6 +979,7 @@ mod tests {
         let e = extracted(&cfg, "h", 4);
         let token = 16;
         let worst = e.pinned_bytes
+            + e.merge_key_bytes
             + token
             + e.descriptors
                 .iter()
@@ -1096,6 +1095,7 @@ mod tests {
             let token = 16;
             let q = cfg.ingress.pending_series_entry_bytes;
             let exact = e.pinned_bytes
+                + e.merge_key_bytes
                 + token
                 + e.descriptors
                     .iter()
@@ -1108,8 +1108,9 @@ mod tests {
             assert_eq!(reservation.new_series.len(), e.descriptors.len());
             assert_eq!(reservation.bytes, exact, "{signal:?}");
 
-            let charged =
-                e.pinned_bytes + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
+            let charged = e.pinned_bytes
+                + e.merge_key_bytes
+                + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
             let fixed = cfg.series_row_fixed_bytes(signal);
             assert_eq!(fixed, 16 * columns + 8 + q);
             assert!(exact <= 2 * charged + token + e.descriptors.len() * fixed);
@@ -1179,6 +1180,70 @@ mod tests {
                 }))
             ));
         }
+    }
+
+    /// Scenario: logs values sorted by a 2 KiB `body`, requests admitted into one block until it
+    /// is full, the block sealed and the merge of every values table built as a flush builds it.
+    /// Guarantees: the sealed block's bytes plus the merge keys of any one of its tables stay
+    /// within `max_block_bytes`, so a wide sort key cannot take the block past its budget.
+    #[test]
+    fn a_full_block_and_the_merge_keys_of_its_table_fit_its_budget() {
+        let mut cfg = LakeConfig::default();
+        cfg.logs.values_sort = vec![SortKey {
+            column: "body".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }];
+        cfg.sorting.run_target_bytes = 256 << 10;
+        cfg.ingress.max_row_bytes = 64 << 10;
+        cfg.ingress.max_extracted_bytes = 1 << 20;
+        cfg.ingress.max_block_bytes = 4 << 20;
+        cfg.ingress.max_series_per_request = 100;
+        cfg.validate().expect("valid config");
+        let mut block = Block::new(0, 1, cfg.clone());
+        let mut cache = SeriesCache::new(100);
+        for request in 0.. {
+            let mut data = logs("h", 100);
+            for (i, record) in data.resource_logs[0].scope_logs[0]
+                .log_records
+                .iter_mut()
+                .enumerate()
+            {
+                let text = format!("{request:06}-{i:04}-");
+                record.body = Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(
+                        text.repeat(2048 / text.len()),
+                    )),
+                });
+            }
+            let e = extract(&mut encode_logs(&data), &cfg).expect("extract");
+            match block.reserve(&e, &mut cache, 16) {
+                Ok(reservation) => block.admit(e, reservation).expect("admit"),
+                Err(Error::Refused(RefuseReason::BlockFull)) => break,
+                Err(other) => panic!("request {request}: {other:?}"),
+            }
+        }
+        block.seal(SEAL_AT_US).expect("seal");
+        let keys = block
+            .tables()
+            .map(|table| {
+                crate::sort::MergeBuild::new(
+                    table.runs().to_vec(),
+                    table.spec(),
+                    cfg.sorting.merge_chunk_bytes,
+                )
+                .and_then(crate::sort::MergeBuild::finish)
+                .expect("merge")
+                .resident_key_bytes()
+            })
+            .max()
+            .expect("a table");
+        assert!(
+            block.bytes + keys <= cfg.ingress.max_block_bytes,
+            "block {} + keys {keys} > {}",
+            block.bytes,
+            cfg.ingress.max_block_bytes
+        );
     }
 
     /// Scenario: a block already holding `max_requests_per_block` tokens.

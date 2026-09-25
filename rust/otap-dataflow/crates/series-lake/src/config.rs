@@ -492,9 +492,9 @@ impl LakeConfig {
     /// measurement behind it.
     ///
     /// `Block::reserve` judges a request on exactly
-    /// `P + T + sum_i (2 * (A_i - D_i) + F)`: P the request's values bytes, T
-    /// its token, A_i a series' extracted estimate and D_i its decoded
-    /// attribute trees. That never exceeds `2 * E + T + S * F`, E the
+    /// `P + T + sum_i (2 * (A_i - D_i) + F)`: P the request's values bytes
+    /// and the merge-key bound of their rows, T its token, A_i a series'
+    /// extracted estimate and D_i its decoded attribute trees. That never exceeds `2 * E + T + S * F`, E the
     /// request's extracted charge and S its number of series, which
     /// [`LakeConfig::check_request_bound`] keeps within `max_block_bytes`.
     #[must_use]
@@ -538,9 +538,9 @@ impl LakeConfig {
     /// `max_series_per_request` and the other terms as in
     /// [`LakeConfig::derived_max_series_per_request`].
     ///
-    /// The `2 * E` term covers a request's values rows and its series rows at
-    /// twice their extracted estimate, `S * F_max` the fixed part of every
-    /// series row, and T its completion token. `block_key` is the name the
+    /// The `2 * E` term covers a request's values rows with their merge keys
+    /// and its series rows at twice their extracted estimate, `S * F_max` the
+    /// fixed part of every series row, and T its completion token. `block_key` is the name the
     /// caller's users write for `max_block_bytes`.
     ///
     /// # Errors
@@ -723,6 +723,17 @@ impl LakeConfig {
                             field.data_type()
                         )));
                     }
+                    // Block admission reserves every row's merge key, so a
+                    // key's encoded size must be computable from its column.
+                    if !crate::sort::merge_key_supported(field.data_type()) {
+                        return Err(Error::invalid(format!(
+                            "{section}.values_sort[{i}].column {:?} has type {}, whose merge \
+                             keys a block cannot reserve; sort by a number, timestamp, boolean, \
+                             id or string column",
+                            key.column,
+                            field.data_type()
+                        )));
+                    }
                 }
             }
         }
@@ -758,6 +769,29 @@ mod tests {
         cfg.ingress.max_requests_per_block = 0;
         let err = cfg.validate().expect_err("max_requests_per_block is 0");
         assert!(err.to_string().contains("max_requests_per_block"));
+    }
+
+    /// Scenario: `values_sort` names the metrics `bucket_counts` column, a list Arrow's row
+    /// converter can sort.
+    /// Guarantees: `validate` refuses it, since block admission cannot bound its merge keys.
+    #[test]
+    fn a_sort_key_whose_merge_keys_cannot_be_reserved_is_rejected() {
+        let mut cfg = LakeConfig::default();
+        cfg.metrics.values_sort = vec![SortKey {
+            column: "bucket_counts".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }];
+        let err = cfg
+            .validate()
+            .expect_err("a list sort key has no merge-key bound");
+        assert!(
+            rule(&err).contains(
+                "metrics.values_sort[0].column \"bucket_counts\" has type List(non-null Int64), \
+                 whose merge keys a block cannot reserve"
+            ),
+            "{err}"
+        );
     }
 
     /// Scenario: `values_sort` names the logs `attrs` column, a Map.

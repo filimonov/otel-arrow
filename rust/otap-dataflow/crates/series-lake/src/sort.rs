@@ -19,8 +19,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{Row, RowConverter, Rows, SortField};
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 
-use crate::config::{Nulls, SortKey, SortOrder};
+use crate::config::{LakeConfig, Nulls, SortKey, SortOrder};
 use crate::error::{Error, Result};
+use crate::schema::Dataset;
 
 /// Ordered list of sort keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,22 @@ impl SortSpec {
             order: SortOrder::Asc,
             nulls: Nulls::Last,
         }])
+    }
+
+    /// The sort a table of `ds` is written in under `cfg`: the fixed series
+    /// sort for a series dataset, the signal's `values_sort` for a values
+    /// dataset, and none for a values dataset while sorting is disabled.
+    #[must_use]
+    pub fn for_dataset(ds: Dataset, cfg: &LakeConfig) -> Self {
+        if ds.is_series() {
+            Self::series()
+        } else if !cfg.sorting.enabled {
+            Self::new(vec![])
+        } else if ds.signal() == crate::canonical::Signal::Logs {
+            Self::new(cfg.logs.values_sort.clone())
+        } else {
+            Self::new(cfg.metrics.values_sort.clone())
+        }
     }
 
     /// Whether sorting is disabled.
@@ -374,6 +391,113 @@ fn key_rows(batch: &RecordBatch, spec: &SortSpec, converter: &RowConverter) -> R
         .map(|c| c.values)
         .collect();
     Ok(converter.convert_columns(&cols)?)
+}
+
+/// Whether [`merge_key_bound`] can bound the merge keys of a sort column of
+/// this type: fixed-width primitives, booleans, fixed-size binaries,
+/// strings and binaries.
+#[must_use]
+pub fn merge_key_supported(data_type: &DataType) -> bool {
+    data_type.primitive_width().is_some()
+        || matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::FixedSizeBinary(_)
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
+        )
+}
+
+/// Row-format bytes of one non-null variable-length value of `len` bytes:
+/// a sentinel, then 8-byte mini-blocks up to 32 bytes and 32-byte blocks
+/// beyond, each followed by a continuation byte (`arrow_row`'s
+/// `variable::padded_length`). A null or empty value takes the sentinel
+/// alone.
+fn encoded_value_len(len: usize) -> usize {
+    const BLOCK: usize = 32;
+    const MINI: usize = 8;
+    if len <= BLOCK {
+        1 + len.div_ceil(MINI) * (MINI + 1)
+    } else {
+        BLOCK / MINI + len.div_ceil(BLOCK) * (BLOCK + 1)
+    }
+}
+
+/// Row-format bytes of every value of one variable-length column, from its
+/// offsets and validity.
+fn encoded_column_len<O: arrow::array::OffsetSizeTrait>(
+    offsets: &[O],
+    nulls: Option<&NullBuffer>,
+) -> usize {
+    offsets
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| {
+            if nulls.is_some_and(|nulls| nulls.is_null(i)) {
+                1
+            } else {
+                encoded_value_len((pair[1] - pair[0]).as_usize())
+            }
+        })
+        .sum()
+}
+
+/// Upper bound on the heap a table's merge keeps for the sort keys of
+/// `batch`'s rows, the batch being one of the table's runs or part of one;
+/// [`MergeIter::resident_key_bytes`] is what it bounds.
+///
+/// Per row: the encoded key, computed from the key columns the way the row
+/// format lays them out, its offset, and the share of two key segments at the
+/// fewest rows a segment holds ([`MIN_KEY_SLICE_ROWS`]): at most one short
+/// segment ends each run and each merge step. Per batch, since a run holds at
+/// least one batch: two more segments and two merge heap entries. Zero for an
+/// empty spec. A key column the batch lacks adds nothing: the sort itself
+/// refuses it.
+///
+/// # Errors
+/// Refuses a key type [`merge_key_supported`] does not cover.
+pub fn merge_key_bound(batch: &RecordBatch, spec: &SortSpec) -> Result<usize> {
+    let rows = batch.num_rows();
+    if spec.is_empty() || rows == 0 {
+        return Ok(0);
+    }
+    let segment = size_of::<Rows>() + size_of::<usize>();
+    let mut bytes = rows * (size_of::<usize>() + (2 * segment).div_ceil(MIN_KEY_SLICE_ROWS))
+        + 2 * (segment + size_of::<HeapItem>());
+    for key in &spec.keys {
+        let Some(column) = batch.column_by_name(&key.column) else {
+            continue;
+        };
+        let data_type = column.data_type();
+        bytes += match data_type {
+            DataType::Boolean => rows * 2,
+            DataType::FixedSizeBinary(width) => rows * (1 + *width as usize),
+            DataType::Utf8 => {
+                encoded_column_len(column.as_string::<i32>().value_offsets(), column.nulls())
+            }
+            DataType::LargeUtf8 => {
+                encoded_column_len(column.as_string::<i64>().value_offsets(), column.nulls())
+            }
+            DataType::Binary => {
+                encoded_column_len(column.as_binary::<i32>().value_offsets(), column.nulls())
+            }
+            DataType::LargeBinary => {
+                encoded_column_len(column.as_binary::<i64>().value_offsets(), column.nulls())
+            }
+            other => match other.primitive_width() {
+                Some(width) => rows * (1 + width),
+                None => {
+                    return Err(Error::internal(format!(
+                        "sort column {} has type {other}, whose merge keys are not bounded",
+                        key.column
+                    )));
+                }
+            },
+        };
+    }
+    Ok(bytes)
 }
 
 /// Average pinned bytes per row over every run, deduplicating shared buffers
@@ -1958,6 +2082,71 @@ mod tests {
         assert_eq!(rows, 5);
         let unsorted = merge_runs(vec![r1, r2], &SortSpec::new(vec![]), 1).expect("merge");
         assert_eq!(unsorted.resident_key_bytes(), 0);
+    }
+
+    /// Scenario: five runs of 1000 rows keyed by a nullable string of 0 to 300 bytes, by an
+    /// Int64 with a Boolean and a FixedSizeBinary(16), and by the id then the string, each
+    /// merged under the default step budget.
+    /// Guarantees: the summed `merge_key_bound` of the runs is never below the keys the merge
+    /// reports resident, and for the string key stays within 15 percent of them.
+    #[test]
+    fn merge_key_bound_covers_what_the_merge_holds() {
+        use arrow::array::{BooleanArray, FixedSizeBinaryArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int64, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("id", DataType::FixedSizeBinary(16), false),
+        ]));
+        let run = |r: usize| {
+            let rows = 0..1000usize;
+            let strings: Vec<Option<String>> = rows
+                .clone()
+                .map(|i| (i % 17 != 0).then(|| "x".repeat((r * 7 + i * 13) % 301)))
+                .collect();
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(strings)),
+                Arc::new(Int64Array::from_iter_values(rows.clone().map(|i| i as i64))),
+                Arc::new(BooleanArray::from_iter(
+                    rows.clone().map(|i| Some(i % 2 == 0)),
+                )),
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(rows.map(|i| [(i % 251) as u8; 16]))
+                        .expect("ids"),
+                ),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).expect("batch")
+        };
+        let key = |column: &str| SortKey {
+            column: column.into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        };
+        for (keys, tight) in [
+            (vec![key("s")], true),
+            (vec![key("i"), key("b"), key("id")], false),
+            (vec![key("id"), key("s")], false),
+        ] {
+            let spec = SortSpec::new(keys);
+            let runs: Vec<RecordBatch> = (0..5)
+                .map(|r| sort_batch(&run(r), &spec).expect("sort"))
+                .collect();
+            let bound: usize = runs
+                .iter()
+                .map(|run| merge_key_bound(run, &spec).expect("bound"))
+                .sum();
+            let resident = MergeBuild::new(runs, &spec, 1 << 20)
+                .and_then(MergeBuild::finish)
+                .expect("merge")
+                .resident_key_bytes();
+            assert!(bound >= resident, "{spec:?}: bound {bound} < {resident}");
+            if tight {
+                assert!(
+                    bound * 100 <= resident * 115,
+                    "{spec:?}: bound {bound} over 1.15 x {resident}"
+                );
+            }
+        }
     }
 
     /// Scenario: string keys growing from one byte to hundreds as the merge advances.

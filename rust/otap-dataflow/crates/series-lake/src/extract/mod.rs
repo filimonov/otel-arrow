@@ -208,6 +208,10 @@ pub struct Extracted {
     pub values: Vec<(Dataset, Vec<RecordBatch>)>,
     /// Pinned bytes of all values batches.
     pub pinned_bytes: usize,
+    /// Bound on the merge keys of the values batches' rows when their tables
+    /// are written ([`crate::sort::merge_key_bound`]), charged to the request
+    /// budget with them.
+    pub merge_key_bytes: usize,
     /// Decoded bytes of the resource and scope attribute lists the
     /// descriptors share, charged once per request.
     ///
@@ -823,6 +827,10 @@ pub(crate) struct RowSink {
     rows_in_slice: usize,
     batches: Vec<RecordBatch>,
     pinned: usize,
+    /// The sort the dataset's table is written in, and the merge-key bound
+    /// of every sealed slice under it.
+    spec: crate::sort::SortSpec,
+    keys: usize,
     seen: CountedAllocations,
     run_target: usize,
 }
@@ -857,6 +865,8 @@ impl RowSink {
             rows_in_slice: 0,
             batches: Vec::new(),
             pinned: 0,
+            spec: crate::sort::SortSpec::for_dataset(ds, cfg),
+            keys: 0,
             seen: CountedAllocations::default(),
             run_target: cfg.sorting.run_target_bytes,
         })
@@ -892,21 +902,28 @@ impl RowSink {
         let cols: Vec<ArrayRef> = self.builders.iter_mut().map(finish).collect();
         let batch = RecordBatch::try_new(self.schema.clone(), cols)?;
         let pinned = record_batch_pinned_bytes(&batch, &mut self.seen);
+        let keys = crate::sort::merge_key_bound(&batch, &self.spec)?;
         self.pinned += pinned;
+        self.keys += keys;
         // The run's rows were charged as estimates while it was being built;
-        // now that it is measurable, swap the estimate for the measurement.
+        // now that it is measurable, swap the estimate for the measurement,
+        // and charge the merge keys its rows will need beside it.
         budget.uncharge(self.slice_bytes);
-        budget.charge(pinned)?;
+        budget.charge(pinned + keys)?;
         self.batches.push(batch);
         self.slice_bytes = 0;
         self.rows_in_slice = 0;
         Ok(())
     }
 
-    /// Seal the last slice and return every batch with their pinned bytes.
-    pub(crate) fn finish(mut self, budget: &mut Budget) -> Result<(Vec<RecordBatch>, usize)> {
+    /// Seal the last slice and return every batch with their pinned bytes and
+    /// their merge-key bound.
+    pub(crate) fn finish(
+        mut self,
+        budget: &mut Budget,
+    ) -> Result<(Vec<RecordBatch>, usize, usize)> {
         self.seal(budget)?;
-        Ok((self.batches, self.pinned))
+        Ok((self.batches, self.pinned, self.keys))
     }
 }
 

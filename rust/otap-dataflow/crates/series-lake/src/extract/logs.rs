@@ -107,6 +107,7 @@ pub(crate) fn extract_logs(
             descriptors: vec![],
             values: vec![],
             pinned_bytes: 0,
+            merge_key_bytes: 0,
             shared_bytes: 0,
             stats,
         });
@@ -302,7 +303,7 @@ pub(crate) fn extract_logs(
     if let Some(body) = body {
         body.release(budget);
     }
-    let (batches, pinned_bytes) = sink.finish(budget)?;
+    let (batches, pinned_bytes, merge_key_bytes) = sink.finish(budget)?;
     let values = if batches.is_empty() {
         vec![]
     } else {
@@ -316,6 +317,7 @@ pub(crate) fn extract_logs(
         descriptors,
         values,
         pinned_bytes,
+        merge_key_bytes,
         shared_bytes: resources.bytes() + scopes.bytes(),
         stats,
     })
@@ -859,6 +861,7 @@ mod tests {
             .map(|d| d.approx_bytes)
             .sum::<usize>()
             + out.pinned_bytes
+            + out.merge_key_bytes
             + out.shared_bytes
             + tables;
 

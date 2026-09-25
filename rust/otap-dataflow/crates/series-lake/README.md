@@ -60,7 +60,9 @@ a zero `sum` read as null, traces) are listed in
   it.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
-  second copy of the table's payload.
+  second copy of the table's payload. Extraction charges every values row
+  its key's bound (`sort::merge_key_bound`) and the block reserves it, so
+  the block and those keys stay within `max_block_bytes`.
 - `merge_chunk_bytes` is an approximation from the table's mean row width, so
   a chunk of much wider rows overshoots it. With sorting disabled it is
   ignored, and runs go to the writer as they are, each at most
