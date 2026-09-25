@@ -380,9 +380,12 @@ struct ShutdownTestHooks {
     stall_flush: bool,
     /// Makes the final persist never finish.
     stall_persist: bool,
+    /// Makes starting the engine's release thread fail.
+    fail_release_thread: bool,
     /// In order: the outcome event name `shutdown_engine` emitted
-    /// (`complete`, `engine_failed`, `persist_deadline`), and `retry` for
-    /// each retry a transient Nack tried to schedule.
+    /// (`complete`, `engine_failed`, `persist_deadline`, then
+    /// `release_deadline` or `release_thread_failed`), and `retry` for each
+    /// retry a transient Nack tried to schedule.
     events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
@@ -1867,23 +1870,53 @@ impl DurableBuffer {
     ///
     /// The engine's last drop runs the WAL writer's blocking drop-time sync,
     /// which a wedged disk can hold without bound; past `finish_by` the
-    /// thread is left to finish on its own.
+    /// thread is left to finish on its own. When no thread can be started,
+    /// the engine is leaked instead of dropped here: the process is shutting
+    /// down and the WAL still holds what was not persisted.
     async fn release_engine(&mut self, finish_by: Instant) {
         let engine = std::mem::replace(
             &mut self.engine_state,
             EngineState::Failed("the storage engine was shut down".to_owned()),
         );
         let pending = std::mem::take(&mut self.pending_bundles);
+        // The thread takes the payload from this slot, so a failed spawn
+        // leaves it here rather than dropping it with the closure.
+        let slot = Arc::new(std::sync::Mutex::new(Some((pending, engine))));
         let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let thread_slot = Arc::clone(&slot);
+        let release = move || {
+            let payload = thread_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            drop(payload);
+            let _ = released_tx.send(());
+        };
+        #[cfg(test)]
+        let spawned = if self.shutdown_hooks.fail_release_thread {
+            drop(release);
+            Err(std::io::Error::other("injected thread spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name("durable-buffer-release".to_owned())
+                .spawn(release)
+        };
+        #[cfg(not(test))]
         let spawned = std::thread::Builder::new()
             .name("durable-buffer-release".to_owned())
-            .spawn(move || {
-                drop(pending);
-                drop(engine);
-                let _ = released_tx.send(());
-            });
+            .spawn(release);
         if let Err(e) = spawned {
-            otel_warn!("durable_buffer.shutdown.release_thread_failed", error = %e);
+            let payload = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            std::mem::forget(payload);
+            otel_warn!(
+                "durable_buffer.shutdown.release_thread_failed",
+                error = %e,
+                message = "no thread could close the storage engine; it is left open and what it did not persist is replayed from the WAL on the next start"
+            );
+            self.record_shutdown_event("release_thread_failed");
             return;
         }
         if until_deadline(finish_by, released_rx).await.is_none() {
@@ -2983,13 +3016,15 @@ mod tests {
         });
     }
 
-    /// Scenario: a graceful shutdown with a 1.5 s deadline whose final
-    /// persist completes, but whose storage engine then hangs in the WAL
-    /// writer's drop (the drop-time sync of a wedged disk).
-    /// Guarantees: the pipeline thread is not held by the drop: the buffer
-    /// exits by its deadline and reports the engine it left releasing.
-    #[test]
-    fn test_a_stuck_engine_release_does_not_hold_the_pipeline() {
+    /// Runs a graceful shutdown with a 1.5 s deadline after one acknowledged
+    /// bundle, while the WAL writer's drop hangs (the drop-time sync of a
+    /// wedged disk), and with `fail_release_thread` the release thread
+    /// cannot start. Returns the recorded events and how long past the
+    /// deadline the buffer exited; a drop on the pipeline thread is freed
+    /// after 5 s so a regression fails on timing instead of hanging.
+    fn shut_down_with_a_stuck_wal_drop(
+        fail_release_thread: bool,
+    ) -> (Vec<&'static str>, Option<Duration>) {
         use otel_arrow_dfe_otap::testing::next_ack;
         use otel_arrow_dfe_quiver::test_hooks::WalDropStall;
 
@@ -2998,8 +3033,6 @@ mod tests {
         let controller = ControllerContext::new(TelemetryRegistryHandle::default());
         let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
         let stall = Arc::new(WalDropStall::new(temp_dir.path()));
-        // Frees a pipeline thread that the drop would block, so a regression
-        // fails its timing assertion instead of hanging.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let unstick = {
             let stall = Arc::clone(&stall);
@@ -3009,9 +3042,12 @@ mod tests {
             })
         };
 
+        let mut processor = DurableBuffer::new(config, &pipeline_ctx).expect("processor");
+        processor.shutdown_hooks.fail_release_thread = fail_release_thread;
+        let events = Arc::clone(&processor.shutdown_hooks.events);
+        let overrun = std::rc::Rc::new(std::cell::Cell::new(None));
+        let observed = std::rc::Rc::clone(&overrun);
         run_local(async move {
-            let processor = DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
-            let events = Arc::clone(&processor.shutdown_hooks.events);
             let mut buffer = start_buffer(processor);
             let delivered = buffer.deliver_one().await;
             let (_, ack) = next_ack(AckMsg::new(delivered)).expect("the buffer subscribes to acks");
@@ -3028,20 +3064,42 @@ mod tests {
                 .expect("the buffer exits")
                 .expect("join")
                 .expect("the buffer shuts down cleanly");
-            let ended = Instant::now();
-
-            assert!(
-                ended < deadline + Duration::from_millis(500),
-                "the engine's drop held the pipeline {:?} past the deadline",
-                ended.saturating_duration_since(deadline)
-            );
-            assert_eq!(
-                *events.lock().expect("events lock"),
-                ["complete", "release_deadline"]
-            );
+            observed.set(Some(Instant::now().saturating_duration_since(deadline)));
         });
         drop(done_tx);
         unstick.join().expect("unstick thread");
+        let events = events.lock().expect("events lock").clone();
+        (events, overrun.get())
+    }
+
+    /// Scenario: a graceful shutdown whose final persist completes, but whose
+    /// storage engine then hangs in the WAL writer's drop.
+    /// Guarantees: the pipeline thread is not held by the drop: the buffer
+    /// exits by its deadline and reports the engine it left releasing.
+    #[test]
+    fn test_a_stuck_engine_release_does_not_hold_the_pipeline() {
+        let (events, overrun) = shut_down_with_a_stuck_wal_drop(false);
+        let overrun = overrun.expect("the buffer exited");
+        assert!(
+            overrun < Duration::from_millis(500),
+            "the engine's drop held the pipeline {overrun:?} past the deadline"
+        );
+        assert_eq!(events, ["complete", "release_deadline"]);
+    }
+
+    /// Scenario: as above, and no thread can be started to release the
+    /// storage engine.
+    /// Guarantees: the engine is not dropped on the pipeline thread: the
+    /// buffer exits before its deadline and reports the failed release.
+    #[test]
+    fn test_a_failed_release_thread_leaves_the_engine_undropped() {
+        let (events, overrun) = shut_down_with_a_stuck_wal_drop(true);
+        assert_eq!(
+            overrun,
+            Some(Duration::ZERO),
+            "exited {overrun:?} past the deadline"
+        );
+        assert_eq!(events, ["complete", "release_thread_failed"]);
     }
 
     /// Shut `buffer` down with `deadline` while its delivered bundle is in
