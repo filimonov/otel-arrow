@@ -325,6 +325,13 @@ throughput at the receiver while `admission.closed` stays at zero.
 `configs/series-parquet-s3.yaml` is sized for 100k records/s in 512-record
 requests.
 
+The OTLP gRPC receiver refuses a message above its `max_decoding_message_size`,
+4MiB unless set, with OUT_OF_RANGE, which OTLP clients retry without end, so
+nothing of such a batch is delivered. Set it to `ingress.max_request_bytes`, as
+the shipped configurations do (16MiB). The exporter cannot see the receiver's
+setting and says so once per worker at startup
+(`series_parquet.receiver_limit.unverified`).
+
 At-least-once begins when a request reaches this exporter: a producer queue
 overflow before that is lost and invisible here, so a file source should block
 on overflow. The reference Grafana Alloy producer,
@@ -471,6 +478,7 @@ the window interval means the destination is the limit.
 | `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
 | `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
 | `series_parquet.upload.parts_exceed_limit` | WARN | At start, when a file of `window.max_block_bytes` would need more than 10,000 parts of `upload.part_bytes`: `max_block_bytes`, `part_bytes`, `parts`, `max_parts`. |
+| `series_parquet.receiver_limit.unverified` | INFO | At start: the upstream receiver's `max_decoding_message_size` is not visible to the exporter and must reach `max_request_bytes`; `receiver_default_bytes` is the receiver's 4MiB default. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt: `seq`, `attempt`, `file`, `objects`, `deadline_remaining`. |
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |

@@ -158,6 +158,41 @@ fn the_shipped_example_configuration_is_valid() {
     assert_eq!(cfg.lake.writer_id, "local_1");
 }
 
+/// Scenario: the receiver and exporter nodes of both shipped series_parquet configurations.
+/// Guarantees: the receiver's `max_decoding_message_size` equals the exporter's
+/// `ingress.max_request_bytes`, so no request the exporter accepts is refused by the receiver.
+#[test]
+fn the_shipped_receiver_takes_every_request_the_exporter_accepts() {
+    use otel_arrow_dfe_otap::otap_grpc::server_settings::GrpcServerSettings;
+    for yaml in [
+        include_str!("../../../../../../configs/series-parquet-local.yaml"),
+        include_str!("../../../../../../configs/series-parquet-s3.yaml"),
+    ] {
+        let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("config parses");
+        let nodes = doc
+            .pointer("/groups/default/pipelines/main/nodes")
+            .expect("nodes");
+        let grpc: GrpcServerSettings = serde_json::from_value(
+            nodes
+                .pointer("/receiver/config/protocols/grpc")
+                .expect("an OTLP gRPC receiver")
+                .clone(),
+        )
+        .expect("receiver settings");
+        let exporter: Config = serde_json::from_value(
+            nodes
+                .pointer("/exporter/config")
+                .expect("an exporter")
+                .clone(),
+        )
+        .expect("exporter config");
+        assert_eq!(
+            grpc.max_decoding_message_size.map(|bytes| bytes as usize),
+            Some(exporter.lake.ingress.max_request_bytes)
+        );
+    }
+}
+
 /// Scenario: the factory builds file storage with no capability bound to the node.
 /// Guarantees: creation succeeds without a bearer token provider.
 #[test]

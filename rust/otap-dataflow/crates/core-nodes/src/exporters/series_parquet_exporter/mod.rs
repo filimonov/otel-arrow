@@ -164,9 +164,10 @@ fn physical_memory_bytes() -> Option<u64> {
 }
 
 /// Emit the start event (writer id, boot id, storage and budget), a warning
-/// when every core's memory budget together exceeds physical memory, and one
+/// when every core's memory budget together exceeds physical memory, one
 /// when a file as large as a block could need more multipart parts than S3
-/// allows.
+/// allows, and a statement that the upstream receiver's message limit is not
+/// visible from here.
 fn announce(worker: &worker::Worker, startup: &Startup) {
     let budget = worker.budget_bytes();
     let total = budget.saturating_mul(startup.num_cores as u64);
@@ -192,6 +193,18 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
         );
     }
     let cfg = &worker.cfg.lake;
+    // An exporter is given no view of the nodes upstream of it, so it cannot
+    // compare the receiver's decoding limit with its own request limit.
+    otel_info!(
+        "series_parquet.receiver_limit.unverified",
+        max_request_bytes = cfg.ingress.max_request_bytes,
+        receiver_default_bytes =
+            otel_arrow_dfe_otap::otap_grpc::server_settings::DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+        message = "this exporter cannot see the upstream receiver's \
+                   max_decoding_message_size; set it to at least ingress.max_request_bytes, \
+                   or the receiver refuses larger requests with OUT_OF_RANGE, which OTLP \
+                   clients retry without end"
+    );
     let parts = cfg.parts_per_block();
     if parts > lake::config::MAX_PARTS {
         otel_warn!(
