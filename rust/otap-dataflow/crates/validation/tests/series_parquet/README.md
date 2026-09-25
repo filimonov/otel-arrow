@@ -532,7 +532,7 @@ one.
 
 The PR-tier soaks (`measure run --case pr-soak-strict`, `pr-soak-buffered`)
 send 65 s of 100-record requests at 20 requests/s, every tenth a metrics
-request, into one worker on MinIO with 1 s windows, `max_block_bytes: 640KiB`
+request, into one worker on MinIO with 1 s windows, `max_block_bytes: 720KiB`
 and `max_requests_per_block: 6`, so blocks rotate both on bytes and on
 requests, and `flush_retry_deadline: 3s` with the store's own retry below
 it. The store is stopped once it holds a completed object and the ACTIVE

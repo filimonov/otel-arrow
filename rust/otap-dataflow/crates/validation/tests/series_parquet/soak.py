@@ -1115,9 +1115,11 @@ soak_buffered_case = functools.partial(soak_case, "soak-buffered")
 PR_RATE_REQUESTS_PER_S = 20
 PR_INPUT_S = 65
 PR_RECORDS_PER_REQUEST = 100
-# Every tenth request is a metrics request, so a block of six requests holds
-# six logs requests (rotated on bytes) or five and one metrics request
-# (rotated on requests).
+# Every tenth request is a metrics request. A logs request is charged about
+# 131 KB and a metrics request about 35 KB, merge keys included, so a block
+# holds five logs requests before the sixth does not fit (rotated on bytes),
+# or five and one metrics request (rotated on requests): 5 * 131 + 35 = 690 KB
+# <= 720 KiB < 6 * 131 = 786 KB.
 PR_WORKLOAD = measurement.Workload(
     requests=PR_RATE_REQUESTS_PER_S * PR_INPUT_S, records_per_request=PR_RECORDS_PER_REQUEST,
     body_bytes=1024, series=100, metrics_every=10,
@@ -1125,12 +1127,12 @@ PR_WORKLOAD = measurement.Workload(
 PR_FLUSH_DEADLINE_S = 3
 PR_WINDOW = {
     "flush_retry_deadline": f"{PR_FLUSH_DEADLINE_S}s",
-    "max_block_bytes": "640KiB",
+    "max_block_bytes": "720KiB",
     "max_requests_per_block": 6,
 }
-# Below half the block, so that the block also holds the fixed part of every
-# series row of one request (about 178 series at these budgets).
-PR_INGRESS = {"max_extracted_bytes": "288KiB"}
+# Leaves the block room for the fixed part of the series rows of one request
+# beside twice the extraction budget (about 226 series).
+PR_INGRESS = {"max_extracted_bytes": "320KiB"}
 # Strictly below the flush deadline, which the exporter requires of a cloud store.
 PR_RETRY = {
     "max_retries": 1, "init_backoff": "100ms", "max_backoff": "500ms",
