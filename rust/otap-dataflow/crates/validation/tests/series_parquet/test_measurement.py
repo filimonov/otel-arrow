@@ -6514,7 +6514,7 @@ class CapacityContracts(unittest.TestCase):
         self.assertFalse(decision["bracketed"])
         self.assertEqual(decision["sustainable_records_per_s"], 1875)
 
-    # Scenario: the receiver shed 6,219 requests as RESOURCE_EXHAUSTED while
+    # Scenario: the receiver refused 6,219 requests at its concurrency limit while
     # 3% of the sends also started late with a slot free.
     # Guarantees: the engine's refusal decides: the trial is unsustainable,
     # a bracket, and the producer's lateness is kept as a reason.
@@ -7005,7 +7005,7 @@ class AlloyContracts(unittest.TestCase):
             request = logs_pb.ExportLogsServiceRequest.FromString(raw)
             seen.append(len(raw))
             if len(request.resource_logs) > 2:
-                context.abort(grpc.StatusCode.OUT_OF_RANGE, "too large")
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, "too large")
             return logs_pb.ExportLogsServiceResponse().SerializeToString()
 
         upstream = grpc.server(futures.ThreadPoolExecutor(4))
@@ -7033,13 +7033,13 @@ class AlloyContracts(unittest.TestCase):
                 _ = call(small, timeout=10)
                 with self.assertRaises(grpc.RpcError) as refused:
                     _ = call(request(3), timeout=10)
-                self.assertEqual(refused.exception.code(), grpc.StatusCode.OUT_OF_RANGE)
+                self.assertEqual(refused.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
                 self.assertEqual(refused.exception.details(), "too large")
         finally:
             tap.stop()
             upstream.stop(0)
         self.assertEqual(seen[0], len(small))
-        self.assertEqual([r["code"] for r in tap.requests], ["OK", "OUT_OF_RANGE"])
+        self.assertEqual([r["code"] for r in tap.requests], ["OK", "INVALID_ARGUMENT"])
         self.assertEqual([r["records"] for r in tap.requests], [2, 3])
         self.assertEqual(tap.requests[0]["bytes"], len(small))
         # One client connection, one upstream connection.

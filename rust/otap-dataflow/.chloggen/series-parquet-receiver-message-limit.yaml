@@ -20,7 +20,8 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  The receiver's 4MiB default answered larger batches with OUT_OF_RANGE, which
-  OTLP clients retry without end. The exporter cannot see the receiver's limit
-  and states so at startup (series_parquet.receiver_limit.unverified); set
-  max_decoding_message_size in your own configurations too.
+  The receiver's 4MiB default refuses larger batches with INVALID_ARGUMENT,
+  which OTLP clients drop (payload_too_large). The exporter cannot see the
+  receiver's limit and states so at startup
+  (series_parquet.receiver_limit.unverified); set max_decoding_message_size in
+  your own configurations too.
