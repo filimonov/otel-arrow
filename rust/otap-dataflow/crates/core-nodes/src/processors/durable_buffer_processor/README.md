@@ -98,7 +98,9 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
 6. **Shutdown**: After the drain the buffer closes its outputs, records the
    ACK/NACK of bundles still in flight until one second before the shutdown
-   deadline, then persists them and stops. Every step ends by the deadline; a
+   deadline, then persists them and stops. The flush, drain and wait end one
+   second before the deadline, and the final persist always gets at least one
+   second, so the buffer can stop up to one second after the deadline. A
    bundle unacknowledged or unpersisted by then is replayed on the next start
 
 ## Telemetry

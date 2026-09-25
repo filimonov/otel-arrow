@@ -8,7 +8,7 @@ change_type: bug_fix
 component: engine
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: A node whose pdata channel closes while it drains a latched Shutdown now receives that Shutdown with its own deadline and reason.
+note: A node whose pdata channel closes during a pipeline shutdown now receives its Shutdown with the pipeline's deadline, not a one-second Shutdown.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  The inbox replaced the latched Shutdown with a one-second "pdata channel
-  closed" Shutdown when a node with admission closed saw its upstream sender
-  drop, which cut the granted drain short. The one-second Shutdown remains for
-  a channel that closes before any Shutdown is latched.
+  This holds for a Shutdown already latched, one still queued unread, and one
+  the runtime still buffers for a full control channel during receiver-first
+  shutdown. A channel that closes outside a pipeline shutdown still gets a
+  one-second Shutdown.

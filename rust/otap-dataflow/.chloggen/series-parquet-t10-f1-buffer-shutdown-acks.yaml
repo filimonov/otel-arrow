@@ -8,7 +8,7 @@ change_type: bug_fix
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: The durable buffer no longer replays bundles its exporter acknowledged during a graceful shutdown; it records acks that arrive before the shutdown deadline.
+note: The durable buffer no longer replays bundles its exporter acknowledged during a graceful shutdown; it records acks that arrive up to one second before the shutdown deadline.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  On shutdown the buffer closes its outputs so the exporter can flush, waits
-  for the acks and nacks of bundles in flight until the deadline, and persists
-  them before stopping. Bundles still unacknowledged at the deadline are
-  replayed on the next start (at-least-once).
+  On shutdown the buffer closes its outputs so the exporter can flush, records
+  acks and nacks until 1s before the deadline, and gives the final persist at
+  least 1s, so it can stop up to 1s past the deadline. Bundles not acknowledged
+  or persisted by then are replayed on the next start.

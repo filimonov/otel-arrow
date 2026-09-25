@@ -560,7 +560,11 @@ deadline is reached.
 As receivers exit and drop their `pdata` senders, downstream channels drain and
 close progressively toward exporters. Once a downstream input is fully drained
 or closed, the corresponding consumer receives `Shutdown` and exits its run
-loop.
+loop. When the input closes before the consumer has read its own `Shutdown`,
+the control messages already queued come first, that `Shutdown` included; if it
+is not queued yet (the control manager buffers sends to a full control
+channel), the inbox releases a `Shutdown` with the pipeline's shutdown
+deadline.
 
 A processor that declares `shutdown_completions` in its runtime requirements
 can report through `awaits_completions()` that it still expects the `Ack` or
