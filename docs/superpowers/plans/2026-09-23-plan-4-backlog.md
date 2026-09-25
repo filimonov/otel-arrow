@@ -154,3 +154,4 @@ topology; throughput and limits of other components wait here.
 - A durable_buffer bundle that fails conversion is rejected without
   `resolved{outcome=...}` (durable_buffer_processor/mod.rs:1426-1430); only
   `conversion_failed` records it.
+- Acks routed to retry_processor or fanout_processor after they exit are dropped silently (Task 12e item 5): retry ignores Shutdown and declares no shutdown_completions (retry_processor/mod.rs:668, 705), fanout ignores control messages (fanout_processor 512, 988, 1107-1109), and the dispatcher drops completions to a closed control channel without a log or counter (pipeline_ctrl.rs:1033, 1058). In durable_buffer -> retry/fanout -> series_parquet the buffer replays bundles the exporter wrote (duplicates). Fix: these processors declare shutdown_completions and track their in-flight frames, or a dispatcher rule for completions to a closed node; at least count and log the drop.
