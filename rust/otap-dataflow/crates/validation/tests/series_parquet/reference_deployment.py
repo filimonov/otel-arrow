@@ -44,7 +44,7 @@ except ImportError:
 ENGINE_CONFIG = "configs/series-parquet-buffered.yaml"
 ALLOY_CONFIG = test_e2e.ALLOY_REFERENCE_CONFIG
 CASES = ("healthy", "s3_outage", "wal_full", "engine_restart", "engine_kill",
-         "alloy_restart", "soak")
+         "alloy_restart", "alloy_kill", "soak")
 # The engine process on the campaign's engine cores, its one worker on core 2,
 # the store beside it, and Alloy with the feeder on the producer cores.
 ENGINE_CPUS = "0-3,16-19"
@@ -256,8 +256,9 @@ class ReferenceEngine:
 class AlloyInstance:
     """One Grafana Alloy container running the reference River config unchanged."""
 
-    def __init__(self, root, index, grpc_port):
+    def __init__(self, root, index, grpc_port, config_text=None):
         self.index = index
+        self.config_text = config_text
         self.dir = Path(root) / f"alloy-{index:02d}"
         self.input = self.dir / "input"
         self.state = self.dir / "state"
@@ -272,7 +273,8 @@ class AlloyInstance:
         image = test_e2e.require_docker_image("alloy")
         self.input.mkdir(parents=True, exist_ok=True)
         self.state.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(test_e2e.WORKSPACE / ALLOY_CONFIG, self.input / "config.alloy")
+        (self.input / "config.alloy").write_text(
+            self.config_text or (test_e2e.WORKSPACE / ALLOY_CONFIG).read_text())
         self.lines.touch()
         self.container = subprocess.check_output([
             "docker", "run", "--pull=never", "--detach", "--name", self.name,
@@ -310,6 +312,18 @@ class AlloyInstance:
         self.wait_ready()
         entry = {"stop_s": (stopped - began) / 1e9,
                  "down_s": (time.monotonic_ns() - stopped) / 1e9}
+        self.restarts.append(entry)
+        return entry
+
+    def kill_and_start(self) -> dict:
+        """SIGKILL the container, then start it again on the same state."""
+        began = time.monotonic_ns()
+        subprocess.run(["docker", "kill", "--signal", "KILL", self.container], check=True,
+                       capture_output=True, timeout=30)
+        subprocess.run(["docker", "start", self.container], check=True,
+                       capture_output=True, timeout=60)
+        self.wait_ready()
+        entry = {"killed": True, "down_s": (time.monotonic_ns() - began) / 1e9}
         self.restarts.append(entry)
         return entry
 
@@ -498,6 +512,15 @@ class Case:
         self.overrides = {"buffer.config.retention_size_cap": WAL_FULL_CAP} \
             if name == "wal_full" else {}
 
+    @property
+    def alloy_text(self):
+        """The River file the fleet runs: the shipped one, or, for the control
+        run `alloy_queue_storage=false`, the same with its queue in memory."""
+        text = (test_e2e.WORKSPACE / ALLOY_CONFIG).read_text()
+        if self.options.get("alloy_queue_storage", True):
+            return text
+        return memory_queue_variant(text)
+
     def event(self, kind, **fields):
         entry = {"kind": kind, "t": time.monotonic_ns(), "wall": time.time_ns(), **fields}
         self.events.append(entry)
@@ -589,6 +612,31 @@ class Case:
         self.event("alloy_restarted", restarts=[a.restarts[-1] for a in self.alloys])
         self.hold(self.options.get("after_s", 90))
 
+    def fault_alloy_kill(self):
+        # The engine is down long enough for every Alloy queue to fill and its
+        # tailer to park; then every Alloy is SIGKILLed and started again.
+        self.event("engine_sigterm", boot=self.engine.boot)
+        self.event("engine_exited", **self.engine.terminate())
+        full = self.wait_for(lambda: self.queues_full(), 120, "Alloy queues full")
+        self.hold(self.options.get("blocked_s", 20))
+        self.event("alloy_sigkill", queues_full=full)
+        threads = [threading.Thread(target=alloy.kill_and_start) for alloy in self.alloys]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.event("alloy_restarted", restarts=[a.restarts[-1] for a in self.alloys])
+        self.hold(10)
+        self.new_engine()
+        self.hold(self.options.get("after_s", 90))
+
+    def queues_full(self):
+        sample = self.sampler.alloy_samples[-1] if self.sampler.alloy_samples else {}
+        per = sample.get("alloys") or {}
+        capacity = shipped_alloy_settings()["queue_size_records"]
+        return len(per) == len(self.alloys) and all(
+            (found.get("queue_size_records") or 0) >= capacity * 0.75 for found in per.values())
+
     def producers_drained(self, stable_polls=6):
         """Every Alloy's queue empty and its read and sent counts unchanged for
         `stable_polls` polls, past its batch timeout; one never restarted has
@@ -630,7 +678,9 @@ class Case:
         lease.acquire(deadline_ns=time.monotonic_ns()
                       + int(self.options.get("lease_wait_s", 4 * 3600) * 1e9))
         self.result = {"case": self.name, "store": self.store_kind,
-                       "started_utc": measurement.utc_now(), "lease": lease.as_json()}
+                       "started_utc": measurement.utc_now(), "lease": lease.as_json(),
+                       "options": {k: v for k, v in self.options.items()
+                                   if k not in ("archive_dir", "report_dir")}}
         try:
             with test_e2e.DockerStore(self.store_kind) as store:
                 self.store = store
@@ -639,7 +689,7 @@ class Case:
                 self.admin_port = test_e2e.free_port()
                 self.new_engine()
                 self.sampler = Sampler(self)
-                self.alloys = [AlloyInstance(self.work, i, self.grpc_port)
+                self.alloys = [AlloyInstance(self.work, i, self.grpc_port, self.alloy_text)
                                for i in range(self.producers)]
                 try:
                     for alloy in self.alloys:
@@ -860,6 +910,13 @@ class Case:
             kills = sum(1 for e in self.events if e["kind"] == "engine_sigkill")
             return {"lines": int(per_kill * kills), "per_kill_lines": int(per_kill),
                     "rule": "in-flight exports + 100ms of WAL acks + one unrecorded block"}
+        if self.name == "alloy_kill":
+            # Resumed from the last saved position (at most 10s old), plus the
+            # batches the file-backed queue held, whose exports may have been
+            # applied before the kill.
+            per = self.rate * 10 + settings["queue_size_records"] + batch
+            return {"lines": int(per * self.producers), "per_producer_lines": int(per),
+                    "rule": "10s position sync + the queue + one batch per producer"}
         if self.name == "alloy_restart":
             # A restarted loki.source.file resumes from its last saved
             # position, written every 10s.
@@ -890,9 +947,24 @@ class Case:
             exits = [e for e in self.events if e["kind"] == "engine_exited"]
             check("fault_observed", exits and all(e.get("code") == -9 for e in exits),
                   f"exits {exits}")
+        if name == "alloy_kill":
+            killed = [e for e in self.events if e["kind"] == "alloy_sigkill"]
+            check("fault_observed", killed and killed[0].get("queues_full")
+                  and all(a.restarts for a in self.alloys),
+                  f"killed {killed}, restarts {[a.restarts for a in self.alloys]}")
         if name == "alloy_restart":
             restarted = all(a.restarts for a in self.alloys)
             check("fault_observed", restarted, {a.index: a.restarts for a in self.alloys})
+
+
+def memory_queue_variant(text):
+    """The reference River config with its sending queue kept in memory."""
+    lines = [row for row in text.splitlines()
+             if "otelcol.storage.file" not in row]
+    variant = "\n".join(lines) + "\n"
+    if "storage" in variant.split("sending_queue", 1)[1].split("}", 1)[0]:
+        raise AssertionError("the queue storage line was not removed")
+    return variant
 
 
 def wal_full_observed(backpressure, statuses):
@@ -1150,10 +1222,22 @@ def read_back(root, written) -> dict:
     }
 
 
+def scrub_paths(result):
+    """The result with this host's checkout paths replaced by placeholders."""
+    text = json.dumps(result, default=str)
+    for root, token in ((test_e2e.WORKSPACE, "<workspace>"),
+                        (faults.FAULT_ARCHIVE_ROOT.parent, "<main_checkout>")):
+        text = text.replace(str(root), token)
+    return json.loads(text)
+
+
 def publish(result, report_dir):
+    result = scrub_paths(result)
     report_dir = Path(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
-    path = report_dir / f"{REPORT_PREFIX}-{result['case'].replace('_', '-')}-{result['store']}.json"
+    label = (result.get("options") or {}).get("label")
+    name = f"{REPORT_PREFIX}-{result['case'].replace('_', '-')}-{result['store']}"
+    path = report_dir / (f"{name}-{label}.json" if label else f"{name}.json")
     path.write_text(json.dumps(result, indent=1, sort_keys=True, default=str) + "\n")
     return path
 

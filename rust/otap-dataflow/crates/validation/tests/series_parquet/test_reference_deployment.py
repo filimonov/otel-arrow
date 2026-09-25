@@ -73,6 +73,17 @@ class ReferenceDeploymentContracts(unittest.TestCase):
         self.assertFalse(ref.wal_full_observed(384, {"OK": 10})[0])
         self.assertFalse(ref.wal_full_observed(0, {"UNAVAILABLE": 3})[0])
 
+    # Scenario: the control variant of the reference River config.
+    # Guarantees: only the file storage component and the queue's storage
+    # reference are removed.
+    def test_memory_queue_variant_drops_only_the_queue_storage(self):
+        text = (ref.test_e2e.WORKSPACE / ref.ALLOY_CONFIG).read_text()
+        variant = ref.memory_queue_variant(text)
+        self.assertNotIn("otelcol.storage.file", variant)
+        removed = set(text.splitlines()) - set(variant.splitlines())
+        self.assertEqual(len(removed), 2, removed)
+        self.assertIn("block_on_overflow = true", variant)
+
     # Scenario: the shipped River config is read for the duplicate bound.
     # Guarantees: the reference producer keeps its file-backed queue, two
     # consumers and 4000-record batches.
