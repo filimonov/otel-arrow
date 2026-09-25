@@ -4253,7 +4253,9 @@ def replay_analysis(ledger, rows, events, final_etags, failed_ids=(), *, buffere
     acknowledged before the exit, which the producer resends, and after a
     SIGKILL in the buffered topology every request, since the buffer
     redelivers what it had not recorded as delivered. A listed key that
-    changed or vanished is recorded.
+    changed or vanished is recorded. A duplicate is attributed when it was
+    replayed, belongs to a request the producer resent, or has a copy in a
+    failed block (`failed_ids`).
     """
     with ledger.lock:
         connection = ledger.connection
@@ -4331,13 +4333,17 @@ def replay_analysis(ledger, rows, events, final_etags, failed_ids=(), *, buffere
             })
         duplicated, outside = connection.execute(
             "SELECT count(*), coalesce(sum(CASE WHEN p.record_id IS NULL AND f.record_id IS NULL "
-            "THEN 1 ELSE 0 END), 0) FROM (SELECT record_id FROM file_rows GROUP BY record_id "
-            "HAVING count(*) > 1) d LEFT JOIN replayed_rows p ON p.record_id = d.record_id "
-            "LEFT JOIN failed_rows f ON f.record_id = d.record_id").fetchone()
+            "AND s.record_id IS NULL THEN 1 ELSE 0 END), 0) FROM (SELECT record_id FROM "
+            "file_rows GROUP BY record_id HAVING count(*) > 1) d "
+            "LEFT JOIN replayed_rows p ON p.record_id = d.record_id "
+            "LEFT JOIN failed_rows f ON f.record_id = d.record_id "
+            "LEFT JOIN (SELECT r.record_id FROM records r JOIN (SELECT request_id FROM attempts "
+            "GROUP BY request_id HAVING count(*) > 1) t ON t.request_id = r.request_id) s "
+            "ON s.record_id = d.record_id").fetchone()
         replayed_total = connection.execute("SELECT count(*) FROM replayed_rows").fetchone()[0]
     return {"events": report, "replayed_records_count": int(replayed_total),
             "duplicated_records": int(duplicated),
-            "duplicated_outside_replay_and_failed_blocks_records": int(outside)}
+            "duplicated_unattributed_records": int(outside)}
 
 
 def interrupted_requests(requests, instant_unix, *, key_part):
@@ -4752,17 +4758,19 @@ class ProcessCase(FaultCase):
 
     def explain_duplicates(self, duplicates, record):
         """Strict: resent requests. Buffered: a copy stored before a restart and
-        again after it, or a copy in a failed block."""
+        again after it, a request the producer resent because a kill cut off
+        its acknowledgement, or a copy in a failed block."""
         if not self.buffered:
             return duplicates_explained(False, duplicates)
         replay = record.get("replay")
         if not replay:
             return False, "the replay was not measured"
-        outside = replay["duplicated_outside_replay_and_failed_blocks_records"]
+        outside = replay["duplicated_unattributed_records"]
         return outside == 0, (
             f"{outside} of {replay['duplicated_records']} duplicated records were neither "
-            f"stored again after a restart ({replay['replayed_records_count']} replayed) nor "
-            "copied in a failed block")
+            f"stored again after a restart ({replay['replayed_records_count']} replayed), nor "
+            f"in a resent request ({duplicates.get('duplicated_in_resent_requests_records')}), "
+            "nor copied in a failed block")
 
     def verdicts(self, record):
         """fault_observed and recovered, then PROCESS_CHECKS."""
@@ -4862,7 +4870,13 @@ class ProcessCase(FaultCase):
               "exit_code": e["exit"]["exit_code"]} for e in self.events])
 
     def upload_problems(self, record):
-        """kill_upload: the multipart upload and the single PUT were both cut off."""
+        """kill_upload: the multipart upload and the single PUT were both cut off.
+
+        The caught multipart upload can never complete, since no completion
+        was sent. A single PUT whose whole body the route had already taken
+        in may still be committed by the store after the kill; that is a
+        late object of the killed boot, recorded, not a missed kill.
+        """
         problems = []
         final_keys = {item["key"] for item in record["objects"]}
         first, second = self.events
@@ -4875,8 +4889,7 @@ class ProcessCase(FaultCase):
         put = interrupted_requests(record["requests"], second["exit"]["signal_unix_s"],
                                    key_part=second["boot_id"])
         cut = [entry for entry in put if entry["operation"] == "put_object"
-               and "/dataset=series/" in entry["uri"]
-               and entry["uri"].partition(f"/{self.store.bucket}/")[2] not in final_keys]
+               and "/dataset=series/" in entry["uri"]]
         if not cut:
             problems.append(f"no series PUT of boot {second['boot_id']} was cut off by the kill: "
                             f"{put}")
@@ -4937,12 +4950,16 @@ class ProcessCase(FaultCase):
 
     def observations(self, record):
         """The events, their timelines and the replay analysis."""
+        final_keys = {item["key"] for item in record["objects"]}
         return {"process": {
             "events": [{key: value for key, value in event.items() if key != "listing"}
                        | {"objects_at_exit_count": len(event["listing"]),
-                          "interrupted_requests": interrupted_requests(
-                              record["requests"], event["exit"]["signal_unix_s"],
-                              key_part=event["boot_id"])}
+                          "interrupted_requests": [
+                              dict(entry, completed_in_store=entry["uri"].partition(
+                                  f"/{self.store.bucket}/")[2] in final_keys)
+                              for entry in interrupted_requests(
+                                  record["requests"], event["exit"]["signal_unix_s"],
+                                  key_part=event["boot_id"])]}
                        for event in self.events],
             "gate_discards": self.discarded,
             "replay": record.get("replay"),

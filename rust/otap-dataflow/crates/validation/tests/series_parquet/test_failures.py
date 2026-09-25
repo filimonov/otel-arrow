@@ -1501,13 +1501,20 @@ class ProcessCaseContracts(unittest.TestCase):
         self.assertEqual(entry["acked_missing_at_exit_records"], 0)
         self.assertEqual(entry["pending_stored_at_exit_records"], 1)
         self.assertEqual(entry["multiplicity_by_cohort"]["later"], {"0->1": 2})
-        self.assertEqual(report["duplicated_outside_replay_and_failed_blocks_records"], 0)
+        self.assertEqual(report["duplicated_unattributed_records"], 0)
         events[0]["kind"] = "kill"
         buffered = faults.replay_analysis(ledger, rows, events, {before: "e1", after: "e2"},
                                           buffered=True)
         self.assertEqual(buffered["events"][0]["ineligible_replayed_records"], 0)
         changed = faults.replay_analysis(ledger, rows, events, {before: "other"}, buffered=True)
         self.assertEqual(changed["events"][0]["changed_listed_keys"], [before])
+        later = rows + [("r20", after)]
+        self.assertEqual(faults.replay_analysis(ledger, later, events, {}, buffered=True)[
+            "duplicated_unattributed_records"], 1)
+        ledger.attempt(2, 1, 60, 61, measurement.OUTCOME_RETRYABLE, "x")
+        ledger.attempt(2, 2, 70, 71, measurement.OUTCOME_ACK)
+        self.assertEqual(faults.replay_analysis(ledger, later, events, {}, buffered=True)[
+            "duplicated_unattributed_records"], 0)
 
     # Scenario: kill_active's gate is judged at several positions of a window.
     # Guarantees: it holds only with an ACTIVE-only block, nothing flushing
@@ -1553,6 +1560,33 @@ class ProcessCaseContracts(unittest.TestCase):
         ]
         found = faults.interrupted_requests(entries, 99.95, key_part="bb22")
         self.assertEqual([entry["uri"] for entry in found], ["/b/otel/x-bb22-1"])
+
+    # Scenario: kill_upload's two kills are judged when the store committed the
+    # cut-off series PUT after the kill, and when the caught multipart key
+    # shows up completed.
+    # Guarantees: a PUT open at the kill counts as cut off even if the store
+    # committed its already-received body later; a caught multipart upload
+    # whose key completed is never counted as interrupted.
+    def test_upload_kills_allow_a_late_put_but_not_a_completed_upload(self):
+        case = faults.ProcessCase.__new__(faults.ProcessCase)
+        case.store = mock.Mock(bucket="b")
+        values = "otel/v=1/signal=logs/dataset=values/part-x-aa11-00000004.parquet"
+        series = "otel/v=1/signal=logs/dataset=series/part-x-bb22-00000000.parquet"
+        upload = {"upload_id": "u1", "key": values, "part_bytes": 1540930, "logged_part_bytes": 0}
+        case.events = [
+            {"gate": {"open_uploads": [upload]}, "uploads_at_exit": [upload],
+             "exit": {"signal_unix_s": 50.0}, "boot_id": "aa11"},
+            {"gate": {}, "uploads_at_exit": [upload], "exit": {"signal_unix_s": 100.0},
+             "boot_id": "bb22"},
+        ]
+        requests = [{"uri": "/b/" + series, "msec": "100.5", "request_time": "3.0",
+                     "status": "499", "operation": "put_object", "method": "PUT"}]
+        record = {"objects": [{"key": series}], "requests": requests}
+        self.assertEqual(case.upload_problems(record), [])
+        record["objects"].append({"key": values})
+        self.assertIn("no caught multipart upload", case.upload_problems(record)[0])
+        record = {"objects": [], "requests": [dict(requests[0], status="200")]}
+        self.assertIn("no series PUT", case.upload_problems(record)[0])
 
     # Scenario: a process result lacks one of its lifecycle checks.
     # Guarantees: fault_check requires the process checks beside the common

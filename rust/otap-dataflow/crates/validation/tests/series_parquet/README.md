@@ -708,7 +708,9 @@ acknowledged input and `drained`.
   flush holds its series PUT, a single PUT, on the wire; then the throttle is
   removed and a third engine runs. The caught upload must stay incomplete,
   its key never completed, and NGINX must log the series PUT the second kill
-  cut off.
+  cut off. The store may still commit a PUT whose whole body the route had
+  already taken in; the event records it (`late_objects`,
+  `interrupted_requests[].completed_in_store`).
 
 A gate is confirmed on a fresh sample just before the signal. One the fresh
 sample no longer shows is a discarded setup attempt, recorded in
@@ -742,8 +744,9 @@ The process checks beside the S3 family's:
 `orphaned_uploads_expected` also allows every values upload a killed engine
 left open at its exit, and once the evidence is kept the case aborts every
 incomplete upload itself (`orphan_cleanup`). Buffered, `duplicates_explained`
-accepts a duplicate stored before a restart and again after it, or copied in
-a failed block.
+accepts a duplicate stored before a restart and again after it, one of a
+request the producer resent because a kill cut off its acknowledgement, or
+one copied in a failed block.
 
 The remaining subcommands (`buffered`, `remediate`, `report`) are named
 here so the command line is one contract; each is implemented by its own
