@@ -120,7 +120,8 @@ def log_request(request_id):
 
 # One metric request carries one gauge point and two histogram points, and all
 # three land in the single `signal=metrics/dataset=values` dataset.
-POINTS_PER_METRIC = 3
+METRIC_REQUEST_NAMES = ("integer", "histogram", "histogram_no_buckets")
+POINTS_PER_METRIC = len(METRIC_REQUEST_NAMES)
 
 
 def metric_request(request_id, unsupported=False):
@@ -2075,7 +2076,7 @@ def verify_readers(
                 "v.body, coalesce(v.attrs['e2e.source'], ''), v.producer_id, "
                 "coalesce(list_extract(map_extract(s.resource_attrs, 'host.id'), 1), '')"
                 if signal == "logs"
-                else "s.attrs['request.id'], v.producer_id, "
+                else "s.attrs['request.id'], s.metric_name, v.producer_id, "
                 "coalesce(list_extract(map_extract(s.resource_attrs, 'host.id'), 1), '')"
             )
             duck_rows = sorted(
@@ -2116,7 +2117,19 @@ def verify_readers(
                 else:
                     test.assertEqual(duck_rows, expected)
             elif metric_ids:
-                test.assertEqual({row[0] for row in duck_rows}, set(metric_ids))
+                # Every request stores one point of each of its metrics, so
+                # a lost point cannot be hidden by another one's duplicate.
+                stored = collections.Counter(row[:2] for row in duck_rows)
+                expected = {
+                    (request_id, name)
+                    for request_id in metric_ids
+                    for name in METRIC_REQUEST_NAMES
+                }
+                test.assertEqual(set(stored), expected)
+                if not allow_duplicates:
+                    test.assertEqual(
+                        [key for key, count in stored.items() if count != 1], []
+                    )
 
 
 # Upper bound on any single docker CLI call, so a wedged daemon fails the test
