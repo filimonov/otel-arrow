@@ -15,9 +15,9 @@ use crate::schema::dataset_schema;
 use crate::sort::{MergeBuild, MergeIter, MergeStep};
 use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
-use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
 use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned_bytes};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
@@ -48,6 +48,15 @@ impl MergeKeys {
         let _ = self.high_water.fetch_max(bytes, AtomicOrdering::Relaxed);
         MergeKeysHeld(self)
     }
+}
+
+/// What one table write put in the store.
+pub(super) struct TableWritten {
+    /// Rows the file holds.
+    pub(super) rows: usize,
+    /// Whether the completion's response was lost and a probe found the
+    /// object committed.
+    pub(super) probed: bool,
 }
 
 /// Clears the resident merge keys when a table write ends, however it ends.
@@ -287,6 +296,9 @@ fn lock_slot(slot: &std::sync::Mutex<UploadSlot>) -> std::sync::MutexGuard<'_, U
 ///
 /// Dropped neither completed nor aborted, it parks the upload in the table's
 /// [`UploadSlot`], so a write that fails while finishing can still abort it.
+/// After a failed completion it refuses the abort that follows, which the
+/// table write sends only once a probe has found no object (see
+/// [`Sink::settle_completion`]).
 #[derive(Debug)]
 pub(super) struct LedgeredUpload {
     pub(super) inner: Option<Box<dyn object_store::MultipartUpload>>,
@@ -294,6 +306,8 @@ pub(super) struct LedgeredUpload {
     pub(super) slot: Arc<std::sync::Mutex<UploadSlot>>,
     /// Set once the upload completed or was aborted.
     pub(super) settled: bool,
+    /// Set when `complete` returned an error: the store may have committed.
+    pub(super) complete_failed: bool,
 }
 
 impl LedgeredUpload {
@@ -330,10 +344,17 @@ impl object_store::MultipartUpload for LedgeredUpload {
         lock_slot(&self.slot).completing = true;
         let completed = self.inner().complete().await;
         self.settled = completed.is_ok();
+        self.complete_failed = completed.is_err();
         completed
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
+        // `WriteMultipart::finish` aborts at once after a failed completion
+        // and returns the abort's error in place of the completion's; the
+        // completion's error is the one that tells a retry is safe.
+        if self.complete_failed {
+            return Ok(());
+        }
         let aborted = self.inner().abort().await;
         self.settled = aborted.is_ok();
         aborted
@@ -508,6 +529,7 @@ impl StoreHooks for Creations {
             ledger: Arc::clone(&self.ledger),
             slot: Arc::clone(&self.slot),
             settled: false,
+            complete_failed: false,
         })
     }
 }
@@ -540,6 +562,45 @@ impl Sink {
                 "abort timed out after {:?}",
                 self.cfg.upload.abort_timeout
             )),
+        }
+    }
+
+    /// Settle an upload whose completion was sent but not confirmed, within
+    /// one `upload.abort_timeout`.
+    ///
+    /// A HEAD of `path` decides: an object that exists was committed by this
+    /// completion, since a block's names are frozen, and is not aborted. Any
+    /// other answer aborts the upload; `NotFound` means nothing is left to
+    /// abort. Returns `Ok` for a commit, else why the upload may be left
+    /// behind, if it may.
+    async fn settle_completion(
+        &self,
+        mut upload: Box<dyn object_store::MultipartUpload>,
+        path: &Path,
+    ) -> std::result::Result<(), Option<String>> {
+        let mut deadline = self.start_cleanup();
+        let timed_out = || {
+            Some(format!(
+                "probe and abort timed out after {:?}",
+                self.cfg.upload.abort_timeout
+            ))
+        };
+        let head = tokio::select! {
+            biased;
+            head = self.store.head(path) => head,
+            () = &mut deadline => return Err(timed_out()),
+        };
+        if head.is_ok() {
+            return Ok(());
+        }
+        let aborted = tokio::select! {
+            biased;
+            aborted = upload.abort() => aborted,
+            () = &mut deadline => return Err(timed_out()),
+        };
+        match aborted {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Err(None),
+            Err(error) => Err(Some(error.to_string())),
         }
     }
 
@@ -733,7 +794,7 @@ impl Sink {
         seq: u64,
         window_start_secs: i64,
         cancel: &CancellationToken,
-    ) -> Result<usize> {
+    ) -> Result<TableWritten> {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
         let total_rows: usize = runs.iter().map(RecordBatch::num_rows).sum();
         // A series table has no `time_unix_nano` column, so the scan would be
@@ -815,16 +876,18 @@ impl Sink {
 
         // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
         // down; `BufWriter::abort` panics once shutdown has started, so a failed or
-        // cancelled finish aborts the upload the writer let go of instead (see
-        // `LedgeredUpload`). One whose completion was sent is left alone: the store
-        // may have committed it.
+        // cancelled finish settles the upload the writer let go of instead (see
+        // `LedgeredUpload`).
         let finish = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(Error::cancelled(None)),
             r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
         };
         let Err(cause) = finish else {
-            return Ok(rows);
+            return Ok(TableWritten {
+                rows,
+                probed: false,
+            });
         };
         // Dropping the writer parks an upload a cancelled finish still held.
         drop(writer);
@@ -832,13 +895,28 @@ impl Sink {
             Some(Unsettled {
                 mut upload,
                 completing: false,
-            }) => self
-                .bounded_abort(upload.abort(), self.start_cleanup())
-                .await
-                .map(|reason| Self::orphan(path, reason)),
-            _ => None,
+            }) => {
+                self.bounded_abort(upload.abort(), self.start_cleanup())
+                    .await
+            }
+            Some(Unsettled {
+                upload,
+                completing: true,
+            }) => match self.settle_completion(upload, path).await {
+                // A cancelled write stays cancelled: its caller has decided the
+                // block, and probes for a late commit itself.
+                Ok(()) if !cause.is_cancelled() => {
+                    return Ok(TableWritten { rows, probed: true });
+                }
+                Ok(()) => None,
+                Err(abort_error) => abort_error,
+            },
+            None => None,
         };
-        Err(Self::with_abort(cause, abort_error))
+        Err(Self::with_abort(
+            cause,
+            abort_error.map(|reason| Self::orphan(path, reason)),
+        ))
     }
 
     /// Write every non-empty table of a sealed block, series datasets first.
@@ -869,10 +947,11 @@ impl Sink {
             .filter(|table| !table.is_empty())
             .zip(self.planned_paths(block))
         {
-            let rows = self
+            let written = self
                 .write_table(table, &path, block.seq, block.window_start_secs, cancel)
                 .await?;
-            report.files.push((table.dataset(), path, rows));
+            report.probed_commits += usize::from(written.probed);
+            report.files.push((table.dataset(), path, written.rows));
         }
         Ok(report)
     }

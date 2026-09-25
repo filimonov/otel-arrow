@@ -1011,11 +1011,7 @@ async fn every_cleanup_outcome_is_logged_and_counted() {
     let later = || clock::now() + Duration::from_secs(60);
     let cancelled = || Some(Err(lake::Error::cancelled(None)));
     trace
-        .cleaned_up(
-            2,
-            Some(Ok(lake::sink::FlushReport { files: Vec::new() })),
-            later(),
-        )
+        .cleaned_up(2, Some(Ok(lake::sink::FlushReport::default())), later())
         .await;
     trace.cleaned_up(2, cancelled(), later()).await;
     let _ = store
@@ -1187,86 +1183,6 @@ async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
     );
 }
 
-/// Scenario: a completed multipart upload answers with a retryable error, and the deadline expires
-/// during the backoff.
-/// Guarantees: a deadline expiry carrying the store's error, and one `late_commit` cleanup.
-#[tokio::test(flavor = "current_thread")]
-async fn a_completed_upload_that_errors_is_a_late_commit_when_the_deadline_ends_the_backoff() {
-    let events = capture();
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let sim = clock::SimClock::new();
-            let _clock_guard = sim.install();
-            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-            let store = fault_store();
-            store.hooks().set(Fault::FailedComplete);
-            let (handler, _rx) = effects(8);
-            let mut cfg = worker_config();
-            cfg.window.flush_retry_deadline = Duration::from_millis(20);
-            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
-            // Past validation on purpose, as in the wedged-upload test.
-            cfg.lake.upload.part_bytes = 4096;
-            cfg.lake.upload.concurrency = 1;
-            cfg.lake.parquet.row_group_bytes = 4096;
-            cfg.lake.sorting.merge_chunk_bytes = 4096;
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
-            worker.metrics = Some(super::super::metrics::Metrics::register(
-                &context,
-                &worker.cfg.lake,
-            ));
-
-            worker.admit(bulk_logs_pdata(20_000));
-            worker.rotate();
-            until("the first attempt fails after its upload landed", || {
-                !events
-                    .named("series_parquet.flush.attempt_failed")
-                    .is_empty()
-            })
-            .await;
-            assert_eq!(store.hooks().completes.load(SeqCst), 1);
-            // The first retry waits 200 ms; the deadline is 20 ms away.
-            sim.advance(Duration::from_millis(20));
-            let done = worker
-                .flushing
-                .as_mut()
-                .expect("a rotated block is flushing")
-                .finish()
-                .await;
-            let finished = done.as_ref().expect("the flush resolves");
-            assert_eq!(finished.attempts, 1, "no retry started");
-            assert!(
-                matches!(
-                    finished.result,
-                    Err(lake::Error::Transient(
-                        lake::TransientError::DeadlineExceeded {
-                            attempts: 1,
-                            last: Some(_)
-                        }
-                    ))
-                ),
-                "{:?}",
-                finished.result.as_ref().err()
-            );
-            worker.complete(done);
-            let mut job = worker.cleaning.take().expect("the cleanup slot");
-            job.cleanup().await.expect("the cleanup is bounded");
-            drop(job);
-            worker.sample_metrics();
-            let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
-            assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
-        })
-        .await;
-    let cleanup = events.named("series_parquet.flush.cleanup");
-    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
-    assert_eq!(cleanup[0].level, tracing::Level::INFO);
-    assert_eq!(
-        cleanup[0].fields.get("outcome"),
-        Some(&FieldValue::Str("late_commit".into()))
-    );
-}
-
 /// Scenario: the first attempt's values multipart upload fails and its abort fails too, and the
 /// retry succeeds.
 /// Guarantees: the block is acknowledged and `flush.abort_failures` counts the upload the failed
@@ -1345,6 +1261,152 @@ async fn an_upload_a_retried_attempt_leaves_behind_is_counted() {
             .is_some_and(|error| error.text().contains("dataset=values/")),
         "{cleanup:?}"
     );
+}
+
+/// A worker whose values file takes the multipart path, over `store`, with
+/// metrics registered.
+fn multipart_worker(
+    store: &Arc<FaultStore>,
+    context: &otel_arrow_dfe_engine::context::PipelineContext,
+    handler: EffectHandler<OtapPdata>,
+) -> Worker {
+    let mut cfg = worker_config();
+    cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+    // Past validation on purpose, as in the wedged-upload test.
+    cfg.lake.upload.part_bytes = 4096;
+    cfg.lake.upload.concurrency = 1;
+    cfg.lake.parquet.row_group_bytes = 4096;
+    cfg.lake.sorting.merge_chunk_bytes = 4096;
+    let wall = Arc::new(lake::clock::TestWallClock::new(0));
+    let mut worker = Worker::new(cfg, store.clone(), wall, handler);
+    worker.metrics = Some(super::super::metrics::Metrics::register(
+        context,
+        &worker.cfg.lake,
+    ));
+    worker
+}
+
+/// Scenario: a values multipart completion is applied by the store, its response is lost, and the
+/// abort that follows is answered `NotFound`, as RustFS answers it.
+/// Guarantees: a HEAD finds the object, so the block is acknowledged on its first attempt with no
+/// second upload; `flush.late_commits` is 1 with one INFO `late_commit` cleanup.
+#[tokio::test(flavor = "current_thread")]
+async fn a_committed_upload_whose_abort_is_not_found_is_acknowledged() {
+    a_committed_upload_is_acknowledged(Fault::CommittedCompleteTimesOut).await;
+}
+
+/// Scenario: a values multipart completion is applied by the store and then answers with a
+/// retryable error, on a store whose abort would succeed.
+/// Guarantees: the probe decides before any abort, so the block is acknowledged on its first
+/// attempt with no second upload and one `late_commit`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_committed_upload_whose_completion_errors_is_acknowledged() {
+    a_committed_upload_is_acknowledged(Fault::FailedComplete).await;
+}
+
+/// Drive one block through `fault`, a completion the store applies and whose
+/// response is lost, and check it is acknowledged as a late commit.
+async fn a_committed_upload_is_acknowledged(fault: Fault) {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = fault_store();
+            store.hooks().set(fault);
+            let (handler, mut rx) = effects(8);
+            let mut worker = multipart_worker(&store, &context, handler);
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let finished = done.as_ref().expect("the flush resolves");
+            assert_eq!(finished.attempts, 1, "no second attempt");
+            assert!(
+                finished.result.is_ok(),
+                "{:?}",
+                finished.result.as_ref().err()
+            );
+            worker.complete(done);
+            worker.notify.next().await.expect("the ack is sent");
+            assert!(matches!(
+                rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
+            assert_eq!(store.hooks().completes.load(SeqCst), 1, "one upload");
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
+            assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
+        })
+        .await;
+    let cleanup = events.named("series_parquet.flush.cleanup");
+    assert_eq!(cleanup.len(), 1, "{cleanup:?}");
+    assert_eq!(cleanup[0].level, tracing::Level::INFO);
+    assert_eq!(
+        cleanup[0].fields.get("outcome"),
+        Some(&FieldValue::Str("late_commit".into()))
+    );
+}
+
+/// Scenario: a values multipart completion is lost before the store applies it, and its abort is
+/// answered `NotFound`; the store then heals.
+/// Guarantees: the completion's own retryable error decides the attempt, so the block is retried
+/// under the same names and acknowledged; no late commit and no abort failure are counted.
+#[tokio::test(flavor = "current_thread")]
+async fn an_uncommitted_upload_whose_abort_is_not_found_is_retried() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let store = fault_store();
+            store.hooks().set(Fault::UncommittedCompleteTimesOutOnce);
+            let (handler, mut rx) = effects(8);
+            let mut worker = multipart_worker(&store, &context, handler);
+
+            worker.admit(bulk_logs_pdata(20_000));
+            worker.rotate();
+            until("the first attempt fails", || {
+                !events
+                    .named("series_parquet.flush.attempt_failed")
+                    .is_empty()
+            })
+            .await;
+            // The first retry waits 200 ms.
+            sim.advance(Duration::from_millis(200));
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            let finished = done.as_ref().expect("the flush resolves");
+            assert_eq!(finished.attempts, 2, "the block is retried");
+            assert!(
+                finished.result.is_ok(),
+                "{:?}",
+                finished.result.as_ref().err()
+            );
+            worker.complete(done);
+            worker.notify.next().await.expect("the ack is sent");
+            assert!(matches!(
+                rx.recv().await.expect("ack"),
+                PipelineCompletionMsg::DeliverAck { .. }
+            ));
+            worker.sample_metrics();
+            let metrics = worker.metrics.as_ref().expect("metrics");
+            assert_eq!(metrics.worker.flush_late_commits.get(), 0);
+            assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
+        })
+        .await;
 }
 
 /// Scenario: one block written on its first attempt.

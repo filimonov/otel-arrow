@@ -31,6 +31,9 @@ use std::time::Duration;
 pub struct FlushReport {
     /// Dataset, path and row count per file, in write order.
     pub files: Vec<(Dataset, Path, usize)>,
+    /// Files whose multipart completion lost its response and that a HEAD
+    /// then found committed.
+    pub probed_commits: usize,
 }
 
 /// Parquet sink.

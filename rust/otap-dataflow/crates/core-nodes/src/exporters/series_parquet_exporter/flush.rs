@@ -222,6 +222,9 @@ async fn write_until(
         }
         match result {
             Ok(report) => {
+                if report.probed_commits > 0 {
+                    trace.probed_commit(attempts);
+                }
                 let _ = result_tx.send(done(attempts, Ok(report)));
                 return;
             }
@@ -264,7 +267,8 @@ pub(super) struct FlushTally {
     /// Multipart uploads a failed write attempt may have left behind (see
     /// [`Trace::abort_failed`]).
     pub(super) abort_failures: Cell<u64>,
-    /// Failed flushes whose every object exists after all.
+    /// Flushes whose files the store committed without confirming it (see
+    /// [`Trace::late_commit`] and [`Trace::probed_commit`]).
     pub(super) late_commits: Cell<u64>,
 }
 
@@ -442,6 +446,22 @@ impl Trace {
             file = &*self.file,
             message = "a failed block's objects exist although its requests were nacked; its \
                        rows may be stored twice once the producer retries"
+        );
+    }
+
+    /// Count and log a block acknowledged although a multipart completion lost
+    /// its response: the sink's probe found the object committed.
+    fn probed_commit(&self, attempt: u64) {
+        let late = &self.shared.tally.late_commits;
+        late.set(late.get() + 1);
+        otel_info!(
+            "series_parquet.flush.cleanup",
+            outcome = "late_commit",
+            seq = self.seq,
+            attempt = attempt,
+            file = &*self.file,
+            message = "a multipart completion lost its response and a probe found the object; \
+                       the block is acknowledged"
         );
     }
 

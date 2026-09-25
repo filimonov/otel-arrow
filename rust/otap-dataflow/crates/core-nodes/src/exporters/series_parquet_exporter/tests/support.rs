@@ -530,6 +530,13 @@ pub(super) enum Fault {
     /// The first `values` multipart upload's parts fail and its abort fails
     /// too, leaving an upload behind; the store then heals.
     ValuesOrphanOnce,
+    /// A `values` multipart upload is completed in the underlying store, the
+    /// completion call then times out, and the abort that follows is answered
+    /// `NotFound`, the way RustFS answers an abort of a committed upload.
+    CommittedCompleteTimesOut,
+    /// The first `values` completion times out without committing and its
+    /// abort is answered `NotFound`; the store then heals.
+    UncommittedCompleteTimesOutOnce,
 }
 
 /// How long one write takes to fail under [`Fault::SlowFail`].
@@ -591,6 +598,10 @@ pub(super) struct LostCompleteUpload {
     pub(super) completes: Arc<AtomicUsize>,
     /// Whether the lost response is an error; otherwise no answer.
     pub(super) fails: bool,
+    /// Whether the completion is applied before its response is lost.
+    pub(super) commits: bool,
+    /// Whether an abort is answered `NotFound` instead of reaching the upload.
+    pub(super) abort_not_found: bool,
 }
 
 #[async_trait::async_trait]
@@ -600,8 +611,10 @@ impl MultipartUpload for LostCompleteUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let _ = self.inner.complete().await?;
-        let _ = self.completes.fetch_add(1, SeqCst);
+        if self.commits {
+            let _ = self.inner.complete().await?;
+            let _ = self.completes.fetch_add(1, SeqCst);
+        }
         if self.fails {
             return Err(object_store::Error::Generic {
                 store: "series-test",
@@ -612,6 +625,12 @@ impl MultipartUpload for LostCompleteUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
+        if self.abort_not_found {
+            return Err(object_store::Error::NotFound {
+                path: "values".into(),
+                source: "NoSuchUpload".into(),
+            });
+        }
         self.inner.abort().await
     }
 }
@@ -820,13 +839,27 @@ impl StoreHooks for Faults {
                 aborts: Arc::clone(&self.aborts),
             });
         }
-        if matches!(mode, Fault::LostComplete | Fault::FailedComplete)
-            && path.as_ref().contains("dataset=values/")
+        if matches!(
+            mode,
+            Fault::LostComplete
+                | Fault::FailedComplete
+                | Fault::CommittedCompleteTimesOut
+                | Fault::UncommittedCompleteTimesOutOnce
+        ) && path.as_ref().contains("dataset=values/")
         {
+            if mode == Fault::UncommittedCompleteTimesOutOnce {
+                self.set(Fault::None);
+            }
+            let not_found = matches!(
+                mode,
+                Fault::CommittedCompleteTimesOut | Fault::UncommittedCompleteTimesOutOnce
+            );
             return Box::new(LostCompleteUpload {
                 inner: upload,
                 completes: Arc::clone(&self.completes),
-                fails: mode == Fault::FailedComplete,
+                fails: mode != Fault::LostComplete,
+                commits: mode != Fault::UncommittedCompleteTimesOutOnce,
+                abort_not_found: not_found,
             });
         }
         upload

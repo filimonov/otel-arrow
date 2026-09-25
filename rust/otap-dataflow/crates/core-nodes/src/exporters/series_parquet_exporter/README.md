@@ -91,12 +91,19 @@ with the class `unavailable`, `rejected by the store`, `cancelled`, `encoding
 failed` or `internal error`. Only a fully successful write marks the
 descriptor cache.
 
+A multipart completion whose response is lost may still have been applied.
+The writer then sends one HEAD for that object before any abort: an object
+that exists was committed under the block's frozen name, so the write goes on
+and the block is acknowledged as a late commit (`flush.late_commits`, INFO
+`series_parquet.flush.cleanup`); otherwise the upload is aborted and the
+completion's own error decides the retry.
+
 A failed block can still leave its files behind: the store may finish an
 upload after the cancellation, or commit one and lose the response. After
 such an ambiguous end the cleanup sends one HEAD per object name, within the
-same cutoff. When every object exists the flush is a late commit
-(`flush.late_commits`, INFO `series_parquet.flush.cleanup`); its requests are
-still nacked, so its rows may be stored twice once the producers retry.
+same cutoff. When every object exists the flush is a late commit too; its
+requests are still nacked, so its rows may be stored twice once the producers
+retry.
 
 ### Block admission
 
@@ -375,7 +382,7 @@ collections is a counter.
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
 | `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. |
-| `flush.late_commits` | `{flush}` | Failed flushes whose every object exists after all; their nacked rows may be stored twice. |
+| `flush.late_commits` | `{flush}` | Flushes whose files the store committed without confirming it: acknowledged after a lost completion response, or failed flushes whose every object exists after all, whose nacked rows may be stored twice. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -427,7 +434,7 @@ the window interval means the destination is the limit.
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
 | `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
-| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion's object was found and the block acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
 | `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
 | `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |
@@ -507,10 +514,10 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   `AbortIncompleteMultipartUpload`, for example after one day). The writer
   aborts the upload of every failed or cancelled write, but an abort can fail,
   a creation can fail without an answer that tells whether the upload exists,
-  and an upload whose completion was sent is not aborted; `flush.abort_failures`
-  counts the uploads the writer knows it may have left behind and is the alert
-  signal. On a versioned bucket, each retry that reached the store leaves a
-  noncurrent version.
+  and a completion still in flight may be applied after the abort;
+  `flush.abort_failures` counts the uploads the writer knows it may have left
+  behind and is the alert signal. On a versioned bucket, each retry that
+  reached the store leaves a noncurrent version.
 - Writer limits (merge keys held during a merge, the average-based merge chunk,
   row-group upload bursts) are in the
   [series-lake README](../../../../series-lake/README.md#limitations-in-version-1),

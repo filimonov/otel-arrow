@@ -43,8 +43,11 @@ a zero `sum` read as null, traces) are listed in
 [FORMAT.md](docs/FORMAT.md#limitations-of-version-1). The writer adds these:
 
 - A failed or cancelled write aborts its multipart upload within
-  `upload.abort_timeout`, but an upload whose completion was already sent is
-  not aborted, since the store may have committed it. An abort that fails or
+  `upload.abort_timeout`. After a completion was sent, a HEAD first decides
+  whether the store committed the object: one that exists counts as written
+  (`FlushReport::probed_commits`) unless the write was cancelled, and only an
+  absent one is aborted. A completion still in flight may be applied after
+  that abort. An abort that fails or
   times out, and a CreateMultipartUpload that fails without a definite answer
   (the store may hold an upload whose id the writer never received), are
   reported as `TransientError::AbortFailed` naming the object key; the
