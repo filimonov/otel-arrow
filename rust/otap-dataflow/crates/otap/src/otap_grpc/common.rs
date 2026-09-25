@@ -156,7 +156,9 @@ pub fn apply_server_tuning<L>(builder: Server<L>, config: &GrpcServerSettings) -
 
     let mut builder = builder
         .concurrency_limit_per_connection(transport_limit)
-        .load_shed(config.load_shed)
+        // Tonic sheds with RESOURCE_EXHAUSTED, which OTLP clients drop; the receiver sheds with
+        // `ConcurrencyShedLayer` instead, so a request over this limit waits on its connection.
+        .load_shed(false)
         .initial_stream_window_size(config.initial_stream_window_size)
         .initial_connection_window_size(config.initial_connection_window_size)
         .max_frame_size(config.max_frame_size)

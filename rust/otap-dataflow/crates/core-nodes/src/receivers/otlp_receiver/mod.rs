@@ -5056,6 +5056,71 @@ mod tests {
             .run_validation_concurrent(validation);
     }
 
+    /// Scenario: one gRPC connection sends two requests while
+    /// `transport_concurrency_limit` is 1 and the receiver-wide limit is 2.
+    /// Guarantees: the second request waits for the connection's permit and
+    /// succeeds; nothing is refused or counted.
+    #[test]
+    fn test_otlp_grpc_connection_limit_queues_instead_of_refusing() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        let grpc = config.protocols.grpc.as_mut().unwrap();
+        grpc.max_concurrent_requests = 2;
+        grpc.transport_concurrency_limit = Some(1);
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validation = hold_first_request(held.clone(), release.clone(), 1);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let client = LogsServiceClient::connect(endpoint.clone())
+                    .await
+                    .expect("Failed to connect");
+                let mut first_client = client.clone();
+                let first = tokio::spawn(async move {
+                    first_client.export(create_logs_service_request()).await
+                });
+                timeout(Duration::from_secs(3), held.notified())
+                    .await
+                    .expect("Timed out waiting for the held request");
+
+                let mut second_client = client.clone();
+                let second = tokio::spawn(async move {
+                    second_client.export(create_logs_service_request()).await
+                });
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let finished_early = second.is_finished();
+                release.notify_one();
+                let first = first.await.unwrap();
+                let second = second.await.unwrap();
+                let rejections =
+                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                ctx.send_shutdown(Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+
+                assert!(
+                    !finished_early,
+                    "the second request must wait for the connection permit: {second:?}"
+                );
+                assert!(first.is_ok(), "the held request must succeed: {first:?}");
+                assert!(
+                    second.is_ok(),
+                    "the queued request must succeed: {second:?}"
+                );
+                assert_eq!(rejections, 0);
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
     // Run the receiver-side DST sweep for wait_for_result completion.
     // The seeded scenarios cover normal Ack, temporary Nack, permanent Nack,
     // and shutdown-forced completion without standing up real network servers.
