@@ -61,6 +61,14 @@ pub enum RefuseReason {
         /// The configured limit.
         limit: usize,
     },
+    /// The request's completion token, its routing context, holds more than
+    /// the bytes a block reserves for one: the route is too deep.
+    TokenTooLarge {
+        /// The token's bytes.
+        observed: usize,
+        /// The allowance, `config::TOKEN_ALLOWANCE_BYTES`.
+        limit: usize,
+    },
     /// A nested value is deeper than `ingress.max_nesting_depth`, the limit
     /// carried here.
     ///
@@ -113,6 +121,10 @@ impl std::fmt::Display for RefuseReason {
             RefuseReason::TooManySeries { observed, limit } => write!(
                 f,
                 "series limit exceeded: at least {observed} distinct series, limit {limit}"
+            ),
+            RefuseReason::TokenTooLarge { observed, limit } => write!(
+                f,
+                "completion token of {observed} bytes exceeds the {limit}-byte allowance"
             ),
             RefuseReason::BlockFull => f.write_str("BlockFull"),
             RefuseReason::TooManyRequests => f.write_str("TooManyRequests"),
@@ -442,6 +454,13 @@ mod tests {
                     limit: 10,
                 }),
                 "refused: series limit exceeded: at least 11 distinct series, limit 10",
+            ),
+            (
+                Error::Refused(RefuseReason::TokenTooLarge {
+                    observed: 5000,
+                    limit: 4096,
+                }),
+                "refused: completion token of 5000 bytes exceeds the 4096-byte allowance",
             ),
             (
                 Error::Refused(RefuseReason::BlockFull),

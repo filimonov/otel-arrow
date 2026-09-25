@@ -4098,7 +4098,8 @@ PUT_IN_FLIGHT_S = 1.0
 KILL_LOG_TOLERANCE_S = 0.1
 # The nack classes that refuse a request's own content; no retry cures them.
 PERMANENT_NACK_CLASSES = ("request_too_large", "extracted_too_large", "row_too_large",
-                          "too_many_series", "too_deep", "invalid", "unsupported")
+                          "too_many_series", "token_too_large", "too_deep", "invalid",
+                          "unsupported")
 # The checks a process case records beside FAULT_CHECKS.
 PROCESS_CHECKS = ("new_boot_id", "restart_same_cores_and_buffer", "prior_acks_durable",
                   "replay_only_eligible", "no_permanent_rejection", "retry_bytes_identical")

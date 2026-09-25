@@ -14,7 +14,7 @@ use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned
 use crate::cache::SeriesCache;
 use crate::canonical::SeriesId;
 use crate::clock::PartitionId;
-use crate::config::{LakeConfig, TOKEN_ALLOWANCE_BYTES};
+use crate::config::{LakeConfig, check_token};
 use crate::error::{Error, RefuseReason, Result};
 use crate::extract::{DescriptorRow, Extracted, series_batch};
 use crate::schema::Dataset;
@@ -314,8 +314,9 @@ impl Block {
     /// Compute what admitting `extracted` would add.
     ///
     /// Refuses before touching anything:
-    /// * an internal error when the completion token is larger than
-    ///   [`TOKEN_ALLOWANCE_BYTES`];
+    /// * `TokenTooLarge` when the completion token is larger than
+    ///   [`TOKEN_ALLOWANCE_BYTES`](crate::config::TOKEN_ALLOWANCE_BYTES), a
+    ///   permanent refusal (see [`check_token`]);
     /// * an internal error when the request's worst case (every descriptor it
     ///   carries written by this block; see
     ///   [`LakeConfig::series_row_fixed_bytes`]) exceeds `max_block_bytes`.
@@ -363,12 +364,7 @@ impl Block {
         // The one term of the worst case extraction does not bound; within
         // the allowance, `LakeConfig::check_request_bound` makes the check
         // below unreachable.
-        if token_bytes > TOKEN_ALLOWANCE_BYTES {
-            return Err(Error::internal(format!(
-                "the request's completion token holds {token_bytes} bytes, more than the \
-                 {TOKEN_ALLOWANCE_BYTES} bytes a block reserves for one"
-            )));
-        }
+        check_token(token_bytes)?;
         // The merge keys exist only while the block's tables are written, but
         // they are reserved from admission on, so a block and the keys of the
         // table being written stay within `max_block_bytes` together.
@@ -613,7 +609,7 @@ impl Block {
 mod tests {
     use super::*;
     use crate::cache::SeriesCache;
-    use crate::config::{LakeConfig, Nulls, SortKey, SortOrder};
+    use crate::config::{LakeConfig, Nulls, SortKey, SortOrder, TOKEN_ALLOWANCE_BYTES};
     use crate::error::RefuseReason;
     use crate::extract::extract;
     use arrow::array::AsArray;
@@ -962,8 +958,8 @@ mod tests {
 
     /// Scenario: a small request under the default configuration whose completion token is one
     /// byte over `TOKEN_ALLOWANCE_BYTES`, then exactly at it, offered to an empty block.
-    /// Guarantees: the oversized token is an internal error before any reservation, never a
-    /// permanent refusal, and leaves the block untouched; a token at the allowance is admitted.
+    /// Guarantees: the oversized token is refused permanently as `TokenTooLarge` before any
+    /// reservation and leaves the block untouched; a token at the allowance is admitted.
     #[test]
     fn a_token_over_the_allowance_is_refused_before_reservation() {
         let cfg = LakeConfig::default();
@@ -971,7 +967,16 @@ mod tests {
         let block = Block::new(0, 1, cfg.clone());
         let e = extracted(&cfg, "h", 4);
         let refused = block.reserve(&e, &mut cache, TOKEN_ALLOWANCE_BYTES + 1);
-        assert!(matches!(&refused, Err(Error::Internal(_))), "{refused:?}");
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::Refused(RefuseReason::TokenTooLarge {
+                    observed: 4097,
+                    limit: 4096
+                }))
+            ),
+            "{refused:?}"
+        );
         assert_eq!(block.bytes, 0);
         assert_eq!(block.request_count(), 0);
         assert!(block.pending_series.is_empty());

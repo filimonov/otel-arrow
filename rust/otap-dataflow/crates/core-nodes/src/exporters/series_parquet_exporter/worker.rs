@@ -370,6 +370,11 @@ impl Worker {
                 })),
             );
         }
+        // The token's size is fixed by the route, so an oversized one is
+        // refused here, before any conversion or block reservation.
+        if let Err(error) = lake::config::check_token(token.bytes()) {
+            return Prepared::Failed(token, error);
+        }
         // Traces have no lake schema, so they are refused on the signal alone,
         // before any conversion and whatever the `unsupported` policy says.
         if payload.signal_type() == otel_arrow_dfe_config::SignalType::Traces {

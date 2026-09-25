@@ -886,6 +886,56 @@ async fn a_backward_clock_step_does_not_repark_the_pending_request() {
         .await;
 }
 
+/// Scenario: a logs request routed through 256 subscribing nodes, so its completion token holds
+/// more than the 4 KiB allowance a block reserves for one.
+/// Guarantees: it is refused permanently at ingress, before extraction and any block reservation,
+/// with a reason naming the allowance, the observed size and the too-deep route; not parked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_token_over_the_allowance_is_refused_permanently_at_ingress() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (handler, mut rx) = effects(2);
+            let mut worker = Worker::new(
+                worker_config(),
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                handler,
+            );
+            let mut data = logs_pdata();
+            for node in 100..356 {
+                data = data.test_subscribe_to(
+                    Interests::ACKS | Interests::NACKS,
+                    Default::default(),
+                    node,
+                );
+            }
+            worker.admit(data);
+            assert!(worker.active.data.is_empty());
+            assert!(worker.active.tokens.is_empty());
+            assert!(
+                worker.pending.is_none(),
+                "a larger token never fits a block"
+            );
+            assert_eq!(worker.notify.outcomes()[Outcome::TokenTooLarge as usize], 1);
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(nack.permanent, "reason: {}", nack.reason);
+                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert!(
+                        nack.reason.contains("4096-byte allowance")
+                            && nack.reason.contains("route")
+                            && nack.reason.contains("too deep"),
+                        "reason: {}",
+                        nack.reason
+                    );
+                }
+                other => panic!("expected a permanent refusal, got {other:?}"),
+            }
+        })
+        .await;
+}
+
 /// Scenario: a block budget set below what startup validation allows, so a request's worst
 /// case misses an empty block.
 /// Guarantees: a retryable internal nack counted as `internal`; not parked, block untouched.

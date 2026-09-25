@@ -146,8 +146,11 @@ an empty block:
 ```
 
 F_max is the larger F of the two signals, and 4KiB allows for the completion
-token (measured tokens hold 200 to 464 bytes); block admission nacks a request
-whose token is larger as a retryable `internal` before it reserves anything.
+token (measured tokens hold 200 to 464 bytes). The token is the request's
+routing context, so its size comes from the route: a request whose token is
+larger is refused permanently at ingress (`nacks{error.type=token_too_large}`,
+naming the allowance and the observed size), since every retry would fail
+alike; remove subscribing nodes from the route to this exporter.
 `ingress.max_series_per_request`
 bounds the distinct series of one request, and extraction refuses a request as
 soon as it passes the limit (`nacks{error.type=too_many_series}`, a permanent
@@ -451,7 +454,7 @@ collections is a counter.
 | --- | --- | --- | --- |
 | `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
 | `flush.failures` | `{flush}` | `error.type` | `deadline`, `permanent_storage`, `cancelled`, `encode`, `internal` |
-| `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `too_many_series`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
+| `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `too_many_series`, `token_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary` |
@@ -462,8 +465,8 @@ collections is a counter.
 The `*_too_large` values of `nacks` name `ingress.max_request_bytes`,
 `ingress.max_extracted_bytes` (the extracted request, decoded attributes
 included) and `ingress.max_row_bytes` (one row, attribute value or CBOR cell);
-`too_many_series` is `ingress.max_series_per_request` and `too_deep`
-`ingress.max_nesting_depth`. The
+`too_many_series` is `ingress.max_series_per_request`, `token_too_large` the
+4KiB completion-token allowance, and `too_deep` `ingress.max_nesting_depth`. The
 `column` label is fixed by configuration, so no request can add a label value.
 The node also registers the shared `exporter.exports` set (`messages`,
 `duration`; labels `signal` and `outcome`: `success`, `refused`, `failure`).

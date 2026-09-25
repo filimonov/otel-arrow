@@ -678,6 +678,7 @@ mod tests {
             "extracted_too_large",
             "row_too_large",
             "too_many_series",
+            "token_too_large",
             "too_deep",
             "invalid",
             "unsupported",

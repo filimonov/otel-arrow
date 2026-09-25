@@ -299,10 +299,26 @@ pub const DEFAULT_MAX_SERIES_PER_REQUEST: usize = 1_000_000;
 
 /// The completion token bytes one request's block worst case allows for.
 ///
-/// The token is the request's routing context; measured tokens hold 200 to
-/// 464 bytes. Block admission refuses a larger one as an internal failure
-/// before it reserves anything.
+/// The token is the request's routing context, which grows with every node
+/// of the route that subscribes to the outcome; measured tokens hold 200 to
+/// 464 bytes. See [`check_token`].
 pub const TOKEN_ALLOWANCE_BYTES: usize = 4 << 10;
+
+/// Refuse a request whose completion token holds more than
+/// [`TOKEN_ALLOWANCE_BYTES`], permanently: the size comes from the route, so
+/// every retry of the same request fails alike.
+///
+/// # Errors
+/// Returns [`RefuseReason::TokenTooLarge`](crate::error::RefuseReason::TokenTooLarge).
+pub fn check_token(token_bytes: usize) -> Result<()> {
+    if token_bytes > TOKEN_ALLOWANCE_BYTES {
+        return Err(Error::Refused(crate::error::RefuseReason::TokenTooLarge {
+            observed: token_bytes,
+            limit: TOKEN_ALLOWANCE_BYTES,
+        }));
+    }
+    Ok(())
+}
 
 /// Sorting configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

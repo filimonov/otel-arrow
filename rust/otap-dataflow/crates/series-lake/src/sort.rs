@@ -458,7 +458,7 @@ fn merge_key_overhead(rows: usize) -> usize {
 ///
 /// Per row: the encoded key, computed from the key columns the way the row
 /// format lays them out, its offset, and the share of two key segments at the
-/// fewest rows a segment holds ([`MIN_KEY_SLICE_ROWS`]): at most one short
+/// fewest rows a segment holds (`MIN_KEY_SLICE_ROWS`): at most one short
 /// segment ends each run and each merge step. Per batch, since a run holds at
 /// least one batch: two more segments and two merge heap entries. Zero for an
 /// empty spec. A key column the batch lacks adds nothing: the sort itself

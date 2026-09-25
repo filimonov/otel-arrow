@@ -42,6 +42,9 @@ pub(super) enum Outcome {
     /// The request carried more distinct series than
     /// `ingress.max_series_per_request`.
     TooManySeries,
+    /// The request's completion token exceeded the allowance a block reserves
+    /// for one: its route is too deep.
+    TokenTooLarge,
     /// A nested value exceeded `ingress.max_nesting_depth`.
     TooDeep,
     /// The request's content could not be used.
@@ -65,6 +68,7 @@ impl Outcome {
         Outcome::ExtractedTooLarge,
         Outcome::RowTooLarge,
         Outcome::TooManySeries,
+        Outcome::TokenTooLarge,
         Outcome::TooDeep,
         Outcome::Invalid,
         Outcome::Unsupported,
@@ -149,6 +153,7 @@ impl Outcome {
                     lake::SizeBudget::Row | lake::SizeBudget::Cell => Outcome::RowTooLarge,
                 },
                 lake::RefuseReason::TooManySeries { .. } => Outcome::TooManySeries,
+                lake::RefuseReason::TokenTooLarge { .. } => Outcome::TokenTooLarge,
                 lake::RefuseReason::TooDeep(_) => Outcome::TooDeep,
                 lake::RefuseReason::Unsupported(_) => Outcome::Unsupported,
                 lake::RefuseReason::Invalid(_) => Outcome::Invalid,
@@ -178,6 +183,7 @@ impl Outcome {
                 | Self::ExtractedTooLarge
                 | Self::RowTooLarge
                 | Self::TooManySeries
+                | Self::TokenTooLarge
                 | Self::TooDeep
                 | Self::Invalid
                 | Self::Unsupported
@@ -205,6 +211,10 @@ impl Outcome {
             Self::TooManySeries => {
                 "the request carries more distinct series than ingress.max_series_per_request; \
                  split the batch upstream or raise the limit"
+            }
+            Self::TokenTooLarge => {
+                "the request's routing context exceeds what series_parquet reserves for it; the \
+                 pipeline route is too deep"
             }
             Self::TooDeep => {
                 "the request nests values deeper than ingress.max_nesting_depth; flatten them \
@@ -248,6 +258,14 @@ impl Outcome {
                     "request carries at least {observed} distinct series, more than \
                      ingress.max_series_per_request ({limit}); split the batch upstream or raise \
                      the limit"
+                )
+            }
+            lake::Error::Refused(lake::RefuseReason::TokenTooLarge { observed, limit }) => {
+                format!(
+                    "the request's completion token, its routing context, holds {observed} \
+                     bytes, more than the {limit}-byte allowance a block reserves for one; the \
+                     pipeline route to series_parquet is too deep, remove subscribing nodes \
+                     from it"
                 )
             }
             lake::Error::Refused(lake::RefuseReason::TooDeep(limit)) => TooDeep(*limit).to_string(),
@@ -484,6 +502,16 @@ mod tests {
                 "too_many_series",
             ),
             (
+                lake::Error::Refused(lake::RefuseReason::TokenTooLarge {
+                    observed: 5000,
+                    limit: 4096,
+                }),
+                Outcome::TokenTooLarge,
+                NackCause::Refused,
+                true,
+                "token_too_large",
+            ),
+            (
                 lake::Error::Refused(lake::RefuseReason::TooDeep(32)),
                 Outcome::TooDeep,
                 NackCause::Refused,
@@ -639,6 +667,13 @@ mod tests {
                     limit: 10,
                 }),
                 "request carries at least 11 distinct series, more than ingress.max_series_per_request (10); split the batch upstream or raise the limit",
+            ),
+            (
+                refused(lake::RefuseReason::TokenTooLarge {
+                    observed: 5000,
+                    limit: 4096,
+                }),
+                "the request's completion token, its routing context, holds 5000 bytes, more than the 4096-byte allowance a block reserves for one; the pipeline route to series_parquet is too deep, remove subscribing nodes from it",
             ),
             (
                 refused(lake::RefuseReason::Unsupported("traces".into())),
