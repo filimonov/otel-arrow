@@ -552,9 +552,106 @@ tests always run it.
 The `alloy` step runs the "Capacity" Alloy trial on the soak's store at
 20,000 lines/s with the receiver's 16 MiB decoding limit.
 
-The remaining subcommands (`failures`, `buffered`, `remediate`, `report`)
-are named here so the command line is one contract; each is implemented by
-its own task.
+### Failures
+
+`failures --family s3` (`SERIES_MEASURE_LONG=1`, `faults.py`) runs every
+S3 fault against both real stores in both topologies, one fresh rig,
+store and containerized release engine per cell, and publishes
+`failure-s3.json`:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 \
+  taskset -c 0-7,16-23 python3 -m crates.validation.tests.series_parquet.measure \
+  failures --family s3 --output-dir /var/tmp/series-failure-s3
+```
+
+A cell is `slow`, `http503` or `store_outage` (the registered faults, "Fault
+tools") times `strict` or `buffered` times `minio` or `rustfs`. Docker, both
+fault images and the store image are checked before the lease: a missing one
+skips an optional lane and fails a required one. Anything after that, a fault
+activation error included, is a failure.
+
+The engine runs the shipped S3 store retry section and the default 60 s
+`flush_retry_deadline`, with five-second windows and `upload.part_bytes:
+5MiB`, so every logs values file (about 6.8 MB) is a multipart upload. The
+producer is the ledgered one of the PR-tier soak: 20 requests a second of 100
+one-KiB records, every tenth a metrics request, on CPUs `8-15,24-31`,
+resending a retryable refusal with its original bytes until it is
+acknowledged. Buffered, the write-ahead log acknowledges it and it never
+resends after that.
+
+Each cell is a state machine whose every state is recorded with its instant
+and the evidence that entered it (`observations.fault.states`):
+
+1. `baseline`: at least 15 s of input, a values object HEADed directly in
+   the store, a nonempty ACTIVE block and an acknowledgement within two
+   windows.
+2. `armed`, then `observed` once the fault's intended condition holds:
+   - `slow`: a response delayed at least 1.35 s and an upload throttled to
+     at most twice the toxic's rate, both started under the fault, a
+     nonempty FLUSHING block with ACTIVE or pending work behind it, and
+     backpressure (admission closed for at least a window, a receiver
+     refusal, or the buffer's in-flight bundles holding still while
+     admission is closed);
+   - `http503`: a PUT or POST NGINX answered 503, an exporter retry, a
+     storage nack, and its retry (strict: the producer received the storage
+     sentence; buffered: the buffer scheduled a retry);
+   - `store_outage`: a flush failure at least the flush deadline after the
+     stop, a storage nack and its retry.
+3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket through
+   the route), `resumed` (a values file written and a request acknowledged
+   after the removal), 20 s of acknowledged input, `input_stopped` and
+   `drained` (the drain proof). Everything after `endpoint_healthy` must
+   finish within 300 s.
+
+The hard checks beside the common ones:
+
+- `fault_observed`, `recovered` and `drained` for the states above;
+- `at_least_once`: every sent request acknowledged and no sent or
+  acknowledged record missing, unexpected or corrupt (the ledger oracle);
+  duplicates are counted, and `duplicates_explained` requires every
+  duplicated record to belong to a request the producer resent (strict) or
+  the extra copies to fit in the bundles the exporter nacked (buffered);
+- `descriptor_coverage` and `reader_agreement` from the read-back;
+- `bounded_resources`: ACTIVE and FLUSHING within `window.max_block_bytes`,
+  the series cache within its capacity, at most one pending slot, accounted
+  memory within the budget, the log within its cap with nothing lost or
+  rejected, and the oldest unacknowledged age back at its baseline;
+- `multipart_exercised`: CreateMultipartUpload, UploadPart and
+  CompleteMultipartUpload answered 2xx in the route's trace and a stored
+  object above one part with a multipart ETag;
+- `orphaned_uploads_expected`: the bucket's incomplete multipart uploads,
+  listed in the store directly after the engine stopped, number at most the
+  `flush.abort_failures` the exporter reported;
+- `partition_lateness_bound`: no object of a partition hour visible more
+  than `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)`
+  (135 s here) after the hour ended, by the store's LastModified or by the
+  first direct listing (every second) that showed it;
+- `fault_rig_clean`: nothing of the fault left and the rig removed.
+
+The compared metrics are memory (peak RSS, accounted peak, buffered log
+peak) and the correctness counts; every other number depends on where in a
+window the fault landed and is recorded under `observations.fault.numbers`:
+offered, acknowledged and stored records, 503 responses, fault, recovery
+and drain durations, flush retries and failures by class, abort failures and
+late commits, nacks by class, the producer's storage nacks and local
+timeouts, the buffer's retries, orphaned and multipart uploads and the
+latest visibility after an hour's end. The route's requests, statuses,
+latencies and upload bandwidth before and during the fault, the exporter's
+flush events, the stored objects of every failed block and throughput before,
+during and after the fault are kept beside them.
+
+Options: `only_cells=[...]` (names like `http503-strict-minio`), `faults`,
+`topologies`, `stores`, `straddle_cells=[...]` (those cells arm their fault
+10 s before an hour ends, so the hour's last blocks are written under it;
+they run last and wait for the hour before taking the lease, announcing the
+instant they wait for), `purposes={"cell": "why"}` for a
+rerun, `archive_dir`, `lease_wait_s` and `report_dir`. The family state
+(`failures-state.json`) keeps each cell's latest run, which the index lists.
+
+The remaining subcommands (`buffered`, `remediate`, `report`) are named
+here so the command line is one contract; each is implemented by its own
+task.
 
 ## Reference deployment
 
@@ -723,6 +820,10 @@ control file NGINX answers 503 for; `store_outage` stops the store container
 and recovers the same container, repointing both proxies if its address
 changed. Any activation or recovery error after preflight is a failure, and
 a fault whose recovery failed stays active so the teardown retries it.
+
+NGINX logs each request's completion time, method, URI, status, upstream
+status, request and upstream times, response bytes, request length and the
+full request URI, whose query names each multipart step.
 
 Provision once, outside any measurement lease, from `rust/otap-dataflow`:
 
