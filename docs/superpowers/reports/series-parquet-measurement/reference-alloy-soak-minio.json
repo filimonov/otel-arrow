@@ -201,7 +201,7 @@
    "passed": true
   },
   {
-   "detail": "loss {}, permanently_rejected 0.0",
+   "detail": "loss {}, permanently_rejected 0.0, over 1 boots",
    "name": "no_buffer_loss",
    "passed": true
   },
@@ -211,7 +211,7 @@
    "passed": true
   },
   {
-   "detail": "0 duplicate lines, allowed {'lines': 0, 'rule': 'no duplicates'}",
+   "detail": "per (event, producer) {}; bound 0 each (no duplicates); over {}; []",
    "name": "duplicates_within_bound",
    "passed": true
   },
@@ -261,7 +261,8 @@
   }
  },
  "duplicate_allowance": {
-  "lines": 0,
+  "event": null,
+  "per_producer_per_event_lines": 0,
   "rule": "no duplicates"
  },
  "duplicates": {
@@ -1818,6 +1819,22 @@
   ],
   "total_rows": 74394928
  },
+ "rejudgement": [
+  {
+   "at_utc": "2026-09-25T13:39:02Z",
+   "check": "no_buffer_loss",
+   "now": true,
+   "reason": "loss and permanent rejections summed over every boot",
+   "was": true
+  },
+  {
+   "at_utc": "2026-09-25T13:39:02Z",
+   "check": "duplicates_within_bound",
+   "now": true,
+   "reason": "the bound is enforced per fault event and producer, not as a fleet total",
+   "was": true
+  }
+ ],
  "started_utc": "2026-09-25T12:12:01Z",
  "status": "passed",
  "store": "minio",

@@ -249,7 +249,7 @@
    "passed": true
   },
   {
-   "detail": "loss {}, permanently_rejected 0.0",
+   "detail": "loss {}, permanently_rejected 0.0, over 2 boots",
    "name": "no_buffer_loss",
    "passed": true
   },
@@ -259,7 +259,7 @@
    "passed": true
   },
   {
-   "detail": "82963 duplicate lines, allowed {'lines': 560000, 'per_producer_lines': 70000, 'rule': '10s position sync + the queue + one batch per producer'}",
+   "detail": "per (event, producer) {'event 0 producer 0': 9887, 'event 0 producer 1': 9836, 'event 0 producer 2': 10816, 'event 0 producer 3': 10660, 'event 0 producer 4': 10504, 'event 0 producer 5': 9836, 'event 0 producer 6': 10660, 'event 0 producer 7': 10764}; bound 70000 each (10s position sync + the queue + one batch); over {}; []",
    "name": "duplicates_within_bound",
    "passed": true
   },
@@ -309,9 +309,9 @@
   }
  },
  "duplicate_allowance": {
-  "lines": 560000,
-  "per_producer_lines": 70000,
-  "rule": "10s position sync + the queue + one batch per producer"
+  "event": "alloy_sigkill",
+  "per_producer_per_event_lines": 70000,
+  "rule": "10s position sync + the queue + one batch"
  },
  "duplicates": {
   "duplicate_lines_by_boots": {
@@ -852,6 +852,22 @@
   ],
   "total_rows": 7426691
  },
+ "rejudgement": [
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "no_buffer_loss",
+   "now": true,
+   "reason": "loss and permanent rejections summed over every boot",
+   "was": true
+  },
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "duplicates_within_bound",
+   "now": true,
+   "reason": "the bound is enforced per fault event and producer, not as a fleet total",
+   "was": true
+  }
+ ],
  "started_utc": "2026-09-25T12:02:55Z",
  "status": "passed",
  "store": "minio",

@@ -258,7 +258,7 @@
    "passed": true
   },
   {
-   "detail": "loss {}, permanently_rejected 0.0",
+   "detail": "loss {}, permanently_rejected 0.0, over 2 boots",
    "name": "no_buffer_loss",
    "passed": true
   },
@@ -268,7 +268,7 @@
    "passed": true
   },
   {
-   "detail": "0 duplicate lines, allowed {'lines': 560000, 'per_producer_lines': 70000, 'rule': '10s position sync + the queue + one batch per producer'}",
+   "detail": "per (event, producer) {}; bound 70000 each (10s position sync + the queue + one batch); over {}; []",
    "name": "duplicates_within_bound",
    "passed": true
   },
@@ -319,9 +319,9 @@
  },
  "control_expectation": "a control run: its delivery check is expected to fail, showing the lines an in-memory queue loses in the Alloy SIGKILL that the shipped file-backed queue survives (reference-alloy-alloy-kill-minio.json)",
  "duplicate_allowance": {
-  "lines": 560000,
-  "per_producer_lines": 70000,
-  "rule": "10s position sync + the queue + one batch per producer"
+  "event": "alloy_sigkill",
+  "per_producer_per_event_lines": 70000,
+  "rule": "10s position sync + the queue + one batch"
  },
  "duplicates": {
   "duplicate_lines_by_boots": {},
@@ -792,6 +792,22 @@
   ],
   "total_rows": 7338355
  },
+ "rejudgement": [
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "no_buffer_loss",
+   "now": true,
+   "reason": "loss and permanent rejections summed over every boot",
+   "was": true
+  },
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "duplicates_within_bound",
+   "now": true,
+   "reason": "the bound is enforced per fault event and producer, not as a fleet total",
+   "was": true
+  }
+ ],
  "started_utc": "2026-09-25T12:45:03Z",
  "status": "failed",
  "store": "minio",

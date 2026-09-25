@@ -209,7 +209,7 @@
    "passed": true
   },
   {
-   "detail": "loss {}, permanently_rejected 0.0",
+   "detail": "loss {}, permanently_rejected 0.0, over 4 boots",
    "name": "no_buffer_loss",
    "passed": true
   },
@@ -219,7 +219,7 @@
    "passed": true
   },
   {
-   "detail": "4000 duplicate lines, allowed {'lines': 2004000, 'per_kill_lines': 668000, 'rule': 'in-flight exports + 100ms of WAL acks + one unrecorded block'}",
+   "detail": "per (event, producer) {'event 0 producer 6': 4000}; bound 83500 each (in-flight exports + 100ms of WAL acks + one window of input); over {}; []",
    "name": "duplicates_within_bound",
    "passed": true
   },
@@ -269,9 +269,9 @@
   }
  },
  "duplicate_allowance": {
-  "lines": 2004000,
-  "per_kill_lines": 668000,
-  "rule": "in-flight exports + 100ms of WAL acks + one unrecorded block"
+  "event": "engine_sigkill",
+  "per_producer_per_event_lines": 83500,
+  "rule": "in-flight exports + 100ms of WAL acks + one window of input"
  },
  "duplicates": {
   "duplicate_lines_by_boots": {
@@ -786,6 +786,22 @@
   ],
   "total_rows": 9047640
  },
+ "rejudgement": [
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "no_buffer_loss",
+   "now": true,
+   "reason": "loss and permanent rejections summed over every boot",
+   "was": true
+  },
+  {
+   "at_utc": "2026-09-25T13:39:01Z",
+   "check": "duplicates_within_bound",
+   "now": true,
+   "reason": "the bound is enforced per fault event and producer, not as a fleet total",
+   "was": true
+  }
+ ],
  "started_utc": "2026-09-25T11:57:56Z",
  "status": "passed",
  "store": "rustfs",
