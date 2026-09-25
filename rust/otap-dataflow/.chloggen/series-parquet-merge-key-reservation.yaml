@@ -1,7 +1,7 @@
 # Use this changelog template to create an entry for release notes.
 
 # One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
-change_type: bug_fix
+change_type: breaking
 
 # The name of the component, or a single word describing the area of concern, (e.g. engine, otap).
 # Must be one of the components listed in rust/otap-dataflow/.chloggen/config.yaml.
@@ -20,7 +20,8 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Blocks rotate earlier: the default sort key reserves 44 bytes per values
-  row, and a string key such as body about its length, which halves what a
-  block holds. The keys also count against ingress.max_extracted_bytes. A
-  list column is refused as a values_sort key at startup.
+  Blocks rotate earlier: the default key reserves 44 B per values row, a
+  string key such as body about its length. The keys count against
+  ingress.max_extracted_bytes. A list sort key is refused at startup.
+  Migration: remove a list-valued values_sort key or replace it with a
+  supported scalar key.
