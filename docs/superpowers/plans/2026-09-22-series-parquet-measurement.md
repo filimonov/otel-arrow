@@ -1668,6 +1668,22 @@ Documented only (README/FORMAT limitations section, and Task 14):
 - The ~60 s write stall after a store restart (Task 9): documented as a rig property if Task 11 attributes it to the rig; if it is the engine's connect timeout it becomes a Task 12 fix.
 
 
+**Amendment (user decision 2026-09-25): the deliverable is a verified Alloy + buffered reference deployment.** Priority is a working variant with its fixes, not an exhaustive study of the unfixed one. What must be known in detail is how to configure and run Alloy -> engine (OTLP receiver -> durable_buffer -> series_parquet) so that it works reliably without operator guesswork. Task 12 therefore runs the fix items of the triage amendment first, then this part; the jemalloc heap-dump item runs only after it (backlog if it yields no fix). Task 13 was cut to a 20-minute answer from existing evidence; its open questions (T10-F2 window, freshness, backlog replay memory and disk) are answered here, on the reference configuration instead of in the abstract.
+
+Deliverables:
+- [ ] `configs/series-parquet-buffered.yaml`: receiver `max_decoding_message_size` equal to `ingress.max_request_bytes`; durable_buffer with its WAL path, size cap and retry settings; exporter window, budget and a short flush deadline so the shutdown bound fits the documented 60 s termination grace. It becomes the shipped default; the strict config stays as a documented option.
+- [ ] `configs/series-parquet.alloy`: batch processor with a size cap, OTLP exporter timeout, `retry_on_failure` and `sending_queue` sized and commented, and what Alloy does when the engine answers UNAVAILABLE because the WAL is full.
+- [ ] Operator guide in the README: sizing (WAL disk from rate x outage tolerance, whole-process memory formula, cores per rate), WAL on its own device, bucket permissions and the AbortIncompleteMultipartUpload lifecycle rule, the alert signals (oldest unacknowledged age / freshness, WAL fill, orphaned uploads, late commits, permanent refusals after the WAL ack), and a failure-behaviour table (S3 outage, WAL full, engine restart, engine SIGKILL with its duplicate bound, Alloy restart, store that applies abandoned requests).
+
+Validation, with Alloy as the producer on exactly these configs, MinIO and RustFS, the Task 5 oracle:
+- [ ] Healthy: several Alloy instances at a stated rate; producer ack latency, freshness (log line written to values object visible), RSS against the formula; every line stored once.
+- [ ] S3 outage of a few minutes: Alloy sees no errors, the backlog drains, freshness recovers; RSS and WAL disk stay within the documented bounds during the replay.
+- [ ] WAL full (outage longer than the cap allows): the engine refuses with UNAVAILABLE, Alloy queues and retries, nothing is lost within Alloy's queue; the limit is stated.
+- [ ] Engine graceful restart under load after the T10-F1 fix: no duplicates. Engine SIGKILL: no loss, duplicates within the measured T10-F2 bound, stated as a number.
+- [ ] Alloy restart: no loss; duplicates only as Alloy's own positions allow.
+- [ ] A 30-minute soak of the whole reference deployment.
+
+
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
 **Expected wall-clock cost:** 55-80 minutes for both stores, both topologies' latency cohorts and window comparisons; under one second for latency/backoff analysis tests.
