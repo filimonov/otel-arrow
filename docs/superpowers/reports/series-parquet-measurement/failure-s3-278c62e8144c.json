@@ -115,9 +115,9 @@
   ],
   "child_indexes": [
     {
-      "name": "failure-s3-278c62e8144c.json",
-      "sha256": "278c62e8144c74d5efafd65e65f6f2ff4300c70cc1ded0b46698ab303f479260",
-      "size_bytes": 40761
+      "name": "failure-s3-75c4602afcc6.json",
+      "sha256": "75c4602afcc666abc3996ca81c03c4432e21bdb5cc2b365102998678159920e6",
+      "size_bytes": 41155
     }
   ],
   "children": [
@@ -143,9 +143,6 @@
         "peak_rss_bytes": 437465088,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-buffered-minio-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -172,9 +169,6 @@
         "peak_rss_bytes": 447967232,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-buffered-rustfs-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -200,9 +194,6 @@
         "peak_rss_bytes": 124350464,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-strict-minio-c1-w5-r001",
       "status": "failed",
       "topology": "strict"
@@ -228,9 +219,6 @@
         "peak_rss_bytes": 115511296,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-strict-rustfs-c1-w5-r001",
       "status": "failed",
       "topology": "strict"
@@ -255,7 +243,6 @@
         "peak_rss_bytes": 150351872,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -280,7 +267,6 @@
         "peak_rss_bytes": 145731584,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-buffered-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -304,7 +290,6 @@
         "peak_rss_bytes": 111935488,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -328,7 +313,6 @@
         "peak_rss_bytes": 120983552,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -354,7 +338,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-s3-store_outage-buffered-minio-c1-w5-r001: hold-rule rerun: the old hold ended 0.4-1.5 s past the qualifying failure, so the cell could not show the post-recovery behaviour r003 of buffered RustFS exposed (F2: an attempt sent while the store was down waits its whole deadline after the store returns)",
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-buffered-minio-c1-w5-r002",
       "status": "passed",
       "topology": "buffered"
@@ -380,7 +363,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-s3-store_outage-buffered-rustfs-c1-w5-r002: harness fix rerun: r002 measured the 15 s hold from the failed block window end, but that block had waited for the flush slot, so the outage ended 0.4 s after its deadline failure at 124.6 s; the hold is now measured from the failure (317eaee90). r001 before it removed its outage 0.4 s after the flush deadline",
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-buffered-rustfs-c1-w5-r003",
       "status": "passed",
       "topology": "buffered"
@@ -405,7 +387,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-s3-store_outage-strict-minio-c1-w5-r001: hold-rule rerun: the old hold ended 0.4-1.5 s past the qualifying failure, so the cell could not show the post-recovery behaviour r003 of buffered RustFS exposed (F2: an attempt sent while the store was down waits its whole deadline after the store returns)",
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-strict-minio-c1-w5-r002",
       "status": "passed",
       "topology": "strict"
@@ -432,9 +413,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-s3-store_outage-strict-rustfs-c1-w5-r001: hold-rule rerun: the old hold ended 0.4-1.5 s past the qualifying failure, so the cell could not show the post-recovery behaviour r003 of buffered RustFS exposed (F2: an attempt sent while the store was down waits its whole deadline after the store returns)",
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-store_outage-strict-rustfs-c1-w5-r002",
       "status": "failed",
       "topology": "strict"
@@ -1360,14 +1338,6 @@
     }
   },
   "events": [],
-  "fault_rejudgement": {
-    "not_rejudged": [],
-    "rules": {
-      "duplicates_explained": "strict: every duplicated record belongs to a resent request; buffered: every duplicated record has a copy in a values file of a failed block",
-      "fault_observed": "store_outage: a flush.failed event of class deadline logged at least the flush deadline after arming and before the fault was removed"
-    },
-    "verdict_changes": []
-  },
   "mandatory_metrics": [
     "children_count",
     "children_passed_count"
@@ -1444,7 +1414,7 @@
   "run_id": "failure-s3",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-25T00:47:01Z",
+  "started_utc": "2026-09-25T00:45:30Z",
   "status": "failed",
   "workload": {}
 }
