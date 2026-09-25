@@ -1605,6 +1605,20 @@ class AlloyProducer:
             and "component_id=otelcol.exporter.otlp.series" in line
         ]
 
+    @staticmethod
+    def client_deadline(line):
+        """Whether one `Exporting failed` line is Alloy's own attempt deadline.
+
+        Such an attempt ended on the client before the engine answered, so it
+        carries no status the engine returned. gRPC-Go reports it as
+        DeadlineExceeded, or as Canceled "Timeout expired" when the timer
+        fires before the stream reports the deadline, which a loaded host
+        makes likely.
+        """
+        return "code = DeadlineExceeded" in line or (
+            "code = Canceled" in line and "Timeout expired" in line
+        )
+
     def write(self, ids):
         """Append one line per id and make the bytes visible to the tail."""
         with self.lines.open("a") as stream:
@@ -3181,6 +3195,28 @@ COHORT_WAIT = 60
 CALL_WAIT_SHORT = 1
 
 
+class AlloyFailureLines(unittest.TestCase):
+    """How the outage tests read Alloy's export failure lines."""
+
+    # Scenario: Alloy logs an export whose own per-attempt timeout fired, once
+    # as DeadlineExceeded and once as the Canceled "Timeout expired" that a
+    # loaded host produces, beside a refusal the engine returned.
+    # Guarantees: both client deadlines are recognised as Alloy's own, so
+    # only statuses the engine sent are held to UNAVAILABLE.
+    def test_client_deadlines_are_not_engine_refusals(self):
+        prefix = (
+            'level=warn msg="Exporting failed. Will retry the request after '
+            'interval." component_id=otelcol.exporter.otlp.series '
+            'error="rpc error: '
+        )
+        deadline = prefix + 'code = DeadlineExceeded desc = context deadline exceeded"'
+        canceled = prefix + 'code = Canceled desc = Timeout expired"'
+        refusal = prefix + 'code = Unavailable desc = series_parquet could not write"'
+        self.assertTrue(AlloyProducer.client_deadline(deadline))
+        self.assertTrue(AlloyProducer.client_deadline(canceled))
+        self.assertFalse(AlloyProducer.client_deadline(refusal))
+
+
 class OutageSlice(unittest.TestCase):
     """A real object store taken off the network under live producers."""
 
@@ -3482,12 +3518,12 @@ class OutageSlice(unittest.TestCase):
                     alloy_deadlines = [
                         line
                         for line in alloy_failures
-                        if "code = DeadlineExceeded" in line
+                        if AlloyProducer.client_deadline(line)
                     ]
                     alloy_refusals = [
                         line
                         for line in alloy_failures
-                        if "code = DeadlineExceeded" not in line
+                        if not AlloyProducer.client_deadline(line)
                     ]
                     for line in alloy_refusals:
                         self.assertIn(
