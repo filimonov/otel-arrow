@@ -743,9 +743,11 @@ The process checks beside the S3 family's:
 - `retry_bytes_identical`: the ledger refuses a resent request whose bytes
   differ.
 
-`orphaned_uploads_expected` also allows every values upload a killed engine
-left open at its exit, and once the evidence is kept the case aborts every
-incomplete upload itself (`orphan_cleanup`). Buffered, `duplicates_explained`
+`orphaned_uploads_expected` requires every values upload a killed engine left
+open at its exit to be still listed under its key, allows other uploads only
+up to the reported abort failures, and, once the evidence is kept and the case
+aborted every incomplete upload itself (`orphan_cleanup`), requires none left
+(`orphan_verdict`). Buffered, `duplicates_explained`
 accepts a duplicate stored before a restart and again after it, one of a
 request the producer resent because a kill cut off its acknowledgement, or
 one copied in a failed block.

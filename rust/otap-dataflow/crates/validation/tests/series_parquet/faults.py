@@ -3062,6 +3062,33 @@ class StoreLister:
                 for key, item in sorted(self.list_once().items())]
 
 
+# `orphan_verdict`'s cleanup argument for a case that leaves cleanup to the bucket.
+ORPHANS_NOT_CLEANED = "not cleaned"
+
+
+def orphan_verdict(orphans, expected, abort_failures, cleanup=ORPHANS_NOT_CLEANED) -> tuple:
+    """Whether the incomplete uploads after a case are exactly the expected ones.
+
+    `expected` maps each upload a killed engine left open to its key; every
+    one must still be listed under that key. Any other upload is allowed
+    only up to `abort_failures`, the aborts the exporter reported as failed.
+    A case that aborts the uploads itself (`abort_uploads`) must leave none.
+    """
+    if not isinstance(orphans, list):
+        return False, f"the uploads could not be listed: {orphans}"
+    listed = {entry["upload_id"]: entry["key"] for entry in orphans}
+    missing = sorted(upload for upload, key in expected.items() if listed.get(upload) != key)
+    unknown = [entry for entry in orphans if entry["upload_id"] not in expected]
+    unexpected = max(0, len(unknown) - abort_failures)
+    cleaned = cleanup == ORPHANS_NOT_CLEANED or bool((cleanup or {}).get("clean"))
+    return (not missing and unexpected == 0 and cleaned,
+            f"{len(orphans)} incomplete multipart uploads; {len(expected)} left open by a killed "
+            f"engine, of which not listed under their key {missing[:5]}; {abort_failures} "
+            f"reported abort failures may each leave one; unexpected {unexpected}: "
+            f"{unknown[:5]}; cleanup "
+            f"{cleanup if cleanup == ORPHANS_NOT_CLEANED else (cleanup or {}).get('remaining')}")
+
+
 def orphaned_uploads(store) -> list:
     """The bucket's incomplete multipart uploads, read from the store directly."""
     found = []
@@ -3849,15 +3876,8 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
     abort_failures = case.abort_failures(final)
     orphans = record["orphans"]
     known = case.expected_orphans()
-    if isinstance(orphans, list):
-        unknown = [entry for entry in orphans if entry["upload_id"] not in known]
-        unexpected = max(0, len(unknown) - abort_failures)
-        hard("orphaned_uploads_expected", unexpected == 0,
-             f"{len(orphans)} incomplete multipart uploads; {len(known)} left open by a killed "
-             f"engine; {abort_failures} reported abort failures may each leave one; "
-             f"unexpected {unexpected}: {unknown[:5]}")
-    else:
-        hard("orphaned_uploads_expected", False, f"the uploads could not be listed: {orphans}")
+    hard("orphaned_uploads_expected", *orphan_verdict(
+        orphans, known, abort_failures, record.get("orphan_cleanup", ORPHANS_NOT_CLEANED)))
     lateness = partition_lateness(record["objects"], lateness_bound_s(case.settings))
     hard("partition_lateness_bound", not lateness["violations"],
          f"bound {lateness['bound_s']} s; violations {lateness['violations']}; hours "

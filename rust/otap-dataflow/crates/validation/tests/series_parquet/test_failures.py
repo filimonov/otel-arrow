@@ -1446,6 +1446,27 @@ class ProcessCaseContracts(unittest.TestCase):
         self.assertIsNotNone(faults.graceful_exit_problem(
             dict(stopped, admin_error="HTTPError"), 150, 5.0))
 
+    # Scenario: the incomplete uploads after a kill case are the expected one,
+    # that one missing or under another key, the expected one plus an extra,
+    # and a cleanup that left one behind.
+    # Guarantees: every expected upload must be listed under its key, an
+    # extra needs a reported abort failure, and the test's cleanup must leave
+    # none; a case that cleans nothing keeps the S3 rule.
+    def test_orphan_verdict_needs_exactly_the_expected_uploads(self):
+        upload = {"upload_id": "u1", "key": "k1", "initiated_unix_s": 1.0}
+        extra = {"upload_id": "u2", "key": "k2", "initiated_unix_s": 2.0}
+        clean = {"clean": True, "remaining": []}
+        self.assertTrue(faults.orphan_verdict([upload], {"u1": "k1"}, 0, clean)[0])
+        self.assertFalse(faults.orphan_verdict([], {"u1": "k1"}, 0, clean)[0])
+        self.assertFalse(faults.orphan_verdict([dict(upload, key="kx")], {"u1": "k1"}, 0,
+                                               clean)[0])
+        self.assertFalse(faults.orphan_verdict([upload, extra], {"u1": "k1"}, 0, clean)[0])
+        self.assertTrue(faults.orphan_verdict([upload, extra], {"u1": "k1"}, 1, clean)[0])
+        self.assertFalse(faults.orphan_verdict([upload], {"u1": "k1"}, 0,
+                                               {"clean": False, "remaining": [upload]})[0])
+        self.assertTrue(faults.orphan_verdict([extra], {}, 1)[0])
+        self.assertFalse(faults.orphan_verdict("AccessDenied", {}, 0)[0])
+
     # Scenario: an engine is restarted, keeping and then not keeping its buffer.
     # Guarantees: the successor runs from the next root with the same launch
     # options, the same buffer path only when retained, and records the old
