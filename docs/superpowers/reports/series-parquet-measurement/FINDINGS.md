@@ -1075,6 +1075,80 @@ uploads are compared with the expected set after every case.
   in `.measurement-artifacts/failure-process/`.
 - `campaign/reports/task-10-report.md`.
 
+## Task 11: network, DNS, TCP ACK loss and lost completion responses
+
+### Question
+
+What happens to acknowledged and in-flight data when the path to the store
+fails below HTTP: a refused or reset connection, a failing or silent resolver,
+lost TCP acknowledgements, and a CompleteMultipartUpload or single PUT whose
+response never reaches the writer? Does the partition lateness bound
+L = window.interval + 2 x (flush_retry_deadline + upload.abort_timeout) hold,
+and does slice S8's late-commit detector work on a real store?
+
+### Method
+
+32 cells: disconnect, reset, dns_nxdomain, dns_timeout, tcp_ack_loss,
+dropped_completion_response (single PUT), dropped and held multipart
+completion x strict and buffered x MinIO and RustFS; one held completion
+straddles a partition hour end. Faults come from Toxiproxy, NGINX (a separate
+completion front), dnsmasq and iptables rules matched by the engine's user id;
+each fault must be observed in packet captures, resolver logs or proxy logs
+before the case counts. Task 9's framework, Task 5's generator and oracle;
+orphaned uploads compared after every case.
+
+### Results
+
+- No acknowledged record went missing in any of the 32 cells; no unexpected
+  or corrupt record, both readers agree, every duplicate is attributed.
+- Refused connections, resets, NXDOMAIN and a silent resolver all end as
+  retryable flush failures and nacks; recovery takes about 1 s once the fault
+  is removed. A silent resolver drops 54-56 engine queries per cell.
+- Lost TCP acknowledgements (35 s hold) stall the part upload until its 30 s
+  timeout; the flush retries once and succeeds.
+- A single PUT whose response is withheld: the object is complete, the flush
+  stays in FLUSHING, strict withholds the ack and the buffer withholds its
+  resolution; the retry gets 200 and every record is stored once.
+- A lost multipart completion on MinIO: the S8 detector reports the late
+  commit (INFO `late_commit`, `flush.late_commits` 1-2).
+- A held multipart completion: MinIO drops the held request after 30.25 s, so
+  no late object appears; RustFS applies it when released. In the straddled
+  cell the hour's object appeared 145.0 s after the hour ended, against
+  L = 135 s, 90 s after the writer's cleanup cutoff.
+- Task 9's ~60 s stall after a store restart is the rig: the store answered a
+  direct request at once while Toxiproxy's values route stayed stalled behind
+  one pending connect until 130 s. The rig's health check now asks that route.
+- 14 of 32 cells pass. Failures: F1 orphans in 12 cells, T11-F1 orphans,
+  T11-F2, the T11-F3 violation and four single-sample RSS band excursions
+  (hard failures, not rerun).
+
+### Findings
+
+- F1 again (Task 12): a failed phase 2 of a multipart upload leaves an
+  incomplete upload with no abort and no counter (disconnect on RustFS, TCP ACK
+  loss, held completion on MinIO).
+- T11-F1 (documentation, lifecycle rule, counter folded into F1): a reset
+  CreateMultipartUpload response hides the upload id, so the writer cannot
+  abort it (54 uploads in three cells). S3 protocol ambiguity, not an exporter
+  defect; an exact-key ListMultipartUploads sweep is optional backlog hardening.
+- T11-F2 (Task 12, product defect): on RustFS the abort after a lost
+  completion gets 404, which replaces the ambiguous completion error; NotFound
+  is non-retryable (series-lake error.rs ~210), so `Settle::after`
+  (flush.rs ~471) settles with nothing instead of HEAD-probing the frozen name.
+  The committed block is nacked and its requests land in a later block under a
+  new name: the rows are stored twice and the late commit is not counted.
+- T11-F3 (documentation): once an intermediary keeps a request the writer has
+  abandoned, no writer-side deadline bounds when it is applied. L holds only
+  when the store drops abandoned requests (MinIO, about 30 s); compactors
+  cannot treat L as a completeness bound on RustFS without a store-enforced
+  limit or a writer seal marker (plan 4). FORMAT.md states the exception.
+
+### Evidence
+
+- `failure-network.json` and its `failure-network-*-r*.json` runs; raw archives
+  in `.measurement-artifacts/failure-network/`.
+- `campaign/reports/task-11-report.md`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question
