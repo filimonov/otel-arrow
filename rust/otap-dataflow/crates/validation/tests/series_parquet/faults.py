@@ -2525,7 +2525,22 @@ STRADDLE_MAX_WAIT_S = 3600 + STRADDLE_LEAD_S
 # A request NGINX logged at least this long under the slow fault was delayed by it.
 SLOW_DELAY_FLOOR_S = SLOW_LATENCY_MS / 1000.0 * 0.9
 SHIPPED_S3_CONFIG = test_e2e.WORKSPACE / "configs/series-parquet-s3.yaml"
-FAULT_ARCHIVE_DIR = measurement.REPO_ROOT / ".measurement-artifacts" / "failures"
+# How long an outage is held past the deadline of the block that failed.
+OUTAGE_HOLD_MARGIN_S = 15
+
+
+def main_checkout() -> Path:
+    """The main checkout of this repository, also when running from a worktree."""
+    done = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=measurement.REPO_ROOT, capture_output=True, text=True, timeout=30, check=False)
+    common = Path(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip() else None
+    return common.parent if common is not None and common.name == ".git" \
+        else measurement.REPO_ROOT
+
+
+# Raw fault-case archives live in the main checkout, shared by its worktrees.
+FAULT_ARCHIVE_DIR = main_checkout() / ".measurement-artifacts" / "failure-s3"
 STORAGE_NACK_SENTENCE = "could not write to object storage ("
 # The compared metrics: memory and the correctness counts. Durations and
 # counts depend on where in a window the fault landed and are recorded only.
@@ -3168,10 +3183,18 @@ class FaultCase:
         if self.fault == "store_outage":
             if self.log is not None:
                 self.failures.extend(flush_failures(self.log.lines()))
+            qualifying = [entry for entry in self.failures
+                          if entry["error_type"] == "deadline"
+                          and entry["unix_s"] >= armed["unix_s"] + self.flush_deadline_s]
             observed["deadline_failures_after_deadline"] = [
-                round(entry["unix_s"] - armed["unix_s"], 3) for entry in self.failures
-                if entry["error_type"] == "deadline"
-                and entry["unix_s"] >= armed["unix_s"] + self.flush_deadline_s]
+                round(entry["unix_s"] - armed["unix_s"], 3) for entry in qualifying]
+            # The failed block was sealed at its window's end; the fault is held
+            # a margin past that block's deadline.
+            observed["hold_until_s"] = min(
+                (round(entry["window_start_unix_s"] + self.spec.interval_s
+                       + self.flush_deadline_s + OUTAGE_HOLD_MARGIN_S - armed["unix_s"], 3)
+                 for entry in qualifying if entry["window_start_unix_s"] is not None),
+                default=None)
         if self.fault == "slow":
             totals = [flat_totals(sample) for sample in self.samples_since(armed["monotonic_ns"])]
             # Only requests that started under the fault show its delay.
@@ -3351,8 +3374,12 @@ def _http503_met(case, seen) -> bool:
 
 def _outage_met(case, seen) -> bool:
     """Outage: a deadline-class flush failure logged at least the flush deadline
-    after the store stopped, a storage nack, and its retry."""
-    return (bool(seen["deadline_failures_after_deadline"]) and seen["flush_failures_count"] > 0
+    after the store stopped, held OUTAGE_HOLD_MARGIN_S past that block's own
+    deadline, a storage nack, and its retry."""
+    return (bool(seen["deadline_failures_after_deadline"])
+            and seen.get("hold_until_s") is not None
+            and seen["elapsed_s"] >= seen["hold_until_s"]
+            and seen["flush_failures_count"] > 0
             and seen["storage_nacks_count"] > 0 and seen["retried"])
 
 

@@ -598,7 +598,9 @@ and the evidence that entered it (`observations.fault.states`):
      sentence; buffered: the buffer scheduled a retry);
    - `store_outage`: a `series_parquet.flush.failed` event of class
      `deadline` whose logged time is at least the flush deadline after the
-     stop, a storage nack and its retry.
+     stop, a storage nack and its retry; the store stays stopped until 15 s
+     past that failed block's own deadline (its window's end plus the flush
+     deadline).
 3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket through
    the route), `resumed` (a values file written and a request acknowledged
    after the removal), 20 s of acknowledged input, `input_stopped` and
@@ -649,16 +651,19 @@ Options: `only_cells=[...]` (names like `http503-strict-minio`), `faults`,
 they run last, wait for the hour without the lease, announcing the instant
 they wait for, and take the lease 35 s before arming, enough for the rig, the
 engine and the baseline), `purposes={"cell": "why"}` for a
-rerun, `archive_dir`, `lease_wait_s` and `report_dir`. The family state
+rerun, `archive_dir` (by default the main checkout's
+`.measurement-artifacts/failure-s3`, also from a git worktree),
+`lease_wait_s` and `report_dir`. The family state
 (`failures-state.json`) keeps each cell's latest run, which the index lists.
 
-`measure rejudge-failures --index failure-s3.json --output-dir DIR --option
-archive_dir=DIR` advances a published index to the current fault checks
-from the stored runs and their raw archives (the engine log carries each
-flush failure's time and class), without rerunning anything or changing a
-run file: the advanced index records every changed verdict and every check
-the evidence cannot decide (`fault_rejudgement`), each child's re-judged
-failed checks, and keeps the index it replaces as a child.
+`measure rejudge-failures --index failure-s3.json --output-dir DIR` (and
+`--option archive_dir=DIR` for archives elsewhere) advances a published
+index to the current fault checks from the stored runs and their raw
+archives (the engine log carries each flush failure's time and class),
+without rerunning anything or changing a run file: the advanced index
+records every changed verdict and every check the evidence cannot decide
+(`fault_rejudgement`), each child's re-judged failed checks, and keeps the
+index it replaces as a child.
 
 The remaining subcommands (`buffered`, `remediate`, `report`) are named
 here so the command line is one contract; each is implemented by its own

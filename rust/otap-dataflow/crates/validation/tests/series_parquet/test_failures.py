@@ -1159,6 +1159,26 @@ class FaultCaseContracts(unittest.TestCase):
         self.assertEqual(faults.failed_block_objects(events, objects),
                          {"p-5.parquet": [objects[0]["key"]]})
 
+    # Scenario: an outage's qualifying deadline failure came from a block
+    # sealed 4.6 s after arming, and the fault has been held 70 s.
+    # Guarantees: the outage is held until the flush deadline plus a 15 s
+    # margin after that block was sealed, not removed at its failure.
+    def test_outage_is_held_past_the_failed_block_deadline(self):
+        case = mock.Mock(flush_deadline_s=60.0)
+        seen = {"elapsed_s": 70.0, "flush_failures_count": 1, "storage_nacks_count": 100,
+                "retried": True, "deadline_failures_after_deadline": [64.6],
+                "hold_until_s": 4.6 + 60.0 + faults.OUTAGE_HOLD_MARGIN_S}
+        self.assertFalse(faults.FAULT_CONDITIONS["store_outage"](case, seen))
+        self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, dict(seen, elapsed_s=80.0)))
+
+    # Scenario: the harness runs from a git worktree of the repository.
+    # Guarantees: raw fault-case archives default to the main checkout's
+    # artifact directory, never to the worktree's.
+    def test_archives_default_to_the_main_checkout(self):
+        self.assertEqual(faults.FAULT_ARCHIVE_DIR,
+                         faults.main_checkout() / ".measurement-artifacts" / "failure-s3")
+        self.assertNotIn(".claude", faults.FAULT_ARCHIVE_DIR.parts)
+
     # Scenario: during an outage a flush failed 59.5 s after the stop and the
     # timer has since passed the 60 s flush deadline.
     # Guarantees: the outage condition needs a deadline-class failure whose
@@ -1232,8 +1252,9 @@ class FaultCaseContracts(unittest.TestCase):
                 "storage_nacks_count": 1, "retried": True}
         self.assertTrue(faults.FAULT_CONDITIONS["http503"](case, seen))
         self.assertFalse(faults.FAULT_CONDITIONS["http503"](case, dict(seen, retried=False)))
-        outage = {"elapsed_s": 65.0, "flush_failures_count": 1, "storage_nacks_count": 1,
-                  "retried": True, "deadline_failures_after_deadline": [64.6]}
+        outage = {"elapsed_s": 80.0, "flush_failures_count": 1, "storage_nacks_count": 1,
+                  "retried": True, "deadline_failures_after_deadline": [64.6],
+                  "hold_until_s": 79.6}
         self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, outage))
         slow = {"delayed_requests_count": 1, "throttled_uploads_count": 1,
                 "flushing_with_work_samples_count": 3, "admission_closed_s": 5.5,
