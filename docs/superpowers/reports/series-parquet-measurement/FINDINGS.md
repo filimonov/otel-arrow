@@ -1149,6 +1149,51 @@ orphaned uploads compared after every case.
   in `.measurement-artifacts/failure-network/`.
 - `campaign/reports/task-11-report.md`.
 
+## Task 13: durable buffer, answered from existing evidence
+
+### Question
+
+What does a producer see behind the durable buffer, how fresh is the data,
+where can data be lost after the buffer's acknowledgement, and why does a
+SIGKILL replay acknowledged entries (T10-F2)? By user decision (2026-09-25)
+the task was cut to 20 minutes and answered from committed run files and
+source; its new proofs moved to the Alloy + buffered reference deployment in
+Task 12.
+
+### Results
+
+- Producer acknowledgement behind the buffer: p50 8-23 ms, p99 20-50 ms in
+  the soak and fault cells (Task 7: p50 0.023 s, p99 0.869 s over 133,588
+  requests); it reaches seconds only near the WAL-device ceiling (Task 5
+  MinIO c4: p99 0.73-4.4 s).
+- Freshness, producer send to values object visible, healthy: p50 4.55 s,
+  p99 8.29 s, max 16.5 s at a 15 s window (Task 7); p50/p99 0.93/1.91 s at a
+  1 s window (Task 5). During and after an outage it is not recorded.
+- Losses after the buffer's acknowledgement are all counted: an exporter
+  permanent refusal in `resolved{outcome="permanently_rejected"}` with a WARN
+  event (durable_buffer_processor/mod.rs:1506-1525); drop_oldest and max_age in
+  `loss.*{reason=drop_oldest|expired}`. A bundle that fails conversion is
+  rejected without the resolved counter, only `conversion_failed`
+  (mod.rs:1426-1430).
+- An OK to the producer means written to the WAL, not fsynced; the WAL syncs
+  at most every 25 ms (quiver config.rs:227).
+
+### Findings
+
+- T10-F2 cause (source; one unpublished development run agrees): each 100 ms
+  tick finalizes and fsyncs the open segment (segment/writer.rs:187-224), and
+  only then persists the WAL cursor (engine.rs:1398-1411). A SIGKILL between
+  the two leaves a valid segment and a stale cursor, so replay re-ingests the
+  same entries. Window: entries acknowledged since the last tick (at most
+  about 100 ms of input). Documented as part of at-least-once.
+- T10-F1 reproduced again in a development run (10 records stored twice after
+  a graceful restart); fixed in Task 12.
+
+### Evidence
+
+- Run files named in `campaign/reports/task-13-report.md`; development runs in
+  `.measurement-artifacts/task-13-dev/`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question

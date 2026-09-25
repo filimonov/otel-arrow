@@ -142,3 +142,15 @@ topology; throughput and limits of other components wait here.
   counters in the stage benches.
 - Worker scaling 0.67 from 1 to 4 workers (0.81 x 0.82) and ~6 cores
   estimated for 1M records/s: addressed by the shared writer (priority 1).
+- Task 13 proofs not run (user cut Task 13 to 20 minutes, 2026-09-25; the
+  questions that matter for the shipped deployment are answered by the Task 12
+  Alloy + buffered reference validation): strict vs buffered acknowledgement
+  latency at 15 s and 120 s windows; mid-window kill replay without resend at
+  both windows; NACK/backoff timing against the jittered envelope; lost
+  completion followed by SIGKILL; the Task 6 buffer heap versus mapped split.
+  A work-in-progress harness for them (test_buffered.py, faults/capacity
+  changes, fast contract tests passing) is kept outside the repository in the
+  campaign workspace `task-13-wip/`.
+- A durable_buffer bundle that fails conversion is rejected without
+  `resolved{outcome=...}` (durable_buffer_processor/mod.rs:1426-1430); only
+  `conversion_failed` records it.
