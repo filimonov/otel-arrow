@@ -915,11 +915,34 @@ def passing_fault_result(**metrics):
 class FaultCaseContracts(unittest.TestCase):
     """How a fault case reads its evidence and decides its verdicts, without Docker."""
 
+    # Scenario: the committed http503 strict MinIO run, which left one
+    # multipart upload no abort failure accounts for, is judged.
+    # Guarantees: fault_check fails every result its published status fails,
+    # here on the orphaned upload.
+    def test_fault_check_fails_the_committed_http503_run(self):
+        path = (measurement.resolve_report_dir(None)
+                / "failure-s3-http503-strict-minio-c1-w5-r001.json")
+        result = json.loads(path.read_text(encoding="ascii"))
+        self.assertEqual(result["status"], measurement.STATUS_FAILED)
+        with self.assertRaisesRegex(AssertionError, "orphaned_uploads_expected"):
+            faults.fault_check(result)
+
     # Scenario: a fault case result is judged.
-    # Guarantees: every required check must have passed, an acknowledged
-    # record may not be missing, and the duplicates must have been measured.
+    # Guarantees: every required check must be present and every hard check
+    # passed, an acknowledged record may not be missing, and the duplicates
+    # must have been measured.
     def test_fault_check_requires_every_check_and_no_missing_record(self):
         faults.fault_check(passing_fault_result())
+        result = passing_fault_result()
+        result["checks"].append(measurement.check("affinity_matched", measurement.CHECK_HARD,
+                                                  measurement.STATUS_FAILED, "moved"))
+        with self.assertRaisesRegex(AssertionError, "affinity_matched"):
+            faults.fault_check(result)
+        result = passing_fault_result()
+        result["checks"] = [entry for entry in result["checks"]
+                            if entry["name"] != "partition_lateness_bound"]
+        with self.assertRaisesRegex(AssertionError, "partition_lateness_bound: never checked"):
+            faults.fault_check(result)
         for name in faults.FAULT_CHECKS:
             result = passing_fault_result()
             next(entry for entry in result["checks"] if entry["name"] == name)["status"] = \

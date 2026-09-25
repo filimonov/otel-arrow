@@ -2536,9 +2536,12 @@ FAULT_DIRECTIONS = {
     "unexpected_records": measurement.LOWER_IS_BETTER,
     "corrupt_records": measurement.LOWER_IS_BETTER,
 }
-# The checks `fault_check` requires of every fault case, in every family.
+# The fault checks every case of every family records; `fault_check`
+# requires them present and every hard check of the result passed.
 FAULT_CHECKS = ("fault_observed", "recovered", "drained", "at_least_once",
-                "descriptor_coverage", "reader_agreement", "bounded_resources")
+                "descriptor_coverage", "reader_agreement", "bounded_resources",
+                "multipart_exercised", "orphaned_uploads_expected", "partition_lateness_bound",
+                "duplicates_explained", "fault_rig_clean")
 
 
 def shipped_s3_retry() -> dict:
@@ -3756,17 +3759,20 @@ def soak_byte_size(text) -> int:
 
 
 def fault_check(result: dict) -> None:
-    """Fail unless a fault case proved its fault, recovered and lost nothing.
+    """Fail unless a fault case passes exactly what its published status requires.
 
-    Every check in `FAULT_CHECKS` must have passed, no acknowledged record
-    may be missing, and the duplicates must have been measured.
+    Every check in `FAULT_CHECKS` must be present, every hard check of the
+    result must have passed, no acknowledged record may be missing, and the
+    multiplicity histogram and the duplicates must have been measured.
     """
-    statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
+    names = {entry["name"] for entry in result["checks"]}
     for name in FAULT_CHECKS:
-        if statuses.get(name) != measurement.STATUS_PASSED:
-            detail = next((entry["detail"] for entry in result["checks"]
-                           if entry["name"] == name), "never checked")
-            raise AssertionError(f"failed required fault check: {name}: {detail}")
+        if name not in names:
+            raise AssertionError(f"failed required fault check: {name}: never checked")
+    for entry in result["checks"]:
+        if entry["kind"] == measurement.CHECK_HARD and entry["status"] != measurement.STATUS_PASSED:
+            raise AssertionError(f"failed required fault check: {entry['name']}: "
+                                 f"{entry['detail']}")
     if result["metrics"].get("missing_acked_records") != 0:
         raise AssertionError("acknowledged supported record missing")
     fault = result.get("observations", {}).get("fault") or {}
