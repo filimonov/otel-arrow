@@ -102,6 +102,8 @@ All events are emitted from
 | `durable_buffer.shutdown.start` | `info` | Shutdown sequence started; reports the deadline. |
 | `durable_buffer.shutdown.flushing` | `info` | About to call `engine.flush()` to finalize any open segment before draining. |
 | `durable_buffer.shutdown.drained` | `info` | Reports the number of bundles drained to downstream during shutdown. |
+| `durable_buffer.shutdown.awaiting_acks` | `info` | Bundles are still in flight after the drain; their ACK/NACK are recorded until the shutdown deadline. |
+| `durable_buffer.shutdown.unacknowledged` | `warn` | Bundles still in flight at the shutdown deadline; they are replayed on the next start. |
 | `durable_buffer.shutdown.complete` | `info` | Engine shutdown completed successfully. |
 | `durable_buffer.shutdown.deadline_exceeded` | `warn` | Shutdown deadline already passed before the flush/drain sequence; flush and drain are skipped. |
 | `durable_buffer.shutdown.drain_deadline` | `warn` | Shutdown drain loop exceeded its deadline; remaining bundles are not forwarded. |
@@ -109,6 +111,7 @@ All events are emitted from
 | `durable_buffer.shutdown.bundle_error` | `warn` | Bundle processing error during shutdown drain; drain continues. |
 | `durable_buffer.shutdown.poll_error` | `warn` | `poll_next_bundle()` error during shutdown drain; drain halted. |
 | `durable_buffer.shutdown.flush_failed` | `error` | `engine.flush()` failed during shutdown (data durability is still ensured by `engine.shutdown()`). |
+| `durable_buffer.shutdown.progress_failed` | `error` | Persisting the recorded acknowledgements failed at shutdown; those bundles are replayed on the next start. |
 | `durable_buffer.shutdown.engine_failed` | `error` | `engine.shutdown()` failed; open segment may not have been finalized. |
 
 ## Maintenance

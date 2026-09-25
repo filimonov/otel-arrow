@@ -283,6 +283,11 @@ struct InboxCore<PData, ControlRx, PDataRx> {
     shutting_down_deadline: Option<Instant>,
     /// Holds the ControlMsg::Shutdown until after we've drained pdata.
     pending_shutdown: Option<NodeControlMsg<PData>>,
+    /// Whether the control receiver outlives the released Shutdown (see
+    /// [`ProcessorInbox::recv_completion_until`]).
+    retain_completions: bool,
+    /// The control receiver kept after Shutdown was released.
+    completions_rx: Option<ControlRx>,
     /// Node ID for entry-frame stamping via `ReceivedAtNode`.
     node_id: usize,
     /// Node interests for entry-frame stamping via `ReceivedAtNode`.
@@ -298,6 +303,7 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
         local_scheduler: Option<NodeLocalSchedulerHandle<PData>>,
         node_id: usize,
         interests: Interests,
+        retain_completions: bool,
     ) -> Self {
         Self {
             control_rx: Some(control_rx),
@@ -305,6 +311,8 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
             local_scheduler,
             shutting_down_deadline: None,
             pending_shutdown: None,
+            retain_completions,
+            completions_rx: None,
             node_id,
             interests,
             consecutive_control: 0,
@@ -317,7 +325,10 @@ impl<PData, ControlRx, PDataRx> InboxCore<PData, ControlRx, PDataRx> {
         if let Some(local_scheduler) = &self.local_scheduler {
             local_scheduler.begin_shutdown(clock::now());
         }
-        drop(self.control_rx.take().expect("control_rx must exist"));
+        let control_rx = self.control_rx.take().expect("control_rx must exist");
+        if self.retain_completions {
+            self.completions_rx = Some(control_rx);
+        }
         drop(self.pdata_rx.take().expect("pdata_rx must exist"));
     }
 }
@@ -773,7 +784,7 @@ impl<PData> ProcessorInbox<PData> {
         interests: Interests,
     ) -> Self {
         Self {
-            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests),
+            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, true),
         }
     }
 
@@ -793,7 +804,38 @@ impl<PData> ProcessorInbox<PData> {
                 Some(local_scheduler),
                 node_id,
                 interests,
+                true,
             ),
+        }
+    }
+
+    /// Drops the control receiver kept after Shutdown, so completions sent
+    /// from now on are refused.
+    pub fn close_completions(&mut self) {
+        self.core.completions_rx = None;
+    }
+
+    /// Receives the next `Ack` or `Nack` sent to the processor after the inbox
+    /// released its Shutdown.
+    ///
+    /// Other control messages are discarded. Returns `None` at `deadline`, on
+    /// a further Shutdown, or when the channel is closed.
+    pub async fn recv_completion_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Option<NodeControlMsg<PData>> {
+        let completions = self.core.completions_rx.as_mut()?;
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = clock::sleep_until(deadline) => return None,
+                msg = completions.recv() => msg.ok()?,
+            };
+            match msg {
+                NodeControlMsg::Ack(_) | NodeControlMsg::Nack(_) => return Some(msg),
+                NodeControlMsg::Shutdown { .. } => return None,
+                _ => {}
+            }
         }
     }
 }
@@ -830,7 +872,7 @@ impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
         interests: Interests,
     ) -> Self {
         Self {
-            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests),
+            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, false),
         }
     }
 }

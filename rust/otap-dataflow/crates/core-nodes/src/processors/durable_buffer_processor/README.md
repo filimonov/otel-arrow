@@ -96,6 +96,9 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
 4. **ACK/NACK**: On ACK, bundle marked complete; on NACK, deferred for retry
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
+6. **Shutdown**: After the drain the buffer closes its outputs, records the
+   ACK/NACK of bundles still in flight until the shutdown deadline and persists
+   them; a bundle unacknowledged at the deadline is replayed on the next start
 
 ## Telemetry
 
