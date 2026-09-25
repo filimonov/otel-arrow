@@ -120,10 +120,12 @@ pub trait Processor<PData> {
     /// Returns whether this processor still expects the `Ack` or `Nack` of
     /// pdata it has sent downstream.
     ///
-    /// Read after the processor has handled `Shutdown`. While it returns
+    /// Read after the processor has handled `Shutdown`, and only when its
+    /// runtime requirements declare `shutdown_completions`. While it returns
     /// `true`, the engine closes the processor's outputs and keeps delivering
-    /// `Ack` and `Nack` until the shutdown deadline, then delivers `Shutdown`
-    /// once more as the final message. Defaults to `false`.
+    /// `Ack` and `Nack` until the declared reserve before the shutdown
+    /// deadline, then delivers `Shutdown` once more as the final message.
+    /// Defaults to `false`.
     fn awaits_completions(&self) -> bool {
         false
     }

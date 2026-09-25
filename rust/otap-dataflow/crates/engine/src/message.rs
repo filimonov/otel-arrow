@@ -784,11 +784,13 @@ impl<PData> ProcessorInbox<PData> {
         interests: Interests,
     ) -> Self {
         Self {
-            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, true),
+            core: InboxCore::new(control_rx, pdata_rx, None, node_id, interests, false),
         }
     }
 
-    /// Creates a new processor inbox with an explicit processor-local scheduler.
+    /// Creates a new processor inbox with an explicit processor-local
+    /// scheduler; `retain_completions` keeps the control receiver after
+    /// Shutdown is released (see [`ProcessorInbox::recv_completion_until`]).
     #[must_use]
     pub(crate) fn new_with_local_scheduler(
         control_rx: Receiver<NodeControlMsg<PData>>,
@@ -796,6 +798,7 @@ impl<PData> ProcessorInbox<PData> {
         local_scheduler: NodeLocalSchedulerHandle<PData>,
         node_id: usize,
         interests: Interests,
+        retain_completions: bool,
     ) -> Self {
         Self {
             core: InboxCore::new(
@@ -804,7 +807,7 @@ impl<PData> ProcessorInbox<PData> {
                 Some(local_scheduler),
                 node_id,
                 interests,
-                true,
+                retain_completions,
             ),
         }
     }
@@ -966,6 +969,7 @@ mod tests {
             scheduler.clone(),
             7,
             Interests::empty(),
+            false,
         );
         (control_tx, pdata_tx, scheduler, inbox)
     }

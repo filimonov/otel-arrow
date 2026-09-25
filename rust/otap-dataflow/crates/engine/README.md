@@ -562,11 +562,14 @@ close progressively toward exporters. Once a downstream input is fully drained
 or closed, the corresponding consumer receives `Shutdown` and exits its run
 loop.
 
-A processor that still expects the `Ack` or `Nack` of pdata it has sent
-downstream reports it through `awaits_completions()`. After it has handled
-`Shutdown`, the engine closes its outputs so the nodes downstream can finish,
-delivers `Ack` and `Nack` until the processor expects none or the shutdown
-deadline passes, and then delivers `Shutdown` once more as the final message.
+A processor that declares `shutdown_completions` in its runtime requirements
+can report through `awaits_completions()` that it still expects the `Ack` or
+`Nack` of pdata it has sent downstream. After it has handled `Shutdown`, the
+engine closes its outputs so the nodes downstream can finish, delivers `Ack`
+and `Nack` until the processor expects none or the declared `final_reserve`
+before the shutdown deadline begins, and then delivers `Shutdown` once more as
+the final message. Without the declaration the control receiver closes when
+`Shutdown` is released, as for any other processor.
 
 If the shutdown deadline expires, receivers may force-resolve remaining
 receiver-local waiters and the runtime control manager forces the remaining

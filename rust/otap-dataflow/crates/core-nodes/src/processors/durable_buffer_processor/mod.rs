@@ -132,7 +132,7 @@ use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::processor::ProcessorWrapper;
 use otel_arrow_dfe_engine::{
     ConsumerEffectHandlerExtension, Interests, LocalWakeupRequirements, ProcessorFactory,
-    ProcessorRuntimeRequirements, ProducerEffectHandlerExtension,
+    ProcessorRuntimeRequirements, ProducerEffectHandlerExtension, ShutdownCompletionRequirements,
 };
 use otel_arrow_dfe_pdata::{OtapArrowRecords, OtapPayload, PayloadData};
 #[cfg(test)]
@@ -145,6 +145,10 @@ pub const DURABLE_BUFFER_URN: &str = "urn:otel:processor:durable_buffer";
 /// (backpressure, flush failures). Prevents log flooding when the timer
 /// tick fires every poll_interval (~100 ms).
 const WARN_RATE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Time kept before the shutdown deadline to persist the recorded
+/// acknowledgements and shut the storage engine down.
+const SHUTDOWN_PERSIST_RESERVE: Duration = Duration::from_secs(1);
 
 /// Subscriber ID used by this processor.
 const SUBSCRIBER_ID: &str = "durable-buffer";
@@ -1787,6 +1791,9 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
     fn runtime_requirements(&self) -> ProcessorRuntimeRequirements {
         ProcessorRuntimeRequirements {
             local_wakeups: Some(LocalWakeupRequirements::new(1)),
+            shutdown_completions: Some(ShutdownCompletionRequirements::new(
+                SHUTDOWN_PERSIST_RESERVE,
+            )),
             ..ProcessorRuntimeRequirements::none()
         }
     }
