@@ -101,6 +101,27 @@ class ReferenceDeploymentContracts(unittest.TestCase):
         self.assertFalse(ref.duplicate_check("engine_kill", orphan, 1, events, allowed)[0])
         self.assertFalse(ref.duplicate_check("engine_kill", within, 3, events, allowed)[0])
 
+    # Scenario: 8000 lines duplicated in boot 1 only and 1000 lines present in
+    # boots 0, 1 and 2, after two SIGKILLs, against an 8000-line bound.
+    # Guarantees: each later-boot copy is charged to the kill that started its
+    # boot, so kill 1 (starting boot 1) carries 9000 and fails, where charging
+    # a run to its latest boot alone would pass.
+    def test_each_copy_is_charged_to_the_kill_that_started_its_boot(self):
+        allowed = {"event": "engine_sigkill", "per_producer_per_event_lines": 8000,
+                   "rule": "test"}
+        events = [{"kind": "engine_sigkill"}, {"kind": "engine_sigkill"}]
+        runs = [{"producer": 0, "lines": 8000, "copies": 2, "boots": [0, 1],
+                 "boot_copies": {"0": 1, "1": 1}},
+                {"producer": 0, "lines": 1000, "copies": 3, "boots": [0, 1, 2],
+                 "boot_copies": {"0": 1, "1": 1, "2": 1}}]
+        passed, detail = ref.duplicate_check("engine_kill", runs, 2, events, allowed)
+        self.assertFalse(passed)
+        self.assertIn("'event 0 producer 0': 9000", detail)
+        self.assertIn("'event 1 producer 0': 1000", detail)
+        # Old results without per-boot counts: two copies in one boot are known.
+        self.assertEqual(ref.boot_copies({"boots": [1], "copies": 2}), {1: 2})
+        self.assertIsNone(ref.boot_copies({"boots": [0, 1], "copies": 3}))
+
     # Scenario: a permanent rejection counted by boot 0 and a clean boot 1.
     # Guarantees: buffer losses are summed over every boot, so a restart
     # resetting the counter does not hide them.

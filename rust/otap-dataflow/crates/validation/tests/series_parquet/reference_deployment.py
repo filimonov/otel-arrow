@@ -54,7 +54,8 @@ PRODUCER_CPUS = "8-15,24-31"
 PRODUCER_CPU_LIST = list(range(8, 16)) + list(range(24, 32))
 PRODUCERS = 8
 RATE_PER_PRODUCER = 5000
-# Every line is BODY_BYTES long: `p<NN> <12-digit seq> x...`.
+# Every line is BODY_BYTES long unless a case sets `body_bytes`:
+# `p<NN> <12-digit seq> x...`.
 BODY_BYTES = 100
 SEQ_DIGITS = 12
 TIMELINE_PERIOD_NS = 100_000_000
@@ -71,10 +72,10 @@ ARCHIVE_DIR = faults.FAULT_ARCHIVE_ROOT / "reference-alloy"
 METRIC_PREFIXES = ("exporter.series_parquet", "processor.durable_buffer", "receiver")
 
 
-def line(producer, seq) -> str:
-    """Line `seq` of producer `producer`, padded to BODY_BYTES."""
+def line(producer, seq, body_bytes=BODY_BYTES) -> str:
+    """Line `seq` of producer `producer`, padded to `body_bytes`."""
     head = f"p{producer:02d} {seq:0{SEQ_DIGITS}d} "
-    return head + "x" * (BODY_BYTES - len(head))
+    return head + "x" * (body_bytes - len(head))
 
 
 def parse_line(body):
@@ -365,6 +366,7 @@ def _feeder(config, stop):
     """Append lines to every producer's file at the rate; record a timeline."""
     os.sched_setaffinity(0, config["cpus"])
     rate = config["rate"]
+    body_bytes = config["body_bytes"]
     streams = [open(path, "a", encoding="ascii") for path in config["paths"]]
     written = [0] * len(streams)
     timeline = []
@@ -375,7 +377,7 @@ def _feeder(config, stop):
         due = int((now - start) / 1e9 * rate)
         for index, stream in enumerate(streams):
             if due > written[index]:
-                stream.write("".join(line(index, seq) + "\n"
+                stream.write("".join(line(index, seq, body_bytes) + "\n"
                                      for seq in range(written[index], due)))
                 stream.flush()
                 written[index] = due
@@ -393,10 +395,11 @@ def _feeder(config, stop):
 
 
 class Feeder:
-    def __init__(self, paths, rate, result):
+    def __init__(self, paths, rate, result, body_bytes=BODY_BYTES):
         self.context = multiprocessing.get_context("spawn")
         self.stop_event = self.context.Event()
         self.config = {"paths": [str(p) for p in paths], "rate": rate,
+                       "body_bytes": body_bytes,
                        "cpus": PRODUCER_CPU_LIST, "result": str(result)}
         self.process = None
 
@@ -696,7 +699,8 @@ class Case:
                         alloy.start()
                     self.sampler.start()
                     self.feeder = Feeder([a.lines for a in self.alloys], self.rate,
-                                         self.work / "feeder.json")
+                                         self.work / "feeder.json",
+                                         self.options.get("body_bytes", BODY_BYTES))
                     self.feeder.start()
                     self.event("input_started", producers=self.producers, rate=self.rate)
                     self.hold(self.options.get("baseline_s", 60))
@@ -732,7 +736,8 @@ class Case:
                 store.download(local)
                 self.result["object_inventory_count"] = len(self.sampler.objects)
                 self.oracle = measurement.run_pinned(
-                    STORE_CPUS, read_back, local, self.feed["written"])
+                    STORE_CPUS, read_back, local, self.feed["written"],
+                    self.options.get("body_bytes", BODY_BYTES))
                 self.settle()
         finally:
             lease.release()
@@ -963,13 +968,31 @@ def duplicate_allowance(case, producers, rate, settings):
     return {"event": None, "per_producer_per_event_lines": 0, "rule": "no duplicates"}
 
 
+def boot_copies(run):
+    """{boot ordinal: copies} of a duplicate run, or None when it cannot be known.
+
+    Runs recorded before per-boot counts were kept carry only the distinct
+    boots; their counts follow when every copy is in one boot or each copy in
+    its own boot.
+    """
+    if "boot_copies" in run:
+        return {int(b): n for b, n in run["boot_copies"].items()}
+    boots = run["boots"]
+    if len(boots) == 1:
+        return {boots[0]: run["copies"]}
+    if len(boots) == run["copies"]:
+        return {b: 1 for b in boots}
+    return None
+
+
 def duplicate_check(case, runs, runs_count, events, allowed):
     """Duplicates per (fault event, producer) against the per-producer bound.
 
-    An engine SIGKILL owns the duplicates whose latest copy is in the boot it
-    started, so a run is charged to kill `max(boots) - 1`; a copy in no known
-    boot, or one in the first boot only, belongs to no kill and fails. An
-    Alloy fault is one event per producer.
+    For an engine SIGKILL the earliest copy of a line is the original and
+    every other copy is charged to the kill that started the boot which
+    wrote it (boot `b`, kill `b - 1`); a copy in the first boot or in no known
+    boot belongs to no kill and fails. An Alloy fault is one event per
+    producer.
     """
     if len(runs) < runs_count:
         return False, f"only {len(runs)} of {runs_count} duplicate runs were kept"
@@ -978,18 +1001,23 @@ def duplicate_check(case, runs, runs_count, events, allowed):
     charged = collections.Counter()
     problems = []
     for run in runs:
-        lines = run["lines"] * (run["copies"] - 1)
-        if case == "engine_kill":
-            event = max(run["boots"]) - 1
-            if min(run["boots"]) < 0 or not 0 <= event < kills:
-                problems.append(f"run {run} is attributed to no kill")
-                continue
-        else:
-            event = 0 if kills else None
-            if event is None:
+        if case != "engine_kill":
+            if not kills:
                 problems.append(f"run {run} with no fault event")
                 continue
-        charged[(event, run["producer"])] += lines
+            charged[(0, run["producer"])] += run["lines"] * (run["copies"] - 1)
+            continue
+        per_boot = boot_copies(run)
+        if per_boot is None:
+            problems.append(f"run {run} has no per-boot copy counts")
+            continue
+        copies = sorted(b for b, n in per_boot.items() for _ in range(n))
+        for boot in copies[1:]:
+            event = boot - 1
+            if boot < 0 or not 0 <= event < kills:
+                problems.append(f"a copy of run {run} in boot {boot} belongs to no kill")
+                continue
+            charged[(event, run["producer"])] += run["lines"]
     over = {f"event {e} producer {p}": n for (e, p), n in charged.items() if n > bound}
     table = {f"event {e} producer {p}": n for (e, p), n in sorted(charged.items())}
     passed = not problems and not over
@@ -1162,11 +1190,13 @@ def duplicate_view(runs, boots):
     summary = collections.Counter()
     shaped = []
     for producer, first, last, copies, run_boots in runs:
-        ordinals = sorted({index.get(b, -1) for b in run_boots})
+        per_boot = collections.Counter(index.get(b, -1) for b in run_boots)
+        ordinals = sorted(per_boot)
         lines = last - first + 1
         summary[",".join(map(str, ordinals))] += lines * (copies - 1)
         shaped.append({"producer": producer, "first_seq": first, "last_seq": last,
-                       "lines": lines, "copies": copies, "boots": ordinals})
+                       "lines": lines, "copies": copies, "boots": ordinals,
+                       "boot_copies": {str(b): n for b, n in sorted(per_boot.items())}})
     return {"runs": shaped[:200], "runs_count": len(shaped),
             "duplicate_lines_by_boots": dict(summary)}
 
@@ -1209,7 +1239,7 @@ def timeline_view(sampler, first):
     return rows
 
 
-def read_back(root, written) -> dict:
+def read_back(root, written, body_bytes=BODY_BYTES) -> dict:
     """Every line of every producer stored, read by DuckDB and clickhouse-local."""
     import duckdb
     root = Path(root).resolve()
@@ -1222,7 +1252,7 @@ def read_back(root, written) -> dict:
               "hive_partitioning=false, filename=true)")
     descriptors = (f"read_parquet({test_e2e.sql_string(root / series)}, union_by_name=true, "
                    "filename=true, hive_partitioning=false)")
-    well = (f"length(body) = {BODY_BYTES} AND substr(body, 1, 1) = 'p' AND "
+    well = (f"length(body) = {body_bytes} AND substr(body, 1, 1) = 'p' AND "
             f"TRY_CAST(substr(body, 2, 2) AS INTEGER) IS NOT NULL AND "
             f"TRY_CAST(substr(body, 5, {SEQ_DIGITS}) AS BIGINT) IS NOT NULL")
     prod = "TRY_CAST(substr(body, 2, 2) AS INTEGER)"
@@ -1236,7 +1266,7 @@ def read_back(root, written) -> dict:
         malformed = db.execute("SELECT count(*) FROM v WHERE NOT ok").fetchone()[0]
         total = db.execute("SELECT count(*) FROM v").fetchone()[0]
         dup_lines = db.execute("""
-            SELECT p, s, count(*) AS c, list(DISTINCT regexp_extract(filename,
+            SELECT p, s, count(*) AS c, list(regexp_extract(filename,
                    '-([0-9a-f]+)-[0-9]+\\.parquet$', 1)) AS boots
             FROM v WHERE ok GROUP BY 1, 2 HAVING count(*) > 1 ORDER BY 1, 2""").fetchall()
         groups = db.execute(f"""
@@ -1255,7 +1285,7 @@ def read_back(root, written) -> dict:
         ch = {int(r[0]): (int(r[1]), int(r[2])) for r in clickhouse(
             f"SELECT toInt32(substring(body, 2, 2)), count(), sum(toInt64(substring(body, 5, "
             f"{SEQ_DIGITS}))) FROM file({test_e2e.sql_string(relative)}, 'Parquet') "
-            f"WHERE length(body) = {BODY_BYTES} GROUP BY 1")}
+            f"WHERE length(body) = {body_bytes} GROUP BY 1")}
     per = {}
     for p, pid, count, distinct, low, high, total_seq in rows:
         entry = per.setdefault(p, {"rows": 0, "distinct": 0, "producer_ids": [], "min": low,
@@ -1287,6 +1317,7 @@ def read_back(root, written) -> dict:
     duplicate_rows = sum(c - 1 for _p, _s, c, _b in dup_lines)
     runs = []
     for p, s, c, b in dup_lines:
+        # One boot id per copy, so the copies each boot wrote are kept.
         boots = tuple(sorted(b))
         if runs and runs[-1][0] == p and runs[-1][2] == s - 1 and runs[-1][3] == c \
                 and runs[-1][4] == boots:
