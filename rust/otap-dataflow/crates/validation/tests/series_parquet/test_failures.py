@@ -962,8 +962,11 @@ class FaultCaseContracts(unittest.TestCase):
 
     # Scenario: a straddling cell is scheduled at several instants of an hour.
     # Guarantees: it arms ten seconds before an hour end that leaves it the
-    # full start lead, and never waits more than one hour plus that lead.
+    # full start lead, never waits more than one hour plus that lead, and
+    # holds the lease before arming no longer than a baseline plus a window.
     def test_straddle_arms_before_the_first_reachable_hour_end(self):
+        self.assertLessEqual(faults.STRADDLE_LEAD_S,
+                             2 * faults.FAULT_BASELINE_S + faults.FAULT_INTERVAL_S)
         hour = 1790290800
         for now in (hour - 3600, hour - 101, hour - 99, hour - 1):
             with self.subTest(now=now):

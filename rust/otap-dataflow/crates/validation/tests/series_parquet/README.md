@@ -612,7 +612,8 @@ The hard checks beside the common ones:
   acknowledged record missing, unexpected or corrupt (the ledger oracle);
   duplicates are counted, and `duplicates_explained` requires every
   duplicated record to belong to a request the producer resent (strict) or
-  the extra copies to fit in the bundles the exporter nacked (buffered);
+  to have a copy in a values file of a block whose flush failed (buffered:
+  the buffer delivers that block's nacked requests again);
 - `descriptor_coverage` and `reader_agreement` from the read-back;
 - `bounded_resources`: ACTIVE and FLUSHING within `window.max_block_bytes`,
   the series cache within its capacity, at most one pending slot, accounted
@@ -645,8 +646,9 @@ during and after the fault are kept beside them.
 Options: `only_cells=[...]` (names like `http503-strict-minio`), `faults`,
 `topologies`, `stores`, `straddle_cells=[...]` (those cells arm their fault
 10 s before an hour ends, so the hour's last blocks are written under it;
-they run last and wait for the hour before taking the lease, announcing the
-instant they wait for), `purposes={"cell": "why"}` for a
+they run last, wait for the hour without the lease, announcing the instant
+they wait for, and take the lease 35 s before arming, enough for the rig, the
+engine and the baseline), `purposes={"cell": "why"}` for a
 rerun, `archive_dir`, `lease_wait_s` and `report_dir`. The family state
 (`failures-state.json`) keeps each cell's latest run, which the index lists.
 

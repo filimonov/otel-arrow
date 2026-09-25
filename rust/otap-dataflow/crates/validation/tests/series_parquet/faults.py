@@ -2515,10 +2515,11 @@ FAULT_PRODUCER_TIMEOUT_S = 180.0
 FAULT_LISTING_PERIOD_S = 1.0
 # A cell run with `straddle_hour` arms its fault this long before a
 # partition hour ends, so the hour's last blocks are written under the
-# fault and the lateness bound is exercised; its engine starts at least
-# the lead before that.
+# fault and the lateness bound is exercised. It takes the lease the lead
+# before arming: rig, engine and baseline took 20 s of it on this host, so
+# the case waits under the lease, with its input running, about 15 s.
 STRADDLE_ARM_BEFORE_END_S = 10
-STRADDLE_LEAD_S = 90
+STRADDLE_LEAD_S = 35
 STRADDLE_MAX_WAIT_S = 3600 + STRADDLE_LEAD_S
 # A request NGINX logged at least this long under the slow fault was delayed by it.
 SLOW_DELAY_FLOOR_S = SLOW_LATENCY_MS / 1000.0 * 0.9
