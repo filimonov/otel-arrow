@@ -8,7 +8,7 @@ change_type: bug_fix
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: The OTLP gRPC receiver refuses a request at max_concurrent_requests with UNAVAILABLE, which OTLP clients retry, instead of RESOURCE_EXHAUSTED, which they drop.
+note: The OTLP gRPC receiver answers max_concurrent_requests, rate-limit and memory-pressure refusals with UNAVAILABLE, which OTLP clients retry, not RESOURCE_EXHAUSTED, which they drop.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Every such refusal counts as concurrency_limit. A request over
-  transport_concurrency_limit waits on its connection. A message above
-  max_decoding_message_size gets INVALID_ARGUMENT, not the retried-forever
-  OUT_OF_RANGE, and counts as payload_too_large.
+  Concurrency refusals count as concurrency_limit, and OTLP/HTTP adds
+  Retry-After: 1. A request over transport_concurrency_limit waits on its
+  connection. A message above max_decoding_message_size (payload_too_large) or
+  the rate-limit burst gets INVALID_ARGUMENT, not a retried status.

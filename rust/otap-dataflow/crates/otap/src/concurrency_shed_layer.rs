@@ -15,13 +15,17 @@ use std::task::{Context, Poll};
 use tonic::{Status, body::Body};
 use tower::{Layer, Service};
 
+/// Message of every refusal at the receiver's concurrency limit, on gRPC and HTTP.
+pub const CONCURRENCY_LIMIT_MESSAGE: &str =
+    "receiver concurrency limit reached (max_concurrent_requests); retry later";
+
 /// Builds the status for a request refused at the receiver's concurrency limit.
 ///
 /// UNAVAILABLE is retryable for every OTLP client, while RESOURCE_EXHAUSTED is
 /// retryable only with a `google.rpc.RetryInfo` detail attached.
 #[must_use]
 pub fn grpc_concurrency_limit_status() -> Status {
-    Status::unavailable("receiver concurrency limit reached (max_concurrent_requests); retry later")
+    Status::unavailable(CONCURRENCY_LIMIT_MESSAGE)
 }
 
 /// Layer that answers [`grpc_concurrency_limit_status`] when the inner service

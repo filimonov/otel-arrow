@@ -248,7 +248,8 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   wait-for-result slot is refused with `UNAVAILABLE`, which every OTLP client
   retries, and counted as `concurrency_limit`. With `load_shed: false` it waits
   for a permit instead. A request over `transport_concurrency_limit` waits on
-  its connection and is never refused. OTLP/HTTP answers 503.
+  its connection and is never refused. OTLP/HTTP answers 503 with
+  `Retry-After: 1`.
 - A gRPC message above `max_decoding_message_size`, on the wire or after
   decompression, is refused with `INVALID_ARGUMENT`, which OTLP clients do not
   retry, and counted as `payload_too_large`. OTLP/HTTP answers 400.

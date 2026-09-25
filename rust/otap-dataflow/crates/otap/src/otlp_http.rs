@@ -12,6 +12,7 @@
 //! the pipeline as `OtapPdata`, matching the OTLP/gRPC receiver's lazy-decoding strategy.
 
 use crate::bearer_authorization::{AuthorizationRejection, authorize_bearer};
+use crate::concurrency_shed_layer::CONCURRENCY_LIMIT_MESSAGE;
 use crate::otap_grpc::common::AckRegistry;
 use crate::otap_grpc::otlp::server_new::AckSlot;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
@@ -349,17 +350,40 @@ fn authorization_rejection_response(rejection: AuthorizationRejection) -> Respon
     }
 }
 
-fn resource_exhausted_with_retry_after(
-    message: &'static str,
+fn with_retry_after(
+    mut response: Response<Full<Bytes>>,
     retry_after_secs: u32,
 ) -> Response<Full<Bytes>> {
-    let mut response = rpc_status_response(StatusCode::SERVICE_UNAVAILABLE, 8, message);
     if let Ok(retry_after) = HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
         _ = response
             .headers_mut()
             .insert(http::header::RETRY_AFTER, retry_after);
     }
     response
+}
+
+fn resource_exhausted_with_retry_after(
+    message: &'static str,
+    retry_after_secs: u32,
+) -> Response<Full<Bytes>> {
+    with_retry_after(
+        rpc_status_response(StatusCode::SERVICE_UNAVAILABLE, 8, message),
+        retry_after_secs,
+    )
+}
+
+/// `Retry-After` of a refusal at the concurrency limit: a permit frees within a request's lifetime.
+const CONCURRENCY_LIMIT_RETRY_AFTER_SECS: u32 = 1;
+
+fn concurrency_limit_unavailable() -> Response<Full<Bytes>> {
+    with_retry_after(
+        rpc_status_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            14,
+            CONCURRENCY_LIMIT_MESSAGE,
+        ),
+        CONCURRENCY_LIMIT_RETRY_AFTER_SECS,
+    )
 }
 
 fn memory_pressure_unavailable(retry_after_secs: u32) -> Response<Full<Bytes>> {
@@ -676,7 +700,7 @@ impl HttpHandler {
                             timeout_ms = permit_timeout.as_millis() as u64
                         );
                         self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                        return Err(service_unavailable());
+                        return Err(concurrency_limit_unavailable());
                     }
                 }
             } else {
@@ -718,7 +742,7 @@ impl HttpHandler {
                         timeout_ms = permit_timeout.as_millis() as u64
                     );
                     self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                    return Err(service_unavailable());
+                    return Err(concurrency_limit_unavailable());
                 }
             };
 
@@ -884,7 +908,8 @@ impl HttpHandler {
                     let (key, rx) = match state.allocate_slot() {
                         None => {
                             self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                            return Err(processing.refused(signal, Box::new(service_unavailable())));
+                            return Err(processing
+                                .refused(signal, Box::new(concurrency_limit_unavailable())));
                         }
                         Some(pair) => pair,
                     };
@@ -1740,12 +1765,12 @@ mod tests {
     }
 
     /// Scenario: A non-empty HTTP request cannot allocate its acknowledgement slot.
-    /// Guarantees: The request is rejected without incrementing the OTLP accepted counter.
+    /// Guarantees: The request gets 503 with `Retry-After: 1` and is not counted as accepted.
     #[tokio::test]
     async fn rejected_http_request_is_not_accepted() {
         use hyper::Method;
         use hyper::client::conn::http1;
-        use hyper::header::{CONTENT_TYPE, HOST};
+        use hyper::header::{CONTENT_TYPE, HOST, RETRY_AFTER};
         use hyper_util::rt::TokioIo;
         use otel_arrow_dfe_engine::control::runtime_ctrl_msg_channel;
         use otel_arrow_dfe_engine::shared::message::SharedSender;
@@ -1833,9 +1858,16 @@ mod tests {
             .body(Full::new(Bytes::from(request_bytes)))
             .unwrap();
 
-        let status = sender.send_request(request).await.unwrap().status();
+        let response = sender.send_request(request).await.unwrap();
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
         assert!(msg_rx.try_recv().is_err());
         {
             let metrics = metrics.lock();
