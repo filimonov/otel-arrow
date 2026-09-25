@@ -963,6 +963,66 @@ were thinned out before the evidence-keeping fix stay failed.
   `pr-soak-*.json`, `baseline-soak-strict-5cb03bef4ffc17fe.json`.
 - `campaign/reports/task-7-report.md`.
 
+## Task 9: S3 faults on real stores
+
+### Question
+
+How does the exporter behave, observably and in delivery, when the object
+store is slow, answers HTTP 503, or disappears, strict and behind the durable
+buffer, on MinIO and RustFS?
+
+### Method
+
+12 cells: slow, http503 and store_outage x strict and buffered x MinIO and
+RustFS, one worker, 5 s windows, the fault rig of Task 8 (Toxiproxy and an
+NGINX fault front), Task 5's generator and aggregate oracle. Each fault is a
+state machine with an observable arming condition (for an outage: a flush
+failure of class deadline, logged after the flush deadline) and a hold of
+at least 15 s past that failure. Every cell also checks the partition
+lateness bound (L = 5 + 2 x (60 + 5) = 135 s), multipart on the real store
+and incomplete uploads left in the bucket afterwards.
+
+### Results
+
+- In all 12 cells: no record missing, unexpected or corrupt; DuckDB and
+  clickhouse-local agree; multipart ran on both stores (CreateMultipartUpload,
+  UploadPart, Complete answered 2xx, objects carry `-N` ETags); no lateness
+  violation (worst observed 6.7 s after the hour's end, against 135 s; the
+  worst-case path was not produced).
+- Duplicates occur only inside requests the producer resent (strict) or in
+  files a failed block left behind (buffered), 9,000 records in one cell each.
+- 7 of 12 cells pass. The five failures fail one hard check,
+  `orphaned_uploads_expected`, a product defect (below).
+- Recovery after the store returns: 1.3-7.7 s to the first values file plus
+  ack, 25-31 s to drained, when the store stays down past about 130 s. When it
+  returns earlier, writes stall about 60 s; the NGINX logs place the stall in
+  the fault rig's proxy path (upstream status "-", plausibly a TCP connect
+  stuck until the kernel's connect timeout), not in the exporter, which ended
+  every attempt at its client timeout or flush deadline and nacked the
+  requests for retry.
+
+### Findings for Task 12
+
+- F1: a phase-2 failure of a multipart upload (a failed CompleteMultipartUpload
+  or a part failing during finalization) is neither aborted by the sink nor
+  counted in `flush.abort_failures` (series-lake sink/write.rs:704-714); when
+  object_store's own abort also fails, the error comes back as an ordinary
+  storage error. Each such attempt leaves one incomplete upload with no
+  signal. Seen in 7 runs.
+- An old attempt's part upload can keep running up to 132 s.
+- `flush.late_commits` undercounts while the store stays down through the
+  cleanup cutoff, and the cleanup probe can only report "unknown" during a 503
+  fault.
+- The rig's health HEAD goes through the general proxy, so it can declare the
+  endpoint healthy while the values route still hangs; Task 11 separates rig
+  from store with direct and per-proxy requests.
+
+### Evidence
+
+- `failure-s3.json` (index chain with every rerun's purpose) and its
+  `failure-s3-*-r*.json` runs; raw archives in `.measurement-artifacts/failure-s3/`.
+- `campaign/reports/task-9-report.md`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question
