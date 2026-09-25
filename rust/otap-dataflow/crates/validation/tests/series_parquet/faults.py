@@ -5170,8 +5170,56 @@ FAULT_REJUDGE_RULES = {
     "duplicates_explained": "strict: every duplicated record belongs to a resent request; "
     "buffered: every duplicated record has a copy in a values file of a failed block",
     "fault_observed": "store_outage: a flush.failed event of class deadline logged at least "
-    "the flush deadline after arming and before the fault was removed",
+    "the flush deadline after arming and before the fault was removed; process: a graceful "
+    "stop within the shutdown deadline and the cleanup cutoff (graceful_exit_problem), and "
+    "kill_upload's multipart gate on part bytes the store lists (ProcessCase.multipart_met)",
+    "orphaned_uploads_expected": "process: every upload a killed engine left open listed under "
+    "its key, other uploads only up to the reported abort failures, and the test's cleanup "
+    "leaving none (orphan_verdict)",
 }
+
+
+def rejudge_process_checks(result) -> list:
+    """The process-case verdicts `rejudge_fault_checks` re-judges from a run file.
+
+    fault_observed passes only when it passed as recorded and the stored
+    events meet the graceful-stop and multipart-gate rules; the orphans are
+    judged again from the stored listing, expectations and cleanup.
+    """
+    fault = result["observations"]["fault"]
+    process = fault["process"]
+    numbers = fault["numbers"]
+    statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
+    abort_timeout = duration_s(exporter_settings(result["config"]["effective"])["upload"]
+                               ["abort_timeout"])
+    deadline = numbers["admin_shutdown_deadline_s"]
+    problems = []
+    for event in process["events"]:
+        if event["kind"] == "graceful":
+            problem = graceful_exit_problem(event["exit"], deadline, abort_timeout)
+            if problem:
+                problems.append(f"event {event['ordinal']}: {problem}")
+    if fault["fault"] == "kill_upload" and process["events"]:
+        gate = process["events"][0]["gate"]
+        if not ProcessCase.multipart_met(gate):
+            problems.append("the multipart gate lists no part bytes in the store: "
+                            f"{[upload.get('part_bytes') for upload in gate.get('open_uploads', [])]}")
+    recorded = statuses.get("fault_observed")
+    observed = recorded == measurement.STATUS_PASSED and not problems
+    expected = process.get("expected_orphans") or {}
+    abort_failures = fault["orphaned_uploads_expected_max_count"] - len(expected)
+    passed, why = orphan_verdict(fault["orphaned_uploads"], expected, abort_failures,
+                                 process.get("orphan_cleanup"))
+    status = {True: measurement.STATUS_PASSED, False: measurement.STATUS_FAILED}
+    return [
+        {"check": "fault_observed", "recorded": recorded, "rejudged": status[observed],
+         "reason": "; ".join(problems) or (
+             "graceful stops within the shutdown deadline and cleanup cutoff; multipart gate "
+             f"on stored part bytes; recorded {recorded}")},
+        {"check": "orphaned_uploads_expected",
+         "recorded": statuses.get("orphaned_uploads_expected"), "rejudged": status[passed],
+         "reason": why},
+    ]
 
 
 def archived_engine_log(archive_dir, run_id):
@@ -5194,7 +5242,7 @@ def rejudge_fault_checks(result, archive_dir) -> list:
     """
     fault = result["observations"]["fault"]
     if fault["fault"] in FAILURE_FAMILIES["process"]:
-        return []
+        return rejudge_process_checks(result)
     buffered = result["config"]["requested"]["topology"] == "buffered"
     statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
     verdicts = []

@@ -1467,6 +1467,48 @@ class ProcessCaseContracts(unittest.TestCase):
         self.assertTrue(faults.orphan_verdict([extra], {}, 1)[0])
         self.assertFalse(faults.orphan_verdict("AccessDenied", {}, 0)[0])
 
+    # Scenario: stored process runs are re-judged: a graceful stop past the
+    # cleanup cutoff, a multipart gate on logged bytes only, an expected
+    # upload that vanished, and a clean kill_upload run.
+    # Guarantees: each is failed, or kept, from the run file alone, by the
+    # same rules the live case applies.
+    def test_rejudge_process_runs_from_stored_evidence(self):
+        upload = {"upload_id": "u1", "key": "k1", "initiated_unix_s": 1.0}
+
+        def run(fault, events, orphans, expected):
+            return {"config": {"effective": {"groups": {"default": {"pipelines": {"main": {
+                "nodes": {"exporter": {"config": {"upload": {"abort_timeout": "5s"}}}}}}}}}},
+                "checks": [measurement.check(name, measurement.CHECK_HARD,
+                                             measurement.STATUS_PASSED)
+                           for name in faults.FAULT_CHECKS + faults.PROCESS_CHECKS],
+                "observations": {"fault": {
+                    "fault": fault, "numbers": {"admin_shutdown_deadline_s": 150},
+                    "orphaned_uploads": orphans,
+                    "orphaned_uploads_expected_max_count": len(expected),
+                    "process": {"events": events, "expected_orphans": expected,
+                                "orphan_cleanup": {"clean": True, "remaining": []}}}}}
+
+        def verdicts(result):
+            return {entry["check"]: entry["rejudged"]
+                    for entry in faults.rejudge_fault_checks(result, "/nonexistent")}
+
+        graceful = {"ordinal": 1, "kind": "graceful", "gate": {},
+                    "exit": {"admin_returned_s": 150.1, "exit_s": 157.0, "exit_code": 0,
+                             "admin_error": None}}
+        self.assertEqual(verdicts(run("graceful_restart", [graceful], [], {}))["fault_observed"],
+                         measurement.STATUS_FAILED)
+        gate = {"block_flushing_bytes": 10, "open_uploads": [
+            dict(upload, part_bytes=None, logged_part_bytes=1541694)]}
+        kill = {"ordinal": 1, "kind": "kill", "gate": gate, "exit": {"exit_s": 0.07}}
+        result = run("kill_upload", [kill], [upload], {"u1": "k1"})
+        self.assertEqual(verdicts(result)["fault_observed"], measurement.STATUS_FAILED)
+        gate["open_uploads"][0]["part_bytes"] = 1540930
+        self.assertEqual(verdicts(result), {"fault_observed": measurement.STATUS_PASSED,
+                                            "orphaned_uploads_expected": measurement.STATUS_PASSED})
+        vanished = run("kill_upload", [kill], [], {"u1": "k1"})
+        self.assertEqual(verdicts(vanished)["orphaned_uploads_expected"],
+                         measurement.STATUS_FAILED)
+
     # Scenario: an engine is restarted, keeping and then not keeping its buffer.
     # Guarantees: the successor runs from the next root with the same launch
     # options, the same buffer path only when retained, and records the old

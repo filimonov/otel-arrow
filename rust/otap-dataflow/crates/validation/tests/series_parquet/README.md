@@ -664,7 +664,8 @@ archives (the engine log carries each flush failure's time and class),
 without rerunning anything or changing a run file: the advanced index
 records every changed verdict and every check the evidence cannot decide
 (`fault_rejudgement`), each child's re-judged failed checks, and keeps the
-index it replaces as a child. It re-judges S3 cases only.
+index it replaces as a child. Process cases are re-judged from their run
+files alone (`rejudge_process_checks`).
 
 #### Process restart and hard kill
 
