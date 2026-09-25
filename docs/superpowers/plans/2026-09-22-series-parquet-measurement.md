@@ -2013,3 +2013,16 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
 10. **Toxiproxy (M1):** Tasks 8/11 use official KB/s units and the dropped completion response name/behavior. The linked official toxic definitions and timeout cleanup confirm discarded bytes followed by connection closure on removal; bypass HEAD/GET proof remains.
 11. **Task size (M2):** Split harness/result-schema from launcher/CI (1/2), bench mechanics from attribution (3/4), and fault provisioning from state machines (8/9); renumbered all tasks and references.
 12. **Controller addition:** Task 13 records STRICT latency distributions at the same 15s/120s windows and offered rates alongside buffered results. Task 14 reports evidence for the oldest-pending-request-age rotation decision; no such trigger is implemented here.
+
+## After Task 14 (user decision 2026-09-25): de-slop round and the clean upstream branch
+
+1. **De-slop round on the campaign branch.** Re-read every comment and piece of prose and cut what is superfluous; re-read every Markdown document and remove what is unneeded or stale; remove from the tree the artifacts that are not needed, temporary documents and other noise (history keeps them). The harness writes raw results to the ignored `.measurement-artifacts/` by default.
+2. **A new, clean branch built from the campaign branch**, based on a fresh `origin/main`, carrying only the necessary minimum; nothing optional is carried over (no process documents, evidence, measurement harness or measurement benches). Rule: one logical unit, which becomes one upstream PR, is one commit. The commits are few and nearly disjoint, each a self-contained increment solving one problem; in dependency order, approximately:
+   1. Engine: completions delivered to a processor after Shutdown, the closed-pdata Shutdown fix, and the durable_buffer shutdown-ack fix (T10-F1) with its bounded finalize.
+   2. pdata: the OTLP framing check (a damaged body is never acknowledged) and its adoption by the file, parquet and otap exporters.
+   3. object_store: the shared S3 wiring and UNSIGNED-PAYLOAD over TLS.
+   4. OTLP receiver: `max_decoding_message_size`, retryable concurrency / memory-pressure / rate-limit refusals, non-retryable oversize and burst refusals, counted.
+   5. Small backlog fixes (for example the pdata CBOR encoder recursion limit).
+   6. The series-lake crate: format, FORMAT.md, unit, golden and fuzz tests.
+   7. The series_parquet exporter behind its feature: configs, README and operator guide, Rust tests, and a small MinIO E2E as an optional CI lane.
+   The split may be refined when the branch is cut (for example the pdata byte-view fixes as their own first commit). Each commit gets one changelog entry for its component; issue placeholders are replaced by the PR number when opened. Opening upstream PRs or issues remains the user's call.
