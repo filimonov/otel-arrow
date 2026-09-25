@@ -4,15 +4,15 @@
 
 - Type: `exporter:series_parquet` (`urn:otel:exporter:series_parquet`)
 - Feature gate: `series-parquet` (opt-in, not in `core-exporters`); add `aws`
-  for S3-compatible storage
+  for S3-compatible storage, `azure` for Azure Blob Storage
 - Metric scope: `exporter.series_parquet`
 - Stability: Experimental
 
 ## Overview
 
 `exporter:series_parquet` writes logs and metric number and histogram points
-as series descriptors plus narrow values datasets, on a local filesystem or on
-S3-compatible object storage, under
+as series descriptors plus narrow values datasets, on a local filesystem, on
+S3-compatible object storage or on Azure Blob Storage, under
 `v=1/signal=<signal>/dataset=<dataset>/date=<date>/hour=<hour>/`. Values rows
 join their `series` descriptor on `series_id`; number and histogram points
 share one metrics `values` dataset, and the descriptor's `metric_type` gives
@@ -311,6 +311,38 @@ exporters sharing the S3 storage section keep signed payloads. Some
 S3-compatible stores and bucket policies refuse `UNSIGNED-PAYLOAD`; every
 upload then fails with HTTP 403 (`flush.failures` rises, nothing is stored).
 Set `unsigned_payload: false` for such a store.
+
+Azure storage takes `base_uri`
+(`https://<account>.blob.core.windows.net/<container>/<prefix>`) and an
+optional `endpoint` that replaces the service URL the account implies, for a
+private endpoint, a sovereign cloud or the Azurite emulator
+(`https://127.0.0.1:10000/devstoreaccount1`). It has no credential fields:
+the node must bind `bearer_token_provider` to a token extension, such as
+`azure_identity_auth` (managed or workload identity) or
+`oauth2_client_auth`, and startup fails without that binding. The token must
+be for the `https://storage.azure.com` audience. Only HTTPS is used; a store
+behind a private CA is trusted through the system roots or
+`SSL_CERT_FILE`. The Azure path is covered by one end-to-end smoke against
+Azurite, not by the failure and throughput measurements, which ran on
+S3-compatible stores.
+
+```yaml
+extensions:
+  azure_auth:
+    type: "urn:microsoft:extension:azure_identity_auth"
+    config:
+      method: managed_identity
+      scope: "https://storage.azure.com/.default"
+nodes:
+  exporter:
+    type: exporter:series_parquet
+    capabilities:
+      bearer_token_provider: azure_auth
+    config:
+      storage:
+        azure:
+          base_uri: "https://myaccount.blob.core.windows.net/telemetry/otel"
+```
 
 `producer_id_attribute` projects that resource attribute into the
 `producer_id` column of every values row and stays in the identity (see the
