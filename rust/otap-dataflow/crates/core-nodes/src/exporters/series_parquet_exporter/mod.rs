@@ -202,8 +202,8 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
             otel_arrow_dfe_otap::otap_grpc::server_settings::DEFAULT_MAX_DECODING_MESSAGE_SIZE,
         message = "this exporter cannot see the upstream receiver's \
                    max_decoding_message_size; set it to at least ingress.max_request_bytes, \
-                   or the receiver refuses larger requests with OUT_OF_RANGE, which OTLP \
-                   clients retry without end"
+                   or the receiver refuses larger requests with INVALID_ARGUMENT, which OTLP \
+                   clients drop"
     );
     let parts = cfg.parts_per_block();
     if parts > lake::config::MAX_PARTS {

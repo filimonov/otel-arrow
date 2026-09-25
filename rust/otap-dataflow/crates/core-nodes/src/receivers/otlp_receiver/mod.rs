@@ -5121,6 +5121,67 @@ mod tests {
             .run_validation_concurrent(validation);
     }
 
+    /// Scenario: two gRPC requests exceed `max_decoding_message_size`, one on
+    /// the wire and one gzip-compressed below the limit that decompresses above it.
+    /// Guarantees: both are refused with non-retryable INVALID_ARGUMENT, counted
+    /// as `payload_too_large`, and never reach the pipeline.
+    #[test]
+    fn test_otlp_grpc_oversized_message_is_permanent_and_counted() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        config
+            .protocols
+            .grpc
+            .as_mut()
+            .unwrap()
+            .max_decoding_message_size = Some(1024);
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let mut request = create_logs_service_request();
+                request.resource_logs[0]
+                    .resource
+                    .as_mut()
+                    .unwrap()
+                    .attributes
+                    .push(KeyValue {
+                        key: "x".repeat(8 * 1024),
+                        ..Default::default()
+                    });
+                let client = LogsServiceClient::connect(endpoint.clone())
+                    .await
+                    .expect("Failed to connect");
+                let plain = client.clone().export(request.clone()).await;
+                let compressed = client
+                    .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .export(request)
+                    .await;
+                ctx.send_shutdown(Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+
+                for result in [plain, compressed] {
+                    let status = result.expect_err("an oversized request must be refused");
+                    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+                }
+                assert_eq!(
+                    grpc_rejections(&metrics, ReceiverRejectionErrorType::PayloadTooLarge),
+                    2
+                );
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation(|mut ctx| async move {
+                assert!(matches!(ctx.recv().await, Err(RecvError::Closed)));
+            });
+    }
+
     // Run the receiver-side DST sweep for wait_for_result completion.
     // The seeded scenarios cover normal Ack, temporary Nack, permanent Nack,
     // and shutdown-forced completion without standing up real network servers.

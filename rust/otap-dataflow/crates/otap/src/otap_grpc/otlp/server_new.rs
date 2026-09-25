@@ -365,6 +365,42 @@ impl OtapBatchService {
     }
 }
 
+impl UnaryService<OtapPdata> for &mut OtapBatchService {
+    type Response = ();
+    type Future = BoxFuture<'static, Result<tonic::Response<Self::Response>, Status>>;
+
+    fn call(&mut self, request: tonic::Request<OtapPdata>) -> Self::Future {
+        (**self).call(request)
+    }
+}
+
+/// Runs one export call, answering a message tonic refused for exceeding
+/// `max_decoding_message_size` with non-retryable INVALID_ARGUMENT.
+///
+/// Before the service runs, tonic answers such a message with OUT_OF_RANGE (too
+/// large on the wire, retried forever by OTLP clients) or RESOURCE_EXHAUSTED
+/// (too large after decompression); no other decode failure uses those codes.
+async fn serve_export(
+    mut grpc: Grpc<OtlpBytesCodec>,
+    mut service: OtapBatchService,
+    request: Request<Body>,
+) -> Response<Body> {
+    let response = grpc.unary(&mut service, request).await;
+    if service.effect_handler.is_none() {
+        return response;
+    }
+    match Status::from_header_map(response.headers()) {
+        Some(status) if matches!(status.code(), Code::OutOfRange | Code::ResourceExhausted) => {
+            service.metrics.lock().record_rejection(
+                OtlpProtocol::Grpc,
+                ReceiverRejectionErrorType::PayloadTooLarge,
+            );
+            Status::invalid_argument(status.message().to_owned()).into_http()
+        }
+        _ => response,
+    }
+}
+
 /// Guard mechanism for cancelling a slot when Tonic timeout
 /// drops the future.
 pub(crate) struct SlotGuard {
@@ -391,6 +427,11 @@ impl UnaryService<OtapPdata> for OtapBatchService {
     type Future = BoxFuture<'static, Result<tonic::Response<Self::Response>, Status>>;
 
     fn call(&mut self, request: tonic::Request<OtapPdata>) -> Self::Future {
+        // Taken first: `serve_export` reads a present handler as "tonic refused before this call".
+        let effect_handler = self
+            .effect_handler
+            .take()
+            .expect("`OtapBatchService` is not reused for multiple calls");
         let (metadata, extensions, mut otap_batch) = request.into_parts();
         let payload_size = otap_batch.num_bytes();
 
@@ -441,11 +482,6 @@ impl UnaryService<OtapPdata> for OtapBatchService {
         if let Some(addr) = peer_addr_from_extensions(&extensions) {
             otap_batch.set_peer_addr(addr);
         }
-
-        let effect_handler = self
-            .effect_handler
-            .take()
-            .expect("`OtapBatchService` is not reused for multiple calls");
 
         // Capture transport headers synchronously before moving the effect handler
         // into the async block, avoiding a clone of the capture policy.
@@ -773,7 +809,7 @@ impl Service<Request<Body>> for LogsServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Logs, common.settings.clone());
+                let grpc = new_grpc(SignalType::Logs, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -782,7 +818,7 @@ impl Service<Request<Body>> for LogsServiceServer {
                     SignalType::Logs,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -832,7 +868,7 @@ impl Service<Request<Body>> for MetricsServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Metrics, common.settings.clone());
+                let grpc = new_grpc(SignalType::Metrics, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -841,7 +877,7 @@ impl Service<Request<Body>> for MetricsServiceServer {
                     SignalType::Metrics,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
@@ -891,7 +927,7 @@ impl Service<Request<Body>> for TraceServiceServer {
                 if let Some(response) = common.exhausted_rate_limit_response() {
                     return Box::pin(async move { Ok(response) });
                 }
-                let mut grpc = new_grpc(SignalType::Traces, common.settings.clone());
+                let grpc = new_grpc(SignalType::Traces, common.settings.clone());
                 let rate_limit = common.grpc_rate_limit_context();
                 let service = OtapBatchService::new(
                     common.effect_handler,
@@ -900,7 +936,7 @@ impl Service<Request<Body>> for TraceServiceServer {
                     SignalType::Traces,
                     rate_limit,
                 );
-                Box::pin(async move { Ok(grpc.unary(service, req).await) })
+                Box::pin(async move { Ok(serve_export(grpc, service, req).await) })
             }
             _ => Box::pin(async move { Ok(unimplemented_resp()) }),
         }
