@@ -393,21 +393,23 @@ fn key_rows(batch: &RecordBatch, spec: &SortSpec, converter: &RowConverter) -> R
     Ok(converter.convert_columns(&cols)?)
 }
 
-/// Whether [`merge_key_bound`] can bound the merge keys of a sort column of
-/// this type: fixed-width primitives, booleans, fixed-size binaries,
-/// strings and binaries.
+/// Whether [`merge_key_bound`] bounds the merge keys of a sort column of
+/// this type: exactly the sortable types of the lake's values columns
+/// (Int32, Int64, Float64, UTC microsecond timestamps, booleans, the 8- and
+/// 16-byte ids and strings), each pinned against Arrow's row format by a
+/// conformance test.
 #[must_use]
 pub fn merge_key_supported(data_type: &DataType) -> bool {
-    data_type.primitive_width().is_some()
-        || matches!(
-            data_type,
-            DataType::Boolean
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Binary
-                | DataType::LargeBinary
-        )
+    matches!(
+        data_type,
+        DataType::Int32
+            | DataType::Int64
+            | DataType::Float64
+            | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _)
+            | DataType::Boolean
+            | DataType::FixedSizeBinary(8 | 16)
+            | DataType::Utf8
+    )
 }
 
 /// Row-format bytes of one non-null variable-length value of `len` bytes:
@@ -425,12 +427,9 @@ fn encoded_value_len(len: usize) -> usize {
     }
 }
 
-/// Row-format bytes of every value of one variable-length column, from its
-/// offsets and validity.
-fn encoded_column_len<O: arrow::array::OffsetSizeTrait>(
-    offsets: &[O],
-    nulls: Option<&NullBuffer>,
-) -> usize {
+/// Row-format bytes of every value of one string column, from its offsets
+/// and validity.
+fn encoded_column_len(offsets: &[i32], nulls: Option<&NullBuffer>) -> usize {
     offsets
         .windows(2)
         .enumerate()
@@ -438,7 +437,7 @@ fn encoded_column_len<O: arrow::array::OffsetSizeTrait>(
             if nulls.is_some_and(|nulls| nulls.is_null(i)) {
                 1
             } else {
-                encoded_value_len((pair[1] - pair[0]).as_usize())
+                encoded_value_len(usize::try_from(pair[1] - pair[0]).unwrap_or(0))
             }
         })
         .sum()
@@ -477,30 +476,22 @@ pub fn merge_key_bound(batch: &RecordBatch, spec: &SortSpec) -> Result<usize> {
             continue;
         };
         let data_type = column.data_type();
+        let unbounded = || {
+            Error::internal(format!(
+                "sort column {} has type {data_type}, whose merge keys are not bounded",
+                key.column
+            ))
+        };
+        if !merge_key_supported(data_type) {
+            return Err(unbounded());
+        }
         bytes += match data_type {
             DataType::Boolean => rows * 2,
             DataType::FixedSizeBinary(width) => rows * (1 + *width as usize),
             DataType::Utf8 => {
                 encoded_column_len(column.as_string::<i32>().value_offsets(), column.nulls())
             }
-            DataType::LargeUtf8 => {
-                encoded_column_len(column.as_string::<i64>().value_offsets(), column.nulls())
-            }
-            DataType::Binary => {
-                encoded_column_len(column.as_binary::<i32>().value_offsets(), column.nulls())
-            }
-            DataType::LargeBinary => {
-                encoded_column_len(column.as_binary::<i64>().value_offsets(), column.nulls())
-            }
-            other => match other.primitive_width() {
-                Some(width) => rows * (1 + width),
-                None => {
-                    return Err(Error::internal(format!(
-                        "sort column {} has type {other}, whose merge keys are not bounded",
-                        key.column
-                    )));
-                }
-            },
+            other => rows * (1 + other.primitive_width().ok_or_else(unbounded)?),
         };
     }
     Ok(bytes)
@@ -2155,18 +2146,16 @@ mod tests {
         }
     }
 
-    /// Scenario: one-row key columns of every type `merge_key_supported` names: fixed-width
-    /// primitives, boolean and fixed-size binary with a value and a null, and strings and
-    /// binaries of 0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65 and 300 bytes and null.
+    /// Scenario: one-row key columns of every type `merge_key_supported` accepts: Int32, Int64,
+    /// Float64, UTC microsecond timestamps, booleans and the 8- and 16-byte ids, each with a
+    /// value and a null, and strings of 0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65 and 300 bytes
+    /// and null.
     /// Guarantees: the encoded key size `merge_key_bound` computes is exactly the row length
     /// Arrow's row converter produces, so any change of the row format fails here.
     #[test]
     fn merge_key_bound_matches_the_row_format_exactly() {
         use arrow::array::{
-            BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-            DurationMicrosecondArray, FixedSizeBinaryArray, Float32Array, Int8Array, Int16Array,
-            Int32Array, LargeBinaryArray, LargeStringArray, Time64MicrosecondArray,
-            TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+            BooleanArray, FixedSizeBinaryArray, Int32Array, TimestampMicrosecondArray,
         };
         let lengths = [0usize, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 300];
         let text: Vec<Option<String>> = lengths
@@ -2174,44 +2163,24 @@ mod tests {
             .map(|&n| Some("x".repeat(n)))
             .chain([None])
             .collect();
-        let bytes: Vec<Option<Vec<u8>>> = lengths
-            .iter()
-            .map(|&n| Some(vec![7u8; n]))
-            .chain([None])
-            .collect();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int8Array::from(vec![Some(1), None])),
-            Arc::new(Int16Array::from(vec![Some(1), None])),
-            Arc::new(Int32Array::from(vec![Some(1), None])),
-            Arc::new(Int64Array::from(vec![Some(1), None])),
-            Arc::new(UInt8Array::from(vec![Some(1), None])),
-            Arc::new(UInt16Array::from(vec![Some(1), None])),
-            Arc::new(UInt32Array::from(vec![Some(1), None])),
-            Arc::new(UInt64Array::from(vec![Some(1), None])),
-            Arc::new(Float32Array::from(vec![Some(1.5), None])),
-            Arc::new(Float64Array::from(vec![Some(1.5), None])),
-            Arc::new(Date32Array::from(vec![Some(1), None])),
-            Arc::new(Date64Array::from(vec![Some(1), None])),
-            Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC")),
-            Arc::new(Time64MicrosecondArray::from(vec![Some(1), None])),
-            Arc::new(DurationMicrosecondArray::from(vec![Some(1), None])),
-            Arc::new(
-                Decimal128Array::from(vec![Some(1), None])
-                    .with_precision_and_scale(38, 2)
-                    .expect("decimal"),
-            ),
-            Arc::new(BooleanArray::from(vec![Some(true), None])),
+        let id = |width: i32| -> ArrayRef {
             Arc::new(
                 FixedSizeBinaryArray::try_from_sparse_iter_with_size(
-                    vec![Some([1u8; 16]), None].into_iter(),
-                    16,
+                    vec![Some(vec![1u8; width as usize]), None].into_iter(),
+                    width,
                 )
                 .expect("ids"),
-            ),
-            Arc::new(StringArray::from(text.clone())),
-            Arc::new(LargeStringArray::from(text)),
-            Arc::new(BinaryArray::from_iter(bytes.clone())),
-            Arc::new(LargeBinaryArray::from_iter(bytes)),
+            )
+        };
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(Int64Array::from(vec![Some(1), None])),
+            Arc::new(Float64Array::from(vec![Some(1.5), None])),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC")),
+            Arc::new(BooleanArray::from(vec![Some(true), None])),
+            id(8),
+            id(16),
+            Arc::new(StringArray::from(text)),
         ];
         let spec = SortSpec::new(vec![SortKey {
             column: "k".into(),
@@ -2238,6 +2207,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Scenario: every sortable column of every values dataset, with one denormalized column of
+    /// each type, and types no lake column has: Int16, Float32, Decimal128, Time32, a large
+    /// string, a binary and a 4-byte fixed-size binary.
+    /// Guarantees: `merge_key_supported` accepts exactly the lake's sortable types, so every
+    /// accepted type has a conformance case; the others are refused and `merge_key_bound`
+    /// errs on them.
+    #[test]
+    fn merge_key_supported_is_exactly_the_lake_sort_key_types() {
+        use crate::config::{DenormType, Denormalize};
+        let mut cfg = LakeConfig::default();
+        let denormalize: Vec<Denormalize> = [
+            DenormType::String,
+            DenormType::Int64,
+            DenormType::Double,
+            DenormType::Bool,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ty)| Denormalize {
+            path: format!("resource.k{i}"),
+            column: format!("k{i}"),
+            ty,
+        })
+        .collect();
+        cfg.logs.denormalize = denormalize.clone();
+        cfg.metrics.denormalize = denormalize;
+        for ds in Dataset::ALL.into_iter().filter(|ds| !ds.is_series()) {
+            let schema = crate::schema::dataset_schema(ds, &cfg);
+            for field in schema.fields() {
+                let sortable =
+                    RowConverter::supports_fields(&[SortField::new(field.data_type().clone())])
+                        && !matches!(field.data_type(), DataType::List(_));
+                assert_eq!(
+                    merge_key_supported(field.data_type()),
+                    sortable,
+                    "{}.{}: {}",
+                    ds.name(),
+                    field.name(),
+                    field.data_type()
+                );
+            }
+        }
+        for data_type in [
+            DataType::Int16,
+            DataType::Float32,
+            DataType::Decimal128(38, 2),
+            DataType::Time32(arrow::datatypes::TimeUnit::Second),
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::FixedSizeBinary(4),
+        ] {
+            assert!(!merge_key_supported(&data_type), "{data_type}");
+        }
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int16, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int16Array::from(vec![1_i16])) as ArrayRef],
+        )
+        .expect("batch");
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        assert!(merge_key_bound(&batch, &spec).is_err());
     }
 
     /// Scenario: a dictionary-encoded string column named as a sort key.
