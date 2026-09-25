@@ -638,6 +638,7 @@ impl<PData: 'static + Debug + Clone + ReceivedAtNode + Unwindable + FlowMetricHo
                         effect_metrics_reporter,
                         node_interests,
                         completion_emission_metrics,
+                        exporter_terminal_metrics_deadline.clone(),
                         exporter_runtime_services,
                     )
                     .await

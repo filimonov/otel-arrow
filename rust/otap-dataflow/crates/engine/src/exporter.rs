@@ -25,7 +25,7 @@ use crate::node::{Node, NodeId, NodeWithPDataReceiver};
 use crate::runtime_services::PipelineRuntimeServices;
 use crate::shared::exporter as shared;
 use crate::shared::message::{SharedReceiver, SharedSender};
-use crate::terminal_state::TerminalState;
+use crate::terminal_state::{TerminalMetricsDeadline, TerminalState};
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -299,6 +299,7 @@ impl<PData> ExporterWrapper<PData> {
             metrics_reporter,
             node_interests,
             None,
+            TerminalMetricsDeadline::default(),
             runtime_services,
         )
         .await
@@ -311,6 +312,7 @@ impl<PData> ExporterWrapper<PData> {
         metrics_reporter: MetricsReporter,
         node_interests: Interests,
         completion_emission_metrics: Option<CompletionEmissionMetricsHandle>,
+        terminal_metrics_deadline: TerminalMetricsDeadline,
         runtime_services: PipelineRuntimeServices,
     ) -> Result<TerminalState, Error> {
         match (self, metrics_reporter) {
@@ -347,12 +349,13 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_completion_emission_metrics(completion_emission_metrics.clone());
                 effect_handler.set_propagation_policy(propagation_policy);
-                let inbox = ExporterInbox::new(
+                let mut inbox = ExporterInbox::new(
                     Receiver::Local(control_receiver),
                     pdata_rx,
                     node_id.index,
                     node_interests,
                 );
+                inbox.follow_pipeline_deadline(terminal_metrics_deadline);
                 exporter.start(inbox, effect_handler).await
             }
             (
@@ -385,12 +388,13 @@ impl<PData> ExporterWrapper<PData> {
                     .core
                     .set_completion_emission_metrics(completion_emission_metrics);
                 effect_handler.set_propagation_policy(propagation_policy);
-                let inbox = shared::ExporterInbox::new(
+                let mut inbox = shared::ExporterInbox::new(
                     control_receiver,
                     pdata_rx,
                     node_id.index,
                     node_interests,
                 );
+                inbox.follow_pipeline_deadline(terminal_metrics_deadline);
                 exporter.start(inbox, effect_handler).await
             }
         }

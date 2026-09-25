@@ -70,6 +70,15 @@ impl<PData> ExporterInbox<PData> {
             inner: SharedExporterInbox::new_internal(control_rx, pdata_rx, node_id, interests),
         }
     }
+
+    /// Bounds a Shutdown synthesized for a closed pdata channel by the
+    /// pipeline's shutdown deadline once one is recorded.
+    pub(crate) fn follow_pipeline_deadline(
+        &mut self,
+        deadline: crate::terminal_state::TerminalMetricsDeadline,
+    ) {
+        self.inner.follow_pipeline_deadline(deadline);
+    }
 }
 
 impl<PData: ReceivedAtNode> ExporterInbox<PData> {

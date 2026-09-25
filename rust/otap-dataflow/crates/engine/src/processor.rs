@@ -736,6 +736,7 @@ impl<PData> ProcessorWrapper<PData> {
                 mut inbox,
                 mut effect_handler,
             } => {
+                inbox.follow_pipeline_deadline(terminal_metrics_deadline.clone());
                 effect_handler
                     .core
                     .set_runtime_ctrl_msg_sender(runtime_ctrl_msg_tx);
@@ -848,6 +849,7 @@ impl<PData> ProcessorWrapper<PData> {
                 mut inbox,
                 mut effect_handler,
             } => {
+                inbox.follow_pipeline_deadline(terminal_metrics_deadline.clone());
                 effect_handler
                     .core
                     .set_runtime_ctrl_msg_sender(runtime_ctrl_msg_tx);

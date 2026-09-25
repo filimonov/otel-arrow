@@ -33,6 +33,14 @@ impl TerminalMetricsDeadline {
         *current = Some(current.map_or(deadline, |current| current.min(deadline)));
     }
 
+    /// Returns the deadline recorded so far, without installing a fallback.
+    pub(crate) fn recorded(&self) -> Option<Instant> {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Returns the shared deadline, installing a finite fallback if necessary.
     pub(crate) fn get(&self) -> Instant {
         let mut deadline = self
