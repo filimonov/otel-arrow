@@ -568,8 +568,12 @@ can report through `awaits_completions()` that it still expects the `Ack` or
 engine closes its outputs so the nodes downstream can finish, delivers `Ack`
 and `Nack` until the processor expects none or the declared `final_reserve`
 before the shutdown deadline begins, and then delivers `Shutdown` once more as
-the final message. Without the declaration the control receiver closes when
-`Shutdown` is released, as for any other processor.
+the final message. A further `Shutdown` with an earlier deadline moves the
+deadline, and the final `Shutdown` carries it; one with a later deadline
+changes nothing. If handling a completion fails, the wait ends, the final
+`Shutdown` is still delivered, and the run loop returns the error. Without the
+declaration the control receiver closes when `Shutdown` is released, as for
+any other processor.
 
 If the shutdown deadline expires, receivers may force-resolve remaining
 receiver-local waiters and the runtime control manager forces the remaining

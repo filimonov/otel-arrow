@@ -870,11 +870,11 @@ impl<PData> ProcessorInbox<PData> {
         self.core.completions_rx = None;
     }
 
-    /// Receives the next `Ack` or `Nack` sent to the processor after the inbox
-    /// released its Shutdown.
+    /// Receives the next `Ack`, `Nack` or further `Shutdown` sent to the
+    /// processor after the inbox released its Shutdown.
     ///
-    /// Other control messages are discarded. Returns `None` at `deadline`, on
-    /// a further Shutdown, or when the channel is closed.
+    /// Other control messages are discarded. Returns `None` at `deadline` or
+    /// when the channel is closed.
     pub async fn recv_completion_until(
         &mut self,
         deadline: Instant,
@@ -887,8 +887,9 @@ impl<PData> ProcessorInbox<PData> {
                 msg = completions.recv() => msg.ok()?,
             };
             match msg {
-                NodeControlMsg::Ack(_) | NodeControlMsg::Nack(_) => return Some(msg),
-                NodeControlMsg::Shutdown { .. } => return None,
+                NodeControlMsg::Ack(_)
+                | NodeControlMsg::Nack(_)
+                | NodeControlMsg::Shutdown { .. } => return Some(msg),
                 _ => {}
             }
         }

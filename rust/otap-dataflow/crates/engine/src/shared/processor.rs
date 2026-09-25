@@ -124,7 +124,9 @@ pub trait Processor<PData> {
     /// runtime requirements declare `shutdown_completions`. While it returns
     /// `true`, the engine closes the processor's outputs and keeps delivering
     /// `Ack` and `Nack` until the declared reserve before the shutdown
-    /// deadline, then delivers `Shutdown` once more as the final message.
+    /// deadline, then delivers `Shutdown` once more as the final message,
+    /// carrying the earliest deadline any `Shutdown` gave. The final
+    /// `Shutdown` is delivered even when handling a completion failed.
     /// Defaults to `false`.
     fn awaits_completions(&self) -> bool {
         false
