@@ -65,6 +65,14 @@ class ReferenceDeploymentContracts(unittest.TestCase):
         self.assertEqual(view["duplicate_lines_by_boots"], {"0,1": 10, "1": 5})
         self.assertEqual(view["runs_count"], 2)
 
+    # Scenario: a WAL-full run whose Alloy fleet reports 384 UNAVAILABLE calls.
+    # Guarantees: the fault check reads Alloy's upper-case status label and
+    # needs both the buffer's refusals and the producers' UNAVAILABLE.
+    def test_wal_full_is_observed_from_alloys_status_label(self):
+        self.assertTrue(ref.wal_full_observed(384, {"OK": 10, "UNAVAILABLE": 384})[0])
+        self.assertFalse(ref.wal_full_observed(384, {"OK": 10})[0])
+        self.assertFalse(ref.wal_full_observed(0, {"UNAVAILABLE": 3})[0])
+
     # Scenario: the shipped River config is read for the duplicate bound.
     # Guarantees: the reference producer keeps its file-backed queue, two
     # consumers and 4000-record batches.

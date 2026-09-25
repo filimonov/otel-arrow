@@ -986,7 +986,8 @@ python3 -m crates.validation.tests.series_parquet.reference_deployment \
   1GiB (about three times its steady size at this rate) and keeps the store
   down 90 s past the first refusal;
 - `engine_restart` sends SIGTERM and starts a new engine on the same ports and
-  WAL; `engine_kill` does the same twice with SIGKILL;
+  WAL; `engine_kill` does the same with SIGKILL, three times: mid-window, about
+  when the previous block commits, and during its upload;
 - `alloy_restart` stops (`docker stop --time 10`) and starts every Alloy
   container, whose storage path is a bind mount.
 
@@ -1004,8 +1005,9 @@ whose acknowledgement was not yet persisted) and after an Alloy restart (the
 `rpc_client_call_duration_seconds` histogram. Results are published as
 `reference-alloy-<case>-<store>.json`; raw logs and samples go to
 `.measurement-artifacts/reference-alloy/` of the main checkout. Options:
-`baseline_s`, `measure_s`, `outage_s`, `full_s`, `after_s`, `kills`,
-`producers`, `rate`, `lease_wait_s`, `archive_dir`, `report_dir`.
+`baseline_s`, `measure_s`, `outage_s`, `full_s`, `after_s`, `kill_phases`
+(default 7.0, 1.0 and 0.4 s into the window), `producers`, `rate`,
+`lease_wait_s`, `archive_dir`, `report_dir`.
 
 ## Environment variables
 

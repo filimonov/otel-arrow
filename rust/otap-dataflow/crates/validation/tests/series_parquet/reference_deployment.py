@@ -63,6 +63,9 @@ FRESHNESS_GROUP_LINES = 500
 # times the steady WAL of 40k lines/s (ingest x (window + flush), ~300 MB).
 WAL_FULL_CAP = "1GiB"
 SIGTERM_GRACE_S = 60
+# The shipped window, and where in it the SIGKILLs land (seconds after its start).
+WINDOW_S = 15
+KILL_PHASES_S = (7.0, 1.0, 0.4)
 REPORT_PREFIX = "reference-alloy"
 ARCHIVE_DIR = faults.FAULT_ARCHIVE_ROOT / "reference-alloy"
 METRIC_PREFIXES = ("exporter.series_parquet", "processor.durable_buffer", "receiver")
@@ -562,12 +565,19 @@ class Case:
         self.hold(self.options.get("after_s", 90))
 
     def fault_engine_kill(self):
-        for _ in range(self.options.get("kills", 2)):
-            self.event("engine_sigkill", boot=self.engine.boot)
+        # Each kill lands at a phase of the 15s window: mid-window with nothing
+        # flushing, about when the previous block's acknowledgements reach the
+        # buffer, and while its upload is on the wire.
+        for phase in self.options.get("kill_phases", KILL_PHASES_S):
+            now = time.time()
+            wait = (phase - now % WINDOW_S) % WINDOW_S
+            time.sleep(wait if wait > 1 else wait + WINDOW_S)
+            self.event("engine_sigkill", boot=self.engine.boot,
+                       window_phase_s=round(time.time() % WINDOW_S, 3))
             exit_ = self.engine.kill()
             self.event("engine_exited", **exit_)
             self.new_engine()
-            self.hold(self.options.get("after_s", 60))
+            self.hold(self.options.get("after_s", 45))
 
     def fault_alloy_restart(self):
         self.event("alloy_stop")
@@ -870,9 +880,7 @@ class Case:
             check("alloy_saw_no_errors", failed_lines == 0 and set(statuses) <= {"OK"},
                   f"statuses {dict(statuses)}, 'Exporting failed' lines {failed_lines}")
         if name == "wal_full":
-            unavailable = statuses.get("Unavailable", 0)
-            check("fault_observed", backpressure > 0 and unavailable > 0,
-                  f"backpressure refusals {backpressure}, Alloy UNAVAILABLE {unavailable}")
+            check("fault_observed", *wal_full_observed(backpressure, statuses))
         if name == "engine_restart":
             exits = [e for e in self.events if e["kind"] == "engine_exited"]
             ok = all(e.get("code") == 0 and not e.get("forced")
@@ -885,6 +893,36 @@ class Case:
         if name == "alloy_restart":
             restarted = all(a.restarts for a in self.alloys)
             check("fault_observed", restarted, {a.index: a.restarts for a in self.alloys})
+
+
+def wal_full_observed(backpressure, statuses):
+    """Whether the WAL refused requests and Alloy was told UNAVAILABLE.
+
+    `statuses` are Alloy's `rpc_response_status_code` label values, which
+    name the gRPC code in upper case.
+    """
+    unavailable = statuses.get("UNAVAILABLE", 0)
+    return (backpressure > 0 and unavailable > 0,
+            f"backpressure refusals {backpressure}, Alloy UNAVAILABLE {unavailable}")
+
+
+def rejudge(path):
+    """Advance a published wal_full result to the current fault check."""
+    path = Path(path)
+    result = json.loads(path.read_text())
+    metrics = result["metrics"]
+    passed, detail = wal_full_observed(metrics["buffer_backpressure_refusals"],
+                                       metrics["alloy_calls_by_status"])
+    for entry in result["checks"]:
+        if entry["name"] == "fault_observed" and entry["passed"] != passed:
+            result.setdefault("rejudgement", []).append({
+                "check": "fault_observed", "was": entry["passed"], "now": passed,
+                "reason": "the check read the status label 'Unavailable'; Alloy "
+                          "reports 'UNAVAILABLE'", "at_utc": measurement.utc_now()})
+            entry.update(passed=passed, detail=detail)
+    result["status"] = "passed" if all(c["passed"] for c in result["checks"]) else "failed"
+    path.write_text(json.dumps(result, indent=1, sort_keys=True, default=str) + "\n")
+    return result
 
 
 def last_per_boot(samples):
@@ -1122,13 +1160,21 @@ def publish(result, report_dir):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="reference_deployment", description=__doc__)
-    parser.add_argument("--case", choices=CASES, required=True)
+    parser.add_argument("--case", choices=CASES)
+    parser.add_argument("--rejudge", help="a published result to re-judge")
     parser.add_argument("--store", choices=("minio", "rustfs"), default="minio")
     parser.add_argument("--work-dir", default="/var/tmp/series-reference")
     parser.add_argument("--report-dir", default=str(measurement.REPORT_DIR))
     parser.add_argument("--option", action="append", default=[],
                         help="name=value, decoded as JSON when it parses")
     args = parser.parse_args(argv)
+    if args.rejudge:
+        result = rejudge(args.rejudge)
+        print(json.dumps({"status": result["status"],
+                          "rejudgement": result.get("rejudgement")}, indent=1))
+        return 0 if result["status"] == "passed" else 1
+    if not args.case:
+        parser.error("--case is required")
     # A terminated run still removes its containers, engines and work directory.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     options = {}
