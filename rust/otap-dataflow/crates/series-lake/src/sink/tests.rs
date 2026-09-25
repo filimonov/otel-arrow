@@ -1475,6 +1475,101 @@ async fn an_indeterminate_probe_does_not_abort_the_upload() {
     assert!(abort_error.contains("HEAD"), "{abort_error}");
 }
 
+/// Store hooks whose multipart uploads land every full part and park the
+/// short final part, which only the writer's finish sends.
+#[derive(Debug)]
+struct ParkFinalPart {
+    entered: Arc<Notify>,
+    aborted: Arc<AtomicBool>,
+    part_bytes: usize,
+}
+
+/// The upload handed back by [`ParkFinalPart`].
+#[derive(Debug)]
+struct ParkFinalPartUpload {
+    inner: Box<dyn MultipartUpload>,
+    entered: Arc<Notify>,
+    aborted: Arc<AtomicBool>,
+    part_bytes: usize,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for ParkFinalPartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        if data.content_length() < self.part_bytes {
+            self.entered.notify_one();
+            return Box::pin(std::future::pending());
+        }
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.aborted.store(true, Ordering::SeqCst);
+        self.inner.abort().await
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for ParkFinalPart {
+    fn wrap_upload(
+        &self,
+        _location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        Box::new(ParkFinalPartUpload {
+            inner,
+            entered: self.entered.clone(),
+            aborted: self.aborted.clone(),
+            part_bytes: self.part_bytes,
+        })
+    }
+}
+
+/// Scenario: the write is cancelled while the writer's finish waits for the
+/// final part of the values upload.
+/// Guarantees: the upload the cancelled finish let go of is aborted, the
+/// write reports a cancellation with no abort failure, and no values object
+/// completes.
+#[tokio::test]
+async fn a_cancellation_while_finishing_aborts_the_upload() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let entered = Arc::new(Notify::new());
+    let aborted = Arc::new(AtomicBool::new(false));
+    let cfg = upload_config();
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        ParkFinalPart {
+            entered: entered.clone(),
+            aborted: aborted.clone(),
+            part_bytes: cfg.upload.part_bytes,
+        },
+    ));
+    let b = sealed_upload_block(&cfg);
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
+    let token = CancellationToken::new();
+    let canceller = {
+        let token = token.clone();
+        async move {
+            entered.notified().await;
+            token.cancel();
+        }
+    };
+    let (got, ()) = tokio::join!(sink.write_block(&b, &token), canceller);
+    let Err(Error::Transient(TransientError::Cancelled { abort_error })) = got else {
+        panic!("expected a cancellation, got {got:?}");
+    };
+    assert_eq!(abort_error, None);
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "the upload a cancelled finish lets go of must be aborted"
+    );
+    assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+}
+
 /// A sealed block of `n` log rows whose one series is already committed
 /// in the block's partition, so the block's only table is its values.
 fn values_only_block(cfg: &LakeConfig, n: usize) -> Block {

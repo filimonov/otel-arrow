@@ -53,7 +53,11 @@ a zero `sum` read as null, traces) are listed in
   times out, and a CreateMultipartUpload that fails without a definite answer
   (the store may hold an upload whose id the writer never received), are
   reported as `TransientError::AbortFailed` naming the object key; the
-  leftovers are reclaimed by a bucket lifecycle rule, not by this crate.
+  leftovers are reclaimed by a bucket lifecycle rule, not by this crate. A
+  creation failure is classified from `object_store::Error`, where a 5xx
+  answer and a lost response are both `Generic`, so both count as possible
+  orphans. The upload id is not reported: `MultipartUpload` does not expose
+  it.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload.

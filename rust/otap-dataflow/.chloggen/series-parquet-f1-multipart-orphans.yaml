@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Counted per attempt, also when a retry then succeeds: a failed or timed-out
-  abort, or a CreateMultipartUpload without a definite answer. The WARN cleanup
-  event names the key. Configure an AbortIncompleteMultipartUpload lifecycle
-  rule and alert on the counter.
+  Counted per attempt, even if a retry succeeds: a failed abort, or a
+  CreateMultipartUpload without a definite answer (a 5xx counts too, so it can
+  over-count). The WARN event names the key, not the upload id. Configure an
+  AbortIncompleteMultipartUpload lifecycle rule and alert on the counter.

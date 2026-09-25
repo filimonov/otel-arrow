@@ -384,7 +384,7 @@ collections is a counter.
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
-| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. |
+| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It can over-count: a CreateMultipartUpload answered with a 5xx is reported like one without an answer. |
 | `flush.late_commits` | `{flush}` | Flushes whose files the store committed without confirming it: acknowledged after a lost completion response whose abort was answered `NotFound`, or failed flushes whose every object exists after all, whose nacked rows may be stored twice. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
@@ -437,7 +437,7 @@ the window interval means the destination is the limit.
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
 | `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
-| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion committed the object and the block was acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion committed the object and the block was acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error` naming the object key; the upload id is not logged, as the object store client does not expose it), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
 | `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
 | `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |
@@ -519,8 +519,13 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   a creation can fail without an answer that tells whether the upload exists,
   and a completion still in flight may be applied after the abort;
   `flush.abort_failures` counts the uploads the writer knows it may have left
-  behind and is the alert signal. On a versioned bucket, each retry that
-  reached the store leaves a noncurrent version.
+  behind and is the alert signal. It counts conservatively: a
+  CreateMultipartUpload that failed with a 5xx answer is counted like one
+  that got no answer, since the client reports both as the same error. The
+  WARN event names the object key but not the upload id, which the object
+  store client does not expose; list the uploads of that key to find it. On a
+  versioned bucket, each retry that reached the store leaves a noncurrent
+  version.
 - Writer limits (merge keys held during a merge, the average-based merge chunk,
   row-group upload bursts) are in the
   [series-lake README](../../../../series-lake/README.md#limitations-in-version-1),

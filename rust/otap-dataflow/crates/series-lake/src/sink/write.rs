@@ -527,7 +527,8 @@ impl StoreHooks for Creations {
 
     fn multipart_failed(&self, _location: &Path, error: &object_store::Error) {
         // Every other variant is a definite answer from the store or a local
-        // refusal, neither of which leaves an upload behind.
+        // refusal, neither of which leaves an upload behind. `Generic` also
+        // carries a definite 5xx, so this can over-count.
         if matches!(
             error,
             object_store::Error::Generic { .. } | object_store::Error::JoinError { .. }
