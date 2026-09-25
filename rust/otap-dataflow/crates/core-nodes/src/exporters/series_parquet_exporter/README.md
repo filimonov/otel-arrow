@@ -355,8 +355,10 @@ its tuning and the end-to-end suite that runs it are described in the
 
 With `processor:durable_buffer` between the receiver and this exporter, the
 producer is acknowledged once its request is in the buffer's local WAL, and
-this exporter's acknowledgement goes to the buffer: an OK means "durable on
-this host's WAL", not "readable in the lake". The producer notices a slow
+this exporter's acknowledgement goes to the buffer: an OK means "written to
+this host's WAL", not "readable in the lake" (see "Durability of the
+acknowledgement" under [Deploying with Alloy](#deploying-with-alloy) for what
+it survives). The producer notices a slow
 object store only when the WAL reaches its size cap; then, with
 `size_cap_policy: backpressure`, new requests get a retryable refusal.
 
@@ -398,8 +400,9 @@ log files -> Alloy (file tail, batch 4000, file-backed queue)
           -> OTLP gRPC -> receiver -> durable_buffer (WAL) -> series_parquet -> S3
 ```
 
-An OK to Alloy means the batch is in the WAL, in tens of milliseconds; the
-buffer then retries every failed block until the store takes it. The strict
+An OK to Alloy means the batch is written to the WAL, in tens of
+milliseconds; the buffer then retries every failed block until the store
+takes it. The strict
 alternative, `series-parquet-s3.yaml` with `series-parquet-strict.alloy`,
 answers only once the block is in the bucket (see "Attempt timeouts"). Each
 setting of both files carries its reason in a comment.
@@ -450,6 +453,26 @@ the wire, so 100-byte lines are about 400 bytes of OTLP each.
   limit, whatever the line length, and a `loki.process` stage cuts lines above
   512KiB (suffix included), below the exporter's 1MiB `ingress.max_row_bytes`.
   Both are in the shipped file; the truncation changes data and is counted.
+
+### Durability of the acknowledgement
+
+The buffer acknowledges a request once it is written to the WAL, before the
+write is synced. The WAL syncs on a write at least 25 ms after its previous
+sync, and the buffer's 100 ms tick finalizes and syncs the open segment. So
+an acknowledged request survives a process crash (SIGKILL, OOM kill, panic):
+it is in the page cache, and the restarted engine replays it, which the
+SIGKILL cases below measure. A host crash or power loss can lose what was
+acknowledged since the last sync, about the last 100 ms of requests; the
+SIGKILL tests say nothing about that case. The WAL can sync every write
+(quiver's `flush_interval` of zero), but `durable_buffer` does not expose that
+setting and its cost is not measured. Where power loss must not lose
+acknowledged data, use the strict deployment, whose OK means the rows are in
+the bucket.
+
+Alloy's file-backed queue has the same boundary: with `otelcol.storage.file`'s
+default `fsync = false` a queued batch survives an Alloy crash but not a host
+crash; `fsync = true` syncs every queue write, a disk sync per batch. Its file
+positions are saved every 10 s and on a graceful stop.
 
 ### The WAL device
 

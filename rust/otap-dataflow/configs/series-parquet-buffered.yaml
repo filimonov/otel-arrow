@@ -5,9 +5,12 @@
 #
 #   otlp receiver --> durable_buffer (WAL) --> series_parquet exporter --> S3
 #
-# An OK OTLP response means the request is in the buffer's write-ahead log on
-# this host, not yet in the bucket; the exporter's acknowledgement goes to the
-# buffer, which retries a failed block until the store takes it. The matching
+# An OK OTLP response means the request is written to the buffer's write-ahead
+# log on this host, not yet in the bucket; the exporter's acknowledgement goes
+# to the buffer, which retries a failed block until the store takes it. The
+# WAL is synced at most every 25ms and on each 100ms tick, so an acknowledged
+# request survives a process crash (SIGKILL, OOM) but a host crash or power
+# loss can lose the last ~100ms of acknowledged requests. The matching
 # producer is `series-parquet.alloy`. `series-parquet-s3.yaml` is the strict
 # alternative, whose OK means the rows are in the bucket.
 #
@@ -51,7 +54,7 @@ groups:
                 grpc:
                   # Bind the address the producers reach.
                   listening_addr: "127.0.0.1:4317"
-                  # The response waits for the WAL write, so OK means durable here.
+                  # The response waits for the WAL write (process-crash safe; see the header for power loss).
                   wait_for_result: true
                   # Above Alloy's 10s attempt timeout, so the producer's deadline ends an attempt first.
                   timeout: 15s
@@ -62,7 +65,7 @@ groups:
           buffer:
             type: processor:durable_buffer
             config:
-              # Its own fast device: the WAL writes about twice the ingest bytes and syncs every 25ms.
+              # Its own fast device: it writes about twice the ingest bytes (WAL entry plus segment).
               path: /var/lib/otap/series-wal
               # Disk for rate x outage tolerance x 2 (README, "Deploying with Alloy"); divided between cores.
               retention_size_cap: 32GiB
