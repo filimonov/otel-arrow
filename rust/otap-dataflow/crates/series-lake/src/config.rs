@@ -469,6 +469,11 @@ impl Default for LakeConfig {
 /// request exhaust the stack. 256 is the parser's own default.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
+/// Longest accepted `window_interval`: one day, far inside what window
+/// boundary arithmetic in `i64` seconds and a monotonic deadline one interval
+/// ahead can represent.
+pub const MAX_WINDOW_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Largest accepted `upload.part_bytes`: the S3 multipart maximum part size.
 pub const MAX_PART_BYTES: usize = 5 << 30;
 
@@ -605,14 +610,15 @@ impl LakeConfig {
         if self.writer_id.is_empty() {
             return Err(Error::invalid("writer_id must not be empty"));
         }
+        // A `-` stays unambiguous in file names: the stamp before the
+        // writer id and the boot id and sequence after it contain none.
         if !self
             .writer_id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
         {
             return Err(Error::invalid(format!(
-                "writer_id {:?} must use only [A-Za-z0-9_.]: it sits between '-' separators \
-                 in every file name",
+                "writer_id {:?} must use only [A-Za-z0-9_.-]: it is part of every file name",
                 self.writer_id
             )));
         }
@@ -659,10 +665,14 @@ impl LakeConfig {
         self.check_request_bound("ingress.max_block_bytes")?;
         // The window boundary arithmetic and the `window_secs` file metadata
         // both work in whole seconds.
-        if self.window_interval.subsec_nanos() != 0 || self.window_interval.as_secs() == 0 {
-            return Err(Error::invalid(
-                "window_interval must be a whole number of seconds and at least 1s",
-            ));
+        if self.window_interval.subsec_nanos() != 0
+            || self.window_interval.as_secs() == 0
+            || self.window_interval > MAX_WINDOW_INTERVAL
+        {
+            return Err(Error::invalid(format!(
+                "window_interval must be a whole number of seconds, at least 1s and at most \
+                 {MAX_WINDOW_INTERVAL:?}"
+            )));
         }
         // Every rule below names the key a user writes: the signal section,
         // the list, the entry's position and the field.
@@ -1098,24 +1108,42 @@ mod tests {
         assert!(err.to_string().contains("writer_id"));
     }
 
-    /// Scenario: `writer_id` with a hyphen, a space, a non-ASCII letter or a slash, then an allowed
-    /// one.
-    /// Guarantees: everything outside `[A-Za-z0-9_.]` is refused and the allowed class is accepted.
+    /// Scenario: `writer_id` with a space, a non-ASCII letter or a slash, then allowed ones
+    /// including a pod name with hyphens.
+    /// Guarantees: everything outside `[A-Za-z0-9_.-]` is refused and the allowed class, `-`
+    /// included, is accepted.
     #[test]
     fn writer_id_outside_its_character_class_is_rejected() {
-        for bad in ["local-1", "a b", "w\u{e9}", "team/writer"] {
+        for bad in ["a b", "w\u{e9}", "team/writer"] {
             let cfg = LakeConfig {
                 writer_id: bad.into(),
                 ..LakeConfig::default()
             };
             let err = cfg.validate().expect_err(bad);
-            assert!(err.to_string().contains("[A-Za-z0-9_.]"), "{bad}: {err}");
+            assert!(err.to_string().contains("[A-Za-z0-9_.-]"), "{bad}: {err}");
         }
-        let cfg = LakeConfig {
-            writer_id: "Local_1.eu".into(),
+        for good in ["Local_1.eu", "otel-lake-7d9f-0"] {
+            let cfg = LakeConfig {
+                writer_id: good.into(),
+                ..LakeConfig::default()
+            };
+            cfg.validate().expect(good);
+        }
+    }
+
+    /// Scenario: `window_interval` at the cap and one second above it.
+    /// Guarantees: the cap is accepted and anything longer refused before a
+    /// window clock or monotonic deadline can overflow.
+    #[test]
+    fn window_interval_is_capped() {
+        let mut cfg = LakeConfig {
+            window_interval: MAX_WINDOW_INTERVAL,
             ..LakeConfig::default()
         };
-        cfg.validate().expect("the allowed class");
+        cfg.validate().expect("at the cap");
+        cfg.window_interval = MAX_WINDOW_INTERVAL + Duration::from_secs(1);
+        let err = cfg.validate().expect_err("above the cap");
+        assert!(err.to_string().contains("window_interval"), "{err}");
     }
 
     /// Scenario: `max_nesting_depth` just above and exactly at 256.

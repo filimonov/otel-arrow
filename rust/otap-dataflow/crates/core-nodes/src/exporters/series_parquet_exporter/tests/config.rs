@@ -158,6 +158,18 @@ fn the_shipped_example_configuration_is_valid() {
     assert_eq!(cfg.lake.writer_id, "local_1");
 }
 
+/// Scenario: a `writer_id` that is a Kubernetes pod name with hyphens.
+/// Guarantees: the configuration starts with the id kept as written.
+#[test]
+fn a_hyphenated_writer_id_is_accepted() {
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "storage": {"file": {"base_uri": "/tmp/series-test"}},
+        "writer_id": "otel-lake-7d9f-0"
+    }))
+    .expect("a pod name is a valid writer id");
+    assert_eq!(cfg.lake.writer_id, "otel-lake-7d9f-0");
+}
+
 /// Scenario: the receiver and exporter nodes of every shipped series_parquet configuration.
 /// Guarantees: the receiver's `max_decoding_message_size` equals the exporter's
 /// `ingress.max_request_bytes`, so no request the exporter accepts is refused by the receiver.
@@ -429,6 +441,44 @@ fn a_minimal_s3_config_derives_its_retry_budget_from_the_flush_deadline() {
     }
 }
 
+/// Scenario: an S3 configuration whose `retry` section sets only `max_retries`, or only
+/// `init_backoff` under a 20s flush deadline.
+/// Guarantees: it starts; the fields it sets are kept and every other field, `retry_timeout`
+/// included, is the one derived without a section (half the flush deadline).
+#[test]
+fn a_partial_retry_section_keeps_the_derived_budget() {
+    let validate = super::super::SERIES_PARQUET.validate_config;
+    let doc = serde_json::json!({"storage": s3_storage(), "retry": {"max_retries": 3}});
+    validate(&doc).expect("a partial retry section starts");
+    let retry = serde_json::from_value::<Config>(doc)
+        .expect("valid")
+        .retry
+        .expect("retry options");
+    let defaults: otel_arrow_dfe_otap::object_store::RetryOptions =
+        serde_json::from_value(serde_json::json!({})).expect("defaults");
+    assert_eq!(retry.max_retries, 3);
+    assert_eq!(retry.retry_timeout, Duration::from_secs(30));
+    assert_eq!(retry.init_backoff, defaults.init_backoff);
+    let retry = serde_json::from_value::<Config>(serde_json::json!({
+        "storage": s3_storage(),
+        "window": {"flush_retry_deadline": "20s"},
+        "retry": {"init_backoff": "50ms"}
+    }))
+    .expect("valid")
+    .retry
+    .expect("retry options");
+    assert_eq!(retry.init_backoff, Duration::from_millis(50));
+    assert_eq!(retry.retry_timeout, Duration::from_secs(10));
+    assert_eq!(retry.max_retries, defaults.max_retries);
+    let err = validate(&serde_json::json!({
+        "storage": s3_storage(),
+        "retry": {"max_retires": 3}
+    }))
+    .expect_err("a misspelled retry field")
+    .to_string();
+    assert!(err.contains("max_retires"), "{err}");
+}
+
 /// Scenario: `upload.abort_timeout` of 999 ms and of exactly 1 s.
 /// Guarantees: below 1 s startup is refused naming key, value and floor; 1 s is accepted.
 #[test]
@@ -468,6 +518,11 @@ fn startup_rejects_invalid_configuration() {
             "window",
             serde_json::json!({"interval": "500ms"}),
             "window.interval must be positive whole seconds",
+        ),
+        (
+            "window",
+            serde_json::json!({"interval": "100000000000s"}),
+            "window.interval must be positive whole seconds, at most 86400s",
         ),
         (
             "window",
@@ -548,8 +603,8 @@ fn startup_rejects_invalid_configuration() {
         ),
         (
             "writer_id",
-            serde_json::json!("local-1"),
-            "writer_id \"local-1\" must use only [A-Za-z0-9_.]",
+            serde_json::json!("local 1"),
+            "writer_id \"local 1\" must use only [A-Za-z0-9_.-]",
         ),
         (
             "series_cache",

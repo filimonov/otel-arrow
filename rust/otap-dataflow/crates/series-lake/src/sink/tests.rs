@@ -587,6 +587,39 @@ fn object_path_layout() {
     );
 }
 
+/// Scenario: a hyphenated `writer_id` such as a pod name in a file name.
+/// Guarantees: the name still splits into stamp, writer id, boot id and
+/// sequence, since the stamp, the boot id and the sequence hold no `-`.
+#[test]
+fn object_path_keeps_a_hyphenated_writer_id_recoverable() {
+    let boot = FileNaming::new("x").boot_id;
+    assert!(!boot.contains('-'), "{boot}");
+    let p = object_path(
+        Dataset::LogsValues,
+        PartitionId::from_unix_secs(WINDOW_START),
+        WINDOW_START,
+        &naming("otel-lake-7d9f-0", &boot),
+        42,
+    );
+    let name = p.filename().expect("file name");
+    let stem = name
+        .strip_prefix("part-")
+        .and_then(|n| n.strip_suffix(".parquet"))
+        .expect("part-*.parquet");
+    let (stamp, rest) = stem.split_once('-').expect("stamp");
+    let (rest, seq) = rest.rsplit_once('-').expect("seq");
+    let (writer, boot_id) = rest.rsplit_once('-').expect("boot id");
+    assert_eq!(
+        (stamp, writer, boot_id, seq),
+        (
+            "20260921T031500Z",
+            "otel-lake-7d9f-0",
+            boot.as_str(),
+            "00000042"
+        )
+    );
+}
+
 /// Scenario: a `writer_id` with `/` reaches `object_path` without validation.
 /// Guarantees: the `/` is encoded into one file-name segment that decodes back.
 #[test]

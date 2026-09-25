@@ -279,7 +279,8 @@ Rules enforced at startup:
 
 - Counts, byte and depth budgets, cache capacity, upload concurrency,
   `notify_batch` and the retry durations are positive; `upload.abort_timeout`
-  is at least 1s; `ingress.max_nesting_depth` is at most 256.
+  is at least 1s; `ingress.max_nesting_depth` is at most 256;
+  `window.interval` is whole seconds and at most one day.
 - `ingress.max_row_bytes` is at most a quarter of `sorting.run_target_bytes`,
   and one request's worst case fits `window.max_block_bytes` (see
   [Block admission](#block-admission)).
@@ -287,11 +288,12 @@ Rules enforced at startup:
   (`series_parquet.upload.parts_exceed_limit`) when a file of
   `window.max_block_bytes` would need more than S3's 10,000 parts.
 - For cloud storage, an explicit `retry.retry_timeout` is strictly less than
-  `window.flush_retry_deadline`. Without a `retry` section the store uses
-  object_store's defaults with `retry_timeout` half of
-  `window.flush_retry_deadline`. Local file storage applies no store retry.
-- `writer_id` uses only letters, digits, `_` and `.`, since it sits between
-  the `-` separators of file names; it is never part of the series identity.
+  `window.flush_retry_deadline`. Every field the `retry` section leaves unset,
+  or the whole section when it is absent, takes object_store's default, except
+  `retry_timeout`, which is half of `window.flush_retry_deadline`. Local file
+  storage applies no store retry.
+- `writer_id` uses only letters, digits, `_`, `.` and `-`, so a pod or host
+  name fits; it is never part of the series identity.
 - `metrics.series_attributes` and `logs.exemplars` are refused, and so is a
   denormalized column named `v`, `signal`, `dataset`, `date` or `hour`.
 

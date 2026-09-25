@@ -104,26 +104,10 @@ const fn default_backoff_base() -> f64 {
 }
 
 const fn default_retry_timeout() -> Duration {
-    DEFAULT_RETRY_TIMEOUT
+    Duration::from_secs(3 * 60)
 }
 
-/// The `retry_timeout` a cloud store applies when no `retry` section is
-/// configured, matching `object_store::RetryConfig::default()`.
-pub const DEFAULT_RETRY_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-
 impl RetryOptions {
-    /// The per-request retry budget a store built from `retry` will apply:
-    /// the configured `retry_timeout`, or [`DEFAULT_RETRY_TIMEOUT`] when no
-    /// retry section is given.
-    ///
-    /// A caller that bounds a whole operation by its own deadline validates
-    /// against this, because the default applies just as much as an explicit
-    /// value does.
-    #[must_use]
-    pub fn effective_retry_timeout(retry: Option<&Self>) -> Duration {
-        retry.map_or(DEFAULT_RETRY_TIMEOUT, |retry| retry.retry_timeout)
-    }
-
     /// Validate the options against object_store retry/backoff constraints.
     pub fn validate(&self) -> Result<(), object_store::Error> {
         if !self.backoff_base.is_finite() || self.backoff_base <= 1.0 {
@@ -657,26 +641,6 @@ mod test {
         assert_eq!(retry.max_backoff, Duration::from_secs(30));
         assert_eq!(retry.backoff_base, 2.0);
         assert_eq!(retry.retry_timeout, Duration::from_secs(120));
-    }
-
-    /// Scenario: the effective per-request retry budget is read with and
-    /// without a configured retry section.
-    /// Guarantees: an absent section reports the store default of three
-    /// minutes, which is also what deserialization fills in, and a configured
-    /// section reports its own value, so a caller validating a deadline
-    /// against it sees the budget the store will really apply.
-    #[test]
-    fn effective_retry_timeout_reports_the_default_when_unset() {
-        assert_eq!(
-            RetryOptions::effective_retry_timeout(None),
-            DEFAULT_RETRY_TIMEOUT
-        );
-        assert_eq!(DEFAULT_RETRY_TIMEOUT, Duration::from_secs(180));
-        let retry: RetryOptions = serde_json::from_value(json!({"retry_timeout": "30s"})).unwrap();
-        assert_eq!(
-            RetryOptions::effective_retry_timeout(Some(&retry)),
-            Duration::from_secs(30)
-        );
     }
 
     #[test]

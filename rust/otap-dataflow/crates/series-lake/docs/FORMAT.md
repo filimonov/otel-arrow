@@ -538,7 +538,10 @@ both recipes and how to detect incompatible mixes.
 - `date` and `hour` (two digits, zero-padded) come from the block's
   `window_start` (ingest time), never from event timestamps.
 - `writer_id` from config, validated to be non-empty and made of
-  `[A-Za-z0-9_.]` only, so it never contains the `-` separator or a `/`;
+  `[A-Za-z0-9_.-]` only, so it never contains a `/`. It may contain `-`:
+  the stamp, `boot_id` and `seq` contain none, so a reader takes the stamp
+  after `part-`, `seq` and `boot_id` from the right, and the rest is
+  `writer_id`;
   `boot_id` is a UUIDv4 generated at exporter start; `seq` is a per-worker
   monotonic counter, zero-padded to a minimum of 8 digits (not truncated if
   `seq` itself ever needs more). Names are frozen when the

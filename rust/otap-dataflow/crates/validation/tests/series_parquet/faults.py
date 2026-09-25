@@ -4104,7 +4104,7 @@ PERMANENT_NACK_CLASSES = ("request_too_large", "extracted_too_large", "row_too_l
 PROCESS_CHECKS = ("new_boot_id", "restart_same_cores_and_buffer", "prior_acks_durable",
                   "replay_only_eligible", "no_permanent_rejection", "retry_bytes_identical")
 BOOT_EVENT = re.compile(r"series_parquet\.start\b.*?\bboot_id=([0-9a-f]+)")
-FILE_BOOT = re.compile(r"/part-\d{8}T\d{6}Z-[A-Za-z0-9_.]+-([0-9a-f]+)-\d+\.parquet$")
+FILE_BOOT = re.compile(r"/part-\d{8}T\d{6}Z-[A-Za-z0-9_.-]+-([0-9a-f]+)-\d+\.parquet$")
 
 
 def _activate_upload_throttle(rig, parameters):

@@ -12,8 +12,8 @@
 use otel_arrow_dfe_config::byte_units::deserialize_required_usize;
 use otel_arrow_dfe_otap::object_store::{RetryOptions, StorageType};
 use otel_arrow_dfe_series_lake::config::{
-    IngressLimits, LakeConfig, ParquetConfig, SignalConfig, SortingConfig, UnsupportedPolicy,
-    UploadConfig,
+    IngressLimits, LakeConfig, MAX_WINDOW_INTERVAL, ParquetConfig, SignalConfig, SortingConfig,
+    UnsupportedPolicy, UploadConfig,
 };
 use serde::{Deserialize, Deserializer};
 use std::time::Duration;
@@ -143,8 +143,9 @@ section!(metrics_section, SignalConfig, "metrics");
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     storage: StorageType,
+    /// Kept as written; a cloud store merges it over [`derived_retry`].
     #[serde(default)]
-    retry: Option<RetryOptions>,
+    retry: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default = "writer")]
     writer_id: String,
     #[serde(default = "producer")]
@@ -196,8 +197,8 @@ const MIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 /// `retry.retry_timeout`. If that is not strictly shorter than
 /// `window.flush_retry_deadline`, a single attempt against a destination that
 /// keeps failing is still retrying inside the store when the block's deadline
-/// expires, and the flush ends with no underlying error to report. Without a
-/// `retry` section the budget is derived instead (see [`derived_retry`]).
+/// expires, and the flush ends with no underlying error to report. A budget
+/// the `retry` section leaves unset is derived instead (see [`derived_retry`]).
 /// Local file storage applies no store retry, so `retried` is false for it and
 /// nothing is checked.
 pub(super) fn check_retry_deadline(
@@ -220,16 +221,32 @@ pub(super) fn check_retry_deadline(
     ))
 }
 
-/// The store retry options of a cloud store configured without a `retry`
-/// section: object_store's defaults, with `retry_timeout` half of
-/// `window.flush_retry_deadline`, which leaves the block time for a retry of
-/// its own after the store gives up on one attempt.
-fn derived_retry(flush_retry_deadline: Duration) -> Result<RetryOptions, String> {
-    let mut retry: RetryOptions =
-        serde_json::from_value(serde_json::Value::Object(serde_json::Map::new()))
-            .map_err(|e| format!("retry: {e}"))?;
+/// The store retry options of a cloud store: object_store's defaults with
+/// `retry_timeout` half of `window.flush_retry_deadline`, which leaves the
+/// block time for a retry of its own after the store gives up on one
+/// attempt, and every field `section` sets written over them.
+fn derived_retry(
+    flush_retry_deadline: Duration,
+    section: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<RetryOptions, String> {
+    let mut retry = written_retry(serde_json::Map::new())?;
     retry.retry_timeout = flush_retry_deadline / 2;
-    Ok(retry)
+    let Some(section) = section else {
+        return Ok(retry);
+    };
+    let Ok(serde_json::Value::Object(mut merged)) = serde_json::to_value(&retry) else {
+        return Err("retry: the derived options do not serialize to a map".into());
+    };
+    merged.extend(section);
+    written_retry(merged)
+}
+
+/// A `retry` section read as written, with object_store's default for every
+/// field it leaves unset.
+fn written_retry(
+    section: serde_json::Map<String, serde_json::Value>,
+) -> Result<RetryOptions, String> {
+    serde_json::from_value(serde_json::Value::Object(section)).map_err(|e| format!("retry: {e}"))
 }
 
 /// Validated exporter configuration. Storage and scheduling stay outside
@@ -252,11 +269,10 @@ impl TryFrom<RawConfig> for Config {
 
     fn try_from(raw: RawConfig) -> Result<Self, String> {
         let interval = raw.window.interval;
-        if interval.is_zero()
-            || interval.subsec_nanos() != 0
-            || interval.as_secs() > i64::MAX as u64
-        {
-            return Err("window.interval must be positive whole seconds fitting i64".into());
+        if interval.is_zero() || interval.subsec_nanos() != 0 || interval > MAX_WINDOW_INTERVAL {
+            return Err(format!(
+                "window.interval must be positive whole seconds, at most {MAX_WINDOW_INTERVAL:?}"
+            ));
         }
         if raw.window.flush_retry_deadline.is_zero() {
             return Err("window.flush_retry_deadline must be positive".into());
@@ -347,11 +363,13 @@ impl TryFrom<RawConfig> for Config {
         lake.check_request_bound("window.max_block_bytes")
             .map_err(rule)?;
         lake.validate().map_err(rule)?;
-        let retried = !matches!(raw.storage, StorageType::File { .. });
-        check_retry_deadline(retried, raw.retry.as_ref(), raw.window.flush_retry_deadline)?;
-        let retry = match raw.retry {
-            None if retried => Some(derived_retry(raw.window.flush_retry_deadline)?),
-            retry => retry,
+        let retry = if matches!(raw.storage, StorageType::File { .. }) {
+            // Validated, then ignored: local file storage applies no store retry.
+            raw.retry.map(written_retry).transpose()?
+        } else {
+            let retry = derived_retry(raw.window.flush_retry_deadline, raw.retry)?;
+            check_retry_deadline(true, Some(&retry), raw.window.flush_retry_deadline)?;
+            Some(retry)
         };
         Ok(Self {
             storage: raw.storage,
