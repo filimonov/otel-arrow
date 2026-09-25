@@ -106,3 +106,39 @@ What the OTAP and OTLP models carry and series_parquet does not keep. The export
 - Typing the format flattens: attribute value types in `attrs`, `resource_attrs`, `scope_attrs` (all rendered to Map<string,string>: 42 and "42" collide, bytes become base64, nested values JSON text; types survive only in identity bytes, series_id and typed denormalize columns); non-string log bodies rendered as JSON text (the `body_bytes` column is already deferred to the next format version); histogram sum/min/max that are zero in every point of a request arrive as absent OTAP columns and are stored as null (a transport limit the format could compensate for with a presence flag); zero or out-of-range timestamps stored as null.
 - Layout: number and histogram points share one values dataset, so half the rows of a mixed stream hold null in value_* and the other half in count/sum/min/max, which weakens Parquet statistics; consider per-kind datasets or row groups with the compactor.
 - To check before deciding: span-like `flags` handling and out-of-range severity numbers in logs (the standard OTAP log columns are all present).
+
+## Plan-3 findings triaged to the backlog (user, 2026-09-25)
+
+Scope rule: plan 3 fixes the exporter and correctness defects of the shipped
+topology; throughput and limits of other components wait here.
+
+- durable_buffer WAL throughput (Task 5): the buffered topology is bound by the
+  WAL device (about 2x the wire bytes written, sync_data every 25 ms, segment
+  finalization synchronous on the worker runtime); 144k/s local and 152k/s
+  MinIO with 4 workers on one NVMe. Move finalization off the worker runtime
+  and expose the sync interval and the segment size.
+- Receiver in-flight byte bound (Task 5): the receiver holds every in-flight
+  request, bounded by slots, not bytes (16.2 GB at 4096 slots in strict mode).
+  A receiver-level byte limit (engine, upstream) or an exporter-level retryable
+  refusal, plus a startup log line with the computed bound. The README formula
+  itself is written in plan 3.
+- Engine `pipeline.memory.usage` credits frees only to the allocating thread,
+  so it grows without bound when blocking-pool threads free buffers (Task 5,
+  local store: 9 MB to 10.3 GB at RSS ~550 MB). Upstream issue.
+- Receiver load-shed (tower GlobalConcurrencyLimitLayer, RESOURCE_EXHAUSTED)
+  is not counted, and its message "Too many active requests for the
+  connection" names a connection limit where the limit is per worker.
+  Upstream.
+- The OTLP gRPC receiver answers an oversize message with OUT_OF_RANGE, which
+  clients retry forever; answer with a non-retryable status and count it in
+  `receiver.otlp.requests.rejected`. Upstream PR.
+- Row-group tail pins the previous row-group buffer (~64 MB per large table,
+  Task 3i); back to plan 3 only if the Task 12 heap dumps show it matters.
+- Flaky tests in crates the campaign does not touch: otel-arrow-dfe-telemetry
+  log_tap hang (18 min at 0 CPU), otlp_grpc_exporter test_otlp_exporter and
+  opamp test_client_configured_with_client_tls_from_files AddrInUse.
+- Harness polish: synchronous telemetry/allocator pairing for the ledger
+  (one-sample skew), measurement conditions recorded in every result, heap
+  counters in the stage benches.
+- Worker scaling 0.67 from 1 to 4 workers (0.81 x 0.82) and ~6 cores
+  estimated for 1M records/s: addressed by the shared writer (priority 1).

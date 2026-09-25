@@ -1643,6 +1643,31 @@ Options B (separate `target_block_bytes` for rotation vs `max_block_bytes` as me
 - [ ] An E2E case sends one Alloy batch above 4 MiB and asserts it is stored, so the suite covers large batches, not only 12 lines.
 - [ ] Engine finding for an upstream PR (not the exporter): the OTLP gRPC receiver answers an oversize message with OUT_OF_RANGE (tonic), which OTLP clients retry forever although a retry can never succeed; answer with a non-retryable status and count the refusal in `receiver.otlp.requests.rejected`. Record the evidence and the proposed change; implement it here only if it stays inside the receiver and has its own test.
 
+**Amendment (user triage 2026-09-25): what Task 12 fixes, what goes to the plan-4 backlog, what is only documented.** The shipped default becomes the buffered topology because producers need fast acknowledgements: Alloy will neither wait for a 15 s window nor hold data itself. Defects on the buffered path that break correctness are therefore fixed here; throughput work on components other than the exporter is not. This amendment overrides the earlier Task 12 amendments where they differ.
+
+Fix in Task 12:
+- [ ] T10-F1: `durable_buffer` handle_shutdown shuts Quiver before queued downstream ACK controls reach handle_ack, so a graceful restart replays acknowledged data (Task 10: 10,200 / 2,600 duplicate records). Fixed here although it is buffer code, because every deploy of the default topology hits it.
+- [ ] F1: a failed phase 2 of a multipart upload (sink write.rs:704-714) issues no abort and increments no counter, so incomplete uploads accumulate unseen (Tasks 9 and 11: http503, reset, TCP ACK loss, held completion). Abort with its own bounded deadline, count the orphan when the abort fails, and recommend an `AbortIncompleteMultipartUpload` lifecycle rule in the README.
+- [ ] Alloy: the first three items of the Alloy amendment above (batch processor, receiver `max_decoding_message_size` equal to `ingress.max_request_bytes` with the startup warning, E2E case above 4 MiB). The upstream OUT_OF_RANGE item moves to the backlog.
+- [ ] Option A size limits, as amended above.
+- [ ] Wide sort key reservation (Task 6): the block reservation must charge the sort key bytes of wide keys so the budget cannot be exceeded.
+- [ ] jemalloc raw heap dumps and offline jeprof, as amended above; they also explain the occasional `rss_reconciliation` excursions of Tasks 7 and 11.
+- [ ] Task 11 findings on the lateness bound and on the late-commit detector, if the Task 11 review confirms them as product defects (not rig or judge errors).
+- [ ] The flaky `OutageSlice.test_storage_outage_recovers_without_losing_acked_data` (Alloy's per-attempt deadline races the server's refusal under load).
+- [ ] Shipped defaults (buffered topology, receiver slots, window) proposed with options for the user after Task 13.
+- [ ] Receiver in-flight memory: only the first item of that amendment (README states the whole-process bound workers x (exporter budget + receiver slots x maximum request size) with the measured figures). The startup log line and the byte bound move to the backlog.
+
+Moved to the plan-4 backlog (recorded in docs/superpowers/plans/2026-09-23-plan-4-backlog.md): durable_buffer WAL throughput (segment finalization off the worker runtime, exposed sync interval and segment size); receiver in-flight byte bound and its startup log line; engine `pipeline.memory.usage` crediting frees only to the allocating thread; receiver load-shed not counted and its misleading message; the receiver's retryable OUT_OF_RANGE for an oversize message; row-group tail pinning the previous row-group buffer (promoted back here only if the heap dumps show it matters); flaky tests in crates the campaign does not touch (log_tap hang, otlp_grpc_exporter and opamp AddrInUse); harness polish (synchronous telemetry/allocator pairing, recorded measurement conditions, bench heap counters); worker scaling 0.67 and the ~6 cores estimated for 1M records/s (shared writer).
+
+Documented only (README/FORMAT limitations section, and Task 14):
+- T10-F2: after SIGKILL the WAL replays entries acknowledged by the exporter but whose progress was not yet persisted; duplicates within that window are part of at-least-once. Task 13 measures the bound and the documentation states it as a number.
+- Strict mode is bounded by the window: ceiling per worker = slots x records per request / hold time (128k/s at a 1 s window, 8.5k/s at 15 s); fast acknowledgements need the buffered topology.
+- The WAL writes about 2x the wire bytes and syncs every 25 ms; put it on its own fast device. State the measured buffered ceiling (144k/s local, 152k/s MinIO with 4 workers on one NVMe).
+- `LocalFileSystem` never fsyncs (already in the README).
+- Merge chunks may exceed `merge_chunk_bytes` by about 1 percent.
+- The ~60 s write stall after a store restart (Task 9): documented as a rig property if Task 11 attributes it to the rig; if it is the engine's connect timeout it becomes a Task 12 fix.
+
+
 ### Task 13: Full durable-buffer acknowledgement, restart and replay proof
 
 **Expected wall-clock cost:** 55-80 minutes for both stores, both topologies' latency cohorts and window comparisons; under one second for latency/backoff analysis tests.
