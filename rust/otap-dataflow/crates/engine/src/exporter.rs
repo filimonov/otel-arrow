@@ -25,7 +25,7 @@ use crate::node::{Node, NodeId, NodeWithPDataReceiver};
 use crate::runtime_services::PipelineRuntimeServices;
 use crate::shared::exporter as shared;
 use crate::shared::message::{SharedReceiver, SharedSender};
-use crate::terminal_state::{TerminalMetricsDeadline, TerminalState};
+use crate::terminal_state::TerminalState;
 use otel_arrow_dfe_channel::error::SendError;
 use otel_arrow_dfe_channel::mpsc;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -299,7 +299,6 @@ impl<PData> ExporterWrapper<PData> {
             metrics_reporter,
             node_interests,
             None,
-            TerminalMetricsDeadline::default(),
             runtime_services,
         )
         .await
@@ -312,7 +311,6 @@ impl<PData> ExporterWrapper<PData> {
         metrics_reporter: MetricsReporter,
         node_interests: Interests,
         completion_emission_metrics: Option<CompletionEmissionMetricsHandle>,
-        terminal_metrics_deadline: TerminalMetricsDeadline,
         runtime_services: PipelineRuntimeServices,
     ) -> Result<TerminalState, Error> {
         match (self, metrics_reporter) {
@@ -355,7 +353,7 @@ impl<PData> ExporterWrapper<PData> {
                     node_id.index,
                     node_interests,
                 );
-                inbox.follow_pipeline_deadline(terminal_metrics_deadline);
+                inbox.follow_pipeline_deadline(runtime_services.shutdown_deadline().clone());
                 exporter.start(inbox, effect_handler).await
             }
             (
@@ -369,6 +367,7 @@ impl<PData> ExporterWrapper<PData> {
                 },
                 metrics_reporter,
             ) => {
+                let shutdown_deadline = runtime_services.shutdown_deadline().clone();
                 let mut effect_handler =
                     shared::EffectHandler::new(node_id.clone(), metrics_reporter, runtime_services);
                 let pdata_rx = pdata_receiver.ok_or_else(|| Error::ExporterError {
@@ -394,7 +393,7 @@ impl<PData> ExporterWrapper<PData> {
                     node_id.index,
                     node_interests,
                 );
-                inbox.follow_pipeline_deadline(terminal_metrics_deadline);
+                inbox.follow_pipeline_deadline(shutdown_deadline);
                 exporter.start(inbox, effect_handler).await
             }
         }

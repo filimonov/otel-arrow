@@ -7,8 +7,8 @@ use crate::clock;
 use crate::control::{AckMsg, NackMsg, NodeControlMsg};
 use crate::local::message::{LocalReceiver, LocalSender};
 use crate::node_local_scheduler::NodeLocalSchedulerHandle;
+use crate::runtime_services::PipelineShutdownDeadline;
 use crate::shared::message::{SharedReceiver, SharedSender};
-use crate::terminal_state::TerminalMetricsDeadline;
 use crate::{Interests, ReceivedAtNode};
 use otel_arrow_dfe_channel::error::{RecvError, SendError};
 use otel_arrow_dfe_channel::mpsc;
@@ -292,7 +292,7 @@ struct InboxCore<PData, ControlRx, PDataRx> {
     /// The pipeline's shutdown deadline, once its runtime-control manager
     /// has accepted a shutdown; bounds a Shutdown synthesized for a closed
     /// pdata channel.
-    pipeline_deadline: Option<TerminalMetricsDeadline>,
+    pipeline_deadline: Option<PipelineShutdownDeadline>,
     /// Node ID for entry-frame stamping via `ReceivedAtNode`.
     node_id: usize,
     /// Node interests for entry-frame stamping via `ReceivedAtNode`.
@@ -407,7 +407,7 @@ where
             let deadline = self
                 .pipeline_deadline
                 .as_ref()
-                .and_then(TerminalMetricsDeadline::recorded)
+                .and_then(PipelineShutdownDeadline::get)
                 .filter(|deadline| *deadline > now)
                 .unwrap_or_else(|| now.add(Duration::from_secs(1)));
             NodeControlMsg::Shutdown {
@@ -859,8 +859,8 @@ impl<PData> ProcessorInbox<PData> {
     }
 
     /// Bounds a Shutdown synthesized for a closed pdata channel by the
-    /// pipeline's shutdown deadline once one is recorded.
-    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: TerminalMetricsDeadline) {
+    /// pipeline's shutdown deadline once the pipeline shuts down.
+    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: PipelineShutdownDeadline) {
         self.core.pipeline_deadline = Some(deadline);
     }
 
@@ -969,8 +969,8 @@ impl<PData> ExporterInbox<PData> {
 
 impl<PData, ControlRx, PDataRx> ExporterInbox<PData, ControlRx, PDataRx> {
     /// Bounds a Shutdown synthesized for a closed pdata channel by the
-    /// pipeline's shutdown deadline once one is recorded.
-    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: TerminalMetricsDeadline) {
+    /// pipeline's shutdown deadline once the pipeline shuts down.
+    pub(crate) fn follow_pipeline_deadline(&mut self, deadline: PipelineShutdownDeadline) {
         self.core.pipeline_deadline = Some(deadline);
     }
 
@@ -1641,10 +1641,10 @@ mod tests {
                 9,
                 Interests::empty(),
             );
-            let pipeline = TerminalMetricsDeadline::default();
+            let pipeline = PipelineShutdownDeadline::default();
             let deadline = clock::now() + Duration::from_secs(60);
             if recorded {
-                pipeline.record(deadline);
+                pipeline.latch(deadline);
             }
             inbox.follow_pipeline_deadline(pipeline);
             drop(pdata_tx);

@@ -72,10 +72,10 @@ impl<PData> ExporterInbox<PData> {
     }
 
     /// Bounds a Shutdown synthesized for a closed pdata channel by the
-    /// pipeline's shutdown deadline once one is recorded.
+    /// pipeline's shutdown deadline once the pipeline shuts down.
     pub(crate) fn follow_pipeline_deadline(
         &mut self,
-        deadline: crate::terminal_state::TerminalMetricsDeadline,
+        deadline: crate::runtime_services::PipelineShutdownDeadline,
     ) {
         self.inner.follow_pipeline_deadline(deadline);
     }
