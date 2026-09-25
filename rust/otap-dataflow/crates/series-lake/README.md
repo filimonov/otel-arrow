@@ -42,10 +42,13 @@ Format-level limitations (unsupported points, exemplars, lossy attribute maps,
 a zero `sum` read as null, traces) are listed in
 [FORMAT.md](docs/FORMAT.md#limitations-of-version-1). The writer adds these:
 
-- A cancellation that lands after a file's Parquet finalization has begun
-  (for example, exporter shutdown) cannot abort that file's multipart upload,
-  because `BufWriter::abort` is only safe before finalization starts; the
-  leftover parts are reclaimed by a bucket lifecycle rule, not by this crate.
+- A failed or cancelled write aborts its multipart upload within
+  `upload.abort_timeout`, but an upload whose completion was already sent is
+  not aborted, since the store may have committed it. An abort that fails or
+  times out, and a CreateMultipartUpload that fails without a definite answer
+  (the store may hold an upload whose id the writer never received), are
+  reported as `TransientError::AbortFailed` naming the object key; the
+  leftovers are reclaimed by a bucket lifecycle rule, not by this crate.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload.

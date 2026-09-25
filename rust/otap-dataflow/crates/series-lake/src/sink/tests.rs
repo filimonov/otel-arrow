@@ -1102,6 +1102,140 @@ async fn abort_timeout_is_reported() {
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
 }
 
+/// A store whose multipart parts all fail, with more upload slots than the
+/// file has parts, so no failure surfaces before `finish` joins the parts.
+fn parts_failing_at_finish(
+    dir: &tempfile::TempDir,
+    aborted: &Arc<AtomicBool>,
+    abort: AbortBehavior,
+) -> (Arc<dyn ObjectStore>, LakeConfig) {
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(dir),
+        ControlledMultipart {
+            entered: Arc::new(Notify::new()),
+            aborted: aborted.clone(),
+            parts: Arc::new(AtomicUsize::new(0)),
+            part: PartBehavior::Fail,
+            abort,
+        },
+    ));
+    let mut cfg = upload_config();
+    cfg.upload.concurrency = 64;
+    cfg.validate().expect("valid config");
+    (store, cfg)
+}
+
+/// Scenario: every part of the values upload fails, and the failure first
+/// surfaces while the writer is finishing the file.
+/// Guarantees: the multipart upload is aborted and the part's retryable
+/// failure is returned; no values object completes.
+#[tokio::test]
+async fn a_part_failing_while_finishing_aborts_the_upload() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let aborted = Arc::new(AtomicBool::new(false));
+    let (store, cfg) = parts_failing_at_finish(&dir, &aborted, AbortBehavior::Delegate);
+    let b = sealed_upload_block(&cfg);
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
+    let got = sink.write_block(&b, &CancellationToken::new()).await;
+    let error = got.expect_err("a failed part fails the write");
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "the upload a failed finish gives up must be aborted"
+    );
+    assert!(
+        !matches!(error, Error::Transient(TransientError::AbortFailed { .. })),
+        "{error:?}"
+    );
+    assert!(error.is_retryable(), "{error:?}");
+    assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+}
+
+/// Scenario: a part fails while the writer is finishing the file, and the
+/// abort of the upload fails too.
+/// Guarantees: `AbortFailed` names the object key and both failures, so the
+/// possibly orphaned upload is reported.
+#[tokio::test]
+async fn a_failed_abort_while_finishing_is_reported_with_its_key() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let aborted = Arc::new(AtomicBool::new(false));
+    let (store, cfg) = parts_failing_at_finish(&dir, &aborted, AbortBehavior::Fail);
+    let b = sealed_upload_block(&cfg);
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
+    let got = sink.write_block(&b, &CancellationToken::new()).await;
+    let Err(Error::Transient(TransientError::AbortFailed {
+        source,
+        abort_error,
+    })) = got
+    else {
+        panic!("expected AbortFailed, got {got:?}");
+    };
+    assert!(source.is_retryable(), "{source:?}");
+    assert!(abort_error.contains("injected failure"), "{abort_error}");
+    assert!(abort_error.contains("dataset=values"), "{abort_error}");
+    assert!(aborted.load(Ordering::SeqCst));
+}
+
+/// Store hooks whose multipart creation fails with `error`, as the inner
+/// store of the sink's own watch.
+#[derive(Debug)]
+struct FailingCreate {
+    error: fn() -> object_store::Error,
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for FailingCreate {
+    async fn before_multipart(&self, location: &Path) -> object_store::Result<Option<HookGuard>> {
+        if location.as_ref().contains("dataset=values") {
+            return Err((self.error)());
+        }
+        Ok(None)
+    }
+}
+
+/// Scenario: CreateMultipartUpload of the values object fails without a
+/// definite rejection, and then with a definite one (access denied).
+/// Guarantees: only the first is reported as a possibly orphaned upload,
+/// named by its key; both keep the creation's own failure as the cause.
+#[tokio::test]
+async fn a_creation_without_a_definite_answer_is_a_possible_orphan() {
+    let cfg = upload_config();
+    let b = sealed_upload_block(&cfg);
+    for (error, orphan) in [
+        (injected as fn() -> object_store::Error, true),
+        (
+            || object_store::Error::PermissionDenied {
+                path: "p".into(),
+                source: "denied".into(),
+            },
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(HookStore::new(local(&dir), FailingCreate { error }));
+        let sink = Sink::new(store, cfg.clone(), FileNaming::new("w"), tokio_timer);
+        let got = sink.write_block(&b, &CancellationToken::new()).await;
+        match got {
+            Err(Error::Transient(TransientError::AbortFailed {
+                source,
+                abort_error,
+            })) if orphan => {
+                assert!(
+                    abort_error.contains("CreateMultipartUpload"),
+                    "{abort_error}"
+                );
+                assert!(abort_error.contains("dataset=values"), "{abort_error}");
+                assert!(source.to_string().contains("injected failure"), "{source}");
+            }
+            Err(error) if !orphan => assert!(
+                !matches!(error, Error::Transient(TransientError::AbortFailed { .. })),
+                "{error:?}"
+            ),
+            other => panic!("orphan={orphan}: unexpected {other:?}"),
+        }
+    }
+}
+
 /// A sealed block of `n` log rows whose one series is already committed
 /// in the block's partition, so the block's only table is its values.
 fn values_only_block(cfg: &LakeConfig, n: usize) -> Block {

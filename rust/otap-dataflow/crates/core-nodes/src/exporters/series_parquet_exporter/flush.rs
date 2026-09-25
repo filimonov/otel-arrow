@@ -261,8 +261,8 @@ async fn write_until(
 pub(super) struct FlushTally {
     /// Write attempts started beyond the first of their flush.
     pub(super) retries: Cell<u64>,
-    /// Failed flushes that may have left a multipart upload behind: the
-    /// abort failed, or the write did not unwind in time.
+    /// Multipart uploads a failed write attempt may have left behind (see
+    /// [`Trace::abort_failed`]).
     pub(super) abort_failures: Cell<u64>,
     /// Failed flushes whose every object exists after all.
     pub(super) late_commits: Cell<u64>,
@@ -348,9 +348,12 @@ impl Trace {
 }
 
 impl Trace {
-    /// Log one failed write attempt at WARN, retried or not.
+    /// Log one failed write attempt at WARN, retried or not, and count the
+    /// upload it may have left behind.
     ///
-    /// The only place the per-attempt WARN is emitted.
+    /// The only place the per-attempt WARN is emitted. The upload is counted
+    /// here rather than when the flush ends, so a retry that succeeds does not
+    /// hide it.
     fn attempt_failed(&self, attempt: u64, deadline: Instant, error: &lake::Error) {
         otel_warn!(
             "series_parquet.flush.attempt_failed",
@@ -361,6 +364,9 @@ impl Trace {
             deadline_remaining = ?deadline.saturating_duration_since(clock::now()),
             error = %error
         );
+        if let Some(abort_error) = abort_failure(error) {
+            self.abort_failed(attempt, abort_error);
+        }
     }
 
     /// Report how the cancelled write of an already decided flush unwound:
@@ -439,7 +445,9 @@ impl Trace {
         );
     }
 
-    /// Count and log a cleanup that may have left a multipart upload behind.
+    /// Count and log a multipart upload a write attempt may have left behind:
+    /// its abort failed or timed out, its creation got no definite answer, or
+    /// the write did not unwind by the cleanup cutoff.
     pub(super) fn abort_failed(&self, attempt: u64, abort_error: &str) {
         let failures = &self.shared.tally.abort_failures;
         failures.set(failures.get() + 1);
@@ -459,12 +467,11 @@ impl Trace {
 /// What a flush that ended on an attempt's own error still owes its cleanup
 /// report, decided before the error is handed to the owner.
 enum Settle {
-    /// The attempt's multipart abort failed.
-    AbortFailed(String),
     /// A retryable storage failure, which may be a response the store lost
     /// after committing: the objects are probed.
     Probe,
-    /// Nothing the store could have kept.
+    /// Nothing the store could have kept, or an abort failure already
+    /// counted with its attempt.
     Nothing,
 }
 
@@ -472,9 +479,8 @@ impl Settle {
     /// What the cleanup of a flush ended by `error` must do.
     fn after(error: &lake::Error) -> Self {
         match abort_failure(error) {
-            Some(abort_error) => Self::AbortFailed(abort_error.to_owned()),
             None if error.is_retryable() => Self::Probe,
-            None => Self::Nothing,
+            _ => Self::Nothing,
         }
     }
 }
@@ -484,7 +490,6 @@ impl Trace {
     /// probing until `cutoff` when that error is ambiguous.
     async fn settle(&self, attempt: u64, settle: Settle, cutoff: Instant) {
         match settle {
-            Settle::AbortFailed(abort_error) => self.abort_failed(attempt, &abort_error),
             Settle::Probe => self.probe(attempt, cutoff).await,
             Settle::Nothing => {}
         }

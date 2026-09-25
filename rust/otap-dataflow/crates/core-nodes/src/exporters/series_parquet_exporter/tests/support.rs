@@ -527,6 +527,9 @@ pub(super) enum Fault {
     /// a store that commits the upload and drops the connection looks to the
     /// writer.
     FailedComplete,
+    /// The first `values` multipart upload's parts fail and its abort fails
+    /// too, leaving an upload behind; the store then heals.
+    ValuesOrphanOnce,
 }
 
 /// How long one write takes to fail under [`Fault::SlowFail`].
@@ -648,6 +651,43 @@ impl MultipartUpload for WedgedUpload {
     async fn abort(&mut self) -> object_store::Result<()> {
         let _ = self.aborts.fetch_add(1, SeqCst);
         std::future::pending().await
+    }
+}
+
+/// A real multipart upload whose parts fail and whose abort fails, so the
+/// underlying store keeps it as an incomplete upload.
+#[derive(Debug)]
+pub(super) struct OrphanedUpload {
+    /// The upload the underlying store really initiated.
+    pub(super) _inner: Box<dyn MultipartUpload>,
+    /// Aborts attempted against this upload.
+    pub(super) aborts: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for OrphanedUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        Box::pin(std::future::ready(Err(object_store::Error::Generic {
+            store: "series-test",
+            source: Box::new(std::io::Error::other("injected part failure")),
+        })))
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        Err(object_store::Error::Generic {
+            store: "series-test",
+            source: Box::new(std::io::Error::other(
+                "injected complete after failed parts",
+            )),
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        let _ = self.aborts.fetch_add(1, SeqCst);
+        Err(object_store::Error::Generic {
+            store: "series-test",
+            source: Box::new(std::io::Error::other("injected abort failure")),
+        })
     }
 }
 
@@ -773,6 +813,13 @@ impl StoreHooks for Faults {
             });
         }
         let mode = self.mode();
+        if mode == Fault::ValuesOrphanOnce && path.as_ref().contains("dataset=values/") {
+            self.set(Fault::None);
+            return Box::new(OrphanedUpload {
+                _inner: upload,
+                aborts: Arc::clone(&self.aborts),
+            });
+        }
         if matches!(mode, Fault::LostComplete | Fault::FailedComplete)
             && path.as_ref().contains("dataset=values/")
         {

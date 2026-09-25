@@ -38,6 +38,9 @@ pub trait StoreHooks: fmt::Debug + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Runs when the inner store fails to create a multipart upload.
+    fn multipart_failed(&self, _location: &Path, _error: &object_store::Error) {}
+
     /// The upload the caller receives in place of the one the inner store
     /// created.
     fn wrap_upload(
@@ -98,7 +101,11 @@ impl<H: StoreHooks> ObjectStore for HookStore<H> {
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let _guard = self.hooks.before_multipart(location).await?;
-        let upload = self.inner.put_multipart_opts(location, options).await?;
+        let upload = self
+            .inner
+            .put_multipart_opts(location, options)
+            .await
+            .inspect_err(|error| self.hooks.multipart_failed(location, error))?;
         Ok(self.hooks.wrap_upload(location, upload))
     }
 

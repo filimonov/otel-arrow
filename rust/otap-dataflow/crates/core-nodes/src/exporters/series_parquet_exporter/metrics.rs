@@ -64,10 +64,10 @@ pub(super) struct WorkerMetrics {
     /// Flushes that failed because the write was cancelled.
     #[metric(name = "flush.cancelled", unit = "{flush}")]
     pub flush_cancelled: Counter<u64>,
-    /// Cancelled writes of decided flushes whose multipart abort failed or
-    /// that did not unwind by the cleanup cutoff, each of which may leave an
-    /// upload to the bucket's lifecycle rule.
-    #[metric(name = "flush.abort_failures", unit = "{flush}")]
+    /// Multipart uploads a failed write attempt may have left to the bucket's
+    /// lifecycle rule: the abort failed or timed out, the creation got no
+    /// definite answer, or the write did not unwind by the cleanup cutoff.
+    #[metric(name = "flush.abort_failures", unit = "{upload}")]
     pub flush_abort_failures: Counter<u64>,
     /// Writes of decided flushes that completed while being cancelled: their
     /// files hold rows whose requests were nacked.
@@ -619,7 +619,7 @@ mod tests {
                 ("flush.duration", "s"),
                 ("flush.retries", "{attempt}"),
                 ("flush.cancelled", "{flush}"),
-                ("flush.abort_failures", "{flush}"),
+                ("flush.abort_failures", "{upload}"),
                 ("flush.late_commits", "{flush}"),
                 ("acks", "{message}"),
                 ("notify.queued", "{request}"),

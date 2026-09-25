@@ -256,11 +256,60 @@ impl Drop for PutLanded {
     }
 }
 
+/// What one table write's multipart upload leaves once the writer has let go
+/// of it.
+#[derive(Debug, Default)]
+pub(super) struct UploadSlot {
+    /// The upload, when the writer dropped it neither completed nor aborted.
+    parked: Option<Box<dyn object_store::MultipartUpload>>,
+    /// Whether `complete` was called: from then on the store may have
+    /// committed the object without the writer seeing it.
+    completing: bool,
+    /// Whether the creation failed without a definite rejection, so the store
+    /// may hold an upload whose id the writer never received.
+    create_unknown: bool,
+}
+
+/// An upload the writer let go of unsettled.
+pub(super) struct Unsettled {
+    pub(super) upload: Box<dyn object_store::MultipartUpload>,
+    /// Whether its `complete` was called.
+    pub(super) completing: bool,
+}
+
+/// Locks `slot`, recovering it from a poisoned lock.
+fn lock_slot(slot: &std::sync::Mutex<UploadSlot>) -> std::sync::MutexGuard<'_, UploadSlot> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A multipart upload whose parts are entered in the table's ledger.
+///
+/// Dropped neither completed nor aborted, it parks the upload in the table's
+/// [`UploadSlot`], so a write that fails while finishing can still abort it.
 #[derive(Debug)]
 pub(super) struct LedgeredUpload {
-    pub(super) inner: Box<dyn object_store::MultipartUpload>,
+    pub(super) inner: Option<Box<dyn object_store::MultipartUpload>>,
     pub(super) ledger: Arc<UploadLedger>,
+    pub(super) slot: Arc<std::sync::Mutex<UploadSlot>>,
+    /// Set once the upload completed or was aborted.
+    pub(super) settled: bool,
+}
+
+impl LedgeredUpload {
+    fn inner(&mut self) -> &mut Box<dyn object_store::MultipartUpload> {
+        self.inner
+            .as_mut()
+            .expect("the upload is only taken when it is dropped")
+    }
+}
+
+impl Drop for LedgeredUpload {
+    fn drop(&mut self) {
+        if !self.settled {
+            lock_slot(&self.slot).parked = self.inner.take();
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -270,7 +319,7 @@ impl object_store::MultipartUpload for LedgeredUpload {
             span: self.ledger.part_started(data.content_length()),
             ledger: Arc::clone(&self.ledger),
         };
-        let part = self.inner.put_part(data);
+        let part = self.inner().put_part(data);
         Box::pin(async move {
             let _landed = landed;
             part.await
@@ -278,11 +327,16 @@ impl object_store::MultipartUpload for LedgeredUpload {
     }
 
     async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
-        self.inner.complete().await
+        lock_slot(&self.slot).completing = true;
+        let completed = self.inner().complete().await;
+        self.settled = completed.is_ok();
+        completed
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        self.inner.abort().await
+        let aborted = self.inner().abort().await;
+        self.settled = aborted.is_ok();
+        aborted
     }
 }
 
@@ -341,6 +395,7 @@ pub(super) fn creation_watch(
         Creations {
             state: Arc::new(CreationState::default()),
             ledger,
+            slot: Arc::default(),
         },
     )
 }
@@ -355,6 +410,8 @@ pub(super) struct Creations {
     state: Arc<CreationState>,
     /// Where the table's upload bytes are entered.
     ledger: Arc<UploadLedger>,
+    /// What the table's upload leaves once the writer lets go of it.
+    slot: Arc<std::sync::Mutex<UploadSlot>>,
 }
 
 /// Multipart creations in flight, and the wake-up of their end.
@@ -378,6 +435,25 @@ impl Creations {
     /// Whether a multipart upload is being created right now.
     pub(super) fn creating(&self) -> bool {
         self.state.creating.load(SeqCst) > 0
+    }
+
+    /// The upload the writer let go of neither completed nor aborted, if any.
+    pub(super) fn take_unsettled(&self) -> Option<Unsettled> {
+        let mut slot = lock_slot(&self.slot);
+        let completing = slot.completing;
+        slot.parked
+            .take()
+            .map(|upload| Unsettled { upload, completing })
+    }
+
+    /// Why an upload may exist that no abort can reach: a creation that
+    /// failed without a definite rejection.
+    pub(super) fn create_unknown(&self) -> Option<String> {
+        lock_slot(&self.slot).create_unknown.then(|| {
+            "CreateMultipartUpload failed without a definite answer, so the store may hold an \
+             upload whose id the writer never received"
+                .to_owned()
+        })
     }
 
     /// Resolves once no multipart upload is being created.
@@ -411,14 +487,27 @@ impl StoreHooks for Creations {
         Ok(Some(Box::new(Creating(Arc::clone(&self.state)))))
     }
 
+    fn multipart_failed(&self, _location: &Path, error: &object_store::Error) {
+        // Every other variant is a definite answer from the store or a local
+        // refusal, neither of which leaves an upload behind.
+        if matches!(
+            error,
+            object_store::Error::Generic { .. } | object_store::Error::JoinError { .. }
+        ) {
+            lock_slot(&self.slot).create_unknown = true;
+        }
+    }
+
     fn wrap_upload(
         &self,
         _location: &Path,
         upload: Box<dyn object_store::MultipartUpload>,
     ) -> Box<dyn object_store::MultipartUpload> {
         Box::new(LedgeredUpload {
-            inner: upload,
+            inner: Some(upload),
             ledger: Arc::clone(&self.ledger),
+            slot: Arc::clone(&self.slot),
+            settled: false,
         })
     }
 }
@@ -434,14 +523,30 @@ impl Sink {
         deadline: AbortTimer,
     ) -> Option<String> {
         let mut buf: BufWriter = writer.into_inner().into_buf_writer();
+        self.bounded_abort(buf.abort(), deadline).await
+    }
+
+    /// Run `abort` until `deadline`; returns why it did not succeed, or
+    /// `None` when it did.
+    async fn bounded_abort(
+        &self,
+        abort: impl Future<Output = object_store::Result<()>>,
+        deadline: AbortTimer,
+    ) -> Option<String> {
         tokio::select! {
             biased;
-            aborted = buf.abort() => aborted.err().map(|e| e.to_string()),
+            aborted = abort => aborted.err().map(|e| e.to_string()),
             () = deadline => Some(format!(
                 "abort timed out after {:?}",
                 self.cfg.upload.abort_timeout
             )),
         }
+    }
+
+    /// Why the upload of `path` may be left behind, prefixed with the key an
+    /// operator or a lifecycle sweep finds it by.
+    fn orphan(path: &Path, reason: String) -> String {
+        format!("multipart upload of {path}: {reason}")
     }
 
     /// Run one writable-phase writer step, racing `cancel`.
@@ -692,27 +797,48 @@ impl Sink {
             Ok(rows) => rows,
             Err(cause) => {
                 let deadline = cleanup.unwrap_or_else(|| self.start_cleanup());
-                let abort_error = self.abort_upload(writer, deadline).await;
+                let abort_error = self
+                    .abort_upload(writer, deadline)
+                    .await
+                    .or_else(|| watch.hooks().create_unknown())
+                    .map(|reason| Self::orphan(path, reason));
                 return Err(Self::with_abort(cause, abort_error));
             }
         };
         if cancel.is_cancelled() {
-            let abort_error = self.abort_upload(writer, self.start_cleanup()).await;
+            let abort_error = self
+                .abort_upload(writer, self.start_cleanup())
+                .await
+                .map(|reason| Self::orphan(path, reason));
             return Err(Error::cancelled(abort_error));
         }
 
         // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
-        // down; `BufWriter::abort` panics once shutdown has started, so nothing is
-        // aborted from here on. A partial multipart upload left by a cancellation
-        // in this phase is reclaimed by the bucket's multipart lifecycle rule
-        // (FORMAT.md section 4), not by this crate.
+        // down; `BufWriter::abort` panics once shutdown has started, so a failed or
+        // cancelled finish aborts the upload the writer let go of instead (see
+        // `LedgeredUpload`). One whose completion was sent is left alone: the store
+        // may have committed it.
         let finish = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(Error::cancelled(None)),
             r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
         };
-        finish?;
-        Ok(rows)
+        let Err(cause) = finish else {
+            return Ok(rows);
+        };
+        // Dropping the writer parks an upload a cancelled finish still held.
+        drop(writer);
+        let abort_error = match watch.hooks().take_unsettled() {
+            Some(Unsettled {
+                mut upload,
+                completing: false,
+            }) => self
+                .bounded_abort(upload.abort(), self.start_cleanup())
+                .await
+                .map(|reason| Self::orphan(path, reason)),
+            _ => None,
+        };
+        Err(Self::with_abort(cause, abort_error))
     }
 
     /// Write every non-empty table of a sealed block, series datasets first.

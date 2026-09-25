@@ -374,7 +374,7 @@ collections is a counter.
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
-| `flush.abort_failures` | `{flush}` | Cancelled writes whose multipart abort failed or did not unwind by the cleanup cutoff; each may leave an upload to the bucket's lifecycle rule. |
+| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. |
 | `flush.late_commits` | `{flush}` | Failed flushes whose every object exists after all; their nacked rows may be stored twice. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
@@ -503,9 +503,13 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   attribute key and value is charged as it is read: one longer than
   `ingress.max_row_bytes` refuses the request, and decoded attributes count
   against the same `ingress.max_extracted_bytes` as the extracted rows.
-- Configure a bucket lifecycle rule for incomplete multipart uploads: a
-  cancellation after a file's Parquet finalization has begun cannot abort its
-  upload. On a versioned bucket, each retry that reached the store leaves a
+- Configure a bucket lifecycle rule for incomplete multipart uploads (S3
+  `AbortIncompleteMultipartUpload`, for example after one day). The writer
+  aborts the upload of every failed or cancelled write, but an abort can fail,
+  a creation can fail without an answer that tells whether the upload exists,
+  and an upload whose completion was sent is not aborted; `flush.abort_failures`
+  counts the uploads the writer knows it may have left behind and is the alert
+  signal. On a versioned bucket, each retry that reached the store leaves a
   noncurrent version.
 - Writer limits (merge keys held during a merge, the average-based merge chunk,
   row-group upload bursts) are in the
