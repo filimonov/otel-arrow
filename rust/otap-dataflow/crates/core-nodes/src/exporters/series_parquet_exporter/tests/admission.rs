@@ -131,7 +131,6 @@ fn each_failure_class_maps_to_its_outcome() {
         (lake::SizeBudget::Extracted, Outcome::ExtractedTooLarge),
         (lake::SizeBudget::Table, Outcome::ExtractedTooLarge),
         (lake::SizeBudget::Cell, Outcome::RowTooLarge),
-        (lake::SizeBudget::Block, Outcome::BlockTooLarge),
     ] {
         assert_eq!(
             Outcome::of(&lake::Error::too_large(budget, 2, 1)),
@@ -887,10 +886,11 @@ async fn a_backward_clock_step_does_not_repark_the_pending_request() {
         .await;
 }
 
-/// Scenario: a request whose reservation alone exceeds the block budget, on an empty block.
-/// Guarantees: a permanent `RequestTooLarge` refusal; not parked, block untouched.
+/// Scenario: a block budget set below what startup validation allows, so a request's worst
+/// case misses an empty block.
+/// Guarantees: a retryable internal nack counted as `internal`; not parked, block untouched.
 #[tokio::test(flavor = "current_thread")]
-async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
+async fn a_request_missing_an_empty_block_is_an_internal_nack_not_parked() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let store = Arc::new(object_store::memory::InMemory::new());
@@ -898,7 +898,7 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
             let wall = Arc::new(lake::clock::TestWallClock::new(0));
             let mut cfg = worker_config();
             // The per-request and extraction budgets stay wide open, so the
-            // refusal can only come from the block budget inside `reserve`.
+            // failure can only come from the block budget inside `reserve`.
             cfg.window.max_block_bytes = 1;
             cfg.lake.ingress.max_block_bytes = 1;
             let worker = Worker::new(
@@ -924,17 +924,18 @@ async fn a_request_too_large_for_an_empty_block_is_refused_not_parked() {
             );
 
             assert!(worker.notify.next().await.is_ok());
-            match rx.recv().await.expect("a refusal") {
+            match rx.recv().await.expect("a nack") {
                 PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert!(nack.permanent);
-                    assert_eq!(nack.cause, NackCause::Refused);
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.cause, NackCause::Unspecified);
                     assert!(
-                        nack.reason.contains("window.max_block_bytes (1 bytes)"),
+                        nack.reason.contains("series_parquet internal error")
+                            && nack.reason.contains("exceeds max_block_bytes (1)"),
                         "reason: {}",
                         nack.reason
                     );
                 }
-                other => panic!("expected a block-budget refusal, got {other:?}"),
+                other => panic!("expected an internal nack, got {other:?}"),
             }
             assert_no_more_completions(&mut rx);
         })
@@ -1019,8 +1020,9 @@ async fn the_parked_request_is_stored_before_a_newer_one() {
         .await;
 }
 
-/// Scenario: one request refused by the extraction budget and one by the block budget.
-/// Guarantees: each WARN and reason sentence carry the setting, the observed size and the limit.
+/// Scenario: one request refused by the extraction budget and one by the series limit.
+/// Guarantees: the extraction WARN carries the setting, the observed size and the limit; the
+/// series refusal's WARN and reason name its outcome, the count and the limit.
 #[tokio::test(flavor = "current_thread")]
 async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     let events = capture();
@@ -1078,23 +1080,33 @@ async fn a_size_refusal_reports_the_observed_size_and_the_limit() {
     }
     assert_no_more_completions(&mut rx);
 
-    let (handler, _rx) = effects(4);
-    let mut cfg = worker_config();
-    cfg.window.max_block_bytes = 1;
-    cfg.lake.ingress.max_block_bytes = 1;
-    let mut block = Worker::new(cfg, store, wall, handler);
-    block.admit(logs_pdata());
+    let (handler, mut rx) = effects(4);
+    let mut series = Worker::new(worker_config(), store, wall, handler);
+    series.cfg.lake.ingress.max_series_per_request = 0;
+    series.admit(logs_pdata());
     let event = refusal(&events, 1);
     let field = |name: &str| event.fields.get(name).cloned();
     assert_eq!(
-        field("limit_setting"),
-        Some(FieldValue::Str("window.max_block_bytes".into()))
+        field("outcome"),
+        Some(FieldValue::Str("too_many_series".into()))
     );
-    assert_eq!(field("limit_bytes"), Some(FieldValue::U64(1)));
-    assert!(
-        matches!(field("observed_bytes"), Some(FieldValue::U64(n)) if n > 1),
-        "{event:?}"
-    );
+    series
+        .notify
+        .next()
+        .await
+        .expect("the refusal is delivered");
+    match rx.recv().await.expect("a nack") {
+        PipelineCompletionMsg::DeliverNack { nack } => {
+            assert!(nack.permanent);
+            assert_eq!(
+                nack.reason,
+                "request carries at least 1 distinct series, more than \
+                 ingress.max_series_per_request (0); split the batch upstream or raise the limit"
+            );
+        }
+        other => panic!("expected a nack, got {other:?}"),
+    }
+    assert_no_more_completions(&mut rx);
     drop(events);
 }
 

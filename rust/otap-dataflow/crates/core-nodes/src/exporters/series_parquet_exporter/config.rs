@@ -48,8 +48,8 @@ impl Default for Window {
 
 /// The request-level budgets a user sets under `ingress`.
 ///
-/// Only four of the lake's ingress limits: the two block-level ones are set
-/// under `window`, so writing them here is an unknown field.
+/// Five of the lake's ingress limits: the two block-level ones are set under
+/// `window`, so writing them here is an unknown field.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Ingress {
@@ -60,6 +60,9 @@ struct Ingress {
     #[serde(deserialize_with = "deserialize_required_usize")]
     max_row_bytes: usize,
     max_nesting_depth: usize,
+    /// Unset means the most the block budget holds; see
+    /// [`LakeConfig::derived_max_series_per_request`].
+    max_series_per_request: Option<usize>,
 }
 
 impl Default for Ingress {
@@ -70,6 +73,7 @@ impl Default for Ingress {
             max_extracted_bytes: lake.max_extracted_bytes,
             max_row_bytes: lake.max_row_bytes,
             max_nesting_depth: lake.max_nesting_depth,
+            max_series_per_request: None,
         }
     }
 }
@@ -301,19 +305,7 @@ impl TryFrom<RawConfig> for Config {
                 raw.upload.abort_timeout
             ));
         }
-        // The one cross-field rule whose lake form names a lake key
-        // (`ingress.max_block_bytes`): checked here first with the key the
-        // user writes. Every other cross-field rule is the lake's own, and its
-        // message already names the user's key.
-        if raw.window.max_block_bytes / 2 < raw.ingress.max_extracted_bytes {
-            return Err(
-                "window.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
-                 because a request's series rows may take up to twice their extracted size \
-                 in a block"
-                    .into(),
-            );
-        }
-        let lake = LakeConfig {
+        let mut lake = LakeConfig {
             writer_id: raw.writer_id,
             producer_id_attribute: raw.producer_id_attribute,
             window_interval: interval,
@@ -336,12 +328,25 @@ impl TryFrom<RawConfig> for Config {
             logs: raw.logs,
             metrics: raw.metrics,
         };
+        // An unset limit that the budgets leave no room for becomes 1, which
+        // the bound check below then refuses with its numbers.
+        lake.ingress.max_series_per_request = raw
+            .ingress
+            .max_series_per_request
+            .unwrap_or_else(|| lake.derived_max_series_per_request().max(1));
         // A configuration rule's own sentence, without the request refusal
         // wrapper the lake error type carries.
-        lake.validate().map_err(|e| {
+        let rule = |e: otel_arrow_dfe_series_lake::Error| {
             e.invalid_detail()
                 .map_or_else(|| e.to_string(), str::to_owned)
-        })?;
+        };
+        // The one cross-field rule whose lake form names a lake key
+        // (`ingress.max_block_bytes`): checked here first with the key the
+        // user writes. Every other cross-field rule is the lake's own, and its
+        // message already names the user's key.
+        lake.check_request_bound("window.max_block_bytes")
+            .map_err(rule)?;
+        lake.validate().map_err(rule)?;
         let retried = !matches!(raw.storage, StorageType::File { .. });
         check_retry_deadline(retried, raw.retry.as_ref(), raw.window.flush_retry_deadline)?;
         let retry = match raw.retry {

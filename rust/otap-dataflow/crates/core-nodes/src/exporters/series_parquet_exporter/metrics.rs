@@ -677,7 +677,7 @@ mod tests {
             "request_too_large",
             "extracted_too_large",
             "row_too_large",
-            "block_too_large",
+            "too_many_series",
             "too_deep",
             "invalid",
             "unsupported",

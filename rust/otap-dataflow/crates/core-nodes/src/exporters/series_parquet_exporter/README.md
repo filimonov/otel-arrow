@@ -115,11 +115,38 @@ every series it carries were new to the block, so it gets the same answer after
 a restart or a cache eviction; one that fits the worst case but not the space
 left waits for the next block. The worst case is `P + T + sum over its series
 of (2 * (A - D) + F)`: values rows P, completion token T, each series'
-extracted estimate A less its decoded attribute trees D, and a fixed F of 1352
-bytes per logs series or 2120 per metrics series, plus 128 per denormalized
-series column. Startup requires `window.max_block_bytes` of at least twice
-`ingress.max_extracted_bytes`, which covers only the `2 * A` term, so a request
-of many small series can still be refused for the block, on every attempt.
+extracted estimate A less its decoded attribute trees D, and a fixed F of 232
+bytes per logs series or 328 per metrics series, plus 16 per denormalized
+series column.
+
+F comes from the measured heap of a series row (`measurement --series-cost`,
+`docs/superpowers/reports/series-parquet-measurement/memory-strict-f001.json`):
+342 to 365 bytes per logs row and 405 to 428 per metrics row for requests of
+1000 or more minimal series, 1 to 10 bytes more per denormalized column, and
+about 30 bytes of merge key besides. A minimal series is charged 844 bytes
+(logs) or 1076 (metrics), at least 2.1 times what it holds, and F alone is at
+least 2.6 times the heap beyond the row's content. The first series of a block
+also costs 19 to 22 KB of fixed structures, which no charge includes.
+
+Startup refuses budgets under which a request that passes ingress could miss
+an empty block:
+
+```text
+2 * ingress.max_extracted_bytes + ingress.max_series_per_request * F_max + 4KiB
+  <= window.max_block_bytes
+```
+
+F_max is the larger F of the two signals, and 4KiB allows for the completion
+token (measured tokens hold 200 to 464 bytes). `ingress.max_series_per_request`
+bounds the distinct series of one request, and extraction refuses a request as
+soon as it passes the limit (`nacks{error.type=too_many_series}`, a permanent
+refusal naming the count and the limit). Unset, it is the most series the
+block budget holds, `(B - 2E - 4KiB) / F_max` with B `window.max_block_bytes`
+and E `ingress.max_extracted_bytes`: 1,393,826 at the defaults, and 1,328,997
+with the one denormalized column per signal of the shipped configurations. So
+`window.max_block_bytes` only rotates blocks and bounds memory; it never
+refuses a request. A worst case that still misses an empty block, which only a
+token beyond the allowance can cause, is nacked as a retryable `internal`.
 
 ### Attempt timeouts
 
@@ -211,6 +238,7 @@ written under `ingress` instead of `window`. ZSTD is the only compression.
 | `ingress.max_extracted_bytes` | 32MiB |
 | `ingress.max_row_bytes` | 1MiB |
 | `ingress.max_nesting_depth` | 32 |
+| `ingress.max_series_per_request` | derived, see [Block admission](#block-admission) |
 | `series_cache.max_entries` | 200000 |
 | `sorting.enabled` | true |
 | `sorting.run_target_bytes` | 8MiB |
@@ -232,7 +260,8 @@ Rules enforced at startup:
   `notify_batch` and the retry durations are positive; `upload.abort_timeout`
   is at least 1s; `ingress.max_nesting_depth` is at most 256.
 - `ingress.max_row_bytes` is at most a quarter of `sorting.run_target_bytes`,
-  and `window.max_block_bytes` at least twice `ingress.max_extracted_bytes`.
+  and one request's worst case fits `window.max_block_bytes` (see
+  [Block admission](#block-admission)).
 - `upload.part_bytes` is between 5MiB and 5GiB; a worker warns
   (`series_parquet.upload.parts_exceed_limit`) when a file of
   `window.max_block_bytes` would need more than S3's 10,000 parts.
@@ -306,10 +335,10 @@ object store only when the WAL reaches its size cap; then, with
 These losses happen after the WAL acknowledgement, so the producer never sees
 them; alert on each:
 
-- A permanent refusal by this exporter (a damaged OTLP body, a request larger
-  than a block, traces, or an unsupported point kind under
-  `unsupported: reject`) drops the bundle, counted in the buffer's
-  `resolved{outcome="permanently_rejected"}`.
+- A permanent refusal by this exporter (a damaged OTLP body, a request over an
+  ingress budget or `ingress.max_series_per_request`, traces, or an
+  unsupported point kind under `unsupported: reject`) drops the bundle, counted
+  in the buffer's `resolved{outcome="permanently_rejected"}`.
 - `size_cap_policy: drop_oldest` evicts, and `max_age` expires, acknowledged
   data.
 - With `otlp_handling: convert_to_arrow`, or batching in the OTAP format, this
@@ -403,7 +432,7 @@ collections is a counter.
 | --- | --- | --- | --- |
 | `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
 | `flush.failures` | `{flush}` | `error.type` | `deadline`, `permanent_storage`, `cancelled`, `encode`, `internal` |
-| `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `block_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
+| `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `too_many_series`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary` |
@@ -413,8 +442,9 @@ collections is a counter.
 
 The `*_too_large` values of `nacks` name `ingress.max_request_bytes`,
 `ingress.max_extracted_bytes` (the extracted request, decoded attributes
-included), `ingress.max_row_bytes` (one row, attribute value or CBOR cell) and
-`window.max_block_bytes`; `too_deep` is `ingress.max_nesting_depth`. The
+included) and `ingress.max_row_bytes` (one row, attribute value or CBOR cell);
+`too_many_series` is `ingress.max_series_per_request` and `too_deep`
+`ingress.max_nesting_depth`. The
 `column` label is fixed by configuration, so no request can add a label value.
 The node also registers the shared `exporter.exports` set (`messages`,
 `duration`; labels `signal` and `outcome`: `success`, `refused`, `failure`).

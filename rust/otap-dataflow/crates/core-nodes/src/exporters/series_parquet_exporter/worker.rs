@@ -499,9 +499,9 @@ impl Worker {
         ) {
             Ok(reservation) => reservation,
             // A block-scoped refusal judges whichever block is active, so the
-            // request waits for the next one. An empty block refuses a request
-            // it cannot fit as `RequestTooLarge`, and the guard checks it, so
-            // parking can never become an endless rotation.
+            // request waits for the next one. An empty block fails a request
+            // it cannot fit as internal, and the guard checks it, so parking
+            // can never become an endless rotation.
             Err(lake::Error::Refused(
                 reason @ (lake::RefuseReason::BlockFull | lake::RefuseReason::TooManyRequests),
             )) if !self.active.data.is_empty() => {
@@ -514,9 +514,8 @@ impl Worker {
             }
             Err(error) => {
                 // The reservation refused before the block was touched, so
-                // only this request is affected. Only `RequestTooLarge` judges
-                // the request itself; a block-scoped refusal from an empty
-                // block, or anything else `reserve` returns, is a broken
+                // only this request is affected. A block-scoped refusal from
+                // an empty block, or a worst case that misses one, is a broken
                 // invariant, which is how [`Outcome::of`] reports it.
                 self.refuse(pending.token, &error);
                 return;

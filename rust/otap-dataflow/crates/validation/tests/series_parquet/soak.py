@@ -1128,7 +1128,9 @@ PR_WINDOW = {
     "max_block_bytes": "640KiB",
     "max_requests_per_block": 6,
 }
-PR_INGRESS = {"max_extracted_bytes": "320KiB"}
+# Below half the block, so that the block also holds the fixed part of every
+# series row of one request (about 178 series at these budgets).
+PR_INGRESS = {"max_extracted_bytes": "288KiB"}
 # Strictly below the flush deadline, which the exporter requires of a cloud store.
 PR_RETRY = {
     "max_retries": 1, "init_backoff": "100ms", "max_backoff": "500ms",

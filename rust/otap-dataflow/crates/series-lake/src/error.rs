@@ -17,8 +17,6 @@ pub enum SizeBudget {
     /// Decoded attribute values, charged to the extracted budget
     /// (`ingress.max_extracted_bytes`).
     Table,
-    /// The request's worst case in one block (`max_block_bytes`).
-    Block,
 }
 
 /// How far a too-large request exceeded which budget.
@@ -54,6 +52,15 @@ pub enum RefuseReason {
     BlockFull,
     /// The active block already holds `max_requests_per_block` tokens.
     TooManyRequests,
+    /// The request carries more distinct series than
+    /// `ingress.max_series_per_request`.
+    TooManySeries {
+        /// Series counted when the limit was passed: `limit + 1`, since
+        /// extraction stops there.
+        observed: usize,
+        /// The configured limit.
+        limit: usize,
+    },
     /// A nested value is deeper than `ingress.max_nesting_depth`, the limit
     /// carried here.
     ///
@@ -75,7 +82,6 @@ impl std::fmt::Display for SizeBudget {
             SizeBudget::Row => "row",
             SizeBudget::Cell => "cell",
             SizeBudget::Table => "table",
-            SizeBudget::Block => "block",
         })
     }
 }
@@ -103,6 +109,10 @@ impl std::fmt::Display for RefuseReason {
             }) => write!(
                 f,
                 "{budget} budget exceeded: size not measured, limit {limit} bytes"
+            ),
+            RefuseReason::TooManySeries { observed, limit } => write!(
+                f,
+                "series limit exceeded: at least {observed} distinct series, limit {limit}"
             ),
             RefuseReason::BlockFull => f.write_str("BlockFull"),
             RefuseReason::TooManyRequests => f.write_str("TooManyRequests"),
@@ -425,6 +435,13 @@ mod tests {
                     limit: 5,
                 })),
                 "refused: request budget exceeded: size not measured, limit 5 bytes",
+            ),
+            (
+                Error::Refused(RefuseReason::TooManySeries {
+                    observed: 11,
+                    limit: 10,
+                }),
+                "refused: series limit exceeded: at least 11 distinct series, limit 10",
             ),
             (
                 Error::Refused(RefuseReason::BlockFull),

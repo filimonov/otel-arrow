@@ -14,7 +14,7 @@ use otel_arrow_dfe_pdata::otap::memory::{CountedAllocations, record_batch_pinned
 use crate::cache::SeriesCache;
 use crate::canonical::SeriesId;
 use crate::clock::PartitionId;
-use crate::config::LakeConfig;
+use crate::config::{LakeConfig, TOKEN_ALLOWANCE_BYTES};
 use crate::error::{Error, RefuseReason, Result};
 use crate::extract::{DescriptorRow, Extracted, series_batch};
 use crate::schema::Dataset;
@@ -322,10 +322,13 @@ impl Block {
     /// Compute what admitting `extracted` would add.
     ///
     /// Refuses before touching anything:
-    /// * `RequestTooLarge` when the request's worst case (every descriptor it
+    /// * an internal error when the request's worst case (every descriptor it
     ///   carries written by this block; see
     ///   [`LakeConfig::series_row_fixed_bytes`]) exceeds `max_block_bytes`.
-    ///   A permanent nack, so it never depends on the cache;
+    ///   [`LakeConfig::check_request_bound`] makes that unreachable for a
+    ///   request that passed extraction with a token within
+    ///   [`TOKEN_ALLOWANCE_BYTES`], so it is also a debug assertion; the
+    ///   check never depends on the cache;
     /// * `TooManyRequests` when the block already holds `max_requests_per_block`;
     /// * `BlockFull` when the request does not fit the remaining budget.
     ///
@@ -335,7 +338,7 @@ impl Block {
     /// move only LRU recency, which is not correctness state.
     ///
     /// # Errors
-    /// Returns `Error::Refused` with one of the three reasons above.
+    /// Returns one of the three refusals above.
     pub fn reserve(
         &self,
         extracted: &Extracted,
@@ -355,8 +358,7 @@ impl Block {
     /// descriptors being written. Only this reservation ignores the cache.
     ///
     /// # Errors
-    /// Returns `Error::Refused` with one of the three reasons documented on
-    /// [`Block::reserve`].
+    /// Returns one of the three refusals documented on [`Block::reserve`].
     pub fn reserve_with_reemit(
         &self,
         extracted: &Extracted,
@@ -372,11 +374,16 @@ impl Block {
             .map(|d| d.series_row_bytes() + limits.pending_series_entry_bytes)
             .fold(fixed, usize::saturating_add);
         if worst > limits.max_block_bytes {
-            return Err(Error::too_large(
-                crate::error::SizeBudget::Block,
-                worst,
-                limits.max_block_bytes,
-            ));
+            debug_assert!(
+                token_bytes > TOKEN_ALLOWANCE_BYTES || self.cfg.validate().is_err(),
+                "a request that passed ingress needs {worst} bytes of an empty block of {}",
+                limits.max_block_bytes
+            );
+            return Err(Error::internal(format!(
+                "the request's worst case in one block, {worst} bytes, exceeds \
+                 max_block_bytes ({}), which the configuration bounds it by",
+                limits.max_block_bytes
+            )));
         }
         let mut bytes = fixed;
         let mut new_series = Vec::new();
@@ -945,18 +952,19 @@ mod tests {
         assert!((0..stamps.len()).all(|i| stamps.value(i) == SEAL_AT_US));
     }
 
-    /// Scenario: a request whose reservation alone exceeds `max_block_bytes`, offered to an empty block.
-    /// Guarantees: refused permanently as `RequestTooLarge`, and the empty block is left untouched.
+    /// Scenario: a request under the default configuration whose completion token alone is as
+    /// large as a block, offered to an empty block.
+    /// Guarantees: an internal error, never a permanent refusal, and the empty block is left
+    /// untouched.
     #[test]
-    fn oversize_request_is_refused_by_an_empty_block() {
-        let mut cfg = LakeConfig::default();
-        cfg.ingress.max_block_bytes = 1;
+    fn a_request_missing_an_empty_block_is_an_internal_error() {
+        let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
         let block = Block::new(0, 1, cfg.clone());
-        let e = extracted(&LakeConfig::default(), "h", 4);
+        let e = extracted(&cfg, "h", 4);
         assert!(matches!(
-            block.reserve(&e, &mut cache, 16),
-            Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
+            block.reserve(&e, &mut cache, cfg.ingress.max_block_bytes),
+            Err(Error::Internal(_))
         ));
         assert_eq!(block.bytes, 0);
         assert_eq!(block.request_count(), 0);
@@ -966,7 +974,7 @@ mod tests {
 
     /// Scenario: one request against an empty block, cold and fully committed cache, with and
     /// without reemit, one byte under and exactly at its worst case.
-    /// Guarantees: every combination is refused one byte short and admitted at the worst case.
+    /// Guarantees: every combination fails one byte short and is admitted at the worst case.
     #[test]
     fn a_request_is_decided_alike_cold_and_warm() {
         let cfg = LakeConfig::default();
@@ -997,10 +1005,7 @@ mod tests {
                         );
                     } else {
                         assert!(
-                            matches!(
-                                outcome,
-                                Err(Error::Refused(RefuseReason::RequestTooLarge(_)))
-                            ),
+                            matches!(outcome, Err(Error::Internal(_))),
                             "limit {limit}, reemit {reemit}: {outcome:?}"
                         );
                     }
@@ -1054,7 +1059,7 @@ mod tests {
     /// Scenario: logs and metrics requests of one and many series, with and without a denormalized
     /// column, against an empty block and a cold cache.
     /// Guarantees: `reserve` charges exactly the worst case documented on
-    /// `LakeConfig::series_row_fixed_bytes` (1352 and 2120 fixed bytes per series).
+    /// `LakeConfig::series_row_fixed_bytes` (232 and 328 fixed bytes per series).
     #[test]
     fn the_documented_worst_case_block_cost_is_what_reserve_charges() {
         use crate::canonical::Signal;
@@ -1067,12 +1072,9 @@ mod tests {
             ty: crate::config::DenormType::String,
         }];
         let defaults = LakeConfig::default();
-        assert_eq!(defaults.series_row_fixed_bytes(Signal::Logs), 1352);
-        assert_eq!(defaults.series_row_fixed_bytes(Signal::Metrics), 2120);
-        assert_eq!(
-            denormalized.series_row_fixed_bytes(Signal::Logs),
-            1352 + 128
-        );
+        assert_eq!(defaults.series_row_fixed_bytes(Signal::Logs), 232);
+        assert_eq!(defaults.series_row_fixed_bytes(Signal::Metrics), 328);
+        assert_eq!(denormalized.series_row_fixed_bytes(Signal::Logs), 232 + 16);
 
         let mut cases: Vec<(LakeConfig, usize, Signal, Extracted)> = Vec::new();
         for cfg in [defaults.clone(), denormalized] {
@@ -1097,7 +1099,7 @@ mod tests {
                 + token
                 + e.descriptors
                     .iter()
-                    .map(|d| 2 * (d.approx_bytes - d.decoded_bytes) + 128 * columns + 8 + q)
+                    .map(|d| 2 * (d.approx_bytes - d.decoded_bytes) + 16 * columns + 8 + q)
                     .sum::<usize>();
             let block = Block::new(0, 1, cfg.clone());
             let reservation = block
@@ -1109,8 +1111,73 @@ mod tests {
             let charged =
                 e.pinned_bytes + e.descriptors.iter().map(|d| d.approx_bytes).sum::<usize>();
             let fixed = cfg.series_row_fixed_bytes(signal);
-            assert_eq!(fixed, 128 * columns + 8 + q);
+            assert_eq!(fixed, 16 * columns + 8 + q);
             assert!(exact <= 2 * charged + token + e.descriptors.len() * fixed);
+        }
+    }
+
+    /// A logs request of `n` records, each its own series through `logger.name`.
+    fn series_logs(n: usize) -> LogsData {
+        let mut data = logs("h", n);
+        for (i, record) in data.resource_logs[0].scope_logs[0]
+            .log_records
+            .iter_mut()
+            .enumerate()
+        {
+            record.attributes = vec![KeyValue {
+                key: "logger.name".into(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(format!("l{i:07}"))),
+                }),
+            }];
+        }
+        data
+    }
+
+    /// Scenario: validated budgets that leave room for exactly 1000 series per request, and
+    /// requests of 1000 and 1001 new series: logs, metrics with a unique attribute per point,
+    /// and logs with a denormalized column.
+    /// Guarantees: every request at the limit passes extraction and fits an empty block; one
+    /// series more is refused at extraction, naming the count and the limit.
+    #[test]
+    fn a_request_at_the_series_limit_fits_an_empty_block() {
+        use crate::config::Denormalize;
+        use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
+        use otel_arrow_dfe_pdata::testing::round_trip::encode_metrics;
+        let mut plain = LakeConfig::default();
+        plain.logs.series_attributes = vec!["logger.name".into()];
+        plain.ingress.max_extracted_bytes = 1 << 20;
+        plain.ingress.max_series_per_request = 1000;
+        let (_, fixed) = plain.max_series_row_fixed_bytes();
+        plain.ingress.max_block_bytes = (2 << 20) + 1000 * fixed + TOKEN_ALLOWANCE_BYTES;
+        let mut denormalized = plain.clone();
+        denormalized.logs.denormalize = vec![
+            serde_json::from_value::<Denormalize>(serde_json::json!("resource.host.id"))
+                .expect("denormalized column"),
+        ];
+        let logs_request = |n| encode_logs(&series_logs(n));
+        let metrics_request = |n| encode_metrics(&gauge_request(n));
+        let cases: [(&LakeConfig, &dyn Fn(usize) -> OtapArrowRecords); 3] = [
+            (&plain, &logs_request),
+            (&plain, &metrics_request),
+            (&denormalized, &logs_request),
+        ];
+        for (cfg, request) in cases {
+            cfg.validate().expect("the budgets hold the bound");
+            let e = extract(&mut request(1000), cfg).expect("extraction accepts the limit");
+            assert_eq!(e.descriptors.len(), 1000);
+            let block = Block::new(0, 1, cfg.clone());
+            let reservation = block
+                .reserve(&e, &mut SeriesCache::new(4096), TOKEN_ALLOWANCE_BYTES)
+                .expect("an empty block takes a request at the limit");
+            assert_eq!(reservation.new_series.len(), 1000);
+            assert!(matches!(
+                extract(&mut request(1001), cfg),
+                Err(Error::Refused(RefuseReason::TooManySeries {
+                    observed: 1001,
+                    limit: 1000
+                }))
+            ));
         }
     }
 

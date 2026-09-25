@@ -14,6 +14,7 @@ fn configuration_maps_and_validates() {
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "storage": {"file": {"base_uri": "/tmp/series-test"}},
         "window": {"interval": "15s", "max_block_bytes": "64MiB"},
+        "ingress": {"max_extracted_bytes": "16MiB"},
         "parquet": {"compression": "zstd"}
     }))
     .expect("valid config");
@@ -26,6 +27,32 @@ fn configuration_maps_and_validates() {
             "upload": {"part_bytes": "1MiB"}
         }))
         .is_err()
+    );
+}
+
+/// Scenario: `ingress.max_series_per_request` unset under the default and under a smaller block
+/// budget, and set explicitly.
+/// Guarantees: unset takes the most series the block budget holds, `(B - 2E - 4KiB) / 328`;
+/// an explicit value is kept.
+#[test]
+fn the_series_limit_defaults_to_what_the_block_budget_holds() {
+    let limit = |doc: serde_json::Value| {
+        let mut doc = doc;
+        doc["storage"] = serde_json::json!({"file": {"base_uri": "/tmp/series-test"}});
+        serde_json::from_value::<Config>(doc)
+            .expect("valid config")
+            .lake
+            .ingress
+            .max_series_per_request
+    };
+    assert_eq!(limit(serde_json::json!({})), 1_393_826);
+    assert_eq!(
+        limit(serde_json::json!({"window": {"max_block_bytes": "100MiB"}})),
+        ((100 << 20) - (64 << 20) - 4096) / 328
+    );
+    assert_eq!(
+        limit(serde_json::json!({"ingress": {"max_series_per_request": 5000}})),
+        5000
     );
 }
 
@@ -395,7 +422,12 @@ fn startup_rejects_invalid_configuration() {
         (
             "window",
             serde_json::json!({"max_block_bytes": "1MiB"}),
-            "window.max_block_bytes must be at least twice ingress.max_extracted_bytes",
+            "window.max_block_bytes (1048576) must hold the worst case of one request",
+        ),
+        (
+            "ingress",
+            serde_json::json!({"max_series_per_request": 2_000_000}),
+            "ingress.max_series_per_request (2000000) * 328 bytes per metrics series",
         ),
         (
             "ingress",

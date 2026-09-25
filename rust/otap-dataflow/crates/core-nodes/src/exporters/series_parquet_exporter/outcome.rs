@@ -39,8 +39,9 @@ pub(super) enum Outcome {
     ExtractedTooLarge,
     /// One row, attribute value or CBOR cell exceeded `ingress.max_row_bytes`.
     RowTooLarge,
-    /// The request's worst case in one block exceeded `window.max_block_bytes`.
-    BlockTooLarge,
+    /// The request carried more distinct series than
+    /// `ingress.max_series_per_request`.
+    TooManySeries,
     /// A nested value exceeded `ingress.max_nesting_depth`.
     TooDeep,
     /// The request's content could not be used.
@@ -63,7 +64,7 @@ impl Outcome {
         Outcome::RequestTooLarge,
         Outcome::ExtractedTooLarge,
         Outcome::RowTooLarge,
-        Outcome::BlockTooLarge,
+        Outcome::TooManySeries,
         Outcome::TooDeep,
         Outcome::Invalid,
         Outcome::Unsupported,
@@ -113,10 +114,6 @@ fn budget_names(budget: lake::SizeBudget) -> (&'static str, &'static str) {
         lake::SizeBudget::Row => ("extracted row", "ingress.max_row_bytes"),
         lake::SizeBudget::Cell => ("attribute value", "ingress.max_row_bytes"),
         lake::SizeBudget::Table => ("decoded attribute table", "ingress.max_extracted_bytes"),
-        lake::SizeBudget::Block => (
-            "worst case in one block, every series written with the request,",
-            "window.max_block_bytes",
-        ),
     }
 }
 
@@ -150,8 +147,8 @@ impl Outcome {
                         Outcome::ExtractedTooLarge
                     }
                     lake::SizeBudget::Row | lake::SizeBudget::Cell => Outcome::RowTooLarge,
-                    lake::SizeBudget::Block => Outcome::BlockTooLarge,
                 },
+                lake::RefuseReason::TooManySeries { .. } => Outcome::TooManySeries,
                 lake::RefuseReason::TooDeep(_) => Outcome::TooDeep,
                 lake::RefuseReason::Unsupported(_) => Outcome::Unsupported,
                 lake::RefuseReason::Invalid(_) => Outcome::Invalid,
@@ -180,7 +177,7 @@ impl Outcome {
             Self::RequestTooLarge
                 | Self::ExtractedTooLarge
                 | Self::RowTooLarge
-                | Self::BlockTooLarge
+                | Self::TooManySeries
                 | Self::TooDeep
                 | Self::Invalid
                 | Self::Unsupported
@@ -202,11 +199,12 @@ impl Outcome {
     pub(super) fn sentence(self) -> &'static str {
         match self {
             Self::Ack => "stored",
-            Self::RequestTooLarge
-            | Self::ExtractedTooLarge
-            | Self::RowTooLarge
-            | Self::BlockTooLarge => {
+            Self::RequestTooLarge | Self::ExtractedTooLarge | Self::RowTooLarge => {
                 "the request exceeds a series_parquet size budget; split the batch upstream"
+            }
+            Self::TooManySeries => {
+                "the request carries more distinct series than ingress.max_series_per_request; \
+                 split the batch upstream or raise the limit"
             }
             Self::TooDeep => {
                 "the request nests values deeper than ingress.max_nesting_depth; flatten them \
@@ -244,6 +242,13 @@ impl Outcome {
             }
             lake::Error::Refused(lake::RefuseReason::Unsupported(what)) => {
                 NotStored(what).to_string()
+            }
+            lake::Error::Refused(lake::RefuseReason::TooManySeries { observed, limit }) => {
+                format!(
+                    "request carries at least {observed} distinct series, more than \
+                     ingress.max_series_per_request ({limit}); split the batch upstream or raise \
+                     the limit"
+                )
             }
             lake::Error::Refused(lake::RefuseReason::TooDeep(limit)) => TooDeep(*limit).to_string(),
             lake::Error::Refused(lake::RefuseReason::Invalid(detail)) => {
@@ -427,13 +432,12 @@ mod tests {
     use super::*;
 
     /// Every size budget a refusal can name, in declaration order.
-    const BUDGETS: [lake::SizeBudget; 6] = [
+    const BUDGETS: [lake::SizeBudget; 5] = [
         lake::SizeBudget::Request,
         lake::SizeBudget::Extracted,
         lake::SizeBudget::Row,
         lake::SizeBudget::Cell,
         lake::SizeBudget::Table,
-        lake::SizeBudget::Block,
     ];
 
     /// Scenario: one error of every lake refusal reason and of each non-refusal class.
@@ -458,7 +462,6 @@ mod tests {
                     lake::SizeBudget::Row | lake::SizeBudget::Cell => {
                         (Outcome::RowTooLarge, "row_too_large")
                     }
-                    lake::SizeBudget::Block => (Outcome::BlockTooLarge, "block_too_large"),
                 };
                 (
                     lake::Error::too_large(budget, 2, 1),
@@ -470,6 +473,16 @@ mod tests {
             })
             .collect();
         table.extend([
+            (
+                lake::Error::Refused(lake::RefuseReason::TooManySeries {
+                    observed: 11,
+                    limit: 10,
+                }),
+                Outcome::TooManySeries,
+                NackCause::Refused,
+                true,
+                "too_many_series",
+            ),
             (
                 lake::Error::Refused(lake::RefuseReason::TooDeep(32)),
                 Outcome::TooDeep,
@@ -569,10 +582,7 @@ mod tests {
             assert_eq!(got.label(), *label, "{error:?}");
             let sized = matches!(
                 outcome,
-                Outcome::RequestTooLarge
-                    | Outcome::ExtractedTooLarge
-                    | Outcome::RowTooLarge
-                    | Outcome::BlockTooLarge
+                Outcome::RequestTooLarge | Outcome::ExtractedTooLarge | Outcome::RowTooLarge
             );
             assert_eq!(excess(error).is_some(), sized, "{error:?}");
         }
@@ -624,8 +634,11 @@ mod tests {
                 "decoded attribute table of 10 bytes exceeds ingress.max_extracted_bytes (5 bytes); split the batch upstream or raise the limit",
             ),
             (
-                sized(lake::SizeBudget::Block, Some(10)),
-                "worst case in one block, every series written with the request, of 10 bytes exceeds window.max_block_bytes (5 bytes); split the batch upstream or raise the limit",
+                refused(lake::RefuseReason::TooManySeries {
+                    observed: 11,
+                    limit: 10,
+                }),
+                "request carries at least 11 distinct series, more than ingress.max_series_per_request (10); split the batch upstream or raise the limit",
             ),
             (
                 refused(lake::RefuseReason::Unsupported("traces".into())),

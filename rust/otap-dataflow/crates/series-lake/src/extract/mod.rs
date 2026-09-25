@@ -90,9 +90,9 @@ impl DescriptorRow {
     }
 }
 
-/// Bytes a block charges per series cell for builder growth, offsets and
-/// validity.
-pub(crate) const SERIES_CELL_BYTES: usize = 64;
+/// Bytes a block charges per series cell beyond its content: a value or
+/// offset slot and its validity bit.
+pub(crate) const SERIES_CELL_BYTES: usize = 8;
 
 /// Bytes a block charges per series row beyond its cells.
 pub(crate) const SERIES_ROW_BYTES: usize = 8;
@@ -101,8 +101,32 @@ pub(crate) const SERIES_ROW_BYTES: usize = 8;
 /// `content` bytes: twice content and cell overhead, the headroom of a
 /// builder that doubles, plus [`SERIES_ROW_BYTES`]. Decoded attribute trees
 /// die at admission and are not part of `content`.
+///
+/// Measured by `measurement --series-cost` (`series_row_cost` in
+/// `docs/superpowers/reports/series-parquet-measurement/memory-strict-f001.json`,
+/// DHAT, requests of 1000 to 100,000 minimal new series): a series row holds
+/// 342-365 bytes of heap for logs and 405-428 for metrics, pending entry
+/// included, of which at most 59 lie beyond its content estimate, and a
+/// denormalized column adds 1-10 bytes. The series merge key adds about 30
+/// bytes per row. A minimal row is charged 844 bytes for logs and 1076 for
+/// metrics, at least 2.1 times its measured heap and merge key; the fixed part
+/// alone (`LakeConfig::series_row_fixed_bytes`, 232 and 328 bytes) is at
+/// least 2.6 times the part beyond content.
 pub(crate) fn series_row_charge(content: usize, columns: usize) -> usize {
     2 * (content + columns * SERIES_CELL_BYTES) + SERIES_ROW_BYTES
+}
+
+/// Refuse a request once its distinct series, `series` counting the one
+/// about to be added, pass `ingress.max_series_per_request`.
+pub(crate) fn check_series_count(series: usize, cfg: &LakeConfig) -> Result<()> {
+    let limit = cfg.ingress.max_series_per_request;
+    if series > limit {
+        return Err(Error::Refused(RefuseReason::TooManySeries {
+            observed: series,
+            limit,
+        }));
+    }
+    Ok(())
 }
 
 /// The resource or scope attribute lists of one request, decoded once per

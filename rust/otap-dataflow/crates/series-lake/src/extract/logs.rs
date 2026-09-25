@@ -200,6 +200,7 @@ pub(crate) fn extract_logs(
                 let identified = identity(&descriptor);
                 let id = identified.1;
                 if seen.insert(id) {
+                    super::check_series_count(seen.len(), cfg)?;
                     descriptors.push(descriptor_row(
                         descriptor,
                         identified,

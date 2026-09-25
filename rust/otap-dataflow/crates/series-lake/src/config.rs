@@ -268,6 +268,9 @@ pub struct IngressLimits {
     pub max_block_bytes: usize,
     /// Ack tokens (requests) one block may hold.
     pub max_requests_per_block: usize,
+    /// Distinct series one request may carry; see
+    /// [`LakeConfig::check_request_bound`] for the bound it keeps.
+    pub max_series_per_request: usize,
     /// Fixed bytes charged per `pending_series` entry.
     #[serde(deserialize_with = "byte_size")]
     pub pending_series_entry_bytes: usize,
@@ -282,10 +285,24 @@ impl Default for IngressLimits {
             max_nesting_depth: 32,
             max_block_bytes: 500 << 20,
             max_requests_per_block: 4096,
+            max_series_per_request: DEFAULT_MAX_SERIES_PER_REQUEST,
             pending_series_entry_bytes: 64,
         }
     }
 }
+
+/// Default `ingress.max_series_per_request`: what
+/// [`LakeConfig::derived_max_series_per_request`] gives for the default
+/// budgets (1,393,826), rounded down so that the defaults stay valid with up
+/// to eight denormalized columns per signal.
+pub const DEFAULT_MAX_SERIES_PER_REQUEST: usize = 1_000_000;
+
+/// The completion token bytes one request's block worst case allows for.
+///
+/// The token is the request's routing context; measured tokens hold 200 to
+/// 464 bytes. A larger one can only make a request that passed ingress miss
+/// an empty block, which block admission reports as an internal failure.
+pub const TOKEN_ALLOWANCE_BYTES: usize = 4 << 10;
 
 /// Sorting configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -469,21 +486,93 @@ impl LakeConfig {
             .div_ceil(self.upload.part_bytes.max(1))
     }
 
-    /// The fixed bytes a block charges per series row, pending entry
-    /// included: `128 * C + 8 + Q`, with C the series columns and Q
-    /// `pending_series_entry_bytes`.
+    /// The fixed bytes F a block charges per series row, pending entry
+    /// included: `16 * C + 8 + Q`, with C the series columns and Q
+    /// `pending_series_entry_bytes`; `extract::series_row_charge` has the
+    /// measurement behind it.
     ///
     /// `Block::reserve` judges a request on exactly
-    /// `P + T + sum_i (2 * (A_i - D_i) + series_row_fixed_bytes)`: P the
-    /// request's values bytes, T its token, A_i a series' extracted estimate
-    /// and D_i its decoded attribute trees. That never exceeds the upper bound
-    /// `2 * E + T + S * series_row_fixed_bytes`, E the request's extracted
-    /// charge and S its number of series. Validation covers the `2 * E` term
-    /// only (see [`LakeConfig::validate`]); the rest is decided per request.
+    /// `P + T + sum_i (2 * (A_i - D_i) + F)`: P the request's values bytes, T
+    /// its token, A_i a series' extracted estimate and D_i its decoded
+    /// attribute trees. That never exceeds `2 * E + T + S * F`, E the
+    /// request's extracted charge and S its number of series, which
+    /// [`LakeConfig::check_request_bound`] keeps within `max_block_bytes`.
     #[must_use]
     pub fn series_row_fixed_bytes(&self, signal: crate::canonical::Signal) -> usize {
         crate::extract::series_row_charge(0, self.series_columns(signal))
             + self.ingress.pending_series_entry_bytes
+    }
+
+    /// The larger [`LakeConfig::series_row_fixed_bytes`] of the two signals,
+    /// with the signal it belongs to.
+    #[must_use]
+    pub fn max_series_row_fixed_bytes(&self) -> (crate::canonical::Signal, usize) {
+        use crate::canonical::Signal;
+        let logs = self.series_row_fixed_bytes(Signal::Logs);
+        let metrics = self.series_row_fixed_bytes(Signal::Metrics);
+        if logs > metrics {
+            (Signal::Logs, logs)
+        } else {
+            (Signal::Metrics, metrics)
+        }
+    }
+
+    /// The most series per request that keep one request's worst case
+    /// within an empty block: `(B - 2 * E - T) / F_max`, with B
+    /// `max_block_bytes`, E `max_extracted_bytes`, T
+    /// [`TOKEN_ALLOWANCE_BYTES`] and F_max from
+    /// [`LakeConfig::max_series_row_fixed_bytes`]. Zero when the budgets
+    /// leave no room for a series.
+    #[must_use]
+    pub fn derived_max_series_per_request(&self) -> usize {
+        let (_, fixed) = self.max_series_row_fixed_bytes();
+        self.ingress
+            .max_block_bytes
+            .saturating_sub(self.ingress.max_extracted_bytes.saturating_mul(2))
+            .saturating_sub(TOKEN_ALLOWANCE_BYTES)
+            / fixed.max(1)
+    }
+
+    /// Refuse budgets under which a request that passes ingress might not
+    /// fit an empty block: `2 * E + S * F_max + T <= B`, with S
+    /// `max_series_per_request` and the other terms as in
+    /// [`LakeConfig::derived_max_series_per_request`].
+    ///
+    /// The `2 * E` term covers a request's values rows and its series rows at
+    /// twice their extracted estimate, `S * F_max` the fixed part of every
+    /// series row, and T its completion token. `block_key` is the name the
+    /// caller's users write for `max_block_bytes`.
+    ///
+    /// # Errors
+    /// Returns an invalid-configuration error that names every term.
+    pub fn check_request_bound(&self, block_key: &str) -> Result<()> {
+        let limits = &self.ingress;
+        if limits.max_series_per_request == 0 {
+            return Err(Error::invalid(
+                "ingress.max_series_per_request must be at least 1",
+            ));
+        }
+        let (signal, fixed) = self.max_series_row_fixed_bytes();
+        let extracted = limits.max_extracted_bytes.saturating_mul(2);
+        let series = limits.max_series_per_request.saturating_mul(fixed);
+        let worst = extracted
+            .saturating_add(series)
+            .saturating_add(TOKEN_ALLOWANCE_BYTES);
+        if worst <= limits.max_block_bytes {
+            return Ok(());
+        }
+        let signal = match signal {
+            crate::canonical::Signal::Logs => "logs",
+            crate::canonical::Signal::Metrics => "metrics",
+        };
+        Err(Error::invalid(format!(
+            "{block_key} ({}) must hold the worst case of one request, {worst} bytes: \
+             2 * ingress.max_extracted_bytes ({extracted}) + ingress.max_series_per_request \
+             ({}) * {fixed} bytes per {signal} series ({series}) + {TOKEN_ALLOWANCE_BYTES} \
+             bytes of completion token; raise {block_key}, or lower \
+             ingress.max_extracted_bytes or ingress.max_series_per_request",
+            limits.max_block_bytes, limits.max_series_per_request,
+        )))
     }
 
     /// Columns of the series dataset of `signal` under this configuration.
@@ -551,16 +640,7 @@ impl LakeConfig {
                 "ingress.max_requests_per_block must be at least 1",
             ));
         }
-        // Covers the doubled series-row term of a request's worst case; the
-        // per-series fixed term is decided per request (see
-        // `series_row_fixed_bytes`).
-        if self.ingress.max_block_bytes / 2 < self.ingress.max_extracted_bytes {
-            return Err(Error::invalid(
-                "ingress.max_block_bytes must be at least twice ingress.max_extracted_bytes, \
-                 because a request's series rows may take up to twice their extracted size in \
-                 a block",
-            ));
-        }
+        self.check_request_bound("ingress.max_block_bytes")?;
         // The window boundary arithmetic and the `window_secs` file metadata
         // both work in whole seconds.
         if self.window_interval.subsec_nanos() != 0 || self.window_interval.as_secs() == 0 {
@@ -738,18 +818,81 @@ mod tests {
         }
     }
 
-    /// Scenario: `max_block_bytes` one byte below, and exactly at, twice `max_extracted_bytes`.
-    /// Guarantees: the first is refused and the second accepted.
+    /// Scenario: `max_block_bytes` exactly at, and one byte below, one request's worst case
+    /// `2 * E + S * F_max + T`, and a series limit of zero.
+    /// Guarantees: the first is accepted; the others are refused, the short block with every
+    /// term of the inequality.
     #[test]
-    fn max_block_bytes_below_twice_extracted_is_rejected() {
+    fn max_block_bytes_below_one_requests_worst_case_is_rejected() {
         let mut cfg = LakeConfig::default();
-        cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes - 1;
+        cfg.ingress.max_series_per_request = 1000;
+        let worst = 2 * cfg.ingress.max_extracted_bytes + 1000 * 328 + TOKEN_ALLOWANCE_BYTES;
+        cfg.ingress.max_block_bytes = worst;
+        cfg.validate().expect("exactly the worst case is enough");
+        cfg.ingress.max_block_bytes = worst - 1;
         let err = cfg
             .validate()
-            .expect_err("max_block_bytes < 2 * max_extracted_bytes");
-        assert!(rule(&err).contains("at least twice ingress.max_extracted_bytes"));
-        cfg.ingress.max_block_bytes = 2 * cfg.ingress.max_extracted_bytes;
-        cfg.validate().expect("exactly twice is enough");
+            .expect_err("one byte short of the worst case");
+        assert_eq!(
+            rule(&err),
+            format!(
+                "ingress.max_block_bytes ({}) must hold the worst case of one request, {worst} \
+                 bytes: 2 * ingress.max_extracted_bytes (67108864) + \
+                 ingress.max_series_per_request (1000) * 328 bytes per metrics series (328000) \
+                 + 4096 bytes of completion token; raise ingress.max_block_bytes, or lower \
+                 ingress.max_extracted_bytes or ingress.max_series_per_request",
+                worst - 1
+            )
+        );
+        cfg.ingress.max_series_per_request = 0;
+        cfg.ingress.max_block_bytes = worst;
+        let err = cfg.validate().expect_err("no series per request");
+        assert_eq!(
+            rule(&err),
+            "ingress.max_series_per_request must be at least 1"
+        );
+    }
+
+    /// Scenario: the default budgets, eight denormalized columns per signal, seven on logs
+    /// alone, and a block of exactly twice the extraction budget.
+    /// Guarantees: the default series limit is the derived one rounded down and stays valid with
+    /// eight denormalized columns, F_max follows the widest signal, and a block with no room left
+    /// for a series derives zero.
+    #[test]
+    fn the_series_limit_is_derived_from_the_budgets() {
+        use crate::canonical::Signal;
+        let columns = |n: usize| -> Vec<Denormalize> {
+            (0..n)
+                .map(|i| Denormalize {
+                    path: format!("resource.k{i}"),
+                    column: format!("k{i}"),
+                    ty: DenormType::String,
+                })
+                .collect()
+        };
+        let defaults = LakeConfig::default();
+        assert_eq!(defaults.derived_max_series_per_request(), 1_393_826);
+        assert_eq!(
+            defaults.max_series_row_fixed_bytes(),
+            (Signal::Metrics, 328)
+        );
+        defaults.validate().expect("the defaults hold the bound");
+        let mut denormalized = LakeConfig::default();
+        denormalized.logs.denormalize = columns(8);
+        denormalized.metrics.denormalize = columns(8);
+        assert!(denormalized.derived_max_series_per_request() >= DEFAULT_MAX_SERIES_PER_REQUEST);
+        denormalized
+            .validate()
+            .expect("eight denormalized columns keep the defaults valid");
+        let mut wide = LakeConfig::default();
+        wide.logs.denormalize = columns(7);
+        assert_eq!(
+            wide.max_series_row_fixed_bytes(),
+            (Signal::Logs, 232 + 7 * 16)
+        );
+        let mut tight = LakeConfig::default();
+        tight.ingress.max_block_bytes = 2 * tight.ingress.max_extracted_bytes;
+        assert_eq!(tight.derived_max_series_per_request(), 0);
     }
 
     /// Scenario: `upload.part_bytes` at the S3 maximum part size and one byte above.

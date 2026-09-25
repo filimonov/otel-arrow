@@ -263,6 +263,7 @@ impl Common<'_> {
         let identified = identity(&d);
         let id = identified.1;
         if self.seen.insert(id) {
+            super::check_series_count(self.seen.len(), self.cfg)?;
             let dr = descriptor_row(
                 d,
                 identified,
