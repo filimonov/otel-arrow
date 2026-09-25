@@ -47,6 +47,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import unittest
@@ -3938,3 +3939,136 @@ def run_failures(output_dir, report_dir=None, *, family="s3", faults=None, topol
                 for _cell, run_id in sorted(cells.items())]
     return command.write_index(f"failure-{family}", output_dir, report_dir, children,
                                publishable=True, purposes=reasons)
+
+
+# --------------------------------------------------------------------------
+# Re-judging published fault cases
+# --------------------------------------------------------------------------
+
+FAULT_REJUDGE_RULES = {
+    "duplicates_explained": "strict: every duplicated record belongs to a resent request; "
+    "buffered: every duplicated record has a copy in a values file of a failed block",
+    "fault_observed": "store_outage: a flush.failed event of class deadline logged at least "
+    "the flush deadline after arming and before the fault was removed",
+}
+
+
+def archived_engine_log(archive_dir, run_id):
+    """The engine log a run's raw archive keeps, as text, or None."""
+    path = Path(archive_dir) / f"{run_id}.tgz"
+    if not path.is_file():
+        return None
+    with tarfile.open(path) as archive:
+        for member in archive.getmembers():
+            if member.name.endswith("engine-1/engine.log"):
+                return archive.extractfile(member).read().decode(errors="replace")
+    return None
+
+
+def rejudge_fault_checks(result, archive_dir) -> list:
+    """Each fault check whose verdict the current rules change, from stored evidence.
+
+    Returns one entry per re-judged check: its recorded and re-judged status
+    (None when the stored evidence cannot decide it) and the reason.
+    """
+    fault = result["observations"]["fault"]
+    buffered = result["config"]["requested"]["topology"] == "buffered"
+    statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
+    verdicts = []
+    duplicates = dict(fault.get("duplicates") or {})
+    if buffered and "duplicated_outside_failed_blocks_records" not in duplicates \
+            and duplicates.get("duplicated_records") == 0:
+        duplicates["duplicated_outside_failed_blocks_records"] = 0
+    if buffered and "duplicated_outside_failed_blocks_records" not in duplicates:
+        verdicts.append({"check": "duplicates_explained", "recorded": statuses.get(
+            "duplicates_explained"), "rejudged": None,
+            "reason": "buffered duplicates were stored without their failed-block copies"})
+    else:
+        explained, why = duplicates_explained(buffered, duplicates)
+        verdicts.append({"check": "duplicates_explained",
+                         "recorded": statuses.get("duplicates_explained"),
+                         "rejudged": measurement.STATUS_PASSED if explained
+                         else measurement.STATUS_FAILED, "reason": why})
+    if fault["fault"] == "store_outage":
+        states = {state["state"]: state["unix_s"] for state in fault["states"]}
+        failures = (fault.get("engine_events") or {}).get("flush_failures")
+        source = "the run file"
+        if failures is None:
+            text = archived_engine_log(archive_dir, result["run_id"])
+            failures = flush_failures(text.splitlines()) if text is not None else None
+            source = "the archived engine log"
+        deadline = duration_s(exporter_settings(result["config"]["effective"])["window"]
+                              ["flush_retry_deadline"])
+        if failures is None or "armed" not in states:
+            verdicts.append({"check": "fault_observed", "recorded": statuses.get(
+                "fault_observed"), "rejudged": None, "reason": "no engine log was kept"})
+        else:
+            end = states.get("fault_removed", float("inf"))
+            timed = [round(entry["unix_s"] - states["armed"], 3) for entry in failures
+                     if entry["unix_s"] <= end]
+            proven = [round(entry["unix_s"] - states["armed"], 3) for entry in failures
+                      if entry["error_type"] == "deadline" and entry["unix_s"] <= end
+                      and entry["unix_s"] >= states["armed"] + deadline]
+            verdicts.append({
+                "check": "fault_observed", "recorded": statuses.get("fault_observed"),
+                "rejudged": measurement.STATUS_PASSED if proven and statuses.get(
+                    "fault_observed") == measurement.STATUS_PASSED
+                else measurement.STATUS_FAILED,
+                "reason": f"flush failures {timed} s after arming ({source}); a deadline "
+                f"failure at or after {deadline} s: {proven or 'none'} before the fault was "
+                f"removed at {round(end - states['armed'], 3)} s"})
+    return verdicts
+
+
+def rejudge_failure_index(index_name, output_dir, archive_dir=FAULT_ARCHIVE_DIR,
+                          report_dir=None) -> dict:
+    """Advance a published fault-case index to the current fault checks.
+
+    Every run file is re-judged from what it stored and its raw archive
+    (`rejudge_fault_checks`); nothing is rerun and no run file changes. The
+    advanced index records every verdict that changed, every check the
+    evidence could not decide and the rules, and keeps the index it replaces
+    as an immutable child.
+    """
+    report_dir = measurement.resolve_report_dir(report_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    index = json.loads((report_dir / measurement.safe_json_name(index_name)).read_text(
+        encoding="ascii"))
+    changes, unjudged, rejudged_failed = [], [], {}
+    for entry in index.get("run_files", []):
+        result = json.loads((report_dir / entry["name"]).read_text(encoding="ascii"))
+        failed = {check["name"] for check in result["checks"]
+                  if check["kind"] == measurement.CHECK_HARD
+                  and check["status"] != measurement.STATUS_PASSED}
+        for verdict in rejudge_fault_checks(result, archive_dir):
+            if verdict["rejudged"] is None:
+                unjudged.append(dict(verdict, run_id=result["run_id"]))
+                continue
+            if verdict["rejudged"] == measurement.STATUS_PASSED:
+                failed.discard(verdict["check"])
+            else:
+                failed.add(verdict["check"])
+            if verdict["rejudged"] != verdict["recorded"]:
+                changes.append(dict(verdict, run_id=result["run_id"]))
+        status = measurement.STATUS_FAILED if failed else measurement.STATUS_PASSED
+        rejudged_failed[result["run_id"]] = sorted(failed)
+        for change in changes:
+            if change["run_id"] == result["run_id"]:
+                change["run_status_recorded"] = result["status"]
+                change["run_status_rejudged"] = status
+    advanced = json.loads(json.dumps(index))
+    for child in advanced.get("children", []):
+        child["rejudged_failed_checks"] = rejudged_failed.get(child["run_id"])
+    advanced["fault_rejudgement"] = {"rules": FAULT_REJUDGE_RULES,
+                                     "verdict_changes": changes, "not_rejudged": unjudged}
+    for name in {entry["name"] for entry in advanced.get("baseline_files", [])}:
+        if not (output_dir / name).is_file():
+            _ = shutil.copyfile(report_dir / name, output_dir / name)
+    previous = measurement.archive_published_index(index_name, output_dir, report_dir)
+    advanced["child_indexes"] = [previous] if previous else []
+    advanced["started_utc"] = measurement.utc_now()
+    path = measurement.write_result(output_dir / measurement.safe_json_name(index_name),
+                                    advanced)
+    _ = measurement.publish_result_tree(path, report_dir)
+    return advanced

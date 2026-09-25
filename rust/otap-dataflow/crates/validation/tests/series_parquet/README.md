@@ -652,6 +652,14 @@ engine and the baseline), `purposes={"cell": "why"}` for a
 rerun, `archive_dir`, `lease_wait_s` and `report_dir`. The family state
 (`failures-state.json`) keeps each cell's latest run, which the index lists.
 
+`measure rejudge-failures --index failure-s3.json --output-dir DIR --option
+archive_dir=DIR` advances a published index to the current fault checks
+from the stored runs and their raw archives (the engine log carries each
+flush failure's time and class), without rerunning anything or changing a
+run file: the advanced index records every changed verdict and every check
+the evidence cannot decide (`fault_rejudgement`), each child's re-judged
+failed checks, and keeps the index it replaces as a child.
+
 The remaining subcommands (`buffered`, `remediate`, `report`) are named
 here so the command line is one contract; each is implemented by its own
 task.

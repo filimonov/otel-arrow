@@ -1352,6 +1352,13 @@ def build_parser() -> argparse.ArgumentParser:
     _ = failures.add_argument("--family", required=True, choices=["s3"])
     _ = failures.add_argument("--output-dir", required=True, type=Path)
     _ = failures.add_argument("--option", action="append", default=[])
+    rejudge_failures = sub.add_parser(
+        "rejudge-failures",
+        help="advance a published fault-case index to the current fault checks, from stored runs",
+    )
+    _ = rejudge_failures.add_argument("--index", required=True)
+    _ = rejudge_failures.add_argument("--output-dir", required=True, type=Path)
+    _ = rejudge_failures.add_argument("--option", action="append", default=[])
     preflight = sub.add_parser(
         "fault-preflight",
         help="probe the disposable fault tools and record fault-preflight.json",
@@ -1423,6 +1430,20 @@ def main(argv=None) -> int:
         return 0
     if arguments.command == "fault-preflight":
         return fault_preflight(arguments)
+    if arguments.command == "rejudge-failures":
+        try:
+            from . import faults
+        except ImportError:
+            import faults
+        options = parse_options(arguments.option)
+        advanced = faults.rejudge_failure_index(arguments.index, arguments.output_dir,
+                                                **options)
+        block = advanced["fault_rejudgement"]
+        sys.stderr.write(
+            f"{arguments.index}: changes "
+            f"{json.dumps([(c['run_id'], c['check'], c['recorded'], c['rejudged']) for c in block['verdict_changes']])}; "
+            f"not re-judged {json.dumps([(u['run_id'], u['check']) for u in block['not_rejudged']])}\n")
+        return 0
     if arguments.command == "failures":
         try:
             from . import faults

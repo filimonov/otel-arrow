@@ -1185,6 +1185,43 @@ class FaultCaseContracts(unittest.TestCase):
         self.assertEqual([entry["file"] for entry in faults.flush_failures(tail.lines())],
                          ["p-5.parquet"])
 
+    # Scenario: stored outage runs are re-judged; one's only deadline failure
+    # was logged 59.5 s after arming, another's 64.6 s, and a buffered run
+    # stored duplicates without their failed-block copies.
+    # Guarantees: re-judging fails the first fault_observed, keeps the second,
+    # and reports the undecidable duplicates as not re-judged, never passed.
+    def test_rejudge_outage_runs_from_stored_evidence(self):
+        def run(failure_after_s, topology="strict", duplicated=0):
+            armed = 1790291290.0
+            return {
+                "run_id": "r", "config": {"requested": {"topology": topology}, "effective": {
+                    "groups": {"default": {"pipelines": {"main": {"nodes": {"exporter": {
+                        "config": {"window": {"flush_retry_deadline": "60s"}}}}}}}}}},
+                "checks": [measurement.check(name, measurement.CHECK_HARD,
+                                             measurement.STATUS_PASSED)
+                           for name in faults.FAULT_CHECKS],
+                "observations": {"fault": {
+                    "fault": "store_outage",
+                    "states": [{"state": "armed", "unix_s": armed},
+                               {"state": "fault_removed", "unix_s": armed + 66}],
+                    "duplicates": {"duplicated_records": duplicated,
+                                   "duplicated_outside_resent_requests_records": 0},
+                    "engine_events": {"flush_failures": [{
+                        "unix_s": armed + failure_after_s, "error_type": "deadline",
+                        "window_start_unix_s": int(armed) - 5, "file": "p.parquet"}]}}}}
+
+        def verdict(result, name):
+            return next(entry for entry in faults.rejudge_fault_checks(result, "/nonexistent")
+                        if entry["check"] == name)
+
+        self.assertEqual(verdict(run(59.5), "fault_observed")["rejudged"],
+                         measurement.STATUS_FAILED)
+        self.assertEqual(verdict(run(64.6), "fault_observed")["rejudged"],
+                         measurement.STATUS_PASSED)
+        self.assertEqual(verdict(run(64.6, "buffered"), "duplicates_explained")["rejudged"],
+                         measurement.STATUS_PASSED)
+        self.assertIsNone(verdict(run(64.6, "buffered", 10), "duplicates_explained")["rejudged"])
+
     # Scenario: each fault's intended condition is judged from partial evidence.
     # Guarantees: a 503 or an outage counts only with the exporter's nack and
     # its retry (an outage also past the flush deadline), and slow storage
