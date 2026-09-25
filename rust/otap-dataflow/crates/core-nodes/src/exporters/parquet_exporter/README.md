@@ -82,6 +82,12 @@ nodes:
           base_uri: https://account.blob.core.windows.net/container/prefix
 ```
 
+Azure storage also takes an optional `endpoint`, the blob service URL to use
+instead of the one the account in `base_uri` implies, for a private endpoint,
+a sovereign cloud or the Azurite emulator
+(`endpoint: https://127.0.0.1:10000/devstoreaccount1`). `base_uri` still names
+the account, container and prefix, and only HTTPS is used.
+
 ## Examples
 
 Partition by schema metadata:
