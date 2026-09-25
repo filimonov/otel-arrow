@@ -728,8 +728,16 @@ class Case:
                 local = self.work / "store"
                 store.download(local)
                 self.result["object_inventory_count"] = len(self.sampler.objects)
-                self.oracle = measurement.run_pinned(STORE_CPUS, self.read_back, local)
-                self.settle()
+                try:
+                    self.oracle = measurement.run_pinned(STORE_CPUS, self.read_back, local)
+                    self.settle()
+                except BaseException:
+                    # The stored objects outlive a failed judgement, to be read again.
+                    kept = self.work.parent / f"kept-{self.work.name}"
+                    shutil.move(str(local), str(kept))
+                    print(f"read-back failed; the downloaded store is kept in {kept}",
+                          flush=True)
+                    raise
         finally:
             lease.release()
             self.archive_raw()
@@ -814,7 +822,10 @@ class Case:
                 shutil.copy(self.work / "engine" / "pipeline.yaml", self.archive / "pipeline.yaml")
             (self.archive / "samples.json").write_text(json.dumps({
                 "engine": self.sampler.engine_samples, "alloy": self.sampler.alloy_samples,
-                "objects": self.sampler.objects, "events": self.events}))
+                "objects": self.sampler.objects, "events": self.events,
+                "final_alloy": getattr(self, "final_alloy", None),
+                "final_buckets": getattr(self, "final_buckets", None),
+                "uploads": getattr(self, "uploads", None)}, default=str))
             if (self.work / "feeder.json").is_file():
                 shutil.copy(self.work / "feeder.json", self.archive / "feeder.json")
 
@@ -1324,6 +1335,7 @@ def read_back(root, written, body_bytes=BODY_BYTES, *, database=None) -> dict:
         if database:
             db.execute(f"SET temp_directory = {test_e2e.sql_string(str(database) + '.tmp')}")
             db.execute(f"SET memory_limit = '{READ_BACK_MEMORY}'")
+            db.execute("SET preserve_insertion_order = false")
         db.execute(f"CREATE TABLE v AS SELECT producer_id, {prod} AS p, {seq} AS s, "
                    f"({well}) AS ok, filename FROM {values}")
         rows = db.execute("""
@@ -1331,10 +1343,15 @@ def read_back(root, written, body_bytes=BODY_BYTES, *, database=None) -> dict:
             FROM v WHERE ok GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
         malformed = db.execute("SELECT count(*) FROM v WHERE NOT ok").fetchone()[0]
         total = db.execute("SELECT count(*) FROM v").fetchone()[0]
+        # The duplicated keys first, by an aggregate that spills; the list of
+        # each copy's boot only for them.
+        db.execute("CREATE OR REPLACE TABLE dupkeys AS SELECT p, s FROM v WHERE ok "
+                   "GROUP BY 1, 2 HAVING count(*) > 1")
         dup_lines = db.execute("""
-            SELECT p, s, count(*) AS c, list(regexp_extract(filename,
+            SELECT v.p, v.s, count(*) AS c, list(regexp_extract(filename,
                    '-([0-9a-f]+)-[0-9]+\\.parquet$', 1)) AS boots
-            FROM v WHERE ok GROUP BY 1, 2 HAVING count(*) > 1 ORDER BY 1, 2""").fetchall()
+            FROM v JOIN dupkeys d ON v.p = d.p AND v.s = d.s
+            WHERE ok GROUP BY 1, 2 ORDER BY 1, 2""").fetchall()
         groups = db.execute(f"""
             SELECT regexp_extract(filename, 'v=1/.*$') AS key, p,
                    min(s) AS first, count(*) AS n

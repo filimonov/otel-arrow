@@ -177,6 +177,26 @@ class DuplicateContracts(unittest.TestCase):
 
 
 class JudgementContracts(unittest.TestCase):
+    # Scenario: RSS with a flat baseline and a 1 s peak in every 15 s window,
+    # sampled every second for four hours.
+    # Guarantees: every hour's p99 sees the peaks, so the trend passes.
+    def test_rss_trend_of_a_flush_sawtooth_sampled_every_second(self):
+        points = [(s, 700e6 if s % 15 == 0 else 480e6) for s in range(0, 4 * 3600)]
+        verdict = canary.rss_trend(points, [], 4 * 3600)
+        self.assertEqual(verdict["second_window_p99_bytes"], 700e6)
+        self.assertEqual(verdict["last_window_p99_bytes"], 700e6)
+        self.assertTrue(verdict["passed"])
+
+    # Scenario: the WAL grows 16 MB/s through a 100 s outage.
+    # Guarantees: the ingest estimate is that growth and the rule adds 20 s.
+    def test_wal_rule_uses_the_outage_growth(self):
+        events = [event(0, "store_outage", 1000, 1100)]
+        points = [(s, 3e8 + (16e6 * (s - 1000) if 1000 <= s <= 1100 else 0))
+                  for s in range(0, 2000, 10)]
+        found = canary.wal_per_event(points, events)
+        self.assertAlmostEqual(found["ingest_bytes_per_s"], 16e6)
+        self.assertAlmostEqual(found["events"][0]["sizing_rule_bytes"], 16e6 * 120)
+
     # Scenario: flat RSS with a spike during an event, and RSS that grows 30
     # percent between the second and the last hour.
     # Guarantees: event samples are not quiet; a rising baseline fails.

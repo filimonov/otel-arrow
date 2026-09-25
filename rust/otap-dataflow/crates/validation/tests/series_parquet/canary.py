@@ -48,6 +48,9 @@ LATENCY_MS = (100, 1000)
 LATENCY_JITTER_MS = 100
 
 SAMPLE_PERIOD_S = 10.0
+# RSS alone is read every second, so an hour's p99 is not decided by whether a
+# few samples land on the peak of a 15 s window's flush.
+RSS_PERIOD_S = 1.0
 # jemalloc prints its totals into the engine log after each GiB allocated.
 JEMALLOC_CONF = "stats_interval:1073741824,stats_interval_opts:Jgmdablxeh"
 
@@ -324,9 +327,14 @@ def rss_trend(points, events, input_s):
 def wal_per_event(points, events):
     """Each event's WAL peak beside the "Sizing" rule
     `ingest x (store down + window + 5 s)`, with the ingest bytes per second
-    read from the quiet median, which the rule puts at ingest x (window + 5 s)."""
+    taken as the fastest WAL growth over a store outage."""
     steady = percentile([v for s, v in points if quiet(s, events)], 0.5) or 0
-    ingest = steady / (ref.WINDOW_S + 5)
+    growth = []
+    for event in events:
+        inside = [(s, v) for s, v in points if event["start_s"] <= s <= event["end_s"]]
+        if event["kind"] == "store_outage" and len(inside) >= 2 and inside[-1][0] > inside[0][0]:
+            growth.append((inside[-1][1] - inside[0][1]) / (inside[-1][0] - inside[0][0]))
+    ingest = max(growth, default=0.0)
     rows = []
     for event in events:
         peak = max((v for s, v in points
@@ -452,14 +460,18 @@ def canary_read_back(database, root, profile_json, written, failed_files):
     with duckdb.connect(str(database)) as db:
         db.execute(f"SET temp_directory = {test_e2e.sql_string(str(database) + '.tmp')}")
         db.execute(f"SET memory_limit = '{ref.READ_BACK_MEMORY}'")
+        db.execute("SET preserve_insertion_order = false")
         db.execute("CREATE OR REPLACE TABLE failed (name VARCHAR)")
         if failed_files:
             db.executemany("INSERT INTO failed VALUES (?)", [(n,) for n in set(failed_files)])
+        # `dupkeys` is the read-back's table of duplicated lines.
         rows = db.execute("""
-            SELECT p, s, list(regexp_extract(filename, '-([0-9a-f]+)-[0-9]+\\.parquet$', 1)),
+            SELECT v.p, v.s,
+                   list(regexp_extract(filename, '-([0-9a-f]+)-[0-9]+\\.parquet$', 1)),
                    count(*) FILTER (WHERE regexp_extract(filename, '[^/]+$')
                                     IN (SELECT name FROM failed))
-            FROM v WHERE ok GROUP BY p, s HAVING count(*) > 1 ORDER BY p, s""").fetchall()
+            FROM v JOIN dupkeys d ON v.p = d.p AND v.s = d.s
+            WHERE ok GROUP BY v.p, v.s ORDER BY v.p, v.s""").fetchall()
         seq = f"TRY_CAST(substr(body, 5, {width}) AS BIGINT)"
         slot_text = f"substr(body, {ref.SLOT_OFFSET + 1}, {width})"
         db.execute(f"""
@@ -518,6 +530,22 @@ class ChaosSampler(ref.Sampler):
         super().__init__(case, engine_period_s=SAMPLE_PERIOD_S, alloy_period_s=SAMPLE_PERIOD_S)
         self.allocator = {}
         self.latest_print = {}
+        self.rss = []
+
+    def start(self):
+        super().start()
+        thread = threading.Thread(target=self._rss, daemon=True)
+        thread.start()
+        self.threads.append(thread)
+
+    def _rss(self):
+        while not self.stop_event.is_set():
+            engine = self.case.engine
+            if engine.process is not None and engine.process.poll() is None:
+                found = engine.rss()
+                if "VmRSS" in found:
+                    self.rss.append((time.time_ns(), engine.boot, found["VmRSS"]))
+            self.stop_event.wait(RSS_PERIOD_S)
 
     def annotate(self, sample):
         engine = self.case.engine
@@ -674,8 +702,11 @@ class ChaosCase(ref.Case):
         resources = resource_checks(samples, limits)
         check("resources_within_bounds", resources["passed"], resources["problems"])
         input_s = (events["input_stopped"]["t"] - events["input_started"]["t"]) / 1e9
-        points = [((s["wall"] - first_wall) / 1e9, s["VmRSS"]) for s in samples if "VmRSS" in s]
+        points = [((wall - first_wall) / 1e9, rss) for wall, _boot, rss in self.sampler.rss]
         trend = rss_trend(points, executed, input_s)
+        trend["every_10s"] = rss_trend(
+            [((s["wall"] - first_wall) / 1e9, s["VmRSS"]) for s in samples if "VmRSS" in s],
+            executed, input_s)
         if trend["gating"]:
             check("rss_trend", trend["passed"], trend)
         buckets = freshness_buckets(self.oracle.get("groups", []), self.feed,
@@ -706,6 +737,11 @@ class ChaosCase(ref.Case):
         self.result["canary_timeline"] = canary_timeline(self.sampler.engine_samples, first_wall)
         self.result["config"]["alloy_site_stage"] = SITE_STAGE.strip()
         self.result["series_parquet"] = {"oracle_series": self.oracle["canary"]["series"]}
+
+    def archive_raw(self):
+        super().archive_raw()
+        with contextlib.suppress(Exception):
+            (self.archive / "rss-1s.json").write_text(json.dumps(self.sampler.rss))
 
 
 def cache_view(samples, input_s):
