@@ -206,12 +206,9 @@ fn the_buffered_configuration_drains_within_the_signal_grace() {
         .pointer("/groups/default/pipelines/main/nodes/exporter/config")
         .expect("an exporter");
     let cfg: Config = serde_json::from_value(exporter.clone()).expect("exporter config");
-    let drain = cfg.window.interval
-        + 2 * (cfg.window.flush_retry_deadline + cfg.lake.upload.abort_timeout);
-    assert!(
-        drain <= Duration::from_secs(60),
-        "drain bound {drain:?}"
-    );
+    let drain =
+        cfg.window.interval + 2 * (cfg.window.flush_retry_deadline + cfg.lake.upload.abort_timeout);
+    assert!(drain <= Duration::from_secs(60), "drain bound {drain:?}");
 }
 
 /// Scenario: the factory builds file storage with no capability bound to the node.
