@@ -10,8 +10,23 @@
 // `series-parquet-strict.alloy`.
 loki.source.file "series" {
   targets = [{ __path__ = "/input/events.log", job = "series-e2e" }]
-  forward_to = [otelcol.receiver.loki.series.receiver]
+  forward_to = [loki.process.series.receiver]
   tail_from_end = false
+}
+
+// Changes data: a line longer than 512KiB is cut to 512KiB, suffix included.
+// The exporter refuses a record above its ingress.max_row_bytes (1MiB), and
+// with it the whole export after the WAL has acknowledged it, so one long line
+// would drop up to 8MiB of its neighbours; the limit leaves room for the
+// record's attributes.
+loki.process "series" {
+  stage.truncate {
+    rule {
+      limit  = "512KiB"
+      suffix = "...[truncated]"
+    }
+  }
+  forward_to = [otelcol.receiver.loki.series.receiver]
 }
 
 otelcol.receiver.loki "series" {
@@ -51,10 +66,9 @@ otelcol.processor.attributes "series" {
 }
 
 // The Loki bridge turns every line into its own request; the batch makes one
-// export of up to 4000 lines. The Loki bridge adds about 300 bytes per line on
-// the wire, so 4000 lines of 100 bytes are 1.6 MB, and lines of up to about
-// 3.9 KB stay under the engine receiver's 16MiB max_decoding_message_size (an
-// export above it gets OUT_OF_RANGE and is retried without end).
+// queue entry of up to 4000 lines (1.6 MB at 100-byte lines, which carry
+// about 300 bytes more each on the wire), so the file-backed queue writes one
+// entry per batch, not per line. The bytes cap is the sending queue's.
 otelcol.processor.batch "series" {
   send_batch_size     = 4000
   send_batch_max_size = 4000
@@ -64,8 +78,11 @@ otelcol.processor.batch "series" {
   }
 }
 
-// Survives an Alloy restart: without it the queued batches, whose lines the
-// file positions have already passed, are lost.
+// Survives an Alloy restart or crash: without it the queued batches, whose
+// lines the file positions have already passed, are lost. With the default
+// `fsync = false` a write reaches the page cache, which survives a process
+// crash but not a host crash or power loss; `fsync = true` syncs every queue
+// write, at the cost of a disk sync per batch.
 otelcol.storage.file "queue" {}
 
 otelcol.exporter.otlp "series" {
@@ -97,6 +114,18 @@ otelcol.exporter.otlp "series" {
     // waiting: 2 * 2 * 4000 = 16000.
     sizer = "items"
     queue_size = 16000
+
+    // Splits an export at 8MiB, half the engine receiver's 16MiB
+    // max_decoding_message_size, whatever the line length: 4000 lines of 8KiB
+    // (34 MB) leave as four exports of 8.38 MB and one of 0.44 MB. An export
+    // above the receiver limit is refused and never delivered. `min_size = 0`
+    // sends each batch at once, without waiting to merge.
+    batch {
+      flush_timeout = "5s"
+      min_size      = 0
+      max_size      = 8388608
+      sizer         = "bytes"
+    }
 
     // The source is a file. A full queue parks the tailer and leaves the
     // unread lines on disk; dropping is the default and loses them.

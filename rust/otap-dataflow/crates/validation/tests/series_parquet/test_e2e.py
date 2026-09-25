@@ -1692,6 +1692,27 @@ def wait_for_alloy(store, directory, ids, timeout=90):
     raise AssertionError(f"Alloy rows did not become durable: {missing}")
 
 
+def wait_for_local_bodies(engine, count, timeout=90):
+    """Wait until the local store holds `count` logs values rows; return their bodies."""
+    deadline = time.monotonic() + timeout
+    bodies = []
+    while time.monotonic() < deadline:
+        paths = sorted((engine.data / "v=1/signal=logs/dataset=values").rglob("*.parquet"))
+        if paths:
+            with duckdb.connect() as db:
+                bodies = [
+                    row[0]
+                    for row in db.execute(
+                        "SELECT body FROM read_parquet(?, union_by_name=true)",
+                        [[str(path) for path in paths]],
+                    ).fetchall()
+                ]
+            if len(bodies) >= count:
+                return bodies
+        time.sleep(0.5)
+    raise AssertionError(f"{len(bodies)} of {count} Alloy rows became durable")
+
+
 @contextlib.contextmanager
 def clickhouse_reader(root):
     """A `query(sql)` callable backed by clickhouse-local over `root`."""
@@ -2676,6 +2697,51 @@ class DockerSlice(unittest.TestCase):
                 except Exception:
                     print(engine.engine_log())
                     raise
+
+    # Scenario: Alloy on the reference config tails 4000 lines of 8 KiB, one
+    # 4000-record batch of about 34 MB, into a receiver limited to 16MiB.
+    # Guarantees: the sending queue's bytes cap splits the batch into exports
+    # the receiver takes, so no export is refused and every line is stored once.
+    def test_alloy_splits_large_lines_under_the_receiver_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with Engine(directory) as engine:
+                ids = [f"wide-{i:04d}-" + "x" * (8192 - 10) for i in range(4000)]
+                self.assertGreater(sum(len(body) for body in ids), 16 << 20)
+                with AlloyProducer(directory, engine) as alloy:
+                    alloy.write(ids)
+                    bodies = wait_for_local_bodies(engine, len(ids), timeout=120)
+                    failures = alloy.export_failures()
+                engine.shutdown()
+                self.assertEqual(failures, [])
+                self.assertEqual(sorted(bodies), sorted(ids))
+                requests = sum(
+                    int(count)
+                    for count in re.findall(
+                        r"series_parquet\.block\.committed\b.*?\brequests=(\d+)",
+                        engine.engine_log(),
+                    )
+                )
+                # 34 MB in exports of at most 8MiB.
+                self.assertGreaterEqual(requests, 5)
+
+    # Scenario: Alloy on the reference config tails three lines of 3 MiB each,
+    # above the exporter's 1MiB ingress.max_row_bytes.
+    # Guarantees: the truncate stage cuts each to 512KiB, suffix included, so
+    # the export is stored rather than refused as a whole.
+    def test_alloy_truncates_lines_above_the_row_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with Engine(directory) as engine:
+                ids = [f"huge-{i}-" + "y" * (3 << 20) for i in range(3)]
+                with AlloyProducer(directory, engine) as alloy:
+                    alloy.write(ids)
+                    bodies = wait_for_local_bodies(engine, len(ids), timeout=120)
+                    failures = alloy.export_failures()
+                engine.shutdown()
+                self.assertEqual(failures, [])
+                suffix = "...[truncated]"
+                # The limit counts the suffix.
+                keep = (512 << 10) - len(suffix)
+                self.assertEqual(sorted(bodies), sorted(body[:keep] + suffix for body in ids))
 
     # Scenario: the object store is stopped while six producers are exporting
     # and is started again, with its data intact, a few seconds later.
