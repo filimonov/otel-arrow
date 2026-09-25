@@ -89,10 +89,10 @@ pub struct GrpcServerSettings {
     #[serde(default)]
     pub transport_concurrency_limit: Option<usize>,
 
-    /// Whether the gRPC server should shed load immediately once concurrency limits are hit.
-    /// Leaving this `true` (default) results in fast `resource_exhausted` responses and protects
-    /// the single-threaded runtime from unbounded queues. Turning it off allows requests to queue
-    /// but increases memory usage and tail latency under sustained overload.
+    /// Whether the gRPC server refuses a request immediately when `max_concurrent_requests` has no
+    /// free permit. Leaving this `true` (default) answers `UNAVAILABLE`, which OTLP clients retry,
+    /// and protects the single-threaded runtime from unbounded queues. Turning it off allows
+    /// requests to queue but increases memory usage and tail latency under sustained overload.
     #[serde(default = "default_load_shed")]
     pub load_shed: bool,
 

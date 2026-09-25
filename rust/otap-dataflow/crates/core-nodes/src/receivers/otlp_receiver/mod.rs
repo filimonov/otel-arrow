@@ -49,6 +49,7 @@ use otel_arrow_dfe_engine::receiver::ReceiverWrapper;
 use otel_arrow_dfe_engine::shared::capability::auth::bearer_token_authorizer::BearerTokenAuthorizer;
 use otel_arrow_dfe_engine::shared::receiver as shared;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
+use otel_arrow_dfe_otap::concurrency_shed_layer::ConcurrencyShedLayer;
 use otel_arrow_dfe_otap::memory_pressure_layer::MemoryPressureLayer;
 use otel_arrow_dfe_otap::otap_grpc::common;
 use otel_arrow_dfe_otap::otap_grpc::common::AckRegistry;
@@ -611,9 +612,15 @@ impl shared::Receiver<OtapPdata> for OTLPReceiver {
                     forward_authorized_identity,
                 )
             });
+            // The shed layer sits outside every limit so a request that finds any
+            // of them full is refused with a retryable status.
+            let shed_layer = grpc_config
+                .load_shed
+                .then(|| ConcurrencyShedLayer::new(self.metrics.clone()));
             // ServiceBuilder runs layers in insertion order, so admission limits
             // remain outside authorization and reject saturated requests first.
             let server_layers = ServiceBuilder::new()
+                .option_layer(shed_layer)
                 .layer(limit_layer)
                 .option_layer(authorization_layer);
             let mut server =
@@ -4830,6 +4837,216 @@ mod tests {
                         .await
                         .expect("Failed to send Ack");
                 }
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
+    /// Wraps an OTLP receiver without authorization or rate limiting and
+    /// returns its metrics handle.
+    fn refusal_test_receiver(
+        test_runtime: &TestRuntime<OtapPdata>,
+        config: Config,
+    ) -> (ReceiverWrapper<OtapPdata>, Arc<Mutex<OtlpReceiverMetrics>>) {
+        let controller_ctx = ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let metrics = Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx)));
+        let receiver = ReceiverWrapper::shared(
+            OTLPReceiver {
+                config,
+                metrics: metrics.clone(),
+                rate_limiter: None,
+                global_max_concurrent_requests: None,
+                authorizer: None,
+                admission_state: SharedReceiverAdmissionState::from_process_state(
+                    &pipeline_ctx.memory_pressure_state(),
+                ),
+            },
+            test_node(test_runtime.config().name.clone()),
+            Arc::new(NodeUserConfig::new_receiver_config(OTLP_RECEIVER_URN)),
+            test_runtime.config(),
+        );
+        (receiver, metrics)
+    }
+
+    fn grpc_rejections(
+        metrics: &Arc<Mutex<OtlpReceiverMetrics>>,
+        error_type: ReceiverRejectionErrorType,
+    ) -> u64 {
+        metrics
+            .lock()
+            .rejections_for(OtlpProtocol::Grpc, error_type)
+            .requests
+            .get()
+    }
+
+    /// Validation that holds the first request unacknowledged until `release`
+    /// fires, then acknowledges it and `extra` more requests.
+    fn hold_first_request(
+        held: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        extra: usize,
+    ) -> impl FnOnce(NotSendValidateContext<OtapPdata>) -> Pin<Box<dyn Future<Output = ()>>> {
+        move |mut ctx: NotSendValidateContext<OtapPdata>| {
+            Box::pin(async move {
+                let first = timeout(Duration::from_secs(3), ctx.recv())
+                    .await
+                    .expect("Timed out waiting for the held request")
+                    .expect("No request received");
+                held.notify_one();
+                // A failed scenario never releases; the bound lets its panic surface.
+                if timeout(Duration::from_secs(10), release.notified())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if let Some((_node_id, ack)) = next_ack(AckMsg::new(first)) {
+                    ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                        .await
+                        .expect("Failed to send Ack");
+                }
+                for _ in 0..extra {
+                    let next = timeout(Duration::from_secs(3), ctx.recv())
+                        .await
+                        .expect("Timed out waiting for a queued request")
+                        .expect("No request received");
+                    if let Some((_node_id, ack)) = next_ack(AckMsg::new(next)) {
+                        ctx.send_control_msg(NodeControlMsg::Ack(ack))
+                            .await
+                            .expect("Failed to send Ack");
+                    }
+                }
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        }
+    }
+
+    /// Scenario: a second gRPC connection sends while an unacknowledged request
+    /// holds the receiver's only `max_concurrent_requests` permit.
+    /// Guarantees: the refusal is UNAVAILABLE (retryable for every OTLP client),
+    /// names the limit, and counts one `concurrency_limit` rejection.
+    #[test]
+    fn test_otlp_grpc_receiver_limit_refusal_is_retryable_and_counted() {
+        let test_runtime = TestRuntime::new();
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let mut config = test_config(format!("127.0.0.1:{port}").parse().unwrap());
+        config
+            .protocols
+            .grpc
+            .as_mut()
+            .unwrap()
+            .max_concurrent_requests = 1;
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validation = hold_first_request(held.clone(), release.clone(), 0);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let first_endpoint = endpoint.clone();
+                let first = tokio::spawn(async move {
+                    let mut client = LogsServiceClient::connect(first_endpoint).await.unwrap();
+                    client.export(create_logs_service_request()).await
+                });
+                timeout(Duration::from_secs(3), held.notified())
+                    .await
+                    .expect("Timed out waiting for the held request");
+
+                let mut second_client = LogsServiceClient::connect(endpoint.clone())
+                    .await
+                    .expect("Failed to connect a second client");
+                let second = second_client.export(create_logs_service_request()).await;
+                let rejections =
+                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                release.notify_one();
+                let first = first.await.unwrap();
+                ctx.send_shutdown(Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+
+                let status = second.expect_err("the second request must be refused at the limit");
+                assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+                assert!(
+                    status.message().contains("max_concurrent_requests"),
+                    "{status:?}"
+                );
+                assert_eq!(rejections, 1);
+                assert!(first.is_ok(), "the held request must succeed: {first:?}");
+            }) as Pin<Box<dyn Future<Output = ()>>>
+        };
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(scenario)
+            .run_validation_concurrent(validation);
+    }
+
+    /// Scenario: an unacknowledged OTLP/HTTP request holds the only
+    /// wait-for-result slot that gRPC shares, and a gRPC request arrives.
+    /// Guarantees: the gRPC slot refusal is UNAVAILABLE, names the limit, and
+    /// counts one gRPC `concurrency_limit` rejection.
+    #[test]
+    fn test_otlp_grpc_slot_refusal_is_retryable_and_counted() {
+        let test_runtime = TestRuntime::new();
+        let grpc_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let endpoint = format!("http://127.0.0.1:{grpc_port}");
+        let http_port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let http_listen: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
+        let mut config = test_config(format!("127.0.0.1:{grpc_port}").parse().unwrap());
+        config
+            .protocols
+            .grpc
+            .as_mut()
+            .unwrap()
+            .max_concurrent_requests = 1;
+        config.protocols.http = Some(HttpServerSettings {
+            listening_addr: http_listen,
+            max_concurrent_requests: 1,
+            wait_for_result: true,
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        });
+        let (receiver, metrics) = refusal_test_receiver(&test_runtime, config);
+        let held = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let validation = hold_first_request(held.clone(), release.clone(), 0);
+
+        let scenario = move |ctx: TestContext<OtapPdata>| {
+            Box::pin(async move {
+                let mut body = Vec::new();
+                create_logs_service_request().encode(&mut body).unwrap();
+                let http = tokio::spawn(post_otlp_http(http_listen, "/v1/logs", body));
+                timeout(Duration::from_secs(3), held.notified())
+                    .await
+                    .expect("Timed out waiting for the held HTTP request");
+
+                let mut client = LogsServiceClient::connect(endpoint.clone())
+                    .await
+                    .expect("Failed to connect");
+                let grpc = client.export(create_logs_service_request()).await;
+                let rejections =
+                    grpc_rejections(&metrics, ReceiverRejectionErrorType::ConcurrencyLimit);
+                release.notify_one();
+                let http = http.await.unwrap();
+                ctx.send_shutdown(Instant::now(), "Test complete")
+                    .await
+                    .expect("Failed to send shutdown");
+
+                let status = grpc.expect_err("the gRPC request must be refused without a slot");
+                assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+                assert!(
+                    status.message().contains("max_concurrent_requests"),
+                    "{status:?}"
+                );
+                assert_eq!(rejections, 1);
+                let (http_status, _) = http.expect("HTTP response");
+                assert_eq!(http_status, http::StatusCode::OK);
             }) as Pin<Box<dyn Future<Output = ()>>>
         };
 

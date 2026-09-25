@@ -47,6 +47,9 @@ pub mod memory_pressure_layer;
 /// Shared ingress shedding based on receiver-local rate limits.
 pub mod rate_limit_layer;
 
+/// Retryable gRPC refusal at the receiver's concurrency limit.
+pub mod concurrency_shed_layer;
+
 /// Shared mapping from a pipeline NACK to OTLP wire status codes.
 mod nack_status;
 
