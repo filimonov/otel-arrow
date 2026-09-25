@@ -372,7 +372,7 @@ pub struct DurableBuffer {
 }
 
 /// Test hooks for the shutdown steps: stalls that stand in for a wedged
-/// disk, and the outcome events the final persist emitted.
+/// disk, and what the buffer did.
 #[cfg(test)]
 #[derive(Default)]
 struct ShutdownTestHooks {
@@ -380,8 +380,10 @@ struct ShutdownTestHooks {
     stall_flush: bool,
     /// Makes the final persist never finish.
     stall_persist: bool,
-    /// The outcome event names `shutdown_engine` emitted, in order.
-    outcomes: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    /// In order: the outcome event name `shutdown_engine` emitted
+    /// (`complete`, `engine_failed`, `persist_deadline`), and `retry` for
+    /// each retry a transient Nack tried to schedule.
+    events: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl DurableBuffer {
@@ -1602,6 +1604,12 @@ impl DurableBuffer {
             }
 
             // Schedule the retry
+            #[cfg(test)]
+            self.shutdown_hooks
+                .events
+                .lock()
+                .expect("events lock")
+                .push("retry");
             if self.deferred_retry_state.schedule_after(
                 bundle_ref,
                 retry_count,
@@ -1854,9 +1862,9 @@ impl DurableBuffer {
         };
         #[cfg(test)]
         self.shutdown_hooks
-            .outcomes
+            .events
             .lock()
-            .expect("outcomes lock")
+            .expect("events lock")
             .push(outcome);
         #[cfg(not(test))]
         let _ = outcome;
@@ -2806,7 +2814,7 @@ mod tests {
             let mut processor =
                 DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
             processor.shutdown_hooks.stall_flush = true;
-            let outcomes = Arc::clone(&processor.shutdown_hooks.outcomes);
+            let events = Arc::clone(&processor.shutdown_hooks.events);
             let mut buffer = start_buffer(processor);
             let delivered = buffer.deliver_one().await;
             let (_, ack) = next_ack(AckMsg::new(delivered)).expect("the buffer subscribes to acks");
@@ -2826,7 +2834,7 @@ mod tests {
             let ended = Instant::now();
 
             assert_eq!(
-                *outcomes.lock().expect("outcomes lock"),
+                *events.lock().expect("events lock"),
                 ["complete"],
                 "the final persist runs to completion"
             );
@@ -2857,7 +2865,7 @@ mod tests {
 
         run_local(async move {
             let processor = DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
-            let outcomes = Arc::clone(&processor.shutdown_hooks.outcomes);
+            let events = Arc::clone(&processor.shutdown_hooks.events);
             let mut buffer = start_buffer(processor);
             let delivered = buffer.deliver_one().await;
             let (_, ack) = next_ack(AckMsg::new(delivered)).expect("the buffer subscribes to acks");
@@ -2875,7 +2883,7 @@ mod tests {
                 .expect("the buffer shuts down cleanly");
 
             assert_eq!(
-                *outcomes.lock().expect("outcomes lock"),
+                *events.lock().expect("events lock"),
                 ["complete"],
                 "the final persist runs to completion"
             );
@@ -2902,7 +2910,7 @@ mod tests {
             let mut processor =
                 DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
             processor.shutdown_hooks.stall_persist = true;
-            let outcomes = Arc::clone(&processor.shutdown_hooks.outcomes);
+            let events = Arc::clone(&processor.shutdown_hooks.events);
             let mut buffer = start_buffer(processor);
             let _unacknowledged = buffer.deliver_one().await;
 
@@ -2915,10 +2923,7 @@ mod tests {
                 .expect("the buffer shuts down cleanly");
             let ended = Instant::now();
 
-            assert_eq!(
-                *outcomes.lock().expect("outcomes lock"),
-                ["persist_deadline"]
-            );
+            assert_eq!(*events.lock().expect("events lock"), ["persist_deadline"]);
             assert!(
                 ended >= deadline + SHUTDOWN_PERSIST_RESERVE,
                 "the persist got only {:?} past the deadline",
@@ -2932,6 +2937,114 @@ mod tests {
             assert!(
                 replays_after_restart(config, &pipeline_ctx).await,
                 "a bundle never acknowledged is replayed"
+            );
+        });
+    }
+
+    /// Shut `buffer` down with `deadline` while its delivered bundle is in
+    /// flight, wait for its outputs to close (the engine's completion phase
+    /// has begun), send `completion` and wait for the buffer to exit.
+    async fn complete_during_the_shutdown_wait(
+        mut buffer: RunningBuffer,
+        deadline: Instant,
+        completion: NodeControlMsg<OtapPdata>,
+    ) -> Instant {
+        buffer.shut_down(deadline).await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), buffer.output.recv())
+            .await
+            .expect("the buffer closes its outputs while it waits");
+        assert!(closed.is_err(), "no bundle is delivered after shutdown");
+        buffer
+            .control
+            .send(completion)
+            .await
+            .expect("the completion is accepted during the wait");
+        tokio::time::timeout(Duration::from_secs(10), buffer.task)
+            .await
+            .expect("the buffer exits")
+            .expect("join")
+            .expect("the buffer shuts down cleanly");
+        Instant::now()
+    }
+
+    /// Scenario: during a graceful shutdown the buffer waits for the one
+    /// bundle in flight, and downstream answers it with a transient Nack
+    /// (as series_parquet answers a held request at its own deadline).
+    /// Guarantees: the Nack ends the wait before the persist reserve, no
+    /// retry is scheduled, the final persist completes, and the bundle is
+    /// replayed on the next start.
+    #[test]
+    fn test_a_transient_nack_during_the_shutdown_wait_is_replayed() {
+        use otel_arrow_dfe_otap::testing::next_nack;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = run_loop_config(&temp_dir);
+        let controller = ControllerContext::new(TelemetryRegistryHandle::default());
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+
+        run_local(async move {
+            let processor = DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
+            let events = Arc::clone(&processor.shutdown_hooks.events);
+            let buffer = start_buffer(processor);
+            let delivered = buffer.deliver_one().await;
+            let (_, nack) = next_nack(NackMsg::new("store unavailable", delivered))
+                .expect("the buffer subscribes to nacks");
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let ended =
+                complete_during_the_shutdown_wait(buffer, deadline, NodeControlMsg::Nack(nack))
+                    .await;
+
+            assert_eq!(
+                *events.lock().expect("events lock"),
+                ["complete"],
+                "no retry is scheduled and the final persist completes"
+            );
+            assert!(
+                ended < deadline - SHUTDOWN_PERSIST_RESERVE,
+                "the Nack ends the wait"
+            );
+            assert!(
+                replays_after_restart(config, &pipeline_ctx).await,
+                "a transiently refused bundle is replayed on the next start"
+            );
+        });
+    }
+
+    /// Scenario: during a graceful shutdown the buffer waits for the one
+    /// bundle in flight, and downstream answers it with a permanent Nack.
+    /// Guarantees: the rejection is persisted with the final persist, so the
+    /// bundle is not replayed on the next start.
+    #[test]
+    fn test_a_permanent_nack_during_the_shutdown_wait_is_not_replayed() {
+        use otel_arrow_dfe_otap::testing::next_nack;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = run_loop_config(&temp_dir);
+        let controller = ControllerContext::new(TelemetryRegistryHandle::default());
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+
+        run_local(async move {
+            let processor = DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
+            let events = Arc::clone(&processor.shutdown_hooks.events);
+            let buffer = start_buffer(processor);
+            let delivered = buffer.deliver_one().await;
+            let (_, nack) = next_nack(NackMsg::new_permanent("malformed", delivered))
+                .expect("the buffer subscribes to nacks");
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let ended =
+                complete_during_the_shutdown_wait(buffer, deadline, NodeControlMsg::Nack(nack))
+                    .await;
+
+            assert_eq!(*events.lock().expect("events lock"), ["complete"]);
+            assert!(
+                ended < deadline - SHUTDOWN_PERSIST_RESERVE,
+                "the Nack ends the wait"
+            );
+            assert!(
+                !replays_after_restart(config, &pipeline_ctx).await,
+                "a permanently refused bundle is replayed on the next start"
             );
         });
     }
