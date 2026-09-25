@@ -111,6 +111,8 @@ All events are emitted from
 | `durable_buffer.shutdown.bundle_error` | `warn` | Bundle processing error during shutdown drain; drain continues. |
 | `durable_buffer.shutdown.poll_error` | `warn` | `poll_next_bundle()` error during shutdown drain; drain halted. |
 | `durable_buffer.shutdown.flush_failed` | `error` | `engine.flush()` failed during shutdown (data durability is still ensured by `engine.shutdown()`). |
+| `durable_buffer.shutdown.flush_deadline` | `warn` | The shutdown deadline cut the flush of the open segment; its bundles are replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.persist_deadline` | `warn` | The shutdown deadline cut the final persist of progress and the engine shutdown; what was not persisted is replayed from the WAL on the next start. |
 | `durable_buffer.shutdown.progress_failed` | `error` | Persisting the recorded acknowledgements failed at shutdown; those bundles are replayed on the next start. |
 | `durable_buffer.shutdown.engine_failed` | `error` | `engine.shutdown()` failed; open segment may not have been finalized. |
 

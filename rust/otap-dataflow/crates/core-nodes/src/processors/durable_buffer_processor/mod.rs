@@ -153,6 +153,18 @@ const SHUTDOWN_PERSIST_RESERVE: Duration = Duration::from_secs(1);
 /// Subscriber ID used by this processor.
 const SUBSCRIBER_ID: &str = "durable-buffer";
 
+/// Run `work` until `deadline`; `None` when the deadline came first.
+async fn until_deadline<T>(
+    deadline: Instant,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        out = work => Some(out),
+        () = otel_arrow_dfe_engine::clock::sleep_until(deadline) => None,
+    }
+}
+
 // -----------------------------------------------------------------------------
 // BundleRef CallData Encoding
 // -----------------------------------------------------------------------------
@@ -354,6 +366,10 @@ pub struct DurableBuffer {
     /// Set once `Shutdown` has drained the buffer with bundles still in
     /// flight; the storage engine is then shut by the final `Shutdown`.
     awaiting_completions: bool,
+
+    /// Makes the final persist never finish, as a wedged disk would.
+    #[cfg(test)]
+    stall_persist: bool,
 }
 
 impl DurableBuffer {
@@ -421,6 +437,8 @@ impl DurableBuffer {
             metadata_load_warned_segments: HashSet::new(),
             last_loss_snapshot: RetentionLossSnapshot::default(),
             awaiting_completions: false,
+            #[cfg(test)]
+            stall_persist: false,
         })
     }
 
@@ -1648,17 +1666,15 @@ impl DurableBuffer {
     /// 2. Clear deferred-retry gating so parked retry bundles become drainable
     /// 3. Drain remaining bundles to downstream (best-effort, respects deadline)
     /// 4. With bundles still in flight, return and let the engine deliver their
-    ///    `Ack`/`Nack` until the deadline (see `awaits_completions`); the final
-    ///    `Shutdown` then runs step 5 with what was recorded
-    /// 5. Engine shutdown (always attempted - also finalizes open segment if flush was skipped)
+    ///    `Ack`/`Nack` until `SHUTDOWN_PERSIST_RESERVE` before the deadline (see
+    ///    `awaits_completions`); the final `Shutdown` then runs step 5 with what
+    ///    was recorded
+    /// 5. Persist progress and shut the engine down (also finalizes the open
+    ///    segment if the flush was skipped)
     ///
-    /// Note: Quiver's `shutdown()` internally calls `finalize_current_segment()`, so even
-    /// if we skip the explicit flush due to deadline pressure, the engine shutdown will
-    /// still persist any buffered data. The explicit flush + drain sequence is for
-    /// orderly delivery to downstream, not for data durability.
-    ///
-    /// The deadline is enforced for the drain loop: if we run out of time, we skip
-    /// remaining drain iterations and proceed to engine shutdown.
+    /// Every step ends by the deadline; what it cuts off is still in the WAL, so
+    /// the flush and drain are for orderly delivery downstream, not for
+    /// durability, and a cut persist only replays bundles on the next start.
     async fn handle_shutdown(
         &mut self,
         deadline: Instant,
@@ -1678,7 +1694,7 @@ impl DurableBuffer {
                     message = "bundles still in flight at the shutdown deadline are replayed on the next start"
                 );
             }
-            return self.shutdown_engine().await;
+            return self.shutdown_engine(deadline).await;
         }
         otel_info!("durable_buffer.shutdown.start", deadline = ?deadline);
 
@@ -1696,12 +1712,17 @@ impl DurableBuffer {
             // for the drain loop below. Even if this is skipped, engine.shutdown()
             // will finalize the segment.
             otel_info!("durable_buffer.shutdown.flushing");
-            {
+            let flushed = {
                 let (engine, _) = self.engine()?;
-                if let Err(e) = engine.flush().await {
+                until_deadline(deadline, engine.flush()).await
+            };
+            match flushed {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
                     self.metrics.operational_metrics.flush_failures.add(1);
                     otel_error!("durable_buffer.shutdown.flush_failed", error = %e);
                 }
+                None => otel_warn!("durable_buffer.shutdown.flush_deadline"),
             }
 
             // Drain any remaining bundles that became available after flush
@@ -1759,24 +1780,38 @@ impl DurableBuffer {
             );
             return Ok(());
         }
-        self.shutdown_engine().await
+        self.shutdown_engine(deadline).await
     }
 
     /// Persist the acknowledgements recorded so far and shut the Quiver
-    /// engine down.
+    /// engine down, until `deadline`.
     ///
-    /// Always attempted, even past the deadline: the engine persists progress
-    /// only when asked, the periodic tick that asks is cancelled at shutdown,
-    /// and the engine shutdown finalizes any open segment.
-    async fn shutdown_engine(&mut self) -> Result<(), Error> {
+    /// The engine persists progress only when asked, and the periodic tick
+    /// that asks is cancelled at shutdown. What the deadline cuts off stays in
+    /// the WAL and is replayed on the next start.
+    async fn shutdown_engine(&mut self, deadline: Instant) -> Result<(), Error> {
+        #[cfg(test)]
+        let stall = self.stall_persist;
         let (engine, _) = self.engine()?;
-        if let Err(e) = engine.flush_progress().await {
-            otel_error!("durable_buffer.shutdown.progress_failed", error = %e);
-        }
-        if let Err(e) = engine.shutdown().await {
-            otel_error!("durable_buffer.shutdown.engine_failed", error = %e);
-        } else {
-            otel_info!("durable_buffer.shutdown.complete");
+        let engine = Arc::clone(engine);
+        let finished = until_deadline(deadline, async move {
+            #[cfg(test)]
+            if stall {
+                std::future::pending::<()>().await;
+            }
+            if let Err(e) = engine.flush_progress().await {
+                otel_error!("durable_buffer.shutdown.progress_failed", error = %e);
+            }
+            engine.shutdown().await
+        })
+        .await;
+        match finished {
+            Some(Ok(())) => otel_info!("durable_buffer.shutdown.complete"),
+            Some(Err(e)) => otel_error!("durable_buffer.shutdown.engine_failed", error = %e),
+            None => otel_warn!(
+                "durable_buffer.shutdown.persist_deadline",
+                message = "the shutdown deadline cut the final persist; unpersisted progress and the open segment are replayed from the WAL on the next start"
+            ),
         }
         Ok(())
     }
@@ -2465,29 +2500,18 @@ mod tests {
             .validate(|_| async {});
     }
 
-    /// Scenario: the engine's own run loop shuts the buffer down gracefully
-    /// while one delivered bundle is unacknowledged, and downstream acks it
-    /// only after the buffer's outputs have closed (as an exporter does once
-    /// its own Shutdown is released).
-    /// Guarantees: the late Ack is recorded before the storage engine shuts
-    /// down, so a restart on the same WAL replays nothing already acknowledged.
-    #[test]
-    fn test_ack_after_shutdown_release_is_not_replayed() {
-        use otel_arrow_dfe_channel::mpsc::Channel;
-        use otel_arrow_dfe_engine::control::{
-            Controllable, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
-        };
-        use otel_arrow_dfe_engine::local::message::{LocalReceiver, LocalSender};
-        use otel_arrow_dfe_engine::message::{Receiver, Sender};
-        use otel_arrow_dfe_engine::node::{NodeWithPDataReceiver, NodeWithPDataSender};
-        use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
-        use otel_arrow_dfe_otap::testing::next_ack;
-        use otel_arrow_dfe_pdata::encode::encode_logs_otap_batch;
-        use otel_arrow_dfe_pdata::testing::fixtures::DataGenerator;
+    /// A durable buffer driven by the engine's own processor run loop.
+    struct RunningBuffer {
+        task: tokio::task::JoinHandle<Result<(), Error>>,
+        input: Option<otel_arrow_dfe_channel::mpsc::Sender<OtapPdata>>,
+        output: otel_arrow_dfe_channel::mpsc::Receiver<OtapPdata>,
+        control: otel_arrow_dfe_engine::message::Sender<NodeControlMsg<OtapPdata>>,
+    }
 
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = DurableBufferConfig {
-            path: temp_dir.path().to_path_buf(),
+    /// The configuration of a buffer the run-loop tests start in `dir`.
+    fn run_loop_config(dir: &tempfile::TempDir) -> DurableBufferConfig {
+        DurableBufferConfig {
+            path: dir.path().to_path_buf(),
             retention_size_cap: byte_unit::Byte::from_u64(256 * 1024 * 1024),
             max_age: None,
             size_cap_policy: SizeCapPolicy::Backpressure,
@@ -2498,7 +2522,129 @@ mod tests {
             max_retry_interval: Duration::from_secs(30),
             retry_multiplier: 2.0,
             max_in_flight: 1000,
+        }
+    }
+
+    /// Start `processor` in the engine's run loop, on the current `LocalSet`.
+    fn start_buffer(processor: DurableBuffer) -> RunningBuffer {
+        use otel_arrow_dfe_channel::mpsc::Channel;
+        use otel_arrow_dfe_engine::control::{
+            Controllable, pipeline_completion_msg_channel, runtime_ctrl_msg_channel,
         };
+        use otel_arrow_dfe_engine::local::message::{LocalReceiver, LocalSender};
+        use otel_arrow_dfe_engine::message::{Receiver, Sender};
+        use otel_arrow_dfe_engine::node::{NodeWithPDataReceiver, NodeWithPDataSender};
+        use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
+
+        let node = test_node("durable-buffer-run-loop");
+        let node_config = Arc::new(NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN));
+        let mut wrapper = ProcessorWrapper::local(
+            processor,
+            node.clone(),
+            node_config,
+            &ProcessorConfig::new("durable-buffer-run-loop"),
+        );
+        let (input_tx, input_rx) = Channel::new(8);
+        wrapper
+            .set_pdata_receiver(node.clone(), Receiver::Local(LocalReceiver::mpsc(input_rx)))
+            .expect("input");
+        let (output_tx, output_rx) = Channel::new(8);
+        wrapper
+            .set_pdata_sender(
+                node,
+                "out".into(),
+                Sender::Local(LocalSender::mpsc(output_tx)),
+            )
+            .expect("output");
+        let control = wrapper.control_sender();
+        // The receivers are leaked so the processor's reports and acks upstream
+        // never fail for a closed channel.
+        let (runtime_ctrl_tx, runtime_ctrl_rx) = runtime_ctrl_msg_channel(64);
+        let (completion_tx, completion_rx) = pipeline_completion_msg_channel(64);
+        let (metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1024);
+        std::mem::forget((runtime_ctrl_rx, completion_rx, metrics_rx));
+        let task = tokio::task::spawn_local(wrapper.start(
+            runtime_ctrl_tx,
+            completion_tx,
+            metrics_reporter,
+            Interests::empty(),
+            test_pipeline_runtime_services(),
+        ));
+        RunningBuffer {
+            task,
+            input: Some(input_tx),
+            output: output_rx,
+            control,
+        }
+    }
+
+    impl RunningBuffer {
+        /// Ingest one logs request and tick until its bundle is delivered.
+        async fn deliver_one(&self) -> OtapPdata {
+            use otel_arrow_dfe_pdata::encode::encode_logs_otap_batch;
+            use otel_arrow_dfe_pdata::testing::fixtures::DataGenerator;
+            let logs = encode_logs_otap_batch(&DataGenerator::new(1).generate_logs())
+                .expect("encode logs");
+            self.input
+                .as_ref()
+                .expect("input open")
+                .send_async(OtapPdata::new_default(logs.into()))
+                .await
+                .expect("send input");
+            for _ in 0..50 {
+                self.control
+                    .send(NodeControlMsg::TimerTick {})
+                    .await
+                    .expect("send tick");
+                if let Ok(Ok(bundle)) =
+                    tokio::time::timeout(Duration::from_millis(100), self.output.recv()).await
+                {
+                    return bundle;
+                }
+            }
+            panic!("the buffer delivers the ingested bundle");
+        }
+
+        /// Close the input and send Shutdown with `deadline`.
+        async fn shut_down(&mut self, deadline: Instant) {
+            drop(self.input.take());
+            self.control
+                .send(NodeControlMsg::Shutdown {
+                    deadline,
+                    reason: "graceful restart".to_owned(),
+                })
+                .await
+                .expect("send shutdown");
+        }
+    }
+
+    /// Whether a buffer reopened on `config`'s WAL replays any bundle.
+    async fn replays_after_restart(config: DurableBufferConfig, ctx: &PipelineContext) -> bool {
+        let (engine, subscriber_id) = DurableBuffer::new(config, ctx)
+            .expect("restarted processor")
+            .init_engine()
+            .await
+            .expect("reopen the WAL");
+        let replayed = engine
+            .poll_next_bundle(&subscriber_id)
+            .expect("poll after restart")
+            .is_some();
+        engine.shutdown().await.expect("close the reopened engine");
+        replayed
+    }
+
+    /// Scenario: the engine's own run loop shuts the buffer down gracefully
+    /// while one delivered bundle is unacknowledged, and downstream acks it
+    /// only after the buffer's outputs have closed (as an exporter does once
+    /// its own Shutdown is released).
+    /// Guarantees: the late Ack is recorded before the storage engine shuts
+    /// down, so a restart on the same WAL replays nothing already acknowledged.
+    #[test]
+    fn test_ack_after_shutdown_release_is_not_replayed() {
+        use otel_arrow_dfe_otap::testing::next_ack;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = run_loop_config(&temp_dir);
         let controller = ControllerContext::new(TelemetryRegistryHandle::default());
         let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
 
@@ -2508,70 +2654,16 @@ mod tests {
             .expect("runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let node = test_node("durable-buffer-late-ack");
-            let node_config = Arc::new(NodeUserConfig::new_processor_config(DURABLE_BUFFER_URN));
-            let mut wrapper = ProcessorWrapper::local(
-                DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor"),
-                node.clone(),
-                node_config,
-                &ProcessorConfig::new("durable-buffer-late-ack"),
-            );
-            let (input_tx, input_rx) = Channel::new(8);
-            wrapper
-                .set_pdata_receiver(node.clone(), Receiver::Local(LocalReceiver::mpsc(input_rx)))
-                .expect("input");
-            let (output_tx, output_rx) = Channel::new(8);
-            wrapper
-                .set_pdata_sender(
-                    node,
-                    "out".into(),
-                    Sender::Local(LocalSender::mpsc(output_tx)),
-                )
-                .expect("output");
-            let control = wrapper.control_sender();
-            let (runtime_ctrl_tx, _runtime_ctrl_rx) = runtime_ctrl_msg_channel(64);
-            let (completion_tx, _completion_rx) = pipeline_completion_msg_channel(64);
-            let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1024);
-            let task = tokio::task::spawn_local(wrapper.start(
-                runtime_ctrl_tx,
-                completion_tx,
-                metrics_reporter,
-                Interests::empty(),
-                test_pipeline_runtime_services(),
-            ));
-
-            let logs = encode_logs_otap_batch(&DataGenerator::new(1).generate_logs())
-                .expect("encode logs");
-            input_tx
-                .send_async(OtapPdata::new_default(logs.into()))
-                .await
-                .expect("send input");
-            let mut delivered = None;
-            for _ in 0..50 {
-                control
-                    .send(NodeControlMsg::TimerTick {})
-                    .await
-                    .expect("send tick");
-                if let Ok(Ok(bundle)) =
-                    tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await
-                {
-                    delivered = Some(bundle);
-                    break;
-                }
-            }
-            let delivered = delivered.expect("the buffer delivers the ingested bundle");
+            let mut buffer =
+                start_buffer(DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor"));
+            let delivered = buffer.deliver_one().await;
             let (_, ack) = next_ack(AckMsg::new(delivered)).expect("the buffer subscribes to acks");
 
-            drop(input_tx);
-            control
-                .send(NodeControlMsg::Shutdown {
-                    deadline: Instant::now() + Duration::from_secs(5),
-                    reason: "graceful restart".to_owned(),
-                })
-                .await
-                .expect("send shutdown");
+            buffer
+                .shut_down(Instant::now() + Duration::from_secs(5))
+                .await;
             // Downstream is released only once the buffer's outputs close.
-            let closed = tokio::time::timeout(Duration::from_secs(5), output_rx.recv())
+            let closed = tokio::time::timeout(Duration::from_secs(5), buffer.output.recv())
                 .await
                 .expect("the buffer closes its outputs before the deadline");
             assert!(
@@ -2580,26 +2672,61 @@ mod tests {
             );
             // A closed control channel refuses the Ack, as the engine's
             // completion dispatcher would silently drop it.
-            let _ = control.send(NodeControlMsg::Ack(ack)).await;
-            tokio::time::timeout(Duration::from_secs(10), task)
+            let _ = buffer.control.send(NodeControlMsg::Ack(ack)).await;
+            tokio::time::timeout(Duration::from_secs(10), buffer.task)
                 .await
                 .expect("the buffer exits before the deadline")
                 .expect("join")
                 .expect("the buffer shuts down cleanly");
 
-            let (engine, subscriber_id) = DurableBuffer::new(config, &pipeline_ctx)
-                .expect("restarted processor")
-                .init_engine()
-                .await
-                .expect("reopen the WAL");
-            let replayed = engine
-                .poll_next_bundle(&subscriber_id)
-                .expect("poll after restart");
             assert!(
-                replayed.is_none(),
+                !replays_after_restart(config, &pipeline_ctx).await,
                 "an acknowledged bundle is replayed after a graceful restart"
             );
-            engine.shutdown().await.expect("close the reopened engine");
+        });
+    }
+
+    /// Scenario: a graceful shutdown with one bundle never acknowledged, and a
+    /// storage engine whose final persist never finishes.
+    /// Guarantees: the buffer exits by the shutdown deadline, and the
+    /// unacknowledged bundle stays replayable.
+    #[test]
+    fn test_a_stuck_final_persist_is_cut_at_the_deadline() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = run_loop_config(&temp_dir);
+        let controller = ControllerContext::new(TelemetryRegistryHandle::default());
+        let pipeline_ctx = controller.pipeline_context_with("grp".into(), "pipe".into(), 0, 1, 0);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let mut processor =
+                DurableBuffer::new(config.clone(), &pipeline_ctx).expect("processor");
+            processor.stall_persist = true;
+            let mut buffer = start_buffer(processor);
+            let _unacknowledged = buffer.deliver_one().await;
+
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            buffer.shut_down(deadline).await;
+            tokio::time::timeout(Duration::from_secs(10), buffer.task)
+                .await
+                .expect("the buffer exits")
+                .expect("join")
+                .expect("the buffer shuts down cleanly");
+            let ended = Instant::now();
+            assert!(
+                ended < deadline + Duration::from_millis(500),
+                "the buffer outlived its shutdown deadline by {:?}",
+                ended.saturating_duration_since(deadline)
+            );
+
+            assert!(
+                replays_after_restart(config, &pipeline_ctx).await,
+                "a bundle never acknowledged is replayed"
+            );
         });
     }
 
