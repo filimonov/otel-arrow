@@ -2839,29 +2839,92 @@ def ledger_acks(ledger) -> list:
             "SELECT ack_ns FROM requests WHERE ack_ns IS NOT NULL ORDER BY ack_ns")]
 
 
-def duplicate_attribution(ledger) -> dict:
-    """Stored duplicates, split by whether the producer ever resent their request.
+def duplicate_attribution(ledger, failed_block_ids=()) -> dict:
+    """Stored duplicates, split by where their copies can come from.
 
     Runs after `read_oracle` loaded the stored rows into the ledger's
-    `actual` table.
+    `actual` table. A duplicated record whose request the producer resent
+    was replayed by the producer; one with a copy in a file of a block whose
+    flush failed (`failed_block_ids`, from `failed_block_record_ids`) was
+    stored by the failed block and again by the retry of its nacked request.
     """
     with ledger.lock:
-        row = ledger.connection.execute(
+        connection = ledger.connection
+        _ = connection.execute("DROP TABLE IF EXISTS failed_block_rows")
+        _ = connection.execute("CREATE TEMP TABLE failed_block_rows (record_id TEXT PRIMARY KEY)")
+        _ = connection.executemany("INSERT OR IGNORE INTO failed_block_rows VALUES (?)",
+                                   [(record_id,) for record_id in failed_block_ids])
+        row = connection.execute(
             "SELECT count(*), coalesce(sum(d.copies - 1), 0), "
-            "coalesce(sum(CASE WHEN t.n > 1 THEN 1 ELSE 0 END), 0) FROM ("
+            "coalesce(sum(CASE WHEN t.n > 1 THEN 1 ELSE 0 END), 0), "
+            "coalesce(sum(CASE WHEN f.record_id IS NOT NULL THEN 1 ELSE 0 END), 0) FROM ("
             "SELECT e.record_id, e.request_id, count(a.record_id) AS copies "
             "FROM records e JOIN actual a ON a.record_id = e.record_id "
             "GROUP BY e.record_id HAVING count(a.record_id) > 1) d "
             "JOIN (SELECT request_id, count(*) AS n FROM attempts GROUP BY request_id) t "
-            "ON t.request_id = d.request_id").fetchone()
-        resent = ledger.connection.execute(
+            "ON t.request_id = d.request_id "
+            "LEFT JOIN failed_block_rows f ON f.record_id = d.record_id").fetchone()
+        resent = connection.execute(
             "SELECT count(*) FROM (SELECT request_id FROM attempts GROUP BY request_id "
             "HAVING count(*) > 1)").fetchone()[0]
-    duplicated, extra, replayed = (int(value) for value in row)
+        failed_requests = connection.execute(
+            "SELECT count(DISTINCT e.request_id) FROM records e "
+            "JOIN failed_block_rows f ON f.record_id = e.record_id").fetchone()[0]
+    duplicated, extra, replayed, in_failed = (int(value) for value in row)
     return {"duplicated_records": duplicated, "extra_copies_records": extra,
             "duplicated_in_resent_requests_records": replayed,
             "duplicated_outside_resent_requests_records": duplicated - replayed,
-            "resent_requests_count": int(resent)}
+            "resent_requests_count": int(resent),
+            "duplicated_in_failed_blocks_records": in_failed,
+            "duplicated_outside_failed_blocks_records": duplicated - in_failed,
+            "failed_block_records_count": len(set(failed_block_ids)),
+            "failed_block_requests_count": int(failed_requests)}
+
+
+def failed_block_record_ids(root, workload, failed_files) -> set:
+    """The record ids stored in the values files of blocks whose flush failed.
+
+    `failed_files` are the block file names of the exporter's `flush.failed`
+    events; `root` is the downloaded store.
+    """
+    names = set(failed_files)
+    found = set()
+    if not names:
+        return found
+    with measurement.duckdb.connect() as db:
+        for signal in ("logs", "metrics"):
+            files = [path for path in Path(root).glob(
+                f"v=1/signal={signal}/dataset=values/**/*.parquet") if path.name in names]
+            if not files:
+                continue
+            record_id, _payload = measurement._duck_record_expression(workload, signal)
+            relation = (f"read_parquet({[str(path) for path in files]!r}, union_by_name=true, "
+                        "hive_partitioning=false)")
+            found.update(row[0] for row in db.execute(f"SELECT {record_id} FROM {relation} v"
+                                                      ).fetchall())
+    return found
+
+
+def duplicates_explained(buffered, duplicates) -> tuple:
+    """Whether every stored duplicate is attributed, and why.
+
+    Strict: each duplicated record belongs to a request the producer resent.
+    Buffered: the producer never resends after the log acknowledged it, so
+    each duplicated record must have a copy in a file of a failed block,
+    whose nacked requests the buffer delivered again.
+    """
+    if not duplicates:
+        return False, "the duplicates were not measured"
+    if buffered:
+        outside = duplicates.get("duplicated_outside_failed_blocks_records")
+        return outside == 0, (
+            f"{outside} of {duplicates.get('duplicated_records')} duplicated records have no "
+            f"copy in the files of failed blocks ({duplicates.get('failed_block_records_count')}"
+            f" records of {duplicates.get('failed_block_requests_count')} nacked requests)")
+    outside = duplicates.get("duplicated_outside_resent_requests_records")
+    return outside == 0, (
+        f"{outside} duplicated records outside the {duplicates.get('resent_requests_count')} "
+        "resent requests")
 
 
 class StoreLister:
@@ -3485,7 +3548,8 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
             workload=spec.workload,
         )
         acked_scope = measurement._compare(ledger, require_all=False, healthy=False)
-        record["duplicates"] = duplicate_attribution(ledger)
+        record["duplicates"] = duplicate_attribution(ledger, failed_block_record_ids(
+            local, spec.workload, record["events"]["failed_files"]))
     except AssertionError as error:
         oracle_error = str(error)[:2000]
         oracle = {"passed": False, "problems": [oracle_error], "readers": {},
@@ -3576,16 +3640,8 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
          f"bound {lateness['bound_s']} s; violations {lateness['violations']}; hours "
          f"{lateness['hours']}")
     duplicates = record.get("duplicates") or {}
-    nacked_records = int(final.get("nacks", 0)) * case.spec.workload.records_per_request
-    if case.buffered:
-        explained = duplicates.get("extra_copies_records", 0) <= nacked_records
-        why = (f"{duplicates.get('extra_copies_records')} extra copies against "
-               f"{nacked_records} records in bundles the exporter nacked")
-    else:
-        explained = duplicates.get("duplicated_outside_resent_requests_records", 0) == 0
-        why = (f"{duplicates.get('duplicated_outside_resent_requests_records')} duplicated "
-               f"records outside the {duplicates.get('resent_requests_count')} resent requests")
-    hard("duplicates_explained", bool(duplicates) and explained, why)
+    explained, why = duplicates_explained(case.buffered, duplicates)
+    hard("duplicates_explained", explained, why)
     hard("fault_rig_clean", record["residual_state"].get("clean") and record["rig_cleanup_clean"],
          f"residual {record['residual_state'].get('clean')}; cleanup "
          f"{record['rig_cleanup_clean']}")

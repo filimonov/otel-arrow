@@ -1063,6 +1063,46 @@ class FaultCaseContracts(unittest.TestCase):
         self.assertEqual(report["duplicated_outside_resent_requests_records"], 1)
         self.assertEqual(report["resent_requests_count"], 1)
 
+    # Scenario: buffered duplicates, few enough to fit in the nacked bundles'
+    # records, where one duplicated record has no copy in a failed block's file.
+    # Guarantees: a buffered duplicate is explained only by a copy in a file
+    # of a block whose flush failed, never by a count budget.
+    def test_buffered_duplicates_need_a_copy_in_a_failed_block(self):
+        root = temporary_directory(self)
+        workload = measurement.Workload(requests=2, records_per_request=2)
+        width = measurement.ID_FIXED_WIDTH + len(measurement.LOG_KIND)
+        ids = [measurement.stable_id(workload.seed, request, point, measurement.LOG_KIND)
+               for request in range(2) for point in range(2)]
+        self.assertEqual({len(record) for record in ids}, {width})
+        partition = root / "v=1/signal=logs/dataset=values/date=d/hour=h"
+        partition.mkdir(parents=True)
+        with measurement.duckdb.connect() as db:
+            for name, bodies in (("part-a-00000003.parquet", [ids[0] + "x"]),
+                                 ("part-a-00000004.parquet", [ids[1] + "x", ids[2] + "x"])):
+                rows = ", ".join(f"('{body}')" for body in bodies)
+                db.execute(f"COPY (SELECT * FROM (VALUES {rows}) t(body)) TO "
+                           f"'{partition / name}' (FORMAT parquet)")
+        failed = faults.failed_block_record_ids(root, workload, ["part-a-00000003.parquet"])
+        self.assertEqual(failed, {ids[0]})
+        ledger = measurement.Ledger(root / "ledger.sqlite")
+        self.addCleanup(ledger.close)
+        for request in range(2):
+            ledger.add_request(request, "logs", b"w%d" % request,
+                               [(ids[2 * request + point], "log", "h") for point in range(2)],
+                               send_ns=1)
+            ledger.attempt(request, 1, 1, 2, measurement.OUTCOME_ACK)
+        stored = [ids[0], ids[0], ids[1], ids[2], ids[3]]
+        measurement._load_actual(ledger, iter([(record, "logs", "h") for record in stored]))
+        explained, _why = faults.duplicates_explained(
+            True, faults.duplicate_attribution(ledger, failed))
+        self.assertTrue(explained)
+        stored.append(ids[3])
+        measurement._load_actual(ledger, iter([(record, "logs", "h") for record in stored]))
+        report = faults.duplicate_attribution(ledger, failed)
+        self.assertEqual(report["duplicated_outside_failed_blocks_records"], 1)
+        explained, why = faults.duplicates_explained(True, report)
+        self.assertFalse(explained, why)
+
     # Scenario: the engine log carries cleanup, failure and commit events with
     # colour codes.
     # Guarantees: flush events are counted by name and outcome, and other
