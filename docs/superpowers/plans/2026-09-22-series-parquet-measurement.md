@@ -2026,3 +2026,16 @@ Claude-Session: https://claude.ai/code/session_016eXMWRZMWytNktdv5v3vdd"
    6. The series-lake crate: format, FORMAT.md, unit, golden and fuzz tests.
    7. The series_parquet exporter behind its feature: configs, README and operator guide, Rust tests, and a small MinIO E2E as an optional CI lane.
    The split may be refined when the branch is cut (for example the pdata byte-view fixes as their own first commit). Each commit gets one changelog entry for its component; issue placeholders are replaced by the PR number when opened. Opening upstream PRs or issues remains the user's call.
+
+## Task 15 (user decision 2026-09-25): "canary ready" inside plan 3
+
+The spec 9.7 "canary ready" gate is met in this plan, not deferred: "nightly soak with storage latency, errors and restarts shows no RSS trend and no lost acknowledged records" (spec 10.3). On the Alloy + durable_buffer reference deployment (exact shipped configs, site substitutions only), after the Task 12 fixes and full gates:
+- [ ] A chaos schedule harness on top of reference_deployment.py and faults.py: randomized but seeded and recorded events -- S3 latency, 5xx bursts, a short store outage, engine SIGTERM restart, engine SIGKILL, Alloy restart -- with minimum spacing so each recovery is observable; every event logged with its time.
+- [ ] Cardinality profiles from spec 10.3 through the self-verifying generator: stable (10k hot series), churn (1M distinct series against a 200k cache), mixed (80/20); cache, block and eviction metrics asserted against their limits.
+- [ ] A nightly-length run (at least 4 h; record the chosen length) per profile that matters most (churn first, then mixed), MinIO; one shorter run on RustFS.
+- [ ] Acceptance: after drain, no acknowledged record missing (oracle by stable record id), duplicates attributed to events within their bounds, zero unexplained orphans; RSS p99 after the first hour equals p99 at the end within the stated tolerance (a rising baseline is a blocking leak); WAL and exporter memory within the documented bounds throughout.
+- [ ] Failpoints of spec 10.3 are covered by the kill/restart events plus Tasks 10-11; a failpoint build is not required unless the run exposes a gap.
+
+## Task 12g (user decision 2026-09-25): Azure via Azurite, basic smoke
+
+One E2E smoke case against Azurite (pinned image, --pull=never once local), per the third-review amendment: Azure authenticates through the bearer-token capability, so Azurite runs with `--oauth basic` over HTTPS with a self-signed certificate trusted by the engine and a static well-formed token (for example the k8s_service_account_token_auth extension pointed at a token file). Logs and metrics written, read back with DuckDB and ClickHouse through the oracle. If Azurite cannot accept the token path, report it and refuse Azure at startup with the reason. Not a failure matrix.
