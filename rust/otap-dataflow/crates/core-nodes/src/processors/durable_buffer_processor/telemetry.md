@@ -113,6 +113,8 @@ All events are emitted from
 | `durable_buffer.shutdown.flush_failed` | `error` | `engine.flush()` failed during shutdown (data durability is still ensured by `engine.shutdown()`). |
 | `durable_buffer.shutdown.flush_deadline` | `warn` | The flush of the open segment did not finish one second before the shutdown deadline; its bundles are replayed from the WAL on the next start. |
 | `durable_buffer.shutdown.persist_deadline` | `warn` | The final persist of progress and the engine shutdown did not finish by the shutdown deadline, or within one second of starting when that is later; what was not persisted is replayed from the WAL on the next start. |
+| `durable_buffer.shutdown.release_deadline` | `warn` | The storage engine did not finish closing its files (the WAL's drop-time sync) by the shutdown deadline and its reserve; it keeps closing on its own thread and the buffer stops without it. |
+| `durable_buffer.shutdown.release_thread_failed` | `warn` | No thread could be started to close the storage engine; it closes on the pipeline thread without a bound. |
 | `durable_buffer.shutdown.progress_failed` | `error` | Persisting the recorded acknowledgements failed at shutdown; those bundles are replayed on the next start. |
 | `durable_buffer.shutdown.engine_failed` | `error` | `engine.shutdown()` failed; open segment may not have been finalized. |
 
