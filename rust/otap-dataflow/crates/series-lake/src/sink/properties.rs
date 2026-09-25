@@ -52,12 +52,20 @@ pub fn writer_properties(compression: Compression) -> WriterPropertiesBuilder {
             .set_dictionary_enabled(true)
             .set_max_row_group_row_count(None),
         |builder, column| {
-            let path = ColumnPath::from(*column);
+            let path = leaf_path(column);
             builder
                 .set_column_dictionary_enabled(path.clone(), false)
                 .set_column_statistics_enabled(path, EnabledStatistics::Chunk)
         },
     )
+}
+
+/// The Parquet path of a dotted leaf name such as `attrs.entries.values`;
+/// `ColumnPath::from` keeps the dots inside one part, which matches only a
+/// top-level column.
+#[must_use]
+pub(super) fn leaf_path(leaf: &str) -> ColumnPath {
+    ColumnPath::new(leaf.split('.').map(str::to_owned).collect())
 }
 
 /// Whether the writer closes its row group now: its buffered memory reached

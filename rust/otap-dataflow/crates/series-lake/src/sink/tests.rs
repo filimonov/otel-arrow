@@ -3,6 +3,7 @@
 
 //! Tests of the Parquet sink.
 
+use super::properties::leaf_path;
 use super::write::{UploadLedger, chunk_charge, creation_watch};
 use super::*;
 use crate::buffer::Block;
@@ -1853,7 +1854,6 @@ async fn a_step_whose_token_has_fired_is_not_driven_again() {
 #[test]
 fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics() {
     use parquet::file::properties::EnabledStatistics;
-    use parquet::schema::types::ColumnPath;
     let cfg = LakeConfig::default();
     let leaves: Vec<String> = Dataset::ALL
         .iter()
@@ -1874,7 +1874,7 @@ fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics()
             leaves.iter().any(|leaf| leaf == column),
             "{column} is no leaf of any dataset"
         );
-        let path = ColumnPath::from(column);
+        let path = leaf_path(column);
         assert!(
             !props.dictionary_enabled(&path),
             "{column} keeps a dictionary"
@@ -1895,7 +1895,7 @@ fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics()
             leaves.iter().any(|leaf| leaf == column),
             "{column} is no leaf"
         );
-        let path = ColumnPath::from(column);
+        let path = leaf_path(column);
         assert!(props.dictionary_enabled(&path), "{column}");
         assert_eq!(
             props.statistics_enabled(&path),
@@ -1903,4 +1903,78 @@ fn high_entropy_columns_are_real_leaves_and_the_sort_keys_keep_page_statistics()
             "{column}"
         );
     }
+}
+
+/// Scenario: a logs block whose records carry a body, a trace and span id and
+/// an attribute is written, and the column chunks of every file are read back.
+/// Guarantees: each of the `HIGH_ENTROPY_COLUMNS`, the nested
+/// `attrs.entries.values` included, is written without a dictionary page or
+/// dictionary encoding and without a column index, while other string
+/// leaves, nested ones included, keep both and the sort keys keep the index.
+#[tokio::test]
+async fn high_entropy_leaves_are_written_without_a_dictionary() {
+    use parquet::basic::Encoding;
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = LakeConfig::default();
+    let mut data = logs(30, 8);
+    for (i, record) in data.resource_logs[0].scope_logs[0]
+        .log_records
+        .iter_mut()
+        .enumerate()
+    {
+        record.trace_id = vec![i as u8 + 1; 16];
+        record.span_id = vec![i as u8 + 1; 8];
+        record.attributes = vec![kv("request.id", &body(i, 12))];
+    }
+    let mut block = Block::new(WINDOW_START, SEQ, cfg.clone());
+    let mut cache = SeriesCache::new(10);
+    let mut records = encode_logs(&data);
+    let e = extract(&mut records, &cfg).expect("extract");
+    let r = block.reserve(&e, &mut cache, 8).expect("reserve");
+    block.admit(e, r).expect("admit");
+    block.seal(SEAL_AT_US).expect("seal");
+    let sink = Sink::new(local(&dir), cfg, naming("w", "dict"), tokio_timer);
+    let report = sink
+        .write_block(&block, &CancellationToken::new())
+        .await
+        .expect("write");
+
+    // Leaf path -> (dictionary used, column index written), over every file.
+    let mut leaves = std::collections::BTreeMap::new();
+    for (_, path, _) in &report.files {
+        let file = std::fs::File::open(dir.path().join(path.as_ref())).expect("open");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("reader");
+        for rg in reader.metadata().row_groups() {
+            for chunk in rg.columns() {
+                let dictionary = chunk.dictionary_page_offset().is_some()
+                    || chunk.encodings().any(|encoding| {
+                        matches!(
+                            encoding,
+                            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+                        )
+                    });
+                let entry = leaves
+                    .entry(chunk.column_path().string())
+                    .or_insert((false, false));
+                entry.0 |= dictionary;
+                entry.1 |= chunk.column_index_offset().is_some();
+            }
+        }
+    }
+    for column in HIGH_ENTROPY_COLUMNS {
+        let &(dictionary, index) = leaves
+            .get(column)
+            .unwrap_or_else(|| panic!("{column} is in no written file: {leaves:?}"));
+        assert!(!dictionary, "{column} is dictionary-encoded");
+        assert!(!index, "{column} carries page statistics");
+    }
+    for column in [
+        "time_unix_nano",
+        "attrs.entries.keys",
+        "resource_attrs.entries.values",
+    ] {
+        assert_eq!(leaves.get(column), Some(&(true, true)), "{column}");
+    }
+    // FIXED_LEN_BYTE_ARRAY takes no dictionary in the Parquet 1.0 writer.
+    assert_eq!(leaves.get("series_id"), Some(&(false, true)));
 }
