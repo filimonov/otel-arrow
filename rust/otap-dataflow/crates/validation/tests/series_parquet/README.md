@@ -792,8 +792,11 @@ arming until both routes answer again.
   the engine's own fresh queries (AAAA, which the diagnostic `dig` never
   sends) were answered NXDOMAIN and the nack was retried.
 - `dns_timeout`: the same endpoint, and namespace-local OUTPUT rules
-  dropping UDP and TCP destination port 53. Observed when the rules counted
-  packets, a diagnostic `dig` from the namespace timed out, the resolver
+  dropping UDP and TCP destination port 53, the engine's own queries through
+  rules matching its user id (`-m owner --uid-owner`; every tool in the
+  namespace runs as root) ahead of the general ones. Observed when a
+  diagnostic `dig` from the namespace timed out, the engine's rules then
+  dropped queries beyond their reading right after that lookup, the resolver
   received no query for the name, and the nack was retried. Packets dropped
   in OUTPUT never reach the loopback capture, which therefore shows DNS
   silence during the fault. Recovery deletes exactly those rules and needs a

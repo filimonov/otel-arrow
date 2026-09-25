@@ -1893,13 +1893,41 @@ class NetworkCaseContracts(unittest.TestCase):
         self.assertTrue(faults._dns_nxdomain_met(None, nxdomain))
         self.assertFalse(faults._dns_nxdomain_met(None, network_seen(
             dns={"engine_queries_count": 0, "nxdomain_answers_count": 1})))
-        timeout = network_seen(dns={"queries_count": 0}, dns_rule_packets={"udp": 6, "tcp": 0},
-                               diagnostic_dig={"timed_out": True})
+        after_dig = {"udp": 1, "tcp": 0, "engine_udp": 0, "engine_tcp": 0}
+        timeout = network_seen(dns={"queries_count": 0}, diagnostic_dig={"timed_out": True},
+                               dns_rule_packets_after_dig=after_dig,
+                               dns_rule_packets=dict(after_dig, engine_udp=4))
         self.assertTrue(faults._dns_timeout_met(None, timeout))
-        for broken in ({"dns": {"queries_count": 1}}, {"dns_rule_packets": {"udp": 0}},
-                       {"diagnostic_dig": {"timed_out": False}}, {"storage_nacks_count": 0}):
+        for broken in ({"dns": {"queries_count": 1}}, {"diagnostic_dig": {"timed_out": False}},
+                       {"storage_nacks_count": 0}, {"dns_rule_packets_after_dig": None}):
             with self.subTest(broken=broken):
                 self.assertFalse(faults._dns_timeout_met(None, dict(timeout, **broken)))
+
+    # Scenario: during a DNS timeout only the harness's diagnostic lookup hits
+    # the DROP rules, with every retry and nack signal present.
+    # Guarantees: the fault is not observed: only a drop of the engine's own
+    # user's queries after the lookup's snapshot counts, and one does.
+    def test_dns_timeout_needs_the_engines_own_dropped_query(self):
+        listing = "\n".join((
+            "-P OUTPUT ACCEPT -c 0 0",
+            "-A OUTPUT -p tcp -m tcp --dport 53 -m owner --uid-owner 1000 -c {et} 0 -j DROP",
+            "-A OUTPUT -p udp -m udp --dport 53 -m owner --uid-owner 1000 -c {eu} 60 -j DROP",
+            "-A OUTPUT -p udp -m udp --dport 53 -c {u} 60 -j DROP",
+            "-A OUTPUT -p tcp -m tcp --dport 53 -c 0 0 -j DROP"))
+        snapshot = faults.dns_rule_counts(listing.format(et=0, eu=0, u=1))
+        self.assertEqual(snapshot, {"udp": 1, "tcp": 0, "engine_udp": 0, "engine_tcp": 0})
+        base = dict(dns={"queries_count": 0}, diagnostic_dig={"timed_out": True},
+                    dns_rule_packets_after_dig=snapshot)
+        only_dig = network_seen(**base, dns_rule_packets=faults.dns_rule_counts(
+            listing.format(et=0, eu=0, u=1)))
+        self.assertFalse(faults._dns_timeout_met(None, only_dig))
+        engine = network_seen(**base, dns_rule_packets=faults.dns_rule_counts(
+            listing.format(et=0, eu=3, u=1)))
+        self.assertEqual(faults.engine_dns_drops_after_dig(engine), 3)
+        self.assertTrue(faults._dns_timeout_met(None, engine))
+        rules = faults.engine_dns_rules(1000)
+        self.assertEqual(rules[0], ["OUTPUT", "-p", "udp", "--dport", "53", "-m", "owner",
+                                    "--uid-owner", "1000", "-j", "DROP"])
 
     # Scenario: a cohort's values object is observed with its response
     # withheld, then after removal.

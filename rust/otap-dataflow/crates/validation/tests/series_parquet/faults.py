@@ -5113,6 +5113,14 @@ HOLD_COMPLETION_TOXIC = {"name": "hold_completion", "type": "latency", "stream":
 # The DNS timeout's namespace-local rules: every query to any resolver dropped.
 DNS_TIMEOUT_RULES = (["OUTPUT", "-p", "udp", "--dport", "53", "-j", "DROP"],
                      ["OUTPUT", "-p", "tcp", "--dport", "53", "-j", "DROP"])
+
+
+def engine_dns_rules(uid):
+    """The same drops for the engine's own queries, matched by its user id ahead
+    of the general rules: the engine container runs as the invoking user, every
+    tool in the namespace as root, so these counters count only the engine."""
+    return tuple(rule[:5] + ["-m", "owner", "--uid-owner", str(int(uid))] + rule[5:]
+                 for rule in DNS_TIMEOUT_RULES)
 # The DNS cases' resolver: dnsmasq on the namespace's loopback, answering
 # only from the run's hosts file, authoritative for `.test`, never cached.
 DNS_RESOLV_CONF = "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n"
@@ -5274,20 +5282,38 @@ def _recover_dns_nxdomain(rig, state):
     return {"dig": lookup, "removed_unix_s": time.time()}
 
 
+def dns_rule_counts(listing) -> dict:
+    """Packets the DNS timeout rules dropped, from `iptables -v -S OUTPUT`: the
+    general rules as `udp`/`tcp`, the engine's user-matched ones as
+    `engine_udp`/`engine_tcp` (None when a rule is absent or ambiguous)."""
+    found = {}
+    for line in listing.splitlines():
+        protocol = re.search(r"-p (udp|tcp)\b", line)
+        packets = re.search(r"-c (\d+) \d+", line)
+        if not (line.startswith("-A OUTPUT") and protocol and packets and "--dport 53" in line
+                and "-j DROP" in line):
+            continue
+        name = ("engine_" if "--uid-owner" in line else "") + protocol[1]
+        found[name] = None if name in found else int(packets[1])
+    return {name: found.get(name) for name in ("udp", "tcp", "engine_udp", "engine_tcp")}
+
+
 def dns_rule_counters(rig):
-    """Packets each DNS timeout rule dropped so far."""
-    listing = rig.exec(["iptables", "-w", "-v", "-S", "OUTPUT"])["stdout"]
-    return {rule[2]: rule_counters(listing, [f"-p {rule[2]}", "--dport 53", "-j DROP"])
-            .get("packets") for rule in DNS_TIMEOUT_RULES}
+    """Packets each DNS timeout rule dropped so far (`dns_rule_counts`)."""
+    return dns_rule_counts(rig.exec(["iptables", "-w", "-v", "-S", "OUTPUT"])["stdout"])
 
 
 def _activate_dns_timeout(rig, parameters):
-    """Drop every DNS query leaving any process in the namespace."""
-    for rule in DNS_TIMEOUT_RULES:
+    """Drop every DNS query leaving any process in the namespace, the engine's
+    through rules of its own user id so they are counted apart."""
+    rules = [list(rule) for rule in DNS_TIMEOUT_RULES] + [
+        list(rule) for rule in engine_dns_rules(os.getuid())]
+    # Each insertion goes first, so the engine's rules end up ahead of the general ones.
+    for rule in rules:
         done = rig.exec(["iptables", "-w", "-I", rule[0], "1", *rule[1:]])
         if done["exit_status"] != 0:
             raise AssertionError(f"the DNS rule {rule} could not be inserted: {done['stderr']}")
-    return {"rules": [list(rule) for rule in DNS_TIMEOUT_RULES],
+    return {"rules": rules, "engine_uid": os.getuid(),
             "connections": reset_front_connections(rig)}
 
 
@@ -6039,6 +6065,7 @@ class NetworkCase(FaultCase):
         super().arm(parameters)
         if self.fault == "dns_timeout":
             self.network["diagnostic_dig"] = dig(self.rig, self.rig.dns_name)
+            self.network["dns_rules_after_dig"] = dns_rule_counters(self.rig)
 
     def observe_condition(self):
         """The S3 family's observations plus the fault's network evidence."""
@@ -6063,6 +6090,7 @@ class NetworkCase(FaultCase):
             observed["dns_rule_packets"] = self.cached("dns_rules",
                                                        lambda: dns_rule_counters(self.rig))
             observed["diagnostic_dig"] = self.network.get("diagnostic_dig")
+            observed["dns_rule_packets_after_dig"] = self.network.get("dns_rules_after_dig")
         if self.fault == "tcp_ack_loss":
             observed["dropped_pure_ack_packets_count"] = self.cached(
                 "ack_rule", lambda: ack_rule_packets(self.rig))
@@ -6148,6 +6176,7 @@ class NetworkCase(FaultCase):
             "dns_packets_during_fault_count": capture.get("dns_packets_during_fault_count"),
             "dns_rule_dropped_udp_count": (observed.get("dns_rule_packets") or {}).get("udp"),
             "dns_rule_dropped_tcp_count": (observed.get("dns_rule_packets") or {}).get("tcp"),
+            "dns_engine_dropped_after_dig_count": engine_dns_drops_after_dig(observed),
             "dropped_pure_ack_packets_count": self.removal_state().get(
                 "dropped_packets_at_removal", observed.get("dropped_pure_ack_packets_count")),
             "tcp_retransmissions_count": ack.get("tcp_retransmissions_count"),
@@ -6197,12 +6226,24 @@ def _dns_nxdomain_met(case, seen) -> bool:
             and seen["retried"])
 
 
+def engine_dns_drops_after_dig(seen):
+    """Queries of the engine's own user the rules dropped after the diagnostic
+    lookup's snapshot, or None without both readings."""
+    now = seen.get("dns_rule_packets") or {}
+    then = seen.get("dns_rule_packets_after_dig") or {}
+    if any(not isinstance(reading.get(name), int) for reading in (now, then)
+           for name in ("engine_udp", "engine_tcp")):
+        return None
+    return sum(now[name] - then[name] for name in ("engine_udp", "engine_tcp"))
+
+
 def _dns_timeout_met(case, seen) -> bool:
-    """DNS timeout: the rules dropped queries, the diagnostic lookup timed out, the
-    resolver received no query for the name, and the exporter retried and nacked."""
+    """DNS timeout: the engine's own queries were dropped after the diagnostic
+    lookup, which timed out, the resolver received no query for the name, and the
+    exporter retried and nacked."""
     dns = seen.get("dns") or {}
-    rules = seen.get("dns_rule_packets") or {}
-    return ((rules.get("udp") or 0) > 0 and bool((seen.get("diagnostic_dig") or {}).get("timed_out"))
+    return ((engine_dns_drops_after_dig(seen) or 0) > 0
+            and bool((seen.get("diagnostic_dig") or {}).get("timed_out"))
             and dns.get("queries_count") == 0 and seen["flush_retries_count"] > 0
             and seen["storage_nacks_count"] > 0 and seen["retried"])
 
