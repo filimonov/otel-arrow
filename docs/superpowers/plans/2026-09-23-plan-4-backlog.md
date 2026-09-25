@@ -1,157 +1,453 @@
 # Plan 4 backlog (series_parquet exporter)
 
-Status: backlog, not a plan yet. Plan 4 is written from the plan-3 Task 12
-classification and the Task 14 report; this file only collects what has been
-deferred to it, with its origin, so nothing is lost. Ordered by the user's
-priority where stated.
+Status: groomed backlog (2026-09-25), not a plan. Plan 4 is written from it
+after the plan-3 final report (Task 14).
 
-## Priority 1 (user, 2026-09-23: "changes the picture most")
+How items enter and leave: an item enters with its source (task report,
+review, spec section or user decision) and leaves either into a plan with a
+task number or into "Done / removed" with the task that delivered it. An open
+item is never dropped silently; duplicates are merged and the merge is listed
+at the end.
 
-1. **Shared writer per process with parallel preparation** (spec 10.4). One
-   writer instead of one per worker: shared series cache (removes N-fold
-   descriptor duplication per partition with N workers), w-way merge of all
-   workers' sorted runs at the window boundary, one file set per window,
-   multipart upload with parallel parts. Task 5 supplies the measured cost
-   of per-worker duplication and scaling efficiency.
-2. **Flush off the ingest core.** Merge, encode and zstd run through
-   spawn_local on the same core as admission, so a large flush stalls intake
-   for tens of milliseconds per chunk and a flush longer than the window
-   closes intake. Move flush to a bounded pool (or into the shared writer of
-   item 1), keeping the ACTIVE + FLUSHING memory bound. Task 5 measures the
-   admission-closed duration first. User decision 2026-09-23: do it together
-   with item 1.
-3. **Compactor** (spec 10.2), shaped by docs/superpowers/compaction-and-format-chat.md: one hourly high-watermark object instead of per-file manifests (readers use compacted files at or below the watermark and raw files above it, never both for one hour); per-writer seal markers `_sealed/hour=H/writer=<writer_id>/<boot_id>` written only after every PUT of that writer for H has resolved (success or confirmed abort; an unknown outcome is resolved by HEAD first), and the compactor closes H only when all live writers have sealed it; re-sort on compaction (metrics/values by metric_name, series_id, time; logs/values time-first, to be decided from queries); page index everywhere and Bloom filters on series_id (and trace/span ids for logs) in compacted files only; several compacted files per hour above a target size; GC of raw files after a grace period, decoupled from the compactor. Originally: One file set per window per worker means
-   thousands of small files per hour at 15 s and 32 cores. A stateless
-   `series-lake-compactor` with a Quickwit-style policy over the existing
-   compaction scope.
-4. **Format batch 2** (user decision 2026-09-23: plan 4, not before plan 3
-   ends):
-   - `identity_config` hash (series_attributes, producer_id_attribute and any
-     other identity-affecting setting) in the Parquet footer and in the
-     compaction scope, plus a `_lake.json` marker in base_uri; refuse at
-     startup when the configured identity differs from the lake's.
-   - `ingestion_id` (request UUID) as a values column, the dedup key for
-     at-least-once replays, with the reader recipe in FORMAT.md.
-   - Explicit threat model in FORMAT.md (unseeded xxh3, producer_id taken
-     from telemetry, single trust domain).
-   - Path to v2: what may change without a new `v=`, and how a reader learns
-     the version from the footer, not only from the path.
-   - Remove `parquet.compression` until a second codec exists.
-   - `metric_type`, `temporality` and `is_monotonic` duplicated into metrics/values (dictionary/RLE makes them nearly free), so a values file is self-describing without the join to series.
+Not here: Task 12 (fixes), Task 12g (Azurite smoke) and Task 15 (canary-ready
+chaos and multi-hour soak on the reference deployment) are in plan 3,
+docs/superpowers/plans/2026-09-22-series-parquet-measurement.md.
 
-## Other deferred items
+Each item has a why, a done-when criterion and its source.
 
-- Buffered-topology freshness and loss contract (user review, 2026-09-23): (1) an end-to-end freshness SLO metric -- age of the oldest record accepted by the receiver but not yet visible in a values file -- combining the buffer's oldest undelivered segment age and the exporter's `oldest_unacked.age`, with alerting guidance on it and on WAL fill; (2) refuse permanently-invalid requests BEFORE the WAL acknowledges them (run the exporter's framing/size/support checks, or a cheap subset, at or before the buffer), so a producer is told instead of the buffer silently dropping an acknowledged bundle; (3) an optional "max freshness" rotation trigger (oldest-pending age) so a slow trickle does not wait a full window; (4) documentation of the semantics change: with the buffer, success means "durable on the local WAL", without it "durable in the object store".
+## P0: before production, right after plan 3
 
-- Larger CPU candidates from the Task 4 attribution (2026-09-23): sort on fixed-width keys (series_id + time) instead of row-format keys materialised for every row (sort/seal/merge 11-13 percent of engine CPU); extract directly from OTLP bytes via pdata views, skipping OTAP Arrow construction (conversion is 20 percent of metrics CPU, 8 percent of logs).
+Items that affect correctness or operability of the shipped Alloy +
+durable_buffer deployment and are not in plan 3.
 
-- Spatial aggregation processor (user question 2026-09-23): otap-dataflow has `processor:attribute` (delete/hash) and `processor:temporal_reaggregation` (temporal only) but nothing that drops attributes AND merges the colliding streams with temporality-correct aggregation (sum cumulative totals per stream with reset handling, sum deltas, chosen function for gauges), the equivalent of SDK Views or the Go collector's aggregate_labels. A separate node, worth raising upstream; temporal_reaggregation already tracks streams and cumulative state.
+- **P0-1 Acks to retry_processor and fanout_processor after they exit.**
+  Why: in durable_buffer -> retry/fanout -> series_parquet the dispatcher drops
+  completions to a closed control channel silently (retry_processor/mod.rs:668,
+  705; fanout_processor 512, 988, 1107-1109; pipeline_ctrl.rs:1033, 1058), so
+  the buffer replays bundles the exporter already wrote.
+  Done when: both processors declare shutdown_completions and track in-flight
+  frames (or a dispatcher rule covers closed nodes), and a dropped completion is
+  counted and logged; a restart test through each processor stores no duplicate.
+  Source: Task 12e item 5; umbrella review 2026-09-25, needs verification.
 
-- Fifth review (2026-09-23): histogram `sum` of exactly zero becomes null after an OTAP round trip because the transport omits an all-default column; fix in the pdata transport layer by preserving presence, then in the exporter (pdata PR, upstream-relevant). A lossless high-cardinality mode (physical grouping by stable fields with varying attributes kept per point and the full stream identity stored separately) is a format change and a separate mode, not a hash tweak. Bounded yielding inside merge-key building and per-chunk encoding, if the flush does not move off the ingest core first.
+- **P0-2 End-to-end freshness gauge.**
+  Why: operators alert today from external object checks and indirect signals;
+  no metric gives the age of the oldest record accepted by the receiver but not
+  yet in a values file.
+  Done when: durable_buffer exports an oldest-pending-age gauge, the operator
+  guide alerts on it combined with the exporter's `oldest_unacked.age` and on
+  WAL fill.
+  Source: backlog freshness contract (1), user review 2026-09-23; Task 12c F5.
 
-- Refactoring folded into the shared writer (fourth review, 2026-09-23): the worker state machine behind a narrow event API (on_pdata, on_window, on_flush_done, on_cleanup_done, on_shutdown, one private after_slot_freed, futures out instead of fields, metrics and accounting injected at construction); the notifier as a plain VecDeque of (token, outcome) with one live-token counter and a real await-until-deadline drain; and the LakeWriter facade { offer, seal, commit(FlushReport), abort } with LakeConfig::workspace_bytes() next to the allocating code and private Block fields.
+- **P0-3 Refuse permanently invalid requests before the WAL acknowledges them.**
+  Why: a request the exporter will refuse permanently (framing, row size, too
+  many series, unsupported) is acknowledged by the WAL and later dropped, and
+  one oversize line loses its whole export; the reference Alloy config works
+  around it by truncating lines at 512 KiB, which changes data.
+  Done when: the exporter's permanent checks (or a cheap subset) run at or
+  before the buffer, the producer gets INVALID_ARGUMENT, and the Alloy line
+  truncation is removed or replaced by drop-and-count.
+  Source: backlog freshness contract (2); Task 12c fix round 1 F1.
 
-- Oversize requests: option B, separate `target_block_bytes` (rotation, file
-  size) from `max_block_bytes` (memory cap); option C, split an oversize
-  request across blocks with a multi-block token.
-- Streaming series_id: compute it from a resource+scope+metric prefix hash
-  plus point attributes, without materialising canonical bytes per point.
-- Engine memory accounting rebuilt on `retained_work` with a handle through
-  PipelineContext, engine-namespaced metric, its own engine PR (umbrella 8,
-  consistency C2).
-- Lake-level writer facade: reemit rule, commit-after-flush and cache
-  classification move into series-lake (umbrella 14).
-- Live access to buffered data (spec 10.1).
-- Traces, exponential histograms, summaries, exemplars; day/hour partition
-  granularity; typed attribute maps; idempotent replay by producer batch id;
-  producer id from transport headers; commit manifests; discovery index;
-  resumable extraction (spec 10.2).
-- Long-run program: nightly hours-long runs, 24-72 h qualification, random
-  chaos, failpoints (spec 10.3).
-- Tests: factory with a bound bearer-token capability (needs an engine test
-  helper); DuckDB/ClickHouse actually using native SortingColumn.
-- Upstream: decide core-nodes vs contrib-nodes placement with the maintainers; pdata CBOR encoder recursion limit; PR split; Python lane under
-  tools/; history rewrite before the upstream PR (user decision).
-- Metric sets grouping (3f item 10, deferred): reviewer proposed at most three sets (none; {signal,dataset}; {error.type}); folding would drop labels of flushes{reason}, series.emitted{reason}, dropped.unsupported{kind}, dropped.exemplars{signal}, denormalize.type_mismatch{column,registration}; also worker 'acks' duplicates ExporterExportMetrics outcome=success. Decide with the shared-writer telemetry redesign or at upstream PR time.
+- **P0-4 Validate OTLP framing once, in conversion or at the receiver.**
+  Why: the framing check is copied into four exporters while batch_processor
+  (mod.rs:799) and durable_buffer `convert_to_arrow` (mod.rs:1076) convert
+  without it, so a converting processor upstream reopens the truncated-body
+  acknowledgement for every exporter below.
+  Done when: one validated conversion (`try_into_otap_validated` or the
+  receiver) is used by every converting node and the exporter copies are
+  removed; a damaged body through durable_buffer is refused in a test.
+  Source: umbrella review 2026-09-25, minor issues.
 
-## S3 compatibility review (user note, 2026-09-23)
+- **P0-5 Conversion failure in durable_buffer has no resolved outcome.**
+  Why: a bundle that fails conversion is rejected without
+  `resolved{outcome=...}` (durable_buffer_processor/mod.rs:1426-1430), so the
+  buffer's outcome totals do not add up.
+  Done when: the rejection increments `resolved` with its own outcome and a test
+  asserts it.
+  Source: Task 12 triage amendment.
 
-Source: docs/superpowers/s3-compatitibility.md (in Russian). The user asked to look at it, not to follow it blindly. Controller assessment per point:
+- **P0-6 OTAP Arrow receiver's own RESOURCE_EXHAUSTED.**
+  Why: Task 12d made the OTLP receiver's retryable refusals UNAVAILABLE, but the
+  OTAP Arrow receiver still answers RESOURCE_EXHAUSTED, which Alloy and other
+  OTLP clients without RetryInfo drop.
+  Done when: its concurrency refusals answer UNAVAILABLE, counted, as in the
+  OTLP receiver.
+  Source: Task 12d residual 7.
 
-- Multipart path in E2E: valid. Only `test_short_client_waits_duplicate_rather_than_lose` sets `part_bytes: 5MiB` with 8 MiB blocks, and nothing checks that a file actually crossed a part boundary; the rest of E2E likely writes single PUTs. Cheapest fix: one E2E case per store with a file above `part_bytes`, asserting the multipart calls in the server trace (MinIO `mc admin trace`). Candidate for plan 3 Task 9 rather than plan 4.
-- Complete retried after it succeeded (`NoSuchUpload`): already covered by the planned dropped-completion probe (Task 9) and the late-commit log and counter (Task 3j, major 11). Nothing new beyond checking the answer per store.
-- Orphaned multipart uploads after SIGKILL or an abort timeout: valid and cheap. Tasks 9 and 10 should list incomplete uploads after each scenario and expect zero or a known number. Also consider a startup check or README warning when the bucket has no abort-incomplete-multipart lifecycle rule.
-- Store-specific error codes (SlowDown, 503, RequestTimeout, TLS reset): partly covered by the Task 8 fault rig on real MinIO/RustFS; add 5xx during UploadPart and on Complete if the rig can inject per-operation.
-- Upper bound on `part_bytes` (5 GiB per part, 10,000 parts): trivial validation, take it with the next config change.
-- Versioned buckets and object lock: frozen names plus retries create versions; one README line.
-- Not exposed: `unsigned_payload` (sometimes needed behind proxies; Task 5a already measures unsigned payload on TLS), `checksum_algorithm`, S3 Express. Expose `unsigned_payload` only if Task 5a shows a gain or a user needs it.
-- Store matrix: a `workflow_dispatch` lane on real AWS S3 with secrets is the useful one; Ceph RGW, Garage and SeaweedFS in Docker are cheap additions; R2, B2 and GCS XML interop only on request. Azurite remains the plan 3 gate.
-- The note's conclusion, that "tested on S3-compatible stores" should not be claimed before the multipart and completion points are checked, is adopted for the final report wording.
+- **P0-7 durable_buffer WAL per-write sync option.**
+  Why: an acknowledgement means written to the WAL and synced within about
+  100 ms, so a host crash or power loss can lose the last 100 ms; quiver
+  supports per-write sync (flush_interval 0) but durable_buffer does not expose
+  it, and its cost is unmeasured.
+  Done when: the option is exposed, its throughput cost is measured, and the
+  README "Durability of the acknowledgement" offers it next to strict mode.
+  Source: Task 12c fix round 1 F2.
 
-## Complexity review of 2026-09-24 (deferred by user decision)
+## P1: performance and scale toward 1M records/s
 
-Source and triage: docs/superpowers/complexity-review-2026-09-24.md.
-- Worker owns its state: intent-level methods (`rotation_ready`, `rotate_and_resume`, `refuse_forced`, `cleaned`) and futures for the select, private fields, one notifier-credit calculation; `drive` down to about 60 lines. Do it with the worker state machine and the shared writer.
-- One config form: lake sections equal the user sections, `Error::Config` in lake, delete the exporter mirror structs and the duplicated validation rules (deslop B9).
-- Sink write stack: merge `PutLanded` into `PartLanded`; one gauge type with a drop guard for merge keys and flush workspace; drop the `ParquetObjectWriter` layer if the shared writer keeps this stack.
-- `Outcome` with `derive(AttributeEnum)` and `Outcome::ALL` instead of the hand table.
+Acceptance number: 100k-1M records/s from dozens to hundreds of producers
+(Task 5: 684k on four worker cores, about six cores estimated for 1M;
+buffered 144-152k bound by the WAL device).
 
-## Data-model coverage gaps (user note, 2026-09-24)
+### Milestones
 
-What the OTAP and OTLP models carry and series_parquet does not keep. The exporter README section "What this exporter does not keep" is the user-facing list; this is the work list. Each item is a format change unless marked otherwise, so it belongs with format batch 2 or a later format revision.
+- **P1-1 Shared writer with parallel preparation (flush off the ingest core
+  folded in).**
+  Why: one writer per worker duplicates descriptors N-fold, writes N file sets
+  per window, scales at 0.67 from 1 to 4 workers, and runs merge, encode and
+  zstd on the admission core, so a large flush stalls intake (up to 32.8 ms per
+  stretch) and a flush longer than the window closes admission.
+  Done when: spec 10.4 is revised (sections 3, 6, 7) and built with its own
+  plan: per-worker caches deduplicated in a w-way merge at the window boundary,
+  encoding on a bounded pool, one file set per window, parallel multipart parts,
+  a process-wide ACTIVE + FLUSHING reservation; a Task 5 rerun shows the new
+  scaling and no ingest-core flush stall. Bounded yielding in merge-key building
+  and per-chunk encoding is needed only if this milestone slips.
+  Source: spec 10.4; user decisions 2026-09-23 (together) and 2026-09-25
+  (major milestone); Task 5 scaling; Task 3i deferred; fifth review 2026-09-23.
 
-- Signals: traces (OTAP Spans, SpanAttrs, SpanEvents, SpanLinks and their attributes; the plain parquet exporter writes them; today a trace request is refused as a whole). Profiles are not in the OTAP model at all, so they wait for the engine.
-- Metric point kinds: exponential histograms and summaries (the engine carries ExpHistogramDataPoints and SummaryDataPoints with attributes; today dropped and counted, `unsupported: drop` becomes the default in slice S8); exemplars for number and histogram points with their filtered attributes, trace_id and span_id (six OTAP payload types; today dropped and counted by default); multivariate metrics (payload type 25, never read); metric-level attributes (MetricAttrs, never read or validated: at least validate them now, not a format change).
-- Fields not stored: `dropped_attributes_count` on resource, scope, log record and point; arrival order among equal sort keys (by design; say so in FORMAT.md).
-- Typing the format flattens: attribute value types in `attrs`, `resource_attrs`, `scope_attrs` (all rendered to Map<string,string>: 42 and "42" collide, bytes become base64, nested values JSON text; types survive only in identity bytes, series_id and typed denormalize columns); non-string log bodies rendered as JSON text (the `body_bytes` column is already deferred to the next format version); histogram sum/min/max that are zero in every point of a request arrive as absent OTAP columns and are stored as null (a transport limit the format could compensate for with a presence flag); zero or out-of-range timestamps stored as null.
-- Layout: number and histogram points share one values dataset, so half the rows of a mixed stream hold null in value_* and the other half in count/sum/min/max, which weakens Parquet statistics; consider per-kind datasets or row groups with the compactor.
-- To check before deciding: span-like `flags` handling and out-of-range severity numbers in logs (the standard OTAP log columns are all present).
+### Other P1 items
 
-## Plan-3 findings triaged to the backlog (user, 2026-09-25)
 
-Scope rule: plan 3 fixes the exporter and correctness defects of the shipped
-topology; throughput and limits of other components wait here.
+- **P1-2 durable_buffer WAL throughput.**
+  Why: the buffered topology is bound by the WAL device: about 2x the wire bytes
+  written, sync every 25 ms, segment finalization synchronous on the worker
+  runtime (144k/s local, 152k/s MinIO, four workers on one NVMe).
+  Done when: finalization runs off the worker runtime, the sync interval and
+  segment size are configurable, and the buffered ceiling is re-measured.
+  Source: Task 5; Task 12 triage amendment.
 
-- durable_buffer WAL throughput (Task 5): the buffered topology is bound by the
-  WAL device (about 2x the wire bytes written, sync_data every 25 ms, segment
-  finalization synchronous on the worker runtime); 144k/s local and 152k/s
-  MinIO with 4 workers on one NVMe. Move finalization off the worker runtime
-  and expose the sync interval and the segment size.
-- Receiver in-flight byte bound (Task 5): the receiver holds every in-flight
-  request, bounded by slots, not bytes (16.2 GB at 4096 slots in strict mode).
-  A receiver-level byte limit (engine, upstream) or an exporter-level retryable
-  refusal, plus a startup log line with the computed bound. The README formula
-  itself is written in plan 3.
-- Engine `pipeline.memory.usage` credits frees only to the allocating thread,
-  so it grows without bound when blocking-pool threads free buffers (Task 5,
-  local store: 9 MB to 10.3 GB at RSS ~550 MB). Upstream issue.
-- Receiver load-shed (tower GlobalConcurrencyLimitLayer, RESOURCE_EXHAUSTED)
-  is not counted, and its message "Too many active requests for the
-  connection" names a connection limit where the limit is per worker.
-  Upstream.
-- The OTLP gRPC receiver answers an oversize message with OUT_OF_RANGE, which
-  clients retry forever; answer with a non-retryable status and count it in
-  `receiver.otlp.requests.rejected`. Upstream PR.
-- Row-group tail pins the previous row-group buffer (~64 MB per large table,
-  Task 3i); back to plan 3 only if the Task 12 heap dumps show it matters.
-- Flaky tests in crates the campaign does not touch: otel-arrow-dfe-telemetry
-  log_tap hang (18 min at 0 CPU), otlp_grpc_exporter test_otlp_exporter and
-  opamp test_client_configured_with_client_tls_from_files AddrInUse.
-- Harness polish: synchronous telemetry/allocator pairing for the ledger
-  (one-sample skew), measurement conditions recorded in every result, heap
-  counters in the stage benches.
-- Worker scaling 0.67 from 1 to 4 workers (0.81 x 0.82) and ~6 cores
-  estimated for 1M records/s: addressed by the shared writer (priority 1).
-- Task 13 proofs not run (user cut Task 13 to 20 minutes, 2026-09-25; the
-  questions that matter for the shipped deployment are answered by the Task 12
-  Alloy + buffered reference validation): strict vs buffered acknowledgement
-  latency at 15 s and 120 s windows; mid-window kill replay without resend at
-  both windows; NACK/backoff timing against the jittered envelope; lost
-  completion followed by SIGKILL; the Task 6 buffer heap versus mapped split.
-  A work-in-progress harness for them (test_buffered.py, faults/capacity
-  changes, fast contract tests passing) is kept outside the repository in the
-  campaign workspace `task-13-wip/`.
-- A durable_buffer bundle that fails conversion is rejected without
-  `resolved{outcome=...}` (durable_buffer_processor/mod.rs:1426-1430); only
-  `conversion_failed` records it.
-- Acks routed to retry_processor or fanout_processor after they exit are dropped silently (Task 12e item 5): retry ignores Shutdown and declares no shutdown_completions (retry_processor/mod.rs:668, 705), fanout ignores control messages (fanout_processor 512, 988, 1107-1109), and the dispatcher drops completions to a closed control channel without a log or counter (pipeline_ctrl.rs:1033, 1058). In durable_buffer -> retry/fanout -> series_parquet the buffer replays bundles the exporter wrote (duplicates). Fix: these processors declare shutdown_completions and track their in-flight frames, or a dispatcher rule for completions to a closed node; at least count and log the drop.
+- **P1-3 CPU candidates.**
+  Why: sort/seal/merge is 11-13 percent of engine CPU on row-format keys and
+  conversion 20 percent of metrics CPU; extraction rebuilds identity rows for
+  committed series and re-encodes the resource/scope prefix per series.
+  Done when: each candidate is tried with a stage-bench number and kept or
+  rejected: fixed-width sort keys (series_id + time); extraction straight from
+  OTLP bytes via pdata views; streaming series_id from a resource+scope+metric
+  prefix hash; skipping committed-series rows; one attribute materialization
+  instead of three; k-way merge replace-top.
+  Source: Task 4 attribution; backlog streaming series_id; umbrella review
+  2026-09-25, performance.
+
+- **P1-4 jemalloc heap-dump attribution of the memory residual.**
+  Why: the ledger excess (33-47 MB per pair), the ~160 MB large-table flush
+  workspace, the row-group tail pinning ~64 MB per large table, the per-run
+  bookkeeping of chunk builders, the values builder over-charge and the RSS
+  high-water 1.25x above the live formula (Task 12c) are not attributed.
+  Done when: raw dumps symbolized offline name the stacks for each term, and
+  each gets a fix, a charged term or a documented margin (row-group tail copy
+  included if it matters).
+  Source: Task 12 heap-dump amendment (runs after the reference deployment,
+  backlog if it yields no fix); Tasks 3i, 6, 12c.
+
+- **P1-5 Receiver in-flight byte bound.**
+  Why: in-flight requests are bounded by receiver slots, not bytes (16.2 GB at
+  4096 slots in strict mode), and the exporter cannot see the receiver's limits
+  to state the bound.
+  Done when: a receiver-level byte limit (engine, upstream) or an exporter-level
+  retryable refusal exists, and the exporter logs the computed whole-process
+  bound at startup from limits it can see.
+  Source: Task 5 amendment; Task 12 triage amendment; Task 12b residual.
+
+- **P1-6 Re-measure S6 encode after the ColumnPath fix.**
+  Why: Task 12f fixed per-column writer properties (leaf_path split on '.'),
+  which changes attribute-map encoding, and the S6 encode numbers predate it.
+  Done when: the S6 stage family is rerun and FINDINGS updated.
+  Source: Task 12f item 3.
+
+- **P1-7 Conversion memory before the request budget.**
+  Why: `try_into_with_default()` runs before `max_extracted_bytes` is charged,
+  and the README reserves 4x `max_request_bytes` without a measurement.
+  Done when: peak allocation on a 16 MiB body of empty log records and of
+  key-only attributes is measured and the reservation matches it.
+  Source: umbrella review 2026-09-25, needs verification.
+
+- **P1-8 Hourly partition rollover under 100k+ hot series.**
+  Why: the cache is keyed by partition, so every series is re-emitted at the
+  hour boundary, and no throughput run crosses one.
+  Done when: a capacity run crosses an hour boundary at 100k+ hot series and
+  the stall and memory spike are within the documented bounds (or fixed).
+  Source: umbrella review 2026-09-25, needs verification.
+
+- **P1-9 Oldest-pending-age rotation trigger.**
+  Why: with the buffer, longer windows cut file count, but a slow trickle then
+  waits a full window before it is visible.
+  Done when: an optional max-freshness trigger rotates a block by the age of its
+  oldest request, with a test and a README line.
+  Source: backlog freshness contract (3); plan 3 out of scope.
+
+- **P1-10 Block sizing options B and C.**
+  Why: `max_block_bytes` both rotates (file size) and caps memory, and an
+  oversize request can only be refused.
+  Done when: decided and, if taken, built: B separates `target_block_bytes`
+  from `max_block_bytes`; C splits an oversize request across blocks with a
+  multi-block token.
+  Source: Task 12 option A amendment.
+
+- **P1-11 Resumable extraction.**
+  Why: admission work is one step per request; finer interleaving with control
+  handling may be needed if the section 6.7 bound proves too loose at scale.
+  Done when: measured against the 6.7 bound at the P1-1 load and built only if
+  it fails.
+  Source: spec 10.2.
+
+## P2: format and data
+
+- **P2-1 Compactor with seal markers.**
+  Why: one file set per window per worker gives thousands of small files per
+  hour, and after T11-F3 a compactor cannot treat the lateness bound as a
+  completeness bound on stores that apply abandoned requests (RustFS).
+  Done when: a stateless `series-lake-compactor` closes hour H only when every
+  live writer has written `_sealed/hour=H/writer=<writer_id>/<boot_id>` (after
+  every PUT for H resolved), publishes one hourly high-watermark object, re-sorts,
+  adds page index and Bloom filters on series_id (and trace/span ids for logs)
+  in compacted files, and GCs raw files after a grace period; this closes
+  T11-F3.
+  Source: spec 10.2; docs/superpowers/compaction-and-format-chat.md; Task 11
+  T11-F3.
+
+- **P2-2 Format batch 2.**
+  Why: the format lacks an identity-config guard, a dedup key, a threat model
+  and a v2 path, and its "revision 2" rendering change is recorded nowhere a
+  reader sees (files still say `format_version=1`, `v=1`).
+  Done when: all of these ship with FORMAT.md: `identity_config` hash in the
+  footer and compaction scope plus `_lake.json` with startup refusal on
+  mismatch; `ingestion_id` values column with the reader dedup recipe; threat
+  model (unseeded xxh3, producer_id from telemetry, one trust domain); v2 path
+  and version from the footer; `parquet.compression` removed until a second
+  codec; `metric_type`, `temporality`, `is_monotonic` in metrics/values; a
+  visible format revision (or the framing dropped); `body_bytes` for non-string
+  log bodies.
+  Source: user decision 2026-09-23; umbrella review 2026-09-25, minor issues.
+
+- **P2-3 Data-model coverage.**
+  Why: the exporter README "What this exporter does not keep" lists gaps with no
+  decision: multivariate metrics, metric-level attributes (never read or
+  validated), `dropped_attributes_count`, histogram sum/min/max all zero stored
+  as null (OTAP omits all-default columns), zero or out-of-range timestamps as
+  null, number and histogram points sharing one values dataset, log `flags` and
+  out-of-range severity, arrival order among equal sort keys (by design, not yet
+  stated in FORMAT.md).
+  Done when: each gap has a decision (format change, validation, or documented
+  limit); MetricAttrs are validated now; the zero-sum presence is fixed in the
+  pdata transport first.
+  Source: user note 2026-09-24; fifth review 2026-09-23.
+
+- **P2-4 Typed attribute maps.**
+  Why: attribute values are rendered to Map<string,string>, so 42 and "42"
+  collide and bytes become base64; types survive only in identity bytes.
+  Done when: a typed layout is specified and shipped as a format revision.
+  Source: spec 10.2.
+
+- **P2-5 Partition granularity, day or hour.**
+  Why: at low volume a day partition gives fewer directories and files.
+  Done when: configurable, included in the compaction scope and identity config.
+  Source: spec 10.2.
+
+- **P2-6 Idempotent replay by producer batch id.**
+  Why: at-least-once duplicates come from WAL replay, retries after lost
+  responses (single PUT, abort-after-complete stores) and producer restarts.
+  Done when: a writer-side or compactor-side dedup by batch id removes replayed
+  rows, with the source of the id decided (P2-2 `ingestion_id`, producer
+  header).
+  Source: spec 10.2; Task 12a residuals.
+
+- **P2-7 Producer id from transport headers.**
+  Why: producer_id comes from telemetry attributes, which a producer can set to
+  anything.
+  Done when: an option takes it from an authenticated transport header.
+  Source: spec 10.2.
+
+- **P2-8 Lossless high-cardinality mode.**
+  Why: a unique attribute per point makes one series per point (series dataset
+  at 66 percent of values, 1.9x CPU).
+  Done when: a separate mode groups by stable fields, keeps varying attributes
+  per point and stores the full identity separately, or is rejected with a
+  reason.
+  Source: fifth review 2026-09-23; Task 5.
+
+- **P2-9 One refusal policy for invalid UTF-8 and repeated singular fields.**
+  Why: nested invalid UTF-8 is refused while top-level is repaired to U+FFFD,
+  series_parquet refuses repeated singular fields (valid protobuf) that other
+  exporters accept, and it is unknown whether any producer or proxy
+  concatenates OTLP messages.
+  Done when: one policy across file, otap, parquet and series_parquet is
+  documented, informed by a check of common producers.
+  Source: umbrella review 2026-09-25, minor issues and needs verification.
+
+- **P2-10 Commit manifests.**
+  Why: readers cannot see block-atomic commits; may return as an audit record.
+  Done when: decided against the P2-1 watermark and built or closed.
+  Source: spec 10.2.
+
+- **P2-11 Discovery index.**
+  Why: object listing may become the bottleneck for readers.
+  Done when: built asynchronously if a measurement shows listing dominates;
+  never a correctness dependency.
+  Source: spec 10.2.
+
+## P3: hygiene, upstream, harness
+
+- **P3-1 Complexity-review refactors.**
+  Why: the worker state machine, config mirrors and sink stack carry duplicated
+  logic that the shared writer (P1-1) will touch anyway.
+  Done when: done with P1-1: worker behind a narrow event API with intent-level
+  methods and `drive` near 60 lines; notifier as a VecDeque with one live-token
+  counter; LakeWriter facade { offer, seal, commit, abort } with reemit,
+  commit-after-flush and cache classification in series-lake; one config form
+  (lake sections equal user sections, exporter mirrors deleted);
+  `PutLanded` merged into `PartLanded`, one gauge type with a drop guard;
+  `Outcome` via `derive(AttributeEnum)`; `RefuseReason` split into permanent and
+  block-scoped refusals.
+  Source: complexity review 2026-09-24; fourth review 2026-09-23; umbrella 14;
+  umbrella review 2026-09-25, architecture.
+
+- **P3-2 Engine upstream issues.**
+  Why: engine defects outside the exporter distort memory telemetry or fail CI.
+  Done when: each has an upstream issue or PR: `pipeline.memory.usage` credits
+  frees only to the allocating thread (10.3 GB against 550 MB RSS); memory
+  accounting rebuilt on `retained_work` with a handle through PipelineContext
+  (umbrella 8, consistency C2); pdata CBOR encoder recursion limit; flaky
+  otel-arrow-dfe-telemetry log_tap hang, otlp_grpc_exporter test_otlp_exporter
+  and opamp AddrInUse; parquet exporter's silent `continue` on a malformed body;
+  whether object_store tracing events are routed (S3 throttling is otherwise
+  invisible); jemalloc `background_thread:true` A/B on a standard pipeline.
+  Source: Tasks 5, 6; Task 12 triage amendment; umbrella review 2026-09-25.
+
+- **P3-3 Receiver refusal hygiene.**
+  Why: after Task 12d one message still names two limits, oversize is not in
+  `receiver.received{outcome=refused}`, and other decode failures (bad
+  compression flag, unsupported encoding) are uncounted.
+  Done when: each is counted under its own reason with a test.
+  Source: Task 12d residuals 3, 5, 6.
+
+- **P3-4 durable_buffer: persist the WAL cursor with the segment.**
+  Why: a SIGKILL between segment fsync and cursor persist replays up to about
+  100 ms of acknowledged entries (T10-F2, documented as at-least-once).
+  Done when: the cursor is made durable together with the segment, or the
+  window is closed another way, with a kill test.
+  Source: Tasks 10, 13; Task 12a residual.
+
+- **P3-5 Exporter operability leftovers.**
+  Why: some signals an operator needs are missing.
+  Done when: the start event logs base_uri, endpoint, resolved
+  `unsigned_payload` and retry timeout; the refusal log gate carries producer
+  identity per outcome; local-backend staging files (`<file>#N`) are documented
+  and reclaimed; `part_bytes` is validated against 5 GiB and 10,000 parts; the
+  README notes versioned buckets and object lock.
+  Source: umbrella review 2026-09-25, minor issues; Task 12f; S3 compatibility
+  note 2026-09-23.
+
+- **P3-6 S3 store matrix.**
+  Why: only MinIO and RustFS are exercised (Azurite in Task 12g).
+  Done when: a `workflow_dispatch` lane runs on real AWS S3 with secrets; Ceph
+  RGW, Garage and SeaweedFS run in Docker; R2, B2, GCS XML, `checksum_algorithm`
+  and S3 Express only on request; optional exact-key ListMultipartUploads sweep
+  (T11-F1) and a startup check for the abort-incomplete lifecycle rule.
+  Source: S3 compatibility note 2026-09-23; Task 11 T11-F1.
+
+- **P3-7 Tests.**
+  Why: some guarantees have no test or only a narrow one.
+  Done when: added: factory with a bound bearer-token capability (engine test
+  helper); DuckDB/ClickHouse reading native SortingColumn; delivery-model
+  proptest asserting `!nack.permanent` over all ten faults; deterministic
+  phase-2 cancellation between the last part and completion; `merge_key_bound`
+  checked at compile time against arrow-row; wall-clock windows off llvm-cov;
+  the live fault matrix as a CI lane.
+  Source: backlog tests; umbrella review 2026-09-25, tests; Tasks 12a, 12b
+  residuals.
+
+- **P3-8 Qualification soak and failpoints.**
+  Why: Task 15 runs nightly-length chaos (at least 4 h); spec 10.3 also asks for
+  24-72 h qualification, a nightly lane and failpoint builds.
+  Done when: a 24-72 h run passes the Task 15 acceptance and a nightly lane
+  exists; failpoints only if Task 15 exposes a gap.
+  Source: spec 10.3.
+
+- **P3-9 Task 13 proofs not run.**
+  Why: strict vs buffered acknowledgement latency at 15 s and 120 s windows,
+  mid-window kill replay without resend at both windows, NACK/backoff timing
+  against the jittered envelope, lost completion followed by SIGKILL, the
+  buffer heap versus mapped split, and a kill within 100 ms after a block commit
+  are unmeasured.
+  Done when: run with the WIP harness kept in the campaign workspace
+  `task-13-wip/`, or closed as covered by Task 15.
+  Source: Task 13 cut 2026-09-25; Task 12c F-G.
+
+- **P3-10 Harness polish.**
+  Why: the memory ledger and stage baselines carry known skews and open
+  questions.
+  Done when: synchronous telemetry/allocator pairing; measurement conditions in
+  every result; heap counters in stage benches; noop-control RSS decision with
+  written rationale; strict memory baseline at the default fingerprint; logs
+  attribution baseline; pipeline baseline CPU dose of several seconds; the encode
+  first-repetition RSS and upload wall CV explained; engine_runtime 0.42 and
+  metrics upload 2.27 explained; quiet-host re-measurement; byte-calibrated
+  families (faults, ledger, capacity) rerun after the key reservation; harness
+  README without one host's CPU layout.
+  Source: FINDINGS open questions and Deferred tables; Task 12b residual;
+  umbrella review 2026-09-25, docs.
+
+- **P3-11 Metric sets grouping.**
+  Why: at most three attribute sets were proposed, which would drop labels of
+  several counters, and worker `acks` duplicates ExporterExportMetrics.
+  Done when: decided with the shared-writer telemetry or at upstream PR time.
+  Source: Task 3f item 10.
+
+- **P3-12 Upstream PR logistics.**
+  Why: the upstream branch must carry only the needed minimum.
+  Done when: plan 3 "After Task 14" is executed (de-slop, clean branch from
+  origin/main, one commit per PR) and these are settled with it: core-nodes vs
+  contrib-nodes placement with the maintainers; Python lane under tools/;
+  `#[non_exhaustive]` or changelog for `shutdown_completions` and
+  `StorageType::S3.unsigned_payload`; series-lake test scaffolding out of the
+  public API and benches out of the published crate; drive-by changes dropped;
+  parquet, file and otap READMEs document the framing refusal and the
+  `otlp.malformed_body` WARN. Opening PRs remains the user's call.
+  Source: plan 3 "After Task 14"; umbrella review 2026-09-25, minor issues.
+
+## Deferred features
+
+- **Live access to buffered data.** Why: `tail -f` and buffer inspection for
+  accepted but uncommitted data. Done when: its own spec is written. Source:
+  spec 10.1; user 2026-09-25: not now.
+- **Traces, exponential histograms, summaries, exemplars.** Why: refused or
+  dropped and counted today. Done when: each has a spec choice and a format
+  revision. Source: spec 10.2; data-model note 2026-09-24.
+- **Spatial aggregation processor.** Why: nothing drops attributes and merges
+  colliding streams with temporality-correct aggregation (Task 3h: a collapsed
+  cumulative pair is two rows under one series). Done when: raised upstream as a
+  separate node building on temporal_reaggregation. Source: user question
+  2026-09-23.
+
+## Done / removed
+
+- Receiver OUT_OF_RANGE for an oversize message, load-shed uncounted and its
+  misleading message: Task 12d.
+- Multipart E2E, NoSuchUpload after a retried Complete, orphaned uploads after
+  kill, 5xx during UploadPart and Complete: Tasks 9-11 (F1 fixed in Task 12a).
+- `unsigned_payload` exposure, ColumnPath: Task 12f.
+- Umbrella 2026-09-25 minors fixed in Tasks 12e/12f: partial `retry:` section,
+  `writer_id` with `-`, `window.interval` cap, panicked flush as Internal,
+  creation dropped in `finish()`, `late_commits{outcome}`, abort events with
+  keys, notify rate limit, receiver_limit INFO once, lifecycle rule and metrics
+  URL in configs, local config ceiling and path, `shutdown_deadline()` doc, a
+  tighter Shutdown during completion.
+- Buffered vs strict acknowledgement semantics documented: Task 12c operator
+  guide.
+- Quiver dropped without `shutdown()`: answered in Task 12e (no loss,
+  duplicates possible). Receiver-first drain race: fixed in Task 12e; SIGTERM
+  restart under load covered by Task 15.
+- Nightly soak with storage faults and restarts: Task 15 (qualification stays
+  as P3-8).
+- "Tested on S3-compatible stores" wording: adopted for the Task 14 report.
+
+Merged duplicates: worker scaling 0.67 and flush off the ingest core into P1-1;
+bounded yielding into P1-1; streaming series_id and umbrella extraction costs
+into P1-3; row-group tail into P1-4; receiver startup log line into P1-5;
+fourth-review refactoring, lake-level writer facade and RefuseReason into
+P3-1; histogram zero sum (fifth review) and data-model typing bullet into
+P2-3; format revision record and `body_bytes` into P2-2; engine memory
+accounting and `pipeline.memory.usage` into P3-2; Alloy line truncation into
+P0-3.
