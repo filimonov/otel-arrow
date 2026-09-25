@@ -1023,6 +1023,58 @@ and incomplete uploads left in the bucket afterwards.
   `failure-s3-*-r*.json` runs; raw archives in `.measurement-artifacts/failure-s3/`.
 - `campaign/reports/task-9-report.md`.
 
+## Task 10: graceful restart and hard kill
+
+### Question
+
+What happens to acknowledged and in-flight data when the engine is stopped
+gracefully or killed with SIGKILL, strict and behind the durable buffer, on
+MinIO and RustFS?
+
+### Method
+
+12 cells: graceful_restart (admin shutdown, then a new engine), kill_active
+(SIGKILL 1.3 s into a window, the new block only in memory) and kill_upload
+(SIGKILL while a throttled multipart upload is on the wire) x strict and
+buffered x MinIO and RustFS; Task 9's fault-case framework, Task 5's generator
+and aggregate oracle. The graceful stop is checked against the configured
+shutdown deadline (150 s) and the absolute cleanup cutoff (156 s); orphaned
+uploads are compared with the expected set after every case.
+
+### Results
+
+- No acknowledged record went missing in any cell; no unexpected, corrupt or
+  permanently refused record.
+- Strict graceful restart exits in 5.0 s with code 0; the 102-103 requests
+  pending at the signal are acknowledged by the old engine and stored once.
+- Strict SIGKILL: the in-memory cohort is not stored, the producer resends it,
+  every record is stored once; a kill during an upload leaves exactly the one
+  expected incomplete upload.
+- Buffered SIGKILL of an in-memory block: records the buffer had acknowledged
+  but not flushed are replayed once each.
+- A store may commit a PUT whose client was killed (RustFS did, about 1.4 s
+  after the kill); the object is attributed to the dead boot and readers are
+  unaffected.
+- 9 of 12 cells pass; the three failures are durable-buffer defects.
+
+### Findings for Task 12
+
+- T10-F1: after a graceful restart the durable buffer redelivers bundles the
+  exporter already wrote (10,200 and 2,600 records stored twice):
+  `handle_shutdown` (durable_buffer_processor/mod.rs:1643-1737) shuts its
+  storage engine down before the exporter's queued acknowledgements reach
+  `handle_ack`, so they are never recorded.
+- T10-F2: after a SIGKILL two requests the buffer had acknowledged 9 and 59 ms
+  earlier were stored twice without a resend; the WAL replayed exactly those
+  two entries. Seen once; the hypothesis that the WAL position is not made
+  durable together with the segment is unverified. Task 13 reproduces it.
+
+### Evidence
+
+- `failure-process.json` and its `failure-process-*-r*.json` runs; raw archives
+  in `.measurement-artifacts/failure-process/`.
+- `campaign/reports/task-10-report.md`.
+
 ## Slice S6: extraction and write speed (Task 5a)
 
 ### Question
