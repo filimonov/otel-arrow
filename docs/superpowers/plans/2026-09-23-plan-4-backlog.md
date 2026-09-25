@@ -126,9 +126,11 @@ buffered 144-152k bound by the WAL device).
   rejected: fixed-width sort keys (series_id + time); extraction straight from
   OTLP bytes via pdata views; streaming series_id from a resource+scope+metric
   prefix hash; skipping committed-series rows; one attribute materialization
-  instead of three; k-way merge replace-top.
+  instead of three; k-way merge replace-top; typed per-dataset builders in
+  extraction instead of the Col -> ValuesRow -> AnyBuilder layer with its
+  runtime width check (extract/mod.rs ~643-699).
   Source: Task 4 attribution; backlog streaming series_id; umbrella review
-  2026-09-25, performance.
+  2026-09-25, performance; complexity review 2026-09-24 item 5.
 
 - **P1-4 jemalloc heap-dump attribution of the memory residual.**
   Why: the ledger excess (33-47 MB per pair), the ~160 MB large-table flush
@@ -198,12 +200,37 @@ buffered 144-152k bound by the WAL device).
   Why: one file set per window per worker gives thousands of small files per
   hour, and after T11-F3 a compactor cannot treat the lateness bound as a
   completeness bound on stores that apply abandoned requests (RustFS).
-  Done when: a stateless `series-lake-compactor` closes hour H only when every
-  live writer has written `_sealed/hour=H/writer=<writer_id>/<boot_id>` (after
-  every PUT for H resolved), publishes one hourly high-watermark object, re-sorts,
-  adds page index and Bloom filters on series_id (and trace/span ids for logs)
-  in compacted files, and GCs raw files after a grace period; this closes
-  T11-F3.
+  Done when: a stateless `series-lake-compactor` ships with all of the
+  following, which closes T11-F3:
+  - Sealing: hour H closes only when every live writer has written
+    `_sealed/hour=H/writer=<writer_id>/<boot_id>`, after every PUT for H
+    resolved.
+  - Policy and sizes: triggered by size, file count or age, not cron (for
+    example file_count >= 32, total bytes >= target, or oldest file >= 5 min);
+    optional L1 minor compaction (~128-256 MiB) inside the open hour, skipped at
+    low volume; final L2 at hour close of ~256-512 MiB per file (up to ~1 GB); a
+    large hour becomes several `part-NNN.parquet` committed together by the
+    watermark.
+  - Sort order, declared in `sort_key` and native sorting_columns:
+    metrics/values (metric_name, series_id, time); logs/values
+    (time, service_name, series_id) benchmarked against
+    (service_name, time, series_id); metrics/series (metric_name, series_id);
+    logs/series series_id. Page index everywhere, Bloom filters on series_id
+    (and trace/span ids for logs) in compacted files only.
+  - Watermark and reader recipe: raw and compacted under separate prefixes (the
+    writer never writes compacted, the compactor never raw); one
+    `_compact_watermark` (compacted_through) for all four datasets, one atomic
+    PUT after all outputs validate; a missing compacted object for a committed
+    hour means an empty dataset; a reader reads the watermark once per query and
+    reads hours at or below it only from compacted, later hours only from raw,
+    never both; FORMAT.md and README recipes updated (today's `**/*.parquet`
+    globs would double-read).
+  - Recovery and GC: the compactor is idempotent (after a crash before the
+    watermark moves it validates and reuses or rebuilds outputs); one output key
+    is never published concurrently (conditional Complete with If-None-Match, or
+    one compactor per scope); GC is a separate job deleting raw hours older than
+    the watermark minus a grace of at least 2x the longest query (preferably
+    hours).
   Source: spec 10.2; docs/superpowers/compaction-and-format-chat.md; Task 11
   T11-F3.
 
@@ -282,10 +309,14 @@ buffered 144-152k bound by the WAL device).
   Source: spec 10.2.
 
 - **P2-11 Discovery index.**
-  Why: object listing may become the bottleneck for readers.
-  Done when: built asynchronously if a measurement shows listing dominates;
-  never a correctness dependency.
-  Source: spec 10.2.
+  Why: partitions are by receive time, so a time-range query cannot prune by
+  path and must prune files by per-file event-time bounds.
+  Done when: footers (and the index) carry observed_time (logs) and start_time
+  (metrics) bounds, and for compacted files min/max of metric_name and
+  series_id and the compaction level; the per-hour index itself is built
+  asynchronously if a measurement shows listing dominates, never a correctness
+  dependency.
+  Source: spec 10.2; compaction chat.
 
 ## P3: hygiene, upstream, harness
 
@@ -299,9 +330,11 @@ buffered 144-152k bound by the WAL device).
   (lake sections equal user sections, exporter mirrors deleted);
   `PutLanded` merged into `PartLanded`, one gauge type with a drop guard;
   `Outcome` via `derive(AttributeEnum)`; `RefuseReason` split into permanent and
-  block-scoped refusals.
-  Source: complexity review 2026-09-24; fourth review 2026-09-23; umbrella 14;
-  umbrella review 2026-09-25, architecture.
+  block-scoped refusals; the `ParquetObjectWriter` adapter removed
+  (`LedgeredWriter` implements `AsyncFileWriter` over `BufWriter`).
+  Source: complexity review 2026-09-24 (item 4 for the adapter); deslop B6;
+  fourth review 2026-09-23; umbrella 14; umbrella review 2026-09-25,
+  architecture.
 
 - **P3-2 Engine upstream issues.**
   Why: engine defects outside the exporter distort memory telemetry or fail CI.
@@ -312,8 +345,14 @@ buffered 144-152k bound by the WAL device).
   otel-arrow-dfe-telemetry log_tap hang, otlp_grpc_exporter test_otlp_exporter
   and opamp AddrInUse; parquet exporter's silent `continue` on a malformed body;
   whether object_store tracing events are routed (S3 throttling is otherwise
-  invisible); jemalloc `background_thread:true` A/B on a standard pipeline.
-  Source: Tasks 5, 6; Task 12 triage amendment; umbrella review 2026-09-25.
+  invisible); jemalloc `background_thread:true` A/B on a standard pipeline,
+  then its default hygiene (on for every glibc jemalloc build at main.rs ~136;
+  a println! bypasses tracing and reports the option, not the threads; no CI
+  assertion; benches differ): if kept, a structured `startup::system_info`
+  event, an E2E default-feature assertion and benches on the same malloc_conf;
+  if dropped, removed.
+  Source: Tasks 5, 6; Task 12 triage amendment; umbrella review 2026-09-25;
+  umbrella review 2026-09-23 major 7.
 
 - **P3-3 Receiver refusal hygiene.**
   Why: after Task 12d one message still names two limits, oversize is not in
@@ -334,10 +373,14 @@ buffered 144-152k bound by the WAL device).
   Done when: the start event logs base_uri, endpoint, resolved
   `unsigned_payload` and retry timeout; the refusal log gate carries producer
   identity per outcome; local-backend staging files (`<file>#N`) are documented
-  and reclaimed; `part_bytes` is validated against 5 GiB and 10,000 parts; the
-  README notes versioned buckets and object lock.
+  and reclaimed; the README notes versioned buckets and object lock; the
+  exporter README limits table and the lake config doc state what
+  `ingress.max_request_bytes` measures (protobuf length for OTLP input,
+  estimated Arrow bytes for OTAP input, so a batch or converting processor
+  upstream can turn an accepted OTLP request into a permanent refusal).
   Source: umbrella review 2026-09-25, minor issues; Task 12f; S3 compatibility
-  note 2026-09-23.
+  note 2026-09-23; umbrella 2026-09-22 finding 12, 2026-09-23 minor,
+  consistency C12.
 
 - **P3-6 S3 store matrix.**
   Why: only MinIO and RustFS are exercised (Azurite in Task 12g).
@@ -354,9 +397,12 @@ buffered 144-152k bound by the WAL device).
   proptest asserting `!nack.permanent` over all ten faults; deterministic
   phase-2 cancellation between the last part and completion; `merge_key_bound`
   checked at compile time against arrow-row; wall-clock windows off llvm-cov;
-  the live fault matrix as a CI lane.
-  Source: backlog tests; umbrella review 2026-09-25, tests; Tasks 12a, 12b
-  residuals.
+  the live fault matrix as a CI lane; an oracle proptest mixing gauge, sum and
+  histogram points in one request; `memory.accounted` back to baseline after
+  ack, nack and abandon (check tests/metrics.rs and sink/tests.rs first); an
+  exact-boundary admission test at 1,000,000,000 ns if absent.
+  Source: backlog tests; umbrella reviews 2026-09-23 and 2026-09-25, tests;
+  Tasks 12a, 12b residuals.
 
 - **P3-8 Qualification soak and failpoints.**
   Why: Task 15 runs nightly-length chaos (at least 4 h); spec 10.3 also asks for
@@ -404,8 +450,34 @@ buffered 144-152k bound by the WAL device).
   `StorageType::S3.unsigned_payload`; series-lake test scaffolding out of the
   public API and benches out of the published crate; drive-by changes dropped;
   parquet, file and otap READMEs document the framing refusal and the
-  `otlp.malformed_body` WARN. Opening PRs remains the user's call.
-  Source: plan 3 "After Task 14"; umbrella review 2026-09-25, minor issues.
+  `otlp.malformed_body` WARN; the parquet exporter event rename
+  `parquet.exporter.retry_ignored_for_file_storage` ->
+  `object_store.retry_ignored_for_file_storage` (5f0135e73) gets its own
+  `breaking` changelog entry naming both in the object_store commit. Opening
+  PRs remains the user's call.
+  Source: plan 3 "After Task 14"; umbrella review 2026-09-25, minor issues and
+  finding 6.
+
+- **P3-13 Engine settles contexts when a node task dies.**
+  Why: an AckToken has no Drop fallback, so if the exporter task panics or its
+  start future is dropped in a live process, held requests may stay undecided
+  and producers hang until their timeout.
+  Done when: a test or a recorded code reading states what the engine does and,
+  if contexts are dropped, the node failure nacks them retryably, with a README
+  line.
+  Source: umbrella review 2026-09-23, needs verification; plan 3 Task 3j.
+
+- **P3-14 durable_buffer directory ownership and dispatch docs.**
+  Why: quiver takes no exclusive lock on `path/core_<id>` although the engine
+  README says old and new runtimes overlap during live reconfiguration; the
+  buffer module doc (mod.rs ~27-38) and config.rs ~6-13 recommend
+  RoundRobin/Random/LeastLoaded, which no longer exist (one_of, broadcast); the
+  buffer README lacks the per-process directory rule, the no-migration drain
+  procedure on a core change and the per-core split of retention_size_cap.
+  Done when: quiver locks the WAL directory and refuses a second opener (or an
+  upstream issue is filed), the dispatch table is rewritten, and the buffer
+  README states the three rules.
+  Source: docs/superpowers/parallel.md (user note 2026-09-25).
 
 ## Deferred features
 
@@ -420,6 +492,13 @@ buffered 144-152k bound by the WAL device).
   cumulative pair is two rows under one series). Done when: raised upstream as a
   separate node building on temporal_reaggregation. Source: user question
   2026-09-23.
+- **Query-side indexes (postings, Tantivy).** Why: Parquet cannot prune
+  arbitrary `attrs` MAP predicates or full-text body search. Done when:
+  profiling shows one is the bottleneck, then a postings index (metric_name or
+  attribute key=value -> series_id, Roaring/FST) for metrics/series or a
+  Tantivy index for the logs body and selected attrs, built only on compacted
+  outputs and published before the watermark advances; trace_id stays on Bloom
+  filters and the page index. Source: compaction chat.
 
 ## Done / removed
 
@@ -442,6 +521,8 @@ buffered 144-152k bound by the WAL device).
 - Nightly soak with storage faults and restarts: Task 15 (qualification stays
   as P3-8).
 - "Tested on S3-compatible stores" wording: adopted for the Task 14 report.
+- `part_bytes` validated against 5 GiB and 10,000 parts: series-lake
+  src/config.rs ~478-481, 652.
 
 Merged duplicates: worker scaling 0.67 and flush off the ingest core into P1-1;
 bounded yielding into P1-1; streaming series_id and umbrella extraction costs
