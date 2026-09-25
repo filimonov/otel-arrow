@@ -1,0 +1,1111 @@
+{
+ "ack_latency": {
+  "buckets": [
+   [
+    0.005,
+    529.0
+   ],
+   [
+    0.01,
+    822.0
+   ],
+   [
+    0.025,
+    1612.0
+   ],
+   [
+    0.05,
+    2027.0
+   ],
+   [
+    0.075,
+    2211.0
+   ],
+   [
+    0.1,
+    2255.0
+   ],
+   [
+    0.25,
+    2314.0
+   ],
+   [
+    0.5,
+    2326.0
+   ],
+   [
+    0.75,
+    2331.0
+   ],
+   [
+    1.0,
+    2336.0
+   ],
+   [
+    2.5,
+    2344.0
+   ],
+   [
+    5.0,
+    2344.0
+   ],
+   [
+    7.5,
+    2344.0
+   ],
+   [
+    10.0,
+    2344.0
+   ],
+   [
+    "+Inf",
+    2344.0
+   ]
+  ],
+  "p50_le_s": 0.025,
+  "p99_le_s": 0.5,
+  "source": "rpc_client_call_duration_seconds of otelcol.exporter.otlp.series"
+ },
+ "alloy_final": {
+  "0": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117101319.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "1": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117121923.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "2": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 116991734.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "3": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117012540.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "4": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117054253.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "5": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 6.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117147880.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "6": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 5.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117012540.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  },
+  "7": {
+   "calls": {
+    "OK": 293.0,
+    "UNAVAILABLE": 7.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 117017691.0,
+   "read_lines": 1170544.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1170544.0
+  }
+ },
+ "alloy_restarts": {
+  "0": [],
+  "1": [],
+  "2": [],
+  "3": [],
+  "4": [],
+  "5": [],
+  "6": [],
+  "7": []
+ },
+ "alloy_settings": {
+  "batch_max_records": 4000,
+  "num_consumers": 2,
+  "persistent_queue": true,
+  "queue_size_records": 16000,
+  "timeout": "10s"
+ },
+ "archive": "<main_checkout>/.measurement-artifacts/reference-alloy/engine_kill-minio-1790338023",
+ "boots": 4,
+ "case": "engine_kill",
+ "checks": [
+  {
+   "detail": [],
+   "name": "delivery",
+   "passed": true
+  },
+  {
+   "detail": "Alloy positions at EOF and queues empty; buffer empty",
+   "name": "drained",
+   "passed": true
+  },
+  {
+   "detail": "enqueue_failed 0.0, send_failed 0.0, 'Dropping data' lines 0",
+   "name": "no_producer_loss",
+   "passed": true
+  },
+  {
+   "detail": "loss {}, permanently_rejected 0.0",
+   "name": "no_buffer_loss",
+   "passed": true
+  },
+  {
+   "detail": "0 incomplete uploads, abort_failures 0.0",
+   "name": "orphans_expected",
+   "passed": true
+  },
+  {
+   "detail": "0 duplicate lines, allowed {'lines': 2004000, 'per_kill_lines': 668000, 'rule': 'in-flight exports + 100ms of WAL acks + one unrecorded block'}",
+   "name": "duplicates_within_bound",
+   "passed": true
+  },
+  {
+   "detail": "exits [{'kind': 'engine_exited', 't': 406428274764556, 'wall': 1790338102015425839, 'signal': 'SIGKILL', 'code': -9, 'exit_s': 0.015277452}, {'kind': 'engine_exited', 't': 406482290874785, 'wall': 1790338156031536208, 'signal': 'SIGKILL', 'code': -9, 'exit_s': 0.031379712}, {'kind': 'engine_exited', 't': 406541690905467, 'wall': 1790338215431566900, 'signal': 'SIGKILL', 'code': -9, 'exit_s': 0.031420632}]",
+   "name": "fault_observed",
+   "passed": true
+  }
+ ],
+ "config": {
+  "alloy_file": "configs/series-parquet.alloy",
+  "alloy_sha256": "ec88a85f1be19a4935d7a9c5f0a82d7cecf7b65290d8b66cb05aef7116c9d4ba",
+  "engine_file": "configs/series-parquet-buffered.yaml",
+  "engine_sha256": "cc366b8e5956633362294c75f3b6940aa41f6887a148f7e008603fc5b5f73ff9",
+  "site_substitutions": {
+   "groups.default.pipelines.main.nodes.buffer.config.path": {
+    "run": "<wal_dir>",
+    "shipped": "/var/lib/otap/series-wal"
+   },
+   "groups.default.pipelines.main.nodes.exporter.config.storage.s3.base_uri": {
+    "run": "s3://series-test/otel",
+    "shipped": "s3://series-test/otel"
+   },
+   "groups.default.pipelines.main.nodes.exporter.config.storage.s3.endpoint": {
+    "run": "<store>",
+    "shipped": "http://127.0.0.1:9000"
+   },
+   "groups.default.pipelines.main.nodes.receiver.config.protocols.grpc.listening_addr": {
+    "run": "<grpc_addr>",
+    "shipped": "127.0.0.1:4317"
+   },
+   "policies.resources.core_allocation": {
+    "run": {
+     "set": [
+      {
+       "end": 2,
+       "start": 2
+      }
+     ],
+     "type": "core_set"
+    },
+    "shipped": {
+     "count": 1,
+     "type": "core_count"
+    }
+   }
+  }
+ },
+ "duplicate_allowance": {
+  "lines": 2004000,
+  "per_kill_lines": 668000,
+  "rule": "in-flight exports + 100ms of WAL acks + one unrecorded block"
+ },
+ "duplicates": {
+  "duplicate_lines_by_boots": {},
+  "runs": [],
+  "runs_count": 0
+ },
+ "engine_exits": [
+  {
+   "code": -9,
+   "exit_s": 0.015277452,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "t": 406428274764556,
+   "wall": 1790338102015425839
+  },
+  {
+   "code": -9,
+   "exit_s": 0.031379712,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "t": 406482290874785,
+   "wall": 1790338156031536208
+  },
+  {
+   "code": -9,
+   "exit_s": 0.031420632,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "t": 406541690905467,
+   "wall": 1790338215431566900
+  },
+  {
+   "code": 0,
+   "exit_s": 0.007187577,
+   "forced": false,
+   "kind": "engine_final_exit",
+   "signal": "SIGTERM",
+   "t": 406643237167819,
+   "wall": 1790338316977828962
+  }
+ ],
+ "environment": {
+  "alloy_image": "grafana/alloy:v1.19.2",
+  "engine_binary": "<workspace>/target/release/df_engine",
+  "engine_cpus": "0-3,16-19",
+  "git": {
+   "dirty": true,
+   "revision": "5c1ddeaaaf4adf9f873f63bf1543c8906a952e97"
+  },
+  "producer_cpus": "8-15,24-31",
+  "producers": 8,
+  "rate_per_producer": 5000,
+  "store_cpus": [
+   4,
+   5,
+   6,
+   7,
+   20,
+   21,
+   22,
+   23
+  ],
+  "store_image": "minio/minio:RELEASE.2025-04-22T22-12-26Z",
+  "worker_core": 2
+ },
+ "events": [
+  {
+   "at_s": -2.475324142,
+   "boot": 0,
+   "kind": "engine_ready",
+   "pid": 365404,
+   "start_s": 0.405039738,
+   "wall": 1790338024134899072
+  },
+  {
+   "at_s": 0.0,
+   "kind": "input_started",
+   "producers": 8,
+   "rate": 5000,
+   "wall": 1790338026610222894
+  },
+  {
+   "at_s": 60.000082087,
+   "kind": "fault_start",
+   "wall": 1790338086610306131
+  },
+  {
+   "at_s": 75.389869674,
+   "boot": 0,
+   "kind": "engine_sigkill",
+   "wall": 1790338102000093028,
+   "window_phase_s": 7.0
+  },
+  {
+   "at_s": 75.405203005,
+   "code": -9,
+   "exit_s": 0.015277452,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "wall": 1790338102015425839
+  },
+  {
+   "at_s": 75.914291624,
+   "boot": 1,
+   "kind": "engine_ready",
+   "pid": 367549,
+   "start_s": 0.502658159,
+   "wall": 1790338102524514938
+  },
+  {
+   "at_s": 129.389882392,
+   "boot": 1,
+   "kind": "engine_sigkill",
+   "wall": 1790338156000105326,
+   "window_phase_s": 1.0
+  },
+  {
+   "at_s": 129.421313234,
+   "code": -9,
+   "exit_s": 0.031379712,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "wall": 1790338156031536208
+  },
+  {
+   "at_s": 129.828196189,
+   "boot": 2,
+   "kind": "engine_ready",
+   "pid": 367784,
+   "start_s": 0.40217913,
+   "wall": 1790338156438419113
+  },
+  {
+   "at_s": 188.789864324,
+   "boot": 2,
+   "kind": "engine_sigkill",
+   "wall": 1790338215400087368,
+   "window_phase_s": 0.4
+  },
+  {
+   "at_s": 188.821343916,
+   "code": -9,
+   "exit_s": 0.031420632,
+   "kind": "engine_exited",
+   "signal": "SIGKILL",
+   "wall": 1790338215431566900
+  },
+  {
+   "at_s": 189.228752074,
+   "boot": 3,
+   "kind": "engine_ready",
+   "pid": 368593,
+   "start_s": 0.402424724,
+   "wall": 1790338215838975098
+  },
+  {
+   "at_s": 234.228858352,
+   "kind": "fault_end",
+   "wall": 1790338260839081786
+  },
+  {
+   "at_s": 234.344791251,
+   "kind": "input_stopped",
+   "wall": 1790338260955013965,
+   "written": 9364352
+  },
+  {
+   "at_s": 250.34651168,
+   "kind": "alloy_drained",
+   "ok": true,
+   "wall": 1790338276956734904
+  },
+  {
+   "at_s": 290.346827703,
+   "kind": "engine_drained",
+   "ok": true,
+   "wall": 1790338316957051357
+  },
+  {
+   "at_s": 290.367606268,
+   "code": 0,
+   "exit_s": 0.007187577,
+   "forced": false,
+   "kind": "engine_final_exit",
+   "signal": "SIGTERM",
+   "wall": 1790338316977828962
+  }
+ ],
+ "finished_utc": "2026-09-25T12:12:01Z",
+ "freshness": {
+  "by_last_modified": {
+   "lines": 9364352,
+   "max_s": 20.903186412,
+   "p50_s": 8.540520543,
+   "p99_s": 18.604908533
+  },
+  "lines_without_listing": 0,
+  "listing_period_s": 2.0,
+  "overall": {
+   "lines": 9364352,
+   "max_s": 22.418371009,
+   "p50_s": 9.624277989,
+   "p99_s": 20.12009313
+  },
+  "per_10s_of_input": [
+   {
+    "input_s": 0,
+    "lines": 392000,
+    "max_s": 16.752726415,
+    "p50_s": 6.953775837,
+    "p99_s": 16.453472622
+   },
+   {
+    "input_s": 10,
+    "lines": 400000,
+    "max_s": 14.146824479,
+    "p50_s": 9.148668146,
+    "p99_s": 14.054439802
+   },
+   {
+    "input_s": 20,
+    "lines": 400000,
+    "max_s": 17.665534404,
+    "p50_s": 12.665326401,
+    "p99_s": 17.56247982
+   },
+   {
+    "input_s": 30,
+    "lines": 400000,
+    "max_s": 16.563576582,
+    "p50_s": 7.460196726,
+    "p99_s": 16.460360288
+   },
+   {
+    "input_s": 40,
+    "lines": 400000,
+    "max_s": 14.356992475,
+    "p50_s": 9.362700011,
+    "p99_s": 14.263912929
+   },
+   {
+    "input_s": 50,
+    "lines": 400000,
+    "max_s": 17.476118274,
+    "p50_s": 12.467638948,
+    "p99_s": 17.373007199
+   },
+   {
+    "input_s": 60,
+    "lines": 400000,
+    "max_s": 17.18491431,
+    "p50_s": 7.369229198,
+    "p99_s": 16.379745435
+   },
+   {
+    "input_s": 70,
+    "lines": 400000,
+    "max_s": 14.585134754,
+    "p50_s": 9.583099976,
+    "p99_s": 14.481854259
+   },
+   {
+    "input_s": 80,
+    "lines": 400000,
+    "max_s": 18.095650542,
+    "p50_s": 13.093227391,
+    "p99_s": 18.002230016
+   },
+   {
+    "input_s": 90,
+    "lines": 400000,
+    "max_s": 17.002219836,
+    "p50_s": 7.898890628,
+    "p99_s": 16.89910026
+   },
+   {
+    "input_s": 100,
+    "lines": 400000,
+    "max_s": 14.805500406,
+    "p50_s": 9.796594864,
+    "p99_s": 14.702178871
+   },
+   {
+    "input_s": 110,
+    "lines": 400000,
+    "max_s": 17.917907304,
+    "p50_s": 12.92423359,
+    "p99_s": 17.824990275
+   },
+   {
+    "input_s": 120,
+    "lines": 400000,
+    "max_s": 17.632295832,
+    "p50_s": 8.024605705,
+    "p99_s": 17.425709729
+   },
+   {
+    "input_s": 130,
+    "lines": 400000,
+    "max_s": 15.033234748,
+    "p50_s": 10.02863296,
+    "p99_s": 14.929182224
+   },
+   {
+    "input_s": 140,
+    "lines": 400000,
+    "max_s": 16.540040425,
+    "p50_s": 11.546844457,
+    "p99_s": 16.437059697
+   },
+   {
+    "input_s": 150,
+    "lines": 400000,
+    "max_s": 17.462658112,
+    "p50_s": 6.33788321,
+    "p99_s": 17.369598693
+   },
+   {
+    "input_s": 160,
+    "lines": 400000,
+    "max_s": 15.265897124,
+    "p50_s": 10.262660211,
+    "p99_s": 15.163008655
+   },
+   {
+    "input_s": 170,
+    "lines": 400000,
+    "max_s": 22.418371009,
+    "p50_s": 17.419246039,
+    "p99_s": 22.315281651
+   },
+   {
+    "input_s": 180,
+    "lines": 400000,
+    "max_s": 15.421211602,
+    "p50_s": 10.417917178,
+    "p99_s": 15.317276336
+   },
+   {
+    "input_s": 190,
+    "lines": 400000,
+    "max_s": 13.297068361,
+    "p50_s": 8.193424109,
+    "p99_s": 13.194382841
+   },
+   {
+    "input_s": 200,
+    "lines": 400000,
+    "max_s": 17.013799002,
+    "p50_s": 12.012326942,
+    "p99_s": 16.910525034
+   },
+   {
+    "input_s": 210,
+    "lines": 400000,
+    "max_s": 17.938258292,
+    "p50_s": 6.809144006,
+    "p99_s": 17.834739095
+   },
+   {
+    "input_s": 220,
+    "lines": 400000,
+    "max_s": 15.730493492,
+    "p50_s": 10.738761235,
+    "p99_s": 15.637713001
+   },
+   {
+    "input_s": 230,
+    "lines": 172352,
+    "max_s": 16.855561589,
+    "p50_s": 4.930759047,
+    "p99_s": 16.855561589
+   }
+  ]
+ },
+ "incomplete_uploads": [],
+ "lease": {
+  "acquired_utc": "2026-09-25T12:07:03Z",
+  "owner": "365095-74c74fb4fb944e0fac0701f12e5dd94f",
+  "path": "/tmp/series-parquet-host-measurement.lock",
+  "pid": 365095,
+  "released_utc": null,
+  "run_id": "reference-alloy-engine_kill-minio"
+ },
+ "metrics": {
+  "ack_latency_p50_le_s": 0.025,
+  "ack_latency_p99_le_s": 0.5,
+  "alloy_calls_by_status": {
+   "OK": 2344.0,
+   "UNAVAILABLE": 48.0
+  },
+  "alloy_dropping_data_log_lines": 0,
+  "alloy_export_failed_log_lines": 48,
+  "buffer_backpressure_refusals": 0.0,
+  "buffer_retries_scheduled": 0.0,
+  "duplicate_lines": 0,
+  "exporter_accounted_peak_bytes": 500588760.0,
+  "exporter_budget_bytes": 1640013824.0,
+  "flush_abort_failures": 0.0,
+  "flush_failures": 0.0,
+  "flush_late_commits": 0.0,
+  "freshness_max_s": 22.418371009,
+  "freshness_p50_s": 9.624277989,
+  "freshness_p99_s": 20.12009313,
+  "incomplete_uploads": 0,
+  "input_s": 234.344791251,
+  "offered_lines_per_s": 40000,
+  "rss_peak_bytes": 881131520,
+  "wal_disk_peak_bytes": 363692032,
+  "wal_used_peak_bytes": 368308017.0,
+  "written_lines": 9364352,
+  "written_lines_per_s": 39959.718967980436
+ },
+ "object_inventory_count": 25,
+ "options": {},
+ "oracle": {
+  "duplicate_rows": 0,
+  "expected_lines": 9364352,
+  "passed": true,
+  "per_producer": {
+   "0": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p00"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "1": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p01"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "2": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p02"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "3": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p03"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "4": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p04"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "5": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p05"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "6": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p06"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   },
+   "7": {
+    "distinct": 1170544,
+    "max": 1170543,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p07"
+    ],
+    "rows": 1170544,
+    "seq_sum": 685086042696
+   }
+  },
+  "problems": [],
+  "readers": [
+   "duckdb",
+   "clickhouse"
+  ],
+  "total_rows": 9364352
+ },
+ "rerun": {
+  "of": "reference-alloy-engine-kill-minio-r1.json",
+  "purpose": "place the kills at fixed window phases (mid-window, 0.4s after a block commit, during a flush), which the first run's schedule did not reach; host-independent"
+ },
+ "started_utc": "2026-09-25T12:07:03Z",
+ "status": "passed",
+ "store": "minio",
+ "timeline": [
+  {
+   "at_s": -0.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 0.0,
+   "rss_bytes": 67268608,
+   "wal_disk_bytes": 4096,
+   "wal_used_bytes": 38.0
+  },
+  {
+   "at_s": 10.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 10.0,
+   "oldest_unacked_s": 0.935007342,
+   "rows_written": 312000.0,
+   "rss_bytes": 331997184,
+   "wal_disk_bytes": 44089344,
+   "wal_used_bytes": 18890960.0
+  },
+  {
+   "at_s": 20.1,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 109.0,
+   "oldest_unacked_s": 10.93581166,
+   "rows_written": 312000.0,
+   "rss_bytes": 496828416,
+   "wal_disk_bytes": 211021824,
+   "wal_used_bytes": 199916124.0
+  },
+  {
+   "at_s": 30.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 64.0,
+   "oldest_unacked_s": 5.886114107,
+   "rows_written": 896000.0,
+   "rss_bytes": 435707904,
+   "wal_disk_bytes": 173166592,
+   "wal_used_bytes": 147930380.0
+  },
+  {
+   "at_s": 40.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 10.0,
+   "oldest_unacked_s": 0.760718039,
+   "rows_written": 1504000.0,
+   "rss_bytes": 481325056,
+   "wal_disk_bytes": 34635776,
+   "wal_used_bytes": 91223102.0
+  },
+  {
+   "at_s": 50.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 112.0,
+   "oldest_unacked_s": 10.760045518,
+   "rows_written": 1504000.0,
+   "rss_bytes": 512970752,
+   "wal_disk_bytes": 225173504,
+   "wal_used_bytes": 199887657.0
+  },
+  {
+   "at_s": 60.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 62.0,
+   "oldest_unacked_s": 5.534548531,
+   "rows_written": 2112000.0,
+   "rss_bytes": 404361216,
+   "wal_disk_bytes": 171585536,
+   "wal_used_bytes": 147908376.0
+  },
+  {
+   "at_s": 70.4,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 9.0,
+   "oldest_unacked_s": 0.938831495,
+   "rows_written": 2716000.0,
+   "rss_bytes": 468074496,
+   "wal_disk_bytes": 39374848,
+   "wal_used_bytes": 14172926.0
+  },
+  {
+   "at_s": 80.4,
+   "backpressure": 0.0,
+   "boot": 1,
+   "buffer_in_flight": 113.0,
+   "oldest_unacked_s": 3.230885476,
+   "rows_written": 0.0,
+   "rss_bytes": 524132352,
+   "wal_disk_bytes": 229855232,
+   "wal_used_bytes": 206162030.0
+  },
+  {
+   "at_s": 90.5,
+   "backpressure": 0.0,
+   "boot": 1,
+   "buffer_in_flight": 64.0,
+   "oldest_unacked_s": 6.446221354,
+   "rows_written": 580000.0,
+   "rss_bytes": 392949760,
+   "wal_disk_bytes": 170045440,
+   "wal_used_bytes": 147941550.0
+  },
+  {
+   "at_s": 100.6,
+   "backpressure": 0.0,
+   "boot": 1,
+   "buffer_in_flight": 16.0,
+   "oldest_unacked_s": 1.004741105,
+   "rows_written": 1188000.0,
+   "rss_bytes": 486436864,
+   "wal_disk_bytes": 55115776,
+   "wal_used_bytes": 29903155.0
+  },
+  {
+   "at_s": 110.6,
+   "backpressure": 0.0,
+   "boot": 1,
+   "buffer_in_flight": 113.0,
+   "oldest_unacked_s": 11.005358007,
+   "rows_written": 1188000.0,
+   "rss_bytes": 528683008,
+   "wal_disk_bytes": 233054208,
+   "wal_used_bytes": 206205476.0
+  },
+  {
+   "at_s": 120.7,
+   "backpressure": 0.0,
+   "boot": 1,
+   "buffer_in_flight": 64.0,
+   "oldest_unacked_s": 5.874929001,
+   "rows_written": 1796000.0,
+   "rss_bytes": 407216128,
+   "wal_disk_bytes": 174706688,
+   "wal_used_bytes": 149486207.0
+  },
+  {
+   "at_s": 130.7,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 0.0,
+   "rss_bytes": 159129600,
+   "wal_disk_bytes": 28356608,
+   "wal_used_bytes": 0.0
+  },
+  {
+   "at_s": 140.8,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 115.0,
+   "oldest_unacked_s": 9.202764848,
+   "rows_written": 0.0,
+   "rss_bytes": 524931072,
+   "wal_disk_bytes": 231395328,
+   "wal_used_bytes": 206161196.0
+  },
+  {
+   "at_s": 150.8,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 80.0,
+   "oldest_unacked_s": 7.415975386,
+   "rows_written": 588000.0,
+   "rss_bytes": 417882112,
+   "wal_disk_bytes": 192028672,
+   "wal_used_bytes": 191975774.0
+  },
+  {
+   "at_s": 160.9,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 24.0,
+   "oldest_unacked_s": 1.9712672439999999,
+   "rows_written": 1196000.0,
+   "rss_bytes": 491438080,
+   "wal_disk_bytes": 51961856,
+   "wal_used_bytes": 51934049.0
+  },
+  {
+   "at_s": 171.0,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 128.0,
+   "oldest_unacked_s": 12.010597863,
+   "rows_written": 1196000.0,
+   "rss_bytes": 549601280,
+   "wal_disk_bytes": 244076544,
+   "wal_used_bytes": 243977275.0
+  },
+  {
+   "at_s": 181.0,
+   "backpressure": 0.0,
+   "boot": 2,
+   "buffer_in_flight": 72.0,
+   "oldest_unacked_s": 6.833901609,
+   "rows_written": 1804000.0,
+   "rss_bytes": 397877248,
+   "wal_disk_bytes": 171610112,
+   "wal_used_bytes": 171550269.0
+  },
+  {
+   "at_s": 191.1,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 0.0,
+   "rss_bytes": 542789632,
+   "wal_disk_bytes": 322756608,
+   "wal_used_bytes": 0.0
+  },
+  {
+   "at_s": 201.1,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 72.0,
+   "oldest_unacked_s": 7.115351177,
+   "rows_written": 772000.0,
+   "rss_bytes": 400551936,
+   "wal_disk_bytes": 173191168,
+   "wal_used_bytes": 136943169.0
+  },
+  {
+   "at_s": 211.2,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 80.0,
+   "oldest_unacked_s": 7.564861458,
+   "rows_written": 1184000.0,
+   "rss_bytes": 397709312,
+   "wal_disk_bytes": 188895232,
+   "wal_used_bytes": 188836176.0
+  },
+  {
+   "at_s": 221.3,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 29.0,
+   "oldest_unacked_s": 2.4220507319999998,
+   "rows_written": 1792000.0,
+   "rss_bytes": 498094080,
+   "wal_disk_bytes": 69271552,
+   "wal_used_bytes": 66097237.0
+  },
+  {
+   "at_s": 231.3,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 128.0,
+   "oldest_unacked_s": 12.42228259,
+   "rows_written": 1792000.0,
+   "rss_bytes": 541274112,
+   "wal_disk_bytes": 240955392,
+   "wal_used_bytes": 240837677.0
+  },
+  {
+   "at_s": 241.4,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 16.0,
+   "oldest_unacked_s": 7.229696583,
+   "rows_written": 2400000.0,
+   "rss_bytes": 162111488,
+   "wal_disk_bytes": 50659328,
+   "wal_used_bytes": 50631606.0
+  },
+  {
+   "at_s": 251.4,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 2452352.0,
+   "rss_bytes": 141860864,
+   "wal_disk_bytes": 30031872,
+   "wal_used_bytes": 30018214.0
+  },
+  {
+   "at_s": 261.5,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 2452352.0,
+   "rss_bytes": 76455936,
+   "wal_disk_bytes": 30031872,
+   "wal_used_bytes": 30018214.0
+  },
+  {
+   "at_s": 271.6,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 2452352.0,
+   "rss_bytes": 74215424,
+   "wal_disk_bytes": 30031872,
+   "wal_used_bytes": 30018214.0
+  },
+  {
+   "at_s": 281.6,
+   "backpressure": 0.0,
+   "boot": 3,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 2452352.0,
+   "rss_bytes": 73928704,
+   "wal_disk_bytes": 30031872,
+   "wal_used_bytes": 30018214.0
+  }
+ ]
+}

@@ -1,0 +1,1199 @@
+{
+ "ack_latency": {
+  "buckets": [
+   [
+    0.005,
+    736.0
+   ],
+   [
+    0.01,
+    1232.0
+   ],
+   [
+    0.025,
+    2186.0
+   ],
+   [
+    0.05,
+    2590.0
+   ],
+   [
+    0.075,
+    2767.0
+   ],
+   [
+    0.1,
+    2831.0
+   ],
+   [
+    0.25,
+    2987.0
+   ],
+   [
+    0.5,
+    3040.0
+   ],
+   [
+    0.75,
+    3070.0
+   ],
+   [
+    1.0,
+    3101.0
+   ],
+   [
+    2.5,
+    3308.0
+   ],
+   [
+    5.0,
+    3312.0
+   ],
+   [
+    7.5,
+    3312.0
+   ],
+   [
+    10.0,
+    3312.0
+   ],
+   [
+    "+Inf",
+    3312.0
+   ]
+  ],
+  "p50_le_s": 0.025,
+  "p99_le_s": 2.5,
+  "source": "rpc_client_call_duration_seconds of otelcol.exporter.otlp.series"
+ },
+ "alloy_final": {
+  "0": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163098335.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "1": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 162973600.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "2": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163108738.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "3": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 162978751.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "4": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163103486.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "5": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163082579.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "6": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163093083.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  },
+  "7": {
+   "calls": {
+    "OK": 414.0
+   },
+   "enqueue_failed_records": 0.0,
+   "in_flight_requests": 0.0,
+   "queue_size_records": 0.0,
+   "read_bytes": 163082579.0,
+   "read_lines": 1652729.0,
+   "send_failed_records": 0.0,
+   "sent_records": 1652729.0
+  }
+ },
+ "alloy_restarts": {
+  "0": [],
+  "1": [],
+  "2": [],
+  "3": [],
+  "4": [],
+  "5": [],
+  "6": [],
+  "7": []
+ },
+ "alloy_settings": {
+  "batch_max_records": 4000,
+  "num_consumers": 2,
+  "persistent_queue": true,
+  "queue_size_records": 16000,
+  "timeout": "10s"
+ },
+ "archive": "<main_checkout>/.measurement-artifacts/reference-alloy/s3_outage-rustfs-1790337079",
+ "boots": 1,
+ "case": "s3_outage",
+ "checks": [
+  {
+   "detail": [],
+   "name": "delivery",
+   "passed": true
+  },
+  {
+   "detail": "Alloy positions at EOF and queues empty; buffer empty",
+   "name": "drained",
+   "passed": true
+  },
+  {
+   "detail": "enqueue_failed 0.0, send_failed 0.0, 'Dropping data' lines 0",
+   "name": "no_producer_loss",
+   "passed": true
+  },
+  {
+   "detail": "loss {}, permanently_rejected 0.0",
+   "name": "no_buffer_loss",
+   "passed": true
+  },
+  {
+   "detail": "0 incomplete uploads, abort_failures 0.0",
+   "name": "orphans_expected",
+   "passed": true
+  },
+  {
+   "detail": "0 duplicate lines, allowed {'lines': 0, 'rule': 'no duplicates'}",
+   "name": "duplicates_within_bound",
+   "passed": true
+  },
+  {
+   "detail": "flush failures 8.0, buffer retries 1454.0",
+   "name": "fault_observed",
+   "passed": true
+  },
+  {
+   "detail": "statuses {'OK': 3312.0}, 'Exporting failed' lines 0",
+   "name": "alloy_saw_no_errors",
+   "passed": true
+  }
+ ],
+ "config": {
+  "alloy_file": "configs/series-parquet.alloy",
+  "alloy_sha256": "ec88a85f1be19a4935d7a9c5f0a82d7cecf7b65290d8b66cb05aef7116c9d4ba",
+  "engine_file": "configs/series-parquet-buffered.yaml",
+  "engine_sha256": "cc366b8e5956633362294c75f3b6940aa41f6887a148f7e008603fc5b5f73ff9",
+  "site_substitutions": {
+   "groups.default.pipelines.main.nodes.buffer.config.path": {
+    "run": "<wal_dir>",
+    "shipped": "/var/lib/otap/series-wal"
+   },
+   "groups.default.pipelines.main.nodes.exporter.config.storage.s3.base_uri": {
+    "run": "s3://series-test/otel",
+    "shipped": "s3://series-test/otel"
+   },
+   "groups.default.pipelines.main.nodes.exporter.config.storage.s3.endpoint": {
+    "run": "<store>",
+    "shipped": "http://127.0.0.1:9000"
+   },
+   "groups.default.pipelines.main.nodes.receiver.config.protocols.grpc.listening_addr": {
+    "run": "<grpc_addr>",
+    "shipped": "127.0.0.1:4317"
+   },
+   "policies.resources.core_allocation": {
+    "run": {
+     "set": [
+      {
+       "end": 2,
+       "start": 2
+      }
+     ],
+     "type": "core_set"
+    },
+    "shipped": {
+     "count": 1,
+     "type": "core_count"
+    }
+   }
+  }
+ },
+ "duplicate_allowance": {
+  "lines": 0,
+  "rule": "no duplicates"
+ },
+ "duplicates": {
+  "duplicate_lines_by_boots": {},
+  "runs": [],
+  "runs_count": 0
+ },
+ "engine_exits": [
+  {
+   "code": 0,
+   "exit_s": 0.015287477,
+   "forced": false,
+   "kind": "engine_final_exit",
+   "signal": "SIGTERM",
+   "t": 405795552386772,
+   "wall": 1790337469293048125
+  }
+ ],
+ "environment": {
+  "alloy_image": "grafana/alloy:v1.19.2",
+  "engine_binary": "<workspace>/target/release/df_engine",
+  "engine_cpus": "0-3,16-19",
+  "git": {
+   "dirty": true,
+   "revision": "5c1ddeaaaf4adf9f873f63bf1543c8906a952e97"
+  },
+  "producer_cpus": "8-15,24-31",
+  "producers": 8,
+  "rate_per_producer": 5000,
+  "store_cpus": [
+   4,
+   5,
+   6,
+   7,
+   20,
+   21,
+   22,
+   23
+  ],
+  "store_image": "rustfs/rustfs:1.0.0-rc.3",
+  "worker_core": 2
+ },
+ "events": [
+  {
+   "at_s": -2.399349276,
+   "boot": 0,
+   "kind": "engine_ready",
+   "pid": 349544,
+   "start_s": 0.405378457,
+   "wall": 1790337080069963044
+  },
+  {
+   "at_s": 0.0,
+   "kind": "input_started",
+   "producers": 8,
+   "rate": 5000,
+   "wall": 1790337082469311490
+  },
+  {
+   "at_s": 60.000091062,
+   "kind": "fault_start",
+   "wall": 1790337142469402912
+  },
+  {
+   "at_s": 60.000133252,
+   "kind": "store_stop",
+   "wall": 1790337142469444272
+  },
+  {
+   "at_s": 210.670835266,
+   "kind": "store_recovered",
+   "wall": 1790337293140146636
+  },
+  {
+   "at_s": 330.670934806,
+   "kind": "fault_end",
+   "wall": 1790337413140247266
+  },
+  {
+   "at_s": 330.791737194,
+   "kind": "input_stopped",
+   "wall": 1790337413261048724,
+   "written": 13221832
+  },
+  {
+   "at_s": 346.793864222,
+   "kind": "alloy_drained",
+   "ok": true,
+   "wall": 1790337429263175972
+  },
+  {
+   "at_s": 386.794169767,
+   "kind": "engine_drained",
+   "ok": true,
+   "wall": 1790337469263481667
+  },
+  {
+   "at_s": 386.823736705,
+   "code": 0,
+   "exit_s": 0.015287477,
+   "forced": false,
+   "kind": "engine_final_exit",
+   "signal": "SIGTERM",
+   "wall": 1790337469293048125
+  }
+ ],
+ "finished_utc": "2026-09-25T11:57:55Z",
+ "freshness": {
+  "by_last_modified": {
+   "lines": 13221832,
+   "max_s": 165.93084699,
+   "p50_s": 16.366175278,
+   "p99_s": 155.204723616
+  },
+  "lines_without_listing": 0,
+  "listing_period_s": 2.0,
+  "overall": {
+   "lines": 13221832,
+   "max_s": 167.265907771,
+   "p50_s": 17.673306897,
+   "p99_s": 155.899813653
+  },
+  "per_10s_of_input": [
+   {
+    "input_s": 0,
+    "lines": 392000,
+    "max_s": 17.554653658,
+    "p50_s": 5.942767012,
+    "p99_s": 17.451566412
+   },
+   {
+    "input_s": 10,
+    "lines": 400000,
+    "max_s": 14.152078118,
+    "p50_s": 9.153564354,
+    "p99_s": 14.049451659
+   },
+   {
+    "input_s": 20,
+    "lines": 400000,
+    "max_s": 16.451015334,
+    "p50_s": 11.458389434,
+    "p99_s": 16.358237025
+   },
+   {
+    "input_s": 30,
+    "lines": 400000,
+    "max_s": 17.382194446,
+    "p50_s": 6.256403724,
+    "p99_s": 17.279115584
+   },
+   {
+    "input_s": 40,
+    "lines": 400000,
+    "max_s": 14.381823597,
+    "p50_s": 9.384340017,
+    "p99_s": 14.277910658
+   },
+   {
+    "input_s": 50,
+    "lines": 400000,
+    "max_s": 167.265907771,
+    "p50_s": 154.715816297,
+    "p99_s": 167.162875687
+   },
+   {
+    "input_s": 60,
+    "lines": 400000,
+    "max_s": 153.41621043,
+    "p50_s": 149.547305212,
+    "p99_s": 153.312751196
+   },
+   {
+    "input_s": 70,
+    "lines": 400000,
+    "max_s": 147.44172098,
+    "p50_s": 139.848833797,
+    "p99_s": 147.348376916
+   },
+   {
+    "input_s": 80,
+    "lines": 400000,
+    "max_s": 139.462569405,
+    "p50_s": 132.442337759,
+    "p99_s": 139.360024274
+   },
+   {
+    "input_s": 90,
+    "lines": 400000,
+    "max_s": 129.464042718,
+    "p50_s": 118.507725374,
+    "p99_s": 129.360637319
+   },
+   {
+    "input_s": 100,
+    "lines": 400000,
+    "max_s": 117.447097531,
+    "p50_s": 113.759538424,
+    "p99_s": 117.343254002
+   },
+   {
+    "input_s": 110,
+    "lines": 400000,
+    "max_s": 109.459745215,
+    "p50_s": 105.781025236,
+    "p99_s": 109.356693862
+   },
+   {
+    "input_s": 120,
+    "lines": 400000,
+    "max_s": 101.473313075,
+    "p50_s": 96.472115591,
+    "p99_s": 101.381109289
+   },
+   {
+    "input_s": 130,
+    "lines": 400000,
+    "max_s": 93.491625478,
+    "p50_s": 88.487677512,
+    "p99_s": 93.388736742
+   },
+   {
+    "input_s": 140,
+    "lines": 400000,
+    "max_s": 83.495737538,
+    "p50_s": 78.522111821,
+    "p99_s": 83.39264211
+   },
+   {
+    "input_s": 150,
+    "lines": 400000,
+    "max_s": 77.519035559,
+    "p50_s": 72.523128221,
+    "p99_s": 77.42675718
+   },
+   {
+    "input_s": 160,
+    "lines": 400000,
+    "max_s": 67.521772941,
+    "p50_s": 62.520988508,
+    "p99_s": 67.418635671
+   },
+   {
+    "input_s": 170,
+    "lines": 400000,
+    "max_s": 59.543478483,
+    "p50_s": 54.543545543,
+    "p99_s": 59.440475722
+   },
+   {
+    "input_s": 180,
+    "lines": 400000,
+    "max_s": 49.542492093,
+    "p50_s": 44.534456156,
+    "p99_s": 49.4393402
+   },
+   {
+    "input_s": 190,
+    "lines": 400000,
+    "max_s": 41.562824501,
+    "p50_s": 36.560967502,
+    "p99_s": 41.460071826
+   },
+   {
+    "input_s": 200,
+    "lines": 400000,
+    "max_s": 31.559481013,
+    "p50_s": 26.755486295,
+    "p99_s": 31.456440086
+   },
+   {
+    "input_s": 210,
+    "lines": 400000,
+    "max_s": 23.579254377,
+    "p50_s": 18.569800896,
+    "p99_s": 23.475844081
+   },
+   {
+    "input_s": 220,
+    "lines": 400000,
+    "max_s": 13.57055627,
+    "p50_s": 8.569618371,
+    "p99_s": 13.477695995
+   },
+   {
+    "input_s": 230,
+    "lines": 400000,
+    "max_s": 19.108363156,
+    "p50_s": 13.510092622,
+    "p99_s": 18.705466686
+   },
+   {
+    "input_s": 240,
+    "lines": 400000,
+    "max_s": 17.227369037,
+    "p50_s": 7.706888569,
+    "p99_s": 17.021495344
+   },
+   {
+    "input_s": 250,
+    "lines": 400000,
+    "max_s": 13.821252757,
+    "p50_s": 8.824141638,
+    "p99_s": 13.728560009
+   },
+   {
+    "input_s": 260,
+    "lines": 400000,
+    "max_s": 18.161241382,
+    "p50_s": 13.163349411,
+    "p99_s": 18.05814318
+   },
+   {
+    "input_s": 270,
+    "lines": 400000,
+    "max_s": 17.074894461,
+    "p50_s": 7.964087536,
+    "p99_s": 16.971385168
+   },
+   {
+    "input_s": 280,
+    "lines": 400000,
+    "max_s": 14.076347243,
+    "p50_s": 9.077095599,
+    "p99_s": 13.97282343
+   },
+   {
+    "input_s": 290,
+    "lines": 400000,
+    "max_s": 15.995218683,
+    "p50_s": 10.996026442,
+    "p99_s": 15.891965477
+   },
+   {
+    "input_s": 300,
+    "lines": 400000,
+    "max_s": 17.735977737,
+    "p50_s": 6.397210133,
+    "p99_s": 17.632400101
+   },
+   {
+    "input_s": 310,
+    "lines": 400000,
+    "max_s": 14.332219578,
+    "p50_s": 9.329736989,
+    "p99_s": 14.22910808
+   },
+   {
+    "input_s": 320,
+    "lines": 400000,
+    "max_s": 16.66093534,
+    "p50_s": 11.660685842,
+    "p99_s": 16.557736072
+   },
+   {
+    "input_s": 330,
+    "lines": 29832,
+    "max_s": 8.453379282,
+    "p50_s": 8.154983406,
+    "p99_s": 8.453379282
+   }
+  ]
+ },
+ "incomplete_uploads": [],
+ "lease": {
+  "acquired_utc": "2026-09-25T11:51:19Z",
+  "owner": "349188-889d075595714bb6bbf1288e916ea5db",
+  "path": "/tmp/series-parquet-host-measurement.lock",
+  "pid": 349188,
+  "released_utc": null,
+  "run_id": "reference-alloy-s3_outage-rustfs"
+ },
+ "metrics": {
+  "ack_latency_p50_le_s": 0.025,
+  "ack_latency_p99_le_s": 2.5,
+  "alloy_calls_by_status": {
+   "OK": 3312.0
+  },
+  "alloy_dropping_data_log_lines": 0,
+  "alloy_export_failed_log_lines": 0,
+  "buffer_backpressure_refusals": 0.0,
+  "buffer_retries_scheduled": 1454.0,
+  "duplicate_lines": 0,
+  "exporter_accounted_peak_bytes": 910232523.0,
+  "exporter_budget_bytes": 1640013824.0,
+  "flush_abort_failures": 0.0,
+  "flush_failures": 8.0,
+  "flush_late_commits": 0.0,
+  "freshness_max_s": 167.265907771,
+  "freshness_p50_s": 17.673306897,
+  "freshness_p99_s": 155.899813653,
+  "incomplete_uploads": 0,
+  "input_s": 330.791737194,
+  "offered_lines_per_s": 40000,
+  "rss_peak_bytes": 2596937728,
+  "wal_disk_peak_bytes": 2646990848,
+  "wal_used_peak_bytes": 2630190641.0,
+  "written_lines": 13221832,
+  "written_lines_per_s": 39970.260781471
+ },
+ "object_inventory_count": 32,
+ "options": {},
+ "oracle": {
+  "duplicate_rows": 0,
+  "expected_lines": 13221832,
+  "passed": true,
+  "per_producer": {
+   "0": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p00"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "1": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p01"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "2": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p02"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "3": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p03"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "4": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p04"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "5": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p05"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "6": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p06"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   },
+   "7": {
+    "distinct": 1652729,
+    "max": 1652728,
+    "min": 0,
+    "producer_ids": [
+     "alloy-p07"
+    ],
+    "rows": 1652729,
+    "seq_sum": 1365755747356
+   }
+  },
+  "problems": [],
+  "readers": [
+   "duckdb",
+   "clickhouse"
+  ],
+  "total_rows": 13221832
+ },
+ "started_utc": "2026-09-25T11:51:19Z",
+ "status": "passed",
+ "store": "rustfs",
+ "timeline": [
+  {
+   "at_s": -0.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 0.0,
+   "rss_bytes": 70164480,
+   "wal_disk_bytes": 4096,
+   "wal_used_bytes": 38.0
+  },
+  {
+   "at_s": 10.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 20.0,
+   "oldest_unacked_s": 2.056999535,
+   "rows_written": 272000.0,
+   "rss_bytes": 331395072,
+   "wal_disk_bytes": 62988288,
+   "wal_used_bytes": 37781584.0
+  },
+  {
+   "at_s": 20.1,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 118.0,
+   "oldest_unacked_s": 12.057152677,
+   "rows_written": 272000.0,
+   "rss_bytes": 525459456,
+   "wal_disk_bytes": 229945344,
+   "wal_used_bytes": 220396082.0
+  },
+  {
+   "at_s": 30.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 72.0,
+   "oldest_unacked_s": 6.744202697,
+   "rows_written": 864000.0,
+   "rss_bytes": 417017856,
+   "wal_disk_bytes": 185798656,
+   "wal_used_bytes": 160537028.0
+  },
+  {
+   "at_s": 40.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 24.0,
+   "oldest_unacked_s": 1.663005861,
+   "rows_written": 1472000.0,
+   "rss_bytes": 209969152,
+   "wal_disk_bytes": 47230976,
+   "wal_used_bytes": 45632703.0
+  },
+  {
+   "at_s": 50.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 120.0,
+   "oldest_unacked_s": 11.662776624,
+   "rows_written": 1472000.0,
+   "rss_bytes": 535191552,
+   "wal_disk_bytes": 237744128,
+   "wal_used_bytes": 212472193.0
+  },
+  {
+   "at_s": 60.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 72.0,
+   "oldest_unacked_s": 6.493606225,
+   "rows_written": 2080000.0,
+   "rss_bytes": 391385088,
+   "wal_disk_bytes": 187318272,
+   "wal_used_bytes": 165221283.0
+  },
+  {
+   "at_s": 70.4,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 168.0,
+   "oldest_unacked_s": 16.493321426,
+   "rows_written": 2080000.0,
+   "rss_bytes": 762904576,
+   "wal_disk_bytes": 289767424,
+   "wal_used_bytes": 264446054.0
+  },
+  {
+   "at_s": 80.4,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 267.0,
+   "oldest_unacked_s": 26.492529776,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1062522880,
+   "wal_disk_bytes": 481878016,
+   "wal_used_bytes": 448605288.0
+  },
+  {
+   "at_s": 90.5,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 368.0,
+   "oldest_unacked_s": 22.055416746,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1405968384,
+   "wal_disk_bytes": 648753152,
+   "wal_used_bytes": 623290586.0
+  },
+  {
+   "at_s": 100.6,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 313.0,
+   "oldest_unacked_s": 15.400893241,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1661984768,
+   "wal_disk_bytes": 773234688,
+   "wal_used_bytes": 747685925.0
+  },
+  {
+   "at_s": 110.6,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 515.0,
+   "oldest_unacked_s": 26.405577713,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1894203392,
+   "wal_disk_bytes": 943288320,
+   "wal_used_bytes": 914514871.0
+  },
+  {
+   "at_s": 120.7,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 515.0,
+   "oldest_unacked_s": 33.768815947,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1915817984,
+   "wal_disk_bytes": 1132171264,
+   "wal_used_bytes": 1131679105.0
+  },
+  {
+   "at_s": 130.8,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 515.0,
+   "oldest_unacked_s": 43.769210748,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1895186432,
+   "wal_disk_bytes": 1244086272,
+   "wal_used_bytes": 1230920460.0
+  },
+  {
+   "at_s": 140.8,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 515.0,
+   "oldest_unacked_s": 38.285737201,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1923899392,
+   "wal_disk_bytes": 1423519744,
+   "wal_used_bytes": 1422886422.0
+  },
+  {
+   "at_s": 150.9,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 322.0,
+   "oldest_unacked_s": 31.108477949,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1823555584,
+   "wal_disk_bytes": 1615577088,
+   "wal_used_bytes": 1589725912.0
+  },
+  {
+   "at_s": 161.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 515.0,
+   "oldest_unacked_s": 41.108049916,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1886253056,
+   "wal_disk_bytes": 1714839552,
+   "wal_used_bytes": 1714115851.0
+  },
+  {
+   "at_s": 171.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 322.0,
+   "oldest_unacked_s": 34.211531744,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1882521600,
+   "wal_disk_bytes": 1859735552,
+   "wal_used_bytes": 1858951824.0
+  },
+  {
+   "at_s": 181.1,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 514.0,
+   "oldest_unacked_s": 43.77431301,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1902190592,
+   "wal_disk_bytes": 2026663936,
+   "wal_used_bytes": 2072987767.0
+  },
+  {
+   "at_s": 191.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 365.0,
+   "oldest_unacked_s": 35.395584485,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1627000832,
+   "wal_disk_bytes": 2198323200,
+   "wal_used_bytes": 2178530056.0
+  },
+  {
+   "at_s": 201.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 365.0,
+   "oldest_unacked_s": 45.389602975,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1624162304,
+   "wal_disk_bytes": 2390409216,
+   "wal_used_bytes": 2364250236.0
+  },
+  {
+   "at_s": 211.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 365.0,
+   "oldest_unacked_s": 23.465960075,
+   "rows_written": 2080000.0,
+   "rss_bytes": 1522376704,
+   "wal_disk_bytes": 2533662720,
+   "wal_used_bytes": 2532645833.0
+  },
+  {
+   "at_s": 221.4,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 477.0,
+   "oldest_unacked_s": 4.789883636,
+   "rows_written": 4568000.0,
+   "rss_bytes": 1550905344,
+   "wal_disk_bytes": 1708380160,
+   "wal_used_bytes": 1684171902.0
+  },
+  {
+   "at_s": 231.5,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 415.0,
+   "oldest_unacked_s": 5.728120553,
+   "rows_written": 7504000.0,
+   "rss_bytes": 1622106112,
+   "wal_disk_bytes": 675319808,
+   "wal_used_bytes": 671948740.0
+  },
+  {
+   "at_s": 241.5,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 90.0,
+   "oldest_unacked_s": 8.038795638,
+   "rows_written": 9240000.0,
+   "rss_bytes": 447180800,
+   "wal_disk_bytes": 154357760,
+   "wal_used_bytes": 196722861.0
+  },
+  {
+   "at_s": 251.6,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 43.0,
+   "oldest_unacked_s": 3.820250294,
+   "rows_written": 9872000.0,
+   "rss_bytes": 508788736,
+   "wal_disk_bytes": 96006144,
+   "wal_used_bytes": 95976944.0
+  },
+  {
+   "at_s": 261.6,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 140.0,
+   "oldest_unacked_s": 13.820294778,
+   "rows_written": 9872000.0,
+   "rss_bytes": 577970176,
+   "wal_disk_bytes": 264458240,
+   "wal_used_bytes": 264372226.0
+  },
+  {
+   "at_s": 271.7,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 93.0,
+   "oldest_unacked_s": 8.815913915,
+   "rows_written": 10464000.0,
+   "rss_bytes": 436588544,
+   "wal_disk_bytes": 155856896,
+   "wal_used_bytes": 151084501.0
+  },
+  {
+   "at_s": 281.8,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 40.0,
+   "oldest_unacked_s": 3.504531455,
+   "rows_written": 11072000.0,
+   "rss_bytes": 502161408,
+   "wal_disk_bytes": 84992000,
+   "wal_used_bytes": 83396735.0
+  },
+  {
+   "at_s": 291.8,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 136.0,
+   "oldest_unacked_s": 13.504648557,
+   "rows_written": 11072000.0,
+   "rss_bytes": 597364736,
+   "wal_disk_bytes": 275410944,
+   "wal_used_bytes": 262766977.0
+  },
+  {
+   "at_s": 301.9,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 88.0,
+   "oldest_unacked_s": 8.467238582,
+   "rows_written": 11680000.0,
+   "rss_bytes": 414638080,
+   "wal_disk_bytes": 208080896,
+   "wal_used_bytes": 202963203.0
+  },
+  {
+   "at_s": 311.9,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 46.0,
+   "oldest_unacked_s": 3.854521262,
+   "rows_written": 12264000.0,
+   "rss_bytes": 269635584,
+   "wal_disk_bytes": 97583104,
+   "wal_used_bytes": 97548414.0
+  },
+  {
+   "at_s": 322.0,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 142.0,
+   "oldest_unacked_s": 13.819481034,
+   "rows_written": 12264000.0,
+   "rss_bytes": 620929024,
+   "wal_disk_bytes": 289640448,
+   "wal_used_bytes": 264360264.0
+  },
+  {
+   "at_s": 332.1,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 88.0,
+   "oldest_unacked_s": 8.783089653,
+   "rows_written": 12864000.0,
+   "rss_bytes": 393146368,
+   "wal_disk_bytes": 195141632,
+   "wal_used_bytes": 195083538.0
+  },
+  {
+   "at_s": 342.1,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 13221832.0,
+   "rss_bytes": 291905536,
+   "wal_disk_bytes": 58925056,
+   "wal_used_bytes": 58905890.0
+  },
+  {
+   "at_s": 352.2,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 13221832.0,
+   "rss_bytes": 81657856,
+   "wal_disk_bytes": 58925056,
+   "wal_used_bytes": 58905890.0
+  },
+  {
+   "at_s": 362.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 13221832.0,
+   "rss_bytes": 77688832,
+   "wal_disk_bytes": 58925056,
+   "wal_used_bytes": 58905890.0
+  },
+  {
+   "at_s": 372.3,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 13221832.0,
+   "rss_bytes": 77877248,
+   "wal_disk_bytes": 58925056,
+   "wal_used_bytes": 58905890.0
+  },
+  {
+   "at_s": 382.4,
+   "backpressure": 0.0,
+   "boot": 0,
+   "buffer_in_flight": 0.0,
+   "oldest_unacked_s": 0.0,
+   "rows_written": 13221832.0,
+   "rss_bytes": 75202560,
+   "wal_disk_bytes": 58925056,
+   "wal_used_bytes": 58905890.0
+  }
+ ]
+}
