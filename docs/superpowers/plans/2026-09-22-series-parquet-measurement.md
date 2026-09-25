@@ -1,5 +1,7 @@
 # Series Parquet Measurement Implementation Plan
 
+> Review documents cited here (umbrella, consistency, complexity and deslop reviews, the S3 compatibility note, the compaction and format chat) were removed from the tree on 2026-09-25 after every open item moved to the plan-4 backlog; they remain in git history.
+
 <!-- markdownlint-disable MD013 MD032 MD031 MD040 MD024 MD033 MD046 MD029 MD004 -->
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

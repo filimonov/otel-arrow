@@ -1,5 +1,7 @@
 # Plan 4 backlog (series_parquet exporter)
 
+> Review documents cited here (umbrella, consistency, complexity and deslop reviews, the S3 compatibility note, the compaction and format chat) were removed from the tree on 2026-09-25 after every open item moved to the plan-4 backlog; they remain in git history.
+
 Status: groomed backlog (2026-09-25), not a plan. Plan 4 is written from it
 after the plan-3 final report (Task 14).
 
