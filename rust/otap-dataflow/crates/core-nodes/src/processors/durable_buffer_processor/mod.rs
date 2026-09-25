@@ -154,10 +154,7 @@ const SHUTDOWN_PERSIST_RESERVE: Duration = Duration::from_secs(1);
 const SUBSCRIBER_ID: &str = "durable-buffer";
 
 /// Run `work` until `deadline`; `None` when the deadline came first.
-async fn until_deadline<T>(
-    deadline: Instant,
-    work: impl Future<Output = T>,
-) -> Option<T> {
+async fn until_deadline<T>(deadline: Instant, work: impl Future<Output = T>) -> Option<T> {
     tokio::select! {
         biased;
         out = work => Some(out),
