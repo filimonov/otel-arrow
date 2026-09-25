@@ -694,7 +694,9 @@ acknowledged input and `drained`.
   (strict: unacknowledged requests; buffered: bundles the exporter holds),
   the admin shutdown with a deadline of `window.interval + 2 *
   (flush_retry_deadline + upload.abort_timeout) + 15 s` (150 s here). The
-  engine must exit 0 within the bound itself (135 s).
+  admin call must return within that deadline and the engine must exit 0 by
+  the cleanup cutoff: the deadline plus `upload.abort_timeout` plus 1 s for
+  deciding held requests and exiting (156 s here, `graceful_exit_problem`).
 - `kill_active`: SIGKILL while the current window's cohort is only in the
   ACTIVE block: at least five requests sent from 0.25 s after the window's
   boundary (strict: unacknowledged; buffered: acknowledged by the log),

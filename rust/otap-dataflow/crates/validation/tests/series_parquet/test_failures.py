@@ -1427,6 +1427,25 @@ class ProcessCaseContracts(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "admin shutdown of 5 failed"):
             faults.stop_engine(engine, 150)
 
+    # Scenario: graceful stops that exit early, after the partition lateness
+    # bound but within the shutdown deadline, past the cleanup cutoff, with a
+    # failed admin call and with a nonzero exit.
+    # Guarantees: a graceful stop is judged against the configured shutdown
+    # deadline and the cleanup cutoff (deadline + abort_timeout + the held
+    # decision allowance), never against the partition lateness bound.
+    def test_graceful_exit_is_judged_against_the_shutdown_deadline(self):
+        stopped = {"admin_returned_s": 4.9, "exit_s": 5.0, "exit_code": 0, "admin_error": None}
+        self.assertIsNone(faults.graceful_exit_problem(stopped, 150, 5.0))
+        self.assertIsNone(faults.graceful_exit_problem(
+            dict(stopped, admin_returned_s=140.0, exit_s=140.5), 150, 5.0))
+        self.assertIsNotNone(faults.graceful_exit_problem(
+            dict(stopped, admin_returned_s=150.2, exit_s=156.5), 150, 5.0))
+        self.assertIsNotNone(faults.graceful_exit_problem(
+            dict(stopped, admin_returned_s=152.0, exit_s=152.1), 150, 5.0))
+        self.assertIsNotNone(faults.graceful_exit_problem(dict(stopped, exit_code=1), 150, 5.0))
+        self.assertIsNotNone(faults.graceful_exit_problem(
+            dict(stopped, admin_error="HTTPError"), 150, 5.0))
+
     # Scenario: an engine is restarted, keeping and then not keeping its buffer.
     # Guarantees: the successor runs from the next root with the same launch
     # options, the same buffer path only when retained, and records the old

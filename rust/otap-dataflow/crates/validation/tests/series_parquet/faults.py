@@ -3983,6 +3983,9 @@ ACTIVE_WINDOW_LEFT_S = 1.5
 # the restarted engine's first series PUT (about 8 KiB, several seconds).
 MULTIPART_THROTTLE_KBPS = 512
 PUT_THROTTLE_KBPS = 1
+# The allowance past the cleanup cutoff for deciding held requests
+# synchronously (about a microsecond each) and for the process to exit.
+HELD_DECISION_ALLOWANCE_S = 1.0
 # How long FLUSHING must have held before that series PUT is on the wire.
 PUT_IN_FLIGHT_S = 1.0
 # A request NGINX logged ending this close to a kill was open at the kill.
@@ -4126,6 +4129,24 @@ def stop_engine(engine, deadline_s) -> dict:
             "exit_s": (exited_ns - signal_ns) / 1e9,
             "exit_code": state.get("ExitCode") if state else engine.process.poll(),
             "container_state": state}
+
+
+def graceful_exit_problem(stopped, deadline_s, abort_timeout_s):
+    """Why a graceful stop broke its bounds, or None.
+
+    The admin call must return within the shutdown deadline and the process
+    must exit 0 by the absolute cleanup cutoff: the deadline plus
+    `upload.abort_timeout`, plus HELD_DECISION_ALLOWANCE_S for deciding held
+    requests and exiting.
+    """
+    cutoff = deadline_s + abort_timeout_s + HELD_DECISION_ALLOWANCE_S
+    admin = stopped.get("admin_returned_s")
+    if stopped.get("admin_error") or stopped.get("exit_code") != 0 or admin is None \
+            or admin > deadline_s + HELD_DECISION_ALLOWANCE_S or stopped["exit_s"] > cutoff:
+        return (f"graceful exit {stopped.get('exit_code')} after {stopped['exit_s']:.3f} s "
+                f"(admin returned after {admin} s) against the {deadline_s} s shutdown "
+                f"deadline and the {cutoff} s cleanup cutoff; admin {stopped.get('admin_error')}")
+    return None
 
 
 def restart_engine(previous, *, retain_buffer: bool):
@@ -4849,12 +4870,10 @@ class ProcessCase(FaultCase):
                 problems.append(f"event {event['ordinal']}: exit {stopped['exit_code']} is not "
                                 "a SIGKILL")
             if event["kind"] == "graceful":
-                bound = lateness_bound_s(self.settings)
-                if stopped["admin_error"] or stopped["exit_code"] != 0 \
-                        or stopped["exit_s"] > bound:
-                    problems.append(
-                        f"graceful exit {stopped['exit_code']} after {stopped['exit_s']:.3f} s "
-                        f"against the {bound} s drain bound; admin {stopped['admin_error']}")
+                problem = graceful_exit_problem(stopped, self.drain_deadline_s, duration_s(
+                    self.settings["upload"]["abort_timeout"]))
+                if problem:
+                    problems.append(problem)
         if self.fault == "kill_active" and self.events:
             event = self.events[0]
             gate = event["gate"]
@@ -4916,8 +4935,10 @@ class ProcessCase(FaultCase):
             "first_values_file_after_restart_s": resumed.get("first_values_file_s"),
             "graceful_drain_s": (first.get("exit") or {}).get("exit_s")
             if first.get("kind") == "graceful" else None,
-            "drain_bound_s": lateness_bound_s(self.settings),
+            "partition_lateness_bound_s": lateness_bound_s(self.settings),
             "admin_shutdown_deadline_s": self.drain_deadline_s,
+            "cleanup_cutoff_s": self.drain_deadline_s + duration_s(
+                self.settings["upload"]["abort_timeout"]) + HELD_DECISION_ALLOWANCE_S,
             "final_shutdown_s": (record.get("final_stop") or {}).get("exit_s"),
             "acked_requests_at_signal_count": (first.get("cohorts_at_signal") or {}).get(
                 "acked_requests_count"),
