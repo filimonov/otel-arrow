@@ -102,9 +102,8 @@ pub(crate) const SERIES_ROW_BYTES: usize = 8;
 /// builder that doubles, plus [`SERIES_ROW_BYTES`]. Decoded attribute trees
 /// die at admission and are not part of `content`.
 ///
-/// Measured by `measurement --series-cost` (`series_row_cost` in
-/// `docs/superpowers/reports/series-parquet-measurement/memory-strict-f001.json`,
-/// DHAT, requests of 1000 to 100,000 minimal new series): a series row holds
+/// Measured by the validation harness's `measurement --series-cost` (DHAT,
+/// requests of 1000 to 100,000 minimal new series): a series row holds
 /// 342-365 bytes of heap for logs and 405-428 for metrics, pending entry
 /// included, of which at most 59 lie beyond its content estimate, and a
 /// denormalized column adds 1-10 bytes. The series merge key adds about 30

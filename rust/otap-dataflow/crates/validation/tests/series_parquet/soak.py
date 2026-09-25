@@ -63,7 +63,8 @@ SOAKS = {
     "soak-strict": {
         "topology": "strict", "store": "minio", "core_count": 1,
         "receiver_capacity": capacity.RAISED_RECEIVER_CAPACITY,
-        "ceiling": {"index": "capacity-minio.json", "cell": CELL, "variant": "raised"},
+        "ceiling": {"index": "docs/superpowers/reports/series-parquet-measurement/"
+                             "capacity-minio.json", "cell": CELL, "variant": "raised"},
     },
     "soak-buffered": {
         "topology": "buffered", "store": "minio", "core_count": 1,
@@ -80,8 +81,12 @@ ZERO_METRICS = (
 
 
 def published_ceiling(index, cell, variant) -> dict:
-    """A searched ceiling from a committed capacity index, and where it is."""
-    path = measurement.REPORT_DIR / index
+    """A searched ceiling from a committed capacity index, and where it is.
+
+    `index` is the index's own path, absolute or relative to the repository,
+    never to the report directory runs publish into.
+    """
+    path = measurement.REPO_ROOT / index
     document = json.loads(path.read_text(encoding="ascii"))
     entry = document["capacity"]["cells"][cell][variant]
     decision = entry["decision"]

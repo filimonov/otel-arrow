@@ -58,6 +58,21 @@ def soak_result(rows, *, topology="strict", **metrics) -> dict:
 
 
 class SoakAnalysis(unittest.TestCase):
+    # Scenario: the strict soak reads its searched ceiling while the report
+    # directory is somewhere else entirely.
+    # Guarantees: the committed capacity index is found by its own explicit
+    # path, so the soak rate does not depend on where runs publish.
+    def test_the_published_ceiling_is_read_from_its_explicit_path(self):
+        ceiling = dict(soak.SOAKS["soak-strict"]["ceiling"])
+        original = measurement.REPORT_DIR
+        measurement.REPORT_DIR = measurement.REPO_ROOT / "no-such-report-dir"
+        try:
+            found = soak.published_ceiling(**ceiling)
+        finally:
+            measurement.REPORT_DIR = original
+        self.assertGreater(found["records_per_s"], 0)
+        self.assertTrue((measurement.REPO_ROOT / ceiling["index"]).is_file())
+
     # Scenario: a soak's RSS rises by half over thirty minutes where its
     # matching baseline stayed flat.
     # Guarantees: the shared regression check fails it; no engine is started.

@@ -1679,6 +1679,28 @@ class PublicationContracts(unittest.TestCase):
         _ = measurement.write_result(index, document)
         return directory, index, {run.name, baseline.name, child.name, index.name}
 
+    # Scenario: a run publishes without naming a report directory.
+    # Guarantees: the default report directory is under the repository's
+    # ignored `.measurement-artifacts/`, so a run adds nothing to git status.
+    def test_the_default_report_directory_is_ignored(self):
+        self.assertEqual(
+            measurement.REPORT_DIR.relative_to(measurement.REPO_ROOT).parts[0],
+            ".measurement-artifacts",
+        )
+        ignored = (measurement.REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".measurement-artifacts/", ignored.splitlines())
+        self.assertEqual(measurement.resolve_report_dir(None), measurement.REPORT_DIR)
+
+    # Scenario: a published family index is checked without asking to stage it.
+    # Guarantees: the verified tree is returned by exact path and nothing is
+    # handed to `git add`.
+    def test_verifying_a_tree_does_not_stage_it(self):
+        directory, index, names = self.tree()
+        with mock.patch.object(measurement.subprocess, "run") as run:
+            paths = measurement.stage_run_files(index)
+        run.assert_not_called()
+        self.assertEqual({Path(path).name for path in paths}, names)
+
     # Scenario: a complete family index is staged for a commit.
     # Guarantees: every enumerated index, child, run and baseline file is
     # handed to `git add` by its exact path, never by a glob or a directory.
@@ -1686,7 +1708,7 @@ class PublicationContracts(unittest.TestCase):
         directory, index, names = self.tree()
         with mock.patch.object(measurement.subprocess, "run") as run:
             run.return_value = subprocess.CompletedProcess([], 0, "", "")
-            measurement.stage_run_files(index)
+            measurement.stage_run_files(index, git_add=True)
         staged = set()
         for call in run.call_args_list:
             arguments = call.args[0]

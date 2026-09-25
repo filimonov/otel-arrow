@@ -936,7 +936,7 @@ class FaultCaseContracts(unittest.TestCase):
     # Guarantees: fault_check fails every result its published status fails,
     # here on the orphaned upload.
     def test_fault_check_fails_the_committed_http503_run(self):
-        path = (measurement.resolve_report_dir(None)
+        path = (measurement.EVIDENCE_DIR
                 / "failure-s3-http503-strict-minio-c1-w5-r001.json")
         result = json.loads(path.read_text(encoding="ascii"))
         self.assertEqual(result["status"], measurement.STATUS_FAILED)

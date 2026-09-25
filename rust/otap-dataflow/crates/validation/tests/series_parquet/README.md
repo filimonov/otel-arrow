@@ -48,13 +48,14 @@ SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 0-7,16-23 \
   python3 -m crates.validation.tests.series_parquet.measure fault-preflight \
   --output-dir /tmp/series-fault-preflight
 
-# Stage one published evidence tree by exact file name, before a commit.
+# Verify one published evidence tree and list its files; --git-add also
+# stages them by exact file name.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
-  --index ../../docs/superpowers/reports/series-parquet-measurement/harness-contracts.json
+  --index ../../.measurement-artifacts/series-parquet-measurement/harness-contracts.json
 ```
 
 Case options are passed as `--option name=value`, decoded as JSON when they
-parse: `report_dir` publishes somewhere other than the committed report
+parse: `report_dir` publishes somewhere other than the default report
 directory, `ordinal` numbers a repeated trial, `cores` pins the workers to
 explicit core ids. `launcher-ci` also takes `legacy_tests=false` to skip the
 original suite and `publish=false`, the CI mode for a runner that is not a
@@ -1265,8 +1266,12 @@ One compact JSON document per run, named
 `{case}-{topology}-{store}-c{cores}-w{interval}-r{ordinal}.json`. A family
 summary index lists its children in `run_files`, `baseline_files` and
 `child_indexes` with their exact names, sizes and SHA-256 hashes; it never
-replaces the per-run files. Committed evidence lives in
-`docs/superpowers/reports/series-parquet-measurement`. Published run and
+replaces the per-run files. Runs publish into the ignored
+`.measurement-artifacts/series-parquet-measurement` unless the `report_dir`
+option names another directory; earlier evidence committed under
+`docs/superpowers/reports/series-parquet-measurement` is read by the baseline
+gate (a baseline in the run's own report directory wins) and by the soak's
+ceiling, which names its capacity index by path. Published run and
 baseline file names are immutable: a re-execution uses a new artifact
 directory rather than overwriting evidence. Raw profiles, Parquet files,
 packet captures, logs and ledgers stay outside tracked source and are
@@ -1274,9 +1279,9 @@ referenced by path, hash, size and retention location.
 
 `stage-results` reads one published index, enumerates the tree recursively,
 rejects a path that is not a plain JSON file name in the report directory,
-rejects cycles, verifies every recorded hash, and hands the files to
-`git add` by name in bounded batches. Nothing is ever staged by glob or by
-directory.
+rejects cycles, verifies every recorded hash and prints the files; with
+`--git-add` it hands them to `git add` by name in bounded batches. Nothing
+is ever staged by glob or by directory.
 
 ## Reproducing a measurement
 

@@ -47,11 +47,16 @@ except ImportError:  # Imported by path, e.g. from an ad hoc script.
 # The one JSON shape every run file, index and baseline declares.
 SCHEMA_VERSION = 1
 
-# Where committed evidence lives. Resolved from this file so that the
-# location does not depend on the current working directory.
+# Where runs publish by default: under the repository's ignored
+# `.measurement-artifacts/`, so a run never adds to the tracked tree. Resolved
+# from this file so that the location does not depend on the current working
+# directory.
 REPO_ROOT = Path(__file__).resolve().parents[6]
-REPORT_DIR_RELATIVE = "docs/superpowers/reports/series-parquet-measurement"
+REPORT_DIR_RELATIVE = ".measurement-artifacts/series-parquet-measurement"
 REPORT_DIR = REPO_ROOT / REPORT_DIR_RELATIVE
+# Evidence committed by earlier runs, read by the baseline gate and the soak's
+# ceiling; nothing publishes here unless a run names it as its report_dir.
+EVIDENCE_DIR = REPO_ROOT / "docs/superpowers/reports/series-parquet-measurement"
 
 
 def resolve_report_dir(value) -> Path:
@@ -61,7 +66,7 @@ def resolve_report_dir(value) -> Path:
     that the evidence does not carry the absolute path of the machine that
     produced it. A test may record an absolute directory of its own instead.
     """
-    path = Path(value or REPORT_DIR_RELATIVE)
+    path = Path(value or REPORT_DIR)
     return path if path.is_absolute() else REPO_ROOT / path
 
 # The first nanosecond a measured point may carry. Point identity is
@@ -4770,9 +4775,12 @@ def evaluate_baseline(result: dict, *, baselines: dict = None) -> dict:
     decision["fingerprint"] = fingerprint
     directions = metric_directions(result)
     if baselines is None:
-        baselines = load_baselines(
-            resolve_report_dir(result.get("report_dir")), result["case"]
-        )
+        # A baseline in the run's own report directory wins over a committed
+        # one with the same fingerprint.
+        baselines = {
+            **load_baselines(EVIDENCE_DIR, result["case"]),
+            **load_baselines(resolve_report_dir(result.get("report_dir")), result["case"]),
+        }
     reference = baselines.get(fingerprint)
     if reference is None:
         decision["action"] = "created"
@@ -5062,19 +5070,22 @@ def archive_published_index(index_name, output_dir, report_dir=None):
 STAGE_BATCH = 100
 
 
-def stage_run_files(index_path) -> None:
-    """Stage one published evidence tree by exact file name.
+def stage_run_files(index_path, *, git_add=False) -> list:
+    """Verify one published evidence tree and return its files by exact path;
+    with `git_add`, also stage them by name.
 
     The tree is read from the report directory, every child is validated as a
-    plain JSON file name in that directory, hashes are checked, and the files
-    are handed to `git add` by name. Nothing is staged by glob or directory,
-    so a commit can never pick up a file the index did not enumerate.
+    plain JSON file name in that directory, and hashes are checked. Nothing is
+    staged by glob or directory, so a commit can never pick up a file the
+    index did not enumerate.
     """
     index_path = Path(index_path).resolve()
     # git runs from the repository root, so every path is made absolute
     # rather than left relative to whichever directory the caller invoked
     # the command from.
     paths = [str(path.resolve()) for _name, path in enumerate_tree(index_path)]
+    if not git_add:
+        return paths
     for start in range(0, len(paths), STAGE_BATCH):
         batch = paths[start:start + STAGE_BATCH]
         outcome = subprocess.run(
@@ -5088,3 +5099,4 @@ def stage_run_files(index_path) -> None:
             raise AssertionError(
                 f"git add failed for {batch}: {outcome.stderr.strip()}"
             )
+    return paths

@@ -135,8 +135,8 @@ string key. A key as wide as the row, such as `body`, therefore halves what a
 block holds. The bound also counts against `ingress.max_extracted_bytes`, and a
 sort key must be a number, timestamp, boolean, id or string column.
 
-F comes from the measured heap of a series row (`measurement --series-cost`,
-`docs/superpowers/reports/series-parquet-measurement/memory-strict-f001.json`):
+F comes from the measured heap of a series row (the validation harness's
+`measurement --series-cost`, DHAT, requests of 1000 to 100,000 minimal series):
 342 to 365 bytes per logs row and 405 to 428 per metrics row for requests of
 1000 or more minimal series, 1 to 10 bytes more per denormalized column, and
 about 30 bytes of merge key besides. A minimal series is charged 844 bytes
@@ -535,8 +535,8 @@ bound freshness from inside the engine; it is a backlog item.
 ### Failure behaviour
 
 Measured with eight Alloy producers at 40k lines/s on one worker, 15 s windows,
-every line read back by DuckDB and clickhouse-local
-(`docs/superpowers/reports/series-parquet-measurement/reference-alloy-*.json`).
+every line read back by DuckDB and clickhouse-local (the validation harness's
+`reference_deployment.py`).
 Without faults, a 30-minute run stored 74.4M lines once, with acknowledgements
 at p50 <= 25ms and p99 <= 250ms, freshness p50 9.7s and p99 17.5s, and flat
 RSS (0.47 GB median, 0.72 GB peak) and WAL (0.3 GB).
