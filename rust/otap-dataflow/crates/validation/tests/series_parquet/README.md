@@ -11,7 +11,7 @@ measurement lane extends the end-to-end helpers; it never replaces them.
 Every command runs from `rust/otap-dataflow`.
 
 ```bash
-# The standing suite: 19 tests, no skips when Docker is required.
+# The standing suite: 25 tests, no skips when Docker is required.
 SERIES_REQUIRE_DOCKER=1 python3 -m unittest \
   crates.validation.tests.series_parquet.test_e2e -v
 
@@ -903,6 +903,34 @@ skips locally unless `SERIES_REQUIRE_DOCKER` is `1`; a startup or reader
 failure always fails. The `series-parquet-e2e` workflow provisions the images
 and runs both stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
 
+### Azure through Azurite
+
+`AzureSlice.test_azurite_stores_every_acknowledged_record` is the one Azure
+case, a smoke rather than a failure matrix. Azure storage authenticates only
+through a bound `bearer_token_provider` capability, so the case runs the
+path a deployment would: Azurite with `--oauth basic` over HTTPS, the
+exporter's `azure` storage with `endpoint` pointing at it, and the
+`oauth2_client_auth` extension acquiring a static, well-formed Entra ID
+token from a loopback token endpoint the test serves. The engine trusts
+Azurite through `SSL_CERT_FILE`, set to a throwaway CA; the server
+certificate is a separate `CA:FALSE` leaf, because the engine's TLS stack
+refuses a self-signed CA certificate as the server's own. The case checks
+that Azurite refuses an anonymous call, sends 12 logs and 6 metrics
+requests, and after every one is acknowledged downloads the objects and
+requires each record exactly once, in DuckDB and in ClickHouse.
+
+It needs an engine built with `azure` and `oauth2-client-auth`:
+
+```bash
+cargo build --locked -p otel-arrow-dfe --bin df_engine \
+  --features series-parquet,aws,azure,oauth2-client-auth,durable-buffer
+```
+
+An engine without them, as `--validate-and-exit` reports, skips the case
+unless `SERIES_REQUIRE_DOCKER` is `1`. The image is
+`mcr.microsoft.com/azure-storage/azurite` 3.37.0, pinned by digest and run
+with `--pull=never`; pull it once by that digest.
+
 ### The Alloy producer
 
 [`configs/series-parquet.alloy`](../../../../configs/series-parquet.alloy),
@@ -1039,7 +1067,7 @@ file name), `purpose`, `lease_wait_s`, `archive_dir`, `report_dir`;
 | `SERIES_ARTIFACT_DIR` | Where measurement tests retain their logs, results and ledgers. |
 | `SERIES_PERF` | The perf executable an attribution records with. Defaults to `perf` on the PATH. |
 | `SERIES_ATTRIBUTION_ENGINE` | The engine an attribution profiles. Defaults to `target/release/df_engine-perf`. |
-| `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE` | The container images the end-to-end lane uses, each a locally present tag; defaults in "Reference deployment". |
+| `SERIES_MINIO_IMAGE`, `SERIES_RUSTFS_IMAGE`, `SERIES_CLICKHOUSE_IMAGE`, `SERIES_ALLOY_IMAGE`, `SERIES_AZURITE_IMAGE` | The container images the end-to-end lane uses, each a locally present tag or digest; defaults in "Reference deployment" and "Azure through Azurite". |
 | `SERIES_CLICKHOUSE_LOCAL` | The `clickhouse-local` executable; default `/usr/bin/clickhouse-local`. |
 
 Python dependencies are pinned in `requirements.txt` and, with hashes, in

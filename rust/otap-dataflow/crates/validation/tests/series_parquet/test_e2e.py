@@ -1,16 +1,19 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 """Real OTLP producer, df_engine process and Parquet reader."""
+import base64
 import collections
 import concurrent.futures
 import contextlib
 import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -18,8 +21,10 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree
 
 import boto3
 import duckdb
@@ -283,6 +288,8 @@ def engine_config(
     merge=None,
     grpc_host="127.0.0.1",
     processor=None,
+    extensions=None,
+    exporter_capabilities=None,
 ):
     """The complete configuration one engine launch serializes.
 
@@ -299,7 +306,9 @@ def engine_config(
     its own network namespace binds every address there, and reaches it
     through a port it publishes on host loopback. `topology="processed"`
     inserts `processor`, a complete node definition, between the receiver
-    and the exporter.
+    and the exporter. `extensions` declares the pipeline's extensions and
+    `exporter_capabilities` binds the exporter's capabilities to them, as
+    Azure storage needs for its bearer token.
     """
     if topology not in TOPOLOGIES:
         raise ValueError(f"topology must be one of {TOPOLOGIES}: {topology}")
@@ -324,6 +333,10 @@ def engine_config(
         if overrides:
             for key, value in overrides.items():
                 export[key] = value
+        if exporter_capabilities:
+            nodes["exporter"]["capabilities"] = dict(exporter_capabilities)
+    if extensions:
+        pipeline["extensions"] = dict(extensions)
     if log_level:
         # Set explicitly rather than through RUST_LOG, which the engine
         # only consults when the configuration omits a level: a test that
@@ -449,6 +462,9 @@ class Engine:
         merge=None,
         binary=None,
         processor=None,
+        extensions=None,
+        exporter_capabilities=None,
+        env=None,
     ):
         self.root = Path(directory)
         self.data = self.root / "data"
@@ -484,6 +500,8 @@ class Engine:
             merge=merge,
             grpc_host=bind_host,
             processor=processor,
+            extensions=extensions,
+            exporter_capabilities=exporter_capabilities,
         )
         self.edges = graph_edges(self.config)
         if self.edges != EXPECTED_EDGES[topology]:
@@ -514,7 +532,7 @@ class Engine:
                 f"{bind_host}:{self.admin_port}",
             ],
             self.log,
-            dict(os.environ),
+            {**os.environ, **(env or {})},
         )
         self.pid = self.launcher.pid(self.process)
         self.channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
@@ -1370,6 +1388,11 @@ IMAGE_DEFAULTS = {
     "rustfs": "rustfs/rustfs:1.0.0-rc.3",
     "clickhouse": "clickhouse/clickhouse-server:26.7.4",
     "alloy": "grafana/alloy:v1.19.2",
+    # Azurite 3.37.0, pinned by digest: its only tags are mutable.
+    "azurite": (
+        "mcr.microsoft.com/azure-storage/azurite@sha256:"
+        "830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
+    ),
 }
 
 
@@ -2333,6 +2356,272 @@ class DockerStore:
         self.remove()
 
 
+# Azurite, the Azure Storage emulator, serves this one account; the blob
+# service is addressed path style under it.
+AZURITE_ACCOUNT = "devstoreaccount1"
+AZURITE_API_VERSION = "2021-08-06"
+
+
+def azure_bearer_token(lifetime_s=3600):
+    """A well-formed, unsigned Entra ID access token for Azurite.
+
+    Azurite's `--oauth basic` decodes the token without checking a
+    signature, but requires `iat`, `nbf` and `exp` covering now, an issuer
+    under `https://sts.windows.net/` and the storage audience; anything else
+    is refused as unauthenticated.
+    """
+    def part(document):
+        raw = json.dumps(document, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    now = int(time.time())
+    claims = {
+        "aud": "https://storage.azure.com",
+        "iss": "https://sts.windows.net/00000000-0000-0000-0000-000000000000/",
+        "iat": now - 60,
+        "nbf": now - 60,
+        "exp": now + lifetime_s,
+    }
+    return part({"alg": "none", "typ": "JWT"}) + "." + part(claims) + ".c2lnbmF0dXJl"
+
+
+class TokenEndpoint:
+    """A loopback OAuth 2.0 token endpoint serving one static access token.
+
+    The engine's `oauth2_client_auth` extension acquires its token here with
+    the client credentials grant and publishes it through the
+    `bearer_token_provider` capability the Azure store requires. `grants`
+    records the grant type of every request served, so a test can show the
+    token path was used.
+    """
+
+    def __init__(self, token):
+        self.token = token
+        self.grants = []
+        endpoint = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+                endpoint.grants.append(form.get("grant_type", [""])[0])
+                body = json.dumps(
+                    {
+                        "access_token": endpoint.token,
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/token"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=10)
+
+
+class AzuriteStore:
+    """An Azurite blob service over HTTPS that accepts only bearer tokens.
+
+    Azurite runs with `--oauth basic` and a certificate for 127.0.0.1 from
+    a throwaway CA; the engine trusts that CA through `SSL_CERT_FILE`,
+    which the object store's native root loader reads. The engine obtains
+    its token from a `TokenEndpoint` through the `oauth2_client_auth`
+    extension, the only credential path Azure storage has.
+    """
+
+    def __init__(self):
+        self.name = "series-e2e-" + uuid.uuid4().hex
+        self.container = None
+        self.blob_container = "series-test"
+        self.token = azure_bearer_token()
+        self.certs = None
+
+    def make_certificate(self):
+        """A throwaway CA and the 127.0.0.1 server certificate it signs.
+
+        The engine's TLS stack refuses a CA certificate presented as the
+        server's own, so a single self-signed certificate is not enough: the
+        CA is what the engine trusts, and the leaf, marked `CA:FALSE` for
+        server authentication, is what Azurite serves.
+        """
+        if not shutil.which("openssl"):
+            unavailable("openssl is needed to issue the Azurite certificate")
+        self.certs = Path(tempfile.mkdtemp(prefix="series-azurite-"))
+
+        def openssl(*args):
+            subprocess.run(
+                ["openssl", *args], check=True, capture_output=True, timeout=60,
+                cwd=self.certs,
+            )
+
+        openssl(
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+            "-subj", "/CN=series-e2e-ca", "-keyout", "ca-key.pem", "-out", "ca.pem",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        )
+        openssl(
+            "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+            "-keyout", "key.pem", "-out", "server.csr",
+        )
+        (self.certs / "server.ext").write_text(
+            "basicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+            "subjectAltName=IP:127.0.0.1,DNS:localhost\n"
+            "subjectKeyIdentifier=hash\n"
+            "authorityKeyIdentifier=keyid,issuer\n"
+        )
+        openssl(
+            "x509", "-req", "-in", "server.csr", "-CA", "ca.pem",
+            "-CAkey", "ca-key.pem", "-CAcreateserial", "-days", "2",
+            "-extfile", "server.ext", "-out", "cert.pem",
+        )
+        # The container reads the server pair as its own user.
+        for name in ("key.pem", "cert.pem"):
+            (self.certs / name).chmod(0o644)
+        self.ca_file = str(self.certs / "ca.pem")
+        self.tls = ssl.create_default_context(cafile=self.ca_file)
+
+    def __enter__(self):
+        image = require_docker_image("azurite")
+        try:
+            self.make_certificate()
+            self.port = free_port()
+            done = subprocess.run(
+                [
+                    "docker", "run", "--pull=never", "--detach", "--name", self.name,
+                    "--publish", f"127.0.0.1:{self.port}:10000",
+                    "--volume", f"{self.certs / 'cert.pem'}:/certs/cert.pem:ro",
+                    "--volume", f"{self.certs / 'key.pem'}:/certs/key.pem:ro",
+                    image, "azurite-blob", "--blobHost", "0.0.0.0",
+                    "--oauth", "basic",
+                    "--cert", "/certs/cert.pem", "--key", "/certs/key.pem",
+                    "--skipApiVersionCheck",
+                ],
+                capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S,
+            )
+            if done.returncode:
+                raise AssertionError(f"docker run of azurite failed: {done.stderr.strip()}")
+            self.container = done.stdout.strip()
+            self.service = f"https://127.0.0.1:{self.port}/{AZURITE_ACCOUNT}"
+            self.ready()
+            status, body = self.request("PUT", f"/{self.blob_container}?restype=container")
+            if status != 201:
+                raise AssertionError(f"container creation returned {status}: {body}")
+            self.storage = {
+                "azure": {
+                    "base_uri": (
+                        f"https://{AZURITE_ACCOUNT}.blob.core.windows.net/"
+                        f"{self.blob_container}/otel"
+                    ),
+                    "endpoint": self.service,
+                }
+            }
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def request(self, method, path, token=True):
+        """One blob service call; the status and body, error statuses included."""
+        headers = {"x-ms-version": AZURITE_API_VERSION}
+        if token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(
+            self.service + path, method=method, headers=headers,
+            data=b"" if method == "PUT" else None,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10, context=self.tls) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
+
+    def ready(self):
+        """Block until Azurite answers an authenticated call, or fail with its log."""
+        deadline = time.monotonic() + 60
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                status, body = self.request("GET", "?comp=list")
+                if status == 200:
+                    return
+                last = f"status {status}: {body[:300]!r}"
+            except Exception as error:
+                last = error
+            time.sleep(0.2)
+        logs = subprocess.run(
+            ["docker", "logs", self.container], capture_output=True, text=True,
+            timeout=DOCKER_TIMEOUT_S,
+        )
+        raise AssertionError(
+            f"azurite never became ready: {last}\n{logs.stdout}{logs.stderr}"
+        )
+
+    def blob_names(self, prefix="otel/"):
+        """Every blob name under `prefix`, following the listing's markers."""
+        names = []
+        marker = ""
+        while True:
+            query = (
+                f"/{self.blob_container}?restype=container&comp=list"
+                f"&prefix={urllib.parse.quote(prefix)}"
+            )
+            if marker:
+                query += f"&marker={urllib.parse.quote(marker)}"
+            status, body = self.request("GET", query)
+            if status != 200:
+                raise AssertionError(f"blob listing returned {status}: {body[:300]!r}")
+            root = xml.etree.ElementTree.fromstring(body)
+            names.extend(node.text for node in root.iter("Name"))
+            marker = root.findtext("NextMarker") or ""
+            if not marker:
+                return names
+
+    def download(self, directory):
+        """Copy every completed Parquet object into a local directory."""
+        directory = Path(directory)
+        for name in self.blob_names():
+            if not name.endswith(".parquet"):
+                continue
+            path = "/" + self.blob_container + "/" + urllib.parse.quote(name)
+            status, body = self.request("GET", path)
+            if status != 200:
+                raise AssertionError(f"GET {name} returned {status}")
+            destination = directory / name.removeprefix("otel/")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(body)
+
+    def __exit__(self, *exc):
+        try:
+            subprocess.run(
+                ["docker", "rm", "--force", "--volumes", self.name],
+                check=False, capture_output=True, timeout=DOCKER_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        self.container = None
+        if self.certs is not None:
+            shutil.rmtree(self.certs, ignore_errors=True)
+
+
 # The frozen object layout of spec section 5.3. The writer id is matched
 # loosely because it is user configured and may itself contain a dash; the
 # boot id and sequence have fixed shapes, so the split stays unambiguous.
@@ -3073,6 +3362,118 @@ class DockerSlice(unittest.TestCase):
                     path.name,
                 )
             self.assertEqual(len(blocks), 1, f"two blocks were written: {blocks}")
+
+
+# The extension instance that serves the Azure store its bearer token.
+AZURE_TOKEN_EXTENSION = "azure_token"
+
+
+def require_azure_engine(config):
+    """Skip, or fail under SERIES_REQUIRE_DOCKER, when the engine binary
+    cannot run Azure storage with the OAuth 2.0 token extension.
+
+    The configuration is validated by the binary itself; only a refusal
+    that names the missing `azure` variant or the unregistered extension
+    means the build lacks the features. Any other refusal is a failure.
+    """
+    binary = Path(os.environ.get("DF_ENGINE", WORKSPACE / "target/debug/df_engine"))
+    if not binary.is_file():
+        raise AssertionError(f"build the feature-enabled engine first: {binary}")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "pipeline.yaml"
+        path.write_text(yaml.safe_dump(config))
+        done = subprocess.run(
+            [str(binary), "--config", str(path), "--validate-and-exit"],
+            capture_output=True, text=True, timeout=60,
+        )
+    output = done.stdout + done.stderr
+    if done.returncode == 0:
+        return
+    if "unknown variant `azure`" in output or (
+        "oauth2_client_auth" in output and "Unknown extension" in output
+    ):
+        unavailable(
+            "the engine was built without the azure and oauth2-client-auth "
+            f"features: {binary}"
+        )
+    raise AssertionError(f"the Azure configuration was refused:\n{output}")
+
+
+class AzureSlice(unittest.TestCase):
+    """The exporter on Azure Blob Storage, as emulated by Azurite."""
+
+    # Scenario: logs and metrics requests reach the engine, whose exporter
+    # writes to Azurite over HTTPS with a bearer token that the
+    # oauth2_client_auth extension acquires from a loopback token endpoint
+    # and the Azure store takes through the bearer_token_provider capability.
+    # Guarantees: Azurite refuses an unauthenticated call, so the writes went
+    # through the token path; every acknowledged log record and metric point
+    # is stored exactly once, and DuckDB and ClickHouse read the same rows
+    # through the latest-descriptor join.
+    def test_azurite_stores_every_acknowledged_record(self):
+        require_clickhouse()
+        with AzuriteStore() as store, TokenEndpoint(store.token) as tokens, \
+                tempfile.TemporaryDirectory() as directory:
+            status, _ = store.request("GET", "?comp=list", token=False)
+            self.assertIn(status, (401, 403), "Azurite accepted an anonymous call")
+            extensions = {
+                AZURE_TOKEN_EXTENSION: {
+                    "type": "urn:otel:extension:oauth2_client_auth",
+                    "config": {
+                        "token_url": tokens.url,
+                        "client_id": "series-e2e",
+                        "client_secret": "series-e2e-secret",
+                        "scopes": ["https://storage.azure.com/.default"],
+                    },
+                }
+            }
+            capabilities = {"bearer_token_provider": AZURE_TOKEN_EXTENSION}
+            overrides = {"retry": S3_RETRY}
+            require_azure_engine(
+                engine_config(
+                    grpc_port=free_port(),
+                    data=Path(directory) / "data",
+                    storage=store.storage,
+                    overrides=overrides,
+                    extensions=extensions,
+                    exporter_capabilities=capabilities,
+                )
+            )
+            log_ids = [f"azure-log-{i}" for i in range(12)]
+            metric_ids = [f"azure-metric-{i}" for i in range(6)]
+            with Engine(
+                directory,
+                storage=store.storage,
+                overrides=overrides,
+                extensions=extensions,
+                exporter_capabilities=capabilities,
+                env={"SSL_CERT_FILE": store.ca_file},
+            ) as engine:
+                try:
+                    metrics = metrics_rpc.MetricsServiceStub(engine.channel)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                        results = [
+                            pool.submit(engine.logs.Export, log_request(item), timeout=60)
+                            for item in log_ids
+                        ] + [
+                            pool.submit(metrics.Export, metric_request(item), timeout=60)
+                            for item in metric_ids
+                        ]
+                        # Every request is acknowledged; a refusal raises here.
+                        for result in results:
+                            result.result(timeout=65)
+                    engine.shutdown()
+                except Exception:
+                    print(engine.engine_log())
+                    raise
+            self.assertTrue(tokens.grants, "the engine acquired no token")
+            self.assertEqual(set(tokens.grants), {"client_credentials"})
+            downloaded = Path(directory) / "downloaded"
+            store.download(downloaded)
+            verify_files(self, downloaded, log_ids, len(metric_ids))
+            verify_readers(
+                self, downloaded, log_ids, len(metric_ids), metric_ids=metric_ids
+            )
 
 
 class RestartSlice(unittest.TestCase):
