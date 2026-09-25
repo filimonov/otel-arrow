@@ -1000,9 +1000,12 @@ read-back requires every line of every producer once (DuckDB, with
 clickhouse-local's count and sequence sum per producer and the
 latest-descriptor join), no Alloy enqueue or send failure and no "Dropping
 data" line, no buffer loss or permanent rejection, and incomplete uploads at
-most `flush.abort_failures`. Duplicates must be zero except after a SIGKILL
-(in-flight exports, the last 100 ms of WAL acknowledgements and one block
-whose acknowledgement was not yet persisted) and after an Alloy restart (the
+most `flush.abort_failures`, all counters summed over every engine boot.
+Duplicates are charged to their fault event and producer (an engine SIGKILL
+owns the runs whose latest copy is in the boot it started) and must be zero
+except, per event and producer, after a SIGKILL (the producer's in-flight
+exports, 100 ms of WAL acknowledgements and one window of its input, whose
+block acknowledgement may not be persisted) and after an Alloy restart (the
 10 s position sync, plus the queue after a SIGKILL). Freshness is line
 written to values object first listed (2 s listing), with the store's
 LastModified beside it; ack latency is Alloy's
