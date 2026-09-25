@@ -2122,6 +2122,11 @@ def probe_xt_bpf(rig) -> dict:
         f"packets; a signed PUT succeeded after the rule was deleted"))
 
 
+def captured_nothing(stderr) -> bool:
+    """Whether tcpdump's summary says it wrote no packet (a count of exactly 0)."""
+    return re.search(r"(?m)^0 packets captured$", stderr or "") is not None
+
+
 def probe_capture(rig) -> dict:
     """tcpdump captures a signed transfer's store traffic and tshark reads it."""
     probe = new_probe("capture", rig)
@@ -2142,7 +2147,7 @@ def probe_capture(rig) -> dict:
         _record(probe, command)
     if not (counts.get("packets") or 0) > 0:
         problems.append(f"tshark read no packets: {counts.get('packets')}")
-    if "0 packets captured" in capture.stderr:
+    if captured_nothing(capture.stderr):
         problems.append("tcpdump wrote no packet it received")
     if counts.get("retransmissions") is None:
         problems.append("tshark could not evaluate tcp.analysis.retransmission")

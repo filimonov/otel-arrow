@@ -2067,6 +2067,13 @@ class NetworkCaseContracts(unittest.TestCase):
         self.assertEqual(faults.pcap_count(rig, "/artifacts/x.pcap"), 5000)
         self.assertGreater(5000 * 4, faults.OUTPUT_LIMIT)
 
+    # Scenario: tcpdump's summary reports 0, 100 or 30 captured packets.
+    # Guarantees: only an exact count of zero means nothing was written.
+    def test_only_a_zero_count_is_an_empty_capture(self):
+        self.assertTrue(faults.captured_nothing("x\n0 packets captured\n0 packets dropped"))
+        for count in (100, 30, 10):
+            self.assertFalse(faults.captured_nothing(f"x\n{count} packets captured\n"))
+
     # Scenario: the multipart completion cases pick their input.
     # Guarantees: only request 0 is a metrics request, so a block's frozen
     # objects are its logs files; the other cases keep the mixed input.
