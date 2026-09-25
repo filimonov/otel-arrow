@@ -1444,6 +1444,39 @@ ALLOY_ATTEMPT_TIMEOUT = "6s"
 # config's file-backed sending queue needs.
 ALLOY_REFERENCE_CONFIG = "configs/series-parquet.alloy"
 ALLOY_PRODUCER_ID = "alloy-producer"
+# The fixture's site values: the file the tests append to, as mounted in the
+# container, and the service name of its lines.
+ALLOY_LOG_PATH = "/input/events.log"
+ALLOY_SERVICE_NAME = "series-e2e-service"
+# The attribute the read-back finds every Alloy row by; the shipped configs
+# carry no such attribute, so the fixture inserts it.
+ALLOY_SOURCE = ("e2e.source", "alloy-file")
+
+
+def e2e_alloy_config(text):
+    """A shipped River config with the fixture's `e2e.source` stage between
+    its transform and its batch."""
+    route = "logs = [otelcol.processor.batch.series.input]"
+    if text.count(route) != 1:
+        raise AssertionError("the River config no longer routes transform -> batch -> exporter")
+    key, value = ALLOY_SOURCE
+    transform_output = text.index(route)
+    return (
+        text[:transform_output] + "logs = [otelcol.processor.attributes.e2e.input]"
+        + text[transform_output + len(route):]
+        + f"""
+otelcol.processor.attributes "e2e" {{
+  action {{
+    key = "{key}"
+    value = "{value}"
+    action = "insert"
+  }}
+  output {{
+    {route}
+  }}
+}}
+"""
+    )
 ALLOY_STABILITY_LEVEL = "public-preview"
 
 
@@ -1452,10 +1485,11 @@ class AlloyProducer:
 
     The container runs on the host network so that it can reach a receiver
     bound to loopback, and the reference River config the repository ships is
-    the one it runs: the test exercises the documented deployment rather than
-    a fixture of its own. Only the attempt timeout and the producer id are
-    set, through the `SERIES_ALLOY_TIMEOUT` and `SERIES_PRODUCER_ID` variables
-    the config itself reads, so that the test owns the values its timing and
+    the one it runs, with one stage added (`e2e_alloy_config`) that marks its
+    rows: the test exercises the documented deployment rather than a fixture
+    of its own. The site values are set through the variables the config
+    reads (`SERIES_LOG_PATH`, `SERIES_SERVICE_NAME`, `SERIES_PRODUCER_ID`,
+    `SERIES_ALLOY_TIMEOUT`), so that the test owns the values its timing and
     its read-back depend on.
     """
 
@@ -1482,7 +1516,7 @@ class AlloyProducer:
         self.lines = self.root / "events.log"
         self.lines.write_text("")
         config = self.root / "config.alloy"
-        config.write_text(self.config.read_text())
+        config.write_text(e2e_alloy_config(self.config.read_text()))
         port = self.admin_port or free_port()
         self.admin_port = port
         args = [
@@ -1492,6 +1526,8 @@ class AlloyProducer:
             "-e", f"OTLP_ENDPOINT=127.0.0.1:{self.engine.grpc_port}",
             "-e", f"SERIES_ALLOY_TIMEOUT={self.timeout}",
             "-e", f"SERIES_PRODUCER_ID={self.producer_id}",
+            "-e", f"SERIES_LOG_PATH={ALLOY_LOG_PATH}",
+            "-e", f"SERIES_SERVICE_NAME={ALLOY_SERVICE_NAME}",
             image, "run", f"--stability.level={ALLOY_STABILITY_LEVEL}",
             "--storage.path=/tmp/alloy-state",
             f"--server.http.listen-addr=127.0.0.1:{port}", "/input/config.alloy",

@@ -907,13 +907,16 @@ and runs both stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
 
 [`configs/series-parquet.alloy`](../../../../configs/series-parquet.alloy),
 the producer of the buffered reference deployment, is shared by the normal and
-the outage tests: it tails `/input/events.log` and exports to `OTLP_ENDPOINT`,
+the outage tests: it tails `SERIES_LOG_PATH` and exports to `OTLP_ENDPOINT`,
 the engine's `127.0.0.1:<grpc_port>`. Its transform stage sets the resource
 attributes the Loki bridge does not supply: `host.id`, named by
 `producer_id_attribute`, from `SERIES_PRODUCER_ID` or the hostname, and
-`service.name`, which feeds the denormalized service column; an attributes
-stage inserts `e2e.source`. `AlloyProducer` sets `SERIES_PRODUCER_ID` to
-`alloy-producer`; each real producer needs its own value (series-lake README,
+`service.name` from `SERIES_SERVICE_NAME`, which feeds the denormalized service
+column. The shipped files carry no fixture value: `AlloyProducer` sets
+`SERIES_LOG_PATH=/input/events.log`, `SERIES_SERVICE_NAME=series-e2e-service`
+and `SERIES_PRODUCER_ID=alloy-producer`, and `e2e_alloy_config` adds the one
+stage the read-back needs, which inserts `e2e.source` between the transform and
+the batch. Each real producer needs its own producer id (series-lake README,
 "Producer id contract"). Its sending queue is file-backed, so Alloy runs with
 `--stability.level=public-preview`.
 

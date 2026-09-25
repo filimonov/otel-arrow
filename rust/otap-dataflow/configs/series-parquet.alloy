@@ -8,8 +8,14 @@
 // The storage path keeps the file positions and the sending queue across a
 // restart; the flag enables the queue's file storage. The strict variant is
 // `series-parquet-strict.alloy`.
+//
+// Site values come from the environment: SERIES_LOG_PATH is the file to tail
+// (default /var/log/app/app.log), SERIES_SERVICE_NAME the service.name of its
+// lines (default unknown_service), SERIES_PRODUCER_ID the producer id, unique
+// per producer (default the hostname), and OTLP_ENDPOINT the engine's
+// receiver.
 loki.source.file "series" {
-  targets = [{ __path__ = "/input/events.log", job = "series-e2e" }]
+  targets = [{ __path__ = coalesce(sys.env("SERIES_LOG_PATH"), "/var/log/app/app.log") }]
   forward_to = [loki.process.series.receiver]
   tail_from_end = false
 }
@@ -46,19 +52,9 @@ otelcol.processor.transform "series" {
     statements = [
       string.format(`set(attributes["host.id"], %q)`,
         coalesce(sys.env("SERIES_PRODUCER_ID"), constants.hostname)),
-      `set(attributes["service.name"], "series-e2e-service")`,
+      string.format(`set(attributes["service.name"], %q)`,
+        coalesce(sys.env("SERIES_SERVICE_NAME"), "unknown_service")),
     ]
-  }
-  output {
-    logs = [otelcol.processor.attributes.series.input]
-  }
-}
-
-otelcol.processor.attributes "series" {
-  action {
-    key = "e2e.source"
-    value = "alloy-file"
-    action = "insert"
   }
   output {
     logs = [otelcol.processor.batch.series.input]

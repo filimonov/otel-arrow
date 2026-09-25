@@ -418,8 +418,11 @@ setting of both files carries its reason in a comment.
 
 Run Alloy with `--stability.level=public-preview` (the file-backed sending
 queue) and `--storage.path` on a persistent volume: it holds the file
-positions and the queue across a restart. Set `SERIES_PRODUCER_ID` to a value
-unique per producer, or leave it unset to use the hostname.
+positions and the queue across a restart. The files read their site values
+from the environment: `SERIES_LOG_PATH` (the file to tail), `SERIES_SERVICE_NAME`
+(the `service.name` of its lines), `OTLP_ENDPOINT` (the engine's receiver) and
+`SERIES_PRODUCER_ID`, a value unique per producer, or unset to use the
+hostname.
 
 ### Sizing
 

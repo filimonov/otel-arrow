@@ -285,6 +285,7 @@ class AlloyInstance:
             "--mount", f"type=bind,src={self.state.resolve()},dst=/state",
             "-e", f"OTLP_ENDPOINT=127.0.0.1:{self.grpc_port}",
             "-e", f"SERIES_PRODUCER_ID={producer_id(self.index)}",
+            "-e", f"SERIES_LOG_PATH={test_e2e.ALLOY_LOG_PATH}",
             image, "run", f"--stability.level={test_e2e.ALLOY_STABILITY_LEVEL}",
             "--storage.path=/state", f"--server.http.listen-addr=127.0.0.1:{self.port}",
             "/input/config.alloy",

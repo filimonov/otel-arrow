@@ -144,6 +144,36 @@ class ReferenceDeploymentContracts(unittest.TestCase):
         self.assertEqual(settings["timeout"], "10s")
         self.assertTrue(settings["persistent_queue"])
 
+    # Scenario: both shipped River configs are read as an operator copies them.
+    # Guarantees: neither carries a fixture value (the `e2e.source` attribute,
+    # the `series-e2e` job or service, the test's `/input/` path, a constant
+    # `host.id`); the log path, service name and producer id come from the
+    # environment.
+    def test_shipped_river_configs_carry_no_fixture_values(self):
+        for name in RIVER_CONFIGS:
+            text = (ref.test_e2e.WORKSPACE / name).read_text()
+            for fixture in ("e2e.source", "series-e2e", "/input/", "alloy-producer"):
+                self.assertNotIn(fixture, text, name)
+            for variable in ("SERIES_LOG_PATH", "SERIES_SERVICE_NAME", "SERIES_PRODUCER_ID"):
+                self.assertIn(f'sys.env("{variable}")', text, name)
+
+    # Scenario: the E2E overlay is applied to both shipped River configs.
+    # Guarantees: exactly one `e2e.source` stage is inserted, fed by the
+    # transform and feeding the batch, so the read-back finds every Alloy row.
+    def test_the_e2e_overlay_inserts_the_source_stage(self):
+        for name in RIVER_CONFIGS:
+            text = ref.test_e2e.e2e_alloy_config(
+                (ref.test_e2e.WORKSPACE / name).read_text())
+            self.assertEqual(text.count('key = "e2e.source"'), 1, name)
+            transform = text.index('otelcol.processor.transform "series"')
+            stage = text.index('otelcol.processor.attributes "e2e"')
+            self.assertIn("logs = [otelcol.processor.attributes.e2e.input]",
+                          text[transform:stage])
+            self.assertIn("logs = [otelcol.processor.batch.series.input]", text[stage:])
+
+
+RIVER_CONFIGS = ("configs/series-parquet.alloy", "configs/series-parquet-strict.alloy")
+
 
 if __name__ == "__main__":
     unittest.main()
