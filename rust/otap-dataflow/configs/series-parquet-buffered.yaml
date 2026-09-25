@@ -67,7 +67,7 @@ groups:
             config:
               # Its own fast device: it writes about twice the ingest bytes (WAL entry plus segment).
               path: /var/lib/otap/series-wal
-              # Disk for rate x outage tolerance x 2 (README, "Deploying with Alloy"); divided between cores.
+              # Steady ingest x (window + flush), 0.3GB at 40k lines/s, plus 1x ingest per second of outage: 34min at 40k/s; divided between cores.
               retention_size_cap: 32GiB
               # A full WAL refuses new requests with UNAVAILABLE; producers retry and keep their data.
               size_cap_policy: backpressure
