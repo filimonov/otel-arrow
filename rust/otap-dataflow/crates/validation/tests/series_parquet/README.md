@@ -905,24 +905,31 @@ and runs both stores and both readers with `SERIES_REQUIRE_DOCKER=1`.
 ### The Alloy producer
 
 [`configs/series-parquet.alloy`](../../../../configs/series-parquet.alloy),
-shared by the normal and the outage tests, tails `/input/events.log` and
-exports to `OTLP_ENDPOINT`, the engine's `127.0.0.1:<grpc_port>`. Its
-transform stage sets the resource attributes the Loki bridge does not supply:
-`host.id`, named by `producer_id_attribute`, and `service.name`, which feeds
-the denormalized service column; an attributes stage inserts `e2e.source`.
-The fixture is one producer, so it sets a constant `host.id`; each real
-producer needs its own value (series-lake README, "Producer id contract").
+the producer of the buffered reference deployment, is shared by the normal and
+the outage tests: it tails `/input/events.log` and exports to `OTLP_ENDPOINT`,
+the engine's `127.0.0.1:<grpc_port>`. Its transform stage sets the resource
+attributes the Loki bridge does not supply: `host.id`, named by
+`producer_id_attribute`, from `SERIES_PRODUCER_ID` or the hostname, and
+`service.name`, which feeds the denormalized service column; an attributes
+stage inserts `e2e.source`. `AlloyProducer` sets `SERIES_PRODUCER_ID` to
+`alloy-producer`; each real producer needs its own value (series-lake README,
+"Producer id contract"). Its sending queue is file-backed, so Alloy runs with
+`--stability.level=public-preview`.
 
-The shipped attempt timeout of 180s is the exporter README's attempt-timeout
-rule applied to a 15s window and a 60s flush deadline. The tests run a
-one-second window and set 6s through `SERIES_ALLOY_TIMEOUT`, which the config
-reads, so an expired attempt is visible inside their own waits. Most tests
-write 12 lines, far below `send_batch_size`, so the batch processor releases
-them on its 5s `timeout`; `DockerSlice.test_alloy_batch_above_4mib_is_stored`
-writes one full batch of 4000 lines of 1100 bytes, one export above 4MiB.
+The tests run a one-second window against the strict engine and set a 6s
+attempt timeout through `SERIES_ALLOY_TIMEOUT`, which the config reads, so an
+expired attempt is visible inside their own waits. Most tests write 12 lines,
+far below `send_batch_size`, so the batch processor releases them on its 5s
+`timeout`; `DockerSlice.test_alloy_batch_above_4mib_is_stored` writes one full
+batch of 4000 lines of 1100 bytes, one export above 4MiB.
 
-The producer settings were measured against `grafana/alloy:v1.19.2` with a
-server that holds each export for a fixed time, as the exporter does. A
+[`configs/series-parquet-strict.alloy`](../../../../configs/series-parquet-strict.alloy)
+is the producer of the strict deployment, which the capacity family's `alloy`
+step runs. Its 180s attempt timeout is the exporter README's attempt-timeout
+rule applied to a 15s window and a 60s flush deadline.
+
+The strict producer's settings were measured against `grafana/alloy:v1.19.2`
+with a server that holds each export for a fixed time, as the exporter does. A
 producer holding one export per window sustains at most
 
 ```text
@@ -957,6 +964,48 @@ discards, and the tailer reads on, so the file source sets
 completes, retries included. The engine's `max_concurrent_requests` must be
 at least the sum of `num_consumers` over its producers, or exports queue at
 the receiver with no signal from the exporter; the local example sets 128.
+
+### Validating the reference deployment
+
+`reference_deployment.py` runs `configs/series-parquet-buffered.yaml` and
+`configs/series-parquet.alloy` as shipped; only the site values are replaced,
+and each result lists them with their shipped values (`site_substitutions`):
+the worker core, the listen address, the WAL path and the store endpoint.
+Eight Alloy containers on CPUs `8-15,24-31` each tail a file that one feeder
+process appends 5000 lines/s to (`p<NN> <12-digit seq> x...`, 100 bytes), so
+40k lines/s reach one worker on core 2 (engine process on `0-3,16-19`, store on
+`4-7,20-23`). Each case holds the host lease, then:
+
+```bash
+python3 -m crates.validation.tests.series_parquet.reference_deployment \
+  --case healthy --store minio
+```
+
+- `healthy` (180 s) and `soak` (1800 s) apply no fault;
+- `s3_outage` stops the store for 150 s; `wal_full` also sets the WAL cap to
+  1GiB (about three times its steady size at this rate) and keeps the store
+  down 90 s past the first refusal;
+- `engine_restart` sends SIGTERM and starts a new engine on the same ports and
+  WAL; `engine_kill` does the same twice with SIGKILL;
+- `alloy_restart` stops (`docker stop --time 10`) and starts every Alloy
+  container, whose storage path is a bind mount.
+
+After the input stops, the case waits until every Alloy has sent its file and
+the buffer and exporter hold nothing, then stops the engine with SIGTERM. The
+read-back requires every line of every producer once (DuckDB, with
+clickhouse-local's count and sequence sum per producer and the
+latest-descriptor join), no Alloy enqueue or send failure and no "Dropping
+data" line, no buffer loss or permanent rejection, and incomplete uploads at
+most `flush.abort_failures`. Duplicates must be zero except after a SIGKILL
+(in-flight exports, the last 100 ms of WAL acknowledgements and one block
+whose acknowledgement was not yet persisted) and after an Alloy restart (the
+10 s position sync). Freshness is line written to values object first listed
+(2 s listing), with the store's LastModified beside it; ack latency is Alloy's
+`rpc_client_call_duration_seconds` histogram. Results are published as
+`reference-alloy-<case>-<store>.json`; raw logs and samples go to
+`.measurement-artifacts/reference-alloy/` of the main checkout. Options:
+`baseline_s`, `measure_s`, `outage_s`, `full_s`, `after_s`, `kills`,
+`producers`, `rate`, `lease_wait_s`, `archive_dir`, `report_dir`.
 
 ## Environment variables
 
