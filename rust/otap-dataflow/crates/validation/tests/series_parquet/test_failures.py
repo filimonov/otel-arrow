@@ -1156,6 +1156,32 @@ class FaultCaseContracts(unittest.TestCase):
         self.assertEqual(faults.failed_block_objects(events, objects),
                          {"p-5.parquet": [objects[0]["key"]]})
 
+    # Scenario: during an outage a flush failed 59.5 s after the stop and the
+    # timer has since passed the 60 s flush deadline.
+    # Guarantees: the outage condition needs a deadline-class failure whose
+    # own logged time is at least the flush deadline after the stop; the
+    # timer and a failure count are not enough.
+    def test_outage_condition_needs_a_failure_after_the_deadline(self):
+        case = mock.Mock(flush_deadline_s=60.0)
+        seen = {"elapsed_s": 61.0, "flush_failures_count": 1, "storage_nacks_count": 100,
+                "retried": True, "deadline_failures_after_deadline": []}
+        self.assertFalse(faults.FAULT_CONDITIONS["store_outage"](case, seen))
+        log = temporary_directory(self) / "engine.log"
+        log.write_text(
+            '{"jemalloc":{}}2026-09-24T23:09:10.018Z  ERROR otel.exporter.series_parquet::'
+            "series_parquet.flush.failed: [window_start=1790291285, seq=4, file=p-4.parquet, "
+            "requests=100, error_type=deadline, error=x]\n"
+            "2026-09-24T23:09:15.000Z  ERROR otel.exporter.series_parquet::"
+            "series_parquet.flush.failed: [window_start=1790291290, seq=5, file=p-5.par")
+        tail = faults.LogTail(log)
+        failures = faults.flush_failures(tail.lines())
+        self.assertEqual(failures, [{"unix_s": 1790291350.018, "error_type": "deadline",
+                                     "window_start_unix_s": 1790291285, "file": "p-4.parquet"}])
+        with log.open("a") as handle:
+            handle.write("quet, error_type=deadline]\n")
+        self.assertEqual([entry["file"] for entry in faults.flush_failures(tail.lines())],
+                         ["p-5.parquet"])
+
     # Scenario: each fault's intended condition is judged from partial evidence.
     # Guarantees: a 503 or an outage counts only with the exporter's nack and
     # its retry (an outage also past the flush deadline), and slow storage
@@ -1166,11 +1192,9 @@ class FaultCaseContracts(unittest.TestCase):
                 "storage_nacks_count": 1, "retried": True}
         self.assertTrue(faults.FAULT_CONDITIONS["http503"](case, seen))
         self.assertFalse(faults.FAULT_CONDITIONS["http503"](case, dict(seen, retried=False)))
-        outage = {"elapsed_s": 61.0, "flush_failures_count": 1, "storage_nacks_count": 1,
-                  "retried": True}
+        outage = {"elapsed_s": 65.0, "flush_failures_count": 1, "storage_nacks_count": 1,
+                  "retried": True, "deadline_failures_after_deadline": [64.6]}
         self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, outage))
-        self.assertFalse(faults.FAULT_CONDITIONS["store_outage"](case, dict(outage,
-                                                                           elapsed_s=59.0)))
         slow = {"delayed_requests_count": 1, "throttled_uploads_count": 1,
                 "flushing_with_work_samples_count": 3, "admission_closed_s": 5.5,
                 "receiver_rejections_count": 0, "buffer_in_flight_plateau": False}

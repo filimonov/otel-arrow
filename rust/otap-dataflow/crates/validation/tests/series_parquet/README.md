@@ -596,7 +596,8 @@ and the evidence that entered it (`observations.fault.states`):
    - `http503`: a PUT or POST NGINX answered 503, an exporter retry, a
      storage nack, and its retry (strict: the producer received the storage
      sentence; buffered: the buffer scheduled a retry);
-   - `store_outage`: a flush failure at least the flush deadline after the
+   - `store_outage`: a `series_parquet.flush.failed` event of class
+     `deadline` whose logged time is at least the flush deadline after the
      stop, a storage nack and its retry.
 3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket through
    the route), `resumed` (a values file written and a request acknowledged

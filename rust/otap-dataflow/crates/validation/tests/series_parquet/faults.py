@@ -2743,11 +2743,61 @@ EVENT_LINE = re.compile(
     r"\b(TRACE|DEBUG|INFO|WARN|ERROR)\s+\S*?(series_parquet\.[a-z_.]+): ([^\[]*)\[(.*)\]")
 
 
+LOG_TIMESTAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)Z")
+
+
+def flush_failures(lines) -> list:
+    """Every `flush.failed` event in engine log lines: its time, class, window and file."""
+    found = []
+    for line in lines:
+        line = ANSI.sub("", line)
+        match = EVENT_LINE.search(line)
+        stamp = LOG_TIMESTAMP.search(line)
+        if not match or not stamp or match[2] != "series_parquet.flush.failed":
+            continue
+        fields = match[4]
+        error_type = re.search(r"\berror_type=(\w+)", fields)
+        window = re.search(r"\bwindow_start=(\d+)", fields)
+        file = re.search(r"\bfile=([^,\s\]]+)", fields)
+        found.append({
+            "unix_s": datetime.datetime.fromisoformat(stamp[1]).replace(
+                tzinfo=datetime.timezone.utc).timestamp(),
+            "error_type": error_type[1] if error_type else None,
+            "window_start_unix_s": int(window[1]) if window else None,
+            "file": file[1] if file else None,
+        })
+    return found
+
+
+class LogTail:
+    """The complete lines appended to a log since the last read."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.offset = 0
+        self.partial = b""
+
+    def lines(self) -> list:
+        """The complete lines written since the previous call."""
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                data = handle.read()
+        except OSError:
+            return []
+        self.offset += len(data)
+        data = self.partial + data
+        complete, _, self.partial = data.rpartition(b"\n")
+        return complete.decode(errors="replace").splitlines() if complete else []
+
+
 def engine_events(log_text) -> dict:
     """The exporter's flush, request and upload events, counted by name and outcome.
 
-    `failed_files` names the block file of every `flush.failed` event and
-    `cleanup_files` that of every `flush.cleanup` event, by outcome.
+    `failed_files` names the block file of every `flush.failed` event,
+    `flush_failures` gives each one's time, class and window, and
+    `cleanup_files` names the block file of every `flush.cleanup` event, by
+    outcome.
     """
     counts = collections.Counter()
     samples = collections.defaultdict(list)
@@ -2772,7 +2822,8 @@ def engine_events(log_text) -> dict:
         elif file and name == "series_parquet.flush.cleanup":
             cleanup[outcome[1] if outcome else "unknown"].append(file[1])
     return {"counts": dict(sorted(counts.items())), "samples": dict(sorted(samples.items())),
-            "failed_files": failed, "cleanup_files": dict(sorted(cleanup.items()))}
+            "failed_files": failed, "flush_failures": flush_failures(log_text.splitlines()),
+            "cleanup_files": dict(sorted(cleanup.items()))}
 
 
 def failed_block_objects(events, objects) -> dict:
@@ -3051,6 +3102,8 @@ class FaultCase:
         self.flush_deadline_s = duration_s(settings["window"]["flush_retry_deadline"])
         self.states = []
         self.problems = []
+        self.log = LogTail(engine.log.name) if engine is not None else None
+        self.failures = []
 
     def transition(self, state, evidence=None):
         """Enter `state`, recording when and why."""
@@ -3110,6 +3163,13 @@ class FaultCase:
             "http_503_writes_count": sum(1 for entry in requests if entry.get("status") == "503"
                                          and entry.get("method") in ("PUT", "POST")),
         }
+        if self.fault == "store_outage":
+            if self.log is not None:
+                self.failures.extend(flush_failures(self.log.lines()))
+            observed["deadline_failures_after_deadline"] = [
+                round(entry["unix_s"] - armed["unix_s"], 3) for entry in self.failures
+                if entry["error_type"] == "deadline"
+                and entry["unix_s"] >= armed["unix_s"] + self.flush_deadline_s]
         if self.fault == "slow":
             totals = [flat_totals(sample) for sample in self.samples_since(armed["monotonic_ns"])]
             # Only requests that started under the fault show its delay.
@@ -3288,8 +3348,9 @@ def _http503_met(case, seen) -> bool:
 
 
 def _outage_met(case, seen) -> bool:
-    """Outage: a flush failed past the flush deadline, was nacked, and the nack retried."""
-    return (seen["elapsed_s"] >= case.flush_deadline_s and seen["flush_failures_count"] > 0
+    """Outage: a deadline-class flush failure logged at least the flush deadline
+    after the store stopped, a storage nack, and its retry."""
+    return (bool(seen["deadline_failures_after_deadline"]) and seen["flush_failures_count"] > 0
             and seen["storage_nacks_count"] > 0 and seen["retried"])
 
 
