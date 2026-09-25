@@ -444,6 +444,14 @@ fn encoded_column_len<O: arrow::array::OffsetSizeTrait>(
         .sum()
 }
 
+/// The part of [`merge_key_bound`] that does not depend on the key values:
+/// offsets, key segments and merge heap entries for `rows` rows.
+fn merge_key_overhead(rows: usize) -> usize {
+    let segment = size_of::<Rows>() + size_of::<usize>();
+    rows * (size_of::<usize>() + (2 * segment).div_ceil(MIN_KEY_SLICE_ROWS))
+        + 2 * (segment + size_of::<HeapItem>())
+}
+
 /// Upper bound on the heap a table's merge keeps for the sort keys of
 /// `batch`'s rows, the batch being one of the table's runs or part of one;
 /// [`MergeIter::resident_key_bytes`] is what it bounds.
@@ -463,9 +471,7 @@ pub fn merge_key_bound(batch: &RecordBatch, spec: &SortSpec) -> Result<usize> {
     if spec.is_empty() || rows == 0 {
         return Ok(0);
     }
-    let segment = size_of::<Rows>() + size_of::<usize>();
-    let mut bytes = rows * (size_of::<usize>() + (2 * segment).div_ceil(MIN_KEY_SLICE_ROWS))
-        + 2 * (segment + size_of::<HeapItem>());
+    let mut bytes = merge_key_overhead(rows);
     for key in &spec.keys {
         let Some(column) = batch.column_by_name(&key.column) else {
             continue;
@@ -2147,6 +2153,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Scenario: one-row key columns of every type `merge_key_supported` names: fixed-width
+    /// primitives, boolean and fixed-size binary with a value and a null, and strings and
+    /// binaries of 0, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65 and 300 bytes and null.
+    /// Guarantees: the encoded key size `merge_key_bound` computes is exactly the row length
+    /// Arrow's row converter produces, so any change of the row format fails here.
+    #[test]
+    fn merge_key_bound_matches_the_row_format_exactly() {
+        use arrow::array::{
+            BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+            DurationMicrosecondArray, FixedSizeBinaryArray, Float32Array, Int8Array, Int16Array,
+            Int32Array, LargeBinaryArray, LargeStringArray, Time64MicrosecondArray,
+            TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        };
+        let lengths = [0usize, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 300];
+        let text: Vec<Option<String>> = lengths
+            .iter()
+            .map(|&n| Some("x".repeat(n)))
+            .chain([None])
+            .collect();
+        let bytes: Vec<Option<Vec<u8>>> = lengths
+            .iter()
+            .map(|&n| Some(vec![7u8; n]))
+            .chain([None])
+            .collect();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![Some(1), None])),
+            Arc::new(Int16Array::from(vec![Some(1), None])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(Int64Array::from(vec![Some(1), None])),
+            Arc::new(UInt8Array::from(vec![Some(1), None])),
+            Arc::new(UInt16Array::from(vec![Some(1), None])),
+            Arc::new(UInt32Array::from(vec![Some(1), None])),
+            Arc::new(UInt64Array::from(vec![Some(1), None])),
+            Arc::new(Float32Array::from(vec![Some(1.5), None])),
+            Arc::new(Float64Array::from(vec![Some(1.5), None])),
+            Arc::new(Date32Array::from(vec![Some(1), None])),
+            Arc::new(Date64Array::from(vec![Some(1), None])),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]).with_timezone("UTC")),
+            Arc::new(Time64MicrosecondArray::from(vec![Some(1), None])),
+            Arc::new(DurationMicrosecondArray::from(vec![Some(1), None])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(1), None])
+                    .with_precision_and_scale(38, 2)
+                    .expect("decimal"),
+            ),
+            Arc::new(BooleanArray::from(vec![Some(true), None])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some([1u8; 16]), None].into_iter(),
+                    16,
+                )
+                .expect("ids"),
+            ),
+            Arc::new(StringArray::from(text.clone())),
+            Arc::new(LargeStringArray::from(text)),
+            Arc::new(BinaryArray::from_iter(bytes.clone())),
+            Arc::new(LargeBinaryArray::from_iter(bytes)),
+        ];
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        for column in columns {
+            let data_type = column.data_type().clone();
+            assert!(merge_key_supported(&data_type), "{data_type}");
+            let schema = Arc::new(Schema::new(vec![Field::new("k", data_type.clone(), true)]));
+            let converter =
+                RowConverter::new(vec![SortField::new(data_type.clone())]).expect("converter");
+            for i in 0..column.len() {
+                let value = column.slice(i, 1);
+                let rows = converter
+                    .convert_columns(std::slice::from_ref(&value))
+                    .expect("rows");
+                let batch = RecordBatch::try_new(schema.clone(), vec![value]).expect("batch");
+                let bound = merge_key_bound(&batch, &spec).expect("bound");
+                assert_eq!(
+                    bound - merge_key_overhead(1),
+                    rows.row(0).as_ref().len(),
+                    "{data_type}, row {i}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a dictionary-encoded string column named as a sort key.
+    /// Guarantees: `merge_key_supported` refuses the type and `merge_key_bound` errs rather
+    /// than bound it by guesswork.
+    #[test]
+    fn a_dictionary_sort_key_is_refused() {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::Int32Type;
+        let dictionary: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        let data_type = dictionary.data_type().clone();
+        assert!(!merge_key_supported(&data_type));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", data_type, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(dictionary) as ArrayRef]).expect("batch");
+        let spec = SortSpec::new(vec![SortKey {
+            column: "k".into(),
+            order: SortOrder::Asc,
+            nulls: Nulls::Last,
+        }]);
+        assert!(merge_key_bound(&batch, &spec).is_err());
     }
 
     /// Scenario: string keys growing from one byte to hundreds as the merge advances.
