@@ -146,16 +146,19 @@ an empty block:
 ```
 
 F_max is the larger F of the two signals, and 4KiB allows for the completion
-token (measured tokens hold 200 to 464 bytes). `ingress.max_series_per_request`
+token (measured tokens hold 200 to 464 bytes); block admission nacks a request
+whose token is larger as a retryable `internal` before it reserves anything.
+`ingress.max_series_per_request`
 bounds the distinct series of one request, and extraction refuses a request as
 soon as it passes the limit (`nacks{error.type=too_many_series}`, a permanent
 refusal naming the count and the limit). Unset, it is the most series the
 block budget holds, `(B - 2E - 4KiB) / F_max` with B `window.max_block_bytes`
 and E `ingress.max_extracted_bytes`: 1,393,826 at the defaults, and 1,328,997
 with the one denormalized column per signal of the shipped configurations. So
-`window.max_block_bytes` only rotates blocks and bounds memory; it never
-refuses a request. A worst case that still misses an empty block, which only a
-token beyond the allowance can cause, is nacked as a retryable `internal`.
+every request that passes ingress, with a token within the allowance, fits an
+empty block, and `window.max_block_bytes` only rotates blocks and bounds
+memory. A worst case that still misses an empty block would be a writer defect:
+it fails a debug assertion and is nacked as a retryable `internal`.
 
 ### Attempt timeouts
 

@@ -300,8 +300,8 @@ pub const DEFAULT_MAX_SERIES_PER_REQUEST: usize = 1_000_000;
 /// The completion token bytes one request's block worst case allows for.
 ///
 /// The token is the request's routing context; measured tokens hold 200 to
-/// 464 bytes. A larger one can only make a request that passed ingress miss
-/// an empty block, which block admission reports as an internal failure.
+/// 464 bytes. Block admission refuses a larger one as an internal failure
+/// before it reserves anything.
 pub const TOKEN_ALLOWANCE_BYTES: usize = 4 << 10;
 
 /// Sorting configuration.

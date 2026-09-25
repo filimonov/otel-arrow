@@ -314,13 +314,14 @@ impl Block {
     /// Compute what admitting `extracted` would add.
     ///
     /// Refuses before touching anything:
+    /// * an internal error when the completion token is larger than
+    ///   [`TOKEN_ALLOWANCE_BYTES`];
     /// * an internal error when the request's worst case (every descriptor it
     ///   carries written by this block; see
     ///   [`LakeConfig::series_row_fixed_bytes`]) exceeds `max_block_bytes`.
     ///   [`LakeConfig::check_request_bound`] makes that unreachable for a
-    ///   request that passed extraction with a token within
-    ///   [`TOKEN_ALLOWANCE_BYTES`], so it is also a debug assertion; the
-    ///   check never depends on the cache;
+    ///   request that passed extraction, so under a valid configuration it is
+    ///   also a debug assertion; the check never depends on the cache;
     /// * `TooManyRequests` when the block already holds `max_requests_per_block`;
     /// * `BlockFull` when the request does not fit the remaining budget.
     ///
@@ -330,7 +331,7 @@ impl Block {
     /// move only LRU recency, which is not correctness state.
     ///
     /// # Errors
-    /// Returns one of the three refusals above.
+    /// Returns one of the four refusals above.
     pub fn reserve(
         &self,
         extracted: &Extracted,
@@ -350,7 +351,7 @@ impl Block {
     /// descriptors being written. Only this reservation ignores the cache.
     ///
     /// # Errors
-    /// Returns one of the three refusals documented on [`Block::reserve`].
+    /// Returns one of the four refusals documented on [`Block::reserve`].
     pub fn reserve_with_reemit(
         &self,
         extracted: &Extracted,
@@ -359,6 +360,15 @@ impl Block {
         reemit: bool,
     ) -> Result<Reservation> {
         let limits = &self.cfg.ingress;
+        // The one term of the worst case extraction does not bound; within
+        // the allowance, `LakeConfig::check_request_bound` makes the check
+        // below unreachable.
+        if token_bytes > TOKEN_ALLOWANCE_BYTES {
+            return Err(Error::internal(format!(
+                "the request's completion token holds {token_bytes} bytes, more than the \
+                 {TOKEN_ALLOWANCE_BYTES} bytes a block reserves for one"
+            )));
+        }
         // The merge keys exist only while the block's tables are written, but
         // they are reserved from admission on, so a block and the keys of the
         // table being written stay within `max_block_bytes` together.
@@ -373,7 +383,7 @@ impl Block {
             .fold(fixed, usize::saturating_add);
         if worst > limits.max_block_bytes {
             debug_assert!(
-                token_bytes > TOKEN_ALLOWANCE_BYTES || self.cfg.validate().is_err(),
+                self.cfg.validate().is_err(),
                 "a request that passed ingress needs {worst} bytes of an empty block of {}",
                 limits.max_block_bytes
             );
@@ -950,24 +960,60 @@ mod tests {
         assert!((0..stamps.len()).all(|i| stamps.value(i) == SEAL_AT_US));
     }
 
-    /// Scenario: a request under the default configuration whose completion token alone is as
-    /// large as a block, offered to an empty block.
-    /// Guarantees: an internal error, never a permanent refusal, and the empty block is left
-    /// untouched.
+    /// Scenario: a small request under the default configuration whose completion token is one
+    /// byte over `TOKEN_ALLOWANCE_BYTES`, then exactly at it, offered to an empty block.
+    /// Guarantees: the oversized token is an internal error before any reservation, never a
+    /// permanent refusal, and leaves the block untouched; a token at the allowance is admitted.
     #[test]
-    fn a_request_missing_an_empty_block_is_an_internal_error() {
+    fn a_token_over_the_allowance_is_refused_before_reservation() {
         let cfg = LakeConfig::default();
         let mut cache = SeriesCache::new(100);
         let block = Block::new(0, 1, cfg.clone());
         let e = extracted(&cfg, "h", 4);
-        assert!(matches!(
-            block.reserve(&e, &mut cache, cfg.ingress.max_block_bytes),
-            Err(Error::Internal(_))
-        ));
+        let refused = block.reserve(&e, &mut cache, TOKEN_ALLOWANCE_BYTES + 1);
+        assert!(matches!(&refused, Err(Error::Internal(_))), "{refused:?}");
         assert_eq!(block.bytes, 0);
         assert_eq!(block.request_count(), 0);
         assert!(block.pending_series.is_empty());
         assert_eq!(block.tables().count(), 0);
+        let _ = block
+            .reserve(&e, &mut cache, TOKEN_ALLOWANCE_BYTES)
+            .expect("a token at the allowance is reserved");
+    }
+
+    /// Scenario: a block budget below what validation allows (one byte), so a small request's
+    /// worst case misses an empty block.
+    /// Guarantees: an internal error that leaves the block untouched; the debug assertion stays
+    /// silent because the configuration does not validate.
+    #[test]
+    fn a_request_missing_an_empty_block_is_an_internal_error() {
+        let mut cfg = LakeConfig::default();
+        cfg.ingress.max_block_bytes = 1;
+        let mut cache = SeriesCache::new(100);
+        let block = Block::new(0, 1, cfg.clone());
+        let e = extracted(&LakeConfig::default(), "h", 4);
+        assert!(matches!(
+            block.reserve(&e, &mut cache, 16),
+            Err(Error::Internal(_))
+        ));
+        assert_eq!(block.bytes, 0);
+        assert_eq!(block.tables().count(), 0);
+    }
+
+    /// Scenario: a validated configuration and a request whose worst case misses an empty block,
+    /// which validation makes impossible for a real extraction; forged by inflating the
+    /// extraction's pinned bytes to the whole block.
+    /// Guarantees: debug builds fail the assertion, with no exemption for the token.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a request that passed ingress needs")]
+    fn an_empty_block_miss_under_a_valid_configuration_fails_the_debug_assertion() {
+        let cfg = LakeConfig::default();
+        cfg.validate().expect("valid");
+        let block = Block::new(0, 1, cfg.clone());
+        let mut e = extracted(&cfg, "h", 4);
+        e.pinned_bytes = cfg.ingress.max_block_bytes;
+        let _ = block.reserve(&e, &mut SeriesCache::new(100), 16);
     }
 
     /// Scenario: one request against an empty block, cold and fully committed cache, with and
