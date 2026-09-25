@@ -36,9 +36,12 @@ failure or a timeout, and a retry can duplicate rows already committed.
 
 ## Getting Started
 
-Use `configs/series-parquet-local.yaml` for a local destination and
-`configs/series-parquet-s3.yaml` for S3-compatible storage. From
-`rust/otap-dataflow`:
+For Grafana Alloy or any OTLP producer, start from
+`configs/series-parquet-buffered.yaml`, which puts a durable buffer in front of
+this exporter (see [Deploying with Alloy](#deploying-with-alloy); build with
+`durable-buffer` too). Use `configs/series-parquet-local.yaml` for a local
+destination and `configs/series-parquet-s3.yaml` for the strict S3 deployment,
+whose OK means the rows are in the bucket. From `rust/otap-dataflow`:
 
 ```bash
 cargo build -p otel-arrow-dfe --bin df_engine --features series-parquet,aws
@@ -52,7 +55,10 @@ budget and descriptor cache (see "Memory").
 
 ## Delivery and shutdown
 
-Connect `receiver:otlp` directly to this exporter with
+This section describes the exporter's own acknowledgement, which the strict
+deployment passes straight to the producer; behind `durable_buffer` it goes
+to the buffer instead (see [Deploying with Alloy](#deploying-with-alloy)). In
+the strict deployment, connect `receiver:otlp` directly to this exporter with
 `protocols.grpc.wait_for_result: true` and `timeout: 180s`. An OK response
 means every file of that request's block completed in the object store. For
 `storage: file` the local backend renames a staging file into place but never
@@ -380,6 +386,117 @@ workers are expected. Give every process its own buffer directory, since the
 WAL does not lock it. A changed core count moves no queue, so drain the old
 shards first and keep old `core_<id>` directories until they are empty.
 
+## Deploying with Alloy
+
+The reference deployment is
+[`configs/series-parquet-buffered.yaml`](../../../../../configs/series-parquet-buffered.yaml)
+with Grafana Alloy running
+[`configs/series-parquet.alloy`](../../../../../configs/series-parquet.alloy):
+
+```text
+log files -> Alloy (file tail, batch 4000, file-backed queue)
+          -> OTLP gRPC -> receiver -> durable_buffer (WAL) -> series_parquet -> S3
+```
+
+An OK to Alloy means the batch is in the WAL, in tens of milliseconds; the
+buffer then retries every failed block until the store takes it. The strict
+alternative, `series-parquet-s3.yaml` with `series-parquet-strict.alloy`,
+answers only once the block is in the bucket (see "Attempt timeouts"). Each
+setting of both files carries its reason in a comment.
+
+Run Alloy with `--stability.level=public-preview` (the file-backed sending
+queue) and `--storage.path` on a persistent volume: it holds the file
+positions and the queue across a restart. Set `SERIES_PRODUCER_ID` to a value
+unique per producer, or leave it unset to use the hostname.
+
+### Sizing
+
+Rates are log lines; the Loki bridge makes a line about 300 bytes larger on
+the wire, so 100-byte lines are about 400 bytes of OTLP each.
+
+- **Workers.** One worker takes about 100k lines/s behind the buffer (104k
+  sustained on MinIO); use `max(1, ceil(rate / 100k))` workers. The WAL device
+  is the next limit: one NVMe shared with the store carried 144-152k records/s
+  with four workers, so beyond that give each engine its own WAL device or run
+  more engines.
+- **WAL disk.** In steady state the WAL holds what the exporter has not yet
+  committed, `ingest_bytes_per_s * (window.interval + flush)`: 300 MB at 40k
+  lines/s. During a store outage it grows by the ingest rate: 2.6 GB after a
+  150 s outage at 40k lines/s (16.8 MB/s). Size `retention_size_cap` for
+  `ingest_bytes_per_s * (outage_tolerance + window.interval + 5s)` and keep the
+  device's write bandwidth at twice the ingest bytes (WAL entry plus the
+  finalized segment). The shipped 32GiB covers about 34 minutes at 40k
+  lines/s and 13 minutes at 100k.
+- **Memory.** Per worker, budget
+  `memory.budget + max_in_flight * request_bytes + receiver slots * request_bytes`:
+  the exporter's own budget (1.64 GB at the defaults), the bundles the buffer
+  has handed to the exporter and not yet had acknowledged (`max_in_flight`,
+  1000 by default), and requests the receiver holds for the WAL write. With
+  1.6 MB batches that is 1.64 + 1.6 + 0.2 = 3.4 GB. Measured at 40k lines/s:
+  0.7 GB healthy, 1.9 GB held and a 2.55 GB peak through a 150 s store outage,
+  when the buffer keeps about 500 bundles at the exporter.
+- **Producers per worker.** A request past the receiver's
+  `max_concurrent_requests` gets RESOURCE_EXHAUSTED, which Alloy's OTLP
+  exporter treats as permanent and drops. Keep the `num_consumers` of every
+  producer that can reach one worker at most that limit: 64 producers at the
+  shipped 128 and 2 consumers. For more, raise `max_concurrent_requests` and
+  the pipeline's `pdata` channel capacity together (the receiver is clamped
+  to it), and the memory term with them.
+- **Alloy.** Two consumers carry 160k lines/s per producer at a 50 ms
+  acknowledgement; the queue holds 16000 records (two batches per consumer).
+
+### The WAL device
+
+Put `path` on its own local NVMe: the WAL writes each request twice, syncs
+every 25 ms, and a slow device raises every producer's latency. The WAL does
+not lock its directory, so give every engine process its own path; each worker
+uses `<path>/core_<id>`. The device must survive a process restart; a WAL on
+tmpfs survives only that.
+
+### Bucket permissions and lifecycle
+
+The writer needs `s3:PutObject` (single PUT and every multipart step),
+`s3:AbortMultipartUpload`, `s3:GetObject` (the HEAD probes after a lost
+response) and `s3:ListBucket` on the bucket, without which S3 answers a HEAD of
+a missing key with 403 rather than 404 and the probe cannot conclude. It never
+deletes. Add a lifecycle rule that aborts incomplete multipart uploads
+(`AbortIncompleteMultipartUpload`, for example after one day); see "Limits".
+
+### Alerts
+
+| Signal | Meaning | Alert |
+| --- | --- | --- |
+| `oldest_unacked.age` (exporter) | Freshness: age of the oldest request the exporter owes the buffer. Healthy it stays below `window.interval` plus the flush (19 s measured maximum at 15 s windows). | above 2 x `window.interval` for a few minutes |
+| `storage.bytes.used` / `storage.bytes.cap` (buffer), per core | WAL fill; each core's cap is its share. | above 50 percent; UNAVAILABLE to producers at 100 |
+| `ingest.failures{failure=backpressure}` (buffer) | Requests refused because the WAL is full. | any |
+| `flush.failures` (exporter), `retries.scheduled` (buffer) | Blocks the store did not take; the buffer retries them. | sustained |
+| `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
+| `flush.late_commits` | A lost completion response was probed and the block acknowledged, or a failed block's objects were found after all (its rows may be stored twice). | any, for investigation |
+| `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
+| `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
+| Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as RESOURCE_EXHAUSTED). | any |
+| Alloy `otelcol_exporter_enqueue_failed_log_records_total` | Records refused by a full queue; stays zero with `block_on_overflow`. | any |
+
+### Failure behaviour
+
+Measured with eight Alloy producers at 40k lines/s on one worker, 15 s windows,
+every line read back by DuckDB and clickhouse-local
+(`docs/superpowers/reports/series-parquet-measurement/reference-alloy-*.json`).
+Without faults, a 30-minute run stored 74.4M lines once, with acknowledgements
+at p50 <= 25ms and p99 <= 250ms, freshness p50 9.7s and p99 17.5s, and flat
+RSS (0.47 GB median, 0.72 GB peak) and WAL (0.3 GB).
+
+| Failure | Producer sees | Data | Measured |
+| --- | --- | --- | --- |
+| Object store down | Nothing: acknowledgements continue from the WAL (p99 up to 2.5s while the worker also retries blocks). | The exporter fails each block after `flush_retry_deadline`; the buffer retries it until the store returns. Freshness grows with the outage and recovers within about 20s of the store's return. | 150s on MinIO and RustFS: no loss, no duplicates, no Alloy error; WAL peak 2.6 GB, RSS 1.9 GB held, 2.6 GB peak. |
+| WAL full (store down past the cap) | UNAVAILABLE; Alloy retries every 5s at most, its queue fills in about 3s and the tailer parks, so new lines wait in the log file. | Nothing is dropped while the file keeps them: a log rotation that removes an unread file before Alloy reaches it loses it. | 1GiB cap at 40k lines/s: full 53s after the store stopped (steady WAL 0.3 GB), refused for 90s, 384 UNAVAILABLE answers, no loss or duplicates, backlog drained 27s after the store returned. The shipped 32GiB absorbs about 34 minutes at 40k lines/s. |
+| Engine restart (SIGTERM) | UNAVAILABLE while no engine listens; Alloy retries. | The receiver drains, the exporter writes its ACTIVE block, and the buffer records every acknowledgement before exiting; what is left stays in the WAL. | Exit in 0.16s with code 0, no duplicates, no loss. |
+| Engine SIGKILL | UNAVAILABLE until the new engine listens; the exports in flight are resent. | Everything acknowledged is in the WAL and is written after the restart. Duplicates: an export whose WAL write completed but whose answer was lost is stored twice (at most `num_consumers` exports per producer), and so are WAL entries acknowledged within the last 100ms, or a block committed within the last 100ms, since the WAL position and the acknowledgements are persisted on that tick. | 8 kills on MinIO and RustFS, mid-window, 0.4s after a block commit and during a flush: no loss; 4000 duplicate lines after one kill (one resent export), none after the other seven. A kill within 100ms of a commit was not produced. |
+| Alloy restart (`docker stop`, 10s grace) | Nothing. | Alloy saves its file positions and its queue on the way down. | All eight producers restarted: no loss, no duplicates. |
+| Alloy SIGKILL with a full queue (engine down) | Nothing. | The file-backed queue survives; lines read after the last saved position (every 10s) are read again. | No loss; 82,963 duplicate lines over eight producers (about 2s of input each). The same kill with the queue in memory lost 40,949 lines (4.4k to 5.7k per producer). |
+| Receiver slots exhausted | RESOURCE_EXHAUSTED, which Alloy drops as permanent (`send_failed`, "Dropping data"). | Lost before the WAL. Keep the producers' `num_consumers` per worker at most `max_concurrent_requests` (see "Sizing"). | Reproduced with a one-slot receiver and three Alloy producers: every refused batch dropped. |
+| A store that applies abandoned requests (RustFS) | Nothing. | A multipart completion held by an intermediary can be applied after the writer gave up and retried; the retry wrote the same names and bytes, so readers see one copy, but a partition can receive a write later than `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)` (55s here). | Seen on RustFS with a completion held in a proxy (FORMAT.md, "Partition lateness bound"); not reproduced here. |
+
 ## Reading and schema changes
 
 Values rows reference repeated descriptors, so a reader joins them through a
@@ -532,7 +649,9 @@ accounted 3.4 GB; the rest was requests held by the receivers, 4096 slots times
 four workers times about 1 MB. Raising `max_concurrent_requests` to lift the
 strict admission ceiling multiplies this term. Behind `durable_buffer` the
 receiver holds a request only until the buffer has written it to its WAL, so
-the term lasts for the WAL write rather than for the window.
+the term lasts for the WAL write rather than for the window, and the buffer
+adds the bundles it has handed to this exporter (see "Sizing" under
+[Deploying with Alloy](#deploying-with-alloy)).
 
 The engine also publishes one process-scoped gauge,
 `memory.unaccounted_rss_bytes` =

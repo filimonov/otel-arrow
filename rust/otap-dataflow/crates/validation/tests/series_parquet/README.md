@@ -989,7 +989,10 @@ python3 -m crates.validation.tests.series_parquet.reference_deployment \
   WAL; `engine_kill` does the same with SIGKILL, three times: mid-window, about
   when the previous block commits, and during its upload;
 - `alloy_restart` stops (`docker stop --time 10`) and starts every Alloy
-  container, whose storage path is a bind mount.
+  container, whose storage path is a bind mount; `alloy_kill` stops the engine
+  until every Alloy queue is full, SIGKILLs every Alloy container, starts it
+  again and then the engine. `alloy_queue_storage=false` runs a case with the
+  sending queue in memory, the control for the file-backed queue.
 
 After the input stops, the case waits until every Alloy has sent its file and
 the buffer and exporter hold nothing, then stops the engine with SIGTERM. The
@@ -1000,14 +1003,17 @@ data" line, no buffer loss or permanent rejection, and incomplete uploads at
 most `flush.abort_failures`. Duplicates must be zero except after a SIGKILL
 (in-flight exports, the last 100 ms of WAL acknowledgements and one block
 whose acknowledgement was not yet persisted) and after an Alloy restart (the
-10 s position sync). Freshness is line written to values object first listed
-(2 s listing), with the store's LastModified beside it; ack latency is Alloy's
+10 s position sync, plus the queue after a SIGKILL). Freshness is line
+written to values object first listed (2 s listing), with the store's
+LastModified beside it; ack latency is Alloy's
 `rpc_client_call_duration_seconds` histogram. Results are published as
 `reference-alloy-<case>-<store>.json`; raw logs and samples go to
 `.measurement-artifacts/reference-alloy/` of the main checkout. Options:
-`baseline_s`, `measure_s`, `outage_s`, `full_s`, `after_s`, `kill_phases`
-(default 7.0, 1.0 and 0.4 s into the window), `producers`, `rate`,
-`lease_wait_s`, `archive_dir`, `report_dir`.
+`baseline_s`, `measure_s`, `outage_s`, `full_s`, `blocked_s`, `after_s`,
+`kill_phases` (default 7.0, 1.0 and 0.4 s into the window),
+`alloy_queue_storage`, `producers`, `rate`, `label` (appended to the result's
+file name), `purpose`, `lease_wait_s`, `archive_dir`, `report_dir`;
+`--rejudge FILE` advances a published result to the current fault checks.
 
 ## Environment variables
 
