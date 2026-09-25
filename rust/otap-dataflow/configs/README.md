@@ -297,7 +297,8 @@ the series_parquet exporter README, "Deploying with Alloy".
 The Grafana Alloy producer of `series-parquet-buffered.yaml`: it tails
 `/input/events.log`, sets `host.id` from `SERIES_PRODUCER_ID` or the hostname,
 inserts an `e2e.source` attribute and exports OTLP logs to the endpoint named
-by the `OTLP_ENDPOINT` environment variable, with a file-backed sending queue.
+by the `OTLP_ENDPOINT` environment variable, with a file-backed sending queue
+that splits exports at 8MiB; lines above 512KiB are truncated.
 Run it with `alloy run --stability.level=public-preview
 --storage.path=<persistent dir>`.
 

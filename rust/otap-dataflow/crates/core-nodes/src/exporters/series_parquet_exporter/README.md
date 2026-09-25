@@ -432,7 +432,9 @@ the wire, so 100-byte lines are about 400 bytes of OTLP each.
   the exporter's own budget (1.64 GB at the defaults), the bundles the buffer
   has handed to the exporter and not yet had acknowledged (`max_in_flight`,
   1000 by default), and requests the receiver holds for the WAL write. With
-  1.6 MB batches that is 1.64 + 1.6 + 0.2 = 3.4 GB. Measured at 40k lines/s:
+  1.6 MB batches that is 1.64 + 1.6 + 0.2 = 3.4 GB; lines of several KiB fill
+  exports to the 8MiB cap, and the in-flight term grows to 8.4 GB unless
+  `max_in_flight` is lowered. Measured at 40k lines/s:
   0.7 GB healthy, 1.9 GB held and a 2.55 GB peak through a 150 s store outage,
   when the buffer keeps about 500 bundles at the exporter.
 - **Producers per worker.** A request past the receiver's
@@ -444,6 +446,10 @@ the wire, so 100-byte lines are about 400 bytes of OTLP each.
   to it), and the memory term with them.
 - **Alloy.** Two consumers carry 160k lines/s per producer at a 50 ms
   acknowledgement; the queue holds 16000 records (two batches per consumer).
+  The sending queue splits every export at 8MiB, half the receiver's 16MiB
+  limit, whatever the line length, and a `loki.process` stage cuts lines above
+  512KiB (suffix included), below the exporter's 1MiB `ingress.max_row_bytes`.
+  Both are in the shipped file; the truncation changes data and is counted.
 
 ### The WAL device
 
@@ -476,6 +482,7 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
 | Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as RESOURCE_EXHAUSTED). | any |
 | Alloy `otelcol_exporter_enqueue_failed_log_records_total` | Records refused by a full queue; stays zero with `block_on_overflow`. | any |
+| Alloy `loki_process_truncated_fields_total{field="line"}` | Lines cut to 512KiB by the truncate stage. | any, for investigation |
 
 ### Failure behaviour
 
@@ -494,6 +501,7 @@ RSS (0.47 GB median, 0.72 GB peak) and WAL (0.3 GB).
 | Engine SIGKILL | UNAVAILABLE until the new engine listens; the exports in flight are resent. | Everything acknowledged is in the WAL and is written after the restart. Duplicates: an export whose WAL write completed but whose answer was lost is stored twice (at most `num_consumers` exports per producer), and so are WAL entries acknowledged within the last 100ms, or a block committed within the last 100ms, since the WAL position and the acknowledgements are persisted on that tick. | 8 kills on MinIO and RustFS, mid-window, 0.4s after a block commit and during a flush: no loss; 4000 duplicate lines after one kill (one resent export), none after the other seven. A kill within 100ms of a commit was not produced. |
 | Alloy restart (`docker stop`, 10s grace) | Nothing. | Alloy saves its file positions and its queue on the way down. | All eight producers restarted: no loss, no duplicates. |
 | Alloy SIGKILL with a full queue (engine down) | Nothing. | The file-backed queue survives; lines read after the last saved position (every 10s) are read again. | No loss; 82,963 duplicate lines over eight producers (about 2s of input each). The same kill with the queue in memory lost 40,949 lines (4.4k to 5.7k per producer). |
+| Long lines | Nothing. | Exports are split at 8MiB; a line above 512KiB is cut to 512KiB, suffix included, and counted in Alloy's `loki_process_truncated_fields_total`. Without the cut, a record above `ingress.max_row_bytes` refuses its whole export after the WAL acknowledgement (`resolved{outcome=permanently_rejected}`). | 4000 lines of 8 KiB (34 MB, one batch): five exports of at most 8.38 MB, every line stored once; three 3 MiB lines stored truncated. |
 | Receiver slots exhausted | RESOURCE_EXHAUSTED, which Alloy drops as permanent (`send_failed`, "Dropping data"). | Lost before the WAL. Keep the producers' `num_consumers` per worker at most `max_concurrent_requests` (see "Sizing"). | Reproduced with a one-slot receiver and three Alloy producers: every refused batch dropped. |
 | A store that applies abandoned requests (RustFS) | Nothing. | A multipart completion held by an intermediary can be applied after the writer gave up and retried; the retry wrote the same names and bytes, so readers see one copy, but a partition can receive a write later than `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)` (55s here). | Seen on RustFS with a completion held in a proxy (FORMAT.md, "Partition lateness bound"); not reproduced here. |
 
