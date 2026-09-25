@@ -9,6 +9,7 @@ bytecode conversion and the rig's activation rules. `LiveRigSlice` builds
 one real rig around a real store when Docker and the provisioned images are
 present, and skips otherwise unless the fault tools are required.
 """
+import datetime
 import json
 import os
 from pathlib import Path
@@ -123,21 +124,25 @@ class ProbeVerdicts(unittest.TestCase):
         required = faults.coverage(probes, required=True)
         self.assertEqual(required["tcp_ack_loss"]["consequence"], "fails the lane")
 
-    # Scenario: every probe the preflight runs passed.
-    # Guarantees: disconnect/reset and the dropped completion response stay
-    # unavailable, because no direct probe with a negative control exists
-    # for them yet; the evidence names the task that owns each one.
-    def test_unprobed_classes_are_not_claimed(self):
+    # Scenario: every preflight probe passed, then the same evidence without
+    # the two direct network probes.
+    # Guarantees: disconnect/reset and the dropped completion response are
+    # available only on their own direct probes; without them they are
+    # unavailable and a required lane fails.
+    def test_direct_network_probes_decide_their_classes(self):
         probes = [{"name": name, "store": "minio", "passed": True}
                   for name in faults.PREFLIGHT_PROBES]
-        for required in (False, True):
-            classes = faults.coverage(probes, required=required)
-            for name in ("disconnect_reset", "dropped_completion_response"):
-                with self.subTest(name=name, required=required):
-                    self.assertEqual(classes[name]["status"], "unavailable")
-                    self.assertIn("Task 11", classes[name]["consequence"])
-                    self.assertTrue(classes[name]["deferred_probes"])
-            self.assertEqual(classes["tcp_ack_loss"]["status"], "available")
+        classes = faults.coverage(probes, required=True)
+        for name in ("disconnect_reset", "dropped_completion_response"):
+            self.assertEqual(classes[name]["status"], "available", name)
+        direct = ("disconnect_reset direct", "dropped_completion_response direct")
+        without = [probe for probe in probes if probe["name"] not in direct]
+        classes = faults.coverage(without, required=True)
+        for name in ("disconnect_reset", "dropped_completion_response"):
+            with self.subTest(name=name):
+                self.assertEqual(classes[name]["status"], "unavailable")
+                self.assertEqual(classes[name]["consequence"], "fails the lane")
+        self.assertEqual(classes["tcp_ack_loss"]["status"], "available")
 
     # Scenario: the RustFS rig fails before any probe ran, while every MinIO
     # probe passed.
@@ -289,7 +294,9 @@ class ToolContracts(unittest.TestCase):
     # Scenario: the NGINX fault front is configured.
     # Guarantees: the checked-in configuration carries the plan's body
     # verbatim -- signed Host preserved, no buffering, no retries, the 503
-    # control file and both backends.
+    # control file and both backends -- and the completion front routes only
+    # a values CompleteMultipartUpload to its own proxy and finishes requests
+    # whose client left.
     def test_nginx_configuration_is_the_plan_body(self):
         body = faults.NGINX_CONF.read_text()
         body = "\n".join(line for line in body.splitlines() if not line.startswith("#"))
@@ -304,10 +311,19 @@ class ToolContracts(unittest.TestCase):
             "proxy_buffering off;",
             "proxy_next_upstream off;",
             "proxy_pass $backend;",
+            'map "$request_method $arg_uploadId $uri" $completion_backend {',
+            '"~^POST [^ ]+ .*dataset=values/" http://127.0.0.1:19003;',
+            "listen 19010;",
+            "proxy_ignore_client_abort on;",
+            "proxy_pass $completion_backend;",
         ):
             self.assertIn(line, body)
+        main = body.split("listen 19010;")[0]
+        self.assertNotIn("proxy_ignore_client_abort", main)
         self.assertEqual(faults.NGINX_PORT, 19000)
-        self.assertEqual(faults.PROXY_PORTS, {"general": 19001, "values": 19002})
+        self.assertEqual(faults.COMPLETION_FRONT_PORT, 19010)
+        self.assertEqual(faults.PROXY_PORTS,
+                         {"general": 19001, "values": 19002, "completion": 19003})
 
     # Scenario: tcpdump prints the ACK-only program.
     # Guarantees: the count and every instruction reach iptables in its
@@ -1721,6 +1737,362 @@ class ProcessFailureTests(measurement.MeasurementTestCase):
                     self.assertNotEqual(numbers["old_pid"], numbers["new_pid"])
                     self.assertEqual(check_status(result, "new_boot_id"),
                                      measurement.STATUS_PASSED)
+                    faults.fault_check(result)
+
+
+def network_seen(**fields):
+    """An observation of a network case with every retry signal present."""
+    seen = {"http_502_writes_count": 1, "flush_retries_count": 1, "storage_nacks_count": 1,
+            "retried": True, "nginx_errors": {}, "dns": {}, "now_unix_s": 1000.0}
+    seen.update(fields)
+    return seen
+
+
+class FakeClient:
+    """A signed S3 client whose two HEADs answer fixed statuses."""
+
+    def __init__(self, bucket_status, key_status):
+        self.bucket_status = bucket_status
+        self.key_status = key_status
+
+    @staticmethod
+    def answer(status):
+        if status == 200:
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        raise faults.ClientError({"ResponseMetadata": {"HTTPStatusCode": status},
+                                  "Error": {"Code": str(status)}}, "Head")
+
+    def head_bucket(self, Bucket):
+        return self.answer(self.bucket_status)
+
+    def head_object(self, Bucket, Key):
+        return self.answer(self.key_status)
+
+
+class NetworkCaseContracts(unittest.TestCase):
+    """How each network fault's evidence becomes an observed condition."""
+
+    # Scenario: the network family is listed.
+    # Guarantees: the six planned cases and the two multipart completion cases
+    # are registered faults with an observation deadline, and the TCP ACK
+    # loss case is held to the 60 s activation deadline.
+    def test_network_faults_are_registered(self):
+        for name in ("disconnect", "reset", "dns_nxdomain", "dns_timeout", "tcp_ack_loss",
+                     "dropped_completion_response", "dropped_multipart_completion",
+                     "held_multipart_completion"):
+            with self.subTest(name=name):
+                self.assertIn(name, faults.FAILURE_FAMILIES["network"])
+                self.assertIn(name, faults.FAULTS)
+                self.assertIn(name, faults.FAULT_OBSERVE_DEADLINE_S)
+        self.assertEqual(faults.FAULT_OBSERVE_DEADLINE_S["tcp_ack_loss"], 60)
+        self.assertEqual(faults.DROP_COMPLETION_TOXIC, json.loads(
+            '{"name":"drop_completion","type":"timeout","stream":"downstream",'
+            '"toxicity":1.0,"attributes":{"timeout":0}}'))
+        self.assertEqual(faults.RESET_TOXIC, json.loads(
+            '{"name":"reset","type":"reset_peer","stream":"downstream","toxicity":1.0,'
+            '"attributes":{"timeout":0}}'))
+
+    # Scenario: an installed ACK-only rule matched no packet while the capture
+    # holds retransmissions and the writer later drained.
+    # Guarantees: the evidence checker refuses it; so does a matched frame
+    # that carries data or other flags, a capture without retransmission, and
+    # complete evidence before the hold past the client's timeout.
+    def test_ack_loss_needs_dropped_pure_acks_and_retransmissions(self):
+        good = {"matched_packets_count": 5, "matched_pure_ack_packets_count": 5,
+                "tcp_retransmissions_count": 3}
+        self.assertEqual(faults.ack_loss_evidence_problems(4, good), [])
+        self.assertTrue(faults._tcp_ack_loss_met(None, network_seen(
+            dropped_pure_ack_packets_count=4, ack_capture=good,
+            elapsed_s=faults.ACK_LOSS_HOLD_S)))
+        self.assertFalse(faults._tcp_ack_loss_met(None, network_seen(
+            dropped_pure_ack_packets_count=4, ack_capture=good,
+            elapsed_s=faults.ACK_LOSS_HOLD_S - 1)))
+        for dropped, evidence in (
+                (0, good), (None, good),
+                (4, dict(good, matched_pure_ack_packets_count=4)),
+                (4, dict(good, matched_packets_count=0, matched_pure_ack_packets_count=0)),
+                (4, dict(good, tcp_retransmissions_count=0))):
+            with self.subTest(dropped=dropped, evidence=evidence):
+                self.assertTrue(faults.ack_loss_evidence_problems(dropped, evidence))
+                self.assertFalse(faults._tcp_ack_loss_met(None, network_seen(
+                    dropped_pure_ack_packets_count=dropped, ack_capture=evidence,
+                    elapsed_s=faults.ACK_LOSS_HOLD_S, drained=True)))
+
+    # Scenario: NGINX's error log holds refused, reset and closed upstreams
+    # before and during a fault.
+    # Guarantees: each class is counted apart, only inside the window.
+    def test_nginx_error_classes_keep_failures_apart(self):
+        text = "\n".join((
+            "2026/09/25 02:00:00 [error] 30#30: *1 connect() failed (111: Connection refused) "
+            "while connecting to upstream",
+            "2026/09/25 02:00:10 [error] 30#30: *2 connect() failed (111: Connection refused) "
+            "while connecting to upstream",
+            "2026/09/25 02:00:11 [error] 30#30: *3 recv() failed (104: Connection reset by peer)",
+            "2026/09/25 02:00:12 [error] 30#30: *4 upstream prematurely closed connection",
+            "2026/09/25 02:00:13 [warn] 30#30: *5 something else",
+            "not a log line"))
+        since = datetime.datetime(2026, 9, 25, 2, 0, 5, tzinfo=datetime.timezone.utc).timestamp()
+        classes = faults.nginx_error_classes(text, since)
+        self.assertEqual(classes["counts"], {"refused": 1, "reset": 1, "prematurely_closed": 1,
+                                             "other": 1})
+        self.assertEqual(faults.nginx_error_classes(text)["counts"]["refused"], 2)
+
+    # Scenario: the resolver logs the engine's and the diagnostic lookups,
+    # before and after the name was removed.
+    # Guarantees: queries and NXDOMAIN answers are counted in the window, and
+    # only AAAA queries, which the diagnostic lookup never sends, are the engine's.
+    def test_dnsmasq_log_counts_queries_and_answers(self):
+        name = "lake-x.test"
+        text = "\n".join((
+            f"Sep 25 02:00:01 dnsmasq[61]: query[A] {name} from 127.0.0.1",
+            f"Sep 25 02:00:01 dnsmasq[61]: /control/hosts {name} is 127.0.0.1",
+            "Sep 25 02:00:05 dnsmasq[61]: read /control/hosts - 0 names",
+            f"Sep 25 02:00:06 dnsmasq[61]: query[AAAA] {name} from 127.0.0.1",
+            f"Sep 25 02:00:06 dnsmasq[61]: config {name} is NXDOMAIN",
+            "Sep  5 02:00:07 dnsmasq[61]: query[A] other.test from 127.0.0.1"))
+        entries = faults.dnsmasq_queries(text, name, 2026)
+        self.assertEqual([entry["kind"] for entry in entries],
+                         ["query", "answer", "query", "answer"])
+        since = datetime.datetime(2026, 9, 25, 2, 0, 5, tzinfo=datetime.timezone.utc).timestamp()
+        self.assertEqual(faults.dns_evidence(entries, since),
+                         {"queries_count": 1, "nxdomain_answers_count": 1,
+                          "address_answers_count": 0})
+        self.assertEqual(faults.dns_evidence(entries, 0)["address_answers_count"], 1)
+
+    # Scenario: each network condition is fed evidence with one part missing.
+    # Guarantees: disconnect needs refused upstreams, reset needs captured RSTs
+    # and reset upstreams, NXDOMAIN needs the engine's own answered queries,
+    # the DNS timeout needs dropped queries, a timed-out diagnostic lookup and
+    # a resolver that received nothing, and all need the retried nack.
+    def test_network_conditions_need_every_part(self):
+        refused = network_seen(nginx_errors={"refused": 2})
+        self.assertTrue(faults._disconnect_met(None, refused))
+        self.assertFalse(faults._disconnect_met(None, network_seen(nginx_errors={"reset": 2})))
+        self.assertFalse(faults._disconnect_met(None, dict(refused, retried=False)))
+        reset = network_seen(nginx_errors={"reset": 1}, rst_packets_count=3)
+        self.assertTrue(faults._reset_met(None, reset))
+        self.assertFalse(faults._reset_met(None, dict(reset, rst_packets_count=0)))
+        nxdomain = network_seen(dns={"engine_queries_count": 2, "nxdomain_answers_count": 4})
+        self.assertTrue(faults._dns_nxdomain_met(None, nxdomain))
+        self.assertFalse(faults._dns_nxdomain_met(None, network_seen(
+            dns={"engine_queries_count": 0, "nxdomain_answers_count": 1})))
+        timeout = network_seen(dns={"queries_count": 0}, dns_rule_packets={"udp": 6, "tcp": 0},
+                               diagnostic_dig={"timed_out": True})
+        self.assertTrue(faults._dns_timeout_met(None, timeout))
+        for broken in ({"dns": {"queries_count": 1}}, {"dns_rule_packets": {"udp": 0}},
+                       {"diagnostic_dig": {"timed_out": False}}, {"storage_nacks_count": 0}):
+            with self.subTest(broken=broken):
+                self.assertFalse(faults._dns_timeout_met(None, dict(timeout, **broken)))
+
+    # Scenario: a cohort's values object is observed with its response
+    # withheld, then after removal.
+    # Guarantees: the cohort counts only with a valid read-back, no 2xx
+    # logged, FLUSHING held and no acknowledgement (strict) or no buffer
+    # resolution (buffered); recovery needs the closed request, a 2xx retry
+    # and the acknowledgement.
+    def test_cohort_conditions_need_a_withheld_complete_object(self):
+        seen = {"values_keys": ["k"], "object": {"valid": True}, "route_log": [],
+                "stable_heads_count": 3,
+                "block_flushing_bytes": 10, "cohort_acked_requests_count": 0,
+                "buffer_resolved_delta": 0, "buffer_in_flight_count": 1, "buffered": False}
+        met = faults.CompletionCohortCase.cohort_met
+        self.assertTrue(met(seen))
+        self.assertTrue(met(dict(seen, buffered=True, cohort_acked_requests_count=10)))
+        for broken in ({"object": {"valid": False}}, {"route_log": [{"status": "200"}]},
+                       {"block_flushing_bytes": 0}, {"cohort_acked_requests_count": 1},
+                       {"values_keys": ["k", "l"]}):
+            with self.subTest(broken=broken):
+                self.assertFalse(met(dict(seen, **broken)))
+        self.assertFalse(met(dict(seen, buffered=True, buffer_resolved_delta=1)))
+        retry = {"closed_requests": [{"status": "502"}], "retried_requests": [{"status": "200"}],
+                 "exporter_acks_delta": 1, "cohort_acked_requests_count": 10,
+                 "cohort_requests_count": 10, "buffer_resolved_delta": 0, "buffered": False}
+        retried = faults.CompletionCohortCase.retry_met
+        self.assertTrue(retried(retry))
+        self.assertFalse(retried(dict(retry, closed_requests=[])))
+        self.assertFalse(retried(dict(retry, retried_requests=[])))
+        self.assertFalse(retried(dict(retry, cohort_acked_requests_count=9)))
+        self.assertTrue(retried(dict(retry, buffered=True, buffer_resolved_delta=1,
+                                     cohort_acked_requests_count=0)))
+
+    # Scenario: the multipart completion conditions see their target block.
+    # Guarantees: a dropped completion needs the object in the store and the
+    # cleanup cutoff passed; a held one needs no object, its upload open and
+    # the release instant reached.
+    def test_multipart_completion_conditions(self):
+        target = {"key": "k", "cutoff_unix_s": 990.0, "window_end_unix_s": 900.0,
+                  "failure": {"unix_s": 985.0}, "incomplete_uploads": [{"upload_id": "u"}]}
+        dropped = network_seen(target=target, target_object={"size_bytes": 1})
+        self.assertTrue(faults._dropped_multipart_met(None, dropped))
+        self.assertFalse(faults._dropped_multipart_met(None, dict(dropped, target_object=None)))
+        self.assertFalse(faults._dropped_multipart_met(None, dict(dropped, now_unix_s=990.5)))
+        self.assertFalse(faults._dropped_multipart_met(None, dict(
+            dropped, target=dict(target, failure=None))))
+        held = network_seen(target=target, object_before_release=None,
+                            uploads_before_release=[{"upload_id": "u"}],
+                            release_at_unix_s=999.0, released_unix_s=999.1)
+        self.assertTrue(faults._held_multipart_met(None, held))
+        self.assertFalse(faults._held_multipart_met(None, dict(held, released_unix_s=998.0)))
+        self.assertFalse(faults._held_multipart_met(None, dict(
+            held, object_before_release={"a": 1})))
+        self.assertFalse(faults._held_multipart_met(None, dict(held, uploads_before_release=[])))
+
+    # Scenario: the engine logs a failed write attempt with the deadline left.
+    # Guarantees: the flush's own deadline is the event's time plus the
+    # remaining Duration, in seconds or milliseconds.
+    def test_attempt_failures_name_their_deadline(self):
+        lines = [
+            "2026-09-24T22:28:03.964Z  WARN  otel.exporter.series_parquet::"
+            "series_parquet.flush.attempt_failed: [seq=3, attempt=1, file=part-a.parquet, "
+            "retryable=true, deadline_remaining=56.5s, error=parquet: External: Gene[...]] x",
+            "2026-09-24T22:28:04.000Z  WARN  otel.exporter.series_parquet::"
+            "series_parquet.flush.attempt_failed: [seq=3, attempt=2, file=part-a.parquet, "
+            "retryable=true, deadline_remaining=250ms, error=e] x"]
+        found = faults.flush_attempt_failures(lines)
+        start = datetime.datetime(2026, 9, 24, 22, 28, 3, 964000,
+                                  tzinfo=datetime.timezone.utc).timestamp()
+        self.assertEqual([entry["file"] for entry in found], ["part-a.parquet"] * 2)
+        self.assertAlmostEqual(found[0]["deadline_unix_s"], start + 56.5, places=3)
+        self.assertAlmostEqual(found[1]["deadline_unix_s"], start + 0.036 + 0.25, places=3)
+
+    # Scenario: objects whose visibility lies before and beyond L after
+    # their own window's end.
+    # Guarantees: each object is measured from its window end, by the later
+    # of LastModified and the first listing, and only those beyond L count.
+    def test_block_lateness_measures_from_the_window_end(self):
+        end = datetime.datetime(2026, 9, 25, 2, 0, 5, tzinfo=datetime.timezone.utc).timestamp()
+        key = "otel/v=1/signal=logs/dataset=values/date=2026-09-25/hour=02/" \
+              "part-20260925T020000Z-local_1-aa-00000001.parquet"
+        self.assertEqual(faults.block_window_end(key, 5), end)
+        report = faults.block_lateness([
+            {"key": key, "last_modified_unix_s": end + 3, "first_listed_unix_s": end + 150},
+            {"key": key.replace("00000001", "00000002"), "last_modified_unix_s": end + 10,
+             "first_listed_unix_s": None},
+            {"key": "otel/other", "last_modified_unix_s": end + 999}], 5, 135.0)
+        self.assertEqual(report["max_after_window_end_s"], 150.0)
+        self.assertEqual(report["beyond_bound_count"], 1)
+
+    # Scenario: the requests sent right after a store came back.
+    # Guarantees: a stalled proxy path while the store answers directly is
+    # the rig, a store that does not answer is the store, and nothing stalled
+    # is no stall.
+    def test_outage_stall_is_attributed_to_rig_or_store(self):
+        answered = {"exit_status": 0}
+        timed_out = {"exit_status": 28}
+        rig = {"bypass_namespace": answered, "bypass_host": 200, "general_proxy": answered,
+               "values_proxy": timed_out, "route_general": 200, "route_values": "ReadTimeoutError"}
+        self.assertEqual(faults.outage_stall_verdict([rig])["stall"], "rig")
+        self.assertEqual(faults.outage_stall_verdict([rig])["stalled_paths"],
+                         ["values_proxy", "route_values"])
+        store = dict(rig, bypass_namespace=timed_out)
+        self.assertEqual(faults.outage_stall_verdict([store])["stall"], "store")
+        healthy = dict(rig, values_proxy=answered, route_values=404)
+        self.assertIsNone(faults.outage_stall_verdict([healthy])["stall"])
+        self.assertFalse(faults.outage_stall_verdict([])["decided"])
+
+    # Scenario: the health check after a fault.
+    # Guarantees: both routes must answer from the store: a 404 for the
+    # absent values key is an answer, a 502 or a timeout through a route is not.
+    def test_route_health_needs_both_routes(self):
+        rig = faults.FaultRig.__new__(faults.FaultRig)
+        rig.store = mock.Mock(bucket="b")
+        rig.run_id = "r"
+        self.assertTrue(rig.route_health(FakeClient(200, 404))["answered"])
+        self.assertFalse(rig.route_health(FakeClient(200, 502))["answered"])
+        self.assertFalse(rig.route_health(FakeClient(502, 404))["answered"])
+
+    # Scenario: a network case's rig is built.
+    # Guarantees: its own direct or capability probes run on entry, before
+    # the residual check, beside the default route and capability probes.
+    def test_entry_probes_add_the_fault_probes(self):
+        self.assertEqual(faults.entry_probes("slow"), faults.FaultRig.DEFAULT_PROBES)
+        probes = faults.entry_probes("tcp_ack_loss")
+        self.assertEqual(probes[-1], "restored state")
+        self.assertIn("xt_bpf", probes)
+        self.assertIn("capture", probes)
+        self.assertIn("dropped_completion_response direct",
+                      faults.entry_probes("held_multipart_completion"))
+        self.assertTrue(all(name in faults.PROBES for name in faults.PREFLIGHT_PROBES))
+
+    # Scenario: a DNS case mounts its resolv.conf into the engine.
+    # Guarantees: a three-part mount names its own read-only target, while
+    # the other mounts keep their host path.
+    def test_engine_mounts_a_file_at_its_target(self):
+        argv = faults.engine_argv(name="e", cidfile="/c", owner="o", image="i", run_id="r",
+                                  argv=["/bin/df_engine"], user="1:1",
+                                  mounts=[("/repo", "ro"), ("/run/resolv", "/etc/resolv.conf",
+                                                            "ro")])
+        self.assertIn("/repo:/repo:ro", argv)
+        self.assertIn("/run/resolv:/etc/resolv.conf:ro", argv)
+        self.assertEqual(faults.DNS_RESOLV_CONF,
+                         "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+
+    # Scenario: several paced schedules of one case's producer.
+    # Guarantees: they report as one input from the first start to the last
+    # finish, with every request and outcome counted.
+    def test_merged_schedules_are_one_input(self):
+        merged = faults.merge_outcomes([
+            {"requests": 3, "concurrency": 3, "started_ns": 10, "finished_ns": 20,
+             "lateness_max_s": 0.1, "outcomes": {"acked": 3}},
+            {"requests": 2, "concurrency": 2, "started_ns": 30, "finished_ns": 50,
+             "lateness_max_s": 0.2, "outcomes": {"acked": 1, "failed": 1}}])
+        self.assertEqual((merged["requests"], merged["started_ns"], merged["finished_ns"]),
+                         (5, 10, 50))
+        self.assertEqual(merged["outcomes"], {"acked": 4, "failed": 1})
+
+    # Scenario: tcpdump writes its two start-up lines in one burst.
+    # Guarantees: the capture sees "listening on" and starts, instead of
+    # waiting out its deadline for a line a buffered read already consumed.
+    def test_capture_start_sees_both_lines_of_one_burst(self):
+        rig = mock.Mock(owner_id="o", artifact_dir=temporary_directory(self))
+        rig.exec.return_value = ok_command()
+        capture = faults.Capture(rig, "burst", "port 53")
+        capture.argv = ["sh", "-c", "printf 'data link type X\\nlistening on any\\n' >&2; "
+                        "exec sleep 30"]
+        started = time.monotonic()
+        with mock.patch.object(faults.Capture, "SETTLE_S", 0):
+            capture.__enter__()
+            self.assertLess(time.monotonic() - started, 5)
+            capture.process.kill()
+            capture.stop()
+        self.assertIn("listening on", capture.stderr)
+
+    # Scenario: a capture holds more frames than the evidence keeps of a
+    # command's output.
+    # Guarantees: frames are counted from tshark's whole output, never from
+    # the clipped copy a command record keeps.
+    def test_capture_counts_read_the_whole_output(self):
+        rig = mock.Mock()
+        rig.exec_output.return_value = (0, "\n".join(str(n) for n in range(5000)), "")
+        self.assertEqual(faults.pcap_count(rig, "/artifacts/x.pcap"), 5000)
+        self.assertGreater(5000 * 4, faults.OUTPUT_LIMIT)
+
+    # Scenario: the multipart completion cases pick their input.
+    # Guarantees: only request 0 is a metrics request, so a block's frozen
+    # objects are its logs files; the other cases keep the mixed input.
+    def test_multipart_completion_cases_send_logs(self):
+        workload = faults.FAULT_WORKLOADS["held_multipart_completion"]
+        self.assertEqual(workload.signal_of(0), "metrics")
+        self.assertEqual({workload.signal_of(index) for index in range(1, 2000)}, {"logs"})
+        self.assertNotIn("reset", faults.FAULT_WORKLOADS)
+
+
+class NetworkFailureTests(measurement.MeasurementTestCase):
+    """Network faults on the real store connection, in both topologies."""
+
+    # Scenario: kernel filtering drops ACK-only packets on the real store connection.
+    # Guarantees: packet loss is proven and recovery preserves IDs in both topologies.
+    def test_tcp_ack_loss(self):
+        measurement.require_long()
+        for topology in ("strict", "buffered"):
+            for store in ("minio", "rustfs"):
+                with self.subTest(topology=topology, store=store):
+                    result = faults.failure_case("network", "tcp_ack_loss", topology, store,
+                                                 self.output_dir, report_dir=self.output_dir,
+                                                 archive_dir=self.output_dir / "archive")
+                    numbers = result["observations"]["fault"]["numbers"]
+                    self.assertGreater(numbers["dropped_pure_ack_packets_count"], 0)
+                    self.assertGreater(numbers["tcp_retransmissions_count"], 0)
                     faults.fault_check(result)
 
 

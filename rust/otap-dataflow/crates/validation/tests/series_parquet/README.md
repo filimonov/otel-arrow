@@ -601,8 +601,10 @@ and the evidence that entered it (`observations.fault.states`):
      stop, a storage nack and its retry; the store stays stopped until 15 s
      past that failure, the failed block's own deadline (later than its
      window's end when it waited for the flush slot).
-3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket through
-   the route), `resumed` (a values file written and a request acknowledged
+3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket
+   through the general route and one of a values key through the values
+   route, each answered by the store; a 404 for the absent key is an answer),
+   `resumed` (a values file written and a request acknowledged
    after the removal), 20 s of acknowledged input, `input_stopped` and
    `drained` (the drain proof). Everything after `endpoint_healthy` must
    finish within 300 s.
@@ -754,6 +756,95 @@ accepts a duplicate stored before a restart and again after it, one of a
 request the producer resent because a kill cut off its acknowledgement, or
 one copied in a failed block.
 
+#### Network, DNS and acknowledgement faults
+
+`failures --family network` runs eight network cases in both topologies on
+both stores, with the S3 family's rig, engine settings, producer, state
+machine and checks, and publishes `failure-network.json`:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 \
+  taskset -c 0-7,16-23 python3 -m crates.validation.tests.series_parquet.measure \
+  failures --family network --output-dir /var/tmp/series-failure-network
+```
+
+Each case's rig first runs its own probes (`entry_probes`): the
+disconnect/reset or dropped-completion direct probe, the UDP and TCP DNS
+probes, or the `xt_bpf` and capture probes. A capture runs from just before
+arming until both routes answer again.
+
+- `disconnect`: both route proxies are disabled (`{"enabled":false}`), so
+  their listeners refuse. Observed when NGINX answered a write 502, its
+  error log names a refused upstream (`connect() failed (111: Connection
+  refused)`), the exporter retried and nacked, and the nack was retried.
+- `reset`: a `reset_peer` toxic (downstream, timeout 0) on both route
+  proxies resets each connection once the store starts answering, after
+  the request reached it. Observed with captured RSTs, a write answered 502
+  over a reset upstream (`104: Connection reset by peer`) and the retried
+  nack.
+- `dns_nxdomain`: the engine's endpoint is `lake-<run>.test:19000`, resolved
+  through a read-only resolv.conf naming only the rig's dnsmasq on the
+  namespace's loopback (`nameserver 127.0.0.1`, `options attempts:1
+  timeout:1`), which answers from the run's hosts file, is authoritative for
+  `.test` (`--local=/test/`) and never caches (`--local-ttl=0`). Arming
+  removes the name and reloads dnsmasq; connections still open to the fronts
+  are reset (`ss -K`; NGINX keeps none, `keepalive_timeout 0`). Observed when
+  the engine's own fresh queries (AAAA, which the diagnostic `dig` never
+  sends) were answered NXDOMAIN and the nack was retried.
+- `dns_timeout`: the same endpoint, and namespace-local OUTPUT rules
+  dropping UDP and TCP destination port 53. Observed when the rules counted
+  packets, a diagnostic `dig` from the namespace timed out, the resolver
+  received no query for the name, and the nack was retried. Packets dropped
+  in OUTPUT never reach the loopback capture, which therefore shows DNS
+  silence during the fault. Recovery deletes exactly those rules and needs a
+  resolving `dig`, then a new engine request.
+- `tcp_ack_loss`: an `xt_bpf` rule at the head of INPUT drops the store's
+  pure ACKs on this run's store connection (the ACK-only expression, compiled
+  in the namespace with `tcpdump -ddd -y RAW` for the inspected store address
+  and port). Observed, within the 60 s activation deadline, when the rule
+  dropped packets, the capture holds retransmissions and every captured
+  frame the rule's expression matches is a pure ACK (`tcp.len == 0`, flags
+  exactly ACK; `ack_loss_evidence_problems`), and the rule has been in place
+  35 s, past object_store's 30 s request timeout. A writer that drains
+  afterwards proves nothing about the fault.
+- `dropped_completion_response`: the values proxy's downstream `timeout`
+  toxic (timeout 0) withholds every response while requests still reach the
+  store. With the paced input paused and nothing pending in the producer,
+  the exporter or the buffer, a cohort of ten requests of one signal is sent
+  inside one window, small enough for one values PUT. Observed when the
+  cohort's values object is complete in the store, reads back as exactly the
+  cohort (`cohort_object_check`: bytes, file invariants, descriptor coverage,
+  record ids and payload hashes), answers three direct HEADs a second apart
+  unchanged, NGINX has logged no answer for it, FLUSHING holds, and the
+  strict producer has no acknowledgement for the cohort (buffered: the
+  buffer resolved nothing). Removing the toxic must close the waiting
+  request (NGINX 502) and the client must retry to a 2xx and an
+  acknowledgement. Logs and metrics cohorts run one after the other; the
+  metrics cohort's states carry `_metrics`.
+- `dropped_multipart_completion` and `held_multipart_completion` point the
+  engine at the completion front and send logs only (request 0 is the one
+  metrics request), so a block's frozen objects are its logs files and its
+  values file is a two-part multipart upload. The target is the first block
+  whose write attempt failed after arming; the attempt's
+  `series_parquet.flush.attempt_failed` event names its deadline. Dropped: the completion
+  lands and its response is dropped; the fault is held until the writer's
+  flush failed, of whatever class, and its cleanup cutoff (the failure plus
+  `upload.abort_timeout`) has passed, and
+  `late_commit_detected` requires the target's INFO
+  `series_parquet.flush.cleanup` `late_commit` event and
+  `flush.late_commits` at least 1. Held: an upstream `latency` toxic holds
+  the completion in the proxy while the writer gives up; it is released
+  10 s past the later of the writer's cleanup cutoff and the block's window
+  end plus the lateness bound, and the case records whether and when the
+  object appears. The
+  store itself drops a connection whose request has not arrived within its
+  request timeout, if it has one, so a completion held longer never lands.
+
+Every network case also records each object's visibility after its own
+window's end against the lateness bound (`block_lateness`); the partition
+hour check is that rule at an hour's last window. `straddle_cells` applies to
+the multipart completion cases as to the S3 family.
+
 The remaining subcommands (`buffered`, `remediate`, `report`) are named
 here so the command line is one contract; each is implemented by its own
 task.
@@ -892,6 +983,7 @@ requirements.lock.txt`.
 ```text
 engine --127.0.0.1:19000--> nginx --19001 general--> toxiproxy --> store
                                   \--19002 values--/
+engine --127.0.0.1:19010--> nginx (completion front) --19003 completion--/
 ```
 
 A private bridge network (unique name, labelled `series-fault-run=<id>`)
@@ -902,10 +994,11 @@ its namespace with `--network container:OWNER`, so the proxies' loopback
 listeners are real and every DNS, firewall and capture rule installed with
 `docker exec` in the owner applies to the engine's own traffic. Nothing uses
 `--privileged`, host networking, host firewall rules or module loading. The
-owner publishes NGINX, the Toxiproxy API and the engine's gRPC and admin
-ports on host loopback only. Every container starts from the inspected image
-id, never the mutable tag. The engine must be a release build (the harness's
-own profile rule; anything else is refused before launch) and its hash is
+owner publishes both NGINX fronts, the Toxiproxy API and the engine's gRPC
+and admin ports on host loopback only. Every container starts from the
+inspected image id, never the mutable tag. The engine must be a release
+build (the harness's own profile rule; anything else is refused before
+launch) and its hash is
 recorded; it runs as the invoking user with the binary and the repository
 mounted read-only and its run and buffer directories read-write, after `ldd`
 inside the image proved its shared libraries resolve; `docker inspect` gives
@@ -923,8 +1016,22 @@ Registered faults: `slow` adds the upstream `bandwidth` (rate 256 KB/s) and
 downstream `latency` (1500 ms) toxics to both proxies; `http503` creates the
 control file NGINX answers 503 for; `store_outage` stops the store container
 and recovers the same container, repointing both proxies if its address
-changed. Any activation or recovery error after preflight is a failure, and
-a fault whose recovery failed stays active so the teardown retries it.
+changed. The network family registers `disconnect`, `reset`,
+`dns_nxdomain`, `dns_timeout`, `tcp_ack_loss`, `dropped_completion_response`,
+`dropped_multipart_completion` and `held_multipart_completion` ("Network,
+DNS and acknowledgement faults"). Any activation or recovery error after
+preflight is a failure, and a fault whose recovery failed stays active so
+the teardown retries it.
+
+The completion front (`fault-nginx.conf`, port 19010) serves the same
+routes as the main front, except that a CompleteMultipartUpload of a values
+object goes through the third proxy, `completion` (19003), and a request
+whose client went away is still finished upstream
+(`proxy_ignore_client_abort`), as a store finishes a request it has
+received. Only the multipart completion cases point the engine at it. The
+tools image sends NGINX's error log to the owner's standard error; a case
+keeps it as `nginx-error.log` and counts its upstream failures by class
+(refused, reset, prematurely closed, timed out).
 
 NGINX logs each request's completion time, method, URI, status, upstream
 status, request and upstream times, response bytes, request length and the
@@ -954,16 +1061,30 @@ deletion, resolution restored), the `xt_bpf` ACK-only drop (bytecode from
 and the probe requires dropped ACKs, a non-empty capture and at least one
 retransmission, then after the exact deletion a signed PUT with a 2xx
 status and its bytes read back), a signed transfer captured and read back
-with tshark, the three activations, and the restored state. Every command's
+with tshark, the three activations, the disconnect/reset direct probe
+(each route's proxy refuses when disabled and resets under `reset_peer`,
+NGINX answers 502, while the same request straight to the store is
+answered), the dropped-completion direct probe (an untoxicated control PUT
+answered; under the withheld response the store holds the PUT's exact bytes
+and removal closes the waiting request with 502; through the completion
+front a dropped completion leaves the completed object and a held one
+publishes only after its client gave up and the toxic was removed), the
+outage stall probe (below), and the restored state. Every command's
 argv, exit status, output and duration is kept in `fault-preflight.json`,
 with the fault-class coverage those probes decide, per store: a class is
 available for a store only when that store's own probes passed, and
 available overall only when it is available for every store (the stores
 themselves start from their inspected image id, `DockerStore(kind,
-by_image_id=True)`; the legacy suite keeps the tag). `disconnect_reset` and
-`dropped_completion_response` stay unavailable until Task 11 adds their
-direct probes with negative controls; the coverage names what each must
-show.
+by_image_id=True)`; the legacy suite keeps the tag).
+
+The outage stall probe answers whether writes that stall after a store
+returned early are the rig's or the store's. It stops the store, opens a
+connection through the values proxy every 5 s as the exporter would,
+brings the store back after 80 s, and then, every 5 s until both routes
+answer, sends one request straight to the store from the namespace and
+from the host, one through each proxy and one through each NGINX route,
+recording each proxy listener's accept queue and every half-open
+connection (`outage_stall_verdict`).
 A failed `xt_bpf` probe names the host fix (`sudo modprobe xt_bpf`); the
 harness never runs it.
 

@@ -1355,7 +1355,7 @@ def build_parser() -> argparse.ArgumentParser:
         "failures",
         help="run one family's fault cases against real stores and record its index",
     )
-    _ = failures.add_argument("--family", required=True, choices=["s3", "process"])
+    _ = failures.add_argument("--family", required=True, choices=["s3", "process", "network"])
     _ = failures.add_argument("--output-dir", required=True, type=Path)
     _ = failures.add_argument("--option", action="append", default=[])
     rejudge_failures = sub.add_parser(

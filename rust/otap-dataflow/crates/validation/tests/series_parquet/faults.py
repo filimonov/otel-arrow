@@ -90,7 +90,12 @@ TOOL_PACKAGES = (
 # Namespace-local ports. They are fixed because every rig has a namespace of
 # its own; only ports the harness chooses are published on host loopback.
 NGINX_PORT = 19000
-PROXY_PORTS = {"general": 19001, "values": 19002}
+# `completion` carries only the completion front's CompleteMultipartUpload
+# requests of values objects (`fault-nginx.conf`).
+PROXY_PORTS = {"general": 19001, "values": 19002, "completion": 19003}
+# The proxies the main front on NGINX_PORT routes through.
+ROUTE_PROXIES = ("general", "values")
+COMPLETION_FRONT_PORT = 19010
 TOXIPROXY_API_PORT = 8474
 STORE_ALIAS = "store"
 STORE_PORT = 9000
@@ -200,8 +205,6 @@ FAULT_CLASS_PROBES = {
     "store_outage": BASE_PROBES + ("store_outage activation",),
     "slow": BASE_PROBES + ("slow activation",),
     "http503": BASE_PROBES + ("http503 activation",),
-    # No direct probe with a negative control exists for these two yet, so
-    # they stay unavailable until the task that owns them adds one.
     "disconnect_reset": BASE_PROBES + ("disconnect_reset direct",),
     "dropped_completion_response": BASE_PROBES + ("dropped_completion_response direct",),
     "dns_nxdomain_timeout": BASE_PROBES + ("UDP DNS", "TCP DNS"),
@@ -209,18 +212,8 @@ FAULT_CLASS_PROBES = {
     "containerized_engine": BASE_PROBES + ("engine launch",),
 }
 
-# Classes whose direct probe a later task owns, and what it must show.
-DEFERRED_PROBES = {
-    "disconnect_reset direct": (
-        "Task 11: a client-observed connection reset and refused connection "
-        "through the route while a bypass request succeeds (negative control)"
-    ),
-    "dropped_completion_response direct": (
-        "Task 11 (reused by Task 13): a values PUT whose completion response is "
-        "withheld while the bypass HEAD/GET shows the complete object, against "
-        "an untoxicated control PUT"
-    ),
-}
+# Probes a class needs that no probe implements yet, and what each must show.
+DEFERRED_PROBES = {}
 
 
 def _consequence(failed, missing, deferred, *, required) -> str:
@@ -530,6 +523,7 @@ def owner_argv(*, name, cidfile, network, image, run_id, control_dir, artifact_d
         "--volume", f"{control_dir}:{CONTROL_MOUNT}:ro",
         "--volume", f"{artifact_dir}:{ARTIFACT_MOUNT}:rw",
         "--publish", f"127.0.0.1::{NGINX_PORT}",
+        "--publish", f"127.0.0.1::{COMPLETION_FRONT_PORT}",
         "--publish", f"127.0.0.1::{TOXIPROXY_API_PORT}",
     ]
     for port in engine_ports:
@@ -561,7 +555,8 @@ def engine_argv(*, name, cidfile, owner, image, run_id, argv, mounts, user,
     engine's. The binary and the repository are mounted read-only, the run
     and buffer directories read-write, each at its own host path, so the
     engine's command line and configuration stay exactly as for a local
-    launch. It gets no added capability.
+    launch; a `(source, target, mode)` mount, such as a run's resolv.conf,
+    names its own target. It gets no added capability.
     """
     command = [
         "docker", "run", "--pull=never", "--name", name, "--cidfile", str(cidfile),
@@ -569,8 +564,9 @@ def engine_argv(*, name, cidfile, owner, image, run_id, argv, mounts, user,
         "--network", f"container:{owner}",
         "--user", user,
     ]
-    for path, mode in mounts:
-        command += ["--volume", f"{path}:{path}:{mode}"]
+    for mount in mounts:
+        source, target, mode = mount if len(mount) == 3 else (mount[0], mount[0], mount[1])
+        command += ["--volume", f"{source}:{target}:{mode}"]
     for key in ENGINE_ENVIRONMENT:
         if env and key in env:
             command += ["--env", f"{key}={env[key]}"]
@@ -659,6 +655,7 @@ class ContainerLauncher:
         self.launches = []
         self.ldd = {}
         self.extra_mounts = []
+        self.file_mounts = []
 
     def reserve_ports(self):
         """The (gRPC, admin) ports the owner publishes on host loopback."""
@@ -667,6 +664,10 @@ class ContainerLauncher:
     def mount(self, path):
         """Also mount `path` read-write, for a directory outside the run root."""
         self.extra_mounts.append(Path(path).resolve())
+
+    def mount_file(self, source, target):
+        """Mount one host file read-only at `target` in every later engine."""
+        self.file_mounts.append((Path(source).resolve(), target, "ro"))
 
     def check_binary(self, binary):
         """Fail unless `binary` is a release engine whose libraries resolve.
@@ -741,7 +742,7 @@ class ContainerLauncher:
             seen.add(path)
             path.mkdir(parents=True, exist_ok=True)
             mounts.append((path, "rw"))
-        return mounts
+        return mounts + list(self.file_mounts)
 
     def start(self, argv, log, env):
         """Start the engine container attached, with its output in `log`."""
@@ -1131,6 +1132,7 @@ class FaultRig:
             raise AssertionError(f"toxiproxy did not start: {done['stderr']}")
         self.toxiproxy_port = self._published(TOXIPROXY_API_PORT)
         self.nginx_port = self._published(NGINX_PORT)
+        self.completion_port = self._published(COMPLETION_FRONT_PORT)
         self.toxiproxy = Toxiproxy(f"http://127.0.0.1:{self.toxiproxy_port}")
         self._wait(lambda: self.toxiproxy.version(), "the toxiproxy API")
         self.toxiproxy_version = self.toxiproxy.version()
@@ -1357,11 +1359,52 @@ class FaultRig:
         """The owner namespace's filter table, as `iptables -S` prints it."""
         return self.exec(["iptables", "-w", "-S"])["stdout"]
 
-    def route_client(self, *, read_timeout=30):
-        """A signed S3 client that reaches the store through NGINX."""
+    def exec_output(self, argv, *, timeout=120) -> tuple:
+        """One command in the owner's namespace: its exit status and its whole
+        standard output, which `exec` would clip for the evidence."""
+        done = subprocess.run(["docker", "exec", self.owner_id, *argv], capture_output=True,
+                              timeout=timeout, check=False)
+        return done.returncode, done.stdout.decode(errors="replace"), \
+            done.stderr.decode(errors="replace")
+
+    def nginx_error_log(self) -> str:
+        """NGINX's error log, which the tools image sends to the owner's stderr."""
+        if not self.owner_id:
+            return ""
+        done = subprocess.run(["docker", "logs", self.owner_id], capture_output=True,
+                              timeout=DOCKER_TIMEOUT_S, check=False)
+        return done.stderr.decode(errors="replace")
+
+    def route_health(self, client) -> dict:
+        """What the store answered through each route of the main front.
+
+        A signed HEAD of the bucket travels the general proxy and a signed
+        HEAD of a values key the values proxy; a status from the store,
+        404 for the absent key included, is an answer.
+        """
+        answers = {}
+        for route, call in (
+                ("general", lambda: client.head_bucket(Bucket=self.store.bucket)),
+                ("values", lambda: client.head_object(
+                    Bucket=self.store.bucket,
+                    Key=f"fault-health/{self.run_id}/dataset=values/health"))):
+            try:
+                answers[route] = call()["ResponseMetadata"]["HTTPStatusCode"]
+            except ClientError as error:
+                answers[route] = error.response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode")
+            except BotoCoreError as error:
+                answers[route] = type(error).__name__
+        answers["answered"] = (answers["general"] == 200 and answers["values"] in (200, 404))
+        return answers
+
+    def route_client(self, *, read_timeout=30, completion_front=False):
+        """A signed S3 client that reaches the store through NGINX's main
+        front, or through its completion front."""
         return boto3.client(
             "s3",
-            endpoint_url=self.route_endpoint,
+            endpoint_url=(f"http://127.0.0.1:{self.completion_port}" if completion_front
+                          else self.route_endpoint),
             region_name="us-east-1",
             aws_access_key_id=self.store.key,
             aws_secret_access_key=self.store.secret,
@@ -1869,13 +1912,15 @@ def probe_dns(rig, protocol) -> dict:
 class Capture:
     """One tcpdump capture in the owner's namespace, written to the artifacts."""
 
-    def __init__(self, rig, name, expression):
+    def __init__(self, rig, name, expression, *, seconds=60, snaplen=None, interface="any"):
         self.rig = rig
         self.file = f"{ARTIFACT_MOUNT}/{name}.pcap"
         self.host_file = rig.artifact_dir / f"{name}.pcap"
-        self.argv = ["docker", "exec", rig.owner_id, "timeout", "60", "tcpdump",
-                     "-Z", "root", "-i", "any", "--immediate-mode", "-U", "-n",
-                     "-w", self.file, expression]
+        self.argv = ["docker", "exec", rig.owner_id, "timeout", str(int(seconds)), "tcpdump",
+                     "-Z", "root", "-i", interface, "--immediate-mode", "-U", "-n"]
+        if snaplen:
+            self.argv += ["-s", str(int(snaplen))]
+        self.argv += ["-w", self.file, expression]
         self.process = None
         self.stderr = ""
 
@@ -1883,13 +1928,16 @@ class Capture:
         self.process = subprocess.Popen(self.argv, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE)
         deadline = time.monotonic() + 10
+        # Read the raw descriptor: a buffered readline can hold the second
+        # line where select no longer sees it.
+        descriptor = self.process.stderr.fileno()
         while time.monotonic() < deadline and "listening on" not in self.stderr:
-            ready, _, _ = select.select([self.process.stderr], [], [], 0.2)
+            ready, _, _ = select.select([descriptor], [], [], 0.2)
             if ready:
-                line = self.process.stderr.readline().decode(errors="replace")
-                if not line:
+                chunk = os.read(descriptor, 4096).decode(errors="replace")
+                if not chunk:
                     break
-                self.stderr += line
+                self.stderr += chunk
         if "listening on" not in self.stderr:
             self.stop()
             raise AssertionError(f"tcpdump did not start: {self.stderr}")
@@ -2483,7 +2531,10 @@ def preflight_fault_tools(required: bool, *, output_dir=None, report_dir=None,
 
 # Each family's faults; a matrix cell is one fault, topology and store.
 FAILURE_FAMILIES = {"s3": ("slow", "http503", "store_outage"),
-                    "process": ("graceful_restart", "kill_active", "kill_upload")}
+                    "process": ("graceful_restart", "kill_active", "kill_upload"),
+                    "network": ("disconnect", "reset", "dns_nxdomain", "dns_timeout",
+                                "tcp_ack_loss", "dropped_completion_response",
+                                "dropped_multipart_completion", "held_multipart_completion")}
 FAILURE_TOPOLOGIES = ("strict", "buffered")
 
 # A finite mixed-signal producer: 20 requests of 100 one-KiB records a
@@ -2495,6 +2546,12 @@ FAULT_WORKLOAD = measurement.Workload(
     requests=FAULT_MAX_REQUESTS, records_per_request=100, body_bytes=1024, series=100,
     metrics_every=10,
 )
+# The same input with only request 0 a metrics request: a block's frozen
+# objects are then its logs files alone, so a late commit of its multipart
+# values object is the whole block.
+LOGS_WORKLOAD = dataclasses.replace(FAULT_WORKLOAD, metrics_every=FAULT_MAX_REQUESTS + 1)
+FAULT_WORKLOADS = {"dropped_multipart_completion": LOGS_WORKLOAD,
+                   "held_multipart_completion": LOGS_WORKLOAD}
 # Five-second windows of that input hold about 6.8 MB of compressed logs
 # values, above the S3 minimum part size of 5 MiB, so every case uploads
 # its logs values files as multipart uploads.
@@ -2507,7 +2564,12 @@ FAULT_AFTER_S = 20
 # How long each fault may take to show its intended condition; for a
 # process case, how long each of its lifecycle gates may take.
 FAULT_OBSERVE_DEADLINE_S = {"slow": 180, "http503": 240, "store_outage": 240,
-                            "graceful_restart": 60, "kill_active": 60, "kill_upload": 120}
+                            "graceful_restart": 60, "kill_active": 60, "kill_upload": 120,
+                            "disconnect": 240, "reset": 240, "dns_nxdomain": 240,
+                            "dns_timeout": 240, "tcp_ack_loss": 60,
+                            "dropped_completion_response": 25,
+                            "dropped_multipart_completion": 180,
+                            "held_multipart_completion": 300}
 # Everything after the endpoint is healthy again -- resumption, the rest of
 # the input and the drain -- must finish within this.
 RECOVERY_DEADLINE_S = 300
@@ -3110,7 +3172,8 @@ def failure_spec(family, fault, topology, store, *, ordinal=1, cores=None) -> me
     return measurement.RunSpec(
         run_id=measurement.RunSpec.build_run_id(case, topology, store, cores,
                                                 FAULT_INTERVAL_S, int(ordinal)),
-        case=case, topology=topology, store=store, cores=cores, workload=FAULT_WORKLOAD,
+        case=case, topology=topology, store=store, cores=cores,
+        workload=FAULT_WORKLOADS.get(fault, FAULT_WORKLOAD),
         interval_s=FAULT_INTERVAL_S,
         duration_s=FAULT_MAX_REQUESTS // FAULT_RATE_REQUESTS_PER_S,
         producer_timeout_s=FAULT_PRODUCER_TIMEOUT_S, max_in_flight=128,
@@ -3132,8 +3195,9 @@ class FaultCase:
     the evidence that moved the case into it: `input_started`; `baseline`,
     a completed values object HEADed in the store, a nonempty ACTIVE block
     and live input; `armed`; `observed`, the fault's intended condition
-    (`FAULT_CONDITIONS`); `fault_removed`; `endpoint_healthy`, a signed HEAD
-    through the route answered; `resumed`, a values file written and a
+    (`FAULT_CONDITIONS`); `fault_removed`; `endpoint_healthy`, signed HEADs
+    through the general and the values route answered (`FaultRig.route_health`);
+    `resumed`, a values file written and a
     request acknowledged after the removal; `input_stopped`; `drained`.
     """
 
@@ -3309,7 +3373,7 @@ class FaultCase:
         self.transition("observed", evidence)
 
     def remove_fault(self, controls, store_cores):
-        """Remove the fault, then wait for a signed HEAD through the route."""
+        """Remove the fault, then wait for both routes to answer."""
         self.rig.recover()
         self.transition("fault_removed", {"totals": self.totals(),
                                           "recovery": self.rig.activations[-1].get("recovery")})
@@ -3321,18 +3385,13 @@ class FaultCase:
         removed = self.at("fault_removed")
 
         def observe():
-            try:
-                status = client.head_bucket(Bucket=self.store.bucket)["ResponseMetadata"][
-                    "HTTPStatusCode"]
-            except (ClientError, BotoCoreError) as error:
-                status = type(error).__name__
-            return {"head_bucket_status": status,
+            return {"routes": self.rig.route_health(client),
                     "elapsed_s": (time.monotonic_ns() - removed["monotonic_ns"]) / 1e9}
 
         evidence = measurement.wait_until(
-            observe, lambda seen: seen["head_bucket_status"] == 200,
+            observe, lambda seen: seen["routes"]["answered"],
             deadline_ns=removed["monotonic_ns"] + ENDPOINT_HEALTH_DEADLINE_S * 10**9,
-            description="a signed HEAD of the bucket through the route",
+            description="signed HEADs through the general and the values route",
         )
         self.transition("endpoint_healthy", evidence)
 
@@ -3459,6 +3518,19 @@ class FaultCase:
             "endpoint_healthy_to_drained_s": self.span("endpoint_healthy", "drained"),
             "drain_s": self.span("input_stopped", "drained"),
         }
+
+    def produce(self, producer, stop):
+        """The case's input: paced requests until `stop`."""
+        return producer.send_paced(range(self.spec.workload.requests),
+                                   FAULT_RATE_REQUESTS_PER_S, stop=stop)
+
+    def collect(self, record):
+        """What the case reads from the rig before it is removed: nothing."""
+        return {}
+
+    def oracle_extras(self, ledger):
+        """The case's own read of the loaded oracle rows: none."""
+        return None
 
     def attempt(self, step, *args):
         """Run one step; a failure is recorded and ends the fault sequence."""
@@ -3601,14 +3673,14 @@ def failure_prerequisites(store) -> dict:
     return images
 
 
-def launch_engine(root, rig, spec, output_dir, binary):
+def launch_engine(root, rig, spec, output_dir, binary, storage=None):
     """One containerized release engine of a fault case, in the rig's namespace.
 
     The launch options are kept on the engine, so `restart_engine` starts
-    its successor exactly alike.
+    its successor exactly alike. `storage` defaults to the rig's route.
     """
     options = {
-        "storage": rig.storage, "launcher": rig.launcher,
+        "storage": storage or rig.storage, "launcher": rig.launcher,
         "overrides": {"retry": spec.overrides["retry"]},
         "interval": f"{spec.interval_s}s", "topology": spec.topology,
         "buffer_path": Path(output_dir) / "buffer" if spec.topology == "buffered" else None,
@@ -3661,10 +3733,15 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
         if store_pid and store_cores:
             controls.register("store", store_pid, store_cores)
         result["ephemeral_values"] = {"<store_endpoint>": store.endpoint}
-        rig = FaultRig(store, output_dir / "rig", cores=allocation.get("fault_tools") or None)
+        fault = spec.overrides["fault"]
+        rig = FaultRig(store, output_dir / "rig", cores=allocation.get("fault_tools") or None,
+                       probes=entry_probes(fault))
         with rig:
+            setup = NETWORK_SETUP.get(fault)
+            storage = setup(rig) if setup else None
+            result["config"]["network"] = getattr(rig, "network_setup", None)
             engine = launch_engine(output_dir / "engine-1", rig, spec, output_dir,
-                                   provenance["build"]["binary"])
+                                   provenance["build"]["binary"], storage=storage)
             engines.append(engine)
             try:
                 settings = exporter_settings(engine.config)
@@ -3691,6 +3768,9 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                 if process:
                     case = ProcessCase(spec, rig, store, engine, phase, ledger, lister, settings,
                                        controls=controls, engines=engines)
+                elif fault in FAILURE_FAMILIES["network"]:
+                    case = NETWORK_CASES.get(fault, NetworkCase)(
+                        spec, rig, store, engine, phase, ledger, lister, settings)
                 else:
                     case = FaultCase(spec, rig, store, engine, phase, ledger, lister, settings)
                 _ = command.await_window_start(spec.interval_s)
@@ -3699,8 +3779,7 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                 sent = {}
 
                 def produce():
-                    sent["outcome"] = producer.send_paced(
-                        range(spec.workload.requests), FAULT_RATE_REQUESTS_PER_S, stop=stop)
+                    sent["outcome"] = case.produce(producer, stop)
 
                 sender = threading.Thread(target=produce, name="fault-producer")
                 case.transition("input_started")
@@ -3747,6 +3826,7 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
             record["requests"] = case.route_requests()
             record["events"] = engine_events("\n".join(
                 Path(launched.log.name).read_text(errors="replace") for launched in engines))
+            record["network"] = case.collect(record)
         record["rig"] = rig.evidence()
         record["rig_cleanup_clean"] = bool((rig.cleanup_report or {}).get("clean"))
         record["objects"] = lister.objects()
@@ -3794,6 +3874,7 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
         failed_ids = failed_block_record_ids(local, spec.workload,
                                              record["events"]["failed_files"])
         record["duplicates"] = duplicate_attribution(ledger, failed_ids)
+        record["case_oracle"] = case.oracle_extras(ledger)
         if process:
             record["replay"] = replay_analysis(
                 ledger, values_rows_by_file(local, spec.workload), case.replay_events(),
@@ -5009,6 +5090,1767 @@ class ProcessCase(FaultCase):
             "orphan_cleanup": record.get("orphan_cleanup"),
             "expected_orphans": self.expected_orphans(),
         }}
+
+
+# --------------------------------------------------------------------------
+# Network, DNS, TCP acknowledgement and completion-response faults
+# --------------------------------------------------------------------------
+
+# Toxiproxy bodies of the network faults, in its own units.
+RESET_TOXIC = {"name": "reset", "type": "reset_peer", "stream": "downstream",
+               "toxicity": 1.0, "attributes": {"timeout": 0}}
+DROP_COMPLETION_TOXIC = {"name": "drop_completion", "type": "timeout", "stream": "downstream",
+                         "toxicity": 1.0, "attributes": {"timeout": 0}}
+# A request held in the proxy for up to ten minutes; removing the toxic
+# delivers what it holds.
+HOLD_COMPLETION_TOXIC = {"name": "hold_completion", "type": "latency", "stream": "upstream",
+                         "toxicity": 1.0, "attributes": {"latency": 600000, "jitter": 0}}
+# The DNS timeout's namespace-local rules: every query to any resolver dropped.
+DNS_TIMEOUT_RULES = (["OUTPUT", "-p", "udp", "--dport", "53", "-j", "DROP"],
+                     ["OUTPUT", "-p", "tcp", "--dport", "53", "-j", "DROP"])
+# The DNS cases' resolver: dnsmasq on the namespace's loopback, answering
+# only from the run's hosts file, authoritative for `.test`, never cached.
+DNS_RESOLV_CONF = "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n"
+DNS_HOSTS = "hosts"
+DNSMASQ_CASE_PID = "/run/series-dnsmasq-case.pid"
+DNSMASQ_CASE_LOG = "dnsmasq-case.log"
+# Requests per single-signal cohort: about a megabyte of logs, one PUT. Its
+# completed object must show within FAULT_OBSERVE_DEADLINE_S, inside
+# object_store's 30 s request timeout.
+COHORT_REQUESTS = 10
+# The withheld object must answer this many direct HEADs, this far apart,
+# unchanged.
+COHORT_HEADS = 3
+COHORT_HEAD_PERIOD_S = 1.0
+# A held completion is released this long past the later of the writer's
+# cleanup cutoff and its block's window end plus L.
+HELD_RELEASE_MARGIN_S = 10
+# How long a released completion may take to publish its object.
+RELEASE_VISIBLE_S = 30
+# A capture of a network case outlives its fault by this much.
+CAPTURE_MARGIN_S = 120
+# Headers are enough for the TCP evidence.
+CAPTURE_SNAPLEN = 128
+# The ACK loss is held past object_store's 30 s request timeout, inside the
+# case's 60 s activation deadline.
+ACK_LOSS_HOLD_S = 35
+# How often a costly observation (tshark, docker logs, iptables) is refreshed.
+COSTLY_PERIOD_S = 2.0
+
+
+def _curl(rig, url, *, max_time=5):
+    """One unsigned request from the owner's namespace, as curl saw it.
+
+    curl's exit status names the transport outcome: 0 answered, 7 refused,
+    28 timed out, 52 empty reply, 56 reset by peer.
+    """
+    done = rig.exec(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
+                     str(max_time), url], timeout=max_time + 15)
+    return {"url": url, "exit_status": done["exit_status"], "http_code": done["stdout"].strip(),
+            "stderr": done["stderr"].strip()[:200], "elapsed_s": done["elapsed_s"]}
+
+
+CURL_OUTCOMES = {0: "answered", 7: "refused", 28: "timed_out", 52: "empty_reply", 56: "reset"}
+
+
+def curl_outcome(entry) -> str:
+    """The transport outcome of one `_curl` record."""
+    return CURL_OUTCOMES.get(entry.get("exit_status"), f"exit_{entry.get('exit_status')}")
+
+
+def _add_toxics(rig, placements):
+    """Add each (proxy, toxic) and require every proxy to carry exactly its own."""
+    for proxy, toxic in placements:
+        rig.toxiproxy.add_toxic(proxy, toxic)
+    proxies = sorted({proxy for proxy, _toxic in placements})
+    state = {proxy: rig.toxiproxy.toxics(proxy) for proxy in proxies}
+    for proxy, present in state.items():
+        wanted = sorted(toxic["name"] for name, toxic in placements if name == proxy)
+        if sorted(entry["name"] for entry in present) != wanted:
+            raise AssertionError(f"proxy {proxy} carries toxics {present} after activation")
+    return {"placements": [[proxy, toxic] for proxy, toxic in placements], "api_state": state,
+            "units": TOXIC_UNITS}
+
+
+def _remove_toxics(rig, state):
+    """Remove exactly the toxics `_add_toxics` placed."""
+    for proxy, toxic in state["placements"]:
+        rig.toxiproxy.remove_toxic(proxy, toxic["name"])
+    remaining = {proxy: rig.toxiproxy.toxics(proxy)
+                 for proxy in sorted({proxy for proxy, _toxic in state["placements"]})}
+    if any(remaining.values()):
+        raise AssertionError(f"toxics remain after recovery: {remaining}")
+    return {"api_state": remaining, "removed_unix_s": time.time()}
+
+
+def _toxic_fault(placements):
+    """A registered fault that adds `placements` and removes them again."""
+    return (lambda rig, parameters: _add_toxics(rig, placements), _remove_toxics)
+
+
+def _activate_disconnect(rig, parameters):
+    """Disable both routes' proxies: their listeners close and refuse."""
+    for proxy in ROUTE_PROXIES:
+        rig.toxiproxy.update(proxy, {"enabled": False})
+    enabled = {name: entry.get("enabled") for name, entry in rig.toxiproxy.proxies().items()
+               if name in ROUTE_PROXIES}
+    if any(enabled.values()):
+        raise AssertionError(f"proxies still enabled after the disconnect: {enabled}")
+    return {"proxies": list(ROUTE_PROXIES), "enabled_after": enabled}
+
+
+def _recover_disconnect(rig, state):
+    """Enable both proxies again."""
+    for proxy in state["proxies"]:
+        rig.toxiproxy.update(proxy, {"enabled": True})
+    enabled = {name: entry.get("enabled") for name, entry in rig.toxiproxy.proxies().items()
+               if name in state["proxies"]}
+    if not all(enabled.values()):
+        raise AssertionError(f"proxies not enabled after recovery: {enabled}")
+    return {"enabled_after": enabled, "removed_unix_s": time.time()}
+
+
+def dig(rig, name, *, timeout_s=1):
+    """One diagnostic lookup of `name` from the owner's namespace: its status and answer."""
+    done = rig.exec(["dig", "@127.0.0.1", "-p", "53", f"+time={timeout_s}", "+tries=1",
+                     name, "A"], timeout=30)
+    status = re.search(r"status: ([A-Z]+)", done["stdout"])
+    answer = re.findall(rf"^{re.escape(name)}\.\s+\d+\s+IN\s+A\s+(\S+)", done["stdout"], re.M)
+    return {"exit_status": done["exit_status"], "status": status[1] if status else None,
+            "answers": answer, "elapsed_s": done["elapsed_s"],
+            "timed_out": done["exit_status"] == 9}
+
+
+def write_dns_hosts(rig, present):
+    """The run's hosts file: the endpoint name mapped to NGINX, or nothing."""
+    (rig.control_dir / DNS_HOSTS).write_text(f"127.0.0.1 {rig.dns_name}\n" if present else "")
+
+
+def reload_dnsmasq(rig):
+    """Make the case's dnsmasq read its hosts file again (SIGHUP)."""
+    done = rig.exec(["sh", "-c", f"kill -HUP \"$(cat {DNSMASQ_CASE_PID})\""])
+    if done["exit_status"] != 0:
+        raise AssertionError(f"dnsmasq could not be reloaded: {done}")
+    return done
+
+
+def reset_front_connections(rig):
+    """Reset every established connection to NGINX's fronts in the namespace.
+
+    NGINX closes each client connection after one response
+    (`keepalive_timeout 0`), so none should exist; any that does is killed
+    with `ss -K`, which forces the engine to open, and resolve, a new one.
+    """
+    selector = ["state", "established", f"( dport = :{NGINX_PORT} or dport = "
+                f":{COMPLETION_FRONT_PORT} )"]
+    before = rig.exec(["ss", "-tnH", *selector])
+    killed = rig.exec(["ss", "-K", "-tnH", *selector]) if before["stdout"].strip() else None
+    return {"established_before": before["stdout"].splitlines(),
+            "killed": killed and {key: killed[key] for key in ("exit_status", "stdout", "stderr")}}
+
+
+def _activate_dns_nxdomain(rig, parameters):
+    """Remove the endpoint's name and reload: the resolver answers NXDOMAIN."""
+    write_dns_hosts(rig, False)
+    reload_dnsmasq(rig)
+    lookup = dig(rig, rig.dns_name)
+    if lookup["status"] != "NXDOMAIN":
+        raise AssertionError(f"the endpoint name still resolves: {lookup}")
+    return {"name": rig.dns_name, "dig": lookup, "connections": reset_front_connections(rig)}
+
+
+def _recover_dns_nxdomain(rig, state):
+    """Restore the name and reload; it must resolve to NGINX again."""
+    write_dns_hosts(rig, True)
+    reload_dnsmasq(rig)
+    lookup = dig(rig, rig.dns_name)
+    if lookup["answers"] != ["127.0.0.1"]:
+        raise AssertionError(f"the endpoint name does not resolve after recovery: {lookup}")
+    return {"dig": lookup, "removed_unix_s": time.time()}
+
+
+def dns_rule_counters(rig):
+    """Packets each DNS timeout rule dropped so far."""
+    listing = rig.exec(["iptables", "-w", "-v", "-S", "OUTPUT"])["stdout"]
+    return {rule[2]: rule_counters(listing, [f"-p {rule[2]}", "--dport 53", "-j DROP"])
+            .get("packets") for rule in DNS_TIMEOUT_RULES}
+
+
+def _activate_dns_timeout(rig, parameters):
+    """Drop every DNS query leaving any process in the namespace."""
+    for rule in DNS_TIMEOUT_RULES:
+        done = rig.exec(["iptables", "-w", "-I", rule[0], "1", *rule[1:]])
+        if done["exit_status"] != 0:
+            raise AssertionError(f"the DNS rule {rule} could not be inserted: {done['stderr']}")
+    return {"rules": [list(rule) for rule in DNS_TIMEOUT_RULES],
+            "connections": reset_front_connections(rig)}
+
+
+def _recover_dns_timeout(rig, state):
+    """Delete exactly those rules; the name must resolve again."""
+    counters = dns_rule_counters(rig)
+    for rule in state["rules"]:
+        done = rig.exec(["iptables", "-w", "-D", *rule])
+        if done["exit_status"] != 0:
+            raise AssertionError(f"the DNS rule {rule} could not be deleted: {done['stderr']}")
+    lookup = dig(rig, rig.dns_name)
+    if lookup["answers"] != ["127.0.0.1"]:
+        raise AssertionError(f"the endpoint name does not resolve after recovery: {lookup}")
+    return {"counters_at_removal": counters, "dig": lookup, "removed_unix_s": time.time()}
+
+
+def ack_rule(bytecode):
+    """The INPUT rule dropping what the ACK-only program matches."""
+    return ["INPUT", "-p", "tcp", "-m", "bpf", "--bytecode", bytecode, "-j", "DROP"]
+
+
+def ack_rule_packets(rig):
+    """Packets the ACK-only rule dropped so far, or None when it is absent."""
+    listing = rig.exec(["iptables", "-w", "-v", "-S", "INPUT"])["stdout"]
+    return rule_counters(listing, ["-m bpf", "-j DROP"]).get("packets")
+
+
+def _activate_tcp_ack_loss(rig, parameters):
+    """Drop the store's pure ACKs on this run's store connection with xt_bpf."""
+    bytecode = ack_drop_bytecode(rig.store_ip, STORE_PORT,
+                                 tcpdump=("docker", "exec", rig.owner_id, "tcpdump"))
+    rule = ack_rule(bytecode)
+    done = rig.exec(["iptables", "-w", "-I", "INPUT", "1", *rule[1:]])
+    if done["exit_status"] != 0:
+        raise AssertionError(f"the ACK-only rule could not be inserted: {done['stderr']}")
+    return {"rule": rule, "bytecode": bytecode, "store_ip": rig.store_ip,
+            "store_port": STORE_PORT, "expression": ack_only_expression(rig.store_ip, STORE_PORT)}
+
+
+def _recover_tcp_ack_loss(rig, state):
+    """Delete exactly that rule, reading its counter first."""
+    packets = ack_rule_packets(rig)
+    done = rig.exec(["iptables", "-w", "-D", *state["rule"]])
+    if done["exit_status"] != 0:
+        raise AssertionError(f"the ACK-only rule could not be deleted: {done['stderr']}")
+    return {"dropped_packets_at_removal": packets, "removed_unix_s": time.time()}
+
+
+register_fault("disconnect", _activate_disconnect, _recover_disconnect)
+register_fault("reset", *_toxic_fault([(proxy, RESET_TOXIC) for proxy in ROUTE_PROXIES]))
+register_fault("dns_nxdomain", _activate_dns_nxdomain, _recover_dns_nxdomain)
+register_fault("dns_timeout", _activate_dns_timeout, _recover_dns_timeout)
+register_fault("tcp_ack_loss", _activate_tcp_ack_loss, _recover_tcp_ack_loss)
+register_fault("dropped_completion_response", *_toxic_fault([("values", DROP_COMPLETION_TOXIC)]))
+register_fault("dropped_multipart_completion",
+               *_toxic_fault([("completion", DROP_COMPLETION_TOXIC)]))
+register_fault("held_multipart_completion", *_toxic_fault([("completion", HOLD_COMPLETION_TOXIC)]))
+
+
+# NGINX error log lines by how the upstream connection failed.
+NGINX_ERROR_CLASSES = (
+    ("refused", re.compile(r"\(111: Connection refused\)")),
+    ("reset", re.compile(r"\(104: Connection reset by peer\)")),
+    ("prematurely_closed", re.compile(r"upstream prematurely closed")),
+    ("timed_out", re.compile(r"\(110: Connection timed out\)|upstream timed out")),
+)
+NGINX_ERROR_TIME = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(\w+)\]")
+
+
+def nginx_error_classes(text, since_unix_s=None, until_unix_s=None) -> dict:
+    """NGINX error log lines counted by upstream failure class, in a window.
+
+    The log's timestamps are UTC at second resolution, so the window is
+    widened to whole seconds.
+    """
+    counts = collections.Counter()
+    examples = {}
+    for line in text.splitlines():
+        stamp = NGINX_ERROR_TIME.match(line)
+        if not stamp:
+            continue
+        instant = datetime.datetime.strptime(stamp[1], "%Y/%m/%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+        if since_unix_s is not None and instant < int(since_unix_s):
+            continue
+        if until_unix_s is not None and instant > until_unix_s + 1:
+            continue
+        label = next((name for name, pattern in NGINX_ERROR_CLASSES if pattern.search(line)),
+                     "other")
+        counts[label] += 1
+        examples.setdefault(label, line[:300])
+    return {"counts": dict(sorted(counts.items())), "examples": examples}
+
+
+DNSMASQ_LINE = re.compile(
+    r"^(\w{3} [ \d]\d \d\d:\d\d:\d\d) dnsmasq\[\d+\]: (query\[(\w+)\] (\S+) from \S+|"
+    r"(?:config|\S+) (\S+) is (\S+))")
+
+
+def dnsmasq_queries(text, name, year) -> list:
+    """Every query for `name` and every answer dnsmasq logged, with its time."""
+    found = []
+    for line in text.splitlines():
+        match = DNSMASQ_LINE.match(line)
+        if not match:
+            continue
+        instant = datetime.datetime.strptime(f"{year} {match[1]}", "%Y %b %d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+        if match[4] == name:
+            found.append({"unix_s": instant, "kind": "query", "type": match[3]})
+        elif match[5] == name:
+            found.append({"unix_s": instant, "kind": "answer", "answer": match[6]})
+    return found
+
+
+def dns_evidence(entries, since_unix_s, until_unix_s=None) -> dict:
+    """Queries and answers for the endpoint within a window, whole seconds wide."""
+    chosen = [entry for entry in entries if entry["unix_s"] >= int(since_unix_s)
+              and (until_unix_s is None or entry["unix_s"] <= until_unix_s + 1)]
+    return {"queries_count": sum(1 for entry in chosen if entry["kind"] == "query"),
+            "nxdomain_answers_count": sum(1 for entry in chosen if entry["kind"] == "answer"
+                                          and entry["answer"] == "NXDOMAIN"),
+            "address_answers_count": sum(1 for entry in chosen if entry["kind"] == "answer"
+                                         and entry["answer"] != "NXDOMAIN"
+                                         and not entry["answer"].startswith("NODATA"))}
+
+
+def pcap_count(rig, capture_file, display_filter=None) -> int:
+    """Frames of one capture tshark reads, optionally only those a filter keeps.
+
+    The capture may still be written; tshark's complaint about a cut-off
+    last frame does not discard the frames it did read.
+    """
+    argv = ["tshark", "-n", "-r", capture_file, "-T", "fields", "-e", "frame.number"]
+    if display_filter:
+        argv[4:4] = ["-Y", display_filter]
+    status, stdout, stderr = rig.exec_output(argv)
+    if status not in (0, 2) and not stdout.strip():
+        raise AssertionError(f"tshark could not read {capture_file}: {stderr[:300]}")
+    return len(stdout.split())
+
+
+def ack_capture_evidence(rig, capture, expression, store_ip) -> dict:
+    """What a capture of the store connection shows about the ACK-only rule.
+
+    The capture is filtered again with the rule's exact expression; every
+    frame that expression keeps must be a pure ACK (TCP payload length 0,
+    flags exactly ACK), so no data-bearing segment counts as one.
+    Retransmissions are tshark's `tcp.analysis.retransmission`.
+    """
+    matched = f"{capture.file}.matched"
+    filtered = rig.exec(["tcpdump", "-n", "-r", capture.file, "-w", matched, expression],
+                        timeout=120)
+    evidence = {"filter_exit_status": filtered["exit_status"]}
+    if filtered["exit_status"] != 0:
+        evidence["error"] = filtered["stderr"][:300]
+        return evidence
+    pure = "tcp.len == 0 && tcp.flags == 0x010"
+    evidence.update({
+        "captured_packets_count": pcap_count(rig, capture.file),
+        "matched_packets_count": pcap_count(rig, matched),
+        "matched_pure_ack_packets_count": pcap_count(rig, matched, pure),
+        "store_pure_ack_packets_count": pcap_count(
+            rig, capture.file, f"ip.src == {store_ip} && tcp.srcport == {STORE_PORT} && {pure}"),
+        "store_data_packets_count": pcap_count(
+            rig, capture.file, f"ip.src == {store_ip} && tcp.srcport == {STORE_PORT} "
+            "&& tcp.len > 0"),
+        "tcp_retransmissions_count": pcap_count(rig, capture.file,
+                                                "tcp.analysis.retransmission"),
+    })
+    return evidence
+
+
+def ack_loss_evidence_problems(dropped, evidence) -> list:
+    """Why a TCP ACK loss case did not prove its fault; empty when it did.
+
+    The rule must have dropped packets, the capture must hold retransmissions,
+    and every captured frame the rule's expression matches must be a pure ACK,
+    so no data-bearing segment is taken for one. A writer that drained
+    afterwards proves nothing about the fault.
+    """
+    problems = []
+    if not isinstance(dropped, int) or dropped <= 0:
+        problems.append(f"the ACK-only rule dropped no packets: {dropped}")
+    matched = evidence.get("matched_packets_count")
+    if not isinstance(matched, int) or matched <= 0:
+        problems.append(f"the capture holds no frame the rule's expression matches: {matched}")
+    elif evidence.get("matched_pure_ack_packets_count") != matched:
+        problems.append(f"{matched - (evidence.get('matched_pure_ack_packets_count') or 0)} of "
+                        f"{matched} matched frames are not pure ACKs")
+    retransmissions = evidence.get("tcp_retransmissions_count")
+    if not isinstance(retransmissions, int) or retransmissions <= 0:
+        problems.append(f"no TCP retransmission was captured: {retransmissions}")
+    return problems
+
+
+def block_window_end(key, interval_s):
+    """The end of the window a part file's name stamps, in Unix seconds, or None."""
+    match = re.search(r"/part-(\d{8}T\d{6}Z)-", "/" + key)
+    if not match:
+        return None
+    start = datetime.datetime.strptime(match[1], "%Y%m%dT%H%M%SZ").replace(
+        tzinfo=datetime.timezone.utc).timestamp()
+    return start + interval_s
+
+
+def block_lateness(objects, interval_s, bound_s) -> dict:
+    """Each object's visibility after its own window ended, against the bound.
+
+    L bounds how long after a block's window closed its writer may still
+    publish it; the partition hour check is this rule at the hour's last
+    window. Visibility is the later of the store's LastModified and the
+    first direct listing that showed the object.
+    """
+    late = []
+    worst = None
+    for item in objects:
+        end = block_window_end(item["key"], interval_s)
+        if end is None:
+            continue
+        seen = [value for value in (item.get("last_modified_unix_s"),
+                                    item.get("first_listed_unix_s")) if value is not None]
+        if not seen:
+            continue
+        after = round(max(seen) - end, 3)
+        worst = after if worst is None or after > worst else worst
+        if after > bound_s:
+            late.append({"key": item["key"], "after_window_end_s": after})
+    return {"bound_s": bound_s, "max_after_window_end_s": worst,
+            "beyond_bound": sorted(late, key=lambda entry: -entry["after_window_end_s"])[:20],
+            "beyond_bound_count": len(late)}
+
+
+def outage_stall_verdict(samples) -> dict:
+    """Whether a stall after a store's return lies in the rig or in the store.
+
+    `samples[0]` holds the requests sent together right after the store came
+    back: straight to the store from the namespace and from the host,
+    through each proxy and through NGINX's two routes. A stalled proxy path
+    while the store itself answers is the rig; a store that does not answer
+    either is the store; nothing stalled is no stall.
+    """
+    if not samples:
+        return {"decided": False, "stall": None, "stalled_paths": [], "direct_answered": None}
+    first = samples[0]
+    direct = (curl_outcome(first.get("bypass_namespace") or {}) == "answered"
+              and first.get("bypass_host") == 200)
+    stalled = [name for name in ("general_proxy", "values_proxy")
+               if curl_outcome(first.get(name) or {}) != "answered"]
+    stalled += [name for name in ("route_general", "route_values")
+                if first.get(name) not in (200, 404)]
+    stall = None if not stalled else "rig" if direct else "store"
+    return {"decided": True, "stall": stall, "stalled_paths": stalled, "direct_answered": direct}
+
+
+# Stores that came back about 80 s after the stop stalled the route's writes,
+# those back after 140 s did not (`failure-s3.json`).
+OUTAGE_STALL_RETURN_S = 80
+OUTAGE_STALL_WATCH_S = 200
+OUTAGE_STALL_PERIOD_S = 5
+
+
+def proxy_sockets(rig) -> dict:
+    """The namespace's view of the proxies' sockets: each listener's accept
+    queue (connections the kernel accepted that the proxy has not taken yet)
+    and every half-open (SYN-SENT) connection to the store."""
+    listening = rig.exec(["ss", "-ltnH"])["stdout"].splitlines()
+    queues = {}
+    for proxy, port in PROXY_PORTS.items():
+        for line in listening:
+            fields = line.split()
+            if len(fields) >= 4 and fields[3].endswith(f":{port}"):
+                queues[proxy] = int(fields[1])
+    return {"accept_queue": queues,
+            "syn_sent": rig.exec(["ss", "-tnH", "state", "syn-sent"])["stdout"].splitlines()}
+
+
+def probe_outage_stall(rig) -> dict:
+    """Is the stall after a store returned early the rig's or the store's?
+
+    Stop the store and, as the exporter does, keep opening connections
+    through the values proxy (one every OUTAGE_STALL_PERIOD_S, each given
+    up after 3 s), recording the proxies' accept queues and half-open
+    connections. Bring the store back after OUTAGE_STALL_RETURN_S, then,
+    every OUTAGE_STALL_PERIOD_S until both routes answer, send one request
+    straight to the store from the namespace and from the host, one through
+    each proxy and one through each NGINX route (`outage_stall_verdict`).
+    """
+    probe = new_probe("outage stall", rig)
+    started = time.monotonic()
+    problems = []
+    samples = []
+    during = []
+    client = rig.route_client(read_timeout=4)
+    try:
+        rig.activate("store_outage", {})
+    except AssertionError as error:
+        return finish(probe, started, False, str(error))
+    stopped = time.monotonic()
+    try:
+        while time.monotonic() - stopped < OUTAGE_STALL_RETURN_S:
+            began = time.monotonic()
+            during.append(dict(proxy_sockets(rig), since_stop_s=round(began - stopped, 3),
+                               values_proxy=_curl(rig, f"http://127.0.0.1:{PROXY_PORTS['values']}/",
+                                                  max_time=3)))
+            time.sleep(max(0.0, min(OUTAGE_STALL_PERIOD_S - (time.monotonic() - began),
+                                    OUTAGE_STALL_RETURN_S - (time.monotonic() - stopped))))
+    finally:
+        rig.recover()
+    returned_s = round(time.monotonic() - stopped, 3)
+    while time.monotonic() - stopped < OUTAGE_STALL_WATCH_S:
+        began = time.monotonic()
+        sample = dict(proxy_sockets(rig), since_stop_s=round(began - stopped, 3),
+                      bypass_namespace=_curl(rig, f"http://{rig.store_ip}:{STORE_PORT}/",
+                                             max_time=4))
+        try:
+            sample["bypass_host"] = rig.store.client.head_bucket(Bucket=rig.store.bucket)[
+                "ResponseMetadata"]["HTTPStatusCode"]
+        except (ClientError, BotoCoreError) as error:
+            sample["bypass_host"] = type(error).__name__
+        for name, proxy in (("general_proxy", "general"), ("values_proxy", "values")):
+            sample[name] = _curl(rig, f"http://127.0.0.1:{PROXY_PORTS[proxy]}/", max_time=4)
+        routes = rig.route_health(client)
+        sample["route_general"], sample["route_values"] = routes["general"], routes["values"]
+        samples.append(sample)
+        if curl_outcome(sample["values_proxy"]) == "answered" and routes["answered"]:
+            break
+        time.sleep(max(0.0, OUTAGE_STALL_PERIOD_S - (time.monotonic() - began)))
+    verdict = outage_stall_verdict(samples)
+    answered = next((sample["since_stop_s"] for sample in samples
+                     if curl_outcome(sample["values_proxy"]) == "answered"), None)
+    probe["evidence"] = {
+        "during_outage": during, "returned_after_stop_s": returned_s, "samples": samples,
+        "verdict": verdict, "values_proxy_answered_after_stop_s": answered,
+        "activation": rig.activations[-1],
+    }
+    if not verdict["decided"]:
+        problems.append("no request was sent after the store returned")
+    if answered is None:
+        problems.append(f"the values proxy never answered within {OUTAGE_STALL_WATCH_S} s")
+    return finish(probe, started, not problems, "; ".join(problems) or (
+        f"stall: {verdict['stall']}; stalled paths {verdict['stalled_paths']} while the store "
+        f"answered directly: {verdict['direct_answered']}; the values proxy answered "
+        f"{answered} s after the stop (store back at {returned_s} s)"))
+
+
+def _stored(store, key):
+    """The bytes the store holds under `key`, read directly, or None."""
+    try:
+        return store.client.get_object(Bucket=store.bucket, Key=key)["Body"].read()
+    except (ClientError, BotoCoreError):
+        return None
+
+
+def probe_disconnect_reset(rig) -> dict:
+    """A disabled proxy refuses and a reset toxic resets, while the store answers.
+
+    Through each route's proxy a direct connection is refused (disconnect)
+    or reset by peer (reset), NGINX answers the signed PUT through the route
+    502 and logs the upstream failure by class, and the same request
+    straight to the store (the negative control) is answered throughout.
+    """
+    probe = new_probe("disconnect_reset direct", rig)
+    started = time.monotonic()
+    problems = []
+    client = rig.route_client(read_timeout=10)
+    bucket = rig.store.bucket
+    key = f"fault-preflight/{rig.run_id}/dataset=values/disconnect-reset"
+    seen = {}
+    for fault, wanted in (("disconnect", "refused"), ("reset", "reset")):
+        since = time.time()
+        try:
+            rig.activate(fault, {})
+        except AssertionError as error:
+            return finish(probe, started, False, str(error))
+        try:
+            direct = {proxy: _curl(rig, f"http://127.0.0.1:{PROXY_PORTS[proxy]}/")
+                      for proxy in ROUTE_PROXIES}
+            _s3_op(probe, f"put_under_{fault}", lambda: client.put_object(
+                Bucket=bucket, Key=key, Body=fault.encode() * 512), key=key)
+            route_status = probe["operations"][-1].get("status")
+            bypass = _curl(rig, f"http://{rig.store_ip}:{STORE_PORT}/")
+        finally:
+            rig.recover()
+        time.sleep(0.3)
+        errors = nginx_error_classes(rig.nginx_error_log(), since)
+        seen[fault] = {"direct": direct, "route_status": route_status, "bypass": bypass,
+                       "stored_under_fault": _stored(rig.store, key) == fault.encode() * 512,
+                       "nginx_errors": errors,
+                       "after": {proxy: _curl(rig, f"http://127.0.0.1:{PROXY_PORTS[proxy]}/")
+                                 for proxy in ROUTE_PROXIES}}
+        for proxy, entry in direct.items():
+            if curl_outcome(entry) != wanted:
+                problems.append(f"{fault}: the {proxy} proxy was {curl_outcome(entry)}, "
+                                f"expected {wanted}")
+        if route_status != 502:
+            problems.append(f"{fault}: NGINX answered {route_status}, expected 502")
+        if curl_outcome(bypass) != "answered":
+            problems.append(f"{fault}: the store itself was {curl_outcome(bypass)}")
+        if not errors["counts"].get(wanted):
+            problems.append(f"{fault}: NGINX logged no {wanted} upstream: {errors['counts']}")
+        for proxy, entry in seen[fault]["after"].items():
+            if curl_outcome(entry) != "answered":
+                problems.append(f"{fault}: the {proxy} proxy did not answer after recovery")
+    ok, _ = _s3_op(probe, "put_restored", lambda: client.put_object(
+        Bucket=bucket, Key=key, Body=b"restored"), key=key)
+    if not ok:
+        problems.append("the signed PUT failed after recovery")
+    _s3_op(probe, "delete_object", lambda: rig.store.client.delete_object(Bucket=bucket, Key=key))
+    probe["evidence"] = seen
+    probe["restored"] = rig.residual_state()
+    if not probe["restored"]["clean"]:
+        problems.append("the rig is not clean after the probe")
+    return finish(probe, started, not problems, "; ".join(problems) or (
+        "disabled proxies refused and reset toxics reset both routes while the store "
+        "answered directly; NGINX answered 502 and logged refused and reset upstreams"))
+
+
+def probe_dropped_completion(rig) -> dict:
+    """A completion response withheld while the object is complete in the store.
+
+    An untoxicated control PUT is answered; under `dropped_completion_response`
+    a values PUT gets no response while the store directly holds its exact
+    bytes, and removing the toxic closes the waiting connection (NGINX 502).
+    Through the completion front, a CompleteMultipartUpload under
+    `dropped_multipart_completion` gets no response while the store holds the
+    completed object, and one held by `held_multipart_completion` publishes
+    nothing until its client has given up and the toxic is removed.
+    """
+    probe = new_probe("dropped_completion_response direct", rig)
+    started = time.monotonic()
+    problems = []
+    bucket = rig.store.bucket
+    base = f"fault-preflight/{rig.run_id}/dataset=values/completion"
+    body = _payload(PROBE_TRANSFER_BYTES, base)
+    evidence = {}
+    control = rig.route_client(read_timeout=10)
+    ok, _ = _s3_op(probe, "control_put", lambda: control.put_object(
+        Bucket=bucket, Key=base + "-control", Body=body), key=base + "-control")
+    evidence["control_put"] = probe["operations"][-1]
+    if not ok:
+        problems.append("the untoxicated control PUT failed")
+    rig.activate("dropped_completion_response", {})
+    waiting = {}
+
+    def withheld_put():
+        slow = rig.route_client(read_timeout=60)
+        _s3_op(probe, "withheld_put", lambda: slow.put_object(
+            Bucket=bucket, Key=base + "-withheld", Body=body), key=base + "-withheld")
+        waiting["operation"] = probe["operations"][-1]
+
+    thread = threading.Thread(target=withheld_put, name="withheld-put")
+    try:
+        thread.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _stored(rig.store, base + "-withheld") != body:
+            time.sleep(0.1)
+        evidence["stored_while_withheld"] = _stored(rig.store, base + "-withheld") == body
+        evidence["waiting_while_stored"] = thread.is_alive()
+    finally:
+        rig.recover()
+    thread.join(30)
+    evidence["withheld_put"] = waiting.get("operation")
+    if not evidence["stored_while_withheld"] or not evidence["waiting_while_stored"]:
+        problems.append(f"the PUT was not stored while its response was withheld: {evidence}")
+    if (waiting.get("operation") or {}).get("status") != 502:
+        problems.append(f"removing the toxic did not close the waiting PUT with 502: "
+                        f"{waiting.get('operation')}")
+    parts = [_payload(MULTIPART_PART_BYTES, base + "-1"), _payload(4096, base + "-2")]
+    for fault, key in (("dropped_multipart_completion", base + "-multipart-dropped"),
+                       ("held_multipart_completion", base + "-multipart-held")):
+        front = rig.route_client(read_timeout=5, completion_front=True)
+        made, upload = _s3_op(probe, f"{fault}_create", lambda: front.create_multipart_upload(
+            Bucket=bucket, Key=key), key=key)
+        etags = []
+        for number, part in enumerate(parts, 1):
+            if made:
+                done, answer = _s3_op(probe, f"{fault}_part_{number}", lambda: front.upload_part(
+                    Bucket=bucket, Key=key, UploadId=upload["UploadId"], PartNumber=number,
+                    Body=part), bytes=len(part))
+                made &= done
+                if done:
+                    etags.append({"ETag": answer["ETag"], "PartNumber": number})
+        if not made:
+            problems.append(f"{fault}: the upload could not be prepared")
+            continue
+        rig.activate(fault, {})
+        try:
+            answered, _ = _s3_op(probe, f"{fault}_complete", lambda: front.complete_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload["UploadId"],
+                MultipartUpload={"Parts": etags}), key=key)
+            gave_up = time.time()
+            time.sleep(2)
+            present = _stored(rig.store, key)
+        finally:
+            rig.recover()
+        released = time.time()
+        visible = None
+        while time.time() - released < 10:
+            if _stored(rig.store, key) == b"".join(parts):
+                visible = round(time.time() - released, 3)
+                break
+            time.sleep(0.1)
+        evidence[fault] = {"answered": answered, "present_after_client_gave_up":
+                           present == b"".join(parts), "client_gave_up_unix_s": gave_up,
+                           "visible_after_removal_s": visible}
+        if answered:
+            problems.append(f"{fault}: the completion was answered")
+        if fault == "dropped_multipart_completion" and present != b"".join(parts):
+            problems.append(f"{fault}: the completed object was not in the store")
+        if fault == "held_multipart_completion" and (present is not None or visible is None):
+            problems.append(f"{fault}: the held completion published before its release "
+                            f"({present is not None}) or never ({visible})")
+    ok, _ = _s3_op(probe, "control_put_after", lambda: control.put_object(
+        Bucket=bucket, Key=base + "-control", Body=body), key=base + "-control")
+    if not ok:
+        problems.append("the control PUT failed after recovery")
+    time.sleep(0.3)
+    evidence["route_log"] = [entry for entry in parse_access_log(rig.artifact_dir / ACCESS_LOG)
+                             if base in entry.get("uri", "")]
+    for suffix in ("-control", "-withheld", "-multipart-dropped", "-multipart-held"):
+        _s3_op(probe, "delete_object", lambda: rig.store.client.delete_object(
+            Bucket=bucket, Key=base + suffix))
+    probe["evidence"] = evidence
+    probe["restored"] = rig.residual_state()
+    if not probe["restored"]["clean"]:
+        problems.append("the rig is not clean after the probe")
+    return finish(probe, started, not problems, "; ".join(problems) or (
+        "withheld completions left complete objects in the store, removal closed the waiting "
+        "PUT with 502, and a held completion published only after its release"))
+
+
+PROBES.update({"disconnect_reset direct": probe_disconnect_reset,
+               "dropped_completion_response direct": probe_dropped_completion,
+               "outage stall": probe_outage_stall})
+PREFLIGHT_PROBES = PREFLIGHT_PROBES[:-1] + (
+    "disconnect_reset direct", "dropped_completion_response direct", "outage stall",
+) + PREFLIGHT_PROBES[-1:]
+
+# The probes a network case's rig runs on entry, beside the route and
+# capability probes, before any traffic.
+NETWORK_ENTRY_PROBES = {
+    "disconnect": ("disconnect_reset direct",),
+    "reset": ("disconnect_reset direct",),
+    "dns_nxdomain": ("UDP DNS", "TCP DNS"),
+    "dns_timeout": ("UDP DNS", "TCP DNS"),
+    "tcp_ack_loss": ("xt_bpf", "capture"),
+    "dropped_completion_response": ("dropped_completion_response direct",),
+    "dropped_multipart_completion": ("dropped_completion_response direct",),
+    "held_multipart_completion": ("dropped_completion_response direct",),
+}
+
+
+def entry_probes(fault) -> tuple:
+    """The rig's entry probes for one fault: the defaults, the fault's own, the residual check."""
+    defaults = FaultRig.DEFAULT_PROBES
+    return defaults[:-1] + NETWORK_ENTRY_PROBES.get(fault, ()) + defaults[-1:]
+
+
+def dns_setup(rig) -> dict:
+    """The DNS cases' resolver and the engine's endpoint name; returns its storage.
+
+    The probe resolver is stopped, the case's dnsmasq started with the run's
+    hosts file mapping `lake-<run>.test` to NGINX, the engine given a
+    read-only resolv.conf naming only that resolver, and the name must
+    resolve before any traffic.
+    """
+    rig.exec(["sh", "-c", "pkill -x dnsmasq; true"])
+    rig.dnsmasq = None
+    rig.dns_name = f"lake-{rig.run_id}.test"
+    write_dns_hosts(rig, True)
+    daemon = rig.exec([
+        "dnsmasq", "--conf-file=/dev/null", "--user=root", "--no-resolv", "--no-hosts",
+        "--bind-interfaces", f"--listen-address={DNS_LISTEN}", "--port=53", "--log-queries",
+        "--local=/test/", f"--addn-hosts={CONTROL_MOUNT}/{DNS_HOSTS}", "--local-ttl=0",
+        f"--log-facility={ARTIFACT_MOUNT}/{DNSMASQ_CASE_LOG}", f"--pid-file={DNSMASQ_CASE_PID}",
+    ])
+    if daemon["exit_status"] != 0:
+        raise AssertionError(f"the case's dnsmasq did not start: {daemon['stderr']}")
+    resolv = rig.root / "resolv.conf"
+    resolv.write_text(DNS_RESOLV_CONF)
+    rig.launcher.mount_file(resolv, "/etc/resolv.conf")
+    lookup = dig(rig, rig.dns_name)
+    if lookup["answers"] != ["127.0.0.1"]:
+        raise AssertionError(f"the endpoint name does not resolve: {lookup}")
+    storage = json.loads(json.dumps(rig.storage))
+    storage["s3"]["endpoint"] = f"http://{rig.dns_name}:{NGINX_PORT}"
+    rig.network_setup = {"dns_name": rig.dns_name, "endpoint": storage["s3"]["endpoint"],
+                         "resolv_conf": DNS_RESOLV_CONF, "dnsmasq": daemon["argv"],
+                         "dig": lookup}
+    return storage
+
+
+def completion_front_setup(rig) -> dict:
+    """The multipart completion cases' storage: the engine uses the completion front."""
+    storage = json.loads(json.dumps(rig.storage))
+    storage["s3"]["endpoint"] = f"http://127.0.0.1:{COMPLETION_FRONT_PORT}"
+    rig.network_setup = {"endpoint": storage["s3"]["endpoint"]}
+    return storage
+
+
+NETWORK_SETUP = {"dns_nxdomain": dns_setup, "dns_timeout": dns_setup,
+                 "dropped_multipart_completion": completion_front_setup,
+                 "held_multipart_completion": completion_front_setup}
+
+# The capture each network fault keeps: its tcpdump expression.
+NETWORK_CAPTURES = {
+    "reset": lambda rig: (f"(tcp port {PROXY_PORTS['general']} or tcp port "
+                          f"{PROXY_PORTS['values']}) and tcp[tcpflags] & tcp-rst != 0"),
+    "dns_nxdomain": lambda rig: "port 53",
+    "dns_timeout": lambda rig: "port 53",
+    "tcp_ack_loss": lambda rig: f"host {rig.store_ip} and tcp port {STORE_PORT}",
+}
+
+
+DURATION_FIELD = re.compile(r"([0-9.]+)(ms|us|\u00b5s|ns|s)\b")
+DURATION_SCALE = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "ns": 1e-9}
+
+
+def flush_attempt_failures(lines) -> list:
+    """Every `flush.attempt_failed` event: its time, file and the deadline it names.
+
+    The event carries `deadline_remaining` as Rust prints a Duration, so the
+    flush's own deadline is the event's time plus that.
+    """
+    found = []
+    for line in lines:
+        line = ANSI.sub("", line)
+        match = EVENT_LINE.search(line)
+        stamp = LOG_TIMESTAMP.search(line)
+        if not match or not stamp or match[2] != "series_parquet.flush.attempt_failed":
+            continue
+        file = re.search(r"\bfile=([^,\s\]]+)", match[4])
+        remaining = re.search(r"\bdeadline_remaining=(\S+?),", match[4])
+        amount = DURATION_FIELD.fullmatch(remaining[1]) if remaining else None
+        instant = datetime.datetime.fromisoformat(stamp[1]).replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+        found.append({"unix_s": instant, "file": file[1] if file else None,
+                      "deadline_unix_s": instant + float(amount[1]) * DURATION_SCALE[amount[2]]
+                      if amount else None})
+    return found
+
+
+def flush_cleanups(lines) -> list:
+    """Every `flush.cleanup` event in engine log lines: its time, outcome and file."""
+    found = []
+    for line in lines:
+        line = ANSI.sub("", line)
+        match = EVENT_LINE.search(line)
+        stamp = LOG_TIMESTAMP.search(line)
+        if not match or not stamp or match[2] != "series_parquet.flush.cleanup":
+            continue
+        outcome = re.search(r"\boutcome=(\w+)", match[4])
+        file = re.search(r"\bfile=([^,\s\]]+)", match[4])
+        found.append({"unix_s": datetime.datetime.fromisoformat(stamp[1]).replace(
+            tzinfo=datetime.timezone.utc).timestamp(),
+            "outcome": outcome[1] if outcome else None, "file": file[1] if file else None,
+            "level": match[1]})
+    return found
+
+
+def any_event(*events):
+    """An event set as soon as any of `events` is."""
+    combined = threading.Event()
+    for event in events:
+        threading.Thread(target=lambda e=event: (e.wait(), combined.set()), daemon=True).start()
+    return combined
+
+
+def merge_outcomes(outcomes) -> dict:
+    """One `send_paced` outcome for several consecutive schedules."""
+    counts = collections.Counter()
+    for outcome in outcomes:
+        counts.update(outcome.get("outcomes") or {})
+    return {"requests": sum(outcome["requests"] for outcome in outcomes),
+            "concurrency": max((outcome["concurrency"] for outcome in outcomes), default=0),
+            "rate_requests_per_s": FAULT_RATE_REQUESTS_PER_S,
+            "started_ns": min(outcome["started_ns"] for outcome in outcomes),
+            "finished_ns": max(outcome["finished_ns"] for outcome in outcomes),
+            "lateness_max_s": max((outcome["lateness_max_s"] for outcome in outcomes), default=0),
+            "outcomes": dict(counts), "schedules_count": len(outcomes)}
+
+
+class NetworkCase(FaultCase):
+    """A network fault case: the S3 family's state machine with network evidence.
+
+    The fault's own condition (`FAULT_CONDITIONS`) reads what the rig saw:
+    NGINX's upstream failures by class, captured RSTs, the resolver's
+    queries and answers, rule counters, retransmissions and the pure-ACK
+    check. A capture runs from just before arming until the routes are
+    healthy again.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capture = None
+        self.costly = {}
+        self.flush_events = {"failures": [], "cleanups": [], "attempts": []}
+        self.network = {"setup": getattr(self.rig, "network_setup", None)}
+
+    def cached(self, name, compute):
+        """A costly observation, refreshed at most every COSTLY_PERIOD_S."""
+        now = time.monotonic()
+        entry = self.costly.get(name)
+        if entry is None or now - entry[0] >= COSTLY_PERIOD_S:
+            entry = (now, compute())
+            self.costly[name] = entry
+        return entry[1]
+
+    def engine_flush_events(self):
+        """Every flush failure and cleanup the current engine logged so far."""
+        if self.log is not None:
+            lines = self.log.lines()
+            self.flush_events["failures"].extend(flush_failures(lines))
+            self.flush_events["cleanups"].extend(flush_cleanups(lines))
+            self.flush_events["attempts"].extend(flush_attempt_failures(lines))
+        return self.flush_events
+
+    def dns_entries(self):
+        """The case resolver's log, parsed."""
+        _status, text, _stderr = self.rig.exec_output(
+            ["cat", f"{ARTIFACT_MOUNT}/{DNSMASQ_CASE_LOG}"])
+        return dnsmasq_queries(text, self.rig.dns_name, time.gmtime().tm_year)
+
+    def arm(self, parameters=None):
+        """Start the fault's capture, then activate it."""
+        expression = NETWORK_CAPTURES.get(self.fault)
+        if expression is not None:
+            self.capture = Capture(self.rig, f"{self.fault}-{self.store.kind}",
+                                   expression(self.rig),
+                                   seconds=FAULT_OBSERVE_DEADLINE_S[self.fault] + CAPTURE_MARGIN_S,
+                                   snaplen=CAPTURE_SNAPLEN)
+            self.capture.__enter__()
+        super().arm(parameters)
+        if self.fault == "dns_timeout":
+            self.network["diagnostic_dig"] = dig(self.rig, self.rig.dns_name)
+
+    def observe_condition(self):
+        """The S3 family's observations plus the fault's network evidence."""
+        observed = super().observe_condition()
+        armed = self.at("armed")
+        requests = [entry for entry in self.route_requests()
+                    if _within(entry, armed["unix_s"], None)]
+        observed["engine_requests_logged_count"] = len(requests)
+        observed["http_502_writes_count"] = sum(
+            1 for entry in requests if entry.get("status") == "502"
+            and entry.get("method") in ("PUT", "POST"))
+        if self.fault in ("disconnect", "reset"):
+            observed["nginx_errors"] = self.cached("nginx_errors", lambda: nginx_error_classes(
+                self.rig.nginx_error_log(), armed["unix_s"]))["counts"]
+        if self.fault == "reset":
+            observed["rst_packets_count"] = self.cached(
+                "rst", lambda: pcap_count(self.rig, self.capture.file))
+        if self.fault in ("dns_nxdomain", "dns_timeout"):
+            entries = self.cached("dns", self.dns_entries)
+            observed["dns"] = dns_evidence(entries, armed["unix_s"])
+            # glibc asks for AAAA as well; the harness's diagnostic dig asks only A.
+            observed["dns"]["engine_queries_count"] = sum(
+                1 for entry in entries if entry["kind"] == "query" and entry["type"] == "AAAA"
+                and entry["unix_s"] >= int(armed["unix_s"]))
+        if self.fault == "dns_timeout":
+            observed["dns_rule_packets"] = self.cached("dns_rules",
+                                                       lambda: dns_rule_counters(self.rig))
+            observed["diagnostic_dig"] = self.network.get("diagnostic_dig")
+        if self.fault == "tcp_ack_loss":
+            observed["dropped_pure_ack_packets_count"] = self.cached(
+                "ack_rule", lambda: ack_rule_packets(self.rig))
+            observed["ack_capture"] = self.cached("ack_capture", lambda: ack_capture_evidence(
+                self.rig, self.capture, armed["evidence"]["activation"]["state"]["expression"],
+                self.rig.store_ip))
+        return observed
+
+    def remove_fault(self, controls, store_cores):
+        """Remove the fault, wait for both routes, then close the capture."""
+        try:
+            super().remove_fault(controls, store_cores)
+        finally:
+            self.close_capture()
+
+    def close_capture(self):
+        """Stop the capture and read its final evidence."""
+        if self.capture is None or self.capture.process is None:
+            return
+        self.capture.stop()
+        final = {"capture": self.capture.as_json()}
+        if self.fault == "tcp_ack_loss":
+            state = self.at("armed")["evidence"]["activation"]["state"]
+            final["ack_capture"] = ack_capture_evidence(self.rig, self.capture,
+                                                        state["expression"], self.rig.store_ip)
+        elif self.fault == "reset":
+            final["rst_packets_count"] = pcap_count(self.rig, self.capture.file)
+        else:
+            windows = self.fault_window()
+            final["dns_packets_count"] = pcap_count(self.rig, self.capture.file)
+            final["dns_packets_during_fault_count"] = pcap_count(
+                self.rig, self.capture.file,
+                f"frame.time_epoch >= {windows[0]} && frame.time_epoch < {windows[1]}")
+        self.network["capture"] = final
+
+    def collect(self, record):
+        """What the rig alone can still tell before it is removed."""
+        self.close_capture()
+        window = self.fault_window()
+        text = self.rig.nginx_error_log()
+        (self.rig.artifact_dir / "nginx-error.log").write_text(text)
+        self.network["nginx_errors_during_fault"] = nginx_error_classes(
+            text, *(window if window else (None, None)))
+        if self.fault in ("dns_nxdomain", "dns_timeout") and window and window[1]:
+            entries = self.dns_entries()
+            self.network["dns_during_fault"] = dns_evidence(entries, window[0], window[1])
+            self.network["dns_after_fault"] = dns_evidence(entries, window[1])
+        self.network["activations"] = self.rig.activations
+        return self.network
+
+    def verdicts(self, record):
+        """The S3 family's two verdicts, then the fault's own checks."""
+        return super().verdicts(record) + self.network_verdicts(record)
+
+    def network_verdicts(self, record):
+        """Checks beside the common ones: none by default."""
+        return []
+
+    def numbers(self, record, during):
+        """The S3 family's numbers plus the network evidence's."""
+        numbers = super().numbers(record, during)
+        network = record.get("network") or {}
+        observed = (self.at("observed") or {}).get("evidence", {})
+        errors = (network.get("nginx_errors_during_fault") or {}).get("counts", {})
+        capture = network.get("capture") or {}
+        ack = capture.get("ack_capture") or {}
+        numbers.update({
+            "http_502_responses_count": (sum(
+                count for statuses in during["status_by_operation"].values()
+                for status, count in statuses.items() if status == "502") if during else None),
+            "nginx_upstream_refused_count": errors.get("refused", 0),
+            "nginx_upstream_reset_count": errors.get("reset", 0),
+            "nginx_upstream_prematurely_closed_count": errors.get("prematurely_closed", 0),
+            "nginx_upstream_timed_out_count": errors.get("timed_out", 0),
+            "rst_packets_count": capture.get("rst_packets_count"),
+            "engine_requests_during_fault_count": during["requests_count"] if during else None,
+            "dns_engine_queries_count": (observed.get("dns") or {}).get("engine_queries_count"),
+            "dns_nxdomain_answers_count": (network.get("dns_during_fault") or {}).get(
+                "nxdomain_answers_count"),
+            "dns_queries_during_fault_count": (network.get("dns_during_fault") or {}).get(
+                "queries_count"),
+            "dns_packets_during_fault_count": capture.get("dns_packets_during_fault_count"),
+            "dns_rule_dropped_udp_count": (observed.get("dns_rule_packets") or {}).get("udp"),
+            "dns_rule_dropped_tcp_count": (observed.get("dns_rule_packets") or {}).get("tcp"),
+            "dropped_pure_ack_packets_count": self.removal_state().get(
+                "dropped_packets_at_removal", observed.get("dropped_pure_ack_packets_count")),
+            "tcp_retransmissions_count": ack.get("tcp_retransmissions_count"),
+            "ack_matched_packets_count": ack.get("matched_packets_count"),
+            "ack_matched_pure_ack_packets_count": ack.get("matched_pure_ack_packets_count"),
+            "block_visibility_max_after_window_end_s": block_lateness(
+                record["objects"], self.spec.interval_s,
+                lateness_bound_s(self.settings))["max_after_window_end_s"],
+        })
+        return numbers
+
+    def removal_state(self):
+        """What the fault's recovery recorded, such as counters read before removal."""
+        activation = (self.at("armed") or {}).get("evidence", {}).get("activation") or {}
+        return activation.get("recovery") or {}
+
+    def observations(self, record):
+        """The network evidence and each object's lateness after its window."""
+        return {"network": dict(record.get("network") or {}, block_lateness=block_lateness(
+            record["objects"], self.spec.interval_s, lateness_bound_s(self.settings)))}
+
+
+def _upstream_failure_met(case, seen, label) -> bool:
+    """NGINX answered a write 502 and logged the upstream failure as `label`, the
+    exporter retried and nacked, and the nack was retried."""
+    return (seen["http_502_writes_count"] > 0 and seen.get("nginx_errors", {}).get(label, 0) > 0
+            and seen["flush_retries_count"] > 0 and seen["storage_nacks_count"] > 0
+            and seen["retried"])
+
+
+def _disconnect_met(case, seen) -> bool:
+    """Disconnect: writes answered 502 over refused upstream connections, retried and nacked."""
+    return _upstream_failure_met(case, seen, "refused")
+
+
+def _reset_met(case, seen) -> bool:
+    """Reset: RSTs captured and writes answered 502 over reset upstreams, retried and nacked."""
+    return (seen.get("rst_packets_count") or 0) > 0 and _upstream_failure_met(case, seen, "reset")
+
+
+def _dns_nxdomain_met(case, seen) -> bool:
+    """NXDOMAIN: the engine's own fresh queries were answered NXDOMAIN, the exporter
+    retried and nacked, and the nack was retried."""
+    dns = seen.get("dns") or {}
+    return (dns.get("engine_queries_count", 0) > 0 and dns.get("nxdomain_answers_count", 0) > 0
+            and seen["flush_retries_count"] > 0 and seen["storage_nacks_count"] > 0
+            and seen["retried"])
+
+
+def _dns_timeout_met(case, seen) -> bool:
+    """DNS timeout: the rules dropped queries, the diagnostic lookup timed out, the
+    resolver received no query for the name, and the exporter retried and nacked."""
+    dns = seen.get("dns") or {}
+    rules = seen.get("dns_rule_packets") or {}
+    return ((rules.get("udp") or 0) > 0 and bool((seen.get("diagnostic_dig") or {}).get("timed_out"))
+            and dns.get("queries_count") == 0 and seen["flush_retries_count"] > 0
+            and seen["storage_nacks_count"] > 0 and seen["retried"])
+
+
+def _tcp_ack_loss_met(case, seen) -> bool:
+    """ACK loss: dropped pure ACKs, retransmissions and only pure ACKs matched,
+    held ACK_LOSS_HOLD_S so a stalled request meets the client's own timeout."""
+    return seen.get("elapsed_s", 0) >= ACK_LOSS_HOLD_S and not ack_loss_evidence_problems(
+        seen.get("dropped_pure_ack_packets_count"), seen.get("ack_capture") or {})
+
+
+FAULT_CONDITIONS.update({"disconnect": _disconnect_met, "reset": _reset_met,
+                         "dns_nxdomain": _dns_nxdomain_met, "dns_timeout": _dns_timeout_met,
+                         "tcp_ack_loss": _tcp_ack_loss_met})
+
+
+def cohort_object_check(store, key, ledger, request_ids, workload, signal, root) -> dict:
+    """Read one completed values object back as the oracle does, against its cohort.
+
+    The object and every series file of its signal are copied from the store
+    directly; the scanner checks the files' own invariants and descriptor
+    coverage, and each values row's record id and payload hash, joined to
+    its descriptor, must be exactly the cohort's records.
+    """
+    root = Path(root)
+    shutil.rmtree(root, ignore_errors=True)
+    head = store.client.head_object(Bucket=store.bucket, Key=key)
+    body = store.client.get_object(Bucket=store.bucket, Key=key)["Body"].read()
+    target = root / key.removeprefix("otel/")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    for page in store.client.get_paginator("list_objects_v2").paginate(
+            Bucket=store.bucket, Prefix=f"otel/v=1/signal={signal}/dataset=series/"):
+        for item in page.get("Contents", []):
+            destination = root / item["Key"].removeprefix("otel/")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            store.client.download_file(store.bucket, item["Key"], str(destination))
+    report = {"key": key, "size_bytes": head["ContentLength"], "etag": head.get("ETag"),
+              "bytes_complete": len(body) == head["ContentLength"]}
+    placeholders = ",".join("?" for _ in request_ids)
+    with ledger.lock:
+        expected = dict(ledger.connection.execute(
+            f"SELECT record_id, expected_sha256 FROM records WHERE request_id IN ({placeholders})",
+            list(request_ids)).fetchall())
+    try:
+        with measurement.duckdb.connect() as db:
+            test_e2e.scan_objects(measurement._SilentAsserts(), root, db, collect_bodies=False)
+            values, canonical = measurement._duck_latest_descriptor(root, signal)
+            record_id, payload = measurement._duck_record_expression(workload, signal)
+            rows = db.execute(f"SELECT {record_id}, lower(sha256({payload})) FROM {values} v "
+                              f"INNER JOIN {canonical} s ON v.series_id = s.series_id").fetchall()
+            total = db.execute(f"SELECT count(*) FROM {values}").fetchone()[0]
+        report["scan"] = "passed"
+    except (AssertionError, measurement.duckdb.Error) as error:
+        report["scan"] = f"{type(error).__name__}: {error}"[:500]
+        rows, total = [], None
+    found = dict(rows)
+    report.update({
+        "values_rows_count": total, "joined_rows_count": len(rows),
+        "cohort_records_count": len(expected),
+        "missing_records_count": len(set(expected) - set(found)),
+        "unexpected_records_count": len(set(found) - set(expected)),
+        "corrupt_records_count": sum(1 for record, digest in found.items()
+                                     if record in expected and expected[record] != digest),
+    })
+    report["valid"] = (report["bytes_complete"] and report["scan"] == "passed"
+                       and total == len(rows) == len(expected) and not report["missing_records_count"]
+                       and not report["unexpected_records_count"]
+                       and not report["corrupt_records_count"])
+    shutil.rmtree(root, ignore_errors=True)
+    return report
+
+
+class CompletionCohortCase(NetworkCase):
+    """The dropped completion response: one single-signal cohort per signal.
+
+    With input paused and the exporter idle, the values proxy's downstream
+    toxic withholds every response, and a cohort of COHORT_REQUESTS requests
+    of one signal is sent inside one window, small enough for one values
+    PUT. The case then requires, while the response is withheld, the values
+    object complete in the store and read back as exactly the cohort, the
+    exporter still FLUSHING, and no acknowledgement (strict) or no buffer
+    resolution (buffered). Removing the toxic must close the waiting
+    connection and the client must retry to an acknowledgement. The logs
+    cohort's states carry the plain names, the metrics cohort's `_metrics`.
+    """
+
+    SIGNALS = ("logs", "metrics")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pause = threading.Event()
+        self.segments = []
+        self.segment_ready = threading.Condition()
+        self.baseline_requests = None
+        self.next_index = None
+        self.cohorts = {}
+
+    @staticmethod
+    def suffix(signal):
+        """The state suffix of one cohort."""
+        return "" if signal == "logs" else f"_{signal}"
+
+    def produce(self, producer, stop):
+        """Paced input until paused, then each schedule the case hands over."""
+        outcomes = [producer.send_paced(range(self.spec.workload.requests),
+                                        FAULT_RATE_REQUESTS_PER_S, stop=any_event(stop, self.pause))]
+        with self.segment_ready:
+            self.baseline_requests = outcomes[0]["requests"]
+            self.segment_ready.notify_all()
+        while not stop.is_set():
+            with self.segment_ready:
+                if not self.segments:
+                    self.segment_ready.wait(0.2)
+                    continue
+                indexes, done = self.segments.pop(0)
+            outcomes.append(producer.send_paced(indexes, FAULT_RATE_REQUESTS_PER_S, stop=stop))
+            done.set()
+        return merge_outcomes(outcomes)
+
+    def schedule(self, indexes):
+        """Hand one schedule to the producer; returns the event set when it finished."""
+        done = threading.Event()
+        with self.segment_ready:
+            self.segments.append((list(indexes), done))
+            self.segment_ready.notify_all()
+        return done
+
+    def run(self, controls, store_cores, result, options):
+        """Pause, then a cohort per signal, then resume the paced input."""
+        self.pause.set()
+        if not self.attempt(self.await_paused):
+            return
+        for kind in self.SIGNALS:
+            if not (self.attempt(self.quiesce, kind) and self.attempt(self.cohort, kind)):
+                return
+        self.schedule(range(self.next_index, self.spec.workload.requests))
+        self.attempt(self.await_after_input)
+
+    def await_paused(self):
+        """The paced producer stopped and every request it started finished."""
+        with self.segment_ready:
+            deadline = time.monotonic() + FAULT_PRODUCER_TIMEOUT_S
+            while self.baseline_requests is None and time.monotonic() < deadline:
+                self.segment_ready.wait(0.5)
+        if self.baseline_requests is None:
+            raise AssertionError("the paced producer did not stop")
+        self.next_index = self.baseline_requests
+        self.transition("paused", {"requests_sent_count": self.baseline_requests})
+
+    def quiesce(self, signal):
+        """Nothing pending anywhere: the producer, the exporter and the buffer."""
+        def observe():
+            # A fresh sample every quarter second, not every poll.
+            time.sleep(0.25)
+            totals = flat_totals(self.phase.sampler.once())
+            return {"pending_requests_count": ledger_cohorts(
+                        self.ledger, time.monotonic_ns())["pending_requests_count"],
+                    "block_active_bytes": totals.get("block.active", 0),
+                    "block_flushing_bytes": totals.get("block.flushing", 0),
+                    "block_pending_bytes": totals.get("block.pending", 0),
+                    "buffer_in_flight_count": totals.get("buffer.in.flight", 0),
+                    "buffer_queued_items": totals.get("buffer.items.queued", 0)}
+
+        evidence = measurement.wait_until(
+            observe, lambda seen: not any(seen.values()),
+            deadline_ns=time.monotonic_ns() + 90 * 10**9,
+            description="no request pending and the exporter and buffer idle")
+        self.transition(f"quiet{self.suffix(signal)}", evidence)
+
+    def cohort(self, signal):
+        """One cohort: arm, send, observe the withheld completion, remove, resume."""
+        suffix = self.suffix(signal)
+        indexes = []
+        index = self.next_index
+        while len(indexes) < COHORT_REQUESTS:
+            if self.spec.workload.signal_of(index) == signal:
+                indexes.append(index)
+            index += 1
+        self.next_index = index
+        before = set(self.lister.list_once())
+        capacity._command().await_window_start(self.spec.interval_s)
+        totals = self.totals()
+        self.rig.activate(self.fault, {})
+        self.transition(f"armed{suffix}", {"totals": totals,
+                                           "activation": self.rig.activations[-1],
+                                           "signal": signal, "request_ids": indexes})
+        cohort = {"signal": signal, "request_ids": indexes, "keys_before": before}
+        self.cohorts[signal] = cohort
+        cohort["done"] = self.schedule(indexes)
+        try:
+            evidence = measurement.wait_until(
+                lambda: self.observe_cohort(cohort), self.cohort_met,
+                deadline_ns=self.at(f"armed{suffix}")["monotonic_ns"]
+                + FAULT_OBSERVE_DEADLINE_S[self.fault] * 10**9,
+                description=f"the {signal} cohort's completed values object with its "
+                            "response withheld")
+            confirmed = flat_totals(self.phase.sampler.once())
+            evidence["confirmed_block_flushing_bytes"] = confirmed.get("block.flushing", 0)
+            if not evidence["confirmed_block_flushing_bytes"]:
+                raise AssertionError(f"the exporter no longer holds FLUSHING: {evidence}")
+            evidence["totals"] = self.totals()
+            self.transition(f"observed{suffix}", evidence)
+        finally:
+            removed_unix = time.time()
+            self.rig.recover()
+        self.transition(f"fault_removed{suffix}", {"totals": self.totals(),
+                                                   "removed_unix_s": removed_unix})
+        client = self.rig.route_client(read_timeout=10)
+        health = measurement.wait_until(
+            lambda: self.rig.route_health(client), lambda seen: seen["answered"],
+            deadline_ns=time.monotonic_ns() + ENDPOINT_HEALTH_DEADLINE_S * 10**9,
+            description="signed HEADs through the general and the values route")
+        self.transition(f"endpoint_healthy{suffix}", {"routes": health})
+        resumed = measurement.wait_until(
+            lambda: self.observe_retry(cohort, removed_unix), self.retry_met,
+            deadline_ns=self.at(f"endpoint_healthy{suffix}")["monotonic_ns"]
+            + RECOVERY_DEADLINE_S * 10**9,
+            description=f"the {signal} cohort's closed connection, its retry and its "
+                        "acknowledgement")
+        self.transition(f"resumed{suffix}", resumed)
+        if not cohort["done"].wait(FAULT_PRODUCER_TIMEOUT_S):
+            raise AssertionError(f"the {signal} cohort's requests did not finish")
+
+    def observe_cohort(self, cohort):
+        """What the store, the route, the producer and the exporter show for a cohort."""
+        suffix = self.suffix(cohort["signal"])
+        armed = self.at(f"armed{suffix}")
+        marker = f"signal={cohort['signal']}/dataset=values/"
+        keys = sorted(key for key in self.lister.first_listed
+                      if marker in key and key not in cohort["keys_before"])
+        totals = self.totals()
+        base = armed["evidence"]["totals"]
+        with self.ledger.lock:
+            acked = self.ledger.connection.execute(
+                "SELECT count(*) FROM requests WHERE ack_ns IS NOT NULL AND request_id IN "
+                f"({','.join(str(index) for index in cohort['request_ids'])})").fetchone()[0]
+        seen = {"elapsed_s": (time.monotonic_ns() - armed["monotonic_ns"]) / 1e9,
+                "values_keys": keys, "cohort_acked_requests_count": acked,
+                "block_flushing_bytes": totals.get("block.flushing", 0),
+                "buffer_resolved_delta": totals.get("buffer.bundles.resolved", 0)
+                - base.get("buffer.bundles.resolved", 0),
+                "buffer_in_flight_count": totals.get("buffer.in.flight", 0),
+                "buffered": self.buffered}
+        if len(keys) == 1:
+            key = keys[0]
+            logged = [entry for entry in self.route_requests()
+                      if entry.get("uri", "").endswith("/" + key)]
+            seen["route_log"] = [{field: entry.get(field) for field in (
+                "msec", "method", "operation", "status", "upstream_status")} for entry in logged]
+            seen["values_operations"] = sorted({entry["operation"] for entry in logged})
+            if "check" not in cohort:
+                cohort["check"] = cohort_object_check(
+                    self.store, key, self.ledger, cohort["request_ids"], self.spec.workload,
+                    cohort["signal"], self.rig.root / f"cohort-{cohort['signal']}")
+                cohort["key"] = key
+            seen["object"] = cohort["check"]
+            heads = cohort.setdefault("heads", [])
+            if not heads or time.time() - heads[-1]["unix_s"] >= COHORT_HEAD_PERIOD_S:
+                head = self.store.client.head_object(Bucket=self.store.bucket, Key=key)
+                heads.append({"unix_s": time.time(), "etag": head.get("ETag"),
+                              "size_bytes": head["ContentLength"]})
+            seen["stable_heads_count"] = sum(
+                1 for entry in heads if (entry["etag"], entry["size_bytes"])
+                == (cohort["check"]["etag"], cohort["check"]["size_bytes"]))
+            name = key.rsplit("/", 1)[1]
+            seen["block_objects"] = sorted(item for item in self.lister.first_listed
+                                           if item.endswith("/" + name))
+        return seen
+
+    @staticmethod
+    def cohort_met(seen):
+        """One completed values object that reads back as exactly the cohort and
+        that repeated direct HEADs show unchanged, whose response is withheld,
+        while the exporter still owns the flush: strict, no acknowledgement;
+        buffered, no buffer resolution."""
+        withheld = not any(str(entry.get("status", "")).startswith("2")
+                           for entry in seen.get("route_log", []))
+        owner = (seen["buffer_resolved_delta"] == 0 and seen["buffer_in_flight_count"] > 0
+                 if seen["buffered"] else seen["cohort_acked_requests_count"] == 0)
+        return (len(seen["values_keys"]) == 1 and bool((seen.get("object") or {}).get("valid"))
+                and seen.get("stable_heads_count", 0) >= COHORT_HEADS
+                and withheld and seen["block_flushing_bytes"] > 0 and owner)
+
+    def observe_retry(self, cohort, removed_unix):
+        """After removal: the withheld request's close, the retry and the acknowledgement."""
+        key = cohort.get("key", "")
+        logged = [entry for entry in self.route_requests()
+                  if key and entry.get("uri", "").endswith("/" + key)]
+        closed = [entry for entry in logged if entry.get("status") == "502"
+                  and float(entry["msec"]) >= removed_unix - 0.5]
+        retried = [entry for entry in logged if str(entry.get("status", "")).startswith("2")
+                   and float(entry["msec"]) >= removed_unix]
+        suffix = self.suffix(cohort["signal"])
+        totals = self.totals()
+        base = self.at(f"armed{suffix}")["evidence"]["totals"]
+        with self.ledger.lock:
+            acked = self.ledger.connection.execute(
+                "SELECT count(*) FROM requests WHERE ack_ns IS NOT NULL AND request_id IN "
+                f"({','.join(str(index) for index in cohort['request_ids'])})").fetchone()[0]
+        return {"closed_requests": [{f: entry.get(f) for f in ("msec", "status", "upstream_status",
+                                                               "request_time")} for entry in closed],
+                "retried_requests": [{f: entry.get(f) for f in ("msec", "status", "operation")}
+                                     for entry in retried],
+                "flush_retries_delta": totals.get("flush.retries", 0) - base.get("flush.retries", 0),
+                "exporter_acks_delta": totals.get("acks", 0) - base.get("acks", 0),
+                "buffer_resolved_delta": totals.get("buffer.bundles.resolved", 0)
+                - base.get("buffer.bundles.resolved", 0),
+                "cohort_acked_requests_count": acked,
+                "cohort_requests_count": len(cohort["request_ids"]), "buffered": self.buffered}
+
+    @staticmethod
+    def retry_met(seen):
+        """The withheld connection closed (NGINX 502), the client retried to a 2xx,
+        and the cohort was acknowledged (buffered: resolved by the buffer)."""
+        acked = (seen["buffer_resolved_delta"] > 0 if seen["buffered"]
+                 else seen["cohort_acked_requests_count"] == seen["cohort_requests_count"])
+        return (bool(seen["closed_requests"]) and bool(seen["retried_requests"])
+                and seen["exporter_acks_delta"] > 0 and acked)
+
+    def await_after_input(self):
+        """The paced input after the last cohort, measured from its acknowledgement."""
+        resumed = self.at(f"resumed{self.suffix(self.SIGNALS[-1])}")
+        wanted = FAULT_AFTER_S * FAULT_RATE_REQUESTS_PER_S
+
+        def observe():
+            acks = [ack for ack in ledger_acks(self.ledger) if ack >= resumed["monotonic_ns"]]
+            return {"requests_acked_since_resumed_count": len(acks)}
+
+        return measurement.wait_until(
+            observe, lambda seen: seen["requests_acked_since_resumed_count"] >= wanted,
+            deadline_ns=self.recovery_deadline_ns(),
+            description=f"{wanted} requests acknowledged after the last cohort")
+
+    def recovery_deadline_ns(self):
+        """Everything after the last cohort's routes were healthy again."""
+        return self.at(f"endpoint_healthy{self.suffix(self.SIGNALS[-1])}")["monotonic_ns"] \
+            + RECOVERY_DEADLINE_S * 10**9
+
+    def fault_window(self):
+        """From the first cohort's arming to the last cohort's removal."""
+        armed = self.at("armed")
+        removed = self.at(f"fault_removed{self.suffix(self.SIGNALS[-1])}")
+        return (armed["unix_s"], removed and removed["unix_s"]) if armed else None
+
+    def throughput_edges(self):
+        """Before the first cohort, across both, and after the last."""
+        last = f"endpoint_healthy{self.suffix(self.SIGNALS[-1])}"
+        return {"before": ("input_started", "paused"), "during": ("armed", last),
+                "after": (last, "input_stopped")}
+
+    def verdicts(self, record):
+        """Both cohorts observed; both recovered, and the rest drained in time."""
+        observed = [self.at(f"observed{self.suffix(signal)}") for signal in self.SIGNALS]
+        last = self.suffix(self.SIGNALS[-1])
+        recovered_s = self.span(f"endpoint_healthy{last}", "drained")
+        return [
+            ("fault_observed", all(observed), json.dumps(
+                {signal: {key: value for key, value in (entry or {}).get("evidence", {}).items()
+                          if key in ("values_keys", "object", "values_operations",
+                                     "cohort_acked_requests_count", "block_flushing_bytes",
+                                     "buffer_resolved_delta", "block_objects",
+                                     "stable_heads_count")}
+                 for signal, entry in zip(self.SIGNALS, observed)})
+             if all(observed) else "; ".join(self.problems) or "a cohort was never observed"),
+            ("recovered", all(self.at(f"resumed{self.suffix(signal)}") for signal in self.SIGNALS)
+             and recovered_s is not None and recovered_s <= RECOVERY_DEADLINE_S,
+             f"last cohort's healthy routes to drained {recovered_s} s against "
+             f"{RECOVERY_DEADLINE_S} s; problems {self.problems}"),
+        ]
+
+    def numbers(self, record, during):
+        """Per cohort: held, observed and recovery times; the completed-but-unacknowledged
+        objects and bytes; and the cohorts' multiplicities."""
+        numbers = super().numbers(record, during)
+        checks = [cohort.get("check") or {} for cohort in self.cohorts.values()]
+        numbers.update({
+            "completed_unacknowledged_objects_count": sum(1 for check in checks
+                                                          if check.get("valid")),
+            "completed_unacknowledged_bytes": sum(check.get("size_bytes") or 0 for check in checks
+                                                  if check.get("valid")),
+            "fault_duration_s": sum(self.span(f"armed{self.suffix(s)}",
+                                              f"fault_removed{self.suffix(s)}") or 0
+                                    for s in self.SIGNALS),
+            "time_to_condition_s": max((self.span(f"armed{self.suffix(s)}",
+                                                  f"observed{self.suffix(s)}") or 0
+                                        for s in self.SIGNALS), default=None),
+            "recovery_s": max((self.span(f"endpoint_healthy{self.suffix(s)}",
+                                         f"resumed{self.suffix(s)}") or 0
+                               for s in self.SIGNALS), default=None),
+            "endpoint_healthy_to_drained_s": self.span(
+                f"endpoint_healthy{self.suffix(self.SIGNALS[-1])}", "drained"),
+        })
+        numbers.update((record.get("case_oracle") or {}).get("numbers", {}))
+        return numbers
+
+    def oracle_extras(self, ledger):
+        """Each cohort's multiplicity histogram and everything else's."""
+        cohort_ids = sorted(index for cohort in self.cohorts.values()
+                            for index in cohort["request_ids"])
+        marks = ",".join(str(index) for index in cohort_ids) or "-1"
+        histograms = {}
+        with ledger.lock:
+            for name, clause in (("cohorts", f"IN ({marks})"), ("outside", f"NOT IN ({marks})")):
+                rows = ledger.connection.execute(
+                    "SELECT copies, count(*) FROM (SELECT e.record_id, count(a.record_id) AS copies "
+                    "FROM records e LEFT JOIN actual a ON a.record_id = e.record_id "
+                    f"WHERE e.request_id {clause} GROUP BY e.record_id) GROUP BY copies"
+                ).fetchall()
+                histograms[name] = {str(copies): count for copies, count in rows}
+        return {"multiplicity": histograms, "numbers": {
+            "cohort_records_count": sum(histograms["cohorts"].values()),
+            "cohort_duplicated_records": sum(count for copies, count in histograms["cohorts"].items()
+                                             if int(copies) > 1),
+            "outside_cohort_duplicated_records": sum(
+                count for copies, count in histograms["outside"].items() if int(copies) > 1)}}
+
+    def observations(self, record):
+        """The network evidence plus every cohort's evidence."""
+        observations = super().observations(record)
+        observations["network"]["cohorts"] = {
+            signal: {key: value for key, value in cohort.items()
+                     if key not in ("done", "keys_before")}
+            for signal, cohort in self.cohorts.items()}
+        observations["network"]["cohort_multiplicity"] = (record.get("case_oracle") or {}).get(
+            "multiplicity")
+        return observations
+
+
+class MultipartCompletionCase(NetworkCase):
+    """A CompleteMultipartUpload whose response is lost, or which is held, past
+    the writer's deadline, through the completion front.
+
+    `dropped_multipart_completion`: the completion lands in the store and its
+    response is dropped; the case holds the fault until the writer's flush of
+    that block failed at its deadline and its cleanup cutoff passed, so the
+    late-commit probe can find the object. `held_multipart_completion`: the
+    completion is held in the proxy, the writer's flush fails without it, and
+    the case releases it past the later of the writer's cleanup cutoff and the
+    block's window end plus L, then measures whether and when the object
+    appears.
+    The target is the first block whose write attempt failed after arming; its
+    logs values object is the multipart one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completion = {}
+        self.abort_timeout_s = duration_s(self.settings["upload"]["abort_timeout"])
+        self.bound_s = lateness_bound_s(self.settings)
+
+    def target(self):
+        """The first block whose write attempt failed after arming: its file, the
+        deadline its attempt named, its flush failure once logged (of any class)
+        with the cleanup cutoff that follows it, and its values key once the store
+        shows it or its upload."""
+        armed = self.at("armed")
+        events = self.engine_flush_events()
+        attempts = [entry for entry in events["attempts"] if entry["unix_s"] >= armed["unix_s"]
+                    and entry["file"] and entry["deadline_unix_s"] is not None]
+        if not attempts:
+            return None
+        file = attempts[0]["file"]
+        deadline = attempts[0]["deadline_unix_s"]
+        failure = next((entry for entry in events["failures"] if entry["file"] == file), None)
+        suffix = "/" + file
+        listed = [key for key in self.lister.first_listed if key.endswith(suffix)
+                  and "signal=logs/dataset=values/" in key]
+        uploads = self.cached("uploads", lambda: orphaned_uploads(self.store))
+        pending = [upload["key"] for upload in uploads if upload["key"].endswith(suffix)
+                   and "signal=logs/dataset=values/" in upload["key"]]
+        key = (listed or pending or [None])[0]
+        return {"file": file, "deadline_unix_s": deadline, "failure": failure, "key": key,
+                "window_end_unix_s": block_window_end(key, self.spec.interval_s) if key else None,
+                "cutoff_unix_s": (failure["unix_s"] if failure else deadline)
+                + self.abort_timeout_s,
+                "incomplete_uploads": [upload for upload in uploads
+                                       if upload["key"].endswith(suffix)]}
+
+    def release_at(self, target):
+        """When a held completion is released: HELD_RELEASE_MARGIN_S past the later
+        of the writer's cleanup cutoff and the block's window end plus L. A store
+        drops a connection whose request has not arrived within its own request
+        timeout, if it has one; a completion it still holds then lands."""
+        return max(target["cutoff_unix_s"], target["window_end_unix_s"] + self.bound_s) \
+            + HELD_RELEASE_MARGIN_S
+
+    def await_condition(self):
+        """Held: release the completion at its instant, then observe; the dropped
+        case waits for its condition as every fault does."""
+        if self.fault != "held_multipart_completion":
+            return super().await_condition()
+        armed = self.at("armed")
+        target = measurement.wait_until(
+            self.target, lambda seen: bool(seen and seen.get("key") and seen.get("failure")),
+            deadline_ns=armed["monotonic_ns"] + FAULT_OBSERVE_DEADLINE_S[self.fault] * 10**9,
+            description="the target block's failed attempt and its values upload")
+        release = self.release_at(target)
+        time.sleep(max(0.0, release - time.time()))
+        before = self.head(target["key"])
+        uploads = orphaned_uploads(self.store)
+        self.rig.recover()
+        self.released_unix_s = time.time()
+        evidence = self.observe_condition()
+        # The target as it stood before the release; afterwards its upload may be
+        # complete and not yet listed.
+        evidence["target_after_release"] = evidence.get("target")
+        evidence.update({"target": target, "object_before_release": before,
+                         "release_at_unix_s": release,
+                         "released_unix_s": self.released_unix_s,
+                         "uploads_before_release": [upload for upload in uploads
+                                                    if upload["key"] == target["key"]]})
+        if not _held_multipart_met(self, evidence):
+            raise AssertionError(f"the held completion's condition failed: "
+                                 f"{json.dumps(evidence, default=str)[:1500]}")
+        evidence["totals"] = self.totals()
+        self.transition("observed", evidence)
+
+    def observe_condition(self):
+        """The S3 family's observations plus the target block's completion."""
+        observed = super().observe_condition()
+        target = self.target()
+        observed["target"] = target
+        if target and target["key"]:
+            head = self.cached("target_head", lambda: self.head(target["key"]))
+            observed["target_object"] = head
+            cleanups = [entry for entry in self.flush_events["cleanups"]
+                        if entry["file"] == target["file"]]
+            observed["target_cleanups"] = cleanups
+        observed["now_unix_s"] = time.time()
+        return observed
+
+    def head(self, key):
+        """The store's own HEAD of `key`, read directly, or None."""
+        try:
+            answer = self.store.client.head_object(Bucket=self.store.bucket, Key=key)
+        except ClientError:
+            return None
+        return {"size_bytes": answer["ContentLength"], "etag": answer.get("ETag"),
+                "last_modified_unix_s": answer["LastModified"].timestamp()}
+
+    def remove_fault(self, controls, store_cores):
+        """Remove the fault; a held completion is watched until its object appears."""
+        super().remove_fault(controls, store_cores)
+        observed = (self.at("observed") or {}).get("evidence", {})
+        target = observed.get("target") or {}
+        key = target.get("key")
+        if not key:
+            return
+        released = getattr(self, "released_unix_s", None) or self.at("fault_removed")["unix_s"]
+        visible = self.head(key)
+        seen_unix = time.time() if visible else None
+        while visible is None and time.time() - released < RELEASE_VISIBLE_S:
+            time.sleep(0.1)
+            visible = self.head(key)
+            seen_unix = time.time() if visible else None
+        self.completion = {"key": key, "released_unix_s": released,
+                           "visible_after_removal": visible, "seen_after_removal_unix_s": seen_unix}
+
+    def collect(self, record):
+        """The network evidence plus the target's completion timeline."""
+        network = super().collect(record)
+        observed = (self.at("observed") or {}).get("evidence", {})
+        target = observed.get("target") or {}
+        cleanups = [entry for entry in self.engine_flush_events()["cleanups"]
+                    if target and entry["file"] == target["file"]]
+        network["completion"] = dict(self.completion, target=target, target_cleanups=cleanups,
+                                     object_at_observation=observed.get("target_object"))
+        return network
+
+    def completion_timeline(self, record):
+        """When the target object became visible, against its window end, the
+        writer's cutoff and L."""
+        completion = (record.get("network") or {}).get("completion") or {}
+        target = completion.get("target") or {}
+        key = target.get("key")
+        final = next((item for item in record["objects"] if item["key"] == key), None)
+        steps = [{field: entry.get(field) for field in (
+            "msec", "operation", "status", "upstream_status", "request_time")}
+            for entry in record["requests"] if key and key in (entry.get("uri") or "")
+            and entry["operation"] in ("create_multipart_upload", "complete_multipart_upload",
+                                       "abort_multipart_upload")]
+        if not key or final is None:
+            return {"key": key, "visible": False, "multipart_steps": steps,
+                    "released_unix_s": completion.get("released_unix_s"),
+                    "writer_deadline_unix_s": target.get("deadline_unix_s"),
+                    "cleanup_outcomes": [entry["outcome"] for entry in completion.get(
+                        "target_cleanups", [])]}
+        first = min(value for value in (final.get("first_listed_unix_s"),
+                                        completion.get("seen_after_removal_unix_s"),
+                                        (completion.get("object_at_observation") or {}).get(
+                                            "last_modified_unix_s")) if value is not None)
+        end = target["window_end_unix_s"]
+        return {"key": key, "visible": True, "first_visible_unix_s": first,
+                "last_modified_unix_s": final.get("last_modified_unix_s"),
+                "window_end_unix_s": end, "writer_deadline_unix_s": target["deadline_unix_s"],
+                "writer_cutoff_unix_s": target["cutoff_unix_s"],
+                "released_unix_s": completion.get("released_unix_s"),
+                "first_visible_after_window_end_s": round(first - end, 3),
+                "last_modified_after_window_end_s": round(final["last_modified_unix_s"] - end, 3),
+                "first_visible_after_cutoff_s": round(first - target["cutoff_unix_s"], 3),
+                "first_visible_after_deadline_s": round(first - target["deadline_unix_s"], 3),
+                "multipart_steps": steps, "bound_s": self.bound_s,
+                "beyond_bound": max(first, final["last_modified_unix_s"]) - end > self.bound_s,
+                "cleanup_outcomes": [entry["outcome"] for entry in completion.get(
+                    "target_cleanups", [])]}
+
+    def network_verdicts(self, record):
+        """dropped_multipart_completion: the late-commit detector named the target."""
+        if self.fault != "dropped_multipart_completion":
+            return []
+        timeline = self.completion_timeline(record)
+        late = int((record.get("final_totals") or {}).get("flush.late_commits", 0))
+        detected = "late_commit" in timeline.get("cleanup_outcomes", []) and late >= 1
+        return [("late_commit_detected", detected,
+                 f"cleanup outcomes for the target {timeline.get('cleanup_outcomes')}; "
+                 f"flush.late_commits {late}; target {timeline.get('key')}")]
+
+    def numbers(self, record, during):
+        """The network numbers plus the target's completion timeline."""
+        numbers = super().numbers(record, during)
+        timeline = self.completion_timeline(record)
+        numbers.update({
+            "target_first_visible_after_window_end_s": timeline.get(
+                "first_visible_after_window_end_s"),
+            "target_last_modified_after_window_end_s": timeline.get(
+                "last_modified_after_window_end_s"),
+            "target_first_visible_after_cutoff_s": timeline.get("first_visible_after_cutoff_s"),
+            "late_commit_events_count": timeline.get("cleanup_outcomes", []).count("late_commit"),
+        })
+        return numbers
+
+    def observations(self, record):
+        """The network evidence plus the target's completion timeline."""
+        observations = super().observations(record)
+        observations["network"]["completion_timeline"] = self.completion_timeline(record)
+        return observations
+
+
+def _dropped_multipart_met(case, seen) -> bool:
+    """The target's completion landed in the store with its response dropped, its
+    flush failed, the cleanup cutoff passed, and the nack was retried."""
+    target = seen.get("target") or {}
+    return (bool(target.get("key")) and bool(seen.get("target_object"))
+            and target.get("failure") is not None
+            and seen["now_unix_s"] >= target["cutoff_unix_s"] + 1
+            and seen["storage_nacks_count"] > 0 and seen["retried"])
+
+
+def _held_multipart_met(case, seen) -> bool:
+    """The target's completion was held: no object and its upload still open just
+    before the release, which came at its instant (`release_at`)."""
+    target = seen.get("target") or {}
+    return (bool(target.get("key")) and seen.get("object_before_release") is None
+            and bool(seen.get("uploads_before_release"))
+            and target.get("window_end_unix_s") is not None
+            and seen.get("released_unix_s", 0) >= seen.get("release_at_unix_s", float("inf")))
+
+
+FAULT_CONDITIONS.update({"dropped_multipart_completion": _dropped_multipart_met,
+                         "held_multipart_completion": _held_multipart_met})
+
+NETWORK_CASES = {"dropped_completion_response": CompletionCohortCase,
+                 "dropped_multipart_completion": MultipartCompletionCase,
+                 "held_multipart_completion": MultipartCompletionCase}
 
 
 def ledger_attempts_between(ledger, start_ns, end_ns) -> dict:
