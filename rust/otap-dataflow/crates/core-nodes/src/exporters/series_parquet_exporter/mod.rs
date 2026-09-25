@@ -6,6 +6,7 @@
 //! The block state machine is documented in the `worker` module, the window
 //! clock in `window`, and the operating contract in the README.
 
+use super::log_gate::LogGate;
 use async_trait::async_trait;
 use linkme::distributed_slice;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -23,6 +24,7 @@ use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_series_lake as lake;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Registered component identifier.
@@ -195,17 +197,29 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
     }
     let cfg = &worker.cfg.lake;
     // An exporter is given no view of the nodes upstream of it, so it cannot
-    // compare the receiver's decoding limit with its own request limit.
-    otel_info!(
-        "series_parquet.receiver_limit.unverified",
-        max_request_bytes = cfg.ingress.max_request_bytes,
-        receiver_default_bytes =
-            otel_arrow_dfe_otap::otap_grpc::server_settings::DEFAULT_MAX_DECODING_MESSAGE_SIZE,
-        message = "this exporter cannot see the upstream receiver's \
-                   max_decoding_message_size; set it to at least ingress.max_request_bytes, \
-                   or the receiver refuses larger requests with INVALID_ARGUMENT, which OTLP \
-                   clients drop"
-    );
+    // compare the receiver's decoding limit with its own request limit. Every
+    // worker would say the same, so only the first of the process says it at
+    // INFO.
+    static RECEIVER_LIMIT_STATED: AtomicBool = AtomicBool::new(false);
+    macro_rules! receiver_limit {
+        ($log:ident) => {
+            $log!(
+                "series_parquet.receiver_limit.unverified",
+                max_request_bytes = cfg.ingress.max_request_bytes,
+                receiver_default_bytes =
+                    otel_arrow_dfe_otap::otap_grpc::server_settings::DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+                message = "this exporter cannot see the upstream receiver's \
+                           max_decoding_message_size; set it to at least \
+                           ingress.max_request_bytes, or the receiver refuses larger requests \
+                           with INVALID_ARGUMENT, which OTLP clients drop"
+            )
+        };
+    }
+    if RECEIVER_LIMIT_STATED.swap(true, Ordering::Relaxed) {
+        receiver_limit!(otel_debug);
+    } else {
+        receiver_limit!(otel_info);
+    }
     let parts = cfg.parts_per_block();
     if parts > lake::config::MAX_PARTS {
         otel_warn!(
@@ -302,6 +316,7 @@ async fn drive(
     // When the Shutdown control message arrived, for the drain duration.
     let mut closed_at: Option<Instant> = None;
     let mut notify_turns = 0_usize;
+    let mut notify_failures = LogGate::new();
     loop {
         if let Some(deadline) = closed
             && worker.is_idle()
@@ -366,8 +381,14 @@ async fn drive(
             // yields and reopens them.
             result = worker.notify.next(),
                 if !worker.notify.is_empty() && notify_turns < worker.cfg.notify_batch => {
-                if let Err(e) = result {
-                    otel_warn!("series_parquet.notify.failed", error = %e);
+                if let Err(e) = result
+                    && let Some(suppressed) = notify_failures.admit(otel_arrow_dfe_engine::clock::now())
+                {
+                    otel_warn!(
+                        "series_parquet.notify.failed",
+                        error = %e,
+                        suppressed = suppressed
+                    );
                 }
                 notify_turns += 1;
             }

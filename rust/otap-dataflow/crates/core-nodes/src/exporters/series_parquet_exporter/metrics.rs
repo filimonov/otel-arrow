@@ -16,6 +16,7 @@ use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
 use otel_arrow_dfe_series_lake::config::LakeConfig;
 use otel_arrow_dfe_series_lake::extract::ExtractStats;
 use otel_arrow_dfe_series_lake::schema::Dataset;
+use otel_arrow_dfe_telemetry::attributes::AttributeEnum;
 use otel_arrow_dfe_telemetry::instrument::{Counter, Gauge, Mmsc, ObserveCounter};
 use otel_arrow_dfe_telemetry::metrics::{MeasurementMetricSet, MetricSet, MetricSetSnapshot};
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
@@ -69,12 +70,6 @@ pub(super) struct WorkerMetrics {
     /// definite answer, or the write did not unwind by the cleanup cutoff.
     #[metric(name = "flush.abort_failures", unit = "{upload}")]
     pub flush_abort_failures: Counter<u64>,
-    /// Flushes whose files the store committed without confirming it. After a
-    /// lost completion response whose abort is answered `NotFound` the block
-    /// is acknowledged; after the flush was decided its requests were nacked,
-    /// so their rows may be stored twice.
-    #[metric(name = "flush.late_commits", unit = "{flush}")]
-    pub flush_late_commits: Counter<u64>,
     /// Requests acknowledged as durable.
     #[metric(unit = "{message}")]
     pub acks: ObserveCounter<u64>,
@@ -151,6 +146,61 @@ pub(super) struct FlushMetrics {
     /// Non-empty blocks handed to a write task.
     #[metric(name = "flushes", unit = "{flush}")]
     pub count: Counter<u64>,
+}
+
+/// What the cleanup of a flush found in the store that the write had not
+/// confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AttributeEnum)]
+#[repr(usize)]
+pub(super) enum LateCommit {
+    /// Every object of a failed block exists although its requests were
+    /// nacked, so their rows may be stored twice once the producer retries.
+    Stored,
+    /// A multipart completion lost its response, a probe found the object,
+    /// and the block was acknowledged.
+    Acknowledged,
+    /// Only some objects of a failed block exist.
+    Partial,
+    /// A probe could not tell whether a failed block's objects exist.
+    Unknown,
+}
+
+impl LateCommit {
+    /// Every outcome, indexed by its discriminant; the length is the derived
+    /// variant count, so a variant left out does not compile.
+    pub(super) const ALL: [LateCommit; <LateCommit as AttributeEnum>::CARDINALITY] = [
+        LateCommit::Stored,
+        LateCommit::Acknowledged,
+        LateCommit::Partial,
+        LateCommit::Unknown,
+    ];
+}
+
+// `ALL[o as usize] == o`, which the per-outcome tally indexes by.
+const _: () = {
+    let mut i = 0;
+    while i < LateCommit::ALL.len() {
+        assert!(LateCommit::ALL[i] as usize == i);
+        i += 1;
+    }
+};
+
+/// The finding of one flush cleanup.
+#[attribute_set(item, measurement)]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LateCommitAttrs {
+    /// What the cleanup found.
+    pub outcome: LateCommit,
+}
+
+/// Flush cleanups that found objects the write had not confirmed, or could
+/// not tell, split by what they found.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = LateCommitAttrs)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct LateCommitMetrics {
+    /// Flushes whose cleanup found this outcome.
+    #[metric(name = "flush.late_commits", unit = "{flush}")]
+    pub late_commits: Counter<u64>,
 }
 
 /// Why one flush did not put its block in object storage.
@@ -359,6 +409,8 @@ pub(super) struct Metrics {
     pub flush: MeasurementMetricSet<FlushMetrics>,
     /// Failed flushes, by failure class.
     pub flush_failures: MeasurementMetricSet<FlushFailureMetrics>,
+    /// Flush cleanups that found unconfirmed objects, by finding.
+    pub late_commits: MeasurementMetricSet<LateCommitMetrics>,
     /// Refused requests, by refusal class.
     pub nacks: MeasurementMetricSet<NackMetrics>,
     /// Durable rows and files, by dataset.
@@ -412,6 +464,7 @@ impl Metrics {
             worker: WorkerMetrics::register(ctx),
             flush: FlushMetrics::register(ctx),
             flush_failures: FlushFailureMetrics::register(ctx),
+            late_commits: LateCommitMetrics::register(ctx),
             nacks: NackMetrics::register(ctx),
             written: WrittenMetrics::register(ctx),
             emitted: EmittedMetrics::register(ctx),
@@ -493,6 +546,7 @@ impl Metrics {
         let _ = reporter.report(&mut self.worker);
         let _ = reporter.report_measurement(&mut self.flush);
         let _ = reporter.report_measurement(&mut self.flush_failures);
+        let _ = reporter.report_measurement(&mut self.late_commits);
         let _ = reporter.report_measurement(&mut self.nacks);
         let _ = reporter.report_measurement(&mut self.written);
         let _ = reporter.report_measurement(&mut self.emitted);
@@ -512,6 +566,7 @@ impl Metrics {
         }
         out.extend(self.flush.terminal_snapshots());
         out.extend(self.flush_failures.terminal_snapshots());
+        out.extend(self.late_commits.terminal_snapshots());
         out.extend(self.nacks.terminal_snapshots());
         out.extend(self.written.terminal_snapshots());
         out.extend(self.emitted.terminal_snapshots());
@@ -622,7 +677,6 @@ mod tests {
                 ("flush.retries", "{attempt}"),
                 ("flush.cancelled", "{flush}"),
                 ("flush.abort_failures", "{upload}"),
-                ("flush.late_commits", "{flush}"),
                 ("acks", "{message}"),
                 ("notify.queued", "{request}"),
                 ("notify.token_size", "By"),
@@ -669,6 +723,25 @@ mod tests {
                 &snapshots[0],
                 &[("flush.failures", "{flush}")],
                 &[("error.type", label)],
+            );
+        }
+
+        for (outcome, label) in
+            LateCommit::ALL
+                .into_iter()
+                .zip(["stored", "acknowledged", "partial", "unknown"])
+        {
+            metrics
+                .late_commits
+                .with(LateCommitAttrs { outcome })
+                .late_commits
+                .add(1);
+            let snapshots = metrics.late_commits.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(
+                &snapshots[0],
+                &[("flush.late_commits", "{flush}")],
+                &[("outcome", label)],
             );
         }
 

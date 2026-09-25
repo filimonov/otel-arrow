@@ -259,10 +259,11 @@ impl StoreHooks for ControlledMultipart {
 /// Store hooks that make a multipart creation slow: they cancel a token as
 /// the values upload is being created and yield before the creation
 /// finishes, so the cancellation lands while `BufWriter` is still
-/// preparing the upload.
+/// preparing the upload. With `stall`, the creation never finishes.
 #[derive(Debug)]
 struct CancelDuringCreate {
     token: CancellationToken,
+    stall: bool,
 }
 
 #[async_trait::async_trait]
@@ -270,12 +271,30 @@ impl StoreHooks for CancelDuringCreate {
     async fn before_multipart(&self, location: &Path) -> object_store::Result<Option<HookGuard>> {
         if location.as_ref().contains("dataset=values") {
             self.token.cancel();
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
             for _ in 0..4 {
                 tokio::task::yield_now().await;
             }
         }
         Ok(None)
     }
+}
+
+/// Config whose values table reaches the store only in `finish`: its one row
+/// group stays below `parquet.row_group_bytes`, so the multipart upload is
+/// created while the writer writes its footer.
+fn finish_upload_config() -> LakeConfig {
+    let mut cfg = upload_config();
+    cfg.parquet.row_group_bytes = 64 << 20;
+    cfg.validate().expect("valid config");
+    cfg
+}
+
+/// An abort allowance that is already spent, so a cleanup wait ends at once.
+fn spent_timer(_timeout: Duration) -> AbortTimer {
+    Box::pin(std::future::ready(()))
 }
 
 /// Store hooks that cancel a token the first time the values dataset
@@ -1016,6 +1035,7 @@ async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
         )),
         CancelDuringCreate {
             token: token.clone(),
+            stall: false,
         },
     ));
     let cfg = upload_config();
@@ -1028,6 +1048,58 @@ async fn a_cancellation_during_multipart_creation_still_aborts_the_upload() {
         "the upload created after the cancellation must be aborted"
     );
     assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+}
+
+/// Scenario: cancellation while `finish` is creating the values multipart
+/// upload, once with a creation that then finishes and once with one that
+/// never does.
+/// Guarantees: a creation that finishes within `upload.abort_timeout` is
+/// aborted and no values object completes; one that does not is reported
+/// as a possible orphan on the cancellation, so it is counted as an abort
+/// failure rather than a clean abort.
+#[tokio::test]
+async fn a_cancellation_while_finish_creates_the_upload_aborts_or_reports_it() {
+    for stall in [false, true] {
+        let dir = tempfile::tempdir().expect("tmp");
+        let aborted = Arc::new(AtomicBool::new(false));
+        let parts = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+            Arc::new(HookStore::new(
+                local(&dir),
+                ControlledMultipart {
+                    entered: Arc::new(Notify::new()),
+                    aborted: aborted.clone(),
+                    parts: parts.clone(),
+                    part: PartBehavior::Park,
+                    abort: AbortBehavior::Delegate,
+                },
+            )),
+            CancelDuringCreate {
+                token: token.clone(),
+                stall,
+            },
+        ));
+        let cfg = finish_upload_config();
+        let b = sealed_upload_block(&cfg);
+        let timer = if stall { spent_timer } else { tokio_timer };
+        let sink = Sink::new(store, cfg, FileNaming::new("w"), timer);
+        let got = sink.write_block(&b, &token).await;
+        let Err(Error::Transient(TransientError::Cancelled { abort_error })) = got else {
+            panic!("expected a cancellation, got {got:?}");
+        };
+        assert_eq!(parquet_count(dir.path(), "dataset=values"), 0);
+        if stall {
+            let reason = abort_error.expect("a creation left in flight is a possible orphan");
+            assert!(reason.contains("dataset=values"), "{reason}");
+        } else {
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "the upload created after the cancellation must be aborted"
+            );
+            assert_eq!(abort_error, None);
+        }
+    }
 }
 
 /// Scenario: a part upload fails and its abort fails too.

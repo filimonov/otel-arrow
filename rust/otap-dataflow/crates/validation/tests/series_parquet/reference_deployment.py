@@ -800,8 +800,10 @@ class Case:
         loss, permanent = buffer_losses(samples)
         abort_failures = sum(metric(s, "exporter.series_parquet.flush.abort_failures")
                              for s in last_per_boot(samples))
-        late_commits = sum(metric(s, "exporter.series_parquet.flush.late_commits")
-                           for s in last_per_boot(samples))
+        late_commits = sum(metric(s, "exporter.series_parquet.flush.late_commits"
+                                  f"{{outcome={outcome}}}")
+                           for s in last_per_boot(samples)
+                           for outcome in ("stored", "acknowledged"))
         backpressure = sum(metric(s, "processor.durable_buffer.ingest.failures"
                                      "{failure=backpressure}") for s in last_per_boot(samples))
         flush_failures = sum(metric_sum(s, "exporter.series_parquet.flush.failures")

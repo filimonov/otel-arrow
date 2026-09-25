@@ -4002,7 +4002,8 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
         "flush_failures_by_class": {key.split(".", 3)[-1]: value for key, value in final.items()
                                     if key.startswith("flush.failures.by_class.")},
         "flush_abort_failures_count": final.get("flush.abort_failures"),
-        "flush_late_commits_count": final.get("flush.late_commits"),
+        "flush_late_commits_count": final.get("flush.late_commits.stored", 0)
+        + final.get("flush.late_commits.acknowledged", 0),
         "exporter_nacks_by_class": {key.split(".", 1)[1]: value for key, value in final.items()
                                     if key.startswith("nacks.") and value},
         "producer_storage_nacks_count": record["attempts"]["storage_nacks_count"],
@@ -6862,7 +6863,9 @@ class MultipartCompletionCase(NetworkCase):
         if self.fault != "dropped_multipart_completion":
             return []
         timeline = self.completion_timeline(record)
-        late = int((record.get("final_totals") or {}).get("flush.late_commits", 0))
+        final = record.get("final_totals") or {}
+        late = int(final.get("flush.late_commits.stored", 0)
+                   + final.get("flush.late_commits.acknowledged", 0))
         detected = "late_commit" in timeline.get("cleanup_outcomes", []) and late >= 1
         return [("late_commit_detected", detected,
                  f"cleanup outcomes for the target {timeline.get('cleanup_outcomes')}; "

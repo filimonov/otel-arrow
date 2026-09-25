@@ -102,7 +102,8 @@ The writer then sends one HEAD for that object before any abort. An object
 that exists holds the block's frozen bytes, so the write goes on and the block
 is acknowledged; the upload is then aborted, and only an abort answered
 `NotFound` shows this completion committed it, which counts a late commit
-(`flush.late_commits`, INFO `series_parquet.flush.cleanup`). An object that
+(`flush.late_commits{outcome=acknowledged}`, INFO
+`series_parquet.flush.cleanup`). An object that
 does not exist is aborted and the completion's own error decides the retry. A
 HEAD that fails otherwise leaves the upload alone, since the completion may
 still be applied, and counts it in `flush.abort_failures`.
@@ -521,7 +522,7 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 | `ingest.failures{failure=backpressure}` (buffer) | Requests refused because the WAL is full. | any |
 | `flush.failures` (exporter), `retries.scheduled` (buffer) | Blocks the store did not take; the buffer retries them. | sustained |
 | `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
-| `flush.late_commits` | A lost completion response was probed and the block acknowledged, or a failed block's objects were found after all (its rows may be stored twice). | any, for investigation |
+| `flush.late_commits` | `outcome=stored`: a failed block's objects were found after all (its rows may be stored twice); `partial`: only some were; `unknown`: the probe could not tell; `acknowledged`: a lost completion response was probed and the block acknowledged. | `stored`, `partial` or `unknown`: any, for investigation |
 | `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
 | Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as RESOURCE_EXHAUSTED). | any |
@@ -608,7 +609,7 @@ collections is a counter.
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
 | `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It can over-count: a CreateMultipartUpload answered with a 5xx is reported like one without an answer. |
-| `flush.late_commits` | `{flush}` | Flushes whose files the store committed without confirming it: acknowledged after a lost completion response whose abort was answered `NotFound`, or failed flushes whose every object exists after all, whose nacked rows may be stored twice. |
+| `flush.late_commits` | `{flush}` | Flush cleanups that found objects the write had not confirmed, by `outcome`: `stored` (a failed flush whose every object exists; its nacked rows may be stored twice), `partial` (only some objects exist), `unknown` (a HEAD failed or did not finish by the cleanup cutoff), `acknowledged` (a lost completion response whose abort was answered `NotFound`; the block was acknowledged). |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -656,16 +657,17 @@ the window interval means the destination is the limit.
 | `series_parquet.start` | INFO | Once per worker: `writer_id`, `boot_id`, `storage`, `num_cores`, `memory_budget_bytes`. |
 | `series_parquet.memory_budget.oversubscribed` | WARN | At start, when `memory.budget` times the engine's cores exceeds physical memory. |
 | `series_parquet.upload.parts_exceed_limit` | WARN | At start, when a file of `window.max_block_bytes` would need more than 10,000 parts of `upload.part_bytes`: `max_block_bytes`, `part_bytes`, `parts`, `max_parts`. |
-| `series_parquet.receiver_limit.unverified` | INFO | At start: the upstream receiver's `max_decoding_message_size` is not visible to the exporter and must reach `max_request_bytes`; `receiver_default_bytes` is the receiver's 4MiB default. |
+| `series_parquet.receiver_limit.unverified` | INFO for the first worker of the process, DEBUG after | At start: the upstream receiver's `max_decoding_message_size` is not visible to the exporter and must reach `max_request_bytes`; `receiver_default_bytes` is the receiver's 4MiB default. |
 | `series_parquet.request.failed` | WARN | A refusal, at most one line per second. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt: `seq`, `attempt`, `file`, `objects`, `deadline_remaining`. |
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
 | `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
-| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion committed the object and the block was acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error` naming the object key; the upload id is not logged, as the object store client does not expose it), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion committed the object and the block was acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error` naming the object key, or every key of the block when the write did not unwind; the upload id is not logged, as the object store client does not expose it), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
-| `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
-| `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |
+| `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost; the block's requests are nacked as `internal`, retryable. |
+| `series_parquet.notify.failed` | WARN | A completion the engine would not accept, at most one line per second with `suppressed` naming the lines left out; `notify.failures` counts every one. |
+| `series_parquet.inbox.failed` | WARN | The input channel failed. |
 | `series_parquet.shutdown` | INFO | The Shutdown control message arrived. |
 | `series_parquet.shutdown.deadline_exceeded` | WARN | The shutdown deadline decided what was still held. |
 | `series_parquet.shutdown.complete` | INFO | The worker ended: `accepted`, `acked`, `nacked`, `abandoned`, `deadline_exceeded`, `duration`. |

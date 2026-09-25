@@ -780,6 +780,51 @@ async fn a_permission_error_is_not_retried_until_the_deadline() {
         .await;
 }
 
+/// Scenario: the store panics inside a flush, so the flush task unwinds and
+/// its result never arrives.
+/// Guarantees: every request of the block is nacked, retryable, with the
+/// internal-error sentence, not the object-storage one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_panicked_flush_task_is_nacked_as_an_internal_error() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = fault_store();
+            store.hooks().set(Fault::Panic);
+            let (handler, mut rx) = effects(8);
+            let wall = Arc::new(lake::clock::TestWallClock::new(0));
+            let mut worker = Worker::new(worker_config(), store, wall, handler);
+            worker.admit(logs_pdata());
+            worker.rotate();
+            let done = worker
+                .flushing
+                .as_mut()
+                .expect("a rotated block is flushing")
+                .finish()
+                .await;
+            assert!(done.is_err(), "the task unwound without a result");
+            worker.complete(done);
+            assert!(worker.notify.next().await.is_ok());
+            match rx.recv().await.expect("a nack") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(
+                        nack.reason,
+                        "series_parquet hit an internal error handling the request; retry the \
+                         request"
+                    );
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            assert_no_more_completions(&mut rx);
+            let mut job = worker
+                .cleaning
+                .take()
+                .expect("the unwound job holds the slot");
+            assert!(job.cleanup().await.is_err_and(|e| e.is_panic()));
+        })
+        .await;
+}
+
 /// Scenario: a first attempt fails with an error no retry can cure.
 /// Guarantees: it is logged by the per-attempt WARN with its attempt number and error.
 #[tokio::test(flavor = "current_thread")]
@@ -953,7 +998,7 @@ async fn a_wedged_multipart_abort_is_bounded_and_leaves_no_object() {
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
             assert_eq!(metrics.worker.flush_abort_failures.get(), 1);
-            assert_eq!(metrics.worker.flush_late_commits.get(), 0);
+            assert_eq!(all_late_commits(metrics), 0);
             assert_eq!(flush_failures(metrics, WriteFailure::Deadline), 1);
         })
         .await;
@@ -1002,7 +1047,9 @@ fn cleanup_trace(
 /// Scenario: every way a failed block's cleanup can end: completed anyway, cancelled with none, one
 /// or both objects present, abort timed out, abort failed, not unwound, probe unfinished.
 /// Guarantees: each outcome gets its level (`late_commit`, `aborted`, `partial`, `abort_failed`,
-/// `unknown`) and counter, with sequence, attempt and file.
+/// `unknown`) and counter, with sequence, attempt and file, an `abort_failed` naming the object
+/// keys; `flush.late_commits` tells a nacked
+/// block found stored from a partial one and from one the probe could not settle.
 #[tokio::test(flavor = "current_thread")]
 async fn every_cleanup_outcome_is_logged_and_counted() {
     let events = capture();
@@ -1056,9 +1103,13 @@ async fn every_cleanup_outcome_is_logged_and_counted() {
     let (slow_trace, slow_shared, _) = cleanup_trace(Arc::new(slow));
     slow_trace.cleaned_up(2, cancelled(), clock::now()).await;
 
-    assert_eq!(shared.tally.late_commits.get(), 2);
+    let late = |shared: &super::super::flush::FlushShared| {
+        LateCommit::ALL.map(|outcome| shared.tally.late_commits[outcome as usize].get())
+    };
+    // Stored, acknowledged, partial, unknown.
+    assert_eq!(late(&shared), [2, 0, 1, 0]);
     assert_eq!(shared.tally.abort_failures.get(), 3);
-    assert_eq!(slow_shared.tally.late_commits.get(), 0);
+    assert_eq!(late(&slow_shared), [0, 0, 0, 1]);
     assert_eq!(slow_shared.tally.abort_failures.get(), 0);
     let logged = events.named("series_parquet.flush.cleanup");
     let summary: Vec<_> = logged
@@ -1084,7 +1135,10 @@ async fn every_cleanup_outcome_is_logged_and_counted() {
             event(
                 Level::WARN,
                 "abort_failed",
-                Some("the write did not unwind by the cleanup cutoff")
+                Some(
+                    "multipart uploads of dataset=series/part-x.parquet, \
+                     dataset=values/part-x.parquet: the write did not unwind by the cleanup cutoff"
+                )
             ),
             event(Level::WARN, "unknown", None),
         ]
@@ -1163,7 +1217,8 @@ async fn a_completed_upload_whose_response_is_lost_is_a_late_commit() {
             drop(job);
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
+            assert_eq!(late_commits(metrics, LateCommit::Stored), 1);
+            assert_eq!(all_late_commits(metrics), 1);
             assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
         })
         .await;
@@ -1244,7 +1299,7 @@ async fn an_upload_a_retried_attempt_leaves_behind_is_counted() {
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
             assert_eq!(metrics.worker.flush_abort_failures.get(), 1);
-            assert_eq!(metrics.worker.flush_late_commits.get(), 0);
+            assert_eq!(all_late_commits(metrics), 0);
         })
         .await;
     let cleanup = events.named("series_parquet.flush.cleanup");
@@ -1343,7 +1398,11 @@ async fn a_committed_upload_is_acknowledged(fault: Fault, late: bool) {
             assert_eq!(store.hooks().completes.load(SeqCst), 1, "one upload");
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_late_commits.get(), u64::from(late));
+            assert_eq!(
+                late_commits(metrics, LateCommit::Acknowledged),
+                u64::from(late)
+            );
+            assert_eq!(all_late_commits(metrics), u64::from(late));
             assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
         })
         .await;
@@ -1408,7 +1467,7 @@ async fn an_uncommitted_upload_whose_abort_is_not_found_is_retried() {
             ));
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_late_commits.get(), 0);
+            assert_eq!(all_late_commits(metrics), 0);
             assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
         })
         .await;

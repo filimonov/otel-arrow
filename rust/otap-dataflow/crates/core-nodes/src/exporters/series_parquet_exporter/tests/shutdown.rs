@@ -1064,6 +1064,74 @@ async fn dropping_start_cancels_flush_task() {
         .await;
 }
 
+/// Scenario: the completion channel is closed and five requests, one block each, are nacked by a
+/// store refusing every write, all at one instant.
+/// Guarantees: the node loop writes one `series_parquet.notify.failed` WARN for the burst, and
+/// `notify.failures` still counts all five.
+#[tokio::test(flavor = "current_thread")]
+async fn undeliverable_completions_are_logged_once_per_interval() {
+    let events = capture();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let (handler, completion_rx) = effects(8);
+            drop(completion_rx);
+            let store = fault_store();
+            store.hooks().set(Fault::Denied);
+            let cfg = worker_config_with_requests(1);
+            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+            let metrics = super::super::metrics::Metrics::register(&context, &cfg.lake);
+            let node = tokio::task::spawn_local(super::super::run(
+                cfg,
+                store,
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                Some(metrics),
+            ));
+            for _ in 0..5 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request enqueues");
+            }
+            // Every block fails at once; its nack then fails to deliver.
+            for _ in 0..100_000 {
+                if events.named("series_parquet.flush.failed").len() == 5 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..1_000 {
+                tokio::task::yield_now().await;
+            }
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            drop(pdata_tx);
+            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("the node task joins")
+                .expect("the node succeeds");
+            assert_eq!(
+                terminal_value(terminal.metrics(), "notify.failures", &[]),
+                5
+            );
+            drop(control_tx);
+        })
+        .await;
+    let failed = events.named("series_parquet.notify.failed");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].level, tracing::Level::WARN);
+}
+
 /// Scenario: a buffered backlog is force-drained into a full completion channel nobody reads.
 /// Guarantees: one decision per request, undeliverable ones counted, and the node returns at the
 /// deadline.

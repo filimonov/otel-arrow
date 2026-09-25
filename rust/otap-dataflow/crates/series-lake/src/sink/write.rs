@@ -707,18 +707,25 @@ impl Sink {
         (self.abort_timer)(self.cfg.upload.abort_timeout)
     }
 
-    /// Attach the outcome of the cleanup abort to the failure that triggered it.
+    /// Attach the outcome of the cleanup abort of the upload of `path` to the
+    /// failure that triggered it, each reason prefixed with the key (see
+    /// [`Self::orphan`]).
     ///
     /// A cancellation that already carries a cleanup failure keeps it: the
     /// abort that follows cannot see what the unsettled write left behind.
-    pub(super) fn with_abort(cause: Error, abort_error: Option<String>) -> Error {
+    pub(super) fn with_abort(cause: Error, abort_error: Option<String>, path: &Path) -> Error {
+        let abort_error = abort_error.map(|reason| Self::orphan(path, reason));
         match (cause, abort_error) {
             (
                 Error::Transient(TransientError::Cancelled {
                     abort_error: earlier,
                 }),
                 abort_error,
-            ) => Error::cancelled(earlier.or(abort_error)),
+            ) => Error::cancelled(
+                earlier
+                    .map(|reason| Self::orphan(path, reason))
+                    .or(abort_error),
+            ),
             (cause, None) => cause,
             (cause, Some(abort_error)) => Error::Transient(TransientError::AbortFailed {
                 source: Box::new(cause),
@@ -899,9 +906,8 @@ impl Sink {
                 let abort_error = self
                     .abort_upload(writer, deadline)
                     .await
-                    .or_else(|| watch.hooks().create_unknown())
-                    .map(|reason| Self::orphan(path, reason));
-                return Err(Self::with_abort(cause, abort_error));
+                    .or_else(|| watch.hooks().create_unknown());
+                return Err(Self::with_abort(cause, abort_error, path));
             }
         };
         if cancel.is_cancelled() {
@@ -915,12 +921,16 @@ impl Sink {
         // Phase 2: finalizing. `finish` writes the footer and shuts the BufWriter
         // down; `BufWriter::abort` panics once shutdown has started, so a failed or
         // cancelled finish settles the upload the writer let go of instead (see
-        // `LedgeredUpload`).
-        let finish = tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(Error::cancelled(None)),
-            r = writer.finish() => r.map(|_metadata| ()).map_err(Error::from),
-        };
+        // `LedgeredUpload`). A table smaller than one row group first reaches the
+        // store here, so `finish` may be creating the upload when the token fires.
+        let finish = self
+            .step(
+                async { writer.finish().await.map(|_metadata| ()) },
+                &watch,
+                cancel,
+                &mut cleanup,
+            )
+            .await;
         let Err(cause) = finish else {
             return Ok(TableWritten {
                 rows,
@@ -935,8 +945,8 @@ impl Sink {
                 mut upload,
                 completing: false,
             }) => {
-                self.bounded_abort(upload.abort(), self.start_cleanup())
-                    .await
+                let deadline = cleanup.take().unwrap_or_else(|| self.start_cleanup());
+                self.bounded_abort(upload.abort(), deadline).await
             }
             Some(Unsettled {
                 upload,
@@ -957,12 +967,9 @@ impl Sink {
                 Settled::Found { orphan, .. } | Settled::Absent { orphan } => orphan,
                 Settled::Unknown(reason) => Some(reason),
             },
-            None => None,
+            None => watch.hooks().create_unknown(),
         };
-        Err(Self::with_abort(
-            cause,
-            abort_error.map(|reason| Self::orphan(path, reason)),
-        ))
+        Err(Self::with_abort(cause, abort_error, path))
     }
 
     /// Write every non-empty table of a sealed block, series datasets first.

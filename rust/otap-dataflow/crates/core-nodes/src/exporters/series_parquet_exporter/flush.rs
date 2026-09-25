@@ -8,6 +8,7 @@
 //! so the owner can decide them at a deadline without waiting for the task to
 //! unwind.
 
+use super::metrics::LateCommit;
 use super::token::AckToken;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -270,9 +271,17 @@ pub(super) struct FlushTally {
     /// Multipart uploads a failed write attempt may have left behind (see
     /// [`Trace::abort_failed`]).
     pub(super) abort_failures: Cell<u64>,
-    /// Flushes whose files the store committed without confirming it (see
-    /// [`Trace::late_commit`] and [`Trace::probed_commit`]).
-    pub(super) late_commits: Cell<u64>,
+    /// Flush cleanups by what they found that the write had not confirmed,
+    /// indexed by [`LateCommit`].
+    pub(super) late_commits: [Cell<u64>; LateCommit::ALL.len()],
+}
+
+impl FlushTally {
+    /// Count one cleanup that found `outcome`.
+    fn found(&self, outcome: LateCommit) {
+        let count = &self.late_commits[outcome as usize];
+        count.set(count.get() + 1);
+    }
 }
 
 /// What every flush task of one worker shares with it.
@@ -396,7 +405,7 @@ impl Trace {
                 Some(abort_error) => self.abort_failed(attempt, abort_error),
                 None => self.probe(attempt, cutoff).await,
             },
-            None => self.abort_failed(attempt, "the write did not unwind by the cleanup cutoff"),
+            None => self.unwound_late(attempt, "the write did not unwind by the cleanup cutoff"),
         }
     }
 
@@ -414,33 +423,38 @@ impl Trace {
                 attempt = attempt,
                 file = &*self.file
             ),
-            Presence::Some(present) => otel_info!(
-                "series_parquet.flush.cleanup",
-                outcome = "partial",
-                seq = self.seq,
-                attempt = attempt,
-                file = &*self.file,
-                present = present,
-                objects = self.paths.len(),
-                message = "some objects of a failed block exist; their rows may be stored twice \
-                           once the producer retries"
-            ),
-            Presence::Unknown(probe_error) => otel_warn!(
-                "series_parquet.flush.cleanup",
-                outcome = "unknown",
-                seq = self.seq,
-                attempt = attempt,
-                file = &*self.file,
-                probe_error = probe_error.as_str(),
-                message = "could not tell whether a failed block's objects exist"
-            ),
+            Presence::Some(present) => {
+                self.shared.tally.found(LateCommit::Partial);
+                otel_info!(
+                    "series_parquet.flush.cleanup",
+                    outcome = "partial",
+                    seq = self.seq,
+                    attempt = attempt,
+                    file = &*self.file,
+                    present = present,
+                    objects = self.paths.len(),
+                    message = "some objects of a failed block exist; their rows may be stored \
+                               twice once the producer retries"
+                );
+            }
+            Presence::Unknown(probe_error) => {
+                self.shared.tally.found(LateCommit::Unknown);
+                otel_warn!(
+                    "series_parquet.flush.cleanup",
+                    outcome = "unknown",
+                    seq = self.seq,
+                    attempt = attempt,
+                    file = &*self.file,
+                    probe_error = probe_error.as_str(),
+                    message = "could not tell whether a failed block's objects exist"
+                );
+            }
         }
     }
 
     /// Count and log a failed block whose every object exists.
     fn late_commit(&self, attempt: u64) {
-        let late = &self.shared.tally.late_commits;
-        late.set(late.get() + 1);
+        self.shared.tally.found(LateCommit::Stored);
         otel_info!(
             "series_parquet.flush.cleanup",
             outcome = "late_commit",
@@ -456,8 +470,7 @@ impl Trace {
     /// its response: the sink found the object, and the abort that followed
     /// showed this completion committed it (see `FlushReport::probed_commits`).
     fn probed_commit(&self, attempt: u64) {
-        let late = &self.shared.tally.late_commits;
-        late.set(late.get() + 1);
+        self.shared.tally.found(LateCommit::Acknowledged);
         otel_info!(
             "series_parquet.flush.cleanup",
             outcome = "late_commit",
@@ -466,6 +479,16 @@ impl Trace {
             file = &*self.file,
             message = "a multipart completion lost its response and a probe found the object; \
                        the block is acknowledged"
+        );
+    }
+
+    /// [`Trace::abort_failed`] for a write that did not unwind, `why`: any
+    /// object of the block may have an upload left, so every key is named.
+    fn unwound_late(&self, attempt: u64, why: &str) {
+        let keys: Vec<&str> = self.paths.iter().map(Path::as_ref).collect();
+        self.abort_failed(
+            attempt,
+            &format!("multipart uploads of {}: {why}", keys.join(", ")),
         );
     }
 
@@ -710,7 +733,7 @@ impl FlushJob {
             let _ = (&mut self.handle).await;
             let attempt = self.trace.attempts.get();
             if attempt != 0 {
-                self.trace.abort_failed(
+                self.trace.unwound_late(
                     attempt,
                     "the write task did not unwind by the cleanup cutoff and was aborted",
                 );

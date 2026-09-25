@@ -7,6 +7,8 @@
 
 pub(super) use super::super::config::Config;
 
+pub(super) use super::super::metrics::LateCommit;
+
 pub(super) use super::super::outcome::{Outcome, WriteFailure};
 
 pub(super) use super::super::token::{AckToken, Notifier};
@@ -494,6 +496,23 @@ pub(super) fn flush_failures(
         .get()
 }
 
+/// Flushes counted in `flush.late_commits{outcome}` under `outcome`.
+pub(super) fn late_commits(metrics: &super::super::metrics::Metrics, outcome: LateCommit) -> u64 {
+    metrics
+        .late_commits
+        .get(super::super::metrics::LateCommitAttrs { outcome })
+        .late_commits
+        .get()
+}
+
+/// Flushes counted in `flush.late_commits` under every outcome.
+pub(super) fn all_late_commits(metrics: &super::super::metrics::Metrics) -> u64 {
+    LateCommit::ALL
+        .into_iter()
+        .map(|outcome| late_commits(metrics, outcome))
+        .sum()
+}
+
 /// Which failure a [`FaultStore`] injects.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Fault {
@@ -537,6 +556,8 @@ pub(super) enum Fault {
     /// The first `values` completion times out without committing and its
     /// abort is answered `NotFound`; the store then heals.
     UncommittedCompleteTimesOutOnce,
+    /// Every write panics inside the store, which unwinds the flush task.
+    Panic,
 }
 
 /// How long one write takes to fail under [`Fault::SlowFail`].
@@ -729,6 +750,7 @@ impl Faults {
             .push(clock::now());
         self.entered.notify_one();
         let mode = self.mode();
+        assert!(mode != Fault::Panic, "injected store panic");
         if mode == Fault::Park {
             /// Accounts for one parked write for as long as its future lives.
             ///

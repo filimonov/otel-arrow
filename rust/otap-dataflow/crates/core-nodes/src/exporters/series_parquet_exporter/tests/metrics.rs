@@ -473,35 +473,45 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     );
 }
 
-/// Scenario: a worker started with the default `ingress.max_request_bytes`.
-/// Guarantees: one INFO line states that the receiver's decoding limit cannot be seen from the
-/// exporter, with the request limit it must reach and the receiver's 4MiB default.
+/// Scenario: two workers of one process started with the default `ingress.max_request_bytes`.
+/// Guarantees: each states that the receiver's decoding limit cannot be seen from the exporter,
+/// with the request limit it must reach and the receiver's 4MiB default; at most the first worker
+/// of the process says it at INFO, every later one at DEBUG.
 #[tokio::test(flavor = "current_thread")]
 async fn start_up_states_that_the_receiver_limit_is_not_visible() {
     let events = capture();
-    let (handler, _rx) = effects(8);
-    let worker = Worker::new(
-        worker_config(),
-        Arc::new(object_store::memory::InMemory::new()),
-        Arc::new(lake::clock::TestWallClock::new(0)),
-        handler,
-    );
-    super::super::announce(
-        &worker,
-        &super::super::Startup {
-            storage: "file".to_owned(),
-            num_cores: 1,
-        },
-    );
+    for _ in 0..2 {
+        let (handler, _rx) = effects(8);
+        let worker = Worker::new(
+            worker_config(),
+            Arc::new(object_store::memory::InMemory::new()),
+            Arc::new(lake::clock::TestWallClock::new(0)),
+            handler,
+        );
+        super::super::announce(
+            &worker,
+            &super::super::Startup {
+                storage: "file".to_owned(),
+                num_cores: 1,
+            },
+        );
+    }
     let stated = events.named("series_parquet.receiver_limit.unverified");
-    assert_eq!(stated.len(), 1, "{stated:?}");
-    assert_eq!(stated[0].level, tracing::Level::INFO);
-    let field = |name: &str| stated[0].fields.get(name).cloned();
-    assert_eq!(field("max_request_bytes"), Some(FieldValue::U64(16 << 20)));
-    assert_eq!(
-        field("receiver_default_bytes"),
-        Some(FieldValue::U64(4 << 20))
-    );
+    assert_eq!(stated.len(), 2, "{stated:?}");
+    // Another test of this binary may have started a worker first.
+    assert!(matches!(
+        stated[0].level,
+        tracing::Level::INFO | tracing::Level::DEBUG
+    ));
+    assert_eq!(stated[1].level, tracing::Level::DEBUG);
+    for event in &stated {
+        let field = |name: &str| event.fields.get(name).cloned();
+        assert_eq!(field("max_request_bytes"), Some(FieldValue::U64(16 << 20)));
+        assert_eq!(
+            field("receiver_default_bytes"),
+            Some(FieldValue::U64(4 << 20))
+        );
+    }
 }
 
 /// Scenario: a 60GiB block with 5MiB parts (12,288 parts), then the defaults (63 parts).

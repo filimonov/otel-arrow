@@ -13,7 +13,8 @@ use super::super::log_gate::LogGate;
 use super::config::Config;
 use super::flush::{self, FlushDone, FlushJob, FlushShared};
 use super::metrics::{
-    DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, Metrics, NackAttrs,
+    DatasetAttrs, EmitAttrs, EmitReason, FlushAttrs, FlushReason, LateCommit, LateCommitAttrs,
+    Metrics, NackAttrs,
 };
 use super::outcome::{self, Outcome, StorageFailed, WriteFailure};
 use super::token::{AckToken, Notifier};
@@ -738,15 +739,16 @@ impl Worker {
         self.flushing = Some(job);
     }
 
-    /// The outcome a block whose flush did not succeed must be reported as.
+    /// The outcome a block whose flush did not succeed must be reported as:
+    /// `Shutdown` once the shutdown deadline has passed, else `cause`.
     ///
-    /// Both are retryable: the rows never reached object storage, so the
+    /// Every one is retryable: the rows never reached object storage, so the
     /// sender still holds the only copy.
-    fn failed_outcome(&self) -> Outcome {
+    fn failed_outcome(&self, cause: Outcome) -> Outcome {
         if self.deadline.is_some_and(|d| clock::now() >= d) {
             Outcome::Shutdown
         } else {
-            Outcome::Storage
+            cause
         }
     }
 
@@ -849,7 +851,7 @@ impl Worker {
                             message = "Block failed before durable completion"
                         );
                         reason = Some(Rc::from(StorageFailed(error).to_string()));
-                        self.failed_outcome()
+                        self.failed_outcome(Outcome::Storage)
                     }
                 }
             }
@@ -866,7 +868,8 @@ impl Worker {
                     bytes = job.bytes,
                     error = %error
                 );
-                self.failed_outcome()
+                // The task panicked or was dropped: a writer fault, not the store's.
+                self.failed_outcome(Outcome::Internal)
             }
         };
         // A block decided at the shutdown deadline is told so, whatever the
@@ -1060,10 +1063,16 @@ impl Worker {
                 .worker
                 .flush_abort_failures
                 .add(tally.abort_failures.take());
-            metrics
-                .worker
-                .flush_late_commits
-                .add(tally.late_commits.take());
+            for outcome in LateCommit::ALL {
+                let found = tally.late_commits[outcome as usize].take();
+                if found != 0 {
+                    metrics
+                        .late_commits
+                        .with(LateCommitAttrs { outcome })
+                        .late_commits
+                        .add(found);
+                }
+            }
             metrics.worker.cache_entries.set(entries);
             metrics.worker.cache_hits.observe(stats.hits);
             metrics.worker.cache_misses.observe(stats.misses);
