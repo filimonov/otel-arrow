@@ -3094,7 +3094,7 @@ class RestartSlice(unittest.TestCase):
                 work.mkdir()
                 overrides = {
                     "window": {
-                        "interval": "3153600000s",
+                        "interval": "86400s",
                         "max_requests_per_block": 1,
                         "flush_retry_deadline": "10s",
                     }
@@ -3138,7 +3138,15 @@ class RestartSlice(unittest.TestCase):
                     "WHERE decode(key)='window_start'",
                     [path],
                 ).fetchall()
-                self.assertEqual(windows, [("0",)])
+                # The one-day window (the longest allowed) keeps both boots in
+                # one aligned window; a run straddling 00:00 UTC sees the next.
+                starts = sorted(int(value) for (value,) in windows)
+                self.assertTrue(all(start % 86400 == 0 for start in starts), starts)
+                self.assertTrue(
+                    len(starts) == 1
+                    or (len(starts) == 2 and starts[1] - starts[0] == 86400),
+                    starts,
+                )
             verify_files(self, target, ["restart-0", "restart-1"], 0)
 
     # Scenario: a producer disconnects after admission but before a long
