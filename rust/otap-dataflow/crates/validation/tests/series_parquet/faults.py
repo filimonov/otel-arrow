@@ -4549,10 +4549,10 @@ class ProcessCase(FaultCase):
 
     @staticmethod
     def multipart_met(seen):
-        """A multipart upload open in the store with bytes transferred, and FLUSHING."""
+        """A multipart upload open in the store with part bytes the store itself
+        lists (list_parts), and FLUSHING; NGINX's logged bytes are evidence only."""
         return seen["block_flushing_bytes"] > 0 and any(
-            (upload.get("part_bytes") or 0) > 0 or upload["logged_part_bytes"] > 0
-            for upload in seen["open_uploads"])
+            (upload.get("part_bytes") or 0) > 0 for upload in seen["open_uploads"])
 
     def observe_put(self, sample=None):
         """kill_upload: FLUSHING held with no request of the new boot finished yet."""
@@ -4920,7 +4920,7 @@ class ProcessCase(FaultCase):
         final_keys = {item["key"] for item in record["objects"]}
         first, second = self.events
         caught = [upload for upload in first["gate"].get("open_uploads", [])
-                  if (upload.get("part_bytes") or 0) > 0 or upload["logged_part_bytes"] > 0]
+                  if (upload.get("part_bytes") or 0) > 0]
         open_ids = {upload["upload_id"] for upload in first["uploads_at_exit"]}
         if not any(upload["upload_id"] in open_ids and upload["key"] not in final_keys
                    for upload in caught):

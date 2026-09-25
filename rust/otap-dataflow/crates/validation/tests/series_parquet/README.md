@@ -705,8 +705,9 @@ acknowledged input and `drained`.
   stored at the exit.
 - `kill_upload`: with the values route's uploads throttled to 512 KB/s,
   SIGKILL while a values multipart upload of the current boot is open in the
-  store with bytes stored and FLUSHING nonempty. The throttle moves to the
-  general route at 1 KB/s and the restarted engine is killed while its first
+  store with part bytes the store lists (`list_parts`) and FLUSHING
+  nonempty. The throttle moves to the general route at 1 KB/s and the
+  restarted engine is killed while its first
   flush holds its series PUT, a single PUT, on the wire; then the throttle is
   removed and a third engine runs. The caught upload must stay incomplete,
   its key never completed, and NGINX must log the series PUT the second kill

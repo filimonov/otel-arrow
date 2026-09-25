@@ -1570,12 +1570,17 @@ class ProcessCaseContracts(unittest.TestCase):
                 self.assertFalse(faults.ProcessCase.active_met(dict(seen, **change)))
 
     # Scenario: kill_upload's gates are judged from partial evidence.
-    # Guarantees: the multipart gate needs FLUSHING and an open upload with
-    # bytes stored or logged; the PUT gate needs FLUSHING held long enough
-    # and no request of the new boot finished yet.
+    # Guarantees: the multipart gate needs FLUSHING and an open upload whose
+    # parts the store lists with bytes (NGINX's logged bytes alone are not
+    # enough); the PUT gate needs FLUSHING held long enough and no request of
+    # the new boot finished yet.
     def test_upload_gates_need_bytes_on_the_wire(self):
         upload = {"part_bytes": 0, "logged_part_bytes": 0}
         seen = {"block_flushing_bytes": 5, "open_uploads": [upload]}
+        self.assertFalse(faults.ProcessCase.multipart_met(seen))
+        upload["logged_part_bytes"] = 1541694
+        self.assertFalse(faults.ProcessCase.multipart_met(seen))
+        upload["part_bytes"] = None
         self.assertFalse(faults.ProcessCase.multipart_met(seen))
         upload["part_bytes"] = 1550000
         self.assertTrue(faults.ProcessCase.multipart_met(seen))
