@@ -120,9 +120,9 @@
   ],
   "child_indexes": [
     {
-      "name": "failure-s3-551650863b58.json",
-      "sha256": "551650863b5865164a8ca3a00c298549be6a5c8250a25891ae4115e8be765b90",
-      "size_bytes": 40115
+      "name": "failure-s3-f20a3a7431e0.json",
+      "sha256": "f20a3a7431e0f093eeb08b441feac8851378c7c06503d0d50d03616393cd1c65",
+      "size_bytes": 39663
     }
   ],
   "children": [
@@ -148,9 +148,6 @@
         "peak_rss_bytes": 437465088,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-buffered-minio-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -177,9 +174,6 @@
         "peak_rss_bytes": 447967232,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-buffered-rustfs-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -205,9 +199,6 @@
         "peak_rss_bytes": 124350464,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-strict-minio-c1-w5-r001",
       "status": "failed",
       "topology": "strict"
@@ -233,9 +224,6 @@
         "peak_rss_bytes": 115511296,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "orphaned_uploads_expected"
-      ],
       "run_id": "failure-s3-http503-strict-rustfs-c1-w5-r001",
       "status": "failed",
       "topology": "strict"
@@ -260,7 +248,6 @@
         "peak_rss_bytes": 150351872,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -285,7 +272,6 @@
         "peak_rss_bytes": 145731584,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-buffered-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -309,7 +295,6 @@
         "peak_rss_bytes": 111935488,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -333,7 +318,6 @@
         "peak_rss_bytes": 120983552,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-slow-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -358,7 +342,6 @@
         "peak_rss_bytes": 431910912,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -384,7 +367,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-s3-store_outage-buffered-rustfs-c1-w5-r002: harness fix rerun: r002 measured the 15 s hold from the failed block window end, but that block had waited for the flush slot, so the outage ended 0.4 s after its deadline failure at 124.6 s; the hold is now measured from the failure (317eaee90). r001 before it removed its outage 0.4 s after the flush deadline",
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-buffered-rustfs-c1-w5-r003",
       "status": "passed",
       "topology": "buffered"
@@ -408,7 +390,6 @@
         "peak_rss_bytes": 116387840,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -432,7 +413,6 @@
         "peak_rss_bytes": 129593344,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-s3-store_outage-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -1358,14 +1338,6 @@
     }
   },
   "events": [],
-  "fault_rejudgement": {
-    "not_rejudged": [],
-    "rules": {
-      "duplicates_explained": "strict: every duplicated record belongs to a resent request; buffered: every duplicated record has a copy in a values file of a failed block",
-      "fault_observed": "store_outage: a flush.failed event of class deadline logged at least the flush deadline after arming and before the fault was removed"
-    },
-    "verdict_changes": []
-  },
   "mandatory_metrics": [
     "children_count",
     "children_passed_count"
@@ -1442,7 +1414,7 @@
   "run_id": "failure-s3",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-25T00:34:11Z",
+  "started_utc": "2026-09-25T00:33:49Z",
   "status": "failed",
   "workload": {}
 }
