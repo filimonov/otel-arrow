@@ -74,6 +74,8 @@ groups:
               # No max_age: expiry drops acknowledged data, counted in loss.*{reason=expired}.
               # The exporter checks the framing of OTLP bytes, which Arrow conversion would bypass.
               otlp_handling: pass_through
+              # Bundles held in memory until their block commits: 640 x Alloy's 2MiB exports = 1.34GB; carries 640 x 4000 lines / (15s + 5s) = 128k lines/s.
+              max_in_flight: 640
           exporter:
             type: exporter:series_parquet
             config:

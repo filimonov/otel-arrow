@@ -17,7 +17,7 @@ loki.source.file "series" {
 // Changes data: a line longer than 512KiB is cut to 512KiB, suffix included.
 // The exporter refuses a record above its ingress.max_row_bytes (1MiB), and
 // with it the whole export after the WAL has acknowledged it, so one long line
-// would drop up to 8MiB of its neighbours; the limit leaves room for the
+// would drop up to 2MiB of its neighbours; the limit leaves room for the
 // record's attributes.
 loki.process "series" {
   stage.truncate {
@@ -115,15 +115,17 @@ otelcol.exporter.otlp "series" {
     sizer = "items"
     queue_size = 16000
 
-    // Splits an export at 8MiB, half the engine receiver's 16MiB
-    // max_decoding_message_size, whatever the line length: 4000 lines of 8KiB
-    // (34 MB) leave as four exports of 8.38 MB and one of 0.44 MB. An export
-    // above the receiver limit is refused and never delivered. `min_size = 0`
-    // sends each batch at once, without waiting to merge.
+    // Splits an export at 2MiB, whatever the line length, so no export
+    // reaches the engine receiver's 16MiB max_decoding_message_size and the
+    // buffer's max_in_flight (640) exports hold at most 640 * 2MiB = 1.34 GB
+    // per worker. A 4000-line batch of 100-byte lines (1.59 MB) stays whole;
+    // 4000 lines of 8KiB (34 MB) leave as 16 exports of 2.09 MB and one of
+    // 0.54 MB. `min_size = 0` sends each batch at once, without waiting to
+    // merge.
     batch {
       flush_timeout = "5s"
       min_size      = 0
-      max_size      = 8388608
+      max_size      = 2097152
       sizer         = "bytes"
     }
 

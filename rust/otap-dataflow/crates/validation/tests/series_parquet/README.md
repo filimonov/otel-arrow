@@ -921,7 +921,9 @@ attempt timeout through `SERIES_ALLOY_TIMEOUT`, which the config reads, so an
 expired attempt is visible inside their own waits. Most tests write 12 lines,
 far below `send_batch_size`, so the batch processor releases them on its 5s
 `timeout`; `DockerSlice.test_alloy_batch_above_4mib_is_stored` writes one full
-batch of 4000 lines of 1100 bytes, one export above 4MiB.
+batch of 4000 lines of 1100 bytes through the strict config, one export above
+4MiB, and `test_alloy_splits_large_lines_under_the_receiver_limit` 4000 lines
+of 8 KiB through the reference config, split at its 2MiB cap.
 
 [`configs/series-parquet-strict.alloy`](../../../../configs/series-parquet-strict.alloy)
 is the producer of the strict deployment, which the capacity family's `alloy`

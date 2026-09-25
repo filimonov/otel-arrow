@@ -2660,9 +2660,10 @@ class DockerSlice(unittest.TestCase):
     def test_rustfs(self):
         self.exercise("rustfs")
 
-    # Scenario: Docker Alloy tails 4000 lines of 1100 bytes, which its batch
-    # processor sends as one OTLP export of more than 4 MiB, into the shipped
-    # engine receiver and exporter on MinIO.
+    # Scenario: Docker Alloy on the strict River config, which has no bytes
+    # cap, tails 4000 lines of 1100 bytes, which its batch processor sends as
+    # one OTLP export of more than 4 MiB, into the shipped engine receiver and
+    # exporter on MinIO.
     # Guarantees: the export is accepted as one request and every line is
     # stored exactly once, so the receiver's decoding limit admits every
     # request the exporter's ingress.max_request_bytes accepts.
@@ -2674,7 +2675,8 @@ class DockerSlice(unittest.TestCase):
                 try:
                     ids = [f"large-{i:04d}-" + "x" * 1089 for i in range(4000)]
                     self.assertGreater(sum(len(body) for body in ids), 4 << 20)
-                    with AlloyProducer(directory, engine) as alloy:
+                    strict = WORKSPACE / "configs/series-parquet-strict.alloy"
+                    with AlloyProducer(directory, engine, config=strict) as alloy:
                         alloy.write(ids)
                         try:
                             wait_for_alloy(store, directory, ids, timeout=120)
@@ -2721,8 +2723,8 @@ class DockerSlice(unittest.TestCase):
                         engine.engine_log(),
                     )
                 )
-                # 34 MB in exports of at most 8MiB.
-                self.assertGreaterEqual(requests, 5)
+                # 34 MB in exports of at most 2MiB.
+                self.assertGreaterEqual(requests, 17)
 
     # Scenario: Alloy on the reference config tails three lines of 3 MiB each,
     # above the exporter's 1MiB ingress.max_row_bytes.
