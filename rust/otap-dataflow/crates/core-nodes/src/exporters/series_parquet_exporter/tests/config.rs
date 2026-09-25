@@ -158,7 +158,7 @@ fn the_shipped_example_configuration_is_valid() {
     assert_eq!(cfg.lake.writer_id, "local_1");
 }
 
-/// Scenario: the receiver and exporter nodes of both shipped series_parquet configurations.
+/// Scenario: the receiver and exporter nodes of every shipped series_parquet configuration.
 /// Guarantees: the receiver's `max_decoding_message_size` equals the exporter's
 /// `ingress.max_request_bytes`, so no request the exporter accepts is refused by the receiver.
 #[test]
@@ -167,6 +167,7 @@ fn the_shipped_receiver_takes_every_request_the_exporter_accepts() {
     for yaml in [
         include_str!("../../../../../../configs/series-parquet-local.yaml"),
         include_str!("../../../../../../configs/series-parquet-s3.yaml"),
+        include_str!("../../../../../../configs/series-parquet-buffered.yaml"),
     ] {
         let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("config parses");
         let nodes = doc
@@ -191,6 +192,26 @@ fn the_shipped_receiver_takes_every_request_the_exporter_accepts() {
             Some(exporter.lake.ingress.max_request_bytes)
         );
     }
+}
+
+/// Scenario: the exporter of `configs/series-parquet-buffered.yaml` against the 60s grace
+/// that SIGTERM grants.
+/// Guarantees: `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)`, the
+/// longest the exporter's drain runs, fits the grace, so a signal shutdown ends by itself.
+#[test]
+fn the_buffered_configuration_drains_within_the_signal_grace() {
+    let yaml = include_str!("../../../../../../configs/series-parquet-buffered.yaml");
+    let doc: serde_json::Value = serde_yaml::from_str(yaml).expect("config parses");
+    let exporter = doc
+        .pointer("/groups/default/pipelines/main/nodes/exporter/config")
+        .expect("an exporter");
+    let cfg: Config = serde_json::from_value(exporter.clone()).expect("exporter config");
+    let drain = cfg.window.interval
+        + 2 * (cfg.window.flush_retry_deadline + cfg.lake.upload.abort_timeout);
+    assert!(
+        drain <= Duration::from_secs(60),
+        "drain bound {drain:?}"
+    );
 }
 
 /// Scenario: the factory builds file storage with no capability bound to the node.

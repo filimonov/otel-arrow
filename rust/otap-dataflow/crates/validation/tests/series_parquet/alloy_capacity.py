@@ -4,9 +4,9 @@
 
 The capacity numbers come from a Python generator that sends 1000-record
 requests over hundreds of connections. This trial asks whether a real
-producer sees the same engine: Grafana Alloy, running the reference River
-config the E2E suite runs (its default batching included), tails one log
-file into the strict engine on four local-store workers.
+producer sees the same engine: Grafana Alloy, running the strict River
+config (`configs/series-parquet-strict.alloy`, its batching included), tails
+one log file into the strict engine on four local-store workers.
 
 A feeder process owns the file and a recording tap. It appends fixed-width
 lines at the offered rate, holding at most `BACKLOG_LINES` lines ahead of
@@ -60,7 +60,8 @@ SEQ_DIGITS = 12
 BACKLOG_LINES = 1_000_000
 WRITE_PERIOD_S = 0.01
 POLL_PERIOD_S = 0.5
-# The attempt timeout the shipped River config falls back to.
+# The strict engine's producer, and the attempt timeout it falls back to.
+STRICT_ALLOY_CONFIG = "configs/series-parquet-strict.alloy"
 ATTEMPT_TIMEOUT = "180s"
 # After the writer stops, how long Alloy may go without a successful send
 # before the trial stops waiting, and the longest it waits in all.
@@ -467,8 +468,8 @@ def split_producer_cpus(cpu_sets) -> tuple:
 
 
 def shipped_alloy_settings() -> dict:
-    """The batching and concurrency the reference River config ships."""
-    text = (test_e2e.WORKSPACE / "configs/series-parquet.alloy").read_text()
+    """The batching and concurrency the strict River config ships."""
+    text = (test_e2e.WORKSPACE / STRICT_ALLOY_CONFIG).read_text()
 
     def number(name):
         found = re.search(rf"\b{name}\s*=\s*(\d+)", text)
@@ -516,14 +517,15 @@ def alloy_experiment(plan, trial, spec, result, run_dir, controls):
         result["config"]["edges"] = [list(edge) for edge in engine.edges]
         result["config"]["malloc_conf"] = capacity.JEMALLOC_STATS_CONF
         result["config"]["alloy_river"] = (
-            test_e2e.WORKSPACE / "configs/series-parquet.alloy").read_text()
+            test_e2e.WORKSPACE / STRICT_ALLOY_CONFIG).read_text()
         result["ephemeral_values"]["<receiver_listening_addr>"] = f"127.0.0.1:{engine.grpc_port}"
         command.record_graph(result, engine, trial["topology"])
         feeder = Feeder(target=f"127.0.0.1:{engine.grpc_port}", rate=trial["rate"],
                         cpus=feeder_cpus, directory=run_dir / "feeder")
         # The tap needs the engine; Alloy needs the tap, and creates the
         # file the feeder appends to.
-        alloy = test_e2e.AlloyProducer(run_dir, _Target(0), timeout=ATTEMPT_TIMEOUT)
+        alloy = test_e2e.AlloyProducer(run_dir, _Target(0), timeout=ATTEMPT_TIMEOUT,
+                                       config=test_e2e.WORKSPACE / STRICT_ALLOY_CONFIG)
         # A run directory reused after an aborted attempt keeps its old file.
         shutil.rmtree(alloy.root, ignore_errors=True)
         ready = feeder.start(alloy.root / "events.log")

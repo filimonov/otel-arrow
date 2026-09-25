@@ -277,11 +277,35 @@ the shared AWS auth provider configuration. An OK OTLP response means the
 request's objects are in the bucket. Receiver concurrency is sized for 100k
 records/s in requests of about 512 records; the file shows the formula.
 
+### `series-parquet-buffered.yaml`
+
+The reference deployment for Grafana Alloy producers: the S3 pipeline with a
+`processor:durable_buffer` between the receiver and the exporter.
+
+- Receives OTLP on `127.0.0.1:4317`; an OK means the request is in the WAL
+  under `/var/lib/otap/series-wal`, which gets its own device
+- Refuses with UNAVAILABLE while the WAL is at its 32GiB cap; the buffer
+  retries failed blocks, so the exporter's flush deadline is 15s and a SIGTERM
+  drain ends within its 60s grace
+
+Requires a binary built with `--features series-parquet,aws,durable-buffer`,
+an existing bucket and the WAL directory. Sizing, alerts and failure behaviour:
+the series_parquet exporter README, "Deploying with Alloy".
+
 ### `series-parquet.alloy`
 
-The Grafana Alloy producer used with either series Parquet config: it tails
-`/input/events.log`, inserts an `e2e.source` attribute and exports OTLP logs to
-the endpoint named by the `OTLP_ENDPOINT` environment variable.
+The Grafana Alloy producer of `series-parquet-buffered.yaml`: it tails
+`/input/events.log`, sets `host.id` from `SERIES_PRODUCER_ID` or the hostname,
+inserts an `e2e.source` attribute and exports OTLP logs to the endpoint named
+by the `OTLP_ENDPOINT` environment variable, with a file-backed sending queue.
+Run it with `alloy run --stability.level=public-preview
+--storage.path=<persistent dir>`.
+
+### `series-parquet-strict.alloy`
+
+The producer of the strict `series-parquet-s3.yaml`: the same pipeline with a
+180s attempt timeout, since each response waits for its block in the bucket,
+and an in-memory queue sized for that hold.
 
 ### `syslog-perf.yaml`
 

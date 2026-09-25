@@ -1,5 +1,13 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
+
+// The Grafana Alloy producer of the buffered reference deployment
+// (`series-parquet-buffered.yaml`): the engine answers once a request is in
+// its WAL, in tens of milliseconds. Run Alloy with
+//   alloy run --stability.level=public-preview --storage.path=<persistent dir>
+// The storage path keeps the file positions and the sending queue across a
+// restart; the flag enables the queue's file storage. The strict variant is
+// `series-parquet-strict.alloy`.
 loki.source.file "series" {
   targets = [{ __path__ = "/input/events.log", job = "series-e2e" }]
   forward_to = [otelcol.receiver.loki.series.receiver]
@@ -12,17 +20,17 @@ otelcol.receiver.loki "series" {
   }
 }
 
-// The lake takes its producer_id column from a resource attribute, which the
-// Loki bridge does not supply: without this the rows would carry an empty
-// producer. `host.id` is the attribute named by `producer_id_attribute` in the
-// series Parquet exporter config, and `service.name` feeds the denormalized
-// service column.
+// The lake takes its producer_id column from the resource attribute named by
+// `producer_id_attribute` (`host.id`), which the Loki bridge does not supply.
+// Each producer needs its own value: SERIES_PRODUCER_ID, else the hostname.
+// `service.name` feeds the denormalized service column.
 otelcol.processor.transform "series" {
   error_mode = "ignore"
   log_statements {
     context = "resource"
     statements = [
-      `set(attributes["host.id"], "alloy-producer")`,
+      string.format(`set(attributes["host.id"], %q)`,
+        coalesce(sys.env("SERIES_PRODUCER_ID"), constants.hostname)),
       `set(attributes["service.name"], "series-e2e-service")`,
     ]
   }
@@ -42,18 +50,11 @@ otelcol.processor.attributes "series" {
   }
 }
 
-// Without a batch every log line is its own OTLP export. The cap keeps one
-// export well below the engine receiver's max_decoding_message_size (16MiB in
-// the shipped engine configs, tonic's 4MiB when unset): a larger message is
-// refused with OUT_OF_RANGE, and the OTLP exporter below retries it without
-// end. The Loki bridge wraps each line in its own ResourceLogs, about 300
-// bytes on the wire beyond the line itself, so 4000 lines of 100 bytes are
-// 1.6 MB and lines of up to about 3.9 KB stay under 16MiB.
-//
-// Larger batches raise the strict engine's ceiling: each worker takes at most
-//   receiver_slots * records_per_export / hold_time
-// records per second, the hold time being about a window (128 slots of 4000
-// records: 512k/s at a 1s window, 34k/s at 15s).
+// The Loki bridge turns every line into its own request; the batch makes one
+// export of up to 4000 lines. The Loki bridge adds about 300 bytes per line on
+// the wire, so 4000 lines of 100 bytes are 1.6 MB, and lines of up to about
+// 3.9 KB stay under the engine receiver's 16MiB max_decoding_message_size (an
+// export above it gets OUT_OF_RANGE and is retried without end).
 otelcol.processor.batch "series" {
   send_batch_size     = 4000
   send_batch_max_size = 4000
@@ -63,19 +64,15 @@ otelcol.processor.batch "series" {
   }
 }
 
+// Survives an Alloy restart: without it the queued batches, whose lines the
+// file positions have already passed, are lost.
+otelcol.storage.file "queue" {}
+
 otelcol.exporter.otlp "series" {
-  // The engine holds the OTLP response until the whole block is durable, and
-  // blocks are sealed on aligned window boundaries. A timeout below
-  // `window.interval` therefore cannot guarantee that an attempt completes:
-  // requests arriving early in a window commonly expire, while ones arriving
-  // near a boundary, or ones that trigger a byte or request rotation, do not.
-  // Each expired attempt is resent, which is safe under at-least-once
-  // delivery but multiplies both traffic and stored rows. An attempt timeout
-  // should cover channel residence, any flush already running plus its
-  // cleanup, the rest of the current window, its own flush and the
-  // notification; 180s covers the documented 15s window and 60s flush
-  // deadline. `SERIES_ALLOY_TIMEOUT` lets a test choose a short value.
-  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "180s")
+  // Twice the slowest WAL acknowledgement measured (p99 4.4s at the WAL
+  // device's ceiling; 20-50ms below it). `SERIES_ALLOY_TIMEOUT` lets a test
+  // choose another value.
+  timeout = coalesce(sys.env("SERIES_ALLOY_TIMEOUT"), "10s")
   client {
     endpoint = sys.env("OTLP_ENDPOINT")
     compression = "none"
@@ -85,29 +82,34 @@ otelcol.exporter.otlp "series" {
   }
   sending_queue {
     enabled = true
+    storage = otelcol.storage.file.queue.handler
+
+    // Parallel exports. One export takes 4000 lines per WAL write, so two
+    // carry 2 * 4000 / 0.05s = 160k lines/s at a 50ms acknowledgement. The
+    // engine refuses an export beyond its receiver's max_concurrent_requests
+    // (128 per worker) with RESOURCE_EXHAUSTED, which this exporter drops
+    // without retrying, so the num_consumers of every producer that can reach
+    // one worker must sum to at most that: 64 producers here.
+    num_consumers = 2
 
     // Measured in records. An export keeps its records in the queue until it
-    // completes, so the queue must hold num_consumers full batches:
-    // 32 * 4000 = 128000.
+    // completes, so the queue holds the consumers' batches and as many
+    // waiting: 2 * 2 * 4000 = 16000.
     sizer = "items"
-    queue_size = 128000
+    queue_size = 16000
 
-    // Parallel exports. An export is held for half a window plus the flush on
-    // average (a whole window at worst), so the exports in flight are
-    //   in_flight = rate * (interval / 2 + flush) / records_per_export.
-    // Sized for 10000 records/s from one producer in 4000-record batches
-    // against the 15s window: 10000 * (7.5s + 2s) / 4000 ~= 24. A whole-window
-    // hold, 10000 * 17s / 4000 ~= 43, needs more consumers and a larger queue.
-    num_consumers = 32
-
-    // The source is a file. Backpressure parks the tailer and leaves unread
-    // data on disk, which is durable and free. Dropping is neither.
+    // The source is a file. A full queue parks the tailer and leaves the
+    // unread lines on disk; dropping is the default and loses them.
     block_on_overflow = true
   }
+  // Never give up: a batch whose retries end is dropped. While the WAL is
+  // full the engine answers UNAVAILABLE; the queue fills, the tailer parks,
+  // and the lines wait in the file. The 5s cap resumes a producer within 5s
+  // of the engine answering again.
   retry_on_failure {
     enabled = true
-    initial_interval = "200ms"
-    max_interval = "1s"
+    initial_interval = "500ms"
+    max_interval = "5s"
     max_elapsed_time = "0s"
   }
 }

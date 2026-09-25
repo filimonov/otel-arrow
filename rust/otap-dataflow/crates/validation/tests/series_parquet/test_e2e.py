@@ -1439,6 +1439,13 @@ def require_clickhouse():
 # `SERIES_ALLOY_TIMEOUT` rather than inheriting whatever the config ships.
 ALLOY_ATTEMPT_TIMEOUT = "6s"
 
+# The reference River config, the `host.id` the fixture producer stamps
+# through its SERIES_PRODUCER_ID, and the stability level the reference
+# config's file-backed sending queue needs.
+ALLOY_REFERENCE_CONFIG = "configs/series-parquet.alloy"
+ALLOY_PRODUCER_ID = "alloy-producer"
+ALLOY_STABILITY_LEVEL = "public-preview"
+
 
 class AlloyProducer:
     """Grafana Alloy tailing a file into the engine's OTLP gRPC receiver.
@@ -1446,16 +1453,21 @@ class AlloyProducer:
     The container runs on the host network so that it can reach a receiver
     bound to loopback, and the reference River config the repository ships is
     the one it runs: the test exercises the documented deployment rather than
-    a fixture of its own. Only the attempt timeout is overridden, through the
-    `SERIES_ALLOY_TIMEOUT` variable the config itself reads, so that the test
-    owns the one value its own timing depends on.
+    a fixture of its own. Only the attempt timeout and the producer id are
+    set, through the `SERIES_ALLOY_TIMEOUT` and `SERIES_PRODUCER_ID` variables
+    the config itself reads, so that the test owns the values its timing and
+    its read-back depend on.
     """
 
     def __init__(self, directory, engine, timeout=ALLOY_ATTEMPT_TIMEOUT, *,
-                 admin_port=None):
+                 admin_port=None, config=None, producer_id=None):
         self.root = Path(directory) / "alloy"
         self.engine = engine
         self.timeout = timeout
+        # The River file this producer runs, the buffered reference by
+        # default, and the `host.id` it stamps through SERIES_PRODUCER_ID.
+        self.config = Path(config or WORKSPACE / ALLOY_REFERENCE_CONFIG)
+        self.producer_id = producer_id or ALLOY_PRODUCER_ID
         self.name = "series-alloy-" + uuid.uuid4().hex
         self.container = None
         # Alloy's own HTTP server, which serves readiness and its metrics.
@@ -1470,7 +1482,7 @@ class AlloyProducer:
         self.lines = self.root / "events.log"
         self.lines.write_text("")
         config = self.root / "config.alloy"
-        config.write_text((WORKSPACE / "configs/series-parquet.alloy").read_text())
+        config.write_text(self.config.read_text())
         port = self.admin_port or free_port()
         self.admin_port = port
         args = [
@@ -1479,7 +1491,9 @@ class AlloyProducer:
             "--mount", f"type=bind,src={self.root.resolve()},dst=/input,readonly",
             "-e", f"OTLP_ENDPOINT=127.0.0.1:{self.engine.grpc_port}",
             "-e", f"SERIES_ALLOY_TIMEOUT={self.timeout}",
-            image, "run", "--storage.path=/tmp/alloy-state",
+            "-e", f"SERIES_PRODUCER_ID={self.producer_id}",
+            image, "run", f"--stability.level={ALLOY_STABILITY_LEVEL}",
+            "--storage.path=/tmp/alloy-state",
             f"--server.http.listen-addr=127.0.0.1:{port}", "/input/config.alloy",
         ]
         try:
@@ -1741,16 +1755,16 @@ def sql_string(value):
 
 
 def alloy_producer_id():
-    """The `host.id` the reference Alloy config stamps on its resource.
+    """The `host.id` the fixture's Alloy producer stamps on its resource.
 
-    Read out of the shipped config rather than repeated here, so the test
-    cannot drift away from the deployment it documents.
+    The reference config takes it from SERIES_PRODUCER_ID, which
+    `AlloyProducer` sets; the check that the config still reads that
+    variable keeps the fixture from drifting away from the deployment.
     """
-    text = (WORKSPACE / "configs/series-parquet.alloy").read_text()
-    found = re.search(r'set\(attributes\["host\.id"\], "([^"]+)"\)', text)
-    if not found:
-        raise AssertionError("the Alloy config no longer sets a resource host.id")
-    return found.group(1)
+    text = (WORKSPACE / ALLOY_REFERENCE_CONFIG).read_text()
+    if 'sys.env("SERIES_PRODUCER_ID")' not in text or 'attributes["host.id"]' not in text:
+        raise AssertionError("the Alloy config no longer sets host.id from SERIES_PRODUCER_ID")
+    return ALLOY_PRODUCER_ID
 
 
 # Columns every dataset must contribute to the canonical row, checked against
