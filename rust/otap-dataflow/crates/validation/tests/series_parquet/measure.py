@@ -187,6 +187,20 @@ def buffer_inventory(path) -> dict:
     }
 
 
+def buffer_retained(before, after) -> bool:
+    """Whether a restarted engine found the same buffer directory, with every
+    per-core directory it had before (`buffer_inventory` before and after)."""
+    return bool(
+        before and after and before.get("exists") and after.get("exists")
+        and (before["device"], before["inode"]) == (after["device"], after["inode"])
+        and before["cores"]
+        and all(
+            name in after["cores"] and after["cores"][name]["inode"] == entry["inode"]
+            for name, entry in before["cores"].items()
+        )
+    )
+
+
 def await_ready(engine, spec, buffered):
     """The first sample in which every requested worker answered."""
     expected = len(spec.cores)
@@ -622,15 +636,7 @@ def record_restart(result, previous, engine, inventory):
     """Checks that a restart kept the graph, the cores and the buffer."""
     after = buffer_inventory(engine.buffer_path)
     retained = (
-        inventory.get("exists")
-        and after.get("exists")
-        and engine.buffer_path == previous.buffer_path
-        and (inventory["device"], inventory["inode"]) == (after["device"], after["inode"])
-        and all(
-            name in after["cores"] and after["cores"][name]["inode"] == entry["inode"]
-            for name, entry in inventory["cores"].items()
-        )
-        and bool(inventory["cores"])
+        engine.buffer_path == previous.buffer_path and buffer_retained(inventory, after)
     )
     result["observations_restart"] = {
         "buffer_before": inventory,
@@ -1349,7 +1355,7 @@ def build_parser() -> argparse.ArgumentParser:
         "failures",
         help="run one family's fault cases against real stores and record its index",
     )
-    _ = failures.add_argument("--family", required=True, choices=["s3"])
+    _ = failures.add_argument("--family", required=True, choices=["s3", "process"])
     _ = failures.add_argument("--output-dir", required=True, type=Path)
     _ = failures.add_argument("--option", action="append", default=[])
     rejudge_failures = sub.add_parser(

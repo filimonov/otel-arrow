@@ -2482,7 +2482,8 @@ def preflight_fault_tools(required: bool, *, output_dir=None, report_dir=None,
 # --------------------------------------------------------------------------
 
 # Each family's faults; a matrix cell is one fault, topology and store.
-FAILURE_FAMILIES = {"s3": ("slow", "http503", "store_outage")}
+FAILURE_FAMILIES = {"s3": ("slow", "http503", "store_outage"),
+                    "process": ("graceful_restart", "kill_active", "kill_upload")}
 FAILURE_TOPOLOGIES = ("strict", "buffered")
 
 # A finite mixed-signal producer: 20 requests of 100 one-KiB records a
@@ -2503,8 +2504,10 @@ FAULT_EXPORTER_MERGE = {"upload": {"part_bytes": "5MiB"}}
 FAULT_BASELINE_S = 2 * FAULT_INTERVAL_S + 5
 # Input after the exporter resumed, before the producer stops.
 FAULT_AFTER_S = 20
-# How long each fault may take to show its intended condition.
-FAULT_OBSERVE_DEADLINE_S = {"slow": 180, "http503": 240, "store_outage": 240}
+# How long each fault may take to show its intended condition; for a
+# process case, how long each of its lifecycle gates may take.
+FAULT_OBSERVE_DEADLINE_S = {"slow": 180, "http503": 240, "store_outage": 240,
+                            "graceful_restart": 60, "kill_active": 60, "kill_upload": 120}
 # Everything after the endpoint is healthy again -- resumption, the rest of
 # the input and the drain -- must finish within this.
 RECOVERY_DEADLINE_S = 300
@@ -2539,8 +2542,10 @@ def main_checkout() -> Path:
         else measurement.REPO_ROOT
 
 
-# Raw fault-case archives live in the main checkout, shared by its worktrees.
-FAULT_ARCHIVE_DIR = main_checkout() / ".measurement-artifacts" / "failure-s3"
+# Raw fault-case archives live in the main checkout, shared by its worktrees,
+# one directory per family.
+FAULT_ARCHIVE_ROOT = main_checkout() / ".measurement-artifacts"
+FAULT_ARCHIVE_DIR = FAULT_ARCHIVE_ROOT / "failure-s3"
 STORAGE_NACK_SENTENCE = "could not write to object storage ("
 # The compared metrics: memory and the correctness counts. Durations and
 # counts depend on where in a window the fault landed and are recorded only.
@@ -3342,6 +3347,92 @@ class FaultCase:
             description=f"{wanted} requests acknowledged after the exporter resumed",
         )
 
+    def run(self, controls, store_cores, result, options):
+        """The fault sequence after the baseline: arm, observe, remove, resume."""
+        arm_at = options.get("arm_at_unix_s")
+        if arm_at is not None:
+            sys.stderr.write(f"{self.spec.run_id}: arming at {arm_at} (unix s)\n")
+            _ = await_wall_clock(arm_at, "the straddling fault's arming instant")
+            result["config"]["straddle"]["armed_before_hour_end"] = \
+                time.time() < arm_at + STRADDLE_ARM_BEFORE_END_S
+        self.arm(options.get("fault_parameters"))
+        self.attempt(self.await_condition)
+        # The fault is removed whether or not it showed its condition.
+        if self.attempt(self.remove_fault, controls, store_cores) \
+                and self.attempt(self.await_resumed):
+            self.attempt(self.await_after_input)
+
+    def span(self, first, last):
+        """Seconds from entering state `first` to entering `last`, or None."""
+        a, b = self.at(first), self.at(last)
+        return (b["monotonic_ns"] - a["monotonic_ns"]) / 1e9 if a and b else None
+
+    def fault_window(self):
+        """The wall-clock interval the fault was in place, or None."""
+        armed, removed = self.at("armed"), self.at("fault_removed")
+        return (armed["unix_s"], removed and removed["unix_s"]) if armed else None
+
+    def throughput_edges(self):
+        """The states that bound the before, during and after throughput phases."""
+        return {"before": ("input_started", "armed"), "during": ("armed", "endpoint_healthy"),
+                "after": ("endpoint_healthy", "input_stopped")}
+
+    def all_samples(self):
+        """Every sample of the case's engine lifetimes."""
+        return list(self.phase.sampler.samples)
+
+    def lifetime_samples(self, phase):
+        """The samples of one engine lifetime that describe the running engine."""
+        return list(phase.sampler.samples)
+
+    def lifetime_summary(self, phase):
+        """Replacements for one lifetime's summary fields: none."""
+        return {}
+
+    def abort_failures(self, final):
+        """The multipart aborts the exporter reported as failed."""
+        return int(final.get("flush.abort_failures", 0))
+
+    def observations(self, record):
+        """The case's own additions to `observations.fault`: none."""
+        return {}
+
+    def expected_orphans(self):
+        """Upload id to key of every upload this case is known to orphan: none."""
+        return {}
+
+    def explain_duplicates(self, duplicates, record):
+        """Whether every stored duplicate is attributed (`duplicates_explained`)."""
+        return duplicates_explained(self.buffered, duplicates)
+
+    def verdicts(self, record):
+        """The case's own hard checks: its fault's condition and the recovery."""
+        observed = self.at("observed")
+        recovered_s = self.span("endpoint_healthy", "drained")
+        return [
+            ("fault_observed", observed is not None,
+             json.dumps({key: value for key, value in observed["evidence"].items()
+                         if key != "totals"}) if observed
+             else "; ".join(self.problems) or "the condition was never observed"),
+            ("recovered", self.at("resumed") is not None and recovered_s is not None
+             and recovered_s <= RECOVERY_DEADLINE_S,
+             f"endpoint healthy to drained {recovered_s} s against {RECOVERY_DEADLINE_S} s; "
+             f"resumed {bool(self.at('resumed'))}; problems {self.problems}"),
+        ]
+
+    def numbers(self, record, during):
+        """The case's own recorded durations and counts."""
+        return {
+            "http_503_responses_count": (sum(
+                count for statuses in during["status_by_operation"].values()
+                for status, count in statuses.items() if status == "503") if during else None),
+            "fault_duration_s": self.span("armed", "fault_removed"),
+            "time_to_condition_s": self.span("armed", "observed"),
+            "recovery_s": self.span("endpoint_healthy", "resumed"),
+            "endpoint_healthy_to_drained_s": self.span("endpoint_healthy", "drained"),
+            "drain_s": self.span("input_stopped", "drained"),
+        }
+
     def attempt(self, step, *args):
         """Run one step; a failure is recorded and ends the fault sequence."""
         try:
@@ -3387,11 +3478,7 @@ FAULT_CONDITIONS = {"slow": _slow_met, "http503": _http503_met, "store_outage": 
 
 def phase_throughput(acks_ns, objects, case) -> dict:
     """Acknowledged records and object bytes per second before, during and after the fault."""
-    edges = {
-        "before": ("input_started", "armed"),
-        "during": ("armed", "endpoint_healthy"),
-        "after": ("endpoint_healthy", "input_stopped"),
-    }
+    edges = case.throughput_edges()
     rows = case.spec.workload.records_per_request
     report = {}
     for name, (first_state, last_state) in edges.items():
@@ -3487,11 +3574,37 @@ def failure_prerequisites(store) -> dict:
     return images
 
 
+def launch_engine(root, rig, spec, output_dir, binary):
+    """One containerized release engine of a fault case, in the rig's namespace.
+
+    The launch options are kept on the engine, so `restart_engine` starts
+    its successor exactly alike.
+    """
+    options = {
+        "storage": rig.storage, "launcher": rig.launcher,
+        "overrides": {"retry": spec.overrides["retry"]},
+        "interval": f"{spec.interval_s}s", "topology": spec.topology,
+        "buffer_path": Path(output_dir) / "buffer" if spec.topology == "buffered" else None,
+        "cores": list(spec.cores), "merge": {"exporter": spec.overrides["exporter"]},
+        "binary": Path(binary),
+    }
+    Path(root).mkdir(parents=True, exist_ok=True)
+    with capacity.malloc_conf(capacity.JEMALLOC_STATS_CONF):
+        engine = test_e2e.Engine(root, **options)
+    engine.launch_options = options
+    return engine
+
+
 def failure_experiment(spec, result, output_dir, controls, *, provenance, options):
-    """One fault case: baseline, fault, recovery, drain, read-back and verdicts."""
+    """One fault case: baseline, fault, recovery, drain, read-back and verdicts.
+
+    The case class of the family (`FaultCase` or `ProcessCase`) runs
+    everything between the baseline and the end of input.
+    """
     command = capacity._command()
     output_dir = Path(output_dir)
     buffered = spec.topology == "buffered"
+    process = spec.overrides["fault"] in FAILURE_FAMILIES["process"]
     topology = measurement.core_topology()
     allocation = measurement.role_allocation(
         topology["sibling_groups"], sorted(os.sched_getaffinity(0)), spec.cores,
@@ -3511,7 +3624,8 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                                         "arm_before_hour_end_s": STRADDLE_ARM_BEFORE_END_S}
     ledger = measurement.Ledger(output_dir / "ledger.sqlite")
     record = {}
-    engine = phase = case = lister = None
+    engine = phase = case = lister = channel = None
+    engines = []
     local = output_dir / "store"
     with test_e2e.DockerStore(spec.store, by_image_id=True) as store:
         store_cores = allocation.get("store", [])
@@ -3522,17 +3636,9 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
         result["ephemeral_values"] = {"<store_endpoint>": store.endpoint}
         rig = FaultRig(store, output_dir / "rig", cores=allocation.get("fault_tools") or None)
         with rig:
-            root = output_dir / "engine-1"
-            root.mkdir(parents=True, exist_ok=True)
-            with capacity.malloc_conf(capacity.JEMALLOC_STATS_CONF):
-                engine = test_e2e.Engine(
-                    root, storage=rig.storage, launcher=rig.launcher,
-                    overrides={"retry": spec.overrides["retry"]},
-                    interval=f"{spec.interval_s}s", topology=spec.topology,
-                    buffer_path=output_dir / "buffer" if buffered else None,
-                    cores=list(spec.cores), merge={"exporter": spec.overrides["exporter"]},
-                    binary=Path(provenance["build"]["binary"]),
-                )
+            engine = launch_engine(output_dir / "engine-1", rig, spec, output_dir,
+                                   provenance["build"]["binary"])
+            engines.append(engine)
             try:
                 settings = exporter_settings(engine.config)
                 result["config"]["effective"] = engine.config
@@ -3547,12 +3653,19 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                                                buffered)
                 phase.ready("start")
                 lister = StoreLister(store).start()
+                # A process case's producer outlives each engine: its channel
+                # reconnects to the next engine on the launcher's same port.
+                channel = restart_channel(engine) if process else engine.channel
                 producer = measurement.Producer(
-                    engine.channel, ledger, spec.workload, cores=allocation.get("producer", []),
+                    channel, ledger, spec.workload, cores=allocation.get("producer", []),
                     timeout_s=spec.producer_timeout_s, max_in_flight=spec.max_in_flight,
                     retry_attempts=FAULT_PRODUCER_ATTEMPTS,
                 )
-                case = FaultCase(spec, rig, store, engine, phase, ledger, lister, settings)
+                if process:
+                    case = ProcessCase(spec, rig, store, engine, phase, ledger, lister, settings,
+                                       controls=controls, engines=engines)
+                else:
+                    case = FaultCase(spec, rig, store, engine, phase, ledger, lister, settings)
                 _ = command.await_window_start(spec.interval_s)
                 controls.raise_if_invalid()
                 stop = threading.Event()
@@ -3567,17 +3680,7 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                 sender.start()
                 try:
                     if case.attempt(case.await_baseline):
-                        if arm_at is not None:
-                            sys.stderr.write(f"{spec.run_id}: arming at {arm_at} (unix s)\n")
-                            _ = await_wall_clock(arm_at, "the straddling fault's arming instant")
-                            result["config"]["straddle"]["armed_before_hour_end"] = \
-                                time.time() < arm_at + STRADDLE_ARM_BEFORE_END_S
-                        case.arm(options.get("fault_parameters"))
-                        case.attempt(case.await_condition)
-                        # The fault is removed whether or not it showed its condition.
-                        if case.attempt(case.remove_fault, controls, store_cores) \
-                                and case.attempt(case.await_resumed):
-                            case.attempt(case.await_after_input)
+                        case.run(controls, store_cores, result, options)
                 finally:
                     if rig.active:
                         rig.recover()
@@ -3586,6 +3689,7 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                 case.transition("input_stopped", {"outcome": sent.get("outcome")})
                 if "outcome" not in sent:
                     raise AssertionError("the producer did not finish")
+                engine, phase = case.engine, case.phase
                 phase.inputs.append(sent["outcome"])
                 controls.raise_if_invalid()
                 if case.attempt(phase.drained):
@@ -3596,18 +3700,26 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
                     workers=phase.workers, requested_cores=list(spec.cores),
                 )
                 controls.unwatch_workers()
-                engine.shutdown(command.SHUTDOWN_DEADLINE_S)
+                if process:
+                    record["final_stop"] = stop_engine(engine, case.drain_deadline_s)
+                else:
+                    engine.shutdown(command.SHUTDOWN_DEADLINE_S)
                 command.record_event(result, "engine_shut_down", str(engine.pid))
             finally:
                 controls.unwatch_workers()
-                if phase is not None and phase.sampler is not None:
-                    phase.sampler.stop()
+                for lifetime in (case.phases if process and case is not None else [phase]):
+                    if lifetime is not None and lifetime.sampler is not None:
+                        lifetime.sampler.stop()
                 if lister is not None:
                     lister.stop()
-                engine.close()
+                for launched in engines:
+                    launched.close()
+                if process and channel is not None:
+                    channel.close()
             record["residual_state"] = rig.residual_state()
             record["requests"] = case.route_requests()
-            record["events"] = engine_events(Path(engine.log.name).read_text(errors="replace"))
+            record["events"] = engine_events("\n".join(
+                Path(launched.log.name).read_text(errors="replace") for launched in engines))
         record["rig"] = rig.evidence()
         record["rig_cleanup_clean"] = bool((rig.cleanup_report or {}).get("clean"))
         record["objects"] = lister.objects()
@@ -3616,22 +3728,34 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
             record["orphans"] = orphaned_uploads(store)
         except (ClientError, BotoCoreError) as error:
             record["orphans"] = f"{type(error).__name__}: {error}"
+        if process:
+            # Only once the evidence above is kept does the test abort what was left.
+            record["orphan_cleanup"] = abort_uploads(store, record["orphans"])
         store.download(local)
-    samples = list(phase.sampler.samples)
-    summary = phase.summary()
-    residuals, heap = capacity.trial_residuals(samples, phase.capacity_idle,
-                                               getattr(phase.sampler, "pairs", ()))
-    summary["residuals"] = residuals
+    phases = case.phases if process else [phase]
+    summaries, heaps, samples = [], [], []
+    for lifetime in phases:
+        lifetime_samples = case.lifetime_samples(lifetime)
+        summary = lifetime.summary()
+        summary.update(case.lifetime_summary(lifetime))
+        residuals, heap = capacity.trial_residuals(lifetime_samples, lifetime.capacity_idle,
+                                                   getattr(lifetime.sampler, "pairs", ()))
+        summary["residuals"] = residuals
+        summaries.append(summary)
+        heaps.append(heap)
+        samples.extend(lifetime_samples)
     result["observations"] = {
-        "phases": [summary],
+        "phases": summaries,
         "residual_excursions": measurement.residual_excursions(
-            residuals, list(getattr(phase.sampler, "pairs", ())),
+            [residual for summary in summaries for residual in summary["residuals"]],
+            [pair for lifetime in phases for pair in getattr(lifetime.sampler, "pairs", ())],
             max((s["process_rss_bytes"] for s in samples), default=0)),
-        "rss_heap_term": heap,
+        "rss_heap_term": heaps[0] if len(heaps) == 1 else heaps,
     }
     result["samples"] = [dict(measurement.compact_sample(s), extras=s.get("extras"))
                          for s in samples[::capacity.PUBLISHED_SAMPLE_STRIDE * 4]]
     oracle_error = None
+    record["replay"] = None
     try:
         oracle = measurement.run_pinned(
             performance.oracle_cores(allocation, topology["sibling_groups"])
@@ -3640,8 +3764,14 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
             workload=spec.workload,
         )
         acked_scope = measurement._compare(ledger, require_all=False, healthy=False)
-        record["duplicates"] = duplicate_attribution(ledger, failed_block_record_ids(
-            local, spec.workload, record["events"]["failed_files"]))
+        failed_ids = failed_block_record_ids(local, spec.workload,
+                                             record["events"]["failed_files"])
+        record["duplicates"] = duplicate_attribution(ledger, failed_ids)
+        if process:
+            record["replay"] = replay_analysis(
+                ledger, values_rows_by_file(local, spec.workload), case.replay_events(),
+                {item["key"]: item.get("etag") for item in record["objects"]}, failed_ids,
+                buffered=buffered)
     except AssertionError as error:
         oracle_error = str(error)[:2000]
         oracle = {"passed": False, "problems": [oracle_error], "readers": {},
@@ -3654,21 +3784,30 @@ def failure_experiment(spec, result, output_dir, controls, *, provenance, option
     latencies = ledger.acknowledgement_latencies_s()
     record["acks_ns"] = ledger_acks(ledger)
     record["attempts"] = ledger_attempts(ledger)
+    record["ledger_outcomes"] = counts["attempts_by_outcome"]
+    record["producer_finished"] = True
+    if process:
+        record["windows"] = case.producer_windows()
     ledger.close()
     sent_spec = dataclasses.replace(spec, workload=dataclasses.replace(
         spec.workload, requests=counts["requests_attempted_count"]))
     # The producer stops on the case's own schedule, so what it sent is what it intended.
-    command.settle_local_result(result, sent_spec, [phase], oracle, counts, latencies,
+    command.settle_local_result(result, sent_spec, phases, oracle, counts, latencies,
                                 output_dir)
     settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts)
 
 
 def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts):
-    """The fault checks, metrics and observations beside the common ones."""
+    """The fault checks, metrics and observations beside the common ones.
+
+    The case contributes its own verdicts and numbers (`FaultCase.verdicts`,
+    `FaultCase.numbers`): the first two verdicts are `fault_observed` and
+    `recovered`, any further ones follow the common checks.
+    """
     checks = result["checks"]
     metrics = result["metrics"]
     observations = result["observations"]
-    samples = list(case.phase.sampler.samples)
+    samples = case.all_samples()
     final = record.get("final_totals") or {}
 
     def hard(name, passed, detail):
@@ -3677,20 +3816,9 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
             measurement.STATUS_PASSED if passed else measurement.STATUS_FAILED,
             str(detail)[:1500]))
 
-    def span(first, last):
-        a, b = case.at(first), case.at(last)
-        return (b["monotonic_ns"] - a["monotonic_ns"]) / 1e9 if a and b else None
-
-    observed = case.at("observed")
-    hard("fault_observed", observed is not None,
-         json.dumps({key: value for key, value in observed["evidence"].items()
-                     if key != "totals"}) if observed
-         else "; ".join(case.problems) or "the condition was never observed")
-    recovered_s = span("endpoint_healthy", "drained")
-    hard("recovered", case.at("resumed") is not None and recovered_s is not None
-         and recovered_s <= RECOVERY_DEADLINE_S,
-         f"endpoint healthy to drained {recovered_s} s against {RECOVERY_DEADLINE_S} s; "
-         f"resumed {bool(case.at('resumed'))}; problems {case.problems}")
+    verdicts = case.verdicts(record)
+    for name, passed, detail in verdicts[:2]:
+        hard(name, passed, detail)
     drain = case.phase.drain or {}
     hard("drained", bool(drain.get("drained")), f"drain {drain}")
     missing_acked = acked_scope.get("missing_record_count")
@@ -3718,13 +3846,16 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
     multipart = multipart_evidence(record["requests"], record["objects"], part_bytes)
     hard("multipart_exercised", multipart["exercised"], json.dumps(
         {key: value for key, value in multipart.items() if key != "example"}))
-    abort_failures = int(final.get("flush.abort_failures", 0))
+    abort_failures = case.abort_failures(final)
     orphans = record["orphans"]
+    known = case.expected_orphans()
     if isinstance(orphans, list):
-        unexpected = max(0, len(orphans) - abort_failures)
+        unknown = [entry for entry in orphans if entry["upload_id"] not in known]
+        unexpected = max(0, len(unknown) - abort_failures)
         hard("orphaned_uploads_expected", unexpected == 0,
-             f"{len(orphans)} incomplete multipart uploads; {abort_failures} reported abort "
-             f"failures may each leave one; unexpected {unexpected}: {orphans[:5]}")
+             f"{len(orphans)} incomplete multipart uploads; {len(known)} left open by a killed "
+             f"engine; {abort_failures} reported abort failures may each leave one; "
+             f"unexpected {unexpected}: {unknown[:5]}")
     else:
         hard("orphaned_uploads_expected", False, f"the uploads could not be listed: {orphans}")
     lateness = partition_lateness(record["objects"], lateness_bound_s(case.settings))
@@ -3732,15 +3863,15 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
          f"bound {lateness['bound_s']} s; violations {lateness['violations']}; hours "
          f"{lateness['hours']}")
     duplicates = record.get("duplicates") or {}
-    explained, why = duplicates_explained(case.buffered, duplicates)
+    explained, why = case.explain_duplicates(duplicates, record)
     hard("duplicates_explained", explained, why)
     hard("fault_rig_clean", record["residual_state"].get("clean") and record["rig_cleanup_clean"],
          f"residual {record['residual_state'].get('clean')}; cleanup "
          f"{record['rig_cleanup_clean']}")
-    armed = case.at("armed")
-    removed = case.at("fault_removed")
-    during = route_summary(record["requests"], armed and armed["unix_s"],
-                           removed and removed["unix_s"]) if armed else None
+    for name, passed, detail in verdicts[2:]:
+        hard(name, passed, detail)
+    window = case.fault_window()
+    during = route_summary(record["requests"], *window) if window else None
     # Only memory and the correctness counts are compared metrics; every
     # other number depends on where in a window the fault landed.
     for name in list(metrics):
@@ -3759,14 +3890,7 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
         "requests_offered_count": counts["requests_attempted_count"],
         "duplicate_records": duplicates.get("duplicated_records"),
         "duplicate_extra_copies_records": duplicates.get("extra_copies_records"),
-        "http_503_responses_count": (sum(
-            count for statuses in during["status_by_operation"].values()
-            for status, count in statuses.items() if status == "503") if during else None),
-        "fault_duration_s": span("armed", "fault_removed"),
-        "time_to_condition_s": span("armed", "observed"),
-        "recovery_s": span("endpoint_healthy", "resumed"),
-        "endpoint_healthy_to_drained_s": recovered_s,
-        "drain_s": span("input_stopped", "drained"),
+        **case.numbers(record, during),
         "flush_retries_count": final.get("flush.retries"),
         "flush_failures_count": final.get("flush.failures.by_class", 0),
         "flush_failures_by_class": {key.split(".", 3)[-1]: value for key, value in final.items()
@@ -3821,7 +3945,7 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
         },
         "multipart": multipart,
         "orphaned_uploads": orphans,
-        "orphaned_uploads_expected_max_count": abort_failures,
+        "orphaned_uploads_expected_max_count": abort_failures + len(known),
         "partition_lateness": lateness,
         "engine_events": record["events"],
         "throughput_by_phase": phase_throughput(record["acks_ns"], record["objects"], case),
@@ -3833,9 +3957,1019 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
                                                     "toxiproxy_version", "activations",
                                                     "access_log_requests_count", "cleanup")},
     }
+    observations["fault"].update(case.observations(record))
     result["artifacts"].append(dict(
         measurement.file_entry(case.rig.artifact_dir / ACCESS_LOG), kind="access_log",
         retention=str(case.rig.root)))
+
+
+# --------------------------------------------------------------------------
+# Process restart and hard kill
+# --------------------------------------------------------------------------
+
+# How long a killed engine may take to exit, and a shut-down one once its
+# admin shutdown returned.
+KILL_EXIT_DEADLINE_S = 10
+SHUTDOWN_EXIT_DEADLINE_S = 30
+# kill_active selects the requests sent in the current window from this long
+# after its boundary on, and kills only with this many of them, this far into
+# the window and this far from its end.
+ACTIVE_COHORT_MARGIN_S = 0.25
+ACTIVE_COHORT_MIN_REQUESTS = 5
+ACTIVE_WINDOW_ELAPSED_S = 1.0
+ACTIVE_WINDOW_LEFT_S = 1.5
+# kill_upload throttles the values route while it catches a multipart upload
+# (a 5 MiB part takes about 10 s), then the general route while it catches
+# the restarted engine's first series PUT (about 8 KiB, several seconds).
+MULTIPART_THROTTLE_KBPS = 512
+PUT_THROTTLE_KBPS = 1
+# How long FLUSHING must have held before that series PUT is on the wire.
+PUT_IN_FLIGHT_S = 1.0
+# A request NGINX logged ending this close to a kill was open at the kill.
+KILL_LOG_TOLERANCE_S = 0.1
+# The nack classes that refuse a request's own content; no retry cures them.
+PERMANENT_NACK_CLASSES = ("request_too_large", "extracted_too_large", "row_too_large",
+                          "block_too_large", "too_deep", "invalid", "unsupported")
+# The checks a process case records beside FAULT_CHECKS.
+PROCESS_CHECKS = ("new_boot_id", "restart_same_cores_and_buffer", "prior_acks_durable",
+                  "replay_only_eligible", "no_permanent_rejection", "retry_bytes_identical")
+BOOT_EVENT = re.compile(r"series_parquet\.start\b.*?\bboot_id=([0-9a-f]+)")
+FILE_BOOT = re.compile(r"/part-\d{8}T\d{6}Z-[A-Za-z0-9_.]+-([0-9a-f]+)-\d+\.parquet$")
+
+
+def _activate_upload_throttle(rig, parameters):
+    """Limit one proxy's upstream (client to store) bandwidth."""
+    proxy = parameters["proxy"]
+    toxic = {"name": "throttle_upload", "type": "bandwidth", "stream": "upstream",
+             "toxicity": 1.0, "attributes": {"rate": int(parameters["rate_kbps"])}}
+    rig.toxiproxy.add_toxic(proxy, toxic)
+    state = rig.toxiproxy.toxics(proxy)
+    if [entry["name"] for entry in state] != [toxic["name"]]:
+        raise AssertionError(f"proxy {proxy} carries toxics {state} after activation")
+    return {"proxy": proxy, "toxic": toxic, "api_state": state, "units": TOXIC_UNITS}
+
+
+def _recover_upload_throttle(rig, state):
+    """Remove that exact toxic."""
+    rig.toxiproxy.remove_toxic(state["proxy"], state["toxic"]["name"])
+    remaining = rig.toxiproxy.toxics(state["proxy"])
+    if remaining:
+        raise AssertionError(f"toxics remain after recovery: {remaining}")
+    return {"api_state": remaining}
+
+
+register_fault("upload_throttle", _activate_upload_throttle, _recover_upload_throttle)
+
+
+def restart_channel(engine):
+    """A gRPC channel to the engine's port that reconnects within a second.
+
+    It is the producer's, not the engine's, so it survives each engine and
+    reaches the next one the launcher starts on the same port.
+    """
+    return test_e2e.grpc.insecure_channel(
+        f"127.0.0.1:{engine.grpc_port}",
+        options=[("grpc.initial_reconnect_backoff_ms", 200),
+                 ("grpc.min_reconnect_backoff_ms", 200),
+                 ("grpc.max_reconnect_backoff_ms", 1000)])
+
+
+def engine_boot_id(engine, deadline_s=30.0):
+    """The exporter boot id an engine logged in its start event."""
+    cached = getattr(engine, "boot_id", None)
+    if cached:
+        return cached
+    path = Path(engine.log.name)
+
+    def observe():
+        match = BOOT_EVENT.search(ANSI.sub("", path.read_text(errors="replace")))
+        return match[1] if match else None
+
+    engine.boot_id = measurement.wait_until(
+        observe, lambda boot: boot is not None,
+        deadline_ns=time.monotonic_ns() + int(deadline_s * 1e9),
+        description=f"the exporter start event of {path.parent.name}")
+    return engine.boot_id
+
+
+def file_boot_id(key):
+    """The boot id in a part file's name, or None."""
+    match = FILE_BOOT.search("/" + key)
+    return match[1] if match else None
+
+
+def container_state(process):
+    """`docker inspect`'s state of a container engine, or None for a local one."""
+    ident = getattr(process, "container_id", None)
+    return _docker_json(["inspect", "--format", "{{json .State}}", ident]) if ident else None
+
+
+def kill_engine(engine) -> dict:
+    """SIGKILL the engine and observe its exit.
+
+    A container engine is killed by its recorded container id and its exit
+    read from `docker inspect`, never by signalling the docker client that
+    waits for it; a local one is signalled by its host PID.
+    """
+    process = engine.process
+    ident = getattr(process, "container_id", None)
+    signal_ns, signal_unix = time.monotonic_ns(), time.time()
+    deadline = signal_ns + KILL_EXIT_DEADLINE_S * 10**9
+    state = None
+    if ident is not None:
+        done = run_command(["docker", "kill", "--signal", "KILL", ident],
+                           timeout=DOCKER_TIMEOUT_S)
+        if done["exit_status"] != 0:
+            raise AssertionError(f"docker kill of {ident} failed: {done}")
+        state = measurement.wait_until(
+            lambda: _docker_json(["inspect", "--format", "{{json .State}}", ident]),
+            lambda seen: bool(seen) and not seen.get("Running"),
+            deadline_ns=deadline, description="the killed engine container exits")
+        _ = measurement.wait_until(process.poll, lambda code: code is not None,
+                                   deadline_ns=deadline,
+                                   description="the killed engine's docker client exits")
+        exit_code = state.get("ExitCode")
+    else:
+        os.kill(engine.pid, signal.SIGKILL)
+        exit_code = measurement.wait_until(process.poll, lambda code: code is not None,
+                                           deadline_ns=deadline,
+                                           description="the killed engine process exits")
+    exited_ns = time.monotonic_ns()
+    return {"kind": "kill", "signal": "SIGKILL", "pid": engine.pid, "container_id": ident,
+            "signal_ns": signal_ns, "signal_unix_s": signal_unix, "exited_ns": exited_ns,
+            "exit_s": (exited_ns - signal_ns) / 1e9, "exit_code": exit_code,
+            "container_state": state}
+
+
+def stop_engine(engine, deadline_s) -> dict:
+    """Admin shutdown with `deadline_s` (whole seconds, as the API takes them),
+    then the process's own exit, both observed."""
+    deadline_s = int(-(-deadline_s // 1))
+    signal_ns, signal_unix = time.monotonic_ns(), time.time()
+    admin_error = None
+    try:
+        engine.shutdown(deadline_s)
+    except Exception as error:  # noqa: BLE001 - recorded, then raised below
+        admin_error = f"{type(error).__name__}: {error}"[:500]
+    admin_ns = time.monotonic_ns()
+    if admin_error is not None:
+        raise AssertionError(f"the admin shutdown of {engine.pid} failed: {admin_error}")
+    _ = measurement.wait_until(engine.process.poll, lambda code: code is not None,
+                               deadline_ns=admin_ns + SHUTDOWN_EXIT_DEADLINE_S * 10**9,
+                               description="the shut-down engine process exits")
+    exited_ns = time.monotonic_ns()
+    state = container_state(engine.process)
+    return {"kind": "graceful", "deadline_s": deadline_s, "pid": engine.pid,
+            "container_id": getattr(engine.process, "container_id", None),
+            "signal_ns": signal_ns, "signal_unix_s": signal_unix, "exited_ns": exited_ns,
+            "admin_returned_s": (admin_ns - signal_ns) / 1e9, "admin_error": admin_error,
+            "exit_s": (exited_ns - signal_ns) / 1e9,
+            "exit_code": state.get("ExitCode") if state else engine.process.poll(),
+            "container_state": state}
+
+
+def restart_engine(previous, *, retain_buffer: bool):
+    """A fresh engine exactly like `previous`, on its launcher, cores and store.
+
+    `retain_buffer` reuses the previous buffer directory as it is; otherwise
+    a buffered engine gets a new, empty one. The old and new PID, cores,
+    boot ids and buffer paths are recorded as `restart` on the new engine.
+    """
+    options = dict(previous.launch_options)
+    ordinal = int(previous.root.name.rsplit("-", 1)[1]) + 1
+    root = previous.root.parent / f"engine-{ordinal}"
+    root.mkdir(parents=True, exist_ok=True)
+    if options.get("buffer_path") is not None and not retain_buffer:
+        options["buffer_path"] = root / "buffer"
+    previous_boot = engine_boot_id(previous)
+    started_ns = time.monotonic_ns()
+    with capacity.malloc_conf(capacity.JEMALLOC_STATS_CONF):
+        engine = test_e2e.Engine(root, **options)
+    ready_ns = time.monotonic_ns()
+    engine.launch_options = options
+    engine.restart = {
+        "previous_pid": previous.pid, "pid": engine.pid,
+        "previous_container_id": getattr(previous.process, "container_id", None),
+        "container_id": getattr(engine.process, "container_id", None),
+        "previous_cores": previous.cores, "cores": engine.cores,
+        "previous_edges": [list(edge) for edge in previous.edges],
+        "edges": [list(edge) for edge in engine.edges],
+        "previous_boot_id": previous_boot, "boot_id": engine_boot_id(engine),
+        "previous_buffer_path": str(previous.buffer_path) if previous.buffer_path else None,
+        "buffer_path": str(engine.buffer_path) if engine.buffer_path else None,
+        "launched_ns": started_ns, "ready_ns": ready_ns,
+        "launch_to_ready_s": (ready_ns - started_ns) / 1e9,
+    }
+    return engine
+
+
+def buffer_bytes(path) -> int:
+    """The bytes of every file under a buffer directory."""
+    return sum(item.stat().st_size for item in Path(path).rglob("*") if item.is_file()) \
+        if path is not None and Path(path).is_dir() else 0
+
+
+def multipart_uploads(store, *, parts=True) -> list:
+    """The bucket's incomplete multipart uploads, each with its stored parts' bytes."""
+    found = orphaned_uploads(store)
+    for upload in found if parts else ():
+        try:
+            listed = store.client.list_parts(Bucket=store.bucket, Key=upload["key"],
+                                             UploadId=upload["upload_id"])
+            upload["part_bytes"] = sum(int(part["Size"]) for part in listed.get("Parts", []))
+            upload["parts_count"] = len(listed.get("Parts", []))
+        except (ClientError, BotoCoreError) as error:
+            upload["part_bytes"] = None
+            upload["parts_error"] = f"{type(error).__name__}: {error}"[:300]
+    return found
+
+
+def abort_uploads(store, uploads) -> dict:
+    """Abort every listed incomplete upload in the store, then list again."""
+    if not isinstance(uploads, list):
+        return {"aborted": [], "remaining": None, "error": "the uploads were not listed"}
+    aborted = []
+    for upload in uploads:
+        store.client.abort_multipart_upload(Bucket=store.bucket, Key=upload["key"],
+                                            UploadId=upload["upload_id"])
+        aborted.append(upload["upload_id"])
+    remaining = orphaned_uploads(store)
+    return {"aborted": aborted, "remaining": remaining, "clean": not remaining}
+
+
+def ledger_cohorts(ledger, instant_ns, since_ns=None) -> dict:
+    """What the producer knew at `instant_ns`: acknowledged and pending requests.
+
+    A pending request was sent before the instant and not acknowledged by
+    it. With `since_ns`, the requests first sent in [since_ns, instant_ns)
+    form the selected cohort, split into acknowledged and not.
+    """
+    since_ns = instant_ns if since_ns is None else since_ns
+    with ledger.lock:
+        row = ledger.connection.execute(
+            "SELECT "
+            "coalesce(sum(CASE WHEN ack_ns IS NOT NULL AND ack_ns < :t THEN 1 ELSE 0 END), 0), "
+            "coalesce(sum(CASE WHEN first_send_ns < :t AND (ack_ns IS NULL OR ack_ns >= :t) "
+            "THEN 1 ELSE 0 END), 0), "
+            "coalesce(sum(CASE WHEN first_send_ns >= :s AND first_send_ns < :t "
+            "AND ack_ns IS NOT NULL AND ack_ns < :t THEN 1 ELSE 0 END), 0), "
+            "coalesce(sum(CASE WHEN first_send_ns >= :s AND first_send_ns < :t "
+            "AND (ack_ns IS NULL OR ack_ns >= :t) THEN 1 ELSE 0 END), 0), "
+            "max(first_send_ns) FROM requests", {"t": int(instant_ns), "s": int(since_ns)},
+        ).fetchone()
+    acked, pending, cohort_acked, cohort_unacked, last_send = row
+    return {"acked_requests_count": acked, "pending_requests_count": pending,
+            "cohort_acked_requests_count": cohort_acked,
+            "cohort_unacked_requests_count": cohort_unacked,
+            "last_send_age_s": (instant_ns - last_send) / 1e9 if last_send else None}
+
+
+def values_rows_by_file(root, workload) -> list:
+    """(record id, store key) of every values row in a downloaded store."""
+    rows = []
+    with measurement.duckdb.connect() as db:
+        for signal in ("logs", "metrics"):
+            files = sorted(Path(root).glob(f"v=1/signal={signal}/dataset=values/**/*.parquet"))
+            if not files:
+                continue
+            record_id, _payload = measurement._duck_record_expression(workload, signal)
+            relation = (f"read_parquet({[str(path) for path in files]!r}, union_by_name=true, "
+                        "hive_partitioning=false, filename=true)")
+            for record, filename in db.execute(
+                    f"SELECT {record_id}, v.filename FROM {relation} v").fetchall():
+                rows.append((record, "otel/" + str(Path(filename).relative_to(root))))
+    return rows
+
+
+def replay_analysis(ledger, rows, events, final_etags, failed_ids=(), *, buffered) -> dict:
+    """Each stored record's multiplicity before and after every restart.
+
+    `rows` are the final store's values rows by file; `events` give each
+    signal's exit instant, the keys and ETags listed in the store at that
+    exit and the case's selected cohort. A record's pre-multiplicity counts
+    its rows in files listed at the exit, its post-multiplicity every row;
+    a record whose post exceeds a positive pre was stored again after that
+    restart (replayed). The eligible cohorts are the requests not
+    acknowledged before the exit, which the producer resends, and after a
+    SIGKILL in the buffered topology every request, since the buffer
+    redelivers what it had not recorded as delivered. A listed key that
+    changed or vanished is recorded.
+    """
+    with ledger.lock:
+        connection = ledger.connection
+        for statement in (
+                "DROP TABLE IF EXISTS file_rows", "DROP TABLE IF EXISTS snapshot_keys",
+                "DROP TABLE IF EXISTS replayed_rows", "DROP TABLE IF EXISTS failed_rows",
+                "CREATE TEMP TABLE file_rows (record_id TEXT NOT NULL, key TEXT NOT NULL)",
+                "CREATE TEMP TABLE snapshot_keys (key TEXT PRIMARY KEY)",
+                "CREATE TEMP TABLE replayed_rows (record_id TEXT PRIMARY KEY)",
+                "CREATE TEMP TABLE failed_rows (record_id TEXT PRIMARY KEY)"):
+            _ = connection.execute(statement)
+        _ = connection.executemany("INSERT INTO file_rows VALUES (?, ?)", rows)
+        _ = connection.executemany("INSERT OR IGNORE INTO failed_rows VALUES (?)",
+                                   [(record,) for record in failed_ids])
+        _ = connection.execute("CREATE INDEX file_rows_key ON file_rows(key)")
+        _ = connection.execute("CREATE INDEX file_rows_record ON file_rows(record_id)")
+        report = []
+        for event in events:
+            _ = connection.execute("DELETE FROM snapshot_keys")
+            _ = connection.executemany("INSERT INTO snapshot_keys VALUES (?)",
+                                       [(key,) for key in event["listing"]])
+            parameters = {"t": int(event["exited_ns"]),
+                          "s": int(event.get("cohort_since_ns") or event["exited_ns"])}
+            transitions = collections.defaultdict(dict)
+            cohort_stored = 0
+            for cohort, pre, post, count, selected in connection.execute(
+                    "WITH pre AS (SELECT record_id, count(*) AS n FROM file_rows "
+                    "WHERE key IN (SELECT key FROM snapshot_keys) GROUP BY record_id), "
+                    "post AS (SELECT record_id, count(*) AS n FROM file_rows GROUP BY record_id) "
+                    "SELECT CASE WHEN q.ack_ns IS NOT NULL AND q.ack_ns < :t THEN 'acked' "
+                    "WHEN q.first_send_ns < :t THEN 'pending' ELSE 'later' END, "
+                    "coalesce(pre.n, 0), coalesce(post.n, 0), count(*), "
+                    "sum(CASE WHEN q.first_send_ns >= :s AND q.first_send_ns < :t "
+                    "AND coalesce(pre.n, 0) > 0 THEN 1 ELSE 0 END) "
+                    "FROM records r JOIN requests q ON q.request_id = r.request_id "
+                    "LEFT JOIN pre ON pre.record_id = r.record_id "
+                    "LEFT JOIN post ON post.record_id = r.record_id GROUP BY 1, 2, 3",
+                    parameters).fetchall():
+                transitions[cohort][f"{pre}->{post}"] = count
+                cohort_stored += selected or 0
+            _ = connection.execute(
+                "INSERT OR IGNORE INTO replayed_rows SELECT pre.record_id FROM "
+                "(SELECT record_id, count(*) AS n FROM file_rows WHERE key IN "
+                "(SELECT key FROM snapshot_keys) GROUP BY record_id) pre JOIN "
+                "(SELECT record_id, count(*) AS n FROM file_rows GROUP BY record_id) post "
+                "ON post.record_id = pre.record_id WHERE post.n > pre.n")
+
+            def total(cohort, test):
+                return sum(count for pair, count in transitions.get(cohort, {}).items()
+                           if test(*(int(value) for value in pair.split("->"))))
+
+            replayed = {cohort: total(cohort, lambda pre, post: 0 < pre < post)
+                        for cohort in ("acked", "pending", "later")}
+            eligible = ("acked", "pending", "later") if buffered and event["kind"] == "kill" \
+                else ("pending", "later")
+            report.append({
+                "ordinal": event["ordinal"], "kind": event["kind"],
+                "multiplicity_by_cohort": {cohort: dict(sorted(pairs.items()))
+                                           for cohort, pairs in sorted(transitions.items())},
+                "acked_records_count": total("acked", lambda pre, post: True),
+                "acked_stored_at_exit_records": total("acked", lambda pre, post: pre > 0),
+                "acked_missing_at_exit_records": total("acked", lambda pre, post: pre == 0),
+                "acked_missing_at_end_records": total("acked", lambda pre, post: post == 0),
+                "pending_records_count": total("pending", lambda pre, post: True),
+                "pending_stored_at_exit_records": total("pending", lambda pre, post: pre > 0),
+                "replayed_records_by_cohort": replayed,
+                "replayed_records_count": sum(replayed.values()),
+                "eligible_cohorts": list(eligible),
+                "ineligible_replayed_records": sum(value for cohort, value in replayed.items()
+                                                   if cohort not in eligible),
+                "selected_cohort_stored_at_exit_records": cohort_stored,
+                "changed_listed_keys": sorted(
+                    key for key, etag in event["listing"].items()
+                    if final_etags.get(key) != etag)[:20],
+            })
+        duplicated, outside = connection.execute(
+            "SELECT count(*), coalesce(sum(CASE WHEN p.record_id IS NULL AND f.record_id IS NULL "
+            "THEN 1 ELSE 0 END), 0) FROM (SELECT record_id FROM file_rows GROUP BY record_id "
+            "HAVING count(*) > 1) d LEFT JOIN replayed_rows p ON p.record_id = d.record_id "
+            "LEFT JOIN failed_rows f ON f.record_id = d.record_id").fetchone()
+        replayed_total = connection.execute("SELECT count(*) FROM replayed_rows").fetchone()[0]
+    return {"events": report, "replayed_records_count": int(replayed_total),
+            "duplicated_records": int(duplicated),
+            "duplicated_outside_replay_and_failed_blocks_records": int(outside)}
+
+
+def interrupted_requests(requests, instant_unix, *, key_part):
+    """The logged requests on keys containing `key_part` that were open at a kill.
+
+    Such a request started before the kill and NGINX logged its end at or
+    after it, with a status other than 2xx.
+    """
+    found = []
+    for entry in requests:
+        if key_part not in (entry.get("uri") or ""):
+            continue
+        end = _float(entry.get("msec"))
+        took = _float(entry.get("request_time")) or 0.0
+        if end is None or str(entry.get("status", "")).startswith("2"):
+            continue
+        if end - took <= instant_unix + KILL_LOG_TOLERANCE_S \
+                and end >= instant_unix - KILL_LOG_TOLERANCE_S:
+            found.append({key: entry.get(key) for key in (
+                "msec", "method", "operation", "status", "upstream_status", "request_time",
+                "request_length", "uri")})
+    return found
+
+
+def window_position(unix_s, interval_s):
+    """The aligned window around a wall-clock instant: its start, elapsed and left seconds."""
+    start = (unix_s // interval_s) * interval_s
+    return start, unix_s - start, start + interval_s - unix_s
+
+
+class ProcessCase(FaultCase):
+    """A process case: a graceful restart or SIGKILL of the engine, then a new one.
+
+    Every signal is an event with its gate evidence, the producer's cohorts
+    at the signal and at the exit, the exit itself, the store's listing and
+    incomplete uploads at the exit and the restart that followed. States
+    carry the event's ordinal: `gate_N`, `signalled_N`, `exited_N`,
+    `restarted_N`; kill_upload also has `armed_N` and `fault_removed_N`.
+    """
+
+    def __init__(self, spec, rig, store, engine, phase, ledger, lister, settings, *,
+                 controls, engines):
+        super().__init__(spec, rig, store, engine, phase, ledger, lister, settings)
+        self.controls = controls
+        self.engines = engines
+        self.phases = [phase]
+        self.events = []
+        self.discarded = []
+        self.drain_deadline_s = int(lateness_bound_s(settings)) + 15
+
+    # -- the sequences ----------------------------------------------------
+
+    def run(self, controls, store_cores, result, options):
+        """This case's lifecycle after the baseline."""
+        getattr(self, f"run_{self.fault}")()
+
+    def run_graceful_restart(self):
+        """Pending work, admin shutdown and drain, restart on the same buffer and cores."""
+        if self.attempt(self.gate_pending) and self.attempt(self.shutdown) \
+                and self.attempt(self.restart):
+            self.resume()
+
+    def run_kill_active(self):
+        """SIGKILL with a cohort only in the ACTIVE block, then restart."""
+        if self.attempt(self.gate_active) and self.attempt(self.kill) \
+                and self.attempt(self.restart):
+            self.resume()
+
+    def run_kill_upload(self):
+        """SIGKILL in a multipart upload, restart, SIGKILL in a single PUT, restart."""
+        self.throttle("values", MULTIPART_THROTTLE_KBPS)
+        if not (self.attempt(self.gate_multipart) and self.attempt(self.kill)):
+            return
+        self.unthrottle()
+        self.throttle("general", PUT_THROTTLE_KBPS)
+        if not (self.attempt(self.restart) and self.attempt(self.gate_put)
+                and self.attempt(self.kill)):
+            return
+        self.unthrottle()
+        if self.attempt(self.restart):
+            self.resume()
+
+    def resume(self):
+        """A values file of the new boot and an ack, then the rest of the input."""
+        if self.attempt(self.await_resumed):
+            self.attempt(self.await_after_input)
+
+    # -- observations -----------------------------------------------------
+
+    def boot_id(self):
+        """The current engine's boot id."""
+        return engine_boot_id(self.engine)
+
+    def observed_totals(self, sample):
+        """A sample's totals, the latest background sample's without one."""
+        return flat_totals(sample) if sample is not None else self.totals()
+
+    def observe_pending(self, sample=None):
+        """graceful_restart: ACTIVE nonempty, live input and requests awaiting their ack."""
+        totals = self.observed_totals(sample)
+        cohorts = ledger_cohorts(self.ledger, time.monotonic_ns())
+        return {"block_active_bytes": totals.get("block.active", 0),
+                "block_flushing_bytes": totals.get("block.flushing", 0),
+                "buffer_in_flight_count": totals.get("buffer.in.flight", 0),
+                "cohorts": cohorts, "fresh": sample is not None, "totals": totals}
+
+    def pending_met(self, seen):
+        """Work the drain must finish: strict, unacknowledged requests; buffered,
+        bundles the exporter holds."""
+        work = (seen["buffer_in_flight_count"] > 0 if self.buffered
+                else seen["cohorts"]["pending_requests_count"] > 0)
+        return (seen["block_active_bytes"] > 0 and work
+                and (seen["cohorts"]["last_send_age_s"] or 99) < 1.0)
+
+    def observe_active(self, sample=None):
+        """kill_active: the window's position, the blocks and the selected cohort."""
+        totals = self.observed_totals(sample)
+        now_ns, now_unix = time.monotonic_ns(), time.time()
+        start, elapsed, left = window_position(now_unix, self.spec.interval_s)
+        since_ns = now_ns - int((elapsed - ACTIVE_COHORT_MARGIN_S) * 1e9)
+        cohorts = ledger_cohorts(self.ledger, now_ns, since_ns)
+        return {"window_start_unix_s": start, "elapsed_s": round(elapsed, 3),
+                "left_s": round(left, 3), "cohort_since_ns": since_ns,
+                "block_active_bytes": totals.get("block.active", 0),
+                "block_flushing_bytes": totals.get("block.flushing", 0),
+                "block_pending_bytes": totals.get("block.pending", 0),
+                "selected_cohort_requests_count": cohorts[
+                    "cohort_acked_requests_count" if self.buffered
+                    else "cohort_unacked_requests_count"],
+                "cohorts": cohorts, "fresh": sample is not None, "totals": totals}
+
+    @staticmethod
+    def active_met(seen):
+        """ACTIVE only: nothing flushing or sealed, a cohort of this window, and
+        time left before it rotates."""
+        return (seen["block_active_bytes"] > 0 and seen["block_flushing_bytes"] == 0
+                and seen["block_pending_bytes"] == 0
+                and seen["elapsed_s"] >= ACTIVE_WINDOW_ELAPSED_S
+                and seen["left_s"] >= ACTIVE_WINDOW_LEFT_S
+                and seen["selected_cohort_requests_count"] >= ACTIVE_COHORT_MIN_REQUESTS)
+
+    def observe_multipart(self, sample=None):
+        """kill_upload: the current boot's open values uploads, their bytes, and FLUSHING."""
+        totals = self.observed_totals(sample)
+        boot = self.boot_id()
+        requests = self.route_requests()
+        completed = {entry["uri"] for entry in requests
+                     if entry["operation"] == "complete_multipart_upload"
+                     and str(entry.get("status", "")).startswith("2")}
+        logged = collections.Counter()
+        for entry in requests:
+            if entry["operation"] == "upload_part" and str(entry.get("status", "")).startswith("2"):
+                query = urllib.parse.parse_qs((entry.get("request_uri") or "").partition("?")[2])
+                for upload_id in query.get("uploadId", []):
+                    logged[upload_id] += int(_float(entry.get("request_length")) or 0)
+        uploads = [dict(upload, logged_part_bytes=logged[upload["upload_id"]])
+                   for upload in multipart_uploads(self.store)
+                   if boot in upload["key"] and "/dataset=values/" in upload["key"]
+                   and f"/{self.store.bucket}/{upload['key']}" not in completed]
+        return {"block_flushing_bytes": totals.get("block.flushing", 0), "open_uploads": uploads,
+                "fresh": sample is not None, "totals": totals}
+
+    @staticmethod
+    def multipart_met(seen):
+        """A multipart upload open in the store with bytes transferred, and FLUSHING."""
+        return seen["block_flushing_bytes"] > 0 and any(
+            (upload.get("part_bytes") or 0) > 0 or upload["logged_part_bytes"] > 0
+            for upload in seen["open_uploads"])
+
+    def observe_put(self, sample=None):
+        """kill_upload: FLUSHING held with no request of the new boot finished yet."""
+        totals = self.observed_totals(sample)
+        boot = self.boot_id()
+        samples = list(self.phase.sampler.samples)
+        since = None
+        for entry in reversed(samples):
+            if flat_totals(entry).get("block.flushing", 0) <= 0:
+                break
+            since = entry["monotonic_ns"]
+        flushing = totals.get("block.flushing", 0)
+        return {"block_flushing_bytes": flushing,
+                "flushing_for_s": (time.monotonic_ns() - since) / 1e9
+                if since is not None and flushing > 0 else 0.0,
+                "boot_requests_logged": [entry["operation"] for entry in self.route_requests()
+                                         if boot in (entry.get("uri") or "")],
+                "fresh": sample is not None, "totals": totals}
+
+    @staticmethod
+    def put_met(seen):
+        """The first flush of the boot has held its series PUT open a while."""
+        return (seen["block_flushing_bytes"] > 0 and seen["flushing_for_s"] >= PUT_IN_FLIGHT_S
+                and not seen["boot_requests_logged"])
+
+    # -- the steps --------------------------------------------------------
+
+    def gate(self, observe, met, description):
+        """Wait for a lifecycle gate, then confirm it on a fresh sample.
+
+        A gate the fresh sample no longer shows is a discarded setup attempt,
+        recorded and never claimed; the wait resumes until the case's setup
+        deadline, and a gate never confirmed by then fails the step. The
+        lifetime first answers the collection epochs every measured lifetime
+        needs (`measure.MINIMUM_EPOCHS`).
+        """
+        ordinal = len(self.events) + 1
+        deadline = time.monotonic_ns() + FAULT_OBSERVE_DEADLINE_S[self.fault] * 10**9
+        _ = capacity._command().await_answered_epochs(
+            self.phase.sampler, [worker["key"] for worker in self.phase.workers],
+            deadline_ns=deadline)
+        while True:
+            seen = measurement.wait_until(observe, met, deadline_ns=deadline,
+                                          description=description)
+            fresh = observe(self.phase.sampler.once())
+            if met(fresh):
+                fresh["background"] = {key: value for key, value in seen.items()
+                                       if key != "totals"}
+                self.transition(f"gate_{ordinal}", fresh)
+                return fresh
+            self.discarded.append({"gate": ordinal, "unix_s": time.time(),
+                                   "fresh": {key: value for key, value in fresh.items()
+                                             if key != "totals"}})
+
+    def gate_pending(self):
+        """graceful_restart's gate."""
+        return self.gate(self.observe_pending, self.pending_met, "pending work to drain")
+
+    def gate_active(self):
+        """kill_active's gate."""
+        return self.gate(self.observe_active, self.active_met,
+                         "a cohort only in the ACTIVE block, nothing flushing")
+
+    def gate_multipart(self):
+        """kill_upload's first gate."""
+        return self.gate(self.observe_multipart, self.multipart_met,
+                         "a multipart values upload in flight with bytes stored")
+
+    def gate_put(self):
+        """kill_upload's second gate."""
+        return self.gate(self.observe_put, self.put_met,
+                         "the restarted engine's first series PUT on the wire")
+
+    def throttle(self, proxy, rate_kbps):
+        """Throttle one route's uploads."""
+        self.rig.activate("upload_throttle", {"proxy": proxy, "rate_kbps": rate_kbps})
+        self.transition(f"armed_{len(self.events) + 1}", {
+            "proxy": proxy, "rate_kbps": rate_kbps, "activation": self.rig.activations[-1]})
+
+    def unthrottle(self):
+        """Remove the throttle."""
+        self.rig.recover()
+        self.transition(f"fault_removed_{len(self.events)}",
+                        {"recovery": self.rig.activations[-1].get("recovery")})
+
+    def kill(self):
+        """SIGKILL the current engine (`kill_engine`)."""
+        self.signal("kill")
+
+    def shutdown(self):
+        """Shut the current engine down through the admin API (`stop_engine`)."""
+        self.signal("graceful")
+
+    def signal(self, kind):
+        """Stop the current engine and record the event: cohorts, exit, store state."""
+        engine = self.engine
+        ordinal = len(self.events) + 1
+        gate = (self.at(f"gate_{ordinal}") or {}).get("evidence", {})
+        since_ns = gate.get("cohort_since_ns")
+        self.controls.unwatch_workers()
+        at_signal = ledger_cohorts(self.ledger, time.monotonic_ns(), since_ns)
+        self.transition(f"signalled_{ordinal}", {"kind": kind, "pid": engine.pid})
+        try:
+            stopped = kill_engine(engine) if kind == "kill" \
+                else stop_engine(engine, self.drain_deadline_s)
+        finally:
+            self.phase.sampler.stop()
+            self.phase.signal_ns = self.at(f"signalled_{ordinal}")["monotonic_ns"]
+        listing = self.lister.list_once()
+        event = {
+            "ordinal": ordinal, "kind": kind, "pid": engine.pid, "boot_id": engine_boot_id(engine),
+            "gate": {key: value for key, value in gate.items() if key not in ("totals",)},
+            "cohorts_at_signal": at_signal,
+            "cohorts_at_exit": ledger_cohorts(self.ledger, stopped["exited_ns"], since_ns),
+            "cohort_since_ns": since_ns, "exit": stopped, "exited_ns": stopped["exited_ns"],
+            "listing": {key: item.get("etag") for key, item in listing.items()},
+            "uploads_at_exit": multipart_uploads(self.store),
+        }
+        self.events.append(event)
+        self.transition(f"exited_{ordinal}", {
+            key: stopped[key] for key in ("exit_s", "exit_code", "pid", "container_id")}
+            | {"objects_at_exit_count": len(listing),
+               "uploads_at_exit_count": len(event["uploads_at_exit"])})
+
+    def restart(self):
+        """Start the next engine like the last on the same buffer and cores, and verify it."""
+        event = self.events[-1]
+        previous = self.engine
+        listing = self.lister.list_once()
+        event["late_objects"] = sorted(set(listing) - set(event["listing"]))
+        inventory = capacity._command().buffer_inventory
+        event["buffer_before"] = inventory(previous.buffer_path) if self.buffered else None
+        event["buffer_bytes_at_restart"] = buffer_bytes(previous.buffer_path) \
+            if self.buffered else None
+        engine = restart_engine(previous, retain_buffer=True)
+        self.engines.append(engine)
+        phase = capacity.CapacityPhase(capacity._command(), engine.root.name, engine, self.spec,
+                                       self.controls, self.buffered)
+        self.engine, self.phase = engine, phase
+        self.phases.append(phase)
+        self.log = LogTail(engine.log.name)
+        phase.ready(f"restart-{event['ordinal']}")
+        workers_ns = time.monotonic_ns()
+        event["restart"] = dict(
+            engine.restart,
+            buffer_after=inventory(engine.buffer_path) if self.buffered else None,
+            workers_ready_ns=workers_ns,
+            exit_to_ready_s=(workers_ns - event["exited_ns"]) / 1e9,
+            signal_to_ready_s=(workers_ns - event["exit"]["signal_ns"]) / 1e9)
+        self.transition(f"restarted_{event['ordinal']}", {
+            key: event["restart"][key] for key in (
+                "previous_pid", "pid", "previous_boot_id", "boot_id", "cores",
+                "launch_to_ready_s", "exit_to_ready_s")}
+            | {"late_objects_count": len(event["late_objects"])})
+
+    def await_resumed(self):
+        """A values file of the new boot and a request acknowledged after the restart."""
+        restarted = self.at(f"restarted_{len(self.events)}")
+        boot = self.boot_id()
+
+        def observe():
+            acks = [ack for ack in ledger_acks(self.ledger) if ack >= restarted["monotonic_ns"]]
+            files = sorted(key for key in self.lister.first_listed
+                           if boot in key and "dataset=values/" in key)
+            return {"values_files_of_new_boot_count": len(files),
+                    "first_values_file_s": min(
+                        (self.lister.first_listed[key] - restarted["unix_s"] for key in files),
+                        default=None),
+                    "producer_acks_count": len(acks),
+                    "first_ack_after_restart_s": (acks[0] - restarted["monotonic_ns"]) / 1e9
+                    if acks else None,
+                    "exporter_acks_count": self.totals().get("acks", 0)}
+
+        evidence = measurement.wait_until(
+            observe, lambda seen: seen["values_files_of_new_boot_count"] > 0
+            and seen["producer_acks_count"] > 0 and seen["exporter_acks_count"] > 0,
+            deadline_ns=self.recovery_deadline_ns(),
+            description="a values file of the new boot and an acknowledgement after the restart",
+        )
+        self.transition("resumed", evidence)
+
+    def recovery_deadline_ns(self):
+        """Everything after the last restart must finish within RECOVERY_DEADLINE_S."""
+        return self.at(f"restarted_{len(self.events)}")["monotonic_ns"] \
+            + RECOVERY_DEADLINE_S * 10**9
+
+    # -- what the settlement reads ----------------------------------------
+
+    def lifetime_samples(self, phase):
+        """A lifetime's samples up to its signal; later ones describe no engine."""
+        cut = getattr(phase, "signal_ns", None)
+        return [sample for sample in phase.sampler.samples
+                if cut is None or sample["monotonic_ns"] < cut]
+
+    def lifetime_summary(self, phase):
+        """A signalled lifetime's sample figures up to its signal; the sampler
+        errors after it met an engine that was stopping or gone."""
+        cut = getattr(phase, "signal_ns", None)
+        if cut is None:
+            return {}
+        command = capacity._command()
+        samples = self.lifetime_samples(phase)
+        errors = list(phase.sampler.errors)
+        return {"sampler_errors": [entry for entry in errors if entry["monotonic_ns"] < cut],
+                "sampler_errors_after_signal_count": sum(
+                    1 for entry in errors if entry["monotonic_ns"] >= cut),
+                "sample_count": len(samples),
+                "answered_epochs_by_worker": dict(command.answered_epochs(samples)),
+                "stale_gap_s_by_worker": command.stale_gaps(samples),
+                "signal_ns": cut}
+
+    def all_samples(self):
+        """Every lifetime's samples, each up to its signal."""
+        return [sample for phase in self.phases for sample in self.lifetime_samples(phase)]
+
+    def abort_failures(self, final):
+        """The failed multipart aborts every engine reported by its last sample."""
+        return sum(int(flat_totals(samples[-1]).get("flush.abort_failures", 0))
+                   for samples in (self.lifetime_samples(phase) for phase in self.phases)
+                   if samples)
+
+    def expected_orphans(self):
+        """Every values upload a killed engine left open at its exit."""
+        return {upload["upload_id"]: upload["key"] for event in self.events
+                if event["kind"] == "kill" for upload in event["uploads_at_exit"]
+                if event["boot_id"] in upload["key"]}
+
+    def replay_events(self):
+        """The events `replay_analysis` compares, one per signal that exited."""
+        return [{key: event.get(key) for key in (
+            "ordinal", "kind", "exited_ns", "listing", "cohort_since_ns")}
+            for event in self.events]
+
+    def fault_window(self):
+        """From the first signal to the last restart."""
+        first, last = self.at("signalled_1"), self.at(f"restarted_{len(self.events)}")
+        return (first["unix_s"], last and last["unix_s"]) if first else None
+
+    def throughput_edges(self):
+        """Before the first signal, until the last restart, and after it."""
+        last = f"restarted_{len(self.events)}"
+        return {"before": ("input_started", "signalled_1"), "during": ("signalled_1", last),
+                "after": (last, "input_stopped")}
+
+    def explain_duplicates(self, duplicates, record):
+        """Strict: resent requests. Buffered: a copy stored before a restart and
+        again after it, or a copy in a failed block."""
+        if not self.buffered:
+            return duplicates_explained(False, duplicates)
+        replay = record.get("replay")
+        if not replay:
+            return False, "the replay was not measured"
+        outside = replay["duplicated_outside_replay_and_failed_blocks_records"]
+        return outside == 0, (
+            f"{outside} of {replay['duplicated_records']} duplicated records were neither "
+            f"stored again after a restart ({replay['replayed_records_count']} replayed) nor "
+            "copied in a failed block")
+
+    def verdicts(self, record):
+        """fault_observed and recovered, then PROCESS_CHECKS."""
+        replay = record.get("replay") or {}
+        by_event = {entry["ordinal"]: entry for entry in replay.get("events", [])}
+        observed, why = self.lifecycle_observed(record, by_event)
+        last = f"restarted_{len(self.events)}"
+        recovered_s = self.span(last, "drained")
+        boots = [engine_boot_id(engine) for engine in self.engines]
+        values_boots = collections.Counter(
+            file_boot_id(item["key"]) for item in record["objects"]
+            if "/dataset=values/" in item["key"])
+        stored_boots = {file_boot_id(item["key"]) for item in record["objects"]}
+        restarts = [event.get("restart") for event in self.events]
+        same = [bool(entry) and entry["cores"] == entry["previous_cores"] == list(self.spec.cores)
+                and entry["edges"] == entry["previous_edges"] for entry in restarts]
+        retained = [not self.buffered or (
+            bool(entry) and entry["buffer_path"] == entry["previous_buffer_path"]
+            and capacity._command().buffer_retained(event.get("buffer_before"),
+                                                    (entry or {}).get("buffer_after")))
+            for event, entry in zip(self.events, restarts)]
+        strict_missing = sum(entry["acked_missing_at_exit_records"] for entry in by_event.values())
+        end_missing = sum(entry["acked_missing_at_end_records"] for entry in by_event.values())
+        ineligible = sum(entry["ineligible_replayed_records"] for entry in by_event.values())
+        changed = [key for entry in by_event.values() for key in entry["changed_listed_keys"]]
+        outcomes = record.get("ledger_outcomes") or {}
+        permanent = {}
+        for index, phase in enumerate(self.phases):
+            samples = self.lifetime_samples(phase)
+            totals = flat_totals(samples[-1]) if samples else {}
+            for name in [f"nacks.{label}" for label in PERMANENT_NACK_CLASSES] + [
+                    "buffer.bundles.resolved.permanently_rejected"]:
+                if totals.get(name):
+                    permanent[f"engine-{index + 1}:{name}"] = totals[name]
+        resent = (record.get("duplicates") or {}).get("resent_requests_count")
+        return [
+            ("fault_observed", observed, why),
+            ("recovered", self.at("resumed") is not None and recovered_s is not None
+             and recovered_s <= RECOVERY_DEADLINE_S,
+             f"last restart to drained {recovered_s} s against {RECOVERY_DEADLINE_S} s; "
+             f"resumed {bool(self.at('resumed'))}; problems {self.problems}"),
+            ("new_boot_id", len(self.engines) == len(self.events) + 1 and all(boots)
+             and len(set(boots)) == len(boots) and values_boots.get(boots[0], 0) > 0
+             and values_boots.get(boots[-1], 0) > 0 and stored_boots <= set(boots),
+             f"boots {boots}; values files by boot {dict(values_boots)}; stored boots not "
+             f"launched here {sorted(str(b) for b in stored_boots - set(boots))}"),
+            ("restart_same_cores_and_buffer", bool(restarts) and all(same) and all(retained),
+             f"cores and graph unchanged {same}; buffer retained {retained}; restarts "
+             f"{[{k: (e or {}).get(k) for k in ('previous_cores', 'cores', 'previous_buffer_path', 'buffer_path')} for e in restarts]}"),
+            ("prior_acks_durable", bool(by_event) and end_missing == 0
+             and (self.buffered or strict_missing == 0),
+             f"records acknowledged before an exit and not stored at that exit "
+             f"{strict_missing} (strict must be 0; buffered holds them in its log), not stored "
+             f"at the end {end_missing}"),
+            ("replay_only_eligible", bool(by_event) and ineligible == 0 and not changed,
+             f"records stored again after a restart outside the eligible cohorts {ineligible}; "
+             f"per event {[(e['ordinal'], e['kind'], e['replayed_records_by_cohort']) for e in by_event.values()]}; "
+             f"listed keys changed or removed {changed[:5]}"),
+            ("no_permanent_rejection", not permanent and not outcomes.get(
+                measurement.OUTCOME_PERMANENT) and not outcomes.get(measurement.OUTCOME_PARTIAL),
+             f"producer outcomes {outcomes}; engine permanent refusals {permanent}"),
+            ("retry_bytes_identical", record.get("producer_finished", False),
+             f"the ledger refuses a resent request with different bytes; {resent} requests were "
+             "resent and the producer finished"),
+        ]
+
+    def lifecycle_observed(self, record, by_event):
+        """Whether every gate was met and every signal hit what it aimed at."""
+        problems = list(self.problems)
+        expected = {"graceful_restart": 1, "kill_active": 1, "kill_upload": 2}[self.fault]
+        if len(self.events) != expected or not all(event.get("restart") for event in self.events):
+            problems.append(f"{len(self.events)} of {expected} signals exited and restarted")
+        for event in self.events:
+            stopped = event["exit"]
+            if event["kind"] == "kill" and stopped["exit_code"] not in (137, -9):
+                problems.append(f"event {event['ordinal']}: exit {stopped['exit_code']} is not "
+                                "a SIGKILL")
+            if event["kind"] == "graceful":
+                bound = lateness_bound_s(self.settings)
+                if stopped["admin_error"] or stopped["exit_code"] != 0 \
+                        or stopped["exit_s"] > bound:
+                    problems.append(
+                        f"graceful exit {stopped['exit_code']} after {stopped['exit_s']:.3f} s "
+                        f"against the {bound} s drain bound; admin {stopped['admin_error']}")
+        if self.fault == "kill_active" and self.events:
+            event = self.events[0]
+            gate = event["gate"]
+            end = gate.get("window_start_unix_s", 0) + self.spec.interval_s
+            stored = (by_event.get(1) or {}).get("selected_cohort_stored_at_exit_records")
+            if event["exit"]["signal_unix_s"] >= end or stored != 0:
+                problems.append(f"the kill at {event['exit']['signal_unix_s']} was not inside the "
+                                f"window ending {end}, or {stored} cohort records were stored")
+        if self.fault == "kill_upload" and len(self.events) == 2:
+            problems.extend(self.upload_problems(record))
+        return not problems, "; ".join(problems)[:1500] or json.dumps(
+            [{"ordinal": e["ordinal"], "kind": e["kind"], "exit_s": e["exit"]["exit_s"],
+              "exit_code": e["exit"]["exit_code"]} for e in self.events])
+
+    def upload_problems(self, record):
+        """kill_upload: the multipart upload and the single PUT were both cut off."""
+        problems = []
+        final_keys = {item["key"] for item in record["objects"]}
+        first, second = self.events
+        caught = [upload for upload in first["gate"].get("open_uploads", [])
+                  if (upload.get("part_bytes") or 0) > 0 or upload["logged_part_bytes"] > 0]
+        open_ids = {upload["upload_id"] for upload in first["uploads_at_exit"]}
+        if not any(upload["upload_id"] in open_ids and upload["key"] not in final_keys
+                   for upload in caught):
+            problems.append("no caught multipart upload stayed incomplete and uncompleted")
+        put = interrupted_requests(record["requests"], second["exit"]["signal_unix_s"],
+                                   key_part=second["boot_id"])
+        cut = [entry for entry in put if entry["operation"] == "put_object"
+               and "/dataset=series/" in entry["uri"]
+               and entry["uri"].partition(f"/{self.store.bucket}/")[2] not in final_keys]
+        if not cut:
+            problems.append(f"no series PUT of boot {second['boot_id']} was cut off by the kill: "
+                            f"{put}")
+        return problems
+
+    def numbers(self, record, during):
+        """The lifecycle's durations, PIDs, boots and cohort sizes."""
+        first = self.events[0] if self.events else {}
+        last = self.events[-1] if self.events else {}
+        replay = record.get("replay") or {}
+        restart = first.get("restart") or {}
+        resumed = (self.at("resumed") or {}).get("evidence", {})
+        return {
+            "old_pid": first.get("pid"),
+            "new_pid": (last.get("restart") or {}).get("pid"),
+            "boot_ids": [engine_boot_id(engine) for engine in self.engines],
+            "signals_count": len(self.events),
+            "time_to_exit_s": (first.get("exit") or {}).get("exit_s"),
+            "exit_codes": [event["exit"]["exit_code"] for event in self.events],
+            "launch_to_ready_s": restart.get("launch_to_ready_s"),
+            "exit_to_ready_s": restart.get("exit_to_ready_s"),
+            "signal_to_ready_s": restart.get("signal_to_ready_s"),
+            "first_ack_after_restart_s": resumed.get("first_ack_after_restart_s"),
+            "first_values_file_after_restart_s": resumed.get("first_values_file_s"),
+            "graceful_drain_s": (first.get("exit") or {}).get("exit_s")
+            if first.get("kind") == "graceful" else None,
+            "drain_bound_s": lateness_bound_s(self.settings),
+            "admin_shutdown_deadline_s": self.drain_deadline_s,
+            "final_shutdown_s": (record.get("final_stop") or {}).get("exit_s"),
+            "acked_requests_at_signal_count": (first.get("cohorts_at_signal") or {}).get(
+                "acked_requests_count"),
+            "pending_requests_at_signal_count": (first.get("cohorts_at_signal") or {}).get(
+                "pending_requests_count"),
+            "selected_cohort_requests_count": (first.get("gate") or {}).get(
+                "selected_cohort_requests_count"),
+            "replayed_records_count": replay.get("replayed_records_count"),
+            "orphans_expected_count": len(self.expected_orphans()),
+            "buffer_bytes_at_restart": first.get("buffer_bytes_at_restart"),
+            "drain_s": self.span("input_stopped", "drained"),
+            "gate_discards_count": len(self.discarded),
+        }
+
+    def producer_windows(self):
+        """What the producer was told during each downtime and after each restart."""
+        windows = []
+        for event in self.events:
+            ready = (event.get("restart") or {}).get("workers_ready_ns")
+            windows.append({
+                "ordinal": event["ordinal"],
+                "signal_to_ready": ledger_attempts_between(
+                    self.ledger, event["exit"]["signal_ns"], ready),
+                "ready_to_next_signal": ledger_attempts_between(
+                    self.ledger, ready, next((later["exit"]["signal_ns"] for later in self.events
+                                              if later["ordinal"] > event["ordinal"]), None))
+                if ready else None,
+            })
+        return windows
+
+    def observations(self, record):
+        """The events, their timelines and the replay analysis."""
+        return {"process": {
+            "events": [{key: value for key, value in event.items() if key != "listing"}
+                       | {"objects_at_exit_count": len(event["listing"]),
+                          "interrupted_requests": interrupted_requests(
+                              record["requests"], event["exit"]["signal_unix_s"],
+                              key_part=event["boot_id"])}
+                       for event in self.events],
+            "gate_discards": self.discarded,
+            "replay": record.get("replay"),
+            "producer_windows": record.get("windows"),
+            "final_stop": record.get("final_stop"),
+            "orphan_cleanup": record.get("orphan_cleanup"),
+            "expected_orphans": self.expected_orphans(),
+        }}
+
+
+def ledger_attempts_between(ledger, start_ns, end_ns) -> dict:
+    """The producer's attempts started in [start_ns, end_ns), by outcome and code."""
+    with ledger.lock:
+        rows = ledger.connection.execute(
+            "SELECT outcome, detail, count(*) FROM attempts WHERE start_ns >= ? "
+            "AND (? IS NULL OR start_ns < ?) GROUP BY outcome, detail",
+            (int(start_ns), end_ns, end_ns)).fetchall()
+    by_outcome, by_code = collections.Counter(), collections.Counter()
+    samples = {}
+    for outcome, detail, count in rows:
+        by_outcome[outcome] += count
+        code = (detail or "").split(":", 1)[0].replace("StatusCode.", "") or "OK"
+        by_code[code] += count
+        if detail and code not in samples:
+            samples[code] = detail[:200]
+    return {"by_outcome": dict(sorted(by_outcome.items())), "by_code": dict(sorted(by_code.items())),
+            "detail_samples": samples}
 
 
 def soak_byte_size(text) -> int:
@@ -3855,7 +4989,8 @@ def fault_check(result: dict) -> None:
     multiplicity histogram and the duplicates must have been measured.
     """
     names = {entry["name"] for entry in result["checks"]}
-    for name in FAULT_CHECKS:
+    fault = (result.get("observations", {}).get("fault") or {}).get("fault")
+    for name in FAULT_CHECKS + (PROCESS_CHECKS if fault in FAILURE_FAMILIES["process"] else ()):
         if name not in names:
             raise AssertionError(f"failed required fault check: {name}: never checked")
     for entry in result["checks"]:
@@ -3917,9 +5052,11 @@ def failure_case(family: str, fault: str, topology: str, store: str, output_dir:
         result = json.loads((run_dir / f"{spec.run_id}.json").read_text(encoding="ascii"))
     for entry in [{"name": f"{spec.run_id}.json"}] + result["baseline_files"]:
         _ = shutil.copyfile(run_dir / entry["name"], output_dir / entry["name"])
-    capacity.archive_trial({"archive_dir": archive_dir or FAULT_ARCHIVE_DIR}, run_dir)
-    for child in ("buffer", "engine-1/data"):
-        shutil.rmtree(run_dir / child, ignore_errors=True)
+    capacity.archive_trial({"archive_dir": archive_dir or FAULT_ARCHIVE_ROOT / f"failure-{family}"},
+                           run_dir)
+    shutil.rmtree(run_dir / "buffer", ignore_errors=True)
+    for child in run_dir.glob("engine-*/data"):
+        shutil.rmtree(child, ignore_errors=True)
     return result
 
 
@@ -3998,6 +5135,8 @@ def rejudge_fault_checks(result, archive_dir) -> list:
     (None when the stored evidence cannot decide it) and the reason.
     """
     fault = result["observations"]["fault"]
+    if fault["fault"] in FAILURE_FAMILIES["process"]:
+        return []
     buffered = result["config"]["requested"]["topology"] == "buffered"
     statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
     verdicts = []

@@ -645,14 +645,15 @@ latencies and upload bandwidth before and during the fault, the exporter's
 flush events, the stored objects of every failed block and throughput before,
 during and after the fault are kept beside them.
 
-Options: `only_cells=[...]` (names like `http503-strict-minio`), `faults`,
+Options: `only_cells=[...]` (names like `http503-strict-minio`, or
+`kill_upload-buffered-rustfs` in the process family), `faults`,
 `topologies`, `stores`, `straddle_cells=[...]` (those cells arm their fault
 10 s before an hour ends, so the hour's last blocks are written under it;
 they run last, wait for the hour without the lease, announcing the instant
 they wait for, and take the lease 35 s before arming, enough for the rig, the
 engine and the baseline), `purposes={"cell": "why"}` for a
 rerun, `archive_dir` (by default the main checkout's
-`.measurement-artifacts/failure-s3`, also from a git worktree),
+`.measurement-artifacts/failure-<family>`, also from a git worktree),
 `lease_wait_s` and `report_dir`. The family state
 (`failures-state.json`) keeps each cell's latest run, which the index lists.
 
@@ -663,7 +664,86 @@ archives (the engine log carries each flush failure's time and class),
 without rerunning anything or changing a run file: the advanced index
 records every changed verdict and every check the evidence cannot decide
 (`fault_rejudgement`), each child's re-judged failed checks, and keeps the
-index it replaces as a child.
+index it replaces as a child. It re-judges S3 cases only.
+
+#### Process restart and hard kill
+
+`failures --family process` runs `graceful_restart`, `kill_active` and
+`kill_upload` in both topologies on both stores, with the S3 family's rig,
+engine settings and producer, and publishes `failure-process.json`:
+
+```bash
+SERIES_MEASURE_LONG=1 SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 \
+  taskset -c 0-7,16-23 python3 -m crates.validation.tests.series_parquet.measure \
+  failures --family process --output-dir /var/tmp/series-failure-process
+```
+
+The producer's ledger and gRPC channel outlive every engine; the channel
+reconnects within a second to the next engine on the launcher's same port,
+and each refused request is resent with its original bytes. Each signal is
+an event (`observations.fault.process.events`) with its gate, the producer's
+acknowledged and pending requests at the signal and at the exit, the exit,
+the store's listing and incomplete uploads at the exit, and the restart
+(`restart_engine`): the same launcher, cores and, buffered, buffer
+directory, with the old and new PID and boot id. States carry the event's
+ordinal: `gate_N`, `signalled_N`, `exited_N`, `restarted_N`, then
+`resumed` (a values file of the new boot and an acknowledgement), 20 s of
+acknowledged input and `drained`.
+
+- `graceful_restart`: with ACTIVE nonempty, live input and work to drain
+  (strict: unacknowledged requests; buffered: bundles the exporter holds),
+  the admin shutdown with a deadline of `window.interval + 2 *
+  (flush_retry_deadline + upload.abort_timeout) + 15 s` (150 s here). The
+  engine must exit 0 within the bound itself (135 s).
+- `kill_active`: SIGKILL while the current window's cohort is only in the
+  ACTIVE block: at least five requests sent from 0.25 s after the window's
+  boundary (strict: unacknowledged; buffered: acknowledged by the log),
+  nothing flushing or sealed, at least 1 s into the window and 1.5 s before
+  its end. The kill must land inside that window and no cohort record may be
+  stored at the exit.
+- `kill_upload`: with the values route's uploads throttled to 512 KB/s,
+  SIGKILL while a values multipart upload of the current boot is open in the
+  store with bytes stored and FLUSHING nonempty. The throttle moves to the
+  general route at 1 KB/s and the restarted engine is killed while its first
+  flush holds its series PUT, a single PUT, on the wire; then the throttle is
+  removed and a third engine runs. The caught upload must stay incomplete,
+  its key never completed, and NGINX must log the series PUT the second kill
+  cut off.
+
+A gate is confirmed on a fresh sample just before the signal. One the fresh
+sample no longer shows is a discarded setup attempt, recorded in
+`gate_discards` and never claimed; a gate not confirmed within the setup
+deadline (60 s, 120 s for `kill_upload`) fails `fault_observed`. SIGKILL goes
+to the engine container by its id (`docker kill --signal KILL`) and the exit
+status comes from `docker inspect` (`kill_engine`); a local engine is killed
+by its host PID. No wait assumes the engine stopped: exits are observed with
+`poll` under deadlines, readiness through the admin API.
+
+The process checks beside the S3 family's:
+
+- `new_boot_id`: every engine logged a distinct boot id, the first and the
+  last wrote values files, and no stored file names another boot;
+- `restart_same_cores_and_buffer`: each restart kept the cores and the graph,
+  and, buffered, the buffer directory and its per-core directories;
+- `prior_acks_durable`: strict, every record acknowledged before an exit was
+  stored at that exit; both topologies, stored at the end;
+- `replay_only_eligible`: `replay_analysis` counts each stored record in the
+  files listed at an exit and in the final store. A record stored again after
+  the restart is eligible only when its request was not acknowledged by the
+  exit, since the producer resends it, or, after a buffered SIGKILL, whatever
+  its request, since the buffer redelivers what it had not recorded as
+  delivered. A key listed at an exit must keep its ETag;
+- `no_permanent_rejection`: no permanent or partial refusal reached the
+  producer, and no engine reported a permanent nack or a permanently rejected
+  bundle;
+- `retry_bytes_identical`: the ledger refuses a resent request whose bytes
+  differ.
+
+`orphaned_uploads_expected` also allows every values upload a killed engine
+left open at its exit, and once the evidence is kept the case aborts every
+incomplete upload itself (`orphan_cleanup`). Buffered, `duplicates_explained`
+accepts a duplicate stored before a restart and again after it, or copied in
+a failed block.
 
 The remaining subcommands (`buffered`, `remediate`, `report`) are named
 here so the command line is one contract; each is implemented by its own

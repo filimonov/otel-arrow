@@ -1350,5 +1350,258 @@ class S3FailureTests(measurement.MeasurementTestCase):
                     faults.fault_check(result)
 
 
+class FakeEngine:
+    """The parts of an Engine the process helpers read."""
+
+    def __init__(self, root, process=None, pid=4242, boot="aa11", options=None):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.process = process
+        self.pid = pid
+        self.cores = [1]
+        self.edges = [("receiver", "exporter")]
+        self.buffer_path = (options or {}).get("buffer_path")
+        self.launch_options = dict(options or {})
+        self.log = mock.Mock()
+        self.log.name = str(self.root / "engine.log")
+        Path(self.log.name).write_text(
+            "\x1b[2m2026\x1b[0m INFO otel.exporter.series_parquet::series_parquet.start: "
+            f"[writer_id=local_1, boot_id={boot}, storage=s3]\n")
+
+
+def process_ledger(case):
+    """A ledger with an acknowledged, a pending and a later request of two records each."""
+    ledger = measurement.Ledger(temporary_directory(case) / "ledger.sqlite")
+    case.addCleanup(ledger.close)
+    for request, send_ns, ack_ns in ((0, 10, 20), (1, 30, 90), (2, 60, None)):
+        ledger.add_request(request, "logs", b"w%d" % request,
+                           [(f"r{request}{point}", "log", "h") for point in range(2)],
+                           send_ns=send_ns)
+        if ack_ns is not None:
+            ledger.ack(request, ack_ns)
+    return ledger
+
+
+class ProcessCaseContracts(unittest.TestCase):
+    """How a process case kills, restarts and judges replay, without Docker."""
+
+    # Scenario: a container engine is hard-killed.
+    # Guarantees: SIGKILL goes to the recorded container id through docker
+    # kill, the exit status comes from docker inspect, and the docker client
+    # that waits for the container is never signalled.
+    def test_kill_engine_kills_the_container_by_id(self):
+        process = mock.Mock(container_id="abc123")
+        process.poll.return_value = 137
+        engine = mock.Mock(process=process, pid=999)
+        with mock.patch.object(faults, "run_command", return_value=ok_command()) as run, \
+                mock.patch.object(faults, "_docker_json",
+                                  return_value={"Running": False, "ExitCode": 137}):
+            stopped = faults.kill_engine(engine)
+        self.assertEqual(run.call_args.args[0], ["docker", "kill", "--signal", "KILL", "abc123"])
+        self.assertEqual(stopped["exit_code"], 137)
+        process.send_signal.assert_not_called()
+        process.kill.assert_not_called()
+
+    # Scenario: a local engine process is hard-killed.
+    # Guarantees: SIGKILL reaches its host PID and the exit is observed through
+    # poll within the kill deadline, with the signal's exit status.
+    def test_kill_engine_kills_a_local_process_by_pid(self):
+        child = faults.subprocess.Popen(["sleep", "60"])
+        self.addCleanup(child.wait)
+        stopped = faults.kill_engine(mock.Mock(process=child, pid=child.pid))
+        self.assertEqual(stopped["exit_code"], -9)
+        self.assertLess(stopped["exit_s"], faults.KILL_EXIT_DEADLINE_S)
+
+    # Scenario: an engine is shut down through the admin API with a
+    # fractional deadline, and once when the API call fails.
+    # Guarantees: the deadline is passed in whole seconds, rounded up; the
+    # exit is observed; a failed admin call fails at once, never waited out.
+    def test_stop_engine_rounds_the_deadline_and_refuses_a_failed_call(self):
+        process = mock.Mock(spec=["poll"])
+        process.poll.return_value = 0
+        engine = mock.Mock(process=process, pid=5)
+        stopped = faults.stop_engine(engine, 150.2)
+        engine.shutdown.assert_called_once_with(151)
+        self.assertEqual(stopped["exit_code"], 0)
+        engine.shutdown.side_effect = AssertionError("400")
+        with self.assertRaisesRegex(AssertionError, "admin shutdown of 5 failed"):
+            faults.stop_engine(engine, 150)
+
+    # Scenario: an engine is restarted, keeping and then not keeping its buffer.
+    # Guarantees: the successor runs from the next root with the same launch
+    # options, the same buffer path only when retained, and records the old
+    # and new PID, cores and boot ids.
+    def test_restart_engine_launches_a_successor_alike(self):
+        root = temporary_directory(self)
+        options = {"launcher": "L", "cores": [1], "buffer_path": root / "buffer",
+                   "topology": "buffered"}
+        previous = FakeEngine(root / "engine-1", mock.Mock(container_id="old"), 11, "aa11",
+                              options)
+        launched = []
+
+        def successor(directory, **kwargs):
+            launched.append(kwargs)
+            return FakeEngine(directory, mock.Mock(container_id="new"), 22, "bb22", kwargs)
+
+        with mock.patch.object(faults.test_e2e, "Engine", side_effect=successor):
+            engine = faults.restart_engine(previous, retain_buffer=True)
+            fresh = faults.restart_engine(engine, retain_buffer=False)
+        self.assertEqual(engine.root.name, "engine-2")
+        self.assertEqual(launched[0], options)
+        self.assertEqual(engine.restart["previous_boot_id"], "aa11")
+        self.assertEqual(engine.restart["boot_id"], "bb22")
+        self.assertEqual((engine.restart["previous_pid"], engine.restart["pid"]), (11, 22))
+        self.assertEqual(engine.restart["buffer_path"], str(root / "buffer"))
+        self.assertEqual(launched[1]["buffer_path"], root / "engine-3" / "buffer")
+        self.assertEqual(fresh.root.name, "engine-3")
+
+    # Scenario: the boot id is read from an engine log and from a part file name.
+    # Guarantees: both come from the exporter's own start event and naming,
+    # colour codes included, and a foreign name has none.
+    def test_boot_ids_come_from_the_start_event_and_the_file_name(self):
+        engine = FakeEngine(temporary_directory(self) / "engine-1", boot="9f25d1d4")
+        self.assertEqual(faults.engine_boot_id(engine), "9f25d1d4")
+        key = ("otel/v=1/signal=logs/dataset=values/date=2026-09-25/hour=01/"
+               "part-20260925T011400Z-local_1-9f25d1d4-00000001.parquet")
+        self.assertEqual(faults.file_boot_id(key), "9f25d1d4")
+        self.assertIsNone(faults.file_boot_id("otel/other.parquet"))
+
+    # Scenario: the producer's ledger is read at an instant with an
+    # acknowledged, a pending and a later request.
+    # Guarantees: acknowledged, pending and the selected cohort since an
+    # instant are counted apart.
+    def test_ledger_cohorts_split_acked_pending_and_selected(self):
+        ledger = process_ledger(self)
+        cohorts = faults.ledger_cohorts(ledger, 50, since_ns=25)
+        self.assertEqual(cohorts["acked_requests_count"], 1)
+        self.assertEqual(cohorts["pending_requests_count"], 1)
+        self.assertEqual(cohorts["cohort_unacked_requests_count"], 1)
+        self.assertEqual(cohorts["cohort_acked_requests_count"], 0)
+
+    # Scenario: records acknowledged before an exit, pending at it and sent
+    # after it are stored once, twice or not at all around a restart.
+    # Guarantees: a record stored again after the restart is eligible only
+    # when its request was pending (the producer resends it) or, after a
+    # buffered SIGKILL, whatever it was; an acknowledged record stored again
+    # after a graceful restart or a strict kill is counted ineligible, and a
+    # listed key that changed is reported.
+    def test_replay_analysis_judges_each_cohort(self):
+        ledger = process_ledger(self)
+        before, after = "otel/a-1.parquet", "otel/b-2.parquet"
+        rows = [("r00", before), ("r01", before), ("r10", before),
+                ("r00", after), ("r10", after), ("r11", after), ("r20", after), ("r21", after)]
+        events = [{"ordinal": 1, "kind": "graceful", "exited_ns": 50,
+                   "listing": {before: "e1"}, "cohort_since_ns": None}]
+        report = faults.replay_analysis(ledger, rows, events, {before: "e1", after: "e2"},
+                                        buffered=False)
+        entry = report["events"][0]
+        self.assertEqual(entry["replayed_records_by_cohort"], {"acked": 1, "pending": 1,
+                                                               "later": 0})
+        self.assertEqual(entry["ineligible_replayed_records"], 1)
+        self.assertEqual(entry["acked_missing_at_exit_records"], 0)
+        self.assertEqual(entry["pending_stored_at_exit_records"], 1)
+        self.assertEqual(entry["multiplicity_by_cohort"]["later"], {"0->1": 2})
+        self.assertEqual(report["duplicated_outside_replay_and_failed_blocks_records"], 0)
+        events[0]["kind"] = "kill"
+        buffered = faults.replay_analysis(ledger, rows, events, {before: "e1", after: "e2"},
+                                          buffered=True)
+        self.assertEqual(buffered["events"][0]["ineligible_replayed_records"], 0)
+        changed = faults.replay_analysis(ledger, rows, events, {before: "other"}, buffered=True)
+        self.assertEqual(changed["events"][0]["changed_listed_keys"], [before])
+
+    # Scenario: kill_active's gate is judged at several positions of a window.
+    # Guarantees: it holds only with an ACTIVE-only block, nothing flushing
+    # or sealed, a large enough cohort, and time into and left in the window.
+    def test_active_gate_needs_an_active_only_cohort_with_time_left(self):
+        seen = {"block_active_bytes": 10, "block_flushing_bytes": 0, "block_pending_bytes": 0,
+                "elapsed_s": 2.0, "left_s": 3.0, "selected_cohort_requests_count": 20}
+        self.assertTrue(faults.ProcessCase.active_met(seen))
+        for change in ({"block_flushing_bytes": 1}, {"block_pending_bytes": 1},
+                       {"left_s": 1.0}, {"elapsed_s": 0.5},
+                       {"selected_cohort_requests_count": 2}, {"block_active_bytes": 0}):
+            with self.subTest(change=change):
+                self.assertFalse(faults.ProcessCase.active_met(dict(seen, **change)))
+
+    # Scenario: kill_upload's gates are judged from partial evidence.
+    # Guarantees: the multipart gate needs FLUSHING and an open upload with
+    # bytes stored or logged; the PUT gate needs FLUSHING held long enough
+    # and no request of the new boot finished yet.
+    def test_upload_gates_need_bytes_on_the_wire(self):
+        upload = {"part_bytes": 0, "logged_part_bytes": 0}
+        seen = {"block_flushing_bytes": 5, "open_uploads": [upload]}
+        self.assertFalse(faults.ProcessCase.multipart_met(seen))
+        upload["part_bytes"] = 1550000
+        self.assertTrue(faults.ProcessCase.multipart_met(seen))
+        self.assertFalse(faults.ProcessCase.multipart_met(dict(seen, block_flushing_bytes=0)))
+        put = {"block_flushing_bytes": 5, "flushing_for_s": 1.5, "boot_requests_logged": []}
+        self.assertTrue(faults.ProcessCase.put_met(put))
+        self.assertFalse(faults.ProcessCase.put_met(dict(put, flushing_for_s=0.5)))
+        self.assertFalse(faults.ProcessCase.put_met(dict(put, boot_requests_logged=["put_object"])))
+
+    # Scenario: NGINX logged requests of a boot that ended before, across and
+    # after a kill.
+    # Guarantees: only a non-2xx request that started before the kill and
+    # ended at or after it counts as cut off by the kill.
+    def test_interrupted_requests_were_open_at_the_kill(self):
+        base = {"method": "PUT", "operation": "put_object", "upstream_status": "-",
+                "request_length": "900"}
+        entries = [
+            dict(base, uri="/b/otel/x-bb22-1", msec="100.0", request_time="5.0", status="499"),
+            dict(base, uri="/b/otel/x-bb22-2", msec="96.0", request_time="1.0", status="499"),
+            dict(base, uri="/b/otel/x-bb22-3", msec="100.0", request_time="5.0", status="200"),
+            dict(base, uri="/b/otel/x-cc33-4", msec="100.0", request_time="5.0", status="499"),
+        ]
+        found = faults.interrupted_requests(entries, 99.95, key_part="bb22")
+        self.assertEqual([entry["uri"] for entry in found], ["/b/otel/x-bb22-1"])
+
+    # Scenario: a process result lacks one of its lifecycle checks.
+    # Guarantees: fault_check requires the process checks beside the common
+    # fault checks, so a result that never checked its new boot id fails.
+    def test_fault_check_requires_the_process_checks(self):
+        result = passing_fault_result()
+        result["observations"]["fault"]["fault"] = "kill_upload"
+        with self.assertRaisesRegex(AssertionError, "new_boot_id: never checked"):
+            faults.fault_check(result)
+        result["checks"] += [measurement.check(name, measurement.CHECK_HARD,
+                                               measurement.STATUS_PASSED)
+                             for name in faults.PROCESS_CHECKS]
+        faults.fault_check(result)
+
+    # Scenario: buffer inventories before and after a restart are compared.
+    # Guarantees: the buffer counts as retained only when the directory and
+    # every per-core directory keep their inodes.
+    def test_buffer_retention_needs_the_same_directories(self):
+        before = {"exists": True, "device": 1, "inode": 2, "cores": {"core1": {"inode": 3}}}
+        self.assertTrue(measure.buffer_retained(before, json.loads(json.dumps(before))))
+        self.assertFalse(measure.buffer_retained(before, dict(before, inode=9)))
+        self.assertFalse(measure.buffer_retained(before, dict(before, cores={})))
+        self.assertFalse(measure.buffer_retained(dict(before, cores={}), before))
+
+
+def check_status(result, name):
+    """The status of one named check of a result, or None when it was never checked."""
+    return next((entry["status"] for entry in result["checks"] if entry["name"] == name), None)
+
+
+class ProcessFailureTests(measurement.MeasurementTestCase):
+    """A killed or restarted engine loses no acknowledged record, in each topology."""
+
+    # Scenario: SIGKILL interrupts a real upload with acknowledged history on disk.
+    # Guarantees: restart and topology-appropriate replay preserve every supported ID.
+    def test_kill_during_upload(self):
+        measurement.require_long()
+        for topology in ("strict", "buffered"):
+            for store in ("minio", "rustfs"):
+                with self.subTest(topology=topology, store=store):
+                    result = faults.failure_case("process", "kill_upload", topology, store,
+                                                 self.output_dir, report_dir=self.output_dir,
+                                                 archive_dir=self.output_dir / "archive")
+                    numbers = result["observations"]["fault"]["numbers"]
+                    self.assertNotEqual(numbers["old_pid"], numbers["new_pid"])
+                    self.assertEqual(check_status(result, "new_boot_id"),
+                                     measurement.STATUS_PASSED)
+                    faults.fault_check(result)
+
+
 if __name__ == "__main__":
     unittest.main()
