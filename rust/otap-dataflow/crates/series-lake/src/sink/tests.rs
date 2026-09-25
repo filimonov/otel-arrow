@@ -1102,6 +1102,115 @@ async fn a_cancellation_while_finish_creates_the_upload_aborts_or_reports_it() {
     }
 }
 
+thread_local! {
+    /// Cleanup timers [`counted_timer`] has started on this thread.
+    static TIMERS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`tokio_timer`] that also counts the timers started on this thread.
+fn counted_timer(timeout: Duration) -> AbortTimer {
+    TIMERS_STARTED.with(|started| started.set(started.get() + 1));
+    tokio_timer(timeout)
+}
+
+/// Store hooks for a values upload whose completion never answers: parts
+/// land at once, the completion cancels `token` and then hangs, and the abort
+/// never returns.
+#[derive(Debug)]
+struct LostCompleteOnCancel {
+    token: CancellationToken,
+    /// When the completion cancelled the token.
+    cancelled_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// The upload handed back by [`LostCompleteOnCancel`].
+#[derive(Debug)]
+struct CancellingUpload {
+    token: CancellationToken,
+    cancelled_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for CancellingUpload {
+    fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        *self.cancelled_at.lock().expect("lock") = Some(std::time::Instant::now());
+        self.token.cancel();
+        std::future::pending().await
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for LostCompleteOnCancel {
+    fn wrap_upload(
+        &self,
+        location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        if !location.as_ref().contains("dataset=values") {
+            return inner;
+        }
+        Box::new(CancellingUpload {
+            token: self.token.clone(),
+            cancelled_at: Arc::clone(&self.cancelled_at),
+        })
+    }
+}
+
+/// Scenario: the token fires while `finish` waits for the values upload's
+/// completion, which never answers, so the upload is settled by a HEAD and an
+/// abort that never returns.
+/// Guarantees: the cancellation's whole cleanup runs on the one cleanup timer
+/// started where the cancellation was seen, ends within one
+/// `upload.abort_timeout` of it, and reports the upload as a possible orphan.
+#[tokio::test]
+async fn a_cancelled_completion_settles_on_the_one_cleanup_budget() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let token = CancellationToken::new();
+    let cancelled_at = Arc::new(std::sync::Mutex::new(None));
+    let mut cfg = finish_upload_config();
+    cfg.upload.abort_timeout = Duration::from_millis(500);
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        LostCompleteOnCancel {
+            token: token.clone(),
+            cancelled_at: Arc::clone(&cancelled_at),
+        },
+    ));
+    let b = sealed_upload_block(&cfg);
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), counted_timer);
+    TIMERS_STARTED.with(|started| started.set(0));
+    let got = sink.write_block(&b, &token).await;
+    let since_cancel = cancelled_at
+        .lock()
+        .expect("lock")
+        .expect("the completion was sent")
+        .elapsed();
+    let Err(Error::Transient(TransientError::Cancelled { abort_error })) = got else {
+        panic!("expected a cancellation, got {got:?}");
+    };
+    assert!(
+        abort_error.is_some_and(|reason| reason.contains("dataset=values")),
+        "the unsettled upload is a possible orphan"
+    );
+    assert_eq!(
+        TIMERS_STARTED.with(std::cell::Cell::get),
+        1,
+        "one cleanup budget"
+    );
+    assert!(
+        since_cancel < Duration::from_millis(900),
+        "cleanup took {since_cancel:?} after the cancellation"
+    );
+}
+
 /// Scenario: a part upload fails and its abort fails too.
 /// Guarantees: `AbortFailed` carries both errors and no values object completes.
 #[tokio::test]

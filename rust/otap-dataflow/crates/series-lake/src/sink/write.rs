@@ -583,8 +583,8 @@ impl Sink {
         }
     }
 
-    /// Settle an upload whose completion was sent but not confirmed, within
-    /// one `upload.abort_timeout`.
+    /// Settle an upload whose completion was sent but not confirmed, by
+    /// `deadline`, the write's one cleanup allowance.
     ///
     /// A HEAD of `path` decides whether the object exists. Only an answer,
     /// found or `NotFound`, allows the abort of the upload: any other HEAD
@@ -596,8 +596,8 @@ impl Sink {
         &self,
         mut upload: Box<dyn object_store::MultipartUpload>,
         path: &Path,
+        mut deadline: AbortTimer,
     ) -> Settled {
-        let mut deadline = self.start_cleanup();
         let timed_out = || {
             format!(
                 "the probe and abort of an unconfirmed completion timed out after {:?}",
@@ -912,7 +912,10 @@ impl Sink {
         };
         if cancel.is_cancelled() {
             let abort_error = self
-                .abort_upload(writer, self.start_cleanup())
+                .abort_upload(
+                    writer,
+                    cleanup.take().unwrap_or_else(|| self.start_cleanup()),
+                )
                 .await
                 .map(|reason| Self::orphan(path, reason));
             return Err(Error::cancelled(abort_error));
@@ -951,7 +954,14 @@ impl Sink {
             Some(Unsettled {
                 upload,
                 completing: true,
-            }) => match self.settle_completion(upload, path).await {
+            }) => match self
+                .settle_completion(
+                    upload,
+                    path,
+                    cleanup.take().unwrap_or_else(|| self.start_cleanup()),
+                )
+                .await
+            {
                 // A cancelled write stays cancelled: its caller has decided the
                 // block, and probes for a late commit itself.
                 Settled::Found {
