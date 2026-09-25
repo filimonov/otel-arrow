@@ -5415,6 +5415,21 @@ def dns_evidence(entries, since_unix_s, until_unix_s=None) -> dict:
                                          and not entry["answer"].startswith("NODATA"))}
 
 
+def fault_dns_evidence(entries, armed_unix_s) -> dict:
+    """The resolver's queries and answers for the endpoint after a DNS fault was armed.
+
+    The resolver logs whole seconds, so only seconds wholly after the arming
+    instant count; `engine_queries_count` counts AAAA queries, which glibc
+    sends beside A and the diagnostic `dig` never does.
+    """
+    since = int(armed_unix_s) + 1
+    evidence = dns_evidence(entries, since)
+    evidence["engine_queries_count"] = sum(
+        1 for entry in entries if entry["kind"] == "query" and entry["type"] == "AAAA"
+        and entry["unix_s"] >= since)
+    return evidence
+
+
 def pcap_count(rig, capture_file, display_filter=None) -> int:
     """Frames of one capture tshark reads, optionally only those a filter keeps.
 
@@ -6042,12 +6057,8 @@ class NetworkCase(FaultCase):
             observed["rst_packets_count"] = self.cached(
                 "rst", lambda: pcap_count(self.rig, self.capture.file))
         if self.fault in ("dns_nxdomain", "dns_timeout"):
-            entries = self.cached("dns", self.dns_entries)
-            observed["dns"] = dns_evidence(entries, armed["unix_s"])
-            # glibc asks for AAAA as well; the harness's diagnostic dig asks only A.
-            observed["dns"]["engine_queries_count"] = sum(
-                1 for entry in entries if entry["kind"] == "query" and entry["type"] == "AAAA"
-                and entry["unix_s"] >= int(armed["unix_s"]))
+            observed["dns"] = fault_dns_evidence(self.cached("dns", self.dns_entries),
+                                                 armed["unix_s"])
         if self.fault == "dns_timeout":
             observed["dns_rule_packets"] = self.cached("dns_rules",
                                                        lambda: dns_rule_counters(self.rig))
@@ -6097,7 +6108,8 @@ class NetworkCase(FaultCase):
             text, *(window if window else (None, None)))
         if self.fault in ("dns_nxdomain", "dns_timeout") and window and window[1]:
             entries = self.dns_entries()
-            self.network["dns_during_fault"] = dns_evidence(entries, window[0], window[1])
+            self.network["dns_during_fault"] = dns_evidence(entries, int(window[0]) + 1,
+                                                            window[1])
             self.network["dns_after_fault"] = dns_evidence(entries, window[1])
         self.network["activations"] = self.rig.activations
         return self.network
@@ -6672,11 +6684,16 @@ class MultipartCompletionCase(NetworkCase):
 
     def release_at(self, target):
         """When a held completion is released: HELD_RELEASE_MARGIN_S past the later
-        of the writer's cleanup cutoff and the block's window end plus L. A store
-        drops a connection whose request has not arrived within its own request
-        timeout, if it has one; a completion it still holds then lands."""
-        return max(target["cutoff_unix_s"], target["window_end_unix_s"] + self.bound_s) \
-            + HELD_RELEASE_MARGIN_S
+        of the writer's cleanup cutoff and L after the block's window end, or
+        after its partition hour's end when its window is within
+        HELD_RELEASE_MARGIN_S of it (a straddling cell). A store drops a
+        connection whose request has not arrived within its own request timeout,
+        if it has one; a completion it still holds then lands."""
+        end = target["window_end_unix_s"]
+        hour = partition_hour(target["key"])
+        if hour and hour[1] - end <= HELD_RELEASE_MARGIN_S:
+            end = hour[1]
+        return max(target["cutoff_unix_s"], end + self.bound_s) + HELD_RELEASE_MARGIN_S
 
     def await_condition(self):
         """Held: release the completion at its instant, then observe; the dropped

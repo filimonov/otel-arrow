@@ -834,9 +834,10 @@ arming until both routes answer again.
   `series_parquet.flush.cleanup` `late_commit` event and
   `flush.late_commits` at least 1. Held: an upstream `latency` toxic holds
   the completion in the proxy while the writer gives up; it is released
-  10 s past the later of the writer's cleanup cutoff and the block's window
-  end plus the lateness bound, and the case records whether and when the
-  object appears. The
+  10 s past the later of the writer's cleanup cutoff and the lateness bound
+  after the block's window end (after its partition hour's end for an hour's
+  last blocks), and the case records whether and when the object appears.
+  The
   store itself drops a connection whose request has not arrived within its
   request timeout, if it has one, so a completion held longer never lands.
 

@@ -1859,6 +1859,23 @@ class NetworkCaseContracts(unittest.TestCase):
                           "address_answers_count": 0})
         self.assertEqual(faults.dns_evidence(entries, 0)["address_answers_count"], 1)
 
+    # Scenario: the engine resolved the endpoint in the same logged second as
+    # the DNS fault was armed, then again a second later.
+    # Guarantees: only seconds wholly after arming are the fault's, so the
+    # arming second's answered query neither breaks the timeout's "nothing
+    # received" nor counts as a fresh query; the later one does.
+    def test_fault_dns_evidence_starts_after_the_arming_second(self):
+        name = "lake-x.test"
+        entries = faults.dnsmasq_queries("\n".join((
+            f"Sep 25 04:40:10 dnsmasq[61]: query[AAAA] {name} from 127.0.0.1",
+            f"Sep 25 04:40:10 dnsmasq[61]: /control/hosts {name} is 127.0.0.1")), name, 2026)
+        armed = datetime.datetime(2026, 9, 25, 4, 40, 10, 400000,
+                                  tzinfo=datetime.timezone.utc).timestamp()
+        evidence = faults.fault_dns_evidence(entries, armed)
+        self.assertEqual((evidence["queries_count"], evidence["engine_queries_count"]), (0, 0))
+        later = entries + [dict(entries[0], unix_s=entries[0]["unix_s"] + 1)]
+        self.assertEqual(faults.fault_dns_evidence(later, armed)["engine_queries_count"], 1)
+
     # Scenario: each network condition is fed evidence with one part missing.
     # Guarantees: disconnect needs refused upstreams, reset needs captured RSTs
     # and reset upstreams, NXDOMAIN needs the engine's own answered queries,
@@ -2073,6 +2090,23 @@ class NetworkCaseContracts(unittest.TestCase):
         self.assertTrue(faults.captured_nothing("x\n0 packets captured\n0 packets dropped"))
         for count in (100, 30, 10):
             self.assertFalse(faults.captured_nothing(f"x\n{count} packets captured\n"))
+
+    # Scenario: a held completion's block ends mid-hour, then 10 s before its
+    # partition hour ends.
+    # Guarantees: the release comes 10 s past L after the window's end, or
+    # after the hour's end for the hour's last blocks, and never before the
+    # writer's cleanup cutoff.
+    def test_held_release_counts_from_the_hour_end_for_its_last_blocks(self):
+        case = faults.MultipartCompletionCase.__new__(faults.MultipartCompletionCase)
+        case.bound_s = 135.0
+        hour_end = datetime.datetime(2026, 9, 25, 4, 0, tzinfo=datetime.timezone.utc).timestamp()
+        key = "otel/v=1/signal=logs/dataset=values/date=2026-09-25/hour=03/part-x.parquet"
+        mid = {"key": key, "window_end_unix_s": hour_end - 600, "cutoff_unix_s": hour_end - 535}
+        self.assertEqual(case.release_at(mid), hour_end - 600 + 145)
+        last = dict(mid, window_end_unix_s=hour_end - 10, cutoff_unix_s=hour_end + 55)
+        self.assertEqual(case.release_at(last), hour_end + 145)
+        late = dict(mid, cutoff_unix_s=hour_end)
+        self.assertEqual(case.release_at(late), hour_end + 10)
 
     # Scenario: the multipart completion cases pick their input.
     # Guarantees: only request 0 is a metrics request, so a block's frozen
