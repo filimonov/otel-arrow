@@ -125,9 +125,9 @@
   ],
   "child_indexes": [
     {
-      "name": "failure-process-e0a711aa44eb.json",
-      "sha256": "e0a711aa44eb433fa1ae994f0cf2b6df58f58dcf0d7a22f1a03cdd3c2a86d4c0",
-      "size_bytes": 41318
+      "name": "failure-process-ac6577648c50.json",
+      "sha256": "ac6577648c5017d3e4ec5ea14fefa6546781a26ec2e5306d76c1a934c7344e56",
+      "size_bytes": 40183
     }
   ],
   "children": [
@@ -153,9 +153,6 @@
         "peak_rss_bytes": 144056320,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "replay_only_eligible"
-      ],
       "run_id": "failure-process-graceful_restart-buffered-minio-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -182,9 +179,6 @@
         "peak_rss_bytes": 120590336,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [
-        "replay_only_eligible"
-      ],
       "run_id": "failure-process-graceful_restart-buffered-rustfs-c1-w5-r001",
       "status": "failed",
       "topology": "buffered"
@@ -208,7 +202,6 @@
         "peak_rss_bytes": 116305920,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-graceful_restart-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -232,7 +225,6 @@
         "peak_rss_bytes": 116932608,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-graceful_restart-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -257,7 +249,6 @@
         "peak_rss_bytes": 121200640,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_active-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -282,7 +273,6 @@
         "peak_rss_bytes": 120573952,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_active-buffered-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -306,7 +296,6 @@
         "peak_rss_bytes": 111476736,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_active-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -330,7 +319,6 @@
         "peak_rss_bytes": 112672768,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_active-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -355,7 +343,6 @@
         "peak_rss_bytes": 170012672,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_upload-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -383,9 +370,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-kill_upload-buffered-rustfs-c1-w5-r001: harness bugs fixed in e7bbd87fc: the same late-committed series PUT, and duplicates_explained ignored a buffered request the producer resent after a kill cut off its log acknowledgement (100 records, all in resent requests); host-independent",
-      "rejudged_failed_checks": [
-        "duplicates_explained"
-      ],
       "run_id": "failure-process-kill_upload-buffered-rustfs-c1-w5-r002",
       "status": "failed",
       "topology": "buffered"
@@ -409,7 +393,6 @@
         "peak_rss_bytes": 117530624,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_upload-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -434,7 +417,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-kill_upload-strict-rustfs-c1-w5-r001: harness bug fixed in e7bbd87fc: fault_observed required the cut-off series PUT to stay absent, but RustFS committed the body the route had already received after the kill (NGINX 499, request_length 8200); host-independent",
-      "rejudged_failed_checks": [],
       "run_id": "failure-process-kill_upload-strict-rustfs-c1-w5-r002",
       "status": "passed",
       "topology": "strict"
@@ -1360,15 +1342,6 @@
     }
   },
   "events": [],
-  "fault_rejudgement": {
-    "not_rejudged": [],
-    "rules": {
-      "duplicates_explained": "strict: every duplicated record belongs to a resent request; buffered: every duplicated record has a copy in a values file of a failed block",
-      "fault_observed": "store_outage: a flush.failed event of class deadline logged at least the flush deadline after arming and before the fault was removed; process: a graceful stop within the shutdown deadline and the cleanup cutoff (graceful_exit_problem), and kill_upload's multipart gate on part bytes the store lists (ProcessCase.multipart_met)",
-      "orphaned_uploads_expected": "process: every upload a killed engine left open listed under its key, other uploads only up to the reported abort failures, and the test's cleanup leaving none (orphan_verdict)"
-    },
-    "verdict_changes": []
-  },
   "mandatory_metrics": [
     "children_count",
     "children_passed_count"
@@ -1445,7 +1418,7 @@
   "run_id": "failure-process",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-25T01:57:22Z",
+  "started_utc": "2026-09-25T01:40:01Z",
   "status": "failed",
   "workload": {}
 }
