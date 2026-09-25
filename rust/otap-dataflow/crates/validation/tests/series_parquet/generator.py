@@ -7,6 +7,7 @@ Every record's identity is its sequence number, `request * records_per_request
 opens its body, so the stored rows can be checked against the acknowledged
 requests by aggregates alone, without a per-record ledger.
 """
+import dataclasses
 import hashlib
 import random
 import struct
@@ -235,6 +236,91 @@ def _compile(wire, fields, signal) -> dict:
     statics.append(wire[at:])
     return {"statics": statics, "fields": [(kind, point) for _o, _w, kind, point in fields],
             "size": len(wire), "signal": signal}
+
+
+# --------------------------------------------------------------------------
+# Cardinality profiles
+# --------------------------------------------------------------------------
+
+CARDINALITY_PROFILES = ("stable", "churn", "mixed")
+# Series over every producer of a run: the hot set, the churning window live
+# at any moment, and the distinct churning series over the whole run.
+HOT_SERIES = 10_000
+CHURN_ACTIVE_SERIES = 10_000
+CHURN_DISTINCT_SERIES = 1_000_000
+# Churning slots start here, above every hot slot.
+CHURN_SLOT_BASE = 10**9
+# In `mixed`, one record in MIXED_CHURN_EVERY is on a churning series (80/20).
+MIXED_CHURN_EVERY = 5
+
+
+@dataclasses.dataclass(frozen=True)
+class CardinalityProfile:
+    """One producer's series slot for each record sequence number.
+
+    `stable` cycles the records through `hot` slots. `churn` puts every
+    record on a window of `active` slots that slides across `distinct` slots
+    over `planned` records, so a slot is live for a while and never returns.
+    `mixed` puts one record in MIXED_CHURN_EVERY on that window and the rest
+    on the hot slots. `slot_sql` is the same function in DuckDB SQL.
+    """
+
+    name: str
+    planned: int
+    hot: int
+    active: int
+    distinct: int
+
+    def __post_init__(self):
+        if self.name not in CARDINALITY_PROFILES:
+            raise ValueError(f"profile must be one of {CARDINALITY_PROFILES}")
+        if min(self.planned, self.hot, self.active) <= 0 or self.distinct <= self.active:
+            raise ValueError("planned, hot and active must be positive, distinct above active")
+
+    @classmethod
+    def for_run(cls, name, producers, planned):
+        """The profile of one of `producers` producers writing `planned` records."""
+        return cls(name, planned, HOT_SERIES // producers, CHURN_ACTIVE_SERIES // producers,
+                   CHURN_DISTINCT_SERIES // producers)
+
+    @property
+    def churn_records(self) -> int:
+        """How many of the planned records are on churning series."""
+        if self.name == "mixed":
+            return max(1, self.planned // MIXED_CHURN_EVERY)
+        return self.planned
+
+    def _churn(self, index):
+        return (CHURN_SLOT_BASE + index * (self.distinct - self.active) // self.churn_records
+                + index % self.active)
+
+    def slot(self, seq) -> int:
+        if self.name == "stable":
+            return seq % self.hot
+        if self.name == "churn":
+            return self._churn(seq)
+        every = MIXED_CHURN_EVERY
+        if seq % every == every - 1:
+            return self._churn(seq // every)
+        return (seq // every * (every - 1) + seq % every) % self.hot
+
+    def slot_sql(self, seq) -> str:
+        s = f"CAST({seq} AS BIGINT)"
+
+        def churn(index):
+            return (f"({CHURN_SLOT_BASE} + (({index}) * {self.distinct - self.active}) "
+                    f"// {self.churn_records} + ({index}) % {self.active})")
+
+        if self.name == "stable":
+            return f"({s} % {self.hot})"
+        if self.name == "churn":
+            return churn(s)
+        every = MIXED_CHURN_EVERY
+        return (f"(CASE WHEN {s} % {every} = {every - 1} THEN {churn(f'{s} // {every}')} "
+                f"ELSE ({s} // {every} * {every - 1} + {s} % {every}) % {self.hot} END)")
+
+    def as_json(self) -> dict:
+        return dataclasses.asdict(self)
 
 
 # --------------------------------------------------------------------------

@@ -31,12 +31,14 @@ import yaml
 try:
     from . import alloy_capacity
     from . import faults
+    from . import generator
     from . import measurement
     from . import performance
     from . import test_e2e
 except ImportError:
     import alloy_capacity
     import faults
+    import generator
     import measurement
     import performance
     import test_e2e
@@ -58,8 +60,12 @@ RATE_PER_PRODUCER = 5000
 # `p<NN> <12-digit seq> x...`.
 BODY_BYTES = 100
 SEQ_DIGITS = 12
+# Where a line's series slot starts, when it carries one (0-based).
+SLOT_OFFSET = len("pNN ") + SEQ_DIGITS + 1
 TIMELINE_PERIOD_NS = 100_000_000
 FRESHNESS_GROUP_LINES = 500
+# DuckDB's memory limit for a read-back kept in a database file.
+READ_BACK_MEMORY = "24GB"
 # The size cap the wal_full case sets instead of the shipped one: about three
 # times the steady WAL of 40k lines/s (ingest x (window + flush), ~300 MB).
 WAL_FULL_CAP = "1GiB"
@@ -72,9 +78,12 @@ ARCHIVE_DIR = faults.FAULT_ARCHIVE_ROOT / "reference-alloy"
 METRIC_PREFIXES = ("exporter.series_parquet", "processor.durable_buffer", "receiver")
 
 
-def line(producer, seq, body_bytes=BODY_BYTES) -> str:
-    """Line `seq` of producer `producer`, padded to `body_bytes`."""
+def line(producer, seq, body_bytes=BODY_BYTES, slot=None) -> str:
+    """Line `seq` of producer `producer`, padded to `body_bytes`; a `slot`
+    follows the sequence as SEQ_DIGITS digits at SLOT_OFFSET."""
     head = f"p{producer:02d} {seq:0{SEQ_DIGITS}d} "
+    if slot is not None:
+        head += f"{slot:0{SEQ_DIGITS}d} "
     return head + "x" * (body_bytes - len(head))
 
 
@@ -111,7 +120,7 @@ def shipped_alloy_settings() -> dict:
     }
 
 
-def reference_config(*, grpc_port, store, wal_dir, overrides=None):
+def reference_config(*, grpc_port, store, wal_dir, overrides=None, endpoint=None):
     """The shipped buffered config with only the site values replaced.
 
     Returns the config and the dotted paths it changed, so a result records
@@ -136,7 +145,7 @@ def reference_config(*, grpc_port, store, wal_dir, overrides=None):
         {"type": "core_set", "set": [{"start": WORKER_CORE, "end": WORKER_CORE}]})
     put(f"{base}.receiver.config.protocols.grpc.listening_addr", f"127.0.0.1:{grpc_port}")
     put(f"{base}.buffer.config.path", str(wal_dir))
-    put(f"{base}.exporter.config.storage.s3.endpoint", store.endpoint)
+    put(f"{base}.exporter.config.storage.s3.endpoint", endpoint or store.endpoint)
     put(f"{base}.exporter.config.storage.s3.base_uri", f"s3://{store.bucket}/otel")
     for path, value in (overrides or {}).items():
         put(f"{base}.{path}", value)
@@ -165,14 +174,16 @@ def flatten_metrics(document) -> dict:
 class ReferenceEngine:
     """`df_engine` on the reference config; one instance per boot, same ports and WAL."""
 
-    def __init__(self, root, *, store, wal_dir, grpc_port, admin_port, overrides=None, boot=0):
+    def __init__(self, root, *, store, wal_dir, grpc_port, admin_port, overrides=None, boot=0,
+                 endpoint=None):
         self.root = Path(root)
         self.store = store
         self.grpc_port = grpc_port
         self.admin_port = admin_port
         self.boot = boot
         self.config, self.changed = reference_config(
-            grpc_port=grpc_port, store=store, wal_dir=wal_dir, overrides=overrides)
+            grpc_port=grpc_port, store=store, wal_dir=wal_dir, overrides=overrides,
+            endpoint=endpoint)
         self.binary = Path(os.environ.get(
             "DF_ENGINE", test_e2e.WORKSPACE / "target/release/df_engine"))
         self.process = None
@@ -368,6 +379,8 @@ def _feeder(config, stop):
     os.sched_setaffinity(0, config["cpus"])
     rate = config["rate"]
     body_bytes = config["body_bytes"]
+    profile = config.get("profile")
+    slot_of = generator.CardinalityProfile(**profile).slot if profile else (lambda _seq: None)
     streams = [open(path, "a", encoding="ascii") for path in config["paths"]]
     written = [0] * len(streams)
     timeline = []
@@ -378,7 +391,7 @@ def _feeder(config, stop):
         due = int((now - start) / 1e9 * rate)
         for index, stream in enumerate(streams):
             if due > written[index]:
-                stream.write("".join(line(index, seq, body_bytes) + "\n"
+                stream.write("".join(line(index, seq, body_bytes, slot_of(seq)) + "\n"
                                      for seq in range(written[index], due)))
                 stream.flush()
                 written[index] = due
@@ -396,11 +409,14 @@ def _feeder(config, stop):
 
 
 class Feeder:
-    def __init__(self, paths, rate, result, body_bytes=BODY_BYTES):
+    """One process appending every producer's lines; a `profile`
+    (`generator.CardinalityProfile.as_json`) puts a series slot in each."""
+
+    def __init__(self, paths, rate, result, body_bytes=BODY_BYTES, profile=None):
         self.context = multiprocessing.get_context("spawn")
         self.stop_event = self.context.Event()
         self.config = {"paths": [str(p) for p in paths], "rate": rate,
-                       "body_bytes": body_bytes,
+                       "body_bytes": body_bytes, "profile": profile,
                        "cpus": PRODUCER_CPU_LIST, "result": str(result)}
         self.process = None
 
@@ -426,15 +442,23 @@ def dir_bytes(path) -> int:
 
 
 class Sampler:
-    """Engine metrics, RSS and WAL disk each second; Alloy and the store every two."""
+    """Engine metrics, RSS and WAL disk each `engine_period_s`; Alloy each
+    `alloy_period_s`; the store listed every LISTING_PERIOD_S."""
 
-    def __init__(self, case):
+    LISTING_PERIOD_S = 2.0
+
+    def __init__(self, case, *, engine_period_s=1.0, alloy_period_s=2.0):
         self.case = case
+        self.engine_period_s = engine_period_s
+        self.alloy_period_s = alloy_period_s
         self.engine_samples = []
         self.alloy_samples = []
         self.objects = {}
         self.stop_event = threading.Event()
         self.threads = []
+
+    def annotate(self, sample):
+        """Add to an engine sample of a running engine; a subclass reads more."""
 
     def start(self):
         for target in (self._engine, self._producers):
@@ -456,22 +480,26 @@ class Sampler:
                 sample.update(engine.rss())
                 with contextlib.suppress(Exception):
                     sample["metrics"] = engine.metrics()
+                self.annotate(sample)
             self.engine_samples.append(sample)
-            self.stop_event.wait(1.0)
+            self.stop_event.wait(self.engine_period_s)
 
     def _producers(self):
+        next_alloy = 0
         while not self.stop_event.is_set():
             now = time.monotonic_ns()
-            per = {}
-            for alloy in self.case.alloys:
-                with contextlib.suppress(Exception):
-                    found = alloy.metrics()
-                    found.pop("call_buckets", None)
-                    per[alloy.index] = found
-            self.alloy_samples.append({"t": now, "alloys": per})
+            if now >= next_alloy:
+                next_alloy = now + int(self.alloy_period_s * 1e9)
+                per = {}
+                for alloy in self.case.alloys:
+                    with contextlib.suppress(Exception):
+                        found = alloy.metrics()
+                        found.pop("call_buckets", None)
+                        per[alloy.index] = found
+                self.alloy_samples.append({"t": now, "alloys": per})
             with contextlib.suppress(Exception):
                 self._list_objects()
-            self.stop_event.wait(2.0)
+            self.stop_event.wait(self.LISTING_PERIOD_S)
 
     def _list_objects(self):
         client = self.case.store.client
@@ -513,6 +541,7 @@ class Case:
         self.alloys = []
         self.store = None
         self.engine = None
+        self.endpoint = None
         self.overrides = {"buffer.config.retention_size_cap": WAL_FULL_CAP} \
             if name == "wal_full" else {}
 
@@ -534,7 +563,8 @@ class Case:
     def new_engine(self):
         engine = ReferenceEngine(self.work / "engine", store=self.store, wal_dir=self.wal_dir,
                                  grpc_port=self.grpc_port, admin_port=self.admin_port,
-                                 overrides=self.overrides, boot=len(self.engines))
+                                 overrides=self.overrides, boot=len(self.engines),
+                                 endpoint=self.endpoint)
         engine.start()
         self.engines.append(engine)
         self.engine = engine
@@ -691,60 +721,80 @@ class Case:
                 performance.pin_container(store.container, STORE_CPUS)
                 self.grpc_port = test_e2e.free_port()
                 self.admin_port = test_e2e.free_port()
-                self.new_engine()
-                self.sampler = Sampler(self)
-                self.alloys = [AlloyInstance(self.work, i, self.grpc_port, self.alloy_text)
-                               for i in range(self.producers)]
-                try:
-                    for alloy in self.alloys:
-                        alloy.start()
-                    self.sampler.start()
-                    self.feeder = Feeder([a.lines for a in self.alloys], self.rate,
-                                         self.work / "feeder.json",
-                                         self.options.get("body_bytes", BODY_BYTES))
-                    self.feeder.start()
-                    self.event("input_started", producers=self.producers, rate=self.rate)
-                    self.hold(self.options.get("baseline_s", 60))
-                    self.event("fault_start")
-                    getattr(self, f"fault_{self.name}")()
-                    self.event("fault_end")
-                    self.feed = self.feeder.stop()
-                    self.event("input_stopped", written=sum(self.feed["written"]))
-                    alloy_done = self.wait_for(self.producers_drained, 900, "Alloy drained")
-                    self.event("alloy_drained", ok=alloy_done)
-                    time.sleep(20)
-                    engine_done = self.wait_for(
-                        lambda: self.engine_drained() and self.producers_drained(),
-                        600, "engine drained")
-                    time.sleep(20)
-                    engine_done = engine_done and self.engine_drained()
-                    self.event("engine_drained", ok=engine_done)
-                    self.drained = alloy_done and engine_done
-                    self.final_alloy = {a.index: a.metrics() for a in self.alloys}
-                    self.final_buckets = {a.index: self.final_alloy[a.index].pop("call_buckets")
-                                          for a in self.alloys}
-                    exit_ = self.engine.terminate()
-                    self.event("engine_final_exit", **exit_)
-                    self.sampler.stop()
-                finally:
-                    self.sampler.stop_event.set()
-                    self.alloy_logs = {a.index: a.remove(self.archive) or "" for a in self.alloys}
-                    for engine in self.engines:
-                        if engine.process and engine.process.poll() is None:
-                            engine.process.kill()
+                with self.store_route(store) as endpoint:
+                    self.endpoint = endpoint
+                    self.run_fleet()
                 self.uploads = self.incomplete_uploads()
                 local = self.work / "store"
                 store.download(local)
                 self.result["object_inventory_count"] = len(self.sampler.objects)
-                self.oracle = measurement.run_pinned(
-                    STORE_CPUS, read_back, local, self.feed["written"],
-                    self.options.get("body_bytes", BODY_BYTES))
+                self.oracle = measurement.run_pinned(STORE_CPUS, self.read_back, local)
                 self.settle()
         finally:
             lease.release()
             self.archive_raw()
             shutil.rmtree(self.work, ignore_errors=True)
         return self.result
+
+    @contextlib.contextmanager
+    def store_route(self, store):
+        """The endpoint the engine reaches the store at; None is the store's own."""
+        yield None
+
+    def make_sampler(self):
+        return Sampler(self)
+
+    def feeder_profile(self):
+        """The cardinality profile the feeder writes, as JSON, or None."""
+        return None
+
+    def read_back(self, local):
+        return read_back(local, self.feed["written"], self.options.get("body_bytes", BODY_BYTES))
+
+    def run_fleet(self):
+        """Engine, Alloy fleet and feeder through the fault, then the drain."""
+        self.new_engine()
+        self.sampler = self.make_sampler()
+        self.alloys = [AlloyInstance(self.work, i, self.grpc_port, self.alloy_text)
+                       for i in range(self.producers)]
+        try:
+            for alloy in self.alloys:
+                alloy.start()
+            self.sampler.start()
+            self.feeder = Feeder([a.lines for a in self.alloys], self.rate,
+                                 self.work / "feeder.json",
+                                 self.options.get("body_bytes", BODY_BYTES),
+                                 self.feeder_profile())
+            self.feeder.start()
+            self.event("input_started", producers=self.producers, rate=self.rate)
+            self.hold(self.options.get("baseline_s", 60))
+            self.event("fault_start")
+            getattr(self, f"fault_{self.name}")()
+            self.event("fault_end")
+            self.feed = self.feeder.stop()
+            self.event("input_stopped", written=sum(self.feed["written"]))
+            alloy_done = self.wait_for(self.producers_drained, 900, "Alloy drained")
+            self.event("alloy_drained", ok=alloy_done)
+            time.sleep(20)
+            engine_done = self.wait_for(
+                lambda: self.engine_drained() and self.producers_drained(),
+                600, "engine drained")
+            time.sleep(20)
+            engine_done = engine_done and self.engine_drained()
+            self.event("engine_drained", ok=engine_done)
+            self.drained = alloy_done and engine_done
+            self.final_alloy = {a.index: a.metrics() for a in self.alloys}
+            self.final_buckets = {a.index: self.final_alloy[a.index].pop("call_buckets")
+                                  for a in self.alloys}
+            exit_ = self.engine.terminate()
+            self.event("engine_final_exit", **exit_)
+            self.sampler.stop()
+        finally:
+            self.sampler.stop_event.set()
+            self.alloy_logs = {a.index: a.remove(self.archive) or "" for a in self.alloys}
+            for engine in self.engines:
+                if engine.process and engine.process.poll() is None:
+                    engine.process.kill()
 
     def incomplete_uploads(self):
         found = []
@@ -855,9 +905,7 @@ class Case:
               f"loss {loss}, permanently_rejected {permanent}")
         check("orphans_expected", len(self.uploads) <= abort_failures,
               f"{len(self.uploads)} incomplete uploads, abort_failures {abort_failures}")
-        allowed = duplicate_allowance(self.name, self.producers, self.rate, settings)
-        passed, detail = duplicate_check(self.name, dup["runs"], dup["runs_count"],
-                                         self.events, allowed)
+        allowed, passed, detail = self.duplicate_verdict(dup, settings)
         check("duplicates_within_bound", passed, detail)
         self.fault_checks(check, events, statuses, failed_lines, backpressure, flush_failures,
                           retries, samples)
@@ -900,6 +948,12 @@ class Case:
             "timeline": timeline_view(self.sampler, first),
             "archive": str(self.archive),
         })
+
+    def duplicate_verdict(self, dup, settings):
+        """(allowance, passed, detail) of the duplicate check."""
+        allowed = duplicate_allowance(self.name, self.producers, self.rate, settings)
+        return (allowed, *duplicate_check(self.name, dup["runs"], dup["runs_count"],
+                                          self.events, allowed))
 
     def fault_checks(self, check, events, statuses, failed_lines, backpressure, flush_failures,
                      retries, samples):
@@ -1154,8 +1208,10 @@ def quantiles(pairs, qs=(0.5, 0.99)):
 def write_time_ns(feed, producer, seq):
     """Wall time by which line `seq` of `producer` was in its file."""
     timeline = feed["timeline"]
-    counts = [entry[2][producer] for entry in timeline]
-    index = bisect.bisect_right(counts, seq)
+    cache = feed.setdefault("counts_by_producer", {})
+    if producer not in cache:
+        cache[producer] = [entry[2][producer] for entry in timeline]
+    index = bisect.bisect_right(cache[producer], seq)
     index = min(index, len(timeline) - 1)
     return timeline[index][1]
 
@@ -1242,8 +1298,12 @@ def timeline_view(sampler, first):
     return rows
 
 
-def read_back(root, written, body_bytes=BODY_BYTES) -> dict:
-    """Every line of every producer stored, read by DuckDB and clickhouse-local."""
+def read_back(root, written, body_bytes=BODY_BYTES, *, database=None) -> dict:
+    """Every line of every producer stored, read by DuckDB and clickhouse-local.
+
+    With `database`, a DuckDB file that keeps the stored lines as table `v`
+    and spills beside itself, the read-back fits a run of any length.
+    """
     import duckdb
     root = Path(root).resolve()
     relative = "v=1/signal=logs/dataset=values/**/*.parquet"
@@ -1260,7 +1320,10 @@ def read_back(root, written, body_bytes=BODY_BYTES) -> dict:
             f"TRY_CAST(substr(body, 5, {SEQ_DIGITS}) AS BIGINT) IS NOT NULL")
     prod = "TRY_CAST(substr(body, 2, 2) AS INTEGER)"
     seq = f"TRY_CAST(substr(body, 5, {SEQ_DIGITS}) AS BIGINT)"
-    with duckdb.connect() as db:
+    with duckdb.connect(str(database) if database else ":memory:") as db:
+        if database:
+            db.execute(f"SET temp_directory = {test_e2e.sql_string(str(database) + '.tmp')}")
+            db.execute(f"SET memory_limit = '{READ_BACK_MEMORY}'")
         db.execute(f"CREATE TABLE v AS SELECT producer_id, {prod} AS p, {seq} AS s, "
                    f"({well}) AS ok, filename FROM {values}")
         rows = db.execute("""
