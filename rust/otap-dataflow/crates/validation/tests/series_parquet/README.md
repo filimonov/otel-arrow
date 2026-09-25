@@ -1052,6 +1052,63 @@ LastModified beside it; ack latency is Alloy's
 file name), `purpose`, `lease_wait_s`, `archive_dir`, `report_dir`;
 `--rejudge FILE` advances a published result to the current fault checks.
 
+### Chaos soak
+
+`canary.py` runs the same deployment for hours through a seeded schedule of
+faults:
+
+```bash
+SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 8-15,24-31 \
+  python3 -m crates.validation.tests.series_parquet.canary \
+  --profile churn --input-s 14400 --seed 15002 --label r1 --purpose "..."
+```
+
+- The engine reaches MinIO through a `faults.FaultRig` (NGINX and Toxiproxy),
+  so the store endpoint is the rig's published route; the other site values
+  are those of the reference cases.
+- `chaos_schedule` draws events from `--seed`: `s3_latency` (a Toxiproxy
+  latency toxic of 100-1000 ms on every response, 60-180 s),
+  `http503_burst` (NGINX answers 503, 20-60 s), `store_outage` (the store
+  container stopped, 30-120 s), `engine_sigterm`, `engine_sigkill` (at a drawn
+  phase of the 15 s window) and `alloy_restart` (every Alloy container).
+  Every six consecutive events hold each kind once; `min_gap_s` to
+  `max_gap_s` (default 300-480) separate one event's end from the next start;
+  none starts before `first_s` (600) or ends within `tail_s` (600) of the
+  input's end. `--schedule-only` prints the plan. Each event is logged at its
+  start and end with wall and monotonic time.
+- Lines carry a series slot after their sequence number, and the one added
+  Alloy stage (`canary.SITE_STAGE`, recorded in the result) copies it into
+  `logger.name`, a series attribute of the shipped engine config. The slot is
+  `generator.CardinalityProfile`: `stable` cycles 10k hot series, `churn`
+  slides a window of 10k live series across 1M distinct series over the
+  run, `mixed` puts one record in five on that window and the rest on the hot
+  set. The shipped series cache holds 200k entries.
+- Every 10 s the sampler keeps RSS, the process high-water mark, jemalloc's
+  allocated and resident totals (`MALLOC_CONF` prints them every GiB
+  allocated), the exporter's metrics, WAL used and on disk, the buffer's queued
+  and in-flight items and the age of the newest values object listed; the
+  store is listed every 2 s.
+- After the drain the read-back keeps its table in a DuckDB file and adds:
+  every row's `logger.name` (latest descriptor) equals its line's slot, the
+  slot equals the profile's, and each producer stored exactly the profile's
+  distinct series.
+
+The hard checks add to the reference ones: every event observed (NGINX's
+access log shows the latency, the 503s or the 5xx of an outage; SIGTERM exits
+0 within the grace, SIGKILL -9; every Alloy restarted); every sample within
+`memory.budget`, `max_block_bytes`, `series_cache.max_entries` and the WAL
+cap, with the process high-water mark within 1.25 times the "Sizing"
+formula; duplicates charged per event and producer (a copy found in a failed
+block's files to a store event, any other to the Alloy restart or the engine
+restart that started its boot, whose bounds are the reference cases'; a
+SIGTERM allows none); each producer's freshness (p99 per 10 s of input, line
+written to object listed) back within 35 s after every event and holding for
+30 s before the next event's exposure (45 s before it starts); and, for a run
+of three hours or more, RSS p99 over the quiet samples (none from an event's
+start to 120 s after its end) of the last hour at most 1.15 times that of the
+second hour. Results go to `.measurement-artifacts/reference-alloy/canary/`
+of the main checkout.
+
 ## Environment variables
 
 | Variable | Effect |

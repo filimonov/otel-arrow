@@ -260,8 +260,9 @@ def freshness_buckets(groups, feed, objects, first_wall):
 
 
 def freshness_recovery(events, buckets, input_s):
-    """When each producer's freshness is back within FRESHNESS_HEALTHY_S after
-    each event, holding until the next event's exposure begins."""
+    """Whether each producer's freshness is back within FRESHNESS_HEALTHY_S
+    after each event, holding until the next event's exposure begins, and
+    how long after the event's end its stale lines were all listed."""
     verdicts = []
     for n, event in enumerate(events):
         boundary = (events[n + 1]["start_s"] if n + 1 < len(events) else input_s) \
@@ -277,10 +278,13 @@ def freshness_recovery(events, buckets, input_s):
                     recovered_at = b
                     break
             ok = recovered_at is not None and recovered_at + RECOVERY_HOLD_S <= boundary
+            # Caught up when the last stale bucket's lines were listed.
+            caught_up = max((b + FRESHNESS_BUCKET_S + v for b, v in window
+                             if recovered_at is not None and b < recovered_at), default=None)
             per_producer[producer] = {
                 "peak_p99_s": peak, "ok": ok,
                 "recovery_s": None if recovered_at is None
-                else max(0.0, recovered_at - event["end_s"])}
+                else max(0.0, (caught_up or 0.0) - event["end_s"])}
         recovery = [v["recovery_s"] for v in per_producer.values()]
         verdicts.append({
             "index": event["index"], "kind": event["kind"],
@@ -315,6 +319,22 @@ def rss_trend(points, events, input_s):
             "second_window_p99_bytes": p_second, "last_window_p99_bytes": p_last,
             "second_window_quiet_samples": len(second), "last_window_quiet_samples": len(last),
             "ratio": ratio, "passed": ratio is not None and ratio <= RSS_TREND_TOLERANCE}
+
+
+def wal_per_event(points, events):
+    """Each event's WAL peak beside the "Sizing" rule
+    `ingest x (store down + window + 5 s)`, with the ingest bytes per second
+    read from the quiet median, which the rule puts at ingest x (window + 5 s)."""
+    steady = percentile([v for s, v in points if quiet(s, events)], 0.5) or 0
+    ingest = steady / (ref.WINDOW_S + 5)
+    rows = []
+    for event in events:
+        peak = max((v for s, v in points
+                    if event["start_s"] <= s <= event["end_s"] + RSS_QUIET_AFTER_S), default=None)
+        down = event["end_s"] - event["start_s"] if event["kind"] in STORE_FAULTS else 0
+        rows.append({"index": event["index"], "kind": event["kind"], "peak_bytes": peak,
+                     "sizing_rule_bytes": ingest * (down + ref.WINDOW_S + 5)})
+    return {"steady_median_bytes": steady, "ingest_bytes_per_s": ingest, "events": rows}
 
 
 def memory_bound_bytes(config, alloy_text, budget):
@@ -668,6 +688,10 @@ class ChaosCase(ref.Case):
             "schedule": self.schedule, "executed": executed, "observed": observed,
             "memory_bound": bound, "resources": resources, "rss_trend": trend,
             "freshness_recovery": recovery, "cache": cache_view(samples, input_s),
+            "wal_per_event": wal_per_event(
+                [((s["wall"] - first_wall) / 1e9,
+                  ref.metric(s, "processor.durable_buffer.storage.bytes.used")) for s in samples],
+                executed),
             "duplicates": getattr(self, "duplicate_attribution", None),
             "jemalloc_conf": os.environ.get("MALLOC_CONF"),
             "rig_activations": getattr(self, "rig_activations", []),

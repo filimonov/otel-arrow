@@ -200,7 +200,7 @@ class JudgementContracts(unittest.TestCase):
         bad = {b: (150.0 if 100 <= b < 480 else 12.0) for b in range(0, 900, 10)}
         verdicts = canary.freshness_recovery(events, {0: good}, 900)
         self.assertTrue(verdicts[0]["passed"])
-        self.assertEqual(verdicts[0]["recovery_s"], 40.0)
+        self.assertEqual(verdicts[0]["recovery_s"], 190.0)
         self.assertFalse(canary.freshness_recovery(events, {0: good, 1: bad}, 900)[0]["passed"])
 
     # Scenario: samples with accounted memory over the budget and a cache
