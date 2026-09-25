@@ -1292,21 +1292,22 @@ fn multipart_worker(
 /// second upload; `flush.late_commits` is 1 with one INFO `late_commit` cleanup.
 #[tokio::test(flavor = "current_thread")]
 async fn a_committed_upload_whose_abort_is_not_found_is_acknowledged() {
-    a_committed_upload_is_acknowledged(Fault::CommittedCompleteTimesOut).await;
+    a_committed_upload_is_acknowledged(Fault::CommittedCompleteTimesOut, true).await;
 }
 
 /// Scenario: a values multipart completion is applied by the store and then answers with a
-/// retryable error, on a store whose abort would succeed.
-/// Guarantees: the probe decides before any abort, so the block is acknowledged on its first
-/// attempt with no second upload and one `late_commit`.
+/// retryable error, on a store that also accepts the abort that follows.
+/// Guarantees: the found object acknowledges the block on its first attempt with no second
+/// upload, but an accepted abort does not prove this completion committed it: no late commit.
 #[tokio::test(flavor = "current_thread")]
-async fn a_committed_upload_whose_completion_errors_is_acknowledged() {
-    a_committed_upload_is_acknowledged(Fault::FailedComplete).await;
+async fn a_found_object_whose_upload_still_aborts_is_not_a_late_commit() {
+    a_committed_upload_is_acknowledged(Fault::FailedComplete, false).await;
 }
 
 /// Drive one block through `fault`, a completion the store applies and whose
-/// response is lost, and check it is acknowledged as a late commit.
-async fn a_committed_upload_is_acknowledged(fault: Fault) {
+/// response is lost, and check it is acknowledged, as a late commit when
+/// `late`.
+async fn a_committed_upload_is_acknowledged(fault: Fault, late: bool) {
     let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -1342,11 +1343,15 @@ async fn a_committed_upload_is_acknowledged(fault: Fault) {
             assert_eq!(store.hooks().completes.load(SeqCst), 1, "one upload");
             worker.sample_metrics();
             let metrics = worker.metrics.as_ref().expect("metrics");
-            assert_eq!(metrics.worker.flush_late_commits.get(), 1);
+            assert_eq!(metrics.worker.flush_late_commits.get(), u64::from(late));
             assert_eq!(metrics.worker.flush_abort_failures.get(), 0);
         })
         .await;
     let cleanup = events.named("series_parquet.flush.cleanup");
+    if !late {
+        assert!(cleanup.is_empty(), "{cleanup:?}");
+        return;
+    }
     assert_eq!(cleanup.len(), 1, "{cleanup:?}");
     assert_eq!(cleanup[0].level, tracing::Level::INFO);
     assert_eq!(

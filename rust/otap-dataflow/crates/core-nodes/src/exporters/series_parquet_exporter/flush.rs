@@ -222,6 +222,9 @@ async fn write_until(
         }
         match result {
             Ok(report) => {
+                for orphan in &report.possible_orphans {
+                    trace.abort_failed(attempts, orphan);
+                }
                 if report.probed_commits > 0 {
                     trace.probed_commit(attempts);
                 }
@@ -450,7 +453,8 @@ impl Trace {
     }
 
     /// Count and log a block acknowledged although a multipart completion lost
-    /// its response: the sink's probe found the object committed.
+    /// its response: the sink found the object, and the abort that followed
+    /// showed this completion committed it (see `FlushReport::probed_commits`).
     fn probed_commit(&self, attempt: u64) {
         let late = &self.shared.tally.late_commits;
         late.set(late.get() + 1);

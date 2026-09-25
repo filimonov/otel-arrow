@@ -55,8 +55,25 @@ pub(super) struct TableWritten {
     /// Rows the file holds.
     pub(super) rows: usize,
     /// Whether the completion's response was lost and a probe found the
-    /// object committed.
+    /// object this completion committed.
     pub(super) probed: bool,
+    /// Why the upload of a found object may be left behind, if it may.
+    pub(super) orphan: Option<String>,
+}
+
+/// How [`Sink::settle_completion`] left an unconfirmed completion.
+pub(super) enum Settled {
+    /// The object exists. `committed_here` when the abort showed this upload
+    /// was the one that committed it.
+    Found {
+        committed_here: bool,
+        orphan: Option<String>,
+    },
+    /// The object does not exist and the upload was aborted.
+    Absent { orphan: Option<String> },
+    /// Whether the completion was applied is unknown; the upload was left
+    /// alone and may be left behind for this reason.
+    Unknown(String),
 }
 
 /// Clears the resident merge keys when a table write ends, however it ends.
@@ -568,39 +585,59 @@ impl Sink {
     /// Settle an upload whose completion was sent but not confirmed, within
     /// one `upload.abort_timeout`.
     ///
-    /// A HEAD of `path` decides: an object that exists was committed by this
-    /// completion, since a block's names are frozen, and is not aborted. Any
-    /// other answer aborts the upload; `NotFound` means nothing is left to
-    /// abort. Returns `Ok` for a commit, else why the upload may be left
-    /// behind, if it may.
+    /// A HEAD of `path` decides whether the object exists. Only an answer,
+    /// found or `NotFound`, allows the abort of the upload: any other HEAD
+    /// failure leaves it alone, since the completion may still be applied.
+    /// A found object holds the block's frozen bytes, but an earlier attempt
+    /// may have written it; the abort then tells: `NotFound` means this
+    /// completion committed, success means the upload was still open.
     async fn settle_completion(
         &self,
         mut upload: Box<dyn object_store::MultipartUpload>,
         path: &Path,
-    ) -> std::result::Result<(), Option<String>> {
+    ) -> Settled {
         let mut deadline = self.start_cleanup();
         let timed_out = || {
-            Some(format!(
-                "probe and abort timed out after {:?}",
+            format!(
+                "the probe and abort of an unconfirmed completion timed out after {:?}",
                 self.cfg.upload.abort_timeout
-            ))
+            )
         };
         let head = tokio::select! {
             biased;
             head = self.store.head(path) => head,
-            () = &mut deadline => return Err(timed_out()),
+            () = &mut deadline => return Settled::Unknown(timed_out()),
         };
-        if head.is_ok() {
-            return Ok(());
-        }
+        let found = match head {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(error) => {
+                return Settled::Unknown(format!(
+                    "a HEAD could not tell whether an unconfirmed completion was applied, so the \
+                     upload was not aborted: {error}"
+                ));
+            }
+        };
         let aborted = tokio::select! {
             biased;
             aborted = upload.abort() => aborted,
-            () = &mut deadline => return Err(timed_out()),
+            () = &mut deadline => Err(object_store::Error::Generic {
+                store: "series-lake",
+                source: timed_out().into(),
+            }),
         };
-        match aborted {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Err(None),
-            Err(error) => Err(Some(error.to_string())),
+        let (committed_here, orphan) = match aborted {
+            Ok(()) => (false, None),
+            Err(object_store::Error::NotFound { .. }) => (true, None),
+            Err(error) => (false, Some(error.to_string())),
+        };
+        if found {
+            Settled::Found {
+                committed_here,
+                orphan,
+            }
+        } else {
+            Settled::Absent { orphan }
         }
     }
 
@@ -887,6 +924,7 @@ impl Sink {
             return Ok(TableWritten {
                 rows,
                 probed: false,
+                orphan: None,
             });
         };
         // Dropping the writer parks an upload a cancelled finish still held.
@@ -905,11 +943,18 @@ impl Sink {
             }) => match self.settle_completion(upload, path).await {
                 // A cancelled write stays cancelled: its caller has decided the
                 // block, and probes for a late commit itself.
-                Ok(()) if !cause.is_cancelled() => {
-                    return Ok(TableWritten { rows, probed: true });
+                Settled::Found {
+                    committed_here,
+                    orphan,
+                } if !cause.is_cancelled() => {
+                    return Ok(TableWritten {
+                        rows,
+                        probed: committed_here,
+                        orphan: orphan.map(|reason| Self::orphan(path, reason)),
+                    });
                 }
-                Ok(()) => None,
-                Err(abort_error) => abort_error,
+                Settled::Found { orphan, .. } | Settled::Absent { orphan } => orphan,
+                Settled::Unknown(reason) => Some(reason),
             },
             None => None,
         };
@@ -951,6 +996,7 @@ impl Sink {
                 .write_table(table, &path, block.seq, block.window_start_secs, cancel)
                 .await?;
             report.probed_commits += usize::from(written.probed);
+            report.possible_orphans.extend(written.orphan);
             report.files.push((table.dataset(), path, written.rows));
         }
         Ok(report)

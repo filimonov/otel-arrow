@@ -70,9 +70,9 @@ pub(super) struct WorkerMetrics {
     #[metric(name = "flush.abort_failures", unit = "{upload}")]
     pub flush_abort_failures: Counter<u64>,
     /// Flushes whose files the store committed without confirming it. After a
-    /// lost completion response a probe finds the object and the block is
-    /// acknowledged; after the flush was decided its requests were nacked, so
-    /// their rows may be stored twice.
+    /// lost completion response whose abort is answered `NotFound` the block
+    /// is acknowledged; after the flush was decided its requests were nacked,
+    /// so their rows may be stored twice.
     #[metric(name = "flush.late_commits", unit = "{flush}")]
     pub flush_late_commits: Counter<u64>,
     /// Requests acknowledged as durable.

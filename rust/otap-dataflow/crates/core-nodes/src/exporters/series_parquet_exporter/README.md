@@ -92,11 +92,14 @@ failed` or `internal error`. Only a fully successful write marks the
 descriptor cache.
 
 A multipart completion whose response is lost may still have been applied.
-The writer then sends one HEAD for that object before any abort: an object
-that exists was committed under the block's frozen name, so the write goes on
-and the block is acknowledged as a late commit (`flush.late_commits`, INFO
-`series_parquet.flush.cleanup`); otherwise the upload is aborted and the
-completion's own error decides the retry.
+The writer then sends one HEAD for that object before any abort. An object
+that exists holds the block's frozen bytes, so the write goes on and the block
+is acknowledged; the upload is then aborted, and only an abort answered
+`NotFound` shows this completion committed it, which counts a late commit
+(`flush.late_commits`, INFO `series_parquet.flush.cleanup`). An object that
+does not exist is aborted and the completion's own error decides the retry. A
+HEAD that fails otherwise leaves the upload alone, since the completion may
+still be applied, and counts it in `flush.abort_failures`.
 
 A failed block can still leave its files behind: the store may finish an
 upload after the cancellation, or commit one and lose the response. After
@@ -382,7 +385,7 @@ collections is a counter.
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
 | `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. |
-| `flush.late_commits` | `{flush}` | Flushes whose files the store committed without confirming it: acknowledged after a lost completion response, or failed flushes whose every object exists after all, whose nacked rows may be stored twice. |
+| `flush.late_commits` | `{flush}` | Flushes whose files the store committed without confirming it: acknowledged after a lost completion response whose abort was answered `NotFound`, or failed flushes whose every object exists after all, whose nacked rows may be stored twice. |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -434,7 +437,7 @@ the window interval means the destination is the limit.
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
 | `series_parquet.flush.failed` | ERROR | A block failed and every request in it is nacked as retryable: `window_start`, `seq`, `file`, `requests`, `bytes`, `attempts`, `error_type`, `error`. |
-| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion's object was found and the block acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
+| `series_parquet.flush.cleanup` | WARN, INFO for a late commit or a partial block | How the write of a failed flush ended: `outcome`, `seq`, `attempt`, `file`. `late_commit` (INFO: every object exists, or a lost completion committed the object and the block was acknowledged), `partial` (INFO: `present` of `objects` exist), `abort_failed` (WARN, with `abort_error`), `unknown` (WARN, with `probe_error`: a HEAD failed or did not finish by the cleanup cutoff); a clean abort is DEBUG `aborted`. |
 | `series_parquet.seal.failed` | WARN | A block could not be sealed. |
 | `series_parquet.flush.task_failed`, `series_parquet.flush.cleanup_failed` | WARN | The write task or its cleanup panicked or was lost. |
 | `series_parquet.notify.failed`, `series_parquet.inbox.failed` | WARN | A completion or the input channel failed. |

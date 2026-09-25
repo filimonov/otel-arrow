@@ -1236,6 +1236,245 @@ async fn a_creation_without_a_definite_answer_is_a_possible_orphan() {
     }
 }
 
+/// Store hooks whose multipart completion of the values object fails without
+/// being applied, the way a completion whose request is lost looks to the
+/// writer; `abort` says how the abort that follows behaves.
+#[derive(Debug)]
+struct LostCompletion {
+    aborted: Arc<AtomicBool>,
+    abort: AbortBehavior,
+}
+
+/// The upload handed back by [`LostCompletion`].
+#[derive(Debug)]
+struct LostCompletionUpload {
+    inner: Box<dyn MultipartUpload>,
+    aborted: Arc<AtomicBool>,
+    abort: AbortBehavior,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for LostCompletionUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        Err(injected())
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.aborted.store(true, Ordering::SeqCst);
+        match self.abort {
+            AbortBehavior::Delegate => self.inner.abort().await,
+            AbortBehavior::Fail => {
+                let _ = self.inner.abort().await;
+                Err(injected())
+            }
+            AbortBehavior::Hang => std::future::pending().await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for LostCompletion {
+    fn wrap_upload(
+        &self,
+        location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        if !location.as_ref().contains("dataset=values") {
+            return inner;
+        }
+        Box::new(LostCompletionUpload {
+            inner,
+            aborted: self.aborted.clone(),
+            abort: self.abort,
+        })
+    }
+}
+
+/// Scenario: a block is written once, then written again under the same
+/// frozen names while the retry's values completion is lost and the object
+/// from the first write is still in the store.
+/// Guarantees: the found object counts as written but not as a commit of this
+/// completion, and the retry's own upload is aborted.
+#[tokio::test]
+async fn an_earlier_attempts_object_does_not_settle_the_current_upload() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = upload_config();
+    let b = sealed_upload_block(&cfg);
+    let first = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"), tokio_timer);
+    let _ = first
+        .write_block(&b, &CancellationToken::new())
+        .await
+        .expect("the first write succeeds");
+
+    let aborted = Arc::new(AtomicBool::new(false));
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        LostCompletion {
+            aborted: aborted.clone(),
+            abort: AbortBehavior::Delegate,
+        },
+    ));
+    let retry = Sink::new(store, cfg, naming("w", "boot"), tokio_timer);
+    let report = retry
+        .write_block(&b, &CancellationToken::new())
+        .await
+        .expect("the object exists, so the table is written");
+    assert!(
+        aborted.load(Ordering::SeqCst),
+        "the retry's own upload must be aborted"
+    );
+    assert_eq!(
+        report.probed_commits, 0,
+        "an object an earlier attempt wrote is not this completion's commit"
+    );
+}
+
+/// Scenario: as above, but the abort of the retry's own upload fails.
+/// Guarantees: the table still counts as written, and the upload is reported
+/// as a possible orphan naming its key.
+#[tokio::test]
+async fn a_failed_abort_after_a_found_object_is_a_possible_orphan() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = upload_config();
+    let b = sealed_upload_block(&cfg);
+    let first = Sink::new(local(&dir), cfg.clone(), naming("w", "boot"), tokio_timer);
+    let _ = first
+        .write_block(&b, &CancellationToken::new())
+        .await
+        .expect("the first write succeeds");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(HookStore::new(
+        local(&dir),
+        LostCompletion {
+            aborted: Arc::new(AtomicBool::new(false)),
+            abort: AbortBehavior::Fail,
+        },
+    ));
+    let retry = Sink::new(store, cfg, naming("w", "boot"), tokio_timer);
+    let report = retry
+        .write_block(&b, &CancellationToken::new())
+        .await
+        .expect("the object exists, so the table is written");
+    assert_eq!(report.probed_commits, 0);
+    assert_eq!(report.possible_orphans.len(), 1, "{report:?}");
+    assert!(
+        report.possible_orphans[0].contains("dataset=values"),
+        "{report:?}"
+    );
+}
+
+/// An object store whose HEAD requests fail with a retryable error, the way
+/// a store answers during an outage, delegating everything else.
+#[derive(Debug)]
+struct FailingHead(Arc<dyn ObjectStore>);
+
+impl std::fmt::Display for FailingHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingHead {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.0.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.0.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if options.head {
+            return Err(injected());
+        }
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(from, to, options).await
+    }
+}
+
+/// Scenario: a values completion is lost and the HEAD that should tell
+/// whether the store applied it fails with a retryable error.
+/// Guarantees: the upload is not aborted, since the completion may still be
+/// applied; the completion's retryable error is kept and the upload is
+/// reported as a possible orphan naming its key.
+#[tokio::test]
+async fn an_indeterminate_probe_does_not_abort_the_upload() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let aborted = Arc::new(AtomicBool::new(false));
+    let store: Arc<dyn ObjectStore> = Arc::new(FailingHead(Arc::new(HookStore::new(
+        local(&dir),
+        LostCompletion {
+            aborted: aborted.clone(),
+            abort: AbortBehavior::Delegate,
+        },
+    ))));
+    let cfg = upload_config();
+    let b = sealed_upload_block(&cfg);
+    let sink = Sink::new(store, cfg, FileNaming::new("w"), tokio_timer);
+    let got = sink.write_block(&b, &CancellationToken::new()).await;
+    assert!(
+        !aborted.load(Ordering::SeqCst),
+        "an indeterminate probe must not abort the upload"
+    );
+    let Err(Error::Transient(TransientError::AbortFailed {
+        source,
+        abort_error,
+    })) = got
+    else {
+        panic!("expected AbortFailed, got {got:?}");
+    };
+    assert!(source.is_retryable(), "{source:?}");
+    assert!(abort_error.contains("dataset=values"), "{abort_error}");
+    assert!(abort_error.contains("HEAD"), "{abort_error}");
+}
+
 /// A sealed block of `n` log rows whose one series is already committed
 /// in the block's partition, so the block's only table is its values.
 fn values_only_block(cfg: &LakeConfig, n: usize) -> Block {
