@@ -599,8 +599,8 @@ and the evidence that entered it (`observations.fault.states`):
    - `store_outage`: a `series_parquet.flush.failed` event of class
      `deadline` whose logged time is at least the flush deadline after the
      stop, a storage nack and its retry; the store stays stopped until 15 s
-     past that failed block's own deadline (its window's end plus the flush
-     deadline).
+     past that failure, the failed block's own deadline (later than its
+     window's end when it waited for the flush slot).
 3. `fault_removed`, `endpoint_healthy` (a signed HEAD of the bucket through
    the route), `resumed` (a values file written and a request acknowledged
    after the removal), 20 s of acknowledged input, `input_stopped` and

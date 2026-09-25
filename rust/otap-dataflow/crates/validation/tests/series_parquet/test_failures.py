@@ -1159,17 +1159,34 @@ class FaultCaseContracts(unittest.TestCase):
         self.assertEqual(faults.failed_block_objects(events, objects),
                          {"p-5.parquet": [objects[0]["key"]]})
 
-    # Scenario: an outage's qualifying deadline failure came from a block
-    # sealed 4.6 s after arming, and the fault has been held 70 s.
-    # Guarantees: the outage is held until the flush deadline plus a 15 s
-    # margin after that block was sealed, not removed at its failure.
+    # Scenario: an outage's only qualifying deadline failure is logged 124.6 s
+    # after arming, by a block that waited for the flush slot, so its window
+    # ended long before its deadline.
+    # Guarantees: the outage is held 15 s past that failure, the block's own
+    # deadline, not measured from its window's end.
     def test_outage_is_held_past_the_failed_block_deadline(self):
-        case = mock.Mock(flush_deadline_s=60.0)
-        seen = {"elapsed_s": 70.0, "flush_failures_count": 1, "storage_nacks_count": 100,
-                "retried": True, "deadline_failures_after_deadline": [64.6],
-                "hold_until_s": 4.6 + 60.0 + faults.OUTAGE_HOLD_MARGIN_S}
+        armed = 1790296010.4
+        log = temporary_directory(self) / "engine.log"
+        log.write_text(
+            "2026-09-25T00:28:55.005Z  ERROR otel.exporter.series_parquet::"
+            "series_parquet.flush.failed: [window_start=1790296010, seq=4, "
+            "file=p-4.parquet, error_type=deadline]\n")
+        case = faults.FaultCase.__new__(faults.FaultCase)
+        case.fault, case.buffered, case.flush_deadline_s = "store_outage", True, 60.0
+        case.log, case.failures, case.spec = faults.LogTail(log), [], mock.Mock(interval_s=5)
+        case.states = [{"state": "armed", "unix_s": armed, "monotonic_ns": 0,
+                        "evidence": {"totals": {}}}]
+        case.phase = mock.Mock()
+        case.phase.sampler.samples = []
+        case.route_requests = lambda: []
+        case.retry_evidence = lambda since_ns: {"retried": True}
+        seen = case.observe_condition()
+        self.assertEqual(seen["deadline_failures_after_deadline"], [124.605])
+        self.assertAlmostEqual(seen["hold_until_s"], 124.605 + faults.OUTAGE_HOLD_MARGIN_S)
+        seen.update(flush_failures_count=2, storage_nacks_count=200, elapsed_s=125.0)
         self.assertFalse(faults.FAULT_CONDITIONS["store_outage"](case, seen))
-        self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, dict(seen, elapsed_s=80.0)))
+        seen["elapsed_s"] = 140.0
+        self.assertTrue(faults.FAULT_CONDITIONS["store_outage"](case, seen))
 
     # Scenario: the harness runs from a git worktree of the repository.
     # Guarantees: raw fault-case archives default to the main checkout's

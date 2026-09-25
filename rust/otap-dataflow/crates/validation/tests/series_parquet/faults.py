@@ -3188,13 +3188,12 @@ class FaultCase:
                           and entry["unix_s"] >= armed["unix_s"] + self.flush_deadline_s]
             observed["deadline_failures_after_deadline"] = [
                 round(entry["unix_s"] - armed["unix_s"], 3) for entry in qualifying]
-            # The failed block was sealed at its window's end; the fault is held
-            # a margin past that block's deadline.
+            # A deadline failure is logged when its block's deadline expires,
+            # which for a block that waited for the flush slot is later than its
+            # window's end; the fault is held a margin past it.
             observed["hold_until_s"] = min(
-                (round(entry["window_start_unix_s"] + self.spec.interval_s
-                       + self.flush_deadline_s + OUTAGE_HOLD_MARGIN_S - armed["unix_s"], 3)
-                 for entry in qualifying if entry["window_start_unix_s"] is not None),
-                default=None)
+                (round(entry["unix_s"] + OUTAGE_HOLD_MARGIN_S - armed["unix_s"], 3)
+                 for entry in qualifying), default=None)
         if self.fault == "slow":
             totals = [flat_totals(sample) for sample in self.samples_since(armed["monotonic_ns"])]
             # Only requests that started under the fault show its delay.
