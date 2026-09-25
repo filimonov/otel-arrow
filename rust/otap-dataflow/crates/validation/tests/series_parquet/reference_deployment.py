@@ -792,11 +792,7 @@ class Case:
                      default=0)
         accounted_peak = max((metric(s, "exporter.series_parquet.memory.accounted")
                               for s in samples), default=0)
-        last = samples[-1] if samples else {}
-        loss = {k: v for k, v in (last.get("metrics") or {}).items()
-                if k.startswith("processor.durable_buffer.loss") and v}
-        permanent = metric(last, "processor.durable_buffer.bundles.resolved"
-                                 "{outcome=permanently_rejected}")
+        loss, permanent = buffer_losses(samples)
         abort_failures = sum(metric(s, "exporter.series_parquet.flush.abort_failures")
                              for s in last_per_boot(samples))
         late_commits = sum(metric(s, "exporter.series_parquet.flush.late_commits")
@@ -851,9 +847,10 @@ class Case:
               f"loss {loss}, permanently_rejected {permanent}")
         check("orphans_expected", len(self.uploads) <= abort_failures,
               f"{len(self.uploads)} incomplete uploads, abort_failures {abort_failures}")
-        allowed = self.duplicate_allowance(dup, settings)
-        check("duplicates_within_bound", oracle.get("duplicate_rows", 0) <= allowed["lines"],
-              f"{oracle.get('duplicate_rows', 0)} duplicate lines, allowed {allowed}")
+        allowed = duplicate_allowance(self.name, self.producers, self.rate, settings)
+        passed, detail = duplicate_check(self.name, dup["runs"], dup["runs_count"],
+                                         self.events, allowed)
+        check("duplicates_within_bound", passed, detail)
         self.fault_checks(check, events, statuses, failed_lines, backpressure, flush_failures,
                           retries, samples)
         engine_exits = [e for e in self.events if e["kind"] in ("engine_exited",
@@ -896,35 +893,6 @@ class Case:
             "archive": str(self.archive),
         })
 
-    def duplicate_allowance(self, dup, settings):
-        """Duplicates each case may produce, from the mechanism that allows them."""
-        batch = settings["batch_max_records"]
-        consumers = settings["num_consumers"]
-        if self.name == "engine_kill":
-            # Per kill: every export in flight (resent by Alloy), what the WAL
-            # acknowledged since its last 100ms tick, and one block whose
-            # acknowledgement was not yet persisted (window of input).
-            window_lines = self.producers * self.rate * 15
-            per_kill = self.producers * consumers * batch + self.producers * self.rate * 0.1 \
-                + window_lines
-            kills = sum(1 for e in self.events if e["kind"] == "engine_sigkill")
-            return {"lines": int(per_kill * kills), "per_kill_lines": int(per_kill),
-                    "rule": "in-flight exports + 100ms of WAL acks + one unrecorded block"}
-        if self.name == "alloy_kill":
-            # Resumed from the last saved position (at most 10s old), plus the
-            # batches the file-backed queue held, whose exports may have been
-            # applied before the kill.
-            per = self.rate * 10 + settings["queue_size_records"] + batch
-            return {"lines": int(per * self.producers), "per_producer_lines": int(per),
-                    "rule": "10s position sync + the queue + one batch per producer"}
-        if self.name == "alloy_restart":
-            # A restarted loki.source.file resumes from its last saved
-            # position, written every 10s.
-            per = self.rate * 10 + batch
-            return {"lines": int(per * self.producers), "per_producer_lines": int(per),
-                    "rule": "10s position sync period + one batch per producer"}
-        return {"lines": 0, "rule": "no duplicates"}
-
     def fault_checks(self, check, events, statuses, failed_lines, backpressure, flush_failures,
                      retries, samples):
         name = self.name
@@ -957,6 +925,78 @@ class Case:
             check("fault_observed", restarted, {a.index: a.restarts for a in self.alloys})
 
 
+def buffer_losses(samples):
+    """Buffer loss counters and permanent rejections, summed over every boot."""
+    loss = collections.Counter()
+    permanent = 0.0
+    for sample in last_per_boot(samples):
+        for key, value in (sample.get("metrics") or {}).items():
+            if key.startswith("processor.durable_buffer.loss") and value:
+                loss[key] += value
+        permanent += metric(sample, "processor.durable_buffer.bundles.resolved"
+                                    "{outcome=permanently_rejected}")
+    return dict(loss), permanent
+
+
+def duplicate_allowance(case, producers, rate, settings):
+    """The duplicate lines one producer may store per fault event, and why."""
+    batch = settings["batch_max_records"]
+    consumers = settings["num_consumers"]
+    if case == "engine_kill":
+        # Its exports in flight (resent by Alloy), what the WAL acknowledged
+        # since its last 100ms tick, and its share of one block whose
+        # acknowledgement was not yet persisted (one window of input).
+        per = consumers * batch + rate * 0.1 + rate * WINDOW_S
+        return {"event": "engine_sigkill", "per_producer_per_event_lines": int(per),
+                "rule": "in-flight exports + 100ms of WAL acks + one window of input"}
+    if case == "alloy_kill":
+        # Re-read from the last saved position (at most 10s old), plus the
+        # batches the file-backed queue held, whose exports may have been
+        # applied before the kill.
+        per = rate * 10 + settings["queue_size_records"] + batch
+        return {"event": "alloy_sigkill", "per_producer_per_event_lines": int(per),
+                "rule": "10s position sync + the queue + one batch"}
+    if case == "alloy_restart":
+        per = rate * 10 + batch
+        return {"event": "alloy_stop", "per_producer_per_event_lines": int(per),
+                "rule": "10s position sync + one batch"}
+    return {"event": None, "per_producer_per_event_lines": 0, "rule": "no duplicates"}
+
+
+def duplicate_check(case, runs, runs_count, events, allowed):
+    """Duplicates per (fault event, producer) against the per-producer bound.
+
+    An engine SIGKILL owns the duplicates whose latest copy is in the boot it
+    started, so a run is charged to kill `max(boots) - 1`; a copy in no known
+    boot, or one in the first boot only, belongs to no kill and fails. An
+    Alloy fault is one event per producer.
+    """
+    if len(runs) < runs_count:
+        return False, f"only {len(runs)} of {runs_count} duplicate runs were kept"
+    bound = allowed["per_producer_per_event_lines"]
+    kills = sum(1 for e in events if e["kind"] == allowed["event"])
+    charged = collections.Counter()
+    problems = []
+    for run in runs:
+        lines = run["lines"] * (run["copies"] - 1)
+        if case == "engine_kill":
+            event = max(run["boots"]) - 1
+            if min(run["boots"]) < 0 or not 0 <= event < kills:
+                problems.append(f"run {run} is attributed to no kill")
+                continue
+        else:
+            event = 0 if kills else None
+            if event is None:
+                problems.append(f"run {run} with no fault event")
+                continue
+        charged[(event, run["producer"])] += lines
+    over = {f"event {e} producer {p}": n for (e, p), n in charged.items() if n > bound}
+    table = {f"event {e} producer {p}": n for (e, p), n in sorted(charged.items())}
+    passed = not problems and not over
+    return passed, (f"per (event, producer) {table}; bound {bound} each ({allowed['rule']}); "
+                    f"over {over}; {problems[:5]}")
+
+
 def memory_queue_variant(text):
     """The reference River config with its sending queue kept in memory."""
     lines = [row for row in text.splitlines()
@@ -978,20 +1018,60 @@ def wal_full_observed(backpressure, statuses):
             f"backpressure refusals {backpressure}, Alloy UNAVAILABLE {unavailable}")
 
 
+def archived_samples(result):
+    """The engine samples a result's raw archive kept, or None."""
+    archive = str(result.get("archive", "")).replace(
+        "<main_checkout>", str(faults.FAULT_ARCHIVE_ROOT.parent))
+    path = Path(archive) / "samples.json"
+    if not path.is_file():
+        return None
+    return [s for s in json.loads(path.read_text())["engine"] if "metrics" in s]
+
+
 def rejudge(path):
-    """Advance a published wal_full result to the current fault check."""
+    """Advance a published result to the current checks, from what it stored.
+
+    Re-judges the WAL-full fault check, the duplicate bound per fault event
+    and producer, and the buffer-loss check summed over every boot (from the
+    raw archive's samples); each changed verdict is recorded.
+    """
     path = Path(path)
     result = json.loads(path.read_text())
     metrics = result["metrics"]
-    passed, detail = wal_full_observed(metrics["buffer_backpressure_refusals"],
-                                       metrics["alloy_calls_by_status"])
+    env = result["environment"]
+    new = {}
+    if result["case"] == "wal_full":
+        new["fault_observed"] = (wal_full_observed(metrics["buffer_backpressure_refusals"],
+                                                   metrics["alloy_calls_by_status"]),
+                                 "the check read the status label 'Unavailable'; Alloy "
+                                 "reports 'UNAVAILABLE'")
+    allowed = duplicate_allowance(result["case"], env["producers"], env["rate_per_producer"],
+                                  result["alloy_settings"])
+    runs = result["duplicates"]["runs"]
+    new["duplicates_within_bound"] = (
+        duplicate_check(result["case"], runs, result["duplicates"]["runs_count"],
+                        result["events"], allowed),
+        "the bound is enforced per fault event and producer, not as a fleet total")
+    samples = archived_samples(result)
+    if samples is None:
+        new["no_buffer_loss"] = ((False, "the raw archive's samples are missing; rerun"),
+                                 "summed over every boot")
+    else:
+        loss, permanent = buffer_losses(samples)
+        new["no_buffer_loss"] = ((not loss and permanent == 0,
+                                  f"loss {loss}, permanently_rejected {permanent}, "
+                                  f"over {len(last_per_boot(samples))} boots"),
+                                 "loss and permanent rejections summed over every boot")
+    result["duplicate_allowance"] = allowed
     for entry in result["checks"]:
-        if entry["name"] == "fault_observed" and entry["passed"] != passed:
+        if entry["name"] not in new:
+            continue
+        (passed, detail), reason = new[entry["name"]]
+        if entry["passed"] != passed or entry["detail"] != detail:
             result.setdefault("rejudgement", []).append({
-                "check": "fault_observed", "was": entry["passed"], "now": passed,
-                "reason": "the check read the status label 'Unavailable'; Alloy "
-                          "reports 'UNAVAILABLE'", "at_utc": measurement.utc_now()})
-            entry.update(passed=passed, detail=detail)
+                "check": entry["name"], "was": entry["passed"], "now": passed,
+                "reason": reason, "at_utc": measurement.utc_now()})
+        entry.update(passed=bool(passed), detail=detail)
     result["status"] = "passed" if all(c["passed"] for c in result["checks"]) else "failed"
     path.write_text(json.dumps(result, indent=1, sort_keys=True, default=str) + "\n")
     return result

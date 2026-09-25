@@ -84,6 +84,35 @@ class ReferenceDeploymentContracts(unittest.TestCase):
         self.assertEqual(len(removed), 2, removed)
         self.assertIn("block_on_overflow = true", variant)
 
+    # Scenario: after two SIGKILLs one producer stores 9000 duplicates at the
+    # first kill while the fleet total stays under eight producers' bounds.
+    # Guarantees: the bound holds per kill and producer, so unused allowance
+    # of other producers or kills does not mask the excess.
+    def test_duplicates_are_bounded_per_kill_and_producer(self):
+        allowed = {"event": "engine_sigkill", "per_producer_per_event_lines": 8000,
+                   "rule": "test"}
+        events = [{"kind": "engine_sigkill"}, {"kind": "engine_sigkill"}]
+        within = [{"producer": 0, "lines": 4000, "copies": 2, "boots": [1]},
+                  {"producer": 0, "lines": 4000, "copies": 2, "boots": [1, 2]}]
+        self.assertTrue(ref.duplicate_check("engine_kill", within, 2, events, allowed)[0])
+        over = [{"producer": 3, "lines": 9000, "copies": 2, "boots": [0, 1]}]
+        self.assertFalse(ref.duplicate_check("engine_kill", over, 1, events, allowed)[0])
+        orphan = [{"producer": 0, "lines": 10, "copies": 2, "boots": [0]}]
+        self.assertFalse(ref.duplicate_check("engine_kill", orphan, 1, events, allowed)[0])
+        self.assertFalse(ref.duplicate_check("engine_kill", within, 3, events, allowed)[0])
+
+    # Scenario: a permanent rejection counted by boot 0 and a clean boot 1.
+    # Guarantees: buffer losses are summed over every boot, so a restart
+    # resetting the counter does not hide them.
+    def test_buffer_losses_are_summed_over_boots(self):
+        key = "processor.durable_buffer.bundles.resolved{outcome=permanently_rejected}"
+        samples = [{"boot": 0, "metrics": {key: 2.0}},
+                   {"boot": 1, "metrics": {key: 0.0,
+                                           "processor.durable_buffer.loss.bundles": 1.0}}]
+        loss, permanent = ref.buffer_losses(samples)
+        self.assertEqual(permanent, 2.0)
+        self.assertEqual(loss, {"processor.durable_buffer.loss.bundles": 1.0})
+
     # Scenario: the shipped River config is read for the duplicate bound.
     # Guarantees: the reference producer keeps its file-backed queue, two
     # consumers and 4000-record batches.
