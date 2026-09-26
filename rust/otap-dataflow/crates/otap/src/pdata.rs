@@ -527,11 +527,8 @@ impl Context {
     /// Takes and returns the authorization-derived context entries, if any.
     ///
     /// The counterpart of [`Context::take_transport_headers`], for a node that
-    /// must drop verified claims from a context it retains. A node that parks
-    /// a request across slow I/O and later returns the context in an ack or
-    /// nack should keep only the routing frames, so neither the inbound
-    /// credentials nor the claims derived from them stay resident for the
-    /// duration of that I/O.
+    /// parks a request across slow I/O and keeps only the routing frames of
+    /// the context it later acks or nacks.
     #[must_use]
     pub fn take_authorized_identity(&mut self) -> Option<AuthorizedIdentityEntries> {
         self.authorized_identity.take()
@@ -2810,8 +2807,7 @@ mod test {
     /// `take_transport_headers` and `take_authorized_identity`, and then still
     /// routes an ack on that context.
     /// Guarantees: both takes return what was captured and leave the context
-    /// empty of headers and claims, while the ack/nack routing frames survive,
-    /// so a retained context carries no inbound credentials.
+    /// empty of headers and claims, while the ack/nack routing frames survive.
     #[test]
     fn taking_headers_and_claims_clears_them_but_keeps_routing_frames() {
         let mut headers = TransportHeaders::new();

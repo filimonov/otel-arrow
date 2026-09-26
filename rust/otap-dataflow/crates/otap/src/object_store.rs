@@ -350,9 +350,7 @@ pub fn from_storage_type_with_retry(
 /// The bearer token provider `storage` needs, taken from a node's bound
 /// capabilities, or `None` for a backend that obtains no bearer token.
 ///
-/// Shared by every exporter that writes through an object store, so the
-/// capability requirement and its configuration error are the same for all
-/// of them.
+/// Shared by every exporter that writes through an object store.
 pub fn required_token_provider(
     storage: &StorageType,
     capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
