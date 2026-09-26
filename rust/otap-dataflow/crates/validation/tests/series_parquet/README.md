@@ -48,8 +48,7 @@ SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 0-7,16-23 \
   python3 -m crates.validation.tests.series_parquet.measure fault-preflight \
   --output-dir /tmp/series-fault-preflight
 
-# Verify one published evidence tree and list its files; --git-add also
-# stages them by exact file name.
+# Verify one published evidence tree and list its files by exact name.
 python3 -m crates.validation.tests.series_parquet.measure stage-results \
   --index ../../.measurement-artifacts/series-parquet-measurement/harness-contracts.json
 ```
@@ -465,10 +464,10 @@ the output directory belongs on a disk.
 
 The conditions:
 
-- `soak-strict`: 70 percent of the MinIO one-worker raised-slot ceiling, read
-  from the committed `capacity-minio.json`; 4096 receiver slots and the
-  shipped 15 s window, so blocks rotate on `max_block_bytes` and the
-  exporter's retained memory reaches its budget.
+- `soak-strict`: 70 percent of the MinIO one-worker raised-slot ceiling,
+  `soak.STRICT_CEILING` (187k records/s, from `capacity-minio.json`); 4096
+  receiver slots and the shipped 15 s window, so blocks rotate on
+  `max_block_bytes` and the exporter's retained memory reaches its budget.
 - `soak-buffered`: the shipped 128 slots and 15 s window, the durable
   buffer's write-ahead log in the run's engine directory on the host disk,
   at 70 percent of the one-worker buffered rate that `bracket` searches with
@@ -1390,20 +1389,22 @@ summary index lists its children in `run_files`, `baseline_files` and
 `child_indexes` with their exact names, sizes and SHA-256 hashes; it never
 replaces the per-run files. Runs publish into the ignored
 `.measurement-artifacts/series-parquet-measurement` unless the `report_dir`
-option names another directory; earlier evidence committed under
-`docs/superpowers/reports/series-parquet-measurement` is read by the baseline
-gate (a baseline in the run's own report directory wins) and by the soak's
-ceiling, which names its capacity index by path. Published run and
-baseline file names are immutable: a re-execution uses a new artifact
-directory rather than overwriting evidence. Raw profiles, Parquet files,
-packet captures, logs and ledgers stay outside tracked source and are
-referenced by path, hash, size and retention location.
+option names another directory. Nothing is committed: the campaign's
+evidence is archived in the main checkout's ignored
+`.measurement-artifacts/evidence/series-parquet-measurement/`
+(`measurement.EVIDENCE_DIR`, shared by worktrees), and git history at commit
+`75bf2b4a8` holds the original under
+`docs/superpowers/reports/series-parquet-measurement/`. The baseline gate
+reads baselines there (a baseline in the run's own report directory wins);
+contract tests that read an archived run skip when the archive is absent.
+Published run and baseline file names are immutable: a re-execution uses a
+new artifact directory rather than overwriting evidence. Raw profiles,
+Parquet files, packet captures, logs and ledgers stay outside tracked source
+and are referenced by path, hash, size and retention location.
 
 `stage-results` reads one published index, enumerates the tree recursively,
 rejects a path that is not a plain JSON file name in the report directory,
-rejects cycles, verifies every recorded hash and prints the files; with
-`--git-add` it hands them to `git add` by name in bounded batches. Nothing
-is ever staged by glob or by directory.
+rejects cycles, verifies every recorded hash and prints the files.
 
 ## Reproducing a measurement
 
@@ -1415,5 +1416,5 @@ is ever staged by glob or by directory.
    allocation and the build profile, or expect a new baseline rather than a
    comparison.
 3. Run the case with its recorded `config.requested` and `workload`.
-4. Compare the produced JSON against the committed baseline named in
+4. Compare the produced JSON against the archived baseline named in
    `baseline_decision`.

@@ -63,8 +63,7 @@ SOAKS = {
     "soak-strict": {
         "topology": "strict", "store": "minio", "core_count": 1,
         "receiver_capacity": capacity.RAISED_RECEIVER_CAPACITY,
-        "ceiling": {"index": "docs/superpowers/reports/series-parquet-measurement/"
-                             "capacity-minio.json", "cell": CELL, "variant": "raised"},
+        "ceiling": {"index": "capacity-minio", "cell": CELL, "variant": "raised"},
     },
     "soak-buffered": {
         "topology": "buffered", "store": "minio", "core_count": 1,
@@ -80,27 +79,14 @@ ZERO_METRICS = (
 )
 
 
-def published_ceiling(index, cell, variant) -> dict:
-    """A searched ceiling from a committed capacity index, and where it is.
-
-    `index` is the index's own path, absolute or relative to the repository,
-    never to the report directory runs publish into.
-    """
-    path = measurement.REPO_ROOT / index
-    document = json.loads(path.read_text(encoding="ascii"))
-    entry = document["capacity"]["cells"][cell][variant]
-    decision = entry["decision"]
-    if decision.get("kind") != "maximum" or entry.get("aggregate_status") != "passed":
-        raise AssertionError(
-            f"{index} {cell} {variant} is not a passed maximum: "
-            f"{decision.get('kind')} {entry.get('aggregate_status')}"
-        )
-    return {
-        "records_per_s": int(decision["sustainable_records_per_s"]),
-        "index": index, "cell": cell, "variant": variant,
-        "aggregate": entry["aggregate"],
-        "unsustainable_records_per_s": decision["unsustainable_records_per_s"],
-    }
+# The strict soak's ceiling: the searched maximum of capacity index
+# `capacity-minio`, cell minio-c1, variant raised (aggregate
+# capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f002).
+STRICT_CEILING = {
+    "records_per_s": 187_000, "unsustainable_records_per_s": 204_000,
+    "aggregate": "capacity-mixed-1k-hot-raised-strict-minio-c1-w1-f002",
+    **SOAKS["soak-strict"]["ceiling"],
+}
 
 
 def cohorts(rate, records_per_request, warmup_s, input_s) -> tuple:
@@ -1016,9 +1002,8 @@ def run_soak(output_dir, report_dir=None, **options) -> list:
         try:
             with capacity.cell_store(plan):
                 if "strict" in steps:
-                    ceiling = published_ceiling(**SOAKS["soak-strict"]["ceiling"])
-                    rate = int(SOAK_FRACTION * ceiling["records_per_s"])
-                    result = run_one_soak(plan, "soak-strict", rate, ceiling, output_dir,
+                    rate = int(SOAK_FRACTION * STRICT_CEILING["records_per_s"])
+                    result = run_one_soak(plan, "soak-strict", rate, STRICT_CEILING, output_dir,
                                           report_dir, input_s=input_s)
                     state.record("strict", result["run_id"])
                 if "bracket" in steps:

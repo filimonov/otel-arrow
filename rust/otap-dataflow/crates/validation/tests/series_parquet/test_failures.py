@@ -933,11 +933,14 @@ def passing_fault_result(**metrics):
 class FaultCaseContracts(unittest.TestCase):
     """How a fault case reads its evidence and decides its verdicts, without Docker."""
 
-    # Scenario: the committed http503 strict MinIO run, which left one
+    # Scenario: the archived http503 strict MinIO run, which left one
     # multipart upload no abort failure accounts for, is judged.
     # Guarantees: fault_check fails every result its published status fails,
     # here on the orphaned upload.
-    def test_fault_check_fails_the_committed_http503_run(self):
+    @unittest.skipUnless(
+        (measurement.EVIDENCE_DIR / "failure-s3-http503-strict-minio-c1-w5-r001.json").is_file(),
+        "the evidence archive is not present in this checkout")
+    def test_fault_check_fails_the_archived_http503_run(self):
         path = (measurement.EVIDENCE_DIR
                 / "failure-s3-http503-strict-minio-c1-w5-r001.json")
         result = json.loads(path.read_text(encoding="ascii"))
@@ -1211,7 +1214,7 @@ class FaultCaseContracts(unittest.TestCase):
     # artifact directory, never to the worktree's.
     def test_archives_default_to_the_main_checkout(self):
         self.assertEqual(faults.FAULT_ARCHIVE_DIR,
-                         faults.main_checkout() / ".measurement-artifacts" / "failure-s3")
+                         measurement.main_checkout() / ".measurement-artifacts" / "failure-s3")
         self.assertNotIn(".claude", faults.FAULT_ARCHIVE_DIR.parts)
 
     # Scenario: during an outage a flush failed 59.5 s after the stop and the

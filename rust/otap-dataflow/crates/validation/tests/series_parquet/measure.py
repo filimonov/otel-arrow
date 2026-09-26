@@ -10,7 +10,7 @@ Run it from the Rust workspace:
 Every producing subcommand writes one JSON document per run, publishes the
 complete evidence tree into the report directory and exits nonzero when the
 run failed. `stage-results` verifies an already published tree and lists its
-files by exact name; with `--git-add` it also stages them.
+files by exact name.
 """
 import argparse
 import collections
@@ -1313,10 +1313,9 @@ def build_parser() -> argparse.ArgumentParser:
     _ = stages.add_argument("--option", action="append", default=[])
     stage = sub.add_parser(
         "stage-results",
-        help="verify one published evidence tree; --git-add also stages it",
+        help="verify one published evidence tree and list its files",
     )
     _ = stage.add_argument("--index", required=True, type=Path)
-    _ = stage.add_argument("--git-add", action="store_true")
     attribution = sub.add_parser(
         "attribution",
         help="profile the real engine with perf and reconcile its CPU shares "
@@ -1464,8 +1463,7 @@ def main(argv=None) -> int:
                          f"{json.dumps(index['metrics'], sort_keys=True)}\n")
         return 0 if index["status"] == measurement.STATUS_PASSED else 1
     if arguments.command == "stage-results":
-        for path in measurement.stage_run_files(arguments.index,
-                                                git_add=arguments.git_add):
+        for path in measurement.stage_run_files(arguments.index):
             sys.stdout.write(f"{path}\n")
         return 0
     if arguments.command == "stages":

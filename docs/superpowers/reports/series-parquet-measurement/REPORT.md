@@ -4,11 +4,16 @@ Status: final, 2026-09-26.
 
 Every number below comes from a file named in its section. Paths are
 relative to the repository root. `FINDINGS.md` is
-`docs/superpowers/reports/series-parquet-measurement/FINDINGS.md`; the
-Task 12 reports are in `.superpowers/sdd/2026-09-22-series-parquet-measurement/`;
-the reference deployment results are the
-`docs/superpowers/reports/series-parquet-measurement/reference-alloy-*.json`
-files; the canary results are in `.measurement-artifacts/reference-alloy/canary/`.
+`docs/superpowers/reports/series-parquet-measurement/FINDINGS.md`. The
+evidence tree (run and index JSON, the task reports under `campaign/`) is
+archived in the main checkout's ignored
+`.measurement-artifacts/evidence/series-parquet-measurement/` and in git history at commit `75bf2b4a8` under
+`docs/superpowers/reports/series-parquet-measurement/`; a bare JSON file
+name or `campaign/` path below is relative to that tree. The Task 12 reports
+are in `.superpowers/sdd/2026-09-22-series-parquet-measurement/`; the
+reference deployment results are the `reference-alloy-*.json` files of the
+evidence tree; the canary results are in
+`.measurement-artifacts/reference-alloy/canary/`.
 A statement the cited files do not support is marked NOT VERIFIED.
 
 ## 1. Executive summary
@@ -84,7 +89,7 @@ against Azurite. AWS S3 and other S3-compatible stores are not tested
 ## 2. Throughput per core and write speed
 
 Sources: `FINDINGS.md` (Tasks 4, 5, slice S6),
-`docs/superpowers/reports/series-parquet-measurement/campaign/reports/task-5-report.md`.
+`campaign/reports/task-5-report.md`.
 
 Workload for capacity: 80/20 logs and metric points, 1 KiB bodies, 10k hot
 series, 1000 records per request, 256 connections, ZSTD; a winner needs 3 of
@@ -293,7 +298,7 @@ means churn r2 (section 6).
 | Reset CreateMultipartUpload (T11-F1) | nothing | the upload id is lost; the writer cannot abort it | 54 uploads in three Task 11 cells. Counted in `flush.abort_failures`; the bucket needs an AbortIncompleteMultipartUpload lifecycle rule. |
 | Store applies an abandoned request (T11-F3) | nothing | readers see one copy (same names and bytes) | RustFS applied a held completion 145.0 s after the hour ended, against the lateness bound L = 135 s. L holds only when the store drops abandoned requests (MinIO drops them after about 30 s). FORMAT.md states the exception; a compactor needs a seal marker (P2-1). |
 
-Status of the committed failure indexes. The Task 9-11 matrices ran before
+Status of the archived failure indexes. The Task 9-11 matrices ran before
 the Task 12 fixes; Task 16 reran every failing cell on the fixed build
 (`.superpowers/sdd/2026-09-22-series-parquet-measurement/task-16-report.md`):
 
@@ -566,11 +571,11 @@ unsupported kinds, a spatial aggregation processor, query-side indexes.
   3-11, 13 and slice S6, with their JSON indexes (`stages.json`,
   `attribution.json`, `capacity-*.json`, `memory-*.json`, `soak-*.json`,
   `failure-s3.json`, `failure-process.json`, `failure-network.json`).
-- `docs/superpowers/reports/series-parquet-measurement/campaign/reports/`:
+- `campaign/reports/` of the evidence tree:
   task reports 1-13.
 - `.superpowers/sdd/2026-09-22-series-parquet-measurement/task-12a-report.md`
   to `task-12f-report.md`; Task 12g in `progress.md` (no separate report).
-- `docs/superpowers/reports/series-parquet-measurement/reference-alloy-*.json`:
+- `reference-alloy-*.json` of the evidence tree:
   the 13 reference deployment cases and their reruns; raw archives in
   `.measurement-artifacts/reference-alloy/<case>-<store>-<epoch>/`.
 - `.measurement-artifacts/reference-alloy/canary/`: the chaos dry run, the

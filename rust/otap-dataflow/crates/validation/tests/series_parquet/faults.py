@@ -2601,19 +2601,9 @@ SHIPPED_S3_CONFIG = test_e2e.WORKSPACE / "configs/series-parquet-s3.yaml"
 OUTAGE_HOLD_MARGIN_S = 15
 
 
-def main_checkout() -> Path:
-    """The main checkout of this repository, also when running from a worktree."""
-    done = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        cwd=measurement.REPO_ROOT, capture_output=True, text=True, timeout=30, check=False)
-    common = Path(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip() else None
-    return common.parent if common is not None and common.name == ".git" \
-        else measurement.REPO_ROOT
-
-
 # Raw fault-case archives live in the main checkout, shared by its worktrees,
 # one directory per family.
-FAULT_ARCHIVE_ROOT = main_checkout() / ".measurement-artifacts"
+FAULT_ARCHIVE_ROOT = measurement.main_checkout() / ".measurement-artifacts"
 FAULT_ARCHIVE_DIR = FAULT_ARCHIVE_ROOT / "failure-s3"
 STORAGE_NACK_SENTENCE = "could not write to object storage ("
 # The compared metrics: memory and the correctness counts. Durations and

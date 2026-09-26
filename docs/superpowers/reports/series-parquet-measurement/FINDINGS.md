@@ -4,12 +4,15 @@ This document states what the measurement campaign has established so far
 about the series_parquet exporter. It covers Tasks 3, 4, 6 and 3i of the
 plan `docs/superpowers/plans/2026-09-22-series-parquet-measurement.md`, and
 lists what the other finished tasks established. Every number comes from a
-task report or from a committed JSON file in this directory.
+task report or from a JSON file of the evidence tree.
 
-All evidence paths below are relative to this directory,
-`docs/superpowers/reports/series-parquet-measurement/`, unless they start
-with `docs/`. The task reports are in `campaign/reports/`. The controller's
-rulings are in `campaign/ledger.md`.
+The evidence tree (run and index JSON, `flush-stall/`, and the task reports
+and ledger under `campaign/`) is archived in the main checkout's ignored
+`.measurement-artifacts/evidence/series-parquet-measurement/` and in git history at commit `75bf2b4a8` under
+`docs/superpowers/reports/series-parquet-measurement/`. Evidence paths below
+are relative to that tree unless they start with `docs/`. The task reports
+are in `campaign/reports/`. The controller's rulings are in
+`campaign/ledger.md`.
 
 ## The exporter
 

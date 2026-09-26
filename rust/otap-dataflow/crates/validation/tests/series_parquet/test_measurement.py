@@ -1655,7 +1655,7 @@ class BaselineContracts(unittest.TestCase):
 
 
 class PublicationContracts(unittest.TestCase):
-    """Evidence is published and staged by exact name or not at all."""
+    """Evidence is published and listed by exact name or not at all."""
 
     def tree(self):
         """An index naming one run file, one baseline and one child index."""
@@ -1691,37 +1691,23 @@ class PublicationContracts(unittest.TestCase):
         self.assertIn(".measurement-artifacts/", ignored.splitlines())
         self.assertEqual(measurement.resolve_report_dir(None), measurement.REPORT_DIR)
 
-    # Scenario: a published family index is checked without asking to stage it.
-    # Guarantees: the verified tree is returned by exact path and nothing is
-    # handed to `git add`.
-    def test_verifying_a_tree_does_not_stage_it(self):
+    # Scenario: a published family index is verified.
+    # Guarantees: every enumerated index, child, run and baseline file is
+    # returned by its exact absolute path in the report directory, and
+    # nothing is handed to git.
+    def test_verifying_a_tree_lists_every_file_by_path(self):
         directory, index, names = self.tree()
         with mock.patch.object(measurement.subprocess, "run") as run:
             paths = measurement.stage_run_files(index)
         run.assert_not_called()
         self.assertEqual({Path(path).name for path in paths}, names)
-
-    # Scenario: a complete family index is staged for a commit.
-    # Guarantees: every enumerated index, child, run and baseline file is
-    # handed to `git add` by its exact path, never by a glob or a directory.
-    def test_every_enumerated_path_is_staged(self):
-        directory, index, names = self.tree()
-        with mock.patch.object(measurement.subprocess, "run") as run:
-            run.return_value = subprocess.CompletedProcess([], 0, "", "")
-            measurement.stage_run_files(index, git_add=True)
-        staged = set()
-        for call in run.call_args_list:
-            arguments = call.args[0]
-            self.assertEqual(arguments[:3], ["git", "add", "--"])
-            staged.update(Path(item).name for item in arguments[3:])
-            for item in arguments[3:]:
-                self.assertTrue(Path(item).is_absolute(), item)
-                self.assertEqual(Path(item).parent, directory.resolve())
-        self.assertEqual(staged, names)
+        for path in paths:
+            self.assertTrue(Path(path).is_absolute(), path)
+            self.assertEqual(Path(path).parent, directory.resolve())
 
     # Scenario: an index records a hash that no longer matches its run file.
     # Guarantees: a tree whose evidence changed after it was summarised is
-    # refused rather than staged.
+    # refused rather than listed.
     def test_changed_evidence_is_refused(self):
         directory, index, _ = self.tree()
         run = directory / "t-strict-local-c1-w15-r001.json"
@@ -1731,7 +1717,7 @@ class PublicationContracts(unittest.TestCase):
 
     # Scenario: an index names a path outside the report directory.
     # Guarantees: a path escape, a separator and a non-JSON name are all
-    # rejected before anything is read or staged.
+    # rejected before anything is read or listed.
     def test_path_escape_is_rejected(self):
         for name in (
             "../secret.json",

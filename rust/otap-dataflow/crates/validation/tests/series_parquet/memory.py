@@ -2619,7 +2619,7 @@ def memory_family(topology, output_dir, report_dir=None, *, pairs=PAIRS,
         observations=observations,
     )
     # The diagnostics are children of the index, so their evidence is
-    # published and staged with it; they are never part of the stability
+    # published with it; they are never part of the stability
     # rule or the baseline, which the aggregate applies to the pairs alone.
     return measure.write_index(
         case, output_dir, report_dir, children + diagnostic_children + [aggregate],

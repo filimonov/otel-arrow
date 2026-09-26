@@ -54,9 +54,22 @@ SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[6]
 REPORT_DIR_RELATIVE = ".measurement-artifacts/series-parquet-measurement"
 REPORT_DIR = REPO_ROOT / REPORT_DIR_RELATIVE
-# Evidence committed by earlier runs, read by the baseline gate and the soak's
-# ceiling; nothing publishes here unless a run names it as its report_dir.
-EVIDENCE_DIR = REPO_ROOT / "docs/superpowers/reports/series-parquet-measurement"
+
+
+def main_checkout() -> Path:
+    """The main checkout of this repository, also when running from a worktree."""
+    done = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=30, check=False)
+    common = Path(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip() else None
+    return common.parent if common is not None and common.name == ".git" else REPO_ROOT
+
+
+# Evidence of earlier runs, read by the baseline gate; archived in the main
+# checkout's ignored `.measurement-artifacts/`, shared by its worktrees. Git
+# history at commit 75bf2b4a8 holds the original under
+# `docs/superpowers/reports/series-parquet-measurement/`.
+EVIDENCE_DIR = main_checkout() / ".measurement-artifacts/evidence/series-parquet-measurement"
 
 
 def resolve_report_dir(value) -> Path:
@@ -169,7 +182,7 @@ DRAIN_EMPTY_EPOCHS = 3
 LIVENESS_GAUGE = "memory.budget"
 
 # A run file name is a plain file name in the report directory. Nothing else
-# may be staged or published by name.
+# may be published by name.
 SAFE_JSON_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
 
 # Commands whose presence means somebody is compiling or building an image
@@ -5065,38 +5078,11 @@ def archive_published_index(index_name, output_dir, report_dir=None):
     return file_entry(child)
 
 
-# git accepts long argument lists, but a bounded batch keeps the command
-# reproducible and its failure attributable to a known set of files.
-STAGE_BATCH = 100
-
-
-def stage_run_files(index_path, *, git_add=False) -> list:
-    """Verify one published evidence tree and return its files by exact path;
-    with `git_add`, also stage them by name.
+def stage_run_files(index_path) -> list:
+    """Verify one published evidence tree and return its files by exact path.
 
     The tree is read from the report directory, every child is validated as a
-    plain JSON file name in that directory, and hashes are checked. Nothing is
-    staged by glob or directory, so a commit can never pick up a file the
-    index did not enumerate.
+    plain JSON file name in that directory, and hashes are checked.
     """
     index_path = Path(index_path).resolve()
-    # git runs from the repository root, so every path is made absolute
-    # rather than left relative to whichever directory the caller invoked
-    # the command from.
-    paths = [str(path.resolve()) for _name, path in enumerate_tree(index_path)]
-    if not git_add:
-        return paths
-    for start in range(0, len(paths), STAGE_BATCH):
-        batch = paths[start:start + STAGE_BATCH]
-        outcome = subprocess.run(
-            ["git", "add", "--", *batch],
-            check=False,
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-        )
-        if outcome.returncode != 0:
-            raise AssertionError(
-                f"git add failed for {batch}: {outcome.stderr.strip()}"
-            )
-    return paths
+    return [str(path.resolve()) for _name, path in enumerate_tree(index_path)]

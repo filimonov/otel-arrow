@@ -7,6 +7,7 @@ The analysis contracts start nothing. The PR-tier soaks run a real engine
 against a MinIO container for about a minute each. The thirty-minute soaks
 need `SERIES_MEASURE_LONG=1`.
 """
+import json
 import math
 import os
 import unittest
@@ -58,20 +59,24 @@ def soak_result(rows, *, topology="strict", **metrics) -> dict:
 
 
 class SoakAnalysis(unittest.TestCase):
-    # Scenario: the strict soak reads its searched ceiling while the report
-    # directory is somewhere else entirely.
-    # Guarantees: the committed capacity index is found by its own explicit
-    # path, so the soak rate does not depend on where runs publish.
-    def test_the_published_ceiling_is_read_from_its_explicit_path(self):
-        ceiling = dict(soak.SOAKS["soak-strict"]["ceiling"])
-        original = measurement.REPORT_DIR
-        measurement.REPORT_DIR = measurement.REPO_ROOT / "no-such-report-dir"
-        try:
-            found = soak.published_ceiling(**ceiling)
-        finally:
-            measurement.REPORT_DIR = original
-        self.assertGreater(found["records_per_s"], 0)
-        self.assertTrue((measurement.REPO_ROOT / ceiling["index"]).is_file())
+    # Scenario: the strict soak's inlined ceiling is compared with the archived
+    # capacity index it was taken from.
+    # Guarantees: the inlined rates equal that index's passed maximum for the
+    # named cell and variant.
+    @unittest.skipUnless((measurement.EVIDENCE_DIR / "capacity-minio.json").is_file(),
+                         "the evidence archive is not present in this checkout")
+    def test_the_inlined_ceiling_matches_the_archived_index(self):
+        ceiling = soak.STRICT_CEILING
+        path = measurement.EVIDENCE_DIR / f"{ceiling['index']}.json"
+        document = json.loads(path.read_text(encoding="ascii"))
+        entry = document["capacity"]["cells"][ceiling["cell"]][ceiling["variant"]]
+        self.assertEqual(entry["aggregate_status"], "passed")
+        self.assertEqual(entry["aggregate"], ceiling["aggregate"])
+        self.assertEqual(entry["decision"]["kind"], "maximum")
+        self.assertEqual(entry["decision"]["sustainable_records_per_s"],
+                         ceiling["records_per_s"])
+        self.assertEqual(entry["decision"]["unsustainable_records_per_s"],
+                         ceiling["unsustainable_records_per_s"])
 
     # Scenario: a soak's RSS rises by half over thirty minutes where its
     # matching baseline stayed flat.
