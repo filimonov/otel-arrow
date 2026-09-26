@@ -18,6 +18,9 @@ the lake back with DuckDB:
   SIGKILLed while the exporter holds every acknowledged request in its open
   block, or while it writes that block to a paused MinIO; after a restart on
   the same buffer directory every request is stored at least once.
+- `Minio.test_alert_families_exposed`: the buffered configuration provoked
+  into the failures the deployment example's alert rules watch, and its
+  `check.py` run on the engine's scrape.
 - `AlloyConfigs`: `alloy validate` of the Alloy image checks
   `configs/series-parquet.alloy` and `configs/series-parquet-strict.alloy`
   at the stability level they document.
