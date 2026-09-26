@@ -946,7 +946,8 @@ pub fn remove_transport_optimized_encodings(
                             actual: struct_ids.data_type().clone(),
                         })?;
 
-                    let new_struct_ids = remove_delta_encoding_from_column(struct_ids);
+                    let new_struct_ids =
+                        remove_delta_encoding_from_column(struct_ids, struct_id_path)?;
                     replace_column(
                         struct_id_path,
                         None,
