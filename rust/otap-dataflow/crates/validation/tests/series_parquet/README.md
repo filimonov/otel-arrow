@@ -672,7 +672,10 @@ without rerunning anything or changing a run file: the advanced index
 records every changed verdict and every check the evidence cannot decide
 (`fault_rejudgement`), each child's re-judged failed checks, and keeps the
 index it replaces as a child. Process cases are re-judged from their run
-files alone (`rejudge_process_checks`).
+files alone (`rejudge_process_checks`), except the T10-F2 WAL window of a
+buffered run that failed `duplicates_explained`: it needs the archived ledger
+and the next boot's engine log, and without them the check is reported as
+not re-judged.
 
 #### Process restart and hard kill
 

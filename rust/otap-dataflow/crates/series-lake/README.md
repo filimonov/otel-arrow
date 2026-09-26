@@ -45,9 +45,11 @@ a zero `sum` read as null, traces) are listed in
 - A failed or cancelled write aborts its multipart upload within
   `upload.abort_timeout`. After a completion was sent, a HEAD first tells
   whether the object exists: one that exists counts as written unless the
-  write was cancelled, and the upload is aborted either way, an abort answered
-  `NotFound` showing this completion committed it
-  (`FlushReport::probed_commits`). A HEAD that fails otherwise leaves the
+  write was cancelled, and the upload is aborted either way. The object is
+  this completion's commit (`FlushReport::probed_commits`) on the block's
+  first write attempt whatever the abort answers, since nothing else can have
+  written its frozen names, and on a retry when the abort is answered
+  `NotFound`. A HEAD that fails otherwise leaves the
   upload alone and reports it as a possible orphan. A completion still in
   flight may be applied after an abort. An abort that fails or
   times out, and a CreateMultipartUpload that fails without a definite answer

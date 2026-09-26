@@ -101,8 +101,11 @@ descriptor cache.
 A multipart completion whose response is lost may still have been applied.
 The writer then sends one HEAD for that object before any abort. An object
 that exists holds the block's frozen bytes, so the write goes on and the block
-is acknowledged; the upload is then aborted, and only an abort answered
-`NotFound` shows this completion committed it, which counts a late commit
+is acknowledged; the upload is then aborted. On the block's first write
+attempt nothing else can have written its frozen names, so the found object is
+this completion's commit whatever the abort answers (MinIO accepts the abort
+of a completed upload); on a retry only an abort answered `NotFound` shows
+this completion committed it. Either counts a late commit
 (`flush.late_commits{outcome=acknowledged}`, INFO
 `series_parquet.flush.cleanup`). An object that
 does not exist is aborted and the completion's own error decides the retry. A
@@ -653,7 +656,7 @@ collections is a counter.
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
-| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It counts failed attempts, not uploads: the object store client retries a CreateMultipartUpload up to `retry.max_retries` times inside one attempt and the store may create an upload on each, so one counted failure can stand for up to `retry.max_retries + 1` incomplete uploads; a CreateMultipartUpload answered with a 5xx is counted like one without an answer. |
+| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It counts failed attempts, not uploads: the object store client retries a CreateMultipartUpload up to `retry.max_retries` times inside one attempt and the store may create an upload on each, so one counted failure can stand for up to `retry.max_retries + 1` incomplete uploads; a CreateMultipartUpload answered with a 5xx is counted like one without an answer. Creations retried inside an attempt that then succeeds are not counted at all; only the `AbortIncompleteMultipartUpload` lifecycle rule guarantees no incomplete upload is kept. |
 | `flush.late_commits` | `{flush}` | Flush cleanups that found objects the write had not confirmed, by `outcome`: `stored` (a failed flush whose every object exists; its nacked rows may be stored twice), `partial` (only some objects exist), `unknown` (a HEAD failed or did not finish by the cleanup cutoff), `acknowledged` (a lost completion response the probe found committed: on the block's first attempt, or on a retry whose abort was answered `NotFound`; the block was acknowledged). |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
@@ -814,7 +817,12 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   a creation can fail without an answer that tells whether the upload exists,
   and a completion still in flight may be applied after the abort;
   `flush.abort_failures` counts the uploads the writer knows it may have left
-  behind and is the alert signal. It counts failed write attempts, not
+  behind and is the alert signal, but not a complete count: a
+  CreateMultipartUpload the client retries inside an attempt that then
+  succeeds can leave uploads (one per try the store received and answered
+  without its response reaching the writer) that nothing counts. The
+  lifecycle rule is the only guarantee against incomplete uploads. It counts
+  failed write attempts, not
   uploads: within one attempt the object store client retries a
   CreateMultipartUpload up to `retry.max_retries` times, and each try the
   store received may create an upload whose id never reaches the writer, so

@@ -8,7 +8,7 @@ change_type: bug_fix
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: series_parquet now aborts the multipart upload of a write that fails while finishing its file, and flush.abort_failures counts every upload a failed attempt may leave behind.
+note: series_parquet now aborts the multipart upload of a write that fails while finishing its file, and flush.abort_failures counts each failed attempt that may leave up to retry.max_retries + 1 uploads.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 # PLACEHOLDER: no PR exists for this branch yet. Replace 4128 with the real PR number before merge.
@@ -20,7 +20,7 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  Counted per failed attempt, even if a retry succeeds; one count can stand
-  for up to retry.max_retries + 1 uploads, since the client retries a
-  creation inside the attempt. The WARN event names the key. An
-  AbortIncompleteMultipartUpload lifecycle rule is required; alert on it.
+  One count per failed attempt, up to retry.max_retries + 1 uploads each;
+  creations retried inside an attempt that then succeeds are not counted.
+  The WARN event names the key. Only an AbortIncompleteMultipartUpload
+  lifecycle rule guarantees no incomplete upload is kept.
