@@ -7,7 +7,8 @@ relative to the repository root. `FINDINGS.md` is
 `docs/superpowers/reports/series-parquet-measurement/FINDINGS.md`. The
 evidence tree (run and index JSON, the task reports under `campaign/`) is
 archived in the main checkout's ignored
-`.measurement-artifacts/evidence/series-parquet-measurement/` and in git history at commit `75bf2b4a8` under
+`.measurement-artifacts/evidence/series-parquet-measurement/` and in git
+history at commit `75bf2b4a8` under
 `docs/superpowers/reports/series-parquet-measurement/`; a bare JSON file
 name or `campaign/` path below is relative to that tree. The Task 12 reports
 are in `.superpowers/sdd/2026-09-22-series-parquet-measurement/`; the

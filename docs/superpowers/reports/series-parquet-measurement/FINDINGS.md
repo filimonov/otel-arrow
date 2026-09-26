@@ -8,7 +8,8 @@ task report or from a JSON file of the evidence tree.
 
 The evidence tree (run and index JSON, `flush-stall/`, and the task reports
 and ledger under `campaign/`) is archived in the main checkout's ignored
-`.measurement-artifacts/evidence/series-parquet-measurement/` and in git history at commit `75bf2b4a8` under
+`.measurement-artifacts/evidence/series-parquet-measurement/` and in git
+history at commit `75bf2b4a8` under
 `docs/superpowers/reports/series-parquet-measurement/`. Evidence paths below
 are relative to that tree unless they start with `docs/`. The task reports
 are in `campaign/reports/`. The controller's rulings are in
@@ -1334,6 +1335,7 @@ byte gain), a SmallVec for row cells.
   the retry budget; a storage nack is a fixed sentence and a class; flush
   cleanup, failure class and per-attempt retries are reported; a late commit
   is detected by bounded HEAD probes on the frozen names.
+
 ## Open questions
 
 | Question | Current state | Resolved in |
