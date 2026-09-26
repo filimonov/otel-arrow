@@ -14,6 +14,8 @@
 //! into a container for unrelated runtime objects.
 
 use otel_arrow_dfe_pdata_codec::{CodecService, CodecServiceBuilder, DecodePolicy, RegistryError};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// Runtime-owned services shared by every effect handler in one pipeline.
 ///
@@ -22,6 +24,24 @@ use otel_arrow_dfe_pdata_codec::{CodecService, CodecServiceBuilder, DecodePolicy
 #[derive(Clone)]
 pub struct PipelineRuntimeServices {
     codecs: CodecService,
+    shutdown_deadline: PipelineShutdownDeadline,
+}
+
+/// The deadline of the pipeline's graceful shutdown, latched once by the
+/// runtime-control manager when it accepts the shutdown.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PipelineShutdownDeadline(Arc<OnceLock<Instant>>);
+
+impl PipelineShutdownDeadline {
+    /// Latches `deadline`; a later call keeps the first one.
+    pub(crate) fn latch(&self, deadline: Instant) {
+        let _ = self.0.set(deadline);
+    }
+
+    /// The latched deadline, `None` until the pipeline shuts down.
+    pub(crate) fn get(&self) -> Option<Instant> {
+        self.0.get().copied()
+    }
 }
 
 impl PipelineRuntimeServices {
@@ -31,7 +51,13 @@ impl PipelineRuntimeServices {
             codecs: CodecServiceBuilder::from_global_registry()?
                 .with_decode_policy(decode_policy)
                 .build(),
+            shutdown_deadline: PipelineShutdownDeadline::default(),
         })
+    }
+
+    /// The pipeline's graceful-shutdown deadline latch.
+    pub(crate) const fn shutdown_deadline(&self) -> &PipelineShutdownDeadline {
+        &self.shutdown_deadline
     }
 
     /// Pipeline-local codec access.

@@ -560,7 +560,24 @@ deadline is reached.
 As receivers exit and drop their `pdata` senders, downstream channels drain and
 close progressively toward exporters. Once a downstream input is fully drained
 or closed, the corresponding consumer receives `Shutdown` and exits its run
-loop.
+loop. When the input closes before the consumer has read its own `Shutdown`,
+the control messages already queued come first, that `Shutdown` included; if it
+is not queued yet (the control manager buffers sends to a full control
+channel), the inbox releases a `Shutdown` with the pipeline's shutdown
+deadline.
+
+A processor that declares `shutdown_completions` in its runtime requirements
+can report through `awaits_completions()` that it still expects the `Ack` or
+`Nack` of pdata it has sent downstream. After it has handled `Shutdown`, the
+engine closes its outputs so the nodes downstream can finish, delivers `Ack`
+and `Nack` until the processor expects none or the declared `final_reserve`
+before the shutdown deadline begins, and then delivers `Shutdown` once more as
+the final message. A further `Shutdown` with an earlier deadline moves the
+deadline, and the final `Shutdown` carries it; one with a later deadline
+changes nothing. If handling a completion fails, the wait ends, the final
+`Shutdown` is still delivered, and the run loop returns the error. Without the
+declaration the control receiver closes when `Shutdown` is released, as for
+any other processor.
 
 If the shutdown deadline expires, receivers may force-resolve remaining
 receiver-local waiters and the runtime control manager forces the remaining

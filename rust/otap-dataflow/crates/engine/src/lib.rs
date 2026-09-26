@@ -104,7 +104,9 @@ pub mod topic;
 pub mod topology;
 pub mod wiring_contract;
 pub use node_local_scheduler::{WakeupError, WakeupSetOutcome};
-pub use processor::{LocalWakeupRequirements, ProcessorRuntimeRequirements};
+pub use processor::{
+    LocalWakeupRequirements, ProcessorRuntimeRequirements, ShutdownCompletionRequirements,
+};
 pub use route_admission::RouteAdmission;
 
 fn resolve_admission_binding(
