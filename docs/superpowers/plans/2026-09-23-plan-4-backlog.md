@@ -481,6 +481,17 @@ buffered 144-152k bound by the WAL device).
   README states the three rules.
   Source: docs/superpowers/parallel.md (user note 2026-09-25).
 
+- **P3-15 Count CreateMultipartUpload retries that leave uploads (F-A2).**
+  Why: object_store retries a Create inside one write attempt; when a later
+  try succeeds, the uploads created by the failed tries are never counted
+  (Task 16: 57 incomplete uploads against 54 allowed on reset buffered MinIO),
+  and when the attempt fails one count stands for up to max_retries + 1
+  uploads. The lifecycle rule is today the only guarantee.
+  Done when: every failed Create try is counted (a hook per try, or Create
+  issued without internal retries by the exporter), or the metric is renamed to
+  say it is a lower bound; the reset cells pass with an exact rule.
+  Source: Task 16 (F-A, F-A2).
+
 ## Deferred features
 
 - **Live access to buffered data.** Why: `tail -f` and buffer inspection for
