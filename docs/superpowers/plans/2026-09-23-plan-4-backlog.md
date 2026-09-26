@@ -492,6 +492,34 @@ buffered 144-152k bound by the WAL device).
   say it is a lower bound; the reset cells pass with an exact rule.
   Source: Task 16 (F-A, F-A2).
 
+- **P3-16 Minor findings of the clean-branch review (2026-09-26).**
+  Why: none breaks delivery; each is a correctness or operability edge left
+  for later. Done when each is fixed or explicitly declined:
+  `unsigned_payload` default differs between the parquet and series_parquet
+  exporters for the same `storage.s3` section and nothing logs the effective
+  mode (keep signed when invalid certificates are allowed); `Retry-After: 1`
+  without jitter synchronizes OTLP/HTTP retries, and HTTP bodies still say
+  RESOURCE_EXHAUSTED where gRPC says UNAVAILABLE; the OTAP per-batch
+  memory-pressure status is still RESOURCE_EXHAUSTED; a write that commits
+  while `abandon` cancels it is nacked with no late-commit record; metrics
+  freeze during the shutdown drain (forward CollectTelemetry); the
+  shutdown-completion protocol needs two agreeing opt-ins and exposes
+  engine-only methods publicly, and `ShutdownCompletionRequirements::default()`
+  has a zero reserve; series-lake models config errors as request refusals,
+  keeps BlockFull/TooManyRequests in the permanent enum, exposes every module
+  and carries an unused second serde layer; FORMAT.md overstates series_id
+  comparability across writers and leaves metadata encodings and the boot_id
+  form unstated; a metric with no data oneof refuses the whole request; the
+  memory oversubscription warning ignores cgroup limits; refusal WARNs carry
+  no producer identity and late-commit log outcomes differ from metric
+  labels; the hot-series path derives identity before consulting the cache;
+  Alloy configs are validated by nothing and ship `tls { insecure = true }`;
+  the jemalloc test is compiled out of the --all-features job and startup
+  prints the allocator twice; durable_buffer shutdown mixes engine-clock and
+  std Instant; the Python lock and the workflow's system Python are unpinned;
+  validator invariants are enforced only by comments.
+  Source: clean-branch review 2026-09-26, "Minor issues".
+
 ## Deferred features
 
 - **Live access to buffered data.** Why: `tail -f` and buffer inspection for
