@@ -853,7 +853,9 @@ arming until both routes answer again.
   Just before the release a direct HEAD of the target key must answer
   NotFound (any other failure proves nothing), and NGINX must log a
   CompleteMultipartUpload of the key begun while armed and before the
-  release and ended at or after it (`held_completions`), whose upload id the
+  release and either ended at or after it, or held at least 10 s and closed
+  without a 2xx by a store that drops a request it has not received within
+  its own timeout (MinIO, 30.25 s) (`held_completions`), whose upload id the
   store still listed as open before the release or the writer aborted (an
   AbortMultipartUpload of that id answered 2xx): the writer HEADs the name
   after its completion fails and, finding nothing, aborts the upload, so the

@@ -2068,14 +2068,20 @@ class NetworkCaseContracts(unittest.TestCase):
             # The held completion of u1: begun at 900 (armed 890), ended after
             # the release at 999.
             entry("complete_multipart_upload", 999.4, 99.4, "404", "u1"),
-            # Ended before the release: not held across it.
-            entry("complete_multipart_upload", 930.0, 30.0, "502", "u9"),
+            # Answered at once before the release (a part or store failure):
+            # not held.
+            entry("complete_multipart_upload", 930.0, 0.02, "502", "u9"),
+            # Held 30.25 s, then the store dropped it (MinIO): held.
+            entry("complete_multipart_upload", 960.25, 30.25, "502", "u5"),
+            # Held long but answered 2xx before the release: not a hold.
+            entry("complete_multipart_upload", 960.0, 30.0, "200", "u6"),
             # Begun before arming.
             entry("complete_multipart_upload", 1000.0, 120.0, "404", "u8")]
         aborts = faults.writer_aborts(requests, key)
         self.assertEqual(aborts, [{"msec": "930.0", "status": "204", "upload_id": "u1"}])
         held_requests = faults.held_completions(requests, key, 890.0, 999.0)
-        self.assertEqual([entry["upload_id"] for entry in held_requests], ["u1"])
+        self.assertEqual([(entry["upload_id"], entry["held_until"]) for entry in held_requests],
+                         [("u1", "release"), ("u5", "store dropped it")])
         target = {"key": key, "window_end_unix_s": 900.0, "cutoff_unix_s": 990.0}
         held = network_seen(target=target, object_before_release=None,
                             head_before_release="absent", uploads_before_release=[],
@@ -2087,6 +2093,11 @@ class NetworkCaseContracts(unittest.TestCase):
         # An unrelated completion held across the release, another upload id.
         self.assertFalse(faults._held_multipart_met(None, dict(
             held, held_completions=[dict(held_requests[0], upload_id="u7")])))
+        # The MinIO shape: the held completion of an aborted upload the store
+        # dropped before the release.
+        minio = [{"msec": "900.0", "status": "204", "upload_id": "u5"}]
+        self.assertTrue(faults._held_multipart_met(None, dict(
+            held, aborts_before_release=minio, held_completions=held_requests[1:])))
         # A HEAD that failed without NotFound proves no absence.
         self.assertFalse(faults._held_multipart_met(None, dict(
             held, head_before_release="unknown: 403")))

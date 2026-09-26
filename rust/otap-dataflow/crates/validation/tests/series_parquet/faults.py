@@ -7039,10 +7039,19 @@ def writer_aborts(requests, key) -> list:
             and str(entry.get("status") or "").startswith("2")]
 
 
+# A completion held by the proxy for at least this long was held: an answered
+# CompleteMultipartUpload takes milliseconds, and the held one waits for the
+# release or for the store to drop the connection (MinIO: 30.25 s).
+HELD_COMPLETION_MIN_S = 10.0
+
+
 def held_completions(requests, key, armed_unix_s, release_unix_s) -> list:
-    """The CompleteMultipartUpload requests of `key` the proxy held across the
-    release: begun (their end less their request time, as NGINX logs them)
-    after arming and before the release, and ended at or after it."""
+    """The CompleteMultipartUpload requests of `key` the proxy held: begun (their
+    end less their request time, as NGINX logs them) after arming and before
+    the release, and either still open at the release (ended at or after it:
+    the store answers once the proxy lets it through, on RustFS) or held at
+    least `HELD_COMPLETION_MIN_S` and then closed without a 2xx (a store with a
+    request timeout of its own drops the held connection first, on MinIO)."""
     found = []
     for entry in requests:
         if entry.get("operation") != "complete_multipart_upload" or not _of_key(entry, key):
@@ -7052,9 +7061,13 @@ def held_completions(requests, key, armed_unix_s, release_unix_s) -> list:
             start = end - float(entry.get("request_time") or 0.0)
         except (KeyError, ValueError):
             continue
-        if armed_unix_s <= start < release_unix_s <= end:
+        answered = str(entry.get("status") or "").startswith("2")
+        across = release_unix_s <= end
+        dropped = end < release_unix_s and end - start >= HELD_COMPLETION_MIN_S and not answered
+        if armed_unix_s <= start < release_unix_s and (across or dropped):
             found.append({"upload_id": upload_id_of(entry), "start_unix_s": round(start, 3),
-                          "end_unix_s": end, "status": entry.get("status")})
+                          "end_unix_s": end, "status": entry.get("status"),
+                          "held_until": "release" if across else "store dropped it"})
     return found
 
 
