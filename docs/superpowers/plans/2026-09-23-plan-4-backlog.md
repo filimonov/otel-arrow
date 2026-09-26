@@ -520,6 +520,28 @@ buffered 144-152k bound by the WAL device).
   validator invariants are enforced only by comments.
   Source: clean-branch review 2026-09-26, "Minor issues".
 
+- **P0-8 Admit force-drained data during a graceful shutdown behind durable_buffer.**
+  Why: bundles in the buffer's open segment or drained after Shutdown begins
+  are refused by series_parquet (NodeShutdown) and replayed on the next start,
+  so every graceful restart with fresh data defers that tail (nothing lost or
+  duplicated). Done when the exporter admits force-drained bundles within the
+  deadline and the buffered restart E2E stores them before exit.
+  Source: clean-branch fix round 2026-09-26 (E2E finding).
+- **P3-17 Leftovers of the clean-branch fix round (2026-09-26).**
+  Why and done when, each: progress persists in the completion phase are
+  ack-driven only (add a timer so a kill cannot replay acks recorded less than
+  poll_interval after the last persist); stalled durable_buffer storage threads
+  are never reclaimed (bound or reclaim them); the engine's non-zero
+  `final_reserve` path has no user after durable_buffer took a zero reserve
+  (keep or remove); pdata `remove_delta_encoding_from_column`
+  (otap/transform.rs ~136) adds without an overflow check (crafted OTAP ids
+  panic in debug, wrap in release: upstream fix); upstream READMEs list
+  metric names with underscores where the code emits dots; prep APIs
+  (RepeatedSingular::Refuse, OverTls, StorageType::kind,
+  deserialize_required_usize, count_utf8_repairs) land before their first user
+  and series-lake/exporter stay one commit each (finer split at PR time).
+  Source: clean-branch fix round report.
+
 ## Deferred features
 
 - **Live access to buffered data.** Why: `tail -f` and buffer inspection for
