@@ -732,9 +732,8 @@ mod tests {
 
     /// Scenario: An OTLP logs request, well framed, whose record carries bytes that are not
     /// UTF-8 in its string body and its severity text.
-    /// Guarantees: It passes the framing check and is refused by the JSON encoder, as before the
-    /// framing check existed: a permanent nack as invalid pdata, of unspecified cause, and no
-    /// signal file.
+    /// Guarantees: It passes the framing check and is refused by the JSON encoder: a permanent
+    /// nack as invalid pdata, of unspecified cause, and no signal file.
     #[test]
     fn invalid_utf8_is_refused_by_the_json_encoder() {
         let len_field = |field: u32, payload: &[u8]| {

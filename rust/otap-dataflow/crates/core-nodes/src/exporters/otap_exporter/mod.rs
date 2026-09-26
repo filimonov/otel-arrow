@@ -3123,9 +3123,7 @@ mod tests {
     /// holds one.
     /// Guarantees: each is nacked permanently as `Refused`, naming the
     /// malformed body and the damaged message and carrying the request's
-    /// original bytes, before any stream is used, so a damaged request is
-    /// never converted into an empty or partial batch and acknowledged as
-    /// exported.
+    /// original bytes, before any stream is used.
     #[test]
     fn a_malformed_otlp_body_is_refused() {
         let deep = logs_request(b"INFO", &[0x0a, 0x05, b'a']);

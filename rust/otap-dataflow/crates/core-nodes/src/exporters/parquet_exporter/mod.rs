@@ -1076,9 +1076,9 @@ mod test {
     }
 
     /// Scenario: OTLP logs requests whose framing is broken where the lazy
-    /// conversion would still read rows -- a field tag with no length after
+    /// conversion would still read rows (a field tag with no length after
     /// the only `ResourceLogs`, an attribute value declaring two bytes more
-    /// than it holds, a one-byte nested `ResourceLogs` (`0a 01 0a`) -- then
+    /// than it holds, a one-byte nested `ResourceLogs` `0a 01 0a`), then
     /// the well-formed request of three records.
     /// Guarantees: the damaged requests are dropped rather than written as
     /// empty or partial batches, the exporter keeps running, and exactly the
