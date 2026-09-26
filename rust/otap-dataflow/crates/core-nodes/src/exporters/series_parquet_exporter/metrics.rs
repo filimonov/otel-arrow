@@ -68,6 +68,9 @@ pub(super) struct WorkerMetrics {
     /// Multipart uploads a failed write attempt may have left to the bucket's
     /// lifecycle rule: the abort failed or timed out, the creation got no
     /// definite answer, or the write did not unwind by the cleanup cutoff.
+    /// Counted once per failed attempt: the client retries a creation up to
+    /// `retry.max_retries` times inside one attempt, so one count can stand
+    /// for up to `retry.max_retries + 1` incomplete uploads.
     #[metric(name = "flush.abort_failures", unit = "{upload}")]
     pub flush_abort_failures: Counter<u64>,
     /// Requests acknowledged as durable.

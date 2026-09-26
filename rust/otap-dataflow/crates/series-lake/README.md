@@ -56,8 +56,11 @@ a zero `sum` read as null, traces) are listed in
   leftovers are reclaimed by a bucket lifecycle rule, not by this crate. A
   creation failure is classified from `object_store::Error`, where a 5xx
   answer and a lost response are both `Generic`, so both count as possible
-  orphans. The upload id is not reported: `MultipartUpload` does not expose
-  it.
+  orphans. It is reported once per failed write, but the client retries the
+  creation up to `retry.max_retries` times inside it and each try may leave an
+  upload, so one report can stand for up to `retry.max_retries + 1`
+  incomplete uploads; the lifecycle rule is required. The upload id is not
+  reported: `MultipartUpload` does not expose it.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload. Extraction charges every values row

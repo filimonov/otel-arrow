@@ -549,8 +549,10 @@ The writer needs `s3:PutObject` (single PUT and every multipart step),
 `s3:AbortMultipartUpload`, `s3:GetObject` (the HEAD probes after a lost
 response) and `s3:ListBucket` on the bucket, without which S3 answers a HEAD of
 a missing key with 403 rather than 404 and the probe cannot conclude. It never
-deletes. Add a lifecycle rule that aborts incomplete multipart uploads
-(`AbortIncompleteMultipartUpload`, for example after one day); see "Limits".
+deletes. A lifecycle rule that aborts incomplete multipart uploads
+(`AbortIncompleteMultipartUpload`, for example after one day) is required, not
+optional: the writer cannot abort an upload whose creation response it never
+received; see "Limits".
 
 ### Alerts
 
@@ -651,8 +653,8 @@ collections is a counter.
 | `flush.duration` | `s` | Wall time one flush took, from rotation to completion. |
 | `flush.retries` | `{attempt}` | Write attempts beyond the first of their flush, counted as each starts. |
 | `flush.cancelled` | `{flush}` | Flushes that failed because the write was cancelled. |
-| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It can over-count: a CreateMultipartUpload answered with a 5xx is reported like one without an answer. |
-| `flush.late_commits` | `{flush}` | Flush cleanups that found objects the write had not confirmed, by `outcome`: `stored` (a failed flush whose every object exists; its nacked rows may be stored twice), `partial` (only some objects exist), `unknown` (a HEAD failed or did not finish by the cleanup cutoff), `acknowledged` (a lost completion response whose abort was answered `NotFound`; the block was acknowledged). |
+| `flush.abort_failures` | `{upload}` | Multipart uploads a failed write attempt, retried or not, may have left to the bucket's lifecycle rule: the abort failed or timed out, CreateMultipartUpload got no definite answer, a HEAD could not tell whether a lost completion was applied, or the write did not unwind by the cleanup cutoff. Alert on it; each has a WARN `abort_failed` cleanup event naming the key. It counts failed attempts, not uploads: the object store client retries a CreateMultipartUpload up to `retry.max_retries` times inside one attempt and the store may create an upload on each, so one counted failure can stand for up to `retry.max_retries + 1` incomplete uploads; a CreateMultipartUpload answered with a 5xx is counted like one without an answer. |
+| `flush.late_commits` | `{flush}` | Flush cleanups that found objects the write had not confirmed, by `outcome`: `stored` (a failed flush whose every object exists; its nacked rows may be stored twice), `partial` (only some objects exist), `unknown` (a HEAD failed or did not finish by the cleanup cutoff), `acknowledged` (a lost completion response the probe found committed: on the block's first attempt, or on a retry whose abort was answered `NotFound`; the block was acknowledged). |
 | `acks` | `{message}` | Requests acknowledged as durable. |
 | `notify.queued` | `{request}` | Decided completions still waiting to be delivered. |
 | `notify.token_size` | `By` | Bytes the undelivered completions retain. |
@@ -805,15 +807,22 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   attribute key and value is charged as it is read: one longer than
   `ingress.max_row_bytes` refuses the request, and decoded attributes count
   against the same `ingress.max_extracted_bytes` as the extracted rows.
-- Configure a bucket lifecycle rule for incomplete multipart uploads (S3
-  `AbortIncompleteMultipartUpload`, for example after one day). The writer
+- A bucket lifecycle rule for incomplete multipart uploads (S3
+  `AbortIncompleteMultipartUpload`, for example after one day) is required.
+  The writer
   aborts the upload of every failed or cancelled write, but an abort can fail,
   a creation can fail without an answer that tells whether the upload exists,
   and a completion still in flight may be applied after the abort;
   `flush.abort_failures` counts the uploads the writer knows it may have left
-  behind and is the alert signal. It counts conservatively: a
-  CreateMultipartUpload that failed with a 5xx answer is counted like one
-  that got no answer, since the client reports both as the same error. The
+  behind and is the alert signal. It counts failed write attempts, not
+  uploads: within one attempt the object store client retries a
+  CreateMultipartUpload up to `retry.max_retries` times, and each try the
+  store received may create an upload whose id never reaches the writer, so
+  one counted failure can stand for up to `retry.max_retries + 1` incomplete
+  uploads (measured: 54 uploads behind 9 counted failures with
+  `max_retries: 5`). A CreateMultipartUpload that failed with a 5xx answer is
+  counted like one that got no answer, since the client reports both as the
+  same error. The
   WARN event names the object key but not the upload id, which the object
   store client does not expose; list the uploads of that key to find it. On a
   versioned bucket, each retry that reached the store leaves a noncurrent
