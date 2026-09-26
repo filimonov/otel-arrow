@@ -2700,8 +2700,7 @@ mod tests {
     /// Scenario: a processor that does not declare shutdown completions is
     /// shut down through the engine's run loop.
     /// Guarantees: its control channel is closed while it handles Shutdown,
-    /// as before the completion phase existed, and it receives exactly one
-    /// Shutdown.
+    /// and it receives exactly one Shutdown.
     #[test]
     fn a_default_processor_keeps_no_control_receiver_after_shutdown() {
         let local_tasks = tokio::task::LocalSet::new();

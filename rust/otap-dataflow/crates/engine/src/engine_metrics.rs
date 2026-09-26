@@ -61,10 +61,8 @@ struct AccountingState {
 /// Series exporter memory accounting shared by the workers and the monitor.
 ///
 /// Worker registration, a worker's accounted bytes, and the monitor's decision
-/// to register, materialize or drop the residual all move through one guard.
-/// That is what makes "a residual is reported only while a worker is
-/// registered" a fact rather than a race: a worker cannot appear or vanish
-/// between the monitor reading the worker count and it taking the snapshot.
+/// to register, materialize or drop the residual all move through one guard,
+/// so a residual is reported only while a worker is registered.
 ///
 /// The guard is held across the registry calls the decision implies, so the
 /// lock order is always accounting then registry; nothing takes the registry
@@ -86,10 +84,8 @@ impl SeriesAccounting {
         Arc::clone(&PROCESS_ACCOUNTING)
     }
 
-    /// An accounting instance of its own, isolated from the process-wide one.
-    ///
-    /// Tests use this so that one test's workers and reporter ownership are
-    /// invisible to every other test, instead of contending for global state.
+    /// An accounting instance of its own, isolated from the process-wide one,
+    /// so one test's workers and reporter ownership are invisible to others.
     #[must_use]
     pub fn isolated() -> Arc<Self> {
         Arc::new(Self::default())
@@ -97,10 +93,8 @@ impl SeriesAccounting {
 
     /// Takes the guard, tolerating poisoning from a panic elsewhere.
     ///
-    /// Every writer restores a consistent state before it can unwind -- the
-    /// counters are plain numbers updated in one critical section -- so a
-    /// poisoned guard carries no torn value and refusing to hand it out would
-    /// only turn one failure into a cascade of unrelated ones.
+    /// The counters are plain numbers updated in one critical section, so a
+    /// poisoned guard carries no torn value.
     fn lock(&self) -> MutexGuard<'_, AccountingState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -229,12 +223,9 @@ pub struct EngineMetricsMonitor {
     series_entity: EntityKey,
     /// The accounting this monitor reads the worker count and accounted bytes from.
     accounting: Arc<SeriesAccounting>,
-    /// Test hook run at the one instant that matters: after the worker count
-    /// has been checked and before the residual snapshot is materialized.
-    ///
-    /// In the fixed code that instant is inside the accounting guard, so a
-    /// test can drive a worker drop from here and observe that it cannot
-    /// interleave. It receives the state the monitor is deciding on.
+    /// Test hook run after the worker count has been checked and before the
+    /// residual snapshot is materialized, inside the accounting guard. It
+    /// receives the state the monitor is deciding on.
     #[cfg(test)]
     on_materialize: Option<Box<dyn FnMut(usize, u64)>>,
 }
@@ -260,12 +251,8 @@ impl EngineMetricsMonitor {
         )
     }
 
-    /// Creates a monitor reading a specific series accounting instance.
-    ///
-    /// Production passes [`SeriesAccounting::process`], which is what
-    /// [`new`](Self::new) does. Tests pass [`SeriesAccounting::isolated`] so
-    /// that their workers and reporter ownership cannot be seen by, or steal
-    /// ownership from, any other test in the same binary.
+    /// Creates a monitor reading a specific series accounting instance;
+    /// [`new`](Self::new) passes [`SeriesAccounting::process`].
     #[must_use]
     pub fn with_accounting(
         registry: TelemetryRegistryHandle,
@@ -482,12 +469,8 @@ mod tests {
     use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// A monitor over accounting nothing else in this binary can see.
-    ///
-    /// Every monitor test uses this. The residual registration and its
-    /// ownership flag are process state in production, so a test that reached
-    /// for the process instance could steal ownership from, or have it stolen
-    /// by, any other test the harness happens to run beside it.
+    /// A monitor over accounting nothing else in this binary can see; see
+    /// `SeriesAccounting::isolated`.
     struct Harness {
         monitor: EngineMetricsMonitor,
         receiver: flume::Receiver<MetricSetSnapshot>,
@@ -535,10 +518,8 @@ mod tests {
     fn engine_metrics_reports_nonzero_rss() {
         let mut harness = harness();
 
-        // `memory_stats` reads /proc, which can fail transiently under a loaded
-        // machine and then reports zero. Retrying a few times keeps the
-        // guarantee -- the monitor does report real RSS -- without failing the
-        // suite on one unlucky read.
+        // `memory_stats` reads /proc, which can fail transiently on a loaded
+        // machine and then reports zero, so a few reads are allowed.
         let mut rss = 0;
         for _ in 0..5 {
             harness.monitor.update();
