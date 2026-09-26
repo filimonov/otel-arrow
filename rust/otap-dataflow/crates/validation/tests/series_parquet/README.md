@@ -846,11 +846,14 @@ arming until both routes answer again.
   10 s past the later of the writer's cleanup cutoff and the lateness bound
   after the block's window end (after its partition hour's end for an hour's
   last blocks), and the case records whether and when the object appears.
-  Just before the release there must be no object and the target's upload
-  either still open or aborted by the writer (an AbortMultipartUpload of its
-  key answered 2xx): the writer HEADs the name after its completion fails
-  and, finding nothing, aborts the upload, so the released completion has
-  nothing left to complete. The
+  Just before the release a direct HEAD of the target key must answer
+  NotFound (any other failure proves nothing), and NGINX must log a
+  CompleteMultipartUpload of the key begun while armed and before the
+  release and ended at or after it (`held_completions`), whose upload id the
+  store still listed as open before the release or the writer aborted (an
+  AbortMultipartUpload of that id answered 2xx): the writer HEADs the name
+  after its completion fails and, finding nothing, aborts the upload, so the
+  released completion has nothing left to complete. The
   store itself drops a connection whose request has not arrived within its
   request timeout, if it has one, so a completion held longer never lands.
 

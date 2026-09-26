@@ -1974,7 +1974,10 @@ class NetworkCaseContracts(unittest.TestCase):
         self.assertFalse(faults._dropped_multipart_met(None, dict(
             dropped, target=dict(target, failure=None))))
         held = network_seen(target=target, object_before_release=None,
+                            head_before_release="absent",
                             uploads_before_release=[{"upload_id": "u"}],
+                            held_completions=[{"upload_id": "u", "start_unix_s": 950.0,
+                                               "end_unix_s": 999.2}],
                             release_at_unix_s=999.0, released_unix_s=999.1)
         self.assertTrue(faults._held_multipart_met(None, held))
         self.assertFalse(faults._held_multipart_met(None, dict(held, released_unix_s=998.0)))
@@ -2005,30 +2008,81 @@ class NetworkCaseContracts(unittest.TestCase):
 
     # Scenario: on the fixed build the writer HEADs the name after its held
     # completion timed out, finds nothing and aborts the upload (204), so no
-    # upload of the target is open when the case releases the completion.
-    # Guarantees: the held condition accepts an upload the writer aborted in
-    # place of one still open, and still refuses an object before the release,
-    # an early release, or a target with neither an open upload nor an abort.
-    def test_held_completion_accepts_the_writers_abort(self):
+    # upload of the target is open when the case releases the completion; the
+    # held CompleteMultipartUpload itself ends only after the release.
+    # Guarantees: the held condition accepts that abort in place of an open
+    # upload only together with a completion of the same upload id begun while
+    # armed and before the release and ended at or after it, and a HEAD
+    # answered NotFound before the release. A part failure or an unrelated
+    # completion failure followed by a normal abort is not a held completion,
+    # and a HEAD that failed otherwise (403, 503) proves no absence.
+    def test_held_completion_needs_the_held_request_and_a_confirmed_absence(self):
         key = "otel/v=1/signal=logs/dataset=values/part-t-w-b-00000004.parquet"
+
+        def entry(operation, end, took, status, upload, suffix=""):
+            return {"msec": str(end), "request_time": str(took), "operation": operation,
+                    "status": status, "uri": f"/b/{key}{suffix}",
+                    "request_uri": f"/b/{key}{suffix}?uploadId={upload}"}
         requests = [
-            {"msec": "1.0", "operation": "abort_multipart_upload", "status": "204",
-             "uri": f"/b/{key}?uploadId=u1"},
-            {"msec": "2.0", "operation": "abort_multipart_upload", "status": "503",
-             "uri": f"/b/{key}?uploadId=u2"},
-            {"msec": "3.0", "operation": "abort_multipart_upload", "status": "204",
-             "uri": f"/b/{key}-other?uploadId=u3"}]
+            entry("abort_multipart_upload", 930.0, 0.001, "204", "u1"),
+            entry("abort_multipart_upload", 960.0, 0.001, "503", "u2"),
+            entry("abort_multipart_upload", 961.0, 0.001, "204", "u3", "-other"),
+            # The held completion of u1: begun at 900 (armed 890), ended after
+            # the release at 999.
+            entry("complete_multipart_upload", 999.4, 99.4, "404", "u1"),
+            # Ended before the release: not held across it.
+            entry("complete_multipart_upload", 930.0, 30.0, "502", "u9"),
+            # Begun before arming.
+            entry("complete_multipart_upload", 1000.0, 120.0, "404", "u8")]
         aborts = faults.writer_aborts(requests, key)
-        self.assertEqual(aborts, [{"msec": "1.0", "status": "204"}])
+        self.assertEqual(aborts, [{"msec": "930.0", "status": "204", "upload_id": "u1"}])
+        held_requests = faults.held_completions(requests, key, 890.0, 999.0)
+        self.assertEqual([entry["upload_id"] for entry in held_requests], ["u1"])
         target = {"key": key, "window_end_unix_s": 900.0, "cutoff_unix_s": 990.0}
         held = network_seen(target=target, object_before_release=None,
-                            uploads_before_release=[], aborts_before_release=aborts,
+                            head_before_release="absent", uploads_before_release=[],
+                            aborts_before_release=aborts, held_completions=held_requests,
                             release_at_unix_s=999.0, released_unix_s=999.1)
         self.assertTrue(faults._held_multipart_met(None, held))
+        # A part failure followed by a normal abort: no held completion.
+        self.assertFalse(faults._held_multipart_met(None, dict(held, held_completions=[])))
+        # An unrelated completion held across the release, another upload id.
+        self.assertFalse(faults._held_multipart_met(None, dict(
+            held, held_completions=[dict(held_requests[0], upload_id="u7")])))
+        # A HEAD that failed without NotFound proves no absence.
+        self.assertFalse(faults._held_multipart_met(None, dict(
+            held, head_before_release="unknown: 403")))
         self.assertFalse(faults._held_multipart_met(None, dict(held, aborts_before_release=[])))
         self.assertFalse(faults._held_multipart_met(None, dict(
-            held, object_before_release={"size_bytes": 1})))
+            held, object_before_release={"size_bytes": 1}, head_before_release="found")))
         self.assertFalse(faults._held_multipart_met(None, dict(held, released_unix_s=998.0)))
+
+    # Scenario: the case HEADs the target key directly in the store.
+    # Guarantees: only a NotFound answer is an absence; any other failure is
+    # unknown and a found object carries its size.
+    def test_head_state_names_only_not_found_as_absent(self):
+        class Client:
+            def __init__(self, error):
+                self.error = error
+
+            def head_object(self, Bucket, Key):  # noqa: N803 - boto3's names
+                if self.error is None:
+                    return {"ContentLength": 3, "ETag": '"e"',
+                            "LastModified": datetime.datetime.fromtimestamp(
+                                5, tz=datetime.timezone.utc)}
+                raise faults.ClientError({"Error": {"Code": self.error},
+                                          "ResponseMetadata": {}}, "HeadObject")
+        case = faults.MultipartCompletionCase.__new__(faults.MultipartCompletionCase)
+        states = {}
+        for error in ("404", "NoSuchKey", "403", "503", None):
+            case.store = mock.Mock(bucket="b", client=Client(error))
+            states[error] = case.head_state("k")
+        self.assertEqual(states["404"], ("absent", None))
+        self.assertEqual(states["NoSuchKey"], ("absent", None))
+        self.assertEqual(states["403"], ("unknown: 403", None))
+        self.assertEqual(states["503"], ("unknown: 503", None))
+        self.assertEqual(states[None][0], "found")
+        self.assertEqual(states[None][1]["size_bytes"], 3)
 
     # Scenario: NGINX logs the exporter's completions through the completion
     # front: a series completion and a values one answered 200 before

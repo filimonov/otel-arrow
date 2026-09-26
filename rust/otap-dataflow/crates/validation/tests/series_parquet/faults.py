@@ -6795,16 +6795,27 @@ class MultipartCompletionCase(NetworkCase):
             description="the target block's failed attempt and its values upload")
         release = self.release_at(target)
         time.sleep(max(0.0, release - time.time()))
-        before = self.head(target["key"])
+        head_state, before = self.head_state(target["key"])
         uploads = orphaned_uploads(self.store)
         aborts = writer_aborts(self.route_requests(), target["key"])
         self.rig.recover()
         self.released_unix_s = time.time()
+        # NGINX logs a held completion when it ends, just after the release.
+        try:
+            held = measurement.wait_until(
+                lambda: held_completions(self.route_requests(), target["key"],
+                                         armed["unix_s"], self.released_unix_s),
+                bool, deadline_ns=time.monotonic_ns() + RELEASE_VISIBLE_S * 10**9,
+                description="the held completion's end after the release")
+        except AssertionError:
+            held = []
         evidence = self.observe_condition()
         # The target as it stood before the release; afterwards its upload may be
         # complete and not yet listed.
         evidence["target_after_release"] = evidence.get("target")
         evidence.update({"target": target, "object_before_release": before,
+                         "head_before_release": head_state,
+                         "held_completions": held or [],
                          "release_at_unix_s": release,
                          "released_unix_s": self.released_unix_s,
                          "uploads_before_release": [upload for upload in uploads
@@ -6832,12 +6843,22 @@ class MultipartCompletionCase(NetworkCase):
 
     def head(self, key):
         """The store's own HEAD of `key`, read directly, or None."""
+        return self.head_state(key)[1]
+
+    def head_state(self, key):
+        """The store's own HEAD of `key`, read directly: ("found", object),
+        ("absent", None) only for a NotFound answer, or ("unknown: <code>", None)
+        for any other failure, which proves nothing about the object."""
         try:
             answer = self.store.client.head_object(Bucket=self.store.bucket, Key=key)
-        except ClientError:
-            return None
-        return {"size_bytes": answer["ContentLength"], "etag": answer.get("ETag"),
-                "last_modified_unix_s": answer["LastModified"].timestamp()}
+        except ClientError as error:
+            code = str((error.response.get("Error") or {}).get("Code")
+                       or error.response.get("ResponseMetadata", {}).get("HTTPStatusCode"))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return "absent", None
+            return f"unknown: {code}", None
+        return "found", {"size_bytes": answer["ContentLength"], "etag": answer.get("ETag"),
+                         "last_modified_unix_s": answer["LastModified"].timestamp()}
 
     def remove_fault(self, controls, store_cores):
         """Remove the fault; a held completion is watched until its object appears."""
@@ -6971,25 +6992,67 @@ def _dropped_multipart_met(case, seen) -> bool:
     return target.get("deadline_unix_s") is None and target.get("commit") is not None
 
 
+def upload_id_of(entry):
+    """The `uploadId` an NGINX log entry's request URI names, or None."""
+    query = (entry.get("request_uri") or "").partition("?")[2]
+    ids = urllib.parse.parse_qs(query, keep_blank_values=True).get("uploadId")
+    return ids[0] if ids else None
+
+
+def _of_key(entry, key) -> bool:
+    return (entry.get("uri") or "").partition("?")[0].endswith("/" + key)
+
+
 def writer_aborts(requests, key) -> list:
-    """The AbortMultipartUpload requests of `key` the store answered 2xx."""
-    return [{field: entry.get(field) for field in ("msec", "status")}
+    """The AbortMultipartUpload requests of `key` the store answered 2xx, each
+    with the upload id it aborted."""
+    return [{"msec": entry.get("msec"), "status": entry.get("status"),
+             "upload_id": upload_id_of(entry)}
             for entry in requests
-            if entry.get("operation") == "abort_multipart_upload"
-            and (entry.get("uri") or "").partition("?")[0].endswith("/" + key)
+            if entry.get("operation") == "abort_multipart_upload" and _of_key(entry, key)
             and str(entry.get("status") or "").startswith("2")]
 
 
+def held_completions(requests, key, armed_unix_s, release_unix_s) -> list:
+    """The CompleteMultipartUpload requests of `key` the proxy held across the
+    release: begun (their end less their request time, as NGINX logs them)
+    after arming and before the release, and ended at or after it."""
+    found = []
+    for entry in requests:
+        if entry.get("operation") != "complete_multipart_upload" or not _of_key(entry, key):
+            continue
+        try:
+            end = float(entry["msec"])
+            start = end - float(entry.get("request_time") or 0.0)
+        except (KeyError, ValueError):
+            continue
+        if armed_unix_s <= start < release_unix_s <= end:
+            found.append({"upload_id": upload_id_of(entry), "start_unix_s": round(start, 3),
+                          "end_unix_s": end, "status": entry.get("status")})
+    return found
+
+
 def _held_multipart_met(case, seen) -> bool:
-    """The target's completion was held: no object just before the release,
-    which came at its instant (`release_at`), and the target's upload either
-    still open or aborted by the writer. Since the lost-completion probe
-    (Task 12a) the writer HEADs the name after its completion fails and, finding
-    nothing, aborts the upload, so a held completion released later has no
-    upload left to complete; before it, the writer left the upload open."""
+    """The target's completion was held and released at its instant.
+
+    It needs: a confirmed absence of the object just before the release (a HEAD
+    answered NotFound, `head_before_release == "absent"`; any other answer
+    decides nothing); the release at its instant (`release_at`); and a held
+    CompleteMultipartUpload of the target key (`held_completions`: begun while
+    armed and before the release, ended at or after it) whose upload id is one
+    the store still listed as open before the release or one the writer
+    aborted. Since the lost-completion probe (Task 12a) the writer HEADs the
+    name after its completion fails and, finding nothing, aborts that upload,
+    so the released completion finds nothing to complete; before it, the
+    writer left the upload open."""
     target = seen.get("target") or {}
-    return (bool(target.get("key")) and seen.get("object_before_release") is None
-            and bool(seen.get("uploads_before_release") or seen.get("aborts_before_release"))
+    uploads = {upload.get("upload_id") for upload in seen.get("uploads_before_release") or []}
+    aborted = {abort.get("upload_id") for abort in seen.get("aborts_before_release") or []}
+    known = (uploads | aborted) - {None}
+    held = [entry for entry in seen.get("held_completions") or []
+            if entry.get("upload_id") in known]
+    return (bool(target.get("key")) and seen.get("head_before_release") == "absent"
+            and seen.get("object_before_release") is None and bool(held)
             and target.get("window_end_unix_s") is not None
             and seen.get("released_unix_s", 0) >= seen.get("release_at_unix_s", float("inf")))
 
