@@ -22,6 +22,23 @@ use std::collections::VecDeque;
 #[cfg(all(not(windows), feature = "jemalloc"))]
 use tikv_jemalloc_ctl::{epoch, stats};
 
+/// Whether jemalloc started with its background purging thread.
+///
+/// `None` when this build has no jemalloc to ask, or jemalloc does not
+/// answer; the answer is jemalloc's own `opt.background_thread`, fixed at
+/// startup from its compiled-in options and `MALLOC_CONF`.
+#[must_use]
+pub fn jemalloc_background_thread() -> Option<bool> {
+    #[cfg(all(not(windows), feature = "jemalloc"))]
+    {
+        tikv_jemalloc_ctl::opt::background_thread::read().ok()
+    }
+    #[cfg(not(all(not(windows), feature = "jemalloc")))]
+    {
+        None
+    }
+}
+
 /// Values at or above this threshold are treated as "no limit set" by the
 /// cgroup memory controller (e.g. `memory.max = max` parses to `u64::MAX`).
 const CGROUP_UNLIMITED_THRESHOLD_BYTES: u64 = 1 << 60;
