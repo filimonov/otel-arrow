@@ -1617,6 +1617,33 @@ class ProcessCaseContracts(unittest.TestCase):
                 self.assertEqual(verdict[0]["rejudged"], expected, verdict)
         self.assertIsNone(faults.rejudge_wal_window(result, "/nonexistent")[0]["rejudged"])
 
+    # Scenario: an index of two runs, one recorded failed that the current
+    # rules pass, one recorded passed that they fail.
+    # Guarantees: the advanced index's child checks, pass count and status
+    # follow the re-judged verdicts; the recorded ones stay beside them.
+    def test_a_rejudged_index_follows_the_rejudged_verdicts(self):
+        def index(statuses):
+            return {"status": measurement.STATUS_FAILED,
+                    "metrics": {"children_count": 2, "children_passed_count": 1},
+                    "checks": [measurement.check(f"child_{run}", measurement.CHECK_HARD, status,
+                                                 f"{run}: {status}")
+                               for run, status in statuses.items()],
+                    "children": [{"run_id": run, "status": status}
+                                 for run, status in statuses.items()]}
+        passed, failed = measurement.STATUS_PASSED, measurement.STATUS_FAILED
+        advanced = faults.apply_rejudged_status(index({"a": failed, "b": passed}),
+                                                {"a": [], "b": []})
+        self.assertEqual(advanced["status"], passed)
+        self.assertEqual(advanced["metrics"]["children_passed_count"], 2)
+        self.assertEqual(advanced["metrics"]["recorded_children_passed_count"], 1)
+        self.assertEqual([child["status"] for child in advanced["children"]], [failed, passed])
+        self.assertEqual([child["rejudged_status"] for child in advanced["children"]],
+                         [passed, passed])
+        advanced = faults.apply_rejudged_status(index({"a": failed, "b": passed}),
+                                                {"a": [], "b": ["fault_observed"]})
+        self.assertEqual(advanced["status"], failed)
+        self.assertEqual(advanced["metrics"]["children_passed_count"], 1)
+
     # Scenario: stored process runs are re-judged: a graceful stop past the
     # cleanup cutoff, a multipart gate on logged bytes only, an expected
     # upload that vanished, and a clean kill_upload run.

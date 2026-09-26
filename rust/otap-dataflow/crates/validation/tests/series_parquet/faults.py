@@ -7582,6 +7582,41 @@ def rejudge_fault_checks(result, archive_dir) -> list:
     return verdicts
 
 
+def apply_rejudged_status(index, rejudged_failed) -> dict:
+    """An index whose children, child checks, pass count and status follow the
+    re-judged verdicts (`rejudged_failed`: failed checks by run id).
+
+    Each child keeps its recorded `status` and `failed_checks` and gains
+    `rejudged_failed_checks` and `rejudged_status`; the index keeps its
+    recorded pass count as `recorded_children_passed_count`. A run file never
+    changes, so its own status stays as recorded.
+    """
+    rejudged_status = {}
+    for child in index.get("children", []):
+        failed = rejudged_failed.get(child["run_id"])
+        child["rejudged_failed_checks"] = failed
+        status = child["status"] if failed is None else (
+            measurement.STATUS_FAILED if failed else measurement.STATUS_PASSED)
+        child["rejudged_status"] = rejudged_status[child["run_id"]] = status
+    for check in index.get("checks", []):
+        run_id = check["name"].removeprefix("child_")
+        if check["name"].startswith("child_") and run_id in rejudged_status:
+            if rejudged_status[run_id] != check["status"]:
+                check["detail"] = (f"{check.get('detail')}; re-judged "
+                                   f"{rejudged_status[run_id]}")
+            check["status"] = rejudged_status[run_id]
+    metrics = index.setdefault("metrics", {})
+    if "children_passed_count" in metrics:
+        metrics.setdefault("recorded_children_passed_count", metrics["children_passed_count"])
+        metrics["children_passed_count"] = sum(
+            1 for status in rejudged_status.values() if status == measurement.STATUS_PASSED)
+    index["status"] = (measurement.STATUS_PASSED
+                       if all(check["status"] == measurement.STATUS_PASSED
+                              for check in index.get("checks", []))
+                       else measurement.STATUS_FAILED)
+    return index
+
+
 def rejudge_failure_index(index_name, output_dir, archive_dir=FAULT_ARCHIVE_DIR,
                           report_dir=None) -> dict:
     """Advance a published fault-case index to the current fault checks.
@@ -7619,9 +7654,7 @@ def rejudge_failure_index(index_name, output_dir, archive_dir=FAULT_ARCHIVE_DIR,
             if change["run_id"] == result["run_id"]:
                 change["run_status_recorded"] = result["status"]
                 change["run_status_rejudged"] = status
-    advanced = json.loads(json.dumps(index))
-    for child in advanced.get("children", []):
-        child["rejudged_failed_checks"] = rejudged_failed.get(child["run_id"])
+    advanced = apply_rejudged_status(json.loads(json.dumps(index)), rejudged_failed)
     advanced["fault_rejudgement"] = {"rules": FAULT_REJUDGE_RULES,
                                      "verdict_changes": changes, "not_rejudged": unjudged}
     for name in {entry["name"] for entry in advanced.get("baseline_files", [])}:
