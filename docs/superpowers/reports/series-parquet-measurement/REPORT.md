@@ -1,7 +1,6 @@
 # series_parquet exporter: final report of the measurement campaign
 
-Status: DRAFT, 2026-09-26. Two sections wait for runs in progress; they are
-marked PLACEHOLDER.
+Status: final, 2026-09-26.
 
 Every number below comes from a file named in its section. Paths are
 relative to the repository root. `FINDINGS.md` is
@@ -49,8 +48,9 @@ Its contract, stated in the exporter README ("Deploying with Alloy"):
 
 - No acknowledged record was lost in any judged case: the Task 9-11 failure
   matrices (56 cells, both topologies, MinIO and RustFS), the 13 reference
-  deployment cases, the two 30-minute soaks, the chaos dry run and the 4-hour
-  chaos soak (576M lines, 30 fault events). Two independent readers (DuckDB
+  deployment cases, the two 30-minute soaks, the chaos dry run, the two 4-hour
+  chaos soaks (576M lines each, 30 and 33 fault events) and the cache-pressure
+  run (108M lines). Two independent readers (DuckDB
   and clickhouse-local) agree in every case. The one losing case is the
   control with Alloy's in-memory queue, which lost 40,949 lines Alloy had
   read but the engine had not acknowledged.
@@ -76,8 +76,9 @@ against Azurite. AWS S3 and other S3-compatible stores are not tested
   latency at a 120 s window, mid-window kill replay at both windows, NACK
   backoff timing, lost completion followed by SIGKILL, and a kill within
   100 ms of a block commit.
-- Canary ready: the churn profile passed a 4-hour chaos soak on MinIO
-  (section 6). Pending the mixed-profile run.
+- Canary ready: met. The churn and the mixed profile each passed a 4-hour
+  chaos soak on MinIO, and a 45-minute run held the series cache at its limit
+  with sustained evictions (section 6).
 - The spec section 9.8 amendment is not applied yet.
 
 ## 2. Throughput per core and write speed
@@ -293,17 +294,40 @@ means churn r2 (section 6).
 | Store applies an abandoned request (T11-F3) | nothing | readers see one copy (same names and bytes) | RustFS applied a held completion 145.0 s after the hour ended, against the lateness bound L = 135 s. L holds only when the store drops abandoned requests (MinIO drops them after about 30 s). FORMAT.md states the exception; a compactor needs a seal marker (P2-1). |
 
 Status of the committed failure indexes. The Task 9-11 matrices ran before
-the Task 12 fixes and were not rerun afterwards:
+the Task 12 fixes; Task 16 reran every failing cell on the fixed build
+(`.superpowers/sdd/2026-09-22-series-parquet-measurement/task-16-report.md`):
 
-| Index | Cells passed | Failures |
-| --- | --- | --- |
-| `failure-s3.json` | 7 of 12 | F1 orphans |
-| `failure-process.json` | 9 of 12 | T10-F1 replay after graceful restart |
-| `failure-network.json` | 14 of 32 | F1 and T11-F1 orphans, T11-F2, T11-F3, four one-sample RSS band excursions |
+| Index | Before Task 12 | After (Task 16) | Still failing |
+| --- | --- | --- | --- |
+| `failure-s3.json` | 7 of 12 | 12 of 12 | none |
+| `failure-process.json` | 9 of 12 | 12 of 12 | none |
+| `failure-network.json` | 14 of 32 | 29 of 32 | reset buffered MinIO (F-A2), two one-sample RSS band excursions (dns_timeout buffered) |
 
-Each product defect has a red/green regression test (section 7). The
-reference deployment and the canary ran on builds with those fixes:
-0 incomplete uploads, 0 buffer loss, 0 SIGTERM duplicates.
+What the reruns show:
+
+- F1: every phase-2 failure is aborted or counted; one counted failure can
+  stand for up to `retry.max_retries + 1` uploads, because object_store retries
+  CreateMultipartUpload inside one attempt (54 uploads behind 9 counts).
+- F-A2 (open, documented): a Create retried inside an attempt that then
+  succeeds leaves uploads the exporter never counts (57 against 54 allowed).
+  The AbortIncompleteMultipartUpload lifecycle rule is the only guarantee
+  (backlog P3-15).
+- T10-F1: 0 records stored again after a graceful restart (10,200 and 2,600
+  before).
+- T11-F2: a lost completion on RustFS is probed and acknowledged, 0
+  duplicates (12,800 and 20,000 before); on MinIO the first attempt's found
+  object now counts as a late commit (fixed in Task 16).
+- T11-F3: the writer now aborts the upload before a held completion is
+  released, so the hour-straddle case on RustFS published nothing late (+51.0 s
+  against L = 135 s; +145.0 s before). The store-specific exception in
+  FORMAT.md still holds for a completion that lands before the abort.
+- T10-F2: the one post-SIGKILL duplicate is a request acknowledged 42.3 ms
+  before the kill and replayed from the WAL, inside the documented window.
+- Two harness rules changed after a failure, each reviewed: a held completion
+  must be the same upload id with a confirmed NotFound before release (a store
+  that drops the held request after at least 10 s, as MinIO does at 30 s,
+  counts as held), and a lost completion is identified from the proxy log when
+  no attempt fails.
 
 ## 6. Canary soak (Task 15)
 
@@ -358,18 +382,28 @@ is NOT VERIFIED (no heap dump was taken).
 452,442 entries. The difference is not explained in the cited files, so the
 4-hour run does not establish behaviour under sustained eviction.
 
-> PLACEHOLDER (mixed run): results of the 4-hour mixed-profile (80/20) chaos
-> run on MinIO, `.measurement-artifacts/reference-alloy/canary/`
-> (run log `run-logs/mixed-r1.log`, in progress at the time of writing).
-> Fill: build, events and boots, lines written, oracle verdict, duplicates
-> per event, orphans, buffer loss, RSS peak against 4.06 GB, RSS trend ratio,
-> WAL peak, cache peak and evictions, freshness, verdict. The canary-ready
-> gate is met only when this run passes.
+**Mixed profile** (seed 15003, one record in five on the churn window, the
+rest on 10k hot series): 14,400 s, 575,994,656 lines, 33 events, 12 boots.
+Passed all 11 checks after one re-judgement: two short store outages (31 and
+35 s) were logged by the proxy as 499 (the client gave up) rather than 502,
+and the observer now counts 499 inside an executed outage (reviewed).
+0 duplicates, 0 orphans, 0 buffer loss; RSS peak 3.00 GB, exporter accounted
+0.96 GB, WAL peak 1.99 GB (a 120 s outage against the 2.25 GB sizing rule);
+RSS trend 0.980 on 1 s samples (1.017 on 10 s); freshness p99 62 s, max 142 s,
+every event recovered within 31.8 s; series cache at its 200,000 limit with
+43,872 evictions.
 
-> PLACEHOLDER (cache-eviction run): a run that holds the series cache at its
-> 200,000-entry limit with sustained evictions for hours, or an explanation
-> of why the 4-hour churn runs saw 0 evictions. Fill: eviction rate, cache
-> peak, series dataset growth, RSS trend, delivery verdict.
+**Cache pressure** (seed 15004, 1M distinct series in 45 minutes against the
+shipped 200,000-entry cache): 2,700 s, 107,994,976 lines, 6 events. Passed all
+11 checks: entries held at exactly 200,000, 483,680 evictions (179 per second
+over about 36 minutes), hit ratio 0.65, 20,000 duplicate lines from one
+SIGKILL (5 resent exports), RSS peak 2.27 GB.
+
+Why the 4-hour churn runs never evicted: the cache is empty at every engine
+boot and the chaos schedule restarted the engine every 5-43 minutes, while
+1M distinct series over 4 hours (69 new per second) needs about 48 minutes to
+fill 200,000 entries. The mixed run and the pressure run cover eviction under
+pressure.
 
 Not run: the stable profile as a long run (the 30-minute reference soak
 covers healthy steady load), RustFS for the long run (one store by user
@@ -450,8 +484,10 @@ Earlier plan-3 changes, one line each (from `FINDINGS.md`):
 Limits of this report:
 
 - 1M records/s was not measured (section 2).
-- The failure matrices were not rerun on the fixed build (section 5).
-- The long run covers one store, one worker, logs only, 40k lines/s.
+- One network cell fails on a documented limit (F-A2), two on one-sample RSS
+  band excursions (section 5).
+- The long runs cover one store, one worker, logs only, 40k lines/s; no
+  engine kill landed within 100 ms of a block commit.
 - The stage baselines were recorded with a TLA+ model checker loading the
   other half of the CPU package; a quiet host looks about 5 percent faster.
 - The memory ledger does not close in the logs high-rate shape (section 3).
@@ -519,6 +555,7 @@ P3, hygiene, upstream and harness:
 - P3-12 Upstream PR logistics (de-slop, clean branch).
 - P3-13 Engine settles contexts when a node task dies.
 - P3-14 durable_buffer directory ownership.
+- P3-15 Count every CreateMultipartUpload retry that leaves an upload (F-A2).
 
 Deferred features: live access to buffered data, traces and the other
 unsupported kinds, a spatial aggregation processor, query-side indexes.
@@ -537,7 +574,10 @@ unsupported kinds, a spatial aggregation processor, query-side indexes.
   the 13 reference deployment cases and their reruns; raw archives in
   `.measurement-artifacts/reference-alloy/<case>-<store>-<epoch>/`.
 - `.measurement-artifacts/reference-alloy/canary/`: the chaos dry run, the
-  churn r1 archive judgement and churn r2; run logs in `run-logs/`.
+  churn r1 archive judgement, churn r2, mixed r1 and the cache-pressure run;
+  run logs in `run-logs/`.
+- `.superpowers/sdd/2026-09-22-series-parquet-measurement/task-15-report.md`
+  (canary) and `task-16-report.md` (failure-cell reruns on the fixed build).
 - `rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet_exporter/README.md`:
   "Deploying with Alloy", "Memory".
 - `configs/series-parquet-buffered.yaml`, `configs/series-parquet.alloy`,
