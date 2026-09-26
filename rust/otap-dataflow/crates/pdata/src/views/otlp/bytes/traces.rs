@@ -448,8 +448,8 @@ impl<'a> Iterator for ResourceSpansIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
-            // Step over any other field -- unknown, or known with another wire
-            // type -- so its value is never read as field keys.
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
             let (_, end) = field_range(self.buf, tag, self.pos)?;
             self.pos = end;
         }

@@ -254,8 +254,8 @@ impl<'a> Iterator for AnyValueIter<'a> {
 
                 return Some(RawAnyValue::new(slice));
             }
-            // Step over any other field -- unknown, or known with another wire
-            // type -- so its value is never read as field keys.
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
             let (_, end) = field_range(self.buf, tag, self.pos)?;
             self.pos = end;
         }
@@ -331,12 +331,11 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
             Some(variant_type) => variant_type,
             None => {
                 // Every field is scanned: an unknown field may precede the
-                // value, and when a sender sets the oneof more than once the
-                // result is what prost decodes -- the last member wins, except
-                // that a message-typed member (`array_value`, `kvlist_value`)
-                // following itself is merged: its occurrences form one run
-                // whose repeated contents are concatenated. A value with no
-                // member, or only unknown fields, is empty.
+                // value, and a oneof set more than once reads as prost decodes
+                // it. The last member wins, except that a message-typed member
+                // (`array_value`, `kvlist_value`) following itself is merged
+                // into one run whose repeated contents are concatenated. A
+                // value with no member, or only unknown fields, is empty.
                 let mut variant_type = ValueType::Empty;
                 let mut pos = 0;
                 while pos < self.buf.len() {
@@ -497,7 +496,7 @@ fn open_array(slice: &[u8]) -> AnyValueIter<'_> {
 
 /// The key-values of one serialized `KeyValueList`. Like every
 /// `ProtoBytesParser`, the parser behind it allocates its shared state (one
-/// `Rc`) per occurrence, as the single-occurrence path always has.
+/// `Rc`) per occurrence.
 fn open_kvlist(slice: &[u8]) -> KeyValueIter<'_, KeyValuesListFieldOffsets> {
     KeyValueIter::new(RepeatedFieldProtoBytesParser::from_byte_parser(
         &ProtoBytesParser::new(slice),
@@ -724,7 +723,7 @@ mod test {
         AnyValue { value }
     }
 
-    /// Scenario: `AnyValue` bodies that set the oneof more than once -- a
+    /// Scenario: `AnyValue` bodies that set the oneof more than once: a
     /// non-empty `array_value` then an empty one, two non-empty
     /// `kvlist_value`s, an `array_value` then a `string_value`, an array, a
     /// string and another array, two arrays with an unknown field between

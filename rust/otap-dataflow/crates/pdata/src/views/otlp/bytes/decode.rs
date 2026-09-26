@@ -196,10 +196,10 @@ where
 /// The range of the field whose key `tag` ends at `pos`, as a message scanner
 /// needs it to step to the next field: the [`value_range`] of the value, and
 /// for an unknown group the range from just past its start key to just past
-/// its end key, found by [`skip_group`]. So a balanced group -- which the
-/// validator accepts and prost skips -- never ends a scan early and hides the
-/// fields after it. Anything [`value_range`] or [`skip_group`] refuses is
-/// `None`, so callers treat malformed input as an absent field.
+/// its end key, found by [`skip_group`], so a balanced group never ends a
+/// scan early and hides the fields after it. Anything [`value_range`] or
+/// [`skip_group`] refuses is `None`, so callers treat malformed input as an
+/// absent field.
 #[inline]
 pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, usize)> {
     match tag & 7 {
@@ -283,8 +283,8 @@ pub(crate) enum SkipError {
 /// framed and skipped, nested groups are skipped the same way, and the group
 /// must close with an end key of its own field number before `buf` ends.
 /// `depth` is the nesting level of this group, counted against
-/// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`] -- which bounds the
-/// recursion -- together with whatever nesting the caller already holds.
+/// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`], which bounds the
+/// recursion, together with whatever nesting the caller already holds.
 /// Returns the position just past the end key.
 ///
 /// This is the one group skipper: the validator and the byte-view scanners
@@ -875,7 +875,7 @@ mod tests {
     /// same overflowing varint as the value of a top-level varint field.
     /// Guarantees: the maximum `u64` decodes to itself in ten bytes, and every
     /// varint carrying bits past the 64th is refused rather than read modulo
-    /// 2^64, as prost refuses it -- `80 80 80 80 80 80 80 80 80 02` is not
+    /// 2^64, as prost refuses it: `80 80 80 80 80 80 80 80 80 02` is not
     /// zero.
     #[test]
     fn refuses_varints_that_overflow_u64() {
