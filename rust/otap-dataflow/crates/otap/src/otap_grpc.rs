@@ -944,7 +944,7 @@ mod tests {
 
         let response = rx.recv().await.expect("stream rejection should be emitted");
         let status = response.expect_err("memory pressure should surface as a gRPC stream error");
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(
             status
                 .metadata()

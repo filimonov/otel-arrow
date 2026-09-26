@@ -150,12 +150,15 @@ impl OtlpReceiverMetrics {
             .inc();
     }
 
-    /// Records a rate-limit refusal after its signal and encoded payload size are known.
+    /// Records a rate-limit refusal after its signal and encoded payload size are known:
+    /// `rate_limit` for a throttled request, `payload_too_large` for one larger than the
+    /// burst, which is refused permanently.
     pub fn record_rate_limit_refusal<E>(
         metrics: &Arc<Mutex<Self>>,
         signal: SignalType,
         protocol: OtlpProtocol,
         payload_size: usize,
+        error_type: ReceiverRejectionErrorType,
         error: E,
     ) -> E {
         let processing = metrics.lock().boundary.processing();
@@ -164,7 +167,7 @@ impl OtlpReceiverMetrics {
             Err::<(SignalType, ()), _>(processing.refused(signal, error))
         });
         let mut metrics = metrics.lock();
-        metrics.record_rejection(protocol, ReceiverRejectionErrorType::RateLimit);
+        metrics.record_rejection(protocol, error_type);
         match metrics.boundary.record(completed) {
             Ok(()) => unreachable!("refused receiver processing cannot succeed"),
             Err(error) => error,

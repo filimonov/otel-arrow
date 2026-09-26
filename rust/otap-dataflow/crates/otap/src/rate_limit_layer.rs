@@ -15,7 +15,9 @@ use std::task::{Context, Poll};
 use tonic::{Code, Status, body::Body, metadata::MetadataMap};
 use tower::{Layer, Service};
 
-/// Builds a gRPC `resource_exhausted` status with retry pushback metadata.
+/// Builds a retryable gRPC `unavailable` status with retry pushback metadata.
+///
+/// UNAVAILABLE for the reason given at [`crate::memory_pressure_layer::grpc_memory_pressure_status`].
 #[must_use]
 pub fn grpc_rate_limit_status(retry_after_secs: u32) -> Status {
     let mut metadata = MetadataMap::new();
@@ -23,16 +25,17 @@ pub fn grpc_rate_limit_status(retry_after_secs: u32) -> Status {
     if let Ok(value) = retry_pushback_ms.to_string().parse() {
         let _ = metadata.insert("grpc-retry-pushback-ms", value);
     }
-    Status::with_metadata(Code::ResourceExhausted, "rate limit", metadata)
+    Status::with_metadata(Code::Unavailable, "rate limit", metadata)
 }
 
-/// Builds a gRPC `resource_exhausted` status for a weight-blind saturation refusal.
+/// Builds a retryable gRPC `unavailable` status for a weight-blind saturation refusal.
 #[must_use]
 pub fn grpc_rate_limit_saturated_status() -> Status {
-    Status::new(Code::ResourceExhausted, "rate limit")
+    Status::new(Code::Unavailable, "rate limit")
 }
 
-/// Builds a non-retryable gRPC status for a request larger than the configured burst.
+/// Builds a non-retryable gRPC `invalid_argument` status for a request larger than the
+/// configured burst, which no retry of the same request can fit.
 #[must_use]
 pub fn grpc_rate_limit_burst_exceeded_status() -> Status {
     let mut metadata = MetadataMap::new();
@@ -40,7 +43,7 @@ pub fn grpc_rate_limit_burst_exceeded_status() -> Status {
         let _ = metadata.insert("grpc-retry-pushback-ms", value);
     }
     Status::with_metadata(
-        Code::ResourceExhausted,
+        Code::InvalidArgument,
         "request exceeds rate limit burst",
         metadata,
     )
@@ -290,12 +293,12 @@ mod tests {
     }
 
     /// Scenario: a gRPC request is larger than the configured rate-limit burst.
-    /// Guarantees: the response disables retries instead of advertising transient pushback.
+    /// Guarantees: the response is non-retryable INVALID_ARGUMENT and disables pushback.
     #[test]
     fn oversized_status_is_non_retryable() {
         let status = grpc_rate_limit_burst_exceeded_status();
 
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(
             status
                 .metadata()
@@ -306,23 +309,24 @@ mod tests {
     }
 
     /// Scenario: gRPC rejects a saturated receiver before request weight is known.
-    /// Guarantees: the generic refusal is resource-exhausted without request-specific
+    /// Guarantees: the generic refusal is retryable UNAVAILABLE without request-specific
     /// retry pushback metadata.
     #[test]
     fn saturated_status_omits_retry_pushback() {
         let status = grpc_rate_limit_saturated_status();
 
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.code(), Code::Unavailable);
         assert!(status.metadata().get("grpc-retry-pushback-ms").is_none());
     }
 
     /// Scenario: gRPC rejects a request after its weighted recovery delay is known.
-    /// Guarantees: the authoritative refusal retains exact positive retry pushback.
+    /// Guarantees: the authoritative refusal is retryable UNAVAILABLE and retains exact
+    /// positive retry pushback.
     #[test]
     fn weighted_status_includes_retry_pushback() {
         let status = grpc_rate_limit_status(14);
 
-        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(
             status
                 .metadata()
@@ -373,7 +377,7 @@ mod tests {
                 .headers()
                 .get("grpc-status")
                 .and_then(|v| v.to_str().ok()),
-            Some("8")
+            Some("14")
         );
         assert!(!response.headers().contains_key("grpc-retry-pushback-ms"));
 

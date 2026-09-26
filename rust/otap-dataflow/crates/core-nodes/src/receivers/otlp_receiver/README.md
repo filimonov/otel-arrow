@@ -234,12 +234,25 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   size.
 - V1 rate limiting measures decompressed request bytes. A request larger than
   the configured burst is rejected as non-retryable while pressure gating is
-  active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
-  pushback.
+  active: HTTP returns 413 without `Retry-After`, and gRPC returns
+  `INVALID_ARGUMENT` with negative retry pushback.
+- A request refused by the rate limit or hard memory pressure can succeed on
+  retry: HTTP returns 503 and gRPC returns `UNAVAILABLE`, which every OTLP
+  client retries, with `Retry-After` or `grpc-retry-pushback-ms` when the delay
+  is known.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
+  This early HTTP 503 or gRPC `UNAVAILABLE` response has no retry hint.
   Exact retry guidance or non-retryable oversized classification is available
   only after the weighted admission point.
+- A gRPC request that finds no free `max_concurrent_requests` permit or
+  wait-for-result slot is refused with `UNAVAILABLE`, which every OTLP client
+  retries, and counted as `concurrency_limit`. With `load_shed: false` it waits
+  for a permit instead. A request over `transport_concurrency_limit` waits on
+  its connection and is never refused. OTLP/HTTP answers 503 with
+  `Retry-After: 1`.
+- A gRPC message above `max_decoding_message_size`, on the wire or after
+  decompression, is refused with `INVALID_ARGUMENT`, which OTLP clients do not
+  retry, and counted as `payload_too_large`. OTLP/HTTP answers 400.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 

@@ -12,6 +12,7 @@
 //! the pipeline as `OtapPdata`, matching the OTLP/gRPC receiver's lazy-decoding strategy.
 
 use crate::bearer_authorization::{AuthorizationRejection, authorize_bearer};
+use crate::concurrency_shed_layer::CONCURRENCY_LIMIT_MESSAGE;
 use crate::otap_grpc::common::AckRegistry;
 use crate::otap_grpc::otlp::server_new::AckSlot;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
@@ -46,6 +47,7 @@ use prost_types::Any;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -349,17 +351,40 @@ fn authorization_rejection_response(rejection: AuthorizationRejection) -> Respon
     }
 }
 
-fn resource_exhausted_with_retry_after(
-    message: &'static str,
+fn with_retry_after(
+    mut response: Response<Full<Bytes>>,
     retry_after_secs: u32,
 ) -> Response<Full<Bytes>> {
-    let mut response = rpc_status_response(StatusCode::SERVICE_UNAVAILABLE, 8, message);
     if let Ok(retry_after) = HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
         _ = response
             .headers_mut()
             .insert(http::header::RETRY_AFTER, retry_after);
     }
     response
+}
+
+fn resource_exhausted_with_retry_after(
+    message: &'static str,
+    retry_after_secs: u32,
+) -> Response<Full<Bytes>> {
+    with_retry_after(
+        rpc_status_response(StatusCode::SERVICE_UNAVAILABLE, 8, message),
+        retry_after_secs,
+    )
+}
+
+/// `Retry-After` of a refusal at the concurrency limit: a permit frees within a request's lifetime.
+const CONCURRENCY_LIMIT_RETRY_AFTER_SECS: u32 = 1;
+
+fn concurrency_limit_unavailable() -> Response<Full<Bytes>> {
+    with_retry_after(
+        rpc_status_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            14,
+            CONCURRENCY_LIMIT_MESSAGE,
+        ),
+        CONCURRENCY_LIMIT_RETRY_AFTER_SECS,
+    )
 }
 
 fn memory_pressure_unavailable(retry_after_secs: u32) -> Response<Full<Bytes>> {
@@ -633,6 +658,11 @@ impl HttpHandler {
         // Important: this is done inside the request future so the overall request timeout
         // (if enabled) accounts for time spent waiting for a permit.
         let permit_timeout = self.settings.timeout.unwrap_or(Duration::from_secs(5));
+        // Set once both permits are held: the request timeout and the permit waits end
+        // together, so a request timeout before this point is a concurrency refusal.
+        let admitted = AtomicBool::new(false);
+        let admitted_in_request = &admitted;
+        let metrics = self.metrics.clone();
 
         let fut = async move {
             if self.admission_state.should_shed_ingress() {
@@ -676,7 +706,7 @@ impl HttpHandler {
                             timeout_ms = permit_timeout.as_millis() as u64
                         );
                         self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                        return Err(service_unavailable());
+                        return Err(concurrency_limit_unavailable());
                     }
                 }
             } else {
@@ -718,9 +748,11 @@ impl HttpHandler {
                         timeout_ms = permit_timeout.as_millis() as u64
                     );
                     self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                    return Err(service_unavailable());
+                    return Err(concurrency_limit_unavailable());
                 }
             };
+
+            admitted_in_request.store(true, Ordering::Relaxed);
 
             // Re-check after waiting for the local permit.
             if self.admission_state.should_shed_ingress() {
@@ -817,6 +849,7 @@ impl HttpHandler {
                             signal,
                             OtlpProtocol::Http,
                             payload_bytes,
+                            ReceiverRejectionErrorType::RateLimit,
                             rate_limit_unavailable(retry_after_secs),
                         ));
                     }
@@ -826,6 +859,7 @@ impl HttpHandler {
                             signal,
                             OtlpProtocol::Http,
                             payload_bytes,
+                            ReceiverRejectionErrorType::PayloadTooLarge,
                             rate_limit_burst_exceeded(),
                         ));
                     }
@@ -881,7 +915,8 @@ impl HttpHandler {
                     let (key, rx) = match state.allocate_slot() {
                         None => {
                             self.record_rejection(ReceiverRejectionErrorType::ConcurrencyLimit);
-                            return Err(processing.refused(signal, Box::new(service_unavailable())));
+                            return Err(processing
+                                .refused(signal, Box::new(concurrency_limit_unavailable())));
                         }
                         Some(pair) => pair,
                     };
@@ -955,6 +990,19 @@ impl HttpHandler {
         let result = if let Some(timeout_duration) = timeout {
             match tokio::time::timeout(timeout_duration, fut).await {
                 Ok(inner) => inner,
+                Err(_) if !admitted.load(Ordering::Relaxed) => {
+                    otel_arrow_dfe_telemetry::otel_warn!(
+                        "otlp_http_receiver.request_rejected",
+                        reason = "concurrency_limit_timeout",
+                        path = path.as_str(),
+                        timeout_ms = timeout_duration.as_millis() as u64
+                    );
+                    metrics.lock().record_rejection(
+                        OtlpProtocol::Http,
+                        ReceiverRejectionErrorType::ConcurrencyLimit,
+                    );
+                    Err(concurrency_limit_unavailable())
+                }
                 Err(_) => {
                     otel_arrow_dfe_telemetry::otel_warn!(
                         "otlp_http_receiver.request_timeout",
@@ -1737,12 +1785,12 @@ mod tests {
     }
 
     /// Scenario: A non-empty HTTP request cannot allocate its acknowledgement slot.
-    /// Guarantees: The request is rejected without incrementing the OTLP accepted counter.
+    /// Guarantees: The request gets 503 with `Retry-After: 1` and is not counted as accepted.
     #[tokio::test]
     async fn rejected_http_request_is_not_accepted() {
         use hyper::Method;
         use hyper::client::conn::http1;
-        use hyper::header::{CONTENT_TYPE, HOST};
+        use hyper::header::{CONTENT_TYPE, HOST, RETRY_AFTER};
         use hyper_util::rt::TokioIo;
         use otel_arrow_dfe_engine::control::runtime_ctrl_msg_channel;
         use otel_arrow_dfe_engine::shared::message::SharedSender;
@@ -1830,9 +1878,16 @@ mod tests {
             .body(Full::new(Bytes::from(request_bytes)))
             .unwrap();
 
-        let status = sender.send_request(request).await.unwrap().status();
+        let response = sender.send_request(request).await.unwrap();
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
         assert!(msg_rx.try_recv().is_err());
         {
             let metrics = metrics.lock();
@@ -1855,6 +1910,178 @@ mod tests {
             .await
             .expect("server finished");
         assert!(server_result.unwrap().is_ok());
+    }
+
+    /// Sends one OTLP/HTTP logs request on a fresh connection and returns its
+    /// status and `Retry-After` header.
+    async fn post_logs_for_retry_after(addr: SocketAddr) -> (StatusCode, Option<String>) {
+        use hyper::Method;
+        use hyper::client::conn::http1;
+        use hyper::header::{CONTENT_TYPE, HOST, RETRY_AFTER};
+        use hyper_util::rt::TokioIo;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest;
+        use otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ResourceLogs;
+        use tokio::net::TcpStream;
+
+        let mut stream = None;
+        for _ in 0..20 {
+            match TcpStream::connect(addr).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let stream = stream.expect("Failed to connect to server");
+        let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
+        drop(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+        let mut body = Vec::new();
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs::default()],
+        }
+        .encode(&mut body)
+        .unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/logs")
+            .header(HOST, "localhost")
+            .header(CONTENT_TYPE, PROTOBUF_CONTENT_TYPE)
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        (response.status(), retry_after)
+    }
+
+    /// Serves OTLP/HTTP with `settings`, sends one request that waits for an
+    /// acknowledgement and holds the local permit when `hold_local` is set,
+    /// then sends `attempts` requests that must each be refused at the
+    /// concurrency limit.
+    async fn run_http_permit_refusal(
+        settings: HttpServerSettings,
+        global: Option<Arc<Semaphore>>,
+        hold_local: bool,
+        attempts: u64,
+    ) {
+        use otel_arrow_dfe_engine::control::runtime_ctrl_msg_channel;
+        use otel_arrow_dfe_engine::shared::message::SharedSender;
+        use otel_arrow_dfe_engine::testing::test_node;
+        use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+        use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
+        use tokio::sync::mpsc as tokio_mpsc;
+        use tokio_util::sync::CancellationToken;
+
+        let addr = settings.listening_addr;
+        let (msg_tx, mut msg_rx) = tokio_mpsc::channel(4);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("default".into(), SharedSender::mpsc(msg_tx));
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(4);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let effect_handler = EffectHandler::new(
+            test_node("http_permit_refusal"),
+            senders,
+            None,
+            ctrl_tx,
+            metrics_reporter,
+            otel_arrow_dfe_engine::testing::test_pipeline_runtime_services(),
+        );
+        let controller_ctx =
+            otel_arrow_dfe_engine::context::ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline_ctx =
+            controller_ctx.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let metrics = Arc::new(Mutex::new(OtlpReceiverMetrics::register(&pipeline_ctx)));
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve(
+            effect_handler,
+            settings,
+            AckRegistry::new(Some(AckSlot::new(4)), None, None),
+            metrics.clone(),
+            SharedReceiverAdmissionState::default(),
+            None,
+            global,
+            None,
+            shutdown.clone(),
+        ));
+
+        let holder = hold_local.then(|| tokio::spawn(post_logs_for_retry_after(addr)));
+        if hold_local {
+            let _held = tokio::time::timeout(Duration::from_secs(3), msg_rx.recv())
+                .await
+                .expect("the holding request reaches the pipeline")
+                .expect("the pipeline channel is open");
+        }
+
+        let mut outcomes = Vec::new();
+        for _ in 0..attempts {
+            outcomes.push(
+                tokio::time::timeout(Duration::from_secs(10), post_logs_for_retry_after(addr))
+                    .await
+                    .expect("the refused request completes"),
+            );
+        }
+        let rejections = metrics
+            .lock()
+            .rejections_for(
+                OtlpProtocol::Http,
+                ReceiverRejectionErrorType::ConcurrencyLimit,
+            )
+            .requests
+            .get();
+        shutdown.cancel();
+        if let Some(holder) = holder {
+            holder.abort();
+        }
+        server.abort();
+
+        for (status, retry_after) in &outcomes {
+            assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after.as_deref(), Some("1"), "outcomes: {outcomes:?}");
+        }
+        assert_eq!(rejections, attempts);
+    }
+
+    /// Scenario: the gRPC/HTTP shared semaphore stays full for the whole HTTP
+    /// request timeout, so the permit wait and the request timeout expire
+    /// together; 400 requests make the case where the request timeout fires
+    /// first (about one in a hundred) all but certain to occur.
+    /// Guarantees: every refusal is 503 with `Retry-After: 1` and counts as
+    /// `concurrency_limit`.
+    #[tokio::test]
+    async fn global_permit_timeout_carries_retry_after() {
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let global = Arc::new(Semaphore::new(1));
+        let _held = global.clone().acquire_owned().await.expect("global permit");
+        let settings = HttpServerSettings {
+            listening_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            max_concurrent_requests: 1,
+            timeout: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        run_http_permit_refusal(settings, Some(global), false, 400).await;
+    }
+
+    /// Scenario: an unacknowledged request holds the only HTTP permit and a
+    /// second request waits the default 5 s permit timeout (no request timeout).
+    /// Guarantees: the refusal is 503 with `Retry-After: 1` and counts one
+    /// `concurrency_limit` rejection.
+    #[tokio::test]
+    async fn local_permit_timeout_carries_retry_after() {
+        let port = otel_arrow_dfe_test_net::pick_unused_loopback_tcp_port();
+        let settings = HttpServerSettings {
+            listening_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            max_concurrent_requests: 1,
+            wait_for_result: true,
+            timeout: None,
+            ..Default::default()
+        };
+        run_http_permit_refusal(settings, None, true, 1).await;
     }
 
     /// Scenario: Memory pressure turns hard while an HTTP request waits for a shared permit.
@@ -2320,7 +2547,8 @@ mod tests {
     }
 
     /// Scenario: an OTLP HTTP request exceeds the weighted rate-limit burst after body read.
-    /// Guarantees: the refusal records shared refused message and byte metrics.
+    /// Guarantees: the refusal is counted under `payload_too_large` and records shared refused
+    /// message and byte metrics.
     #[tokio::test]
     async fn weighted_rate_limit_rejection_records_http_boundary_metrics() {
         use http_body_util::Full;
@@ -2438,7 +2666,10 @@ mod tests {
             let mut metrics = metrics.lock();
             assert_eq!(
                 metrics
-                    .rejections_for(OtlpProtocol::Http, ReceiverRejectionErrorType::RateLimit,)
+                    .rejections_for(
+                        OtlpProtocol::Http,
+                        ReceiverRejectionErrorType::PayloadTooLarge,
+                    )
                     .requests
                     .get(),
                 1
