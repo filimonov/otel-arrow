@@ -251,6 +251,10 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   time 503. Both carry a random retry delay of 1 to 3 seconds, as `RetryInfo`
   on gRPC and `Retry-After` on OTLP/HTTP, so clients refused together do not
   retry together.
+- The conversion to OTAP records, wherever a pipeline runs it, takes at most
+  65,536 attributed log records, spans or metrics per request, and as many
+  scopes and resources; a larger request fails as a whole. Keep producer
+  batches within it, for example `send_batch_max_size: 65536`.
 - `wait_for_result` reflects the immediate downstream node, not necessarily the
   final exporter.
 
