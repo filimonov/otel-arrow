@@ -1847,7 +1847,9 @@ impl otel_arrow_dfe_engine::local::processor::Processor<OtapPdata> for DurableBu
                     self.handle_retry_wakeup(slot, revision, effect_handler)
                         .await
                 }
-                NodeControlMsg::ResumeData { .. } => Ok(()),
+                NodeControlMsg::ResumeData { .. }
+                | NodeControlMsg::ShutdownDraining { .. }
+                | NodeControlMsg::CompletionsEnded { .. } => Ok(()),
             },
         }
     }

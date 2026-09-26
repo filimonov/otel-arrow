@@ -70,6 +70,21 @@ impl<PData> ExporterInbox<PData> {
             inner: SharedExporterInbox::new_internal(control_rx, pdata_rx, node_id, interests),
         }
     }
+
+    /// Bounds a Shutdown synthesized for a closed pdata channel by the
+    /// pipeline's shutdown deadline once the pipeline shuts down.
+    pub(crate) fn follow_pipeline_deadline(
+        &mut self,
+        deadline: crate::runtime_services::PipelineShutdownDeadline,
+    ) {
+        self.inner.follow_pipeline_deadline(deadline);
+    }
+
+    /// Announces draining with `ShutdownDraining`, as the local exporter
+    /// inbox does (see `crate::message::ExporterInbox::announce_draining`).
+    pub fn announce_draining(&mut self) {
+        self.inner.announce_draining();
+    }
 }
 
 impl<PData: ReceivedAtNode> ExporterInbox<PData> {
