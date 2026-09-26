@@ -18,7 +18,7 @@ SERIES_REQUIRE_DOCKER=1 python3 -m unittest \
 # The measurement contracts: fast, no engine, no container, no build.
 python3 -m unittest crates.validation.tests.series_parquet.test_measurement -v
 
-# The same contracts as a published, committable evidence file.
+# The same contracts as a published evidence file.
 python3 -m crates.validation.tests.series_parquet.measure run \
   --case harness-contracts --output-dir /tmp/series-contracts
 
@@ -245,7 +245,7 @@ baseline.
 
 A trial offers a fixed rate from an open-loop producer: one spawned process
 per physical core of `--option producer_cpus` (default `8-15,24-31`, the
-host's CPUs outside the campaign pin, so eight processes; `allocated` keeps
+host's CPUs outside the engine's pin, so eight processes; `allocated` keeps
 the two physical cores of the role allocation instead), every thread of
 each confined to its core's two SMT threads (the store owns its core
 likewise), each owning a share of the client connections
@@ -671,7 +671,7 @@ without rerunning anything or changing a run file: the advanced index
 records every changed verdict and every check the evidence cannot decide
 (`fault_rejudgement`), each child's re-judged failed checks, and keeps the
 index it replaces as a child. Process cases are re-judged from their run
-files alone (`rejudge_process_checks`), except the T10-F2 WAL window of a
+files alone (`rejudge_process_checks`), except the WAL window of a
 buffered run that failed `duplicates_explained`: it needs the archived ledger
 and the next boot's engine log, and without them the check is reported as
 not re-judged.
@@ -761,7 +761,7 @@ the evidence is kept and the case aborted every incomplete upload itself
 (`orphan_cleanup`), requires none left (`orphan_verdict`). Buffered, `duplicates_explained`
 accepts a duplicate stored before a restart and again after it, one of a
 request the producer resent because a kill cut off its acknowledgement, one
-copied in a failed block, or one charged to the documented T10-F2 window: its
+copied in a failed block, or one charged to the WAL window: its
 request was sent once, acknowledged by the log within the buffer's 100 ms
 tick before a SIGKILL, and the next boot logged `quiver.wal.replay`; a kill
 takes at most as many requests as that boot replayed
