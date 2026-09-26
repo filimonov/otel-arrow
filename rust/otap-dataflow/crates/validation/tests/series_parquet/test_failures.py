@@ -1982,6 +1982,85 @@ class NetworkCaseContracts(unittest.TestCase):
             held, object_before_release={"a": 1})))
         self.assertFalse(faults._held_multipart_met(None, dict(held, uploads_before_release=[])))
 
+    # Scenario: on the fixed build (Task 12a's lost-completion probe) a dropped
+    # completion's block is committed inside its first attempt: no attempt
+    # fails, nothing is nacked, nothing is retried.
+    # Guarantees: the condition then needs the object in the store and the
+    # target's block.committed event; a target without either is not met,
+    # and a target taken from a failed attempt still needs its flush failure,
+    # cutoff and retried nack.
+    def test_dropped_completion_settled_by_the_probe(self):
+        target = {"key": "k", "file": "part-x-00000004.parquet", "deadline_unix_s": None,
+                  "failure": None, "cutoff_unix_s": 940.0, "window_end_unix_s": 900.0,
+                  "commit": {"unix_s": 940.0, "seq": 4, "attempts": 1}}
+        settled = network_seen(target=target, target_object={"size_bytes": 1},
+                               storage_nacks_count=0, retried=False)
+        self.assertTrue(faults._dropped_multipart_met(None, settled))
+        self.assertFalse(faults._dropped_multipart_met(None, dict(settled, target_object=None)))
+        self.assertFalse(faults._dropped_multipart_met(None, dict(
+            settled, target=dict(target, commit=None))))
+        # A failed attempt's target is judged by the pre-probe rule only.
+        attempted = dict(target, deadline_unix_s=950.0)
+        self.assertFalse(faults._dropped_multipart_met(None, dict(settled, target=attempted)))
+
+    # Scenario: on the fixed build the writer HEADs the name after its held
+    # completion timed out, finds nothing and aborts the upload (204), so no
+    # upload of the target is open when the case releases the completion.
+    # Guarantees: the held condition accepts an upload the writer aborted in
+    # place of one still open, and still refuses an object before the release,
+    # an early release, or a target with neither an open upload nor an abort.
+    def test_held_completion_accepts_the_writers_abort(self):
+        key = "otel/v=1/signal=logs/dataset=values/part-t-w-b-00000004.parquet"
+        requests = [
+            {"msec": "1.0", "operation": "abort_multipart_upload", "status": "204",
+             "uri": f"/b/{key}?uploadId=u1"},
+            {"msec": "2.0", "operation": "abort_multipart_upload", "status": "503",
+             "uri": f"/b/{key}?uploadId=u2"},
+            {"msec": "3.0", "operation": "abort_multipart_upload", "status": "204",
+             "uri": f"/b/{key}-other?uploadId=u3"}]
+        aborts = faults.writer_aborts(requests, key)
+        self.assertEqual(aborts, [{"msec": "1.0", "status": "204"}])
+        target = {"key": key, "window_end_unix_s": 900.0, "cutoff_unix_s": 990.0}
+        held = network_seen(target=target, object_before_release=None,
+                            uploads_before_release=[], aborts_before_release=aborts,
+                            release_at_unix_s=999.0, released_unix_s=999.1)
+        self.assertTrue(faults._held_multipart_met(None, held))
+        self.assertFalse(faults._held_multipart_met(None, dict(held, aborts_before_release=[])))
+        self.assertFalse(faults._held_multipart_met(None, dict(
+            held, object_before_release={"size_bytes": 1})))
+        self.assertFalse(faults._held_multipart_met(None, dict(held, released_unix_s=998.0)))
+
+    # Scenario: NGINX logs the exporter's completions through the completion
+    # front: a series completion and a values one answered 200 before
+    # arming, then a values completion whose response was dropped (502).
+    # Guarantees: the target is the dropped values completion's file; a 2xx,
+    # a series file or a request ended before arming is never the target.
+    def test_dropped_completion_target_from_the_route(self):
+        def entry(msec, dataset, status, seq):
+            return {"msec": str(msec), "operation": "complete_multipart_upload",
+                    "status": status, "uri": f"/b/otel/v=1/signal=logs/dataset={dataset}/"
+                    f"date=2026-09-26/hour=07/part-t-w-b-{seq:08d}.parquet?uploadId=u"}
+        requests = [entry(1000.5, "values", "502", 4), entry(999.0, "values", "502", 2),
+                    entry(1000.2, "series", "502", 3), entry(1000.1, "values", "200", 3)]
+        self.assertEqual(faults.dropped_completion_file(requests, 1000.0),
+                         "part-t-w-b-00000004.parquet")
+        self.assertIsNone(faults.dropped_completion_file(requests[1:], 1000.0))
+        self.assertEqual(faults.block_seq("part-t-w-b-00000004.parquet"), 4)
+
+    # Scenario: the engine logs a committed block; its path is truncated.
+    # Guarantees: the block is named by its sequence number, with its time
+    # and attempts.
+    def test_block_commits_name_the_block_by_its_sequence(self):
+        line = ("2026-09-26T07:47:20.157Z  INFO  otel.exporter.series_parquet::"
+                "series_parquet.block.committed: [window_start=1790408805, seq=4, "
+                "path=v=1/signal=logs/dataset=series/date=2026-09-26/hour=07/part-2026[...], "
+                "files=2, requests=100, bytes=11713956, attempts=1, duration=30.1[...]] x")
+        found = faults.block_commits([line])
+        instant = datetime.datetime(2026, 9, 26, 7, 47, 20, 157000,
+                                    tzinfo=datetime.timezone.utc).timestamp()
+        self.assertEqual([(entry["seq"], entry["attempts"]) for entry in found], [(4, 1)])
+        self.assertAlmostEqual(found[0]["unix_s"], instant, places=3)
+
     # Scenario: the engine logs a failed write attempt with the deadline left.
     # Guarantees: the flush's own deadline is the event's time plus the
     # remaining Duration, in seconds or milliseconds.

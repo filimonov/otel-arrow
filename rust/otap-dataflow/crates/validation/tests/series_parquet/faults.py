@@ -5992,6 +5992,32 @@ def flush_cleanups(lines) -> list:
     return found
 
 
+def block_commits(lines) -> list:
+    """Every `block.committed` event in engine log lines: its time, block sequence
+    number and attempts. The event's path is truncated in the log, so a block is
+    named by its sequence number, the last field of its file name."""
+    found = []
+    for line in lines:
+        line = ANSI.sub("", line)
+        match = EVENT_LINE.search(line)
+        stamp = LOG_TIMESTAMP.search(line)
+        if not match or not stamp or match[2] != "series_parquet.block.committed":
+            continue
+        seq = re.search(r"\bseq=(\d+)", match[4])
+        attempts = re.search(r"\battempts=(\d+)", match[4])
+        found.append({"unix_s": datetime.datetime.fromisoformat(stamp[1]).replace(
+            tzinfo=datetime.timezone.utc).timestamp(),
+            "seq": int(seq[1]) if seq else None,
+            "attempts": int(attempts[1]) if attempts else None})
+    return found
+
+
+def block_seq(file):
+    """The block sequence number a frozen file name ends with (`...-00000004.parquet`)."""
+    match = re.search(r"-(\d+)\.parquet$", file or "")
+    return int(match[1]) if match else None
+
+
 def any_event(*events):
     """An event set as soon as any of `events` is."""
     combined = threading.Event()
@@ -6028,7 +6054,7 @@ class NetworkCase(FaultCase):
         super().__init__(*args, **kwargs)
         self.capture = None
         self.costly = {}
-        self.flush_events = {"failures": [], "cleanups": [], "attempts": []}
+        self.flush_events = {"failures": [], "cleanups": [], "attempts": [], "commits": []}
         self.network = {"setup": getattr(self.rig, "network_setup", None)}
 
     def cached(self, name, compute):
@@ -6047,6 +6073,7 @@ class NetworkCase(FaultCase):
             self.flush_events["failures"].extend(flush_failures(lines))
             self.flush_events["cleanups"].extend(flush_cleanups(lines))
             self.flush_events["attempts"].extend(flush_attempt_failures(lines))
+            self.flush_events["commits"].extend(block_commits(lines))
         return self.flush_events
 
     def dns_entries(self):
@@ -6706,11 +6733,25 @@ class MultipartCompletionCase(NetworkCase):
         events = self.engine_flush_events()
         attempts = [entry for entry in events["attempts"] if entry["unix_s"] >= armed["unix_s"]
                     and entry["file"] and entry["deadline_unix_s"] is not None]
-        if not attempts:
+        if attempts:
+            file = attempts[0]["file"]
+            deadline = attempts[0]["deadline_unix_s"]
+        elif self.fault == "dropped_multipart_completion":
+            # Since the lost-completion probe (Task 12a) a completion that lost
+            # its response is settled inside its attempt: the writer HEADs the
+            # frozen name, finds the object and acknowledges the block, so no
+            # attempt fails. The target is then the first values block whose
+            # completion NGINX answered without a 2xx after arming.
+            file = dropped_completion_file(self.route_requests(), armed["unix_s"])
+            if file is None:
+                return None
+            deadline = None
+        else:
             return None
-        file = attempts[0]["file"]
-        deadline = attempts[0]["deadline_unix_s"]
         failure = next((entry for entry in events["failures"] if entry["file"] == file), None)
+        commit = next((entry for entry in events["commits"]
+                       if entry["seq"] == block_seq(file) and entry["unix_s"] >= armed["unix_s"]),
+                      None)
         suffix = "/" + file
         listed = [key for key in self.lister.first_listed if key.endswith(suffix)
                   and "signal=logs/dataset=values/" in key]
@@ -6718,10 +6759,14 @@ class MultipartCompletionCase(NetworkCase):
         pending = [upload["key"] for upload in uploads if upload["key"].endswith(suffix)
                    and "signal=logs/dataset=values/" in upload["key"]]
         key = (listed or pending or [None])[0]
+        # A block settled by the probe has no cleanup cutoff: nothing of it is
+        # left to unwind once it is committed.
+        settled = failure["unix_s"] if failure else deadline
         return {"file": file, "deadline_unix_s": deadline, "failure": failure, "key": key,
+                "commit": commit,
                 "window_end_unix_s": block_window_end(key, self.spec.interval_s) if key else None,
-                "cutoff_unix_s": (failure["unix_s"] if failure else deadline)
-                + self.abort_timeout_s,
+                "cutoff_unix_s": settled + self.abort_timeout_s if settled is not None
+                else (commit or {}).get("unix_s"),
                 "incomplete_uploads": [upload for upload in uploads
                                        if upload["key"].endswith(suffix)]}
 
@@ -6752,6 +6797,7 @@ class MultipartCompletionCase(NetworkCase):
         time.sleep(max(0.0, release - time.time()))
         before = self.head(target["key"])
         uploads = orphaned_uploads(self.store)
+        aborts = writer_aborts(self.route_requests(), target["key"])
         self.rig.recover()
         self.released_unix_s = time.time()
         evidence = self.observe_condition()
@@ -6762,7 +6808,8 @@ class MultipartCompletionCase(NetworkCase):
                          "release_at_unix_s": release,
                          "released_unix_s": self.released_unix_s,
                          "uploads_before_release": [upload for upload in uploads
-                                                    if upload["key"] == target["key"]]})
+                                                    if upload["key"] == target["key"]],
+                         "aborts_before_release": aborts})
         if not _held_multipart_met(self, evidence):
             raise AssertionError(f"the held completion's condition failed: "
                                  f"{json.dumps(evidence, default=str)[:1500]}")
@@ -6851,8 +6898,11 @@ class MultipartCompletionCase(NetworkCase):
                 "released_unix_s": completion.get("released_unix_s"),
                 "first_visible_after_window_end_s": round(first - end, 3),
                 "last_modified_after_window_end_s": round(final["last_modified_unix_s"] - end, 3),
-                "first_visible_after_cutoff_s": round(first - target["cutoff_unix_s"], 3),
-                "first_visible_after_deadline_s": round(first - target["deadline_unix_s"], 3),
+                "first_visible_after_cutoff_s": round(first - target["cutoff_unix_s"], 3)
+                if target.get("cutoff_unix_s") is not None else None,
+                "first_visible_after_deadline_s": round(first - target["deadline_unix_s"], 3)
+                if target.get("deadline_unix_s") is not None else None,
+                "commit": target.get("commit"),
                 "multipart_steps": steps, "bound_s": self.bound_s,
                 "beyond_bound": max(first, final["last_modified_unix_s"]) - end > self.bound_s,
                 "cleanup_outcomes": [entry["outcome"] for entry in completion.get(
@@ -6892,22 +6942,54 @@ class MultipartCompletionCase(NetworkCase):
         return observations
 
 
+def dropped_completion_file(requests, armed_unix_s):
+    """The file of the first values CompleteMultipartUpload the exporter sent
+    through the completion front that NGINX logged without a 2xx after arming,
+    or None. NGINX logs a request when it ends, so this is known once the
+    store or the client closed the held response."""
+    for entry in sorted(requests, key=lambda item: float(item.get("msec") or 0)):
+        uri = entry.get("uri") or ""
+        if (entry.get("operation") == "complete_multipart_upload"
+                and "dataset=values/" in uri and _within(entry, armed_unix_s, None)
+                and not str(entry.get("status") or "").startswith("2")):
+            return uri.partition("?")[0].rsplit("/", 1)[-1]
+    return None
+
+
 def _dropped_multipart_met(case, seen) -> bool:
-    """The target's completion landed in the store with its response dropped, its
-    flush failed, the cleanup cutoff passed, and the nack was retried."""
+    """The target's completion landed in the store with its response dropped,
+    and the writer settled the block one of two ways: its flush failed, the
+    cleanup cutoff passed and the nack was retried (before the lost-completion
+    probe), or it committed the block without a failed attempt (the probe found
+    the object; nothing is nacked, so nothing is retried)."""
     target = seen.get("target") or {}
-    return (bool(target.get("key")) and bool(seen.get("target_object"))
-            and target.get("failure") is not None
-            and seen["now_unix_s"] >= target["cutoff_unix_s"] + 1
-            and seen["storage_nacks_count"] > 0 and seen["retried"])
+    if not (target.get("key") and seen.get("target_object")):
+        return False
+    if target.get("failure") is not None:
+        return (seen["now_unix_s"] >= target["cutoff_unix_s"] + 1
+                and seen["storage_nacks_count"] > 0 and seen["retried"])
+    return target.get("deadline_unix_s") is None and target.get("commit") is not None
+
+
+def writer_aborts(requests, key) -> list:
+    """The AbortMultipartUpload requests of `key` the store answered 2xx."""
+    return [{field: entry.get(field) for field in ("msec", "status")}
+            for entry in requests
+            if entry.get("operation") == "abort_multipart_upload"
+            and (entry.get("uri") or "").partition("?")[0].endswith("/" + key)
+            and str(entry.get("status") or "").startswith("2")]
 
 
 def _held_multipart_met(case, seen) -> bool:
-    """The target's completion was held: no object and its upload still open just
-    before the release, which came at its instant (`release_at`)."""
+    """The target's completion was held: no object just before the release,
+    which came at its instant (`release_at`), and the target's upload either
+    still open or aborted by the writer. Since the lost-completion probe
+    (Task 12a) the writer HEADs the name after its completion fails and, finding
+    nothing, aborts the upload, so a held completion released later has no
+    upload left to complete; before it, the writer left the upload open."""
     target = seen.get("target") or {}
     return (bool(target.get("key")) and seen.get("object_before_release") is None
-            and bool(seen.get("uploads_before_release"))
+            and bool(seen.get("uploads_before_release") or seen.get("aborts_before_release"))
             and target.get("window_end_unix_s") is not None
             and seen.get("released_unix_s", 0) >= seen.get("release_at_unix_s", float("inf")))
 

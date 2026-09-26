@@ -833,7 +833,12 @@ arming until both routes answer again.
   `series_parquet.flush.attempt_failed` event names its deadline. Dropped: the completion
   lands and its response is dropped; the fault is held until the writer's
   flush failed, of whatever class, and its cleanup cutoff (the failure plus
-  `upload.abort_timeout`) has passed, and
+  `upload.abort_timeout`) has passed. Since the writer HEADs a completion
+  that lost its response before aborting it, such a block is usually
+  committed inside its first attempt and nothing fails: the target is then
+  the first values completion NGINX logged without a 2xx after arming, and
+  the fault is held until the target's object is in the store and its
+  `series_parquet.block.committed` event is logged. In both cases
   `late_commit_detected` requires the target's INFO
   `series_parquet.flush.cleanup` `late_commit` event and
   `flush.late_commits` at least 1. Held: an upstream `latency` toxic holds
@@ -841,7 +846,11 @@ arming until both routes answer again.
   10 s past the later of the writer's cleanup cutoff and the lateness bound
   after the block's window end (after its partition hour's end for an hour's
   last blocks), and the case records whether and when the object appears.
-  The
+  Just before the release there must be no object and the target's upload
+  either still open or aborted by the writer (an AbortMultipartUpload of its
+  key answered 2xx): the writer HEADs the name after its completion fails
+  and, finding nothing, aborts the upload, so the released completion has
+  nothing left to complete. The
   store itself drops a connection whose request has not arrived within its
   request timeout, if it has one, so a completion held longer never lands.
 
