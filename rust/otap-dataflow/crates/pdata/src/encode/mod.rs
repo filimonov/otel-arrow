@@ -236,6 +236,11 @@ where
     Ok(otap_batch)
 }
 
+/// Converts a zero-based position into a u16 id, refusing positions past `u16::MAX`.
+fn u16_id<T: TryInto<u16>>(position: T) -> Result<u16> {
+    position.try_into().map_err(|_| Error::U16OverflowError)
+}
+
 /// traverse the log structure within the LogDataView and produces an `OtapArrowRecords' for the log data
 pub fn encode_logs_otap_batch<T>(logs_view: &T) -> Result<OtapArrowRecords>
 where
@@ -246,14 +251,15 @@ where
     let mut curr_scope_id = 0;
     let mut scope_attrs = AttributesRecordBatchBuilder::<u16>::new();
 
-    let mut curr_log_id = 0;
+    // Counted in u32 so the last u16 id is usable; `u16_id` refuses the first id past it.
+    let mut next_log_id: u32 = 0;
     let mut logs = LogsRecordBatchBuilder::new();
     let mut log_attrs = AttributesRecordBatchBuilder::<u16>::new();
 
     let mut total_log_count = 0;
 
     for (curr_resource_id, resource_logs) in logs_view.resources().enumerate() {
-        let curr_resource_id = curr_resource_id as u16;
+        let curr_resource_id = u16_id(curr_resource_id)?;
 
         // keep reference to resource dropped attributes, which will be appended to log later
         let resource_dropped_attrs_count = if let Some(resource) = resource_logs.resource() {
@@ -458,14 +464,15 @@ where
                         .expect("LogRecord should not be None")
                         .attributes()
                     {
+                        let curr_log_id = u16_id(next_log_id)?;
                         log_attrs.append_parent_id(&curr_log_id);
                         log_attrs_count += 1;
                         append_attribute_value(&mut log_attrs, &kv)?;
                     }
 
                     if log_attrs_count > 0 {
-                        logs.append_id(Some(curr_log_id));
-                        curr_log_id += 1;
+                        logs.append_id(Some(u16_id(next_log_id)?));
+                        next_log_id += 1;
                     } else {
                         logs.append_id(None);
                     }
@@ -5293,5 +5300,79 @@ mod test {
             metrics_checked > 0,
             "expected at least one metrics timestamp column"
         );
+    }
+
+    fn attributed_log_record() -> LogRecord {
+        LogRecord {
+            attributes: vec![KeyValue::new("k", AnyValue::new_string("v"))],
+            ..Default::default()
+        }
+    }
+
+    fn logs_with_attributed_records(count: usize) -> LogsData {
+        LogsData::new(vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: (0..count).map(|_| attributed_log_record()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }])
+    }
+
+    fn logs_with_attributed_resources(count: usize) -> LogsData {
+        LogsData::new(
+            (0..count)
+                .map(|_| ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue::new("k", AnyValue::new_string("v"))],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Scenario: a logs request carries 65,536 log records with one attribute each.
+    /// Guarantees: every record gets its own u16 id 0..=65535 and the batch encodes.
+    #[test]
+    fn test_encode_logs_65536_attributed_records_fit_u16_ids() {
+        let batch = encode_logs_otap_batch(&logs_with_attributed_records(65_536))
+            .expect("65,536 attributed records fit the u16 id space");
+        let logs = batch.get(ArrowPayloadType::Logs).expect("logs batch");
+        let ids = logs
+            .column_by_name(consts::ID)
+            .expect("id column")
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .expect("u16 ids");
+        assert_eq!(ids.len(), 65_536);
+        assert_eq!(ids.value(65_535), 65_535);
+    }
+
+    /// Scenario: a logs request carries 65,537 log records with one attribute each.
+    /// Guarantees: the encoder refuses it with U16OverflowError instead of wrapping ids.
+    #[test]
+    fn test_encode_logs_65537_attributed_records_overflow_u16_ids() {
+        let err = encode_logs_otap_batch(&logs_with_attributed_records(65_537))
+            .expect_err("the 65,537th attributed record has no u16 id");
+        assert!(matches!(err, Error::U16OverflowError), "{err:?}");
+    }
+
+    /// Scenario: a logs request carries 65,536 ResourceLogs, each with an attribute and no scopes.
+    /// Guarantees: every resource gets its own u16 id and the batch encodes.
+    #[test]
+    fn test_encode_logs_65536_resources_fit_u16_ids() {
+        let _ = encode_logs_otap_batch(&logs_with_attributed_resources(65_536))
+            .expect("65,536 resources fit the u16 id space");
+    }
+
+    /// Scenario: a logs request carries 65,537 ResourceLogs, each with an attribute.
+    /// Guarantees: the encoder refuses it with U16OverflowError instead of reusing resource id 0.
+    #[test]
+    fn test_encode_logs_65537_resources_overflow_u16_ids() {
+        let err = encode_logs_otap_batch(&logs_with_attributed_resources(65_537))
+            .expect_err("the 65,537th resource has no u16 id");
+        assert!(matches!(err, Error::U16OverflowError), "{err:?}");
     }
 }
