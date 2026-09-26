@@ -115,10 +115,10 @@
       "status": "passed"
     },
     {
-      "detail": "failure-process-kill_upload-buffered-rustfs-c1-w5-r003: failed; re-judged passed",
+      "detail": "failure-process-kill_upload-buffered-rustfs-c1-w5-r003: failed",
       "kind": "hard",
       "name": "child_failure-process-kill_upload-buffered-rustfs-c1-w5-r003",
-      "status": "passed"
+      "status": "failed"
     },
     {
       "detail": "failure-process-kill_upload-strict-minio-c1-w5-r001: passed",
@@ -135,9 +135,9 @@
   ],
   "child_indexes": [
     {
-      "name": "failure-process-ef52910dec30.json",
-      "sha256": "ef52910dec30cabf3396012181a209268bd3720bbe8a8677c56a65f10d4e9680",
-      "size_bytes": 42743
+      "name": "failure-process-a163cddd46cb.json",
+      "sha256": "a163cddd46cb0672b65d1de062b0f61a9fcc6ed3e90d19abbfda7bbef6e19992",
+      "size_bytes": 42709
     }
   ],
   "children": [
@@ -162,8 +162,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-graceful_restart-buffered-minio-c1-w5-r001: rerun on the fixed build, Task 16 (campaign tip 26b6c149e, every Task 12 fix): the pre-fix run replayed bundles the exporter had acknowledged during the graceful shutdown (T10-F1); Task 12a/12e record exporter acks that arrive during shutdown",
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-graceful_restart-buffered-minio-c1-w5-r002",
       "status": "passed",
       "topology": "buffered"
@@ -189,8 +187,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-graceful_restart-buffered-rustfs-c1-w5-r001: rerun on the fixed build, Task 16 (campaign tip 26b6c149e, every Task 12 fix): the pre-fix run replayed bundles the exporter had acknowledged during the graceful shutdown (T10-F1); Task 12a/12e record exporter acks that arrive during shutdown",
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-graceful_restart-buffered-rustfs-c1-w5-r002",
       "status": "passed",
       "topology": "buffered"
@@ -214,8 +210,6 @@
         "peak_rss_bytes": 116305920,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-graceful_restart-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -239,8 +233,6 @@
         "peak_rss_bytes": 116932608,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-graceful_restart-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -265,8 +257,6 @@
         "peak_rss_bytes": 121200640,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_active-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -291,8 +281,6 @@
         "peak_rss_bytes": 120573952,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_active-buffered-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -316,8 +304,6 @@
         "peak_rss_bytes": 111476736,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_active-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -341,8 +327,6 @@
         "peak_rss_bytes": 112672768,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_active-strict-rustfs-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -367,8 +351,6 @@
         "peak_rss_bytes": 170012672,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_upload-buffered-minio-c1-w5-r001",
       "status": "passed",
       "topology": "buffered"
@@ -396,8 +378,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-kill_upload-buffered-rustfs-c1-w5-r002: rerun on the fixed build, Task 16 (campaign tip 26b6c149e, every Task 12 fix): the pre-fix run stored two log-acknowledged requests twice after a SIGKILL (T10-F2, not addressed by Task 12); rerun to see whether it recurs on the fixed build",
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_upload-buffered-rustfs-c1-w5-r003",
       "status": "failed",
       "topology": "buffered"
@@ -421,8 +401,6 @@
         "peak_rss_bytes": 117530624,
         "unexpected_records": 0
       },
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_upload-strict-minio-c1-w5-r001",
       "status": "passed",
       "topology": "strict"
@@ -447,8 +425,6 @@
         "unexpected_records": 0
       },
       "purpose": "replaces failure-process-kill_upload-strict-rustfs-c1-w5-r001: harness bug fixed in e7bbd87fc: fault_observed required the cut-off series PUT to stay absent, but RustFS committed the body the route had already received after the kill (NGINX 499, request_length 8200); host-independent",
-      "rejudged_failed_checks": [],
-      "rejudged_status": "passed",
       "run_id": "failure-process-kill_upload-strict-rustfs-c1-w5-r002",
       "status": "passed",
       "topology": "strict"
@@ -1374,55 +1350,13 @@
     }
   },
   "events": [],
-  "fault_rejudgement": {
-    "not_rejudged": [],
-    "rules": {
-      "duplicates_explained": "strict: every duplicated record belongs to a resent request; buffered: every duplicated record has a copy in a values file of a failed block",
-      "duplicates_explained_process": "buffered process runs: a duplicated record is also explained when its request was sent once, acknowledged by the log within the buffer's 100 ms tick before a SIGKILL, and the next boot logged quiver.wal.replay; each kill takes at most as many requests as its next boot replayed (T10-F2, wal_window_attribution)",
-      "fault_observed": "store_outage: a flush.failed event of class deadline logged at least the flush deadline after arming and before the fault was removed; process: a graceful stop within the shutdown deadline and the cleanup cutoff (graceful_exit_problem), and kill_upload's multipart gate on part bytes the store lists (ProcessCase.multipart_met)",
-      "orphaned_uploads_expected": "incomplete uploads other than those a killed engine left open (each listed under its key) number at most flush.abort_failures x (retry.max_retries + 1): one counted failure is one failed write attempt, inside which the object store client retries a CreateMultipartUpload up to max_retries times, each try possibly creating an upload whose id the writer never receives (Task 16 fix round 1); process: the test's cleanup leaving none (orphan_verdict)"
-    },
-    "verdict_changes": [
-      {
-        "check": "duplicates_explained",
-        "reason": "0 of 100 duplicated records were neither stored again after a restart (0 replayed), nor in a resent request (0), nor copied in a failed block, nor in a request acknowledged within 100.0 ms before a SIGKILL whose next boot replayed its WAL (100 records: {'1': [(461, 42.291)]}; WAL replays by kill {'1': 1, '2': 1}; unattributed requests [])",
-        "recorded": "failed",
-        "rejudged": "passed",
-        "run_id": "failure-process-kill_upload-buffered-rustfs-c1-w5-r003",
-        "run_status_recorded": "failed",
-        "run_status_rejudged": "passed",
-        "wal_window": {
-          "charged": {
-            "1": [
-              {
-                "ack_ns": 476234352979433,
-                "attempts": 1,
-                "before_kill_ms": 42.291,
-                "records": 100,
-                "request_id": 461
-              }
-            ]
-          },
-          "charged_records": 100,
-          "replays": {
-            "1": 1,
-            "2": 1
-          },
-          "unattributed": [],
-          "unattributed_records": 0,
-          "window_ms": 100.0
-        }
-      }
-    ]
-  },
   "mandatory_metrics": [
     "children_count",
     "children_passed_count"
   ],
   "metrics": {
     "children_count": 12,
-    "children_passed_count": 12,
-    "recorded_children_passed_count": 11
+    "children_passed_count": 11
   },
   "metrics_unavailable": {},
   "publishable": true,
@@ -1492,7 +1426,7 @@
   "run_id": "failure-process",
   "samples": [],
   "schema_version": 1,
-  "started_utc": "2026-09-26T09:53:49Z",
-  "status": "passed",
+  "started_utc": "2026-09-26T07:32:27Z",
+  "status": "failed",
   "workload": {}
 }
