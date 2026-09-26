@@ -684,6 +684,13 @@ Runtime recovery notes:
   `reset_after`. A later failure after that window starts a fresh streak.
 - Exhausting `max_restarts`, or setting `enabled: false`, converts the runtime
   failure into a fatal engine error and requests coordinated process shutdown.
+- A failing node takes its whole core pipeline down at once: the other node
+  tasks are dropped, not shut down, so no request in flight on that core is
+  acked or nacked. A producer waiting on a receiver sees its connection close
+  before any status (a gRPC client that maps a lost connection to
+  UNAVAILABLE retries; tonic reports UNKNOWN), and bundles a durable buffer
+  had sent downstream stay unacknowledged in its WAL, so the replacement
+  sends them again (`crates/validation/tests/node_failure_tests.rs`).
 
 Memory limiter configuration:
 
