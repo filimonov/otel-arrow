@@ -258,6 +258,16 @@ class JudgementContracts(unittest.TestCase):
         self.assertTrue(canary.event_observed(slow, {"latency_ms": 1000}, log)[0])
         self.assertFalse(canary.event_observed(slow, {"latency_ms": 2000}, log)[0])
 
+    # Scenario: a 35 s store outage during which the only requests NGINX
+    # logged were abandoned by the exporter (499), and one with only 200s.
+    # Guarantees: an abandoned request counts as the outage observed; a
+    # success does not.
+    def test_short_outage_is_observed_from_abandoned_requests(self):
+        outage = event(0, "store_outage", 10, 45)
+        self.assertTrue(canary.event_observed(
+            outage, {}, [{"msec": "26.3", "status": "499"}, {"msec": "32.7", "status": "499"}])[0])
+        self.assertFalse(canary.event_observed(outage, {}, [{"msec": "26.3", "status": "200"}])[0])
+
     # Scenario: executed chaos events from the case's event log.
     # Guarantees: each is placed on the input's time axis with its started boot.
     def test_executed_events(self):

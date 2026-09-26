@@ -405,8 +405,12 @@ def event_observed(event, detail, access_log):
         refused = [e for e in during if e.get("status") == "503"]
         return bool(refused), f"{len(refused)} of {len(during)} requests answered 503"
     if kind == "store_outage":
-        failed = [e for e in during if e.get("status", "").startswith("5")]
-        return bool(failed), f"{len(failed)} of {len(during)} requests answered 5xx"
+        # A request to the stopped store hangs in the proxy until the exporter
+        # gives up (NGINX logs 499); only after about 45 s does NGINX answer 502.
+        failed = [e for e in during if e.get("status", "").startswith("5")
+                  or e.get("status") == "499"]
+        return bool(failed), (f"{len(failed)} of {len(during)} requests answered 5xx or "
+                              "abandoned (499)")
     exit_ = detail.get("exit") or {}
     if kind == "engine_sigterm":
         ok = exit_.get("code") == 0 and not exit_.get("forced") \
@@ -790,13 +794,47 @@ def canary_timeline(samples, first_wall):
     return rows
 
 
+def rejudge(path):
+    """Advance a published result's `events_observed` check to the current
+    rule, from its executed events and the archived NGINX access log; a
+    changed verdict is recorded."""
+    path = Path(path)
+    result = json.loads(path.read_text())
+    archive = Path(str(result["archive"]).replace(
+        "<main_checkout>", str(faults.FAULT_ARCHIVE_ROOT.parent)))
+    access = faults.parse_access_log(archive / faults.ACCESS_LOG)
+    ends = {e["index"]: e for e in result["events"] if e["kind"] == "chaos_end"}
+    executed = result["canary"]["executed"]
+    observed = []
+    for event in executed:
+        passed, detail = event_observed(event, ends[event["index"]], access)
+        observed.append({"index": event["index"], "kind": event["kind"], "passed": passed,
+                         "detail": detail})
+    passed = len(executed) == len(result["canary"]["schedule"]) and all(
+        o["passed"] for o in observed)
+    detail = [o for o in observed if not o["passed"]] or f"{len(observed)} events"
+    result["canary"]["observed"] = observed
+    for entry in result["checks"]:
+        if entry["name"] == "events_observed" and entry["passed"] != passed:
+            result.setdefault("rejudgement", []).append({
+                "check": "events_observed", "was": entry["passed"], "now": passed,
+                "reason": "a stopped store's requests hang and are abandoned (NGINX 499) "
+                          "before NGINX answers 502, so a short outage shows only 499s",
+                "at_utc": ref.measurement.utc_now()})
+            entry.update(passed=passed, detail=detail)
+    result["status"] = "passed" if all(c["passed"] for c in result["checks"]) else "failed"
+    path.write_text(json.dumps(result, indent=1, sort_keys=True, default=str) + "\n")
+    return result
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="canary", description=__doc__)
-    parser.add_argument("--profile", choices=generator.CARDINALITY_PROFILES, required=True)
-    parser.add_argument("--input-s", type=int, required=True)
-    parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--label", required=True)
-    parser.add_argument("--purpose", required=True)
+    parser.add_argument("--rejudge", help="a published result to re-judge")
+    parser.add_argument("--profile", choices=generator.CARDINALITY_PROFILES)
+    parser.add_argument("--input-s", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--label")
+    parser.add_argument("--purpose")
     parser.add_argument("--work-dir", default="/var/tmp/series-canary")
     parser.add_argument("--report-dir", default=str(REPORT_DIR))
     parser.add_argument("--option", action="append", default=[],
@@ -804,6 +842,15 @@ def main(argv=None) -> int:
     parser.add_argument("--schedule-only", action="store_true",
                         help="print the planned events and exit")
     args = parser.parse_args(argv)
+    if args.rejudge:
+        result = rejudge(args.rejudge)
+        print(json.dumps({"status": result["status"],
+                          "rejudgement": result.get("rejudgement")}, indent=1))
+        return 0 if result["status"] == "passed" else 1
+    missing = [name for name in ("profile", "input_s", "seed", "label", "purpose")
+               if getattr(args, name) is None]
+    if missing:
+        parser.error(f"a run needs --{', --'.join(m.replace('_', '-') for m in missing)}")
     options = {}
     for item in args.option:
         name, _, raw = item.partition("=")
