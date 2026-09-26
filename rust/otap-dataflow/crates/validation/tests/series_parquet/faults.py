@@ -3133,25 +3133,48 @@ class StoreLister:
 ORPHANS_NOT_CLEANED = "not cleaned"
 
 
-def orphan_verdict(orphans, expected, abort_failures, cleanup=ORPHANS_NOT_CLEANED) -> tuple:
+# The retries the exporter's object store client makes by default
+# (`retry.max_retries`, aligned with object_store's RetryConfig).
+DEFAULT_MAX_RETRIES = 10
+
+
+def uploads_per_abort_failure(settings) -> int:
+    """How many incomplete uploads one counted `flush.abort_failures` may stand for.
+
+    The exporter counts one failure per failed write attempt, but inside an
+    attempt the object store client retries a CreateMultipartUpload up to
+    `retry.max_retries` times, and the store may create an upload on every try
+    whose response was lost (Task 16: a reset CreateMultipartUpload left 54
+    uploads behind 9 counted failures with `max_retries: 5`). Each counted
+    failure therefore allows `retry.max_retries + 1` uploads.
+    """
+    retry = (settings or {}).get("retry") or {}
+    return int(retry.get("max_retries", DEFAULT_MAX_RETRIES)) + 1
+
+
+def orphan_verdict(orphans, expected, abort_failures, cleanup=ORPHANS_NOT_CLEANED,
+                   uploads_per_failure=1) -> tuple:
     """Whether the incomplete uploads after a case are exactly the expected ones.
 
     `expected` maps each upload a killed engine left open to its key; every
     one must still be listed under that key. Any other upload is allowed
-    only up to `abort_failures`, the aborts the exporter reported as failed.
-    A case that aborts the uploads itself (`abort_uploads`) must leave none.
+    only up to `abort_failures`, the aborts the exporter reported as failed,
+    times `uploads_per_failure` (`uploads_per_abort_failure`). A case that
+    aborts the uploads itself (`abort_uploads`) must leave none.
     """
     if not isinstance(orphans, list):
         return False, f"the uploads could not be listed: {orphans}"
     listed = {entry["upload_id"]: entry["key"] for entry in orphans}
     missing = sorted(upload for upload, key in expected.items() if listed.get(upload) != key)
     unknown = [entry for entry in orphans if entry["upload_id"] not in expected]
-    unexpected = max(0, len(unknown) - abort_failures)
+    allowed = abort_failures * uploads_per_failure
+    unexpected = max(0, len(unknown) - allowed)
     cleaned = cleanup == ORPHANS_NOT_CLEANED or bool((cleanup or {}).get("clean"))
     return (not missing and unexpected == 0 and cleaned,
             f"{len(orphans)} incomplete multipart uploads; {len(expected)} left open by a killed "
             f"engine, of which not listed under their key {missing[:5]}; {abort_failures} "
-            f"reported abort failures may each leave one; unexpected {unexpected}: "
+            f"reported abort failures may each leave up to {uploads_per_failure} "
+            f"({allowed}); unexpected {unexpected}: "
             f"{unknown[:5]}; cleanup "
             f"{cleanup if cleanup == ORPHANS_NOT_CLEANED else (cleanup or {}).get('remaining')}")
 
@@ -3962,8 +3985,10 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
     abort_failures = case.abort_failures(final)
     orphans = record["orphans"]
     known = case.expected_orphans()
+    per_failure = uploads_per_abort_failure(case.settings)
     hard("orphaned_uploads_expected", *orphan_verdict(
-        orphans, known, abort_failures, record.get("orphan_cleanup", ORPHANS_NOT_CLEANED)))
+        orphans, known, abort_failures, record.get("orphan_cleanup", ORPHANS_NOT_CLEANED),
+        uploads_per_failure=per_failure))
     lateness = partition_lateness(record["objects"], lateness_bound_s(case.settings))
     hard("partition_lateness_bound", not lateness["violations"],
          f"bound {lateness['bound_s']} s; violations {lateness['violations']}; hours "
@@ -4052,7 +4077,8 @@ def settle_fault(result, case, record, oracle, acked_scope, oracle_error, counts
         },
         "multipart": multipart,
         "orphaned_uploads": orphans,
-        "orphaned_uploads_expected_max_count": abort_failures + len(known),
+        "orphaned_uploads_expected_max_count": abort_failures * per_failure + len(known),
+        "uploads_per_abort_failure": per_failure,
         "partition_lateness": lateness,
         "engine_events": record["events"],
         "throughput_by_phase": phase_throughput(record["acks_ns"], record["objects"], case),
@@ -7227,9 +7253,12 @@ FAULT_REJUDGE_RULES = {
     "the flush deadline after arming and before the fault was removed; process: a graceful "
     "stop within the shutdown deadline and the cleanup cutoff (graceful_exit_problem), and "
     "kill_upload's multipart gate on part bytes the store lists (ProcessCase.multipart_met)",
-    "orphaned_uploads_expected": "process: every upload a killed engine left open listed under "
-    "its key, other uploads only up to the reported abort failures, and the test's cleanup "
-    "leaving none (orphan_verdict)",
+    "orphaned_uploads_expected": "incomplete uploads other than those a killed engine left open "
+    "(each listed under its key) number at most flush.abort_failures x (retry.max_retries + "
+    "1): one counted failure is one failed write attempt, inside which the object store client "
+    "retries a CreateMultipartUpload up to max_retries times, each try possibly creating an "
+    "upload whose id the writer never receives (Task 16 fix round 1); process: the test's "
+    "cleanup leaving none (orphan_verdict)",
 }
 
 
@@ -7261,9 +7290,13 @@ def rejudge_process_checks(result) -> list:
     recorded = statuses.get("fault_observed")
     observed = recorded == measurement.STATUS_PASSED and not problems
     expected = process.get("expected_orphans") or {}
-    abort_failures = fault["orphaned_uploads_expected_max_count"] - len(expected)
-    passed, why = orphan_verdict(fault["orphaned_uploads"], expected, abort_failures,
-                                 process.get("orphan_cleanup"))
+    # Runs before the per-failure allowance recorded the raw count.
+    abort_failures = ((fault["orphaned_uploads_expected_max_count"] - len(expected))
+                      // int(fault.get("uploads_per_abort_failure", 1)))
+    passed, why = orphan_verdict(
+        fault["orphaned_uploads"], expected, abort_failures, process.get("orphan_cleanup"),
+        uploads_per_failure=uploads_per_abort_failure(
+            exporter_settings(result["config"]["effective"])))
     status = {True: measurement.STATUS_PASSED, False: measurement.STATUS_FAILED}
     return [
         {"check": "fault_observed", "recorded": recorded, "rejudged": status[observed],
@@ -7313,6 +7346,15 @@ def rejudge_fault_checks(result, archive_dir) -> list:
         verdicts.append({"check": "duplicates_explained",
                          "recorded": statuses.get("duplicates_explained"),
                          "rejudged": measurement.STATUS_PASSED if explained
+                         else measurement.STATUS_FAILED, "reason": why})
+    if isinstance((fault.get("numbers") or {}).get("flush_abort_failures_count"), int):
+        passed, why = orphan_verdict(
+            fault["orphaned_uploads"], {}, fault["numbers"]["flush_abort_failures_count"],
+            uploads_per_failure=uploads_per_abort_failure(
+                exporter_settings(result["config"]["effective"])))
+        verdicts.append({"check": "orphaned_uploads_expected",
+                         "recorded": statuses.get("orphaned_uploads_expected"),
+                         "rejudged": measurement.STATUS_PASSED if passed
                          else measurement.STATUS_FAILED, "reason": why})
     if fault["fault"] == "store_outage":
         states = {state["state"]: state["unix_s"] for state in fault["states"]}

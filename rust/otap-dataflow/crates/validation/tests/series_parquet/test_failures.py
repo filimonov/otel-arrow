@@ -1483,6 +1483,44 @@ class ProcessCaseContracts(unittest.TestCase):
         self.assertTrue(faults.orphan_verdict([extra], {}, 1)[0])
         self.assertFalse(faults.orphan_verdict("AccessDenied", {}, 0)[0])
 
+    # Scenario: a reset CreateMultipartUpload is retried by the object store
+    # client inside one write attempt (retry.max_retries 5) and the store
+    # creates an upload on every try: 54 incomplete uploads behind 9 counted
+    # abort failures (Task 16 reset strict MinIO r002).
+    # Guarantees: one counted failure allows retry.max_retries + 1 uploads
+    # (default 10 + 1 when the section is absent), no more; a stored network
+    # run is re-judged by that rule from its numbers and effective config.
+    def test_one_abort_failure_allows_every_retried_creation(self):
+        self.assertEqual(faults.uploads_per_abort_failure({"retry": {"max_retries": 5}}), 6)
+        self.assertEqual(faults.uploads_per_abort_failure({}), 11)
+        uploads = [{"upload_id": f"u{index}", "key": "k"} for index in range(54)]
+        self.assertFalse(faults.orphan_verdict(uploads, {}, 9)[0])
+        self.assertTrue(faults.orphan_verdict(uploads, {}, 9, uploads_per_failure=6)[0])
+        self.assertTrue(faults.orphan_verdict(uploads[:9], {}, 9, uploads_per_failure=6)[0])
+        self.assertFalse(faults.orphan_verdict(uploads + uploads[:1], {}, 9,
+                                               uploads_per_failure=6)[0])
+        self.assertFalse(faults.orphan_verdict(uploads, {}, 8, uploads_per_failure=6)[0])
+        self.assertFalse(faults.orphan_verdict(uploads[:1], {}, 0, uploads_per_failure=6)[0])
+
+        def network_run(orphans, failures):
+            return {"run_id": "r", "config": {
+                "requested": {"topology": "strict"},
+                "effective": {"groups": {"default": {"pipelines": {"main": {"nodes": {
+                    "exporter": {"config": {"retry": {"max_retries": 5}}}}}}}}}},
+                "checks": [measurement.check("orphaned_uploads_expected", measurement.CHECK_HARD,
+                                             measurement.STATUS_FAILED)],
+                "observations": {"fault": {
+                    "fault": "reset", "orphaned_uploads": orphans,
+                    "numbers": {"flush_abort_failures_count": failures},
+                    "duplicates": {"duplicated_records": 0,
+                                   "duplicated_outside_resent_requests_records": 0}}}}
+        verdict = {entry["check"]: entry["rejudged"] for entry in
+                   faults.rejudge_fault_checks(network_run(uploads, 9), "/nonexistent")}
+        self.assertEqual(verdict["orphaned_uploads_expected"], measurement.STATUS_PASSED)
+        verdict = {entry["check"]: entry["rejudged"] for entry in
+                   faults.rejudge_fault_checks(network_run(uploads, 8), "/nonexistent")}
+        self.assertEqual(verdict["orphaned_uploads_expected"], measurement.STATUS_FAILED)
+
     # Scenario: stored process runs are re-judged: a graceful stop past the
     # cleanup cutoff, a multipart gate on logged bytes only, an expected
     # upload that vanished, and a clean kill_upload run.

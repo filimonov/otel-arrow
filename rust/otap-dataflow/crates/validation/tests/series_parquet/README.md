@@ -629,7 +629,11 @@ The hard checks beside the common ones:
   object above one part with a multipart ETag;
 - `orphaned_uploads_expected`: the bucket's incomplete multipart uploads,
   listed in the store directly after the engine stopped, number at most the
-  `flush.abort_failures` the exporter reported;
+  `flush.abort_failures` the exporter reported times `retry.max_retries + 1`:
+  the exporter counts one failure per failed write attempt, and inside an
+  attempt the object store client retries a CreateMultipartUpload up to
+  `max_retries` times, each try possibly creating an upload whose id the
+  writer never receives (`uploads_per_abort_failure`);
 - `partition_lateness_bound`: no object of a partition hour visible more
   than `window.interval + 2 * (flush_retry_deadline + upload.abort_timeout)`
   (135 s here) after the hour ended, by the store's LastModified or by the
@@ -750,9 +754,9 @@ The process checks beside the S3 family's:
 
 `orphaned_uploads_expected` requires every values upload a killed engine left
 open at its exit to be still listed under its key, allows other uploads only
-up to the reported abort failures, and, once the evidence is kept and the case
-aborted every incomplete upload itself (`orphan_cleanup`), requires none left
-(`orphan_verdict`). Buffered, `duplicates_explained`
+up to the reported abort failures times `retry.max_retries + 1`, and, once
+the evidence is kept and the case aborted every incomplete upload itself
+(`orphan_cleanup`), requires none left (`orphan_verdict`). Buffered, `duplicates_explained`
 accepts a duplicate stored before a restart and again after it, one of a
 request the producer resent because a kill cut off its acknowledgement, or
 one copied in a failed block.
