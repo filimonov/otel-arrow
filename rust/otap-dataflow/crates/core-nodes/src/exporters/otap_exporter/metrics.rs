@@ -21,6 +21,8 @@ use tonic::{Code, Status};
 pub(super) enum OtapExporterErrorType {
     /// The incoming PData payload could not be converted to OTAP Arrow records.
     PayloadConversion,
+    /// The OTLP request body's protobuf framing is broken; the request is refused.
+    MalformedBody,
     /// OTAP Arrow records could not be encoded into outbound batch records.
     Encoding,
     /// Authentication credentials were rejected by the destination.
@@ -222,6 +224,17 @@ mod tests {
         assert_eq!(
             OtapExporterErrorType::from_batch_status(i32::MAX),
             OtapExporterErrorType::Other
+        );
+    }
+
+    /// Scenario: the error type of an OTLP request refused for a malformed body is rendered.
+    /// Guarantees: it has its own stable `error.type` value, `malformed_body`.
+    #[test]
+    fn a_malformed_body_has_its_own_error_type() {
+        use otel_arrow_dfe_telemetry::attributes::AttributeEnum as _;
+        assert_eq!(
+            OtapExporterErrorType::MalformedBody.as_str(),
+            "malformed_body"
         );
     }
 

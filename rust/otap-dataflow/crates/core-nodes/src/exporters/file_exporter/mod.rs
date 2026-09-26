@@ -51,6 +51,8 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use writer::{SignalWriter, WriterFailure};
 
+use super::otlp_framing::{self, MalformedBodyLog};
+
 /// Component URN for the file exporter.
 pub const FILE_EXPORTER_URN: &str = "urn:otel:exporter:file";
 
@@ -64,6 +66,7 @@ pub struct FileExporter {
     export_metrics: MeasurementMetricSet<FileExporterExportMetrics>,
     signal_metrics: MeasurementMetricSet<FileSignalMetrics>,
     failure_metrics: MeasurementMetricSet<FileFailureMetrics>,
+    malformed: MalformedBodyLog,
 }
 
 /// Declares the file exporter as a local exporter factory.
@@ -90,6 +93,7 @@ pub static FILE_EXPORTER: ExporterFactory<OtapPdata> = ExporterFactory {
                 export_metrics: FileExporterExportMetrics::register(&pipeline),
                 signal_metrics: FileSignalMetrics::register(&pipeline),
                 failure_metrics: FileFailureMetrics::register(&pipeline),
+                malformed: MalformedBodyLog::new(),
             };
             Ok(ExporterWrapper::local(
                 exporter,
@@ -168,6 +172,17 @@ impl FileExporter {
         ) {
             self.record_export_outcome(signal, Outcome::Failure);
             let reason = match error {
+                EncodeFailure::Framing(error) => {
+                    self.signal_metrics
+                        .with(SignalAttributes { signal })
+                        .malformed_bodies
+                        .inc();
+                    self.malformed.record(signal, &error);
+                    effect_handler
+                        .notify_nack(otlp_framing::refusal(&error, pdata))
+                        .await?;
+                    return Ok(());
+                }
                 EncodeFailure::Frame(FrameEncodeError::FrameTooLarge { .. }) => {
                     "file exporter frame exceeds max_frame_bytes; split the batch upstream"
                         .to_owned()
@@ -357,6 +372,8 @@ impl FileExporter {
 
 #[derive(Debug, thiserror::Error)]
 enum EncodeFailure {
+    #[error(transparent)]
+    Framing(otel_arrow_dfe_pdata::error::Error),
     #[error("{0}")]
     View(String),
     #[error(transparent)]
@@ -370,23 +387,20 @@ fn encode_payload(
 ) -> Result<(), EncodeFailure> {
     frame.clear();
     match payload.data() {
-        PayloadData::OtlpBytes(bytes) => match bytes {
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(_) => {
-                let view = RawLogsData::try_from(bytes)
-                    .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_logs(&view, frame, max_frame_bytes)?;
+        PayloadData::OtlpBytes(bytes) => {
+            otlp_framing::check(payload).map_err(EncodeFailure::Framing)?;
+            match bytes {
+                otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(buf) => {
+                    encode_logs(&RawLogsData::new(buf), frame, max_frame_bytes)?;
+                }
+                otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(buf) => {
+                    encode_metrics(&RawMetricsData::new(buf), frame, max_frame_bytes)?;
+                }
+                otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(buf) => {
+                    encode_traces(&RawTraceData::new(buf), frame, max_frame_bytes)?;
+                }
             }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportMetricsRequest(bytes) => {
-                let view = RawMetricsData::try_new(bytes)
-                    .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_metrics(&view, frame, max_frame_bytes)?;
-            }
-            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportTracesRequest(bytes) => {
-                let view = RawTraceData::try_new(bytes)
-                    .map_err(|error| EncodeFailure::View(error.to_string()))?;
-                encode_traces(&view, frame, max_frame_bytes)?;
-            }
-        },
+        }
         PayloadData::OtapArrowRecords(records) => match records.signal_type() {
             SignalType::Logs => {
                 let view = OtapLogsView::try_from(records)
@@ -433,7 +447,7 @@ fn exporter_error(
 mod tests {
     use super::*;
     use otel_arrow_dfe_engine::Interests;
-    use otel_arrow_dfe_engine::control::PipelineCompletionMsg;
+    use otel_arrow_dfe_engine::control::{NackCause, PipelineCompletionMsg};
     use otel_arrow_dfe_engine::testing::exporter::{
         TestContext, TestRuntime, create_exporter_from_factory,
     };
@@ -525,6 +539,15 @@ mod tests {
     }
 
     async fn assert_permanent_nack(ctx: &mut TestContext<OtapPdata>, expected_reason: &str) {
+        let _ = next_permanent_nack(ctx, expected_reason).await;
+    }
+
+    /// The next completion, which must be a permanent nack whose reason
+    /// contains `expected_reason`; returns its cause and reason.
+    async fn next_permanent_nack(
+        ctx: &mut TestContext<OtapPdata>,
+        expected_reason: &str,
+    ) -> (NackCause, String) {
         let mut completion_receiver = ctx.take_pipeline_completion_receiver().unwrap();
         let completion = tokio::time::timeout(Duration::from_secs(3), completion_receiver.recv())
             .await
@@ -534,6 +557,7 @@ mod tests {
             PipelineCompletionMsg::DeliverNack { nack } => {
                 assert!(nack.permanent);
                 assert!(nack.reason.contains(expected_reason), "{}", nack.reason);
+                (nack.cause, nack.reason)
             }
             PipelineCompletionMsg::DeliverAck { .. } => panic!("expected a permanent NACK"),
         }
@@ -642,10 +666,94 @@ mod tests {
             });
     }
 
-    /// Scenario: A malformed non-empty protobuf batch is delivered before a writer opens.
-    /// Guarantees: The exporter permanently rejects the input without creating a signal file.
+    /// Scenario: OTLP bodies whose protobuf framing is broken are delivered before a writer
+    /// opens: a logs body holding a truncated field key (`80`), and a logs, a metrics and a traces
+    /// body whose one nested `Resource*` message is `0a 01 0a`.
+    /// Guarantees: Each is nacked permanently as `Refused`, naming the malformed body, and no
+    /// signal file is created.
     #[test]
-    fn invalid_pdata_does_not_create_a_file() {
+    fn a_malformed_otlp_body_is_refused_without_a_file() {
+        let cases = [
+            (SignalType::Logs, "logs", vec![0x80], "field key"),
+            (
+                SignalType::Logs,
+                "logs",
+                vec![0x0a, 0x01, 0x0a],
+                "ResourceLogs",
+            ),
+            (
+                SignalType::Metrics,
+                "metrics",
+                vec![0x0a, 0x01, 0x0a],
+                "ResourceMetrics",
+            ),
+            (
+                SignalType::Traces,
+                "traces",
+                vec![0x0a, 0x01, 0x0a],
+                "ResourceSpans",
+            ),
+        ];
+        for (signal, name, body, named) in cases {
+            let dir = tempdir().unwrap();
+            let template = dir
+                .path()
+                .join("capture-{signal}-{core_id}-{generation}.jsonl");
+            let exporter = create_exporter_from_factory(
+                &FILE_EXPORTER,
+                json!({"path": template.to_string_lossy()}),
+            )
+            .unwrap();
+            let signal_path = dir.path().join(format!("capture-{name}-0-0.jsonl"));
+            TestRuntime::new()
+                .set_exporter(exporter)
+                .run_test(move |ctx| async move {
+                    let pdata =
+                        OtapPdata::new_default(OtlpProtoBytes::new_from_bytes(signal, body).into())
+                            .test_subscribe_to(
+                                Interests::NACKS,
+                                TestCallData::default().into(),
+                                123,
+                            );
+                    ctx.send_pdata(pdata).await.unwrap();
+                    ctx.send_shutdown(StdInstant::now() + Duration::from_secs(10), "test complete")
+                        .await
+                        .unwrap();
+                })
+                .run_validation(move |mut ctx, result| async move {
+                    result.unwrap();
+                    let (cause, reason) =
+                        next_permanent_nack(&mut ctx, "malformed OTLP request body").await;
+                    assert_eq!(cause, NackCause::Refused, "{signal:?}");
+                    assert!(reason.contains(named), "{signal:?}: {reason}");
+                    assert!(!signal_path.exists(), "{signal:?}");
+                });
+        }
+    }
+
+    /// Scenario: An OTLP logs request, well framed, whose record carries bytes that are not
+    /// UTF-8 in its string body and its severity text.
+    /// Guarantees: It passes the framing check and is refused by the JSON encoder: a permanent
+    /// nack as invalid pdata, of unspecified cause, and no signal file.
+    #[test]
+    fn invalid_utf8_is_refused_by_the_json_encoder() {
+        let len_field = |field: u32, payload: &[u8]| {
+            let mut out = Vec::new();
+            prost::encoding::encode_key(
+                field,
+                prost::encoding::WireType::LengthDelimited,
+                &mut out,
+            );
+            prost::encoding::encode_varint(payload.len() as u64, &mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let record = [
+            len_field(3, b"\xc3"),
+            len_field(5, &len_field(1, b"caf\xc3")),
+        ]
+        .concat();
+        let body = len_field(1, &len_field(2, &len_field(2, &record)));
         let dir = tempdir().unwrap();
         let template = dir
             .path()
@@ -660,10 +768,10 @@ mod tests {
             .set_exporter(exporter)
             .run_test(|ctx| async move {
                 let pdata = OtapPdata::new_default(
-                    OtlpProtoBytes::new_from_bytes(SignalType::Logs, vec![0x80]).into(),
+                    OtlpProtoBytes::new_from_bytes(SignalType::Logs, body).into(),
                 )
                 .test_subscribe_to(
-                    Interests::NACKS,
+                    Interests::ACKS | Interests::NACKS,
                     TestCallData::default().into(),
                     123,
                 );
@@ -674,7 +782,12 @@ mod tests {
             })
             .run_validation(move |mut ctx, result| async move {
                 result.unwrap();
-                assert_permanent_nack(&mut ctx, "invalid pdata").await;
+                let (cause, reason) = next_permanent_nack(
+                    &mut ctx,
+                    "file exporter rejected invalid pdata: could not encode OTLP JSON",
+                )
+                .await;
+                assert_eq!(cause, NackCause::Unspecified, "{reason}");
                 assert!(!logs_path.exists());
             });
     }

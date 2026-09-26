@@ -116,6 +116,7 @@ destination lifecycle operations.
 | `exporter.file.failures` | `{failure}` | `signal`, `operation` | Open, write, sync, or rollback failures. |
 | `exporter.file.tail_recoveries` | `{recovery}` | `signal` | Incomplete final frames repaired at open. |
 | `exporter.file.tail_recovered_bytes` | `By` | `signal` | Bytes removed by successful tail repair. |
+| `exporter.file.malformed.bodies` | `{message}` | `signal` | OTLP requests nacked permanently because their body's protobuf framing is broken. |
 
 No metric contains a destination path.
 
@@ -129,6 +130,9 @@ No metric contains a destination path.
 | `otelcol.node.file.operation.fail` | `warn` | `signal`, `operation`, `error` | A signal writer entered an I/O failure state. |
 | `otelcol.node.file.rollback.fail` | `error` | `signal`, `operation`, `error`, `rollback_error` | Rollback failed and the node will terminate. |
 | `otelcol.node.file.stop` | `info` | `reason` | Graceful shutdown completed. |
+| `otlp.malformed_body` | `warn` | `signal`, `error`, `suppressed` | An OTLP request whose protobuf framing is broken was refused; at most one line per second, `suppressed` counting the lines left out. |
+
+The check sees only a request that reaches this exporter as OTLP bytes: a node upstream that converts it to Arrow records (`batch`, `attributes`, `filter`, `transform`, `partition`, `log_sampling`, or `durable_buffer` with `otlp_handling: convert_to_arrow`) converts a damaged body leniently first, and this exporter then receives the partial or empty records.
 
 ## Limits
 

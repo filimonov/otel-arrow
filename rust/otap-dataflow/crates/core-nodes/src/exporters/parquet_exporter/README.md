@@ -123,12 +123,15 @@ channel and is not duplicated by the exporter.
 | `otap.exporter.parquet.rows_written` | `{row}` | Total number of rows written into Parquet writers (appended, not necessarily flushed yet). |
 | `otap.exporter.parquet.flush_scheduled_max_rows` | `{file}` | Files scheduled for flush due to reaching target rows per file. |
 | `otap.exporter.parquet.flush_scheduled_max_age` | `{file}` | Files scheduled for flush due to exceeding max age threshold. |
+| `otap.exporter.parquet.malformed.bodies` | `{message}` | OTLP requests dropped because their body's protobuf framing is broken. |
 
 ### Events
 
 | Event | Severity | Description |
 | --- | --- | --- |
-| *None* | N/A | No node-specific events are emitted. |
+| `otlp.malformed_body` | `warn` | An OTLP request whose protobuf framing is broken was dropped as a failed export; at most one line per second, `suppressed` counting the lines left out. |
+
+The check sees only a request that reaches this exporter as OTLP bytes: a node upstream that converts it to Arrow records (`batch`, `attributes`, `filter`, `transform`, `partition`, `log_sampling`, or `durable_buffer` with `otlp_handling: convert_to_arrow`) converts a damaged body leniently first, and this exporter then receives the partial or empty records.
 
 ## Limits
 

@@ -41,6 +41,7 @@ use self::idgen::PartitionSequenceIdGenerator;
 use self::partition::{Partition, partition};
 use self::schema::transform_to_known_schema;
 use self::writer::WriteBatch;
+use super::otlp_framing::{self, MalformedBodyLog};
 use async_trait::async_trait;
 use futures::{FutureExt, pin_mut};
 use futures_timer::Delay;
@@ -182,6 +183,7 @@ impl Exporter<OtapPdata> for ParquetExporter {
         effect_handler: EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         let exporter_id = effect_handler.exporter_id();
+        let mut malformed = MalformedBodyLog::new();
         if self.config.retry.is_some()
             && matches!(
                 &self.config.storage,
@@ -331,6 +333,24 @@ impl Exporter<OtapPdata> for ParquetExporter {
 
                     // Note: context is not used
                     let (_context, payload) = pdata.into_parts();
+
+                    // The conversion never refuses a damaged OTLP body; the
+                    // request is dropped as a failed export.
+                    if let Err(error) = otlp_framing::check(&payload) {
+                        if let Some(metrics) = self.io_metrics.as_mut() {
+                            metrics.malformed_bodies.inc();
+                        }
+                        if let Some(metrics) = self.pdata_metrics.as_mut() {
+                            metrics
+                                .with(SignalOutcomeAttributes {
+                                    signal: signal_type,
+                                    outcome: Outcome::Failure,
+                                })
+                                .record(export_start.elapsed());
+                        }
+                        malformed.record(signal_type, &error);
+                        continue;
+                    }
 
                     let mut otap_batch: OtapArrowRecords =
                         payload.try_into_with_default().inspect_err(|_| {
@@ -985,6 +1005,155 @@ mod test {
                     }
                 })
             });
+    }
+
+    /// The rows of every Parquet file of `table` under `base_dir`.
+    async fn table_batches(base_dir: &str, table: &str) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        let mut dir = tokio::fs::read_dir(format!("{base_dir}/{table}"))
+            .await
+            .expect("a table directory");
+        while let Some(entry) = dir.next_entry().await.expect("read dir") {
+            let file = File::open(entry.path()).await.unwrap();
+            let mut reader = ParquetRecordBatchStreamBuilder::new(file)
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            while let Some(batch) = reader.next().await {
+                batches.push(batch.unwrap());
+            }
+        }
+        batches
+    }
+
+    /// Run a file-storage parquet exporter over `requests`, OTLP logs bodies,
+    /// and return the rows it wrote to the logs table.
+    fn write_otlp_logs(requests: Vec<Vec<u8>>) -> Vec<RecordBatch> {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_dir: String = temp_dir.path().to_str().unwrap().into();
+        let exporter = ParquetExporter::new(config::Config {
+            storage: object_store::StorageType::File {
+                base_uri: base_dir.clone(),
+            },
+            retry: None,
+            partitioning_strategies: None,
+            writer_options: None,
+        });
+        let node_config = Arc::new(NodeUserConfig::new_exporter_config(PARQUET_EXPORTER_URN));
+        let exporter = ExporterWrapper::<OtapPdata>::local::<ParquetExporter>(
+            exporter,
+            test_node(test_runtime.config().name.clone()),
+            node_config,
+            test_runtime.config(),
+        );
+        let (batches_tx, batches_rx) = std::sync::mpsc::channel();
+        test_runtime
+            .set_exporter(exporter)
+            .run_test(move |ctx| {
+                Box::pin(async move {
+                    for body in requests {
+                        let request =
+                            otel_arrow_dfe_pdata::OtlpProtoBytes::ExportLogsRequest(body.into());
+                        ctx.send_pdata(OtapPdata::new_default(request.into()))
+                            .await
+                            .expect("send the request");
+                    }
+                    ctx.send_shutdown(Instant::now().add(Duration::from_secs(1)), "done")
+                        .await
+                        .unwrap();
+                })
+            })
+            .run_validation(move |_ctx, exporter_result| {
+                Box::pin(async move {
+                    exporter_result.unwrap();
+                    batches_tx
+                        .send(table_batches(&base_dir, "logs").await)
+                        .unwrap();
+                })
+            });
+        batches_rx.recv().unwrap()
+    }
+
+    /// A logs request of three records, the last with the string attribute
+    /// `k = "abc"`.
+    fn three_records() -> Vec<u8> {
+        let record = |attributes| otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::LogRecord {
+            time_unix_nano: 1,
+            attributes,
+            ..Default::default()
+        };
+        let attribute = KeyValue {
+            key: "k".into(),
+            value: Some(AnyValue::new_string("abc")),
+        };
+        prost::Message::encode_to_vec(
+            &otel_arrow_dfe_pdata::proto::opentelemetry::collector::logs::v1::ExportLogsServiceRequest {
+                resource_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ResourceLogs {
+                    scope_logs: vec![otel_arrow_dfe_pdata::proto::opentelemetry::logs::v1::ScopeLogs {
+                        log_records: vec![record(vec![]), record(vec![]), record(vec![attribute])],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            },
+        )
+    }
+
+    /// Scenario: OTLP logs requests whose framing is broken where the lazy
+    /// conversion would still read rows (a field tag with no length after
+    /// the only `ResourceLogs`, an attribute value declaring two bytes more
+    /// than it holds, a one-byte nested `ResourceLogs` `0a 01 0a`), then
+    /// the well-formed request of three records.
+    /// Guarantees: the damaged requests are dropped rather than written as
+    /// empty or partial batches, the exporter keeps running, and exactly the
+    /// three rows of the well-formed OTLP request are written.
+    #[test]
+    fn a_malformed_otlp_body_is_not_written() {
+        let whole = three_records();
+        let mut outer = whole.clone();
+        outer.push(0x0a);
+        let mut inner = whole.clone();
+        let value = [0x0a, 0x03, b'a', b'b', b'c'];
+        let at = inner
+            .windows(value.len())
+            .position(|window| window == value)
+            .expect("the encoded attribute value");
+        inner[at + 1] = 0x05;
+        let batches = write_otlp_logs(vec![outer, inner, vec![0x0a, 0x01, 0x0a], whole]);
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 3, "only the well-formed request is written");
+    }
+
+    /// Scenario: an OTLP logs request whose one record has a string body
+    /// holding bytes that are not UTF-8 (`caf` then a lone `0xc3`).
+    /// Guarantees: it is written, not dropped, with U+FFFD in place of the
+    /// invalid byte, as the OTAP conversion stores it.
+    #[test]
+    fn invalid_utf8_is_written_with_a_replacement_character() {
+        let len_field = |field: u32, payload: &[u8]| {
+            let mut out = Vec::new();
+            prost::encoding::encode_key(
+                field,
+                prost::encoding::WireType::LengthDelimited,
+                &mut out,
+            );
+            prost::encoding::encode_varint(payload.len() as u64, &mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let mut record = vec![0x09];
+        record.extend(1_u64.to_le_bytes());
+        record.extend(len_field(5, &len_field(1, b"caf\xc3")));
+        let body = len_field(1, &len_field(2, &len_field(2, &record)));
+        let batches = write_otlp_logs(vec![body]);
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 1);
+        let printed = arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string();
+        assert!(printed.contains("caf\u{FFFD}"), "{printed}");
     }
 
     #[test]

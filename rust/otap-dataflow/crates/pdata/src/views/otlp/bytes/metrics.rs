@@ -37,8 +37,9 @@ use crate::schema::{SpanId, TraceId};
 use crate::views::otlp::bytes::common::{KeyValueIter, RawInstrumentationScope, RawKeyValue};
 use crate::views::otlp::bytes::decode::{
     FieldRanges, ProtoBytesParser, RepeatedFieldEncodings, RepeatedFieldProtoBytesParser,
-    RepeatedFixed64Iter, RepeatedVarintIter, decode_sint32, from_option_nonzero_range_to_primitive,
-    read_len_delim, read_varint, to_nonzero_range, validate_message_wire_format,
+    RepeatedFixed64Iter, RepeatedVarintIter, decode_sint32, field_range,
+    from_option_nonzero_range_to_primitive, read_len_delim, read_varint, to_nonzero_range,
+    validate_message_wire_format,
 };
 use crate::views::otlp::bytes::resource::RawResource;
 use otel_arrow_dfe_pdata_views::views::common::Str;
@@ -1060,6 +1061,10 @@ impl<'a> Iterator for ResourceMetricsIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None
@@ -2279,5 +2284,98 @@ mod test {
         };
         let bucket_counts = bucket_view.bucket_counts().collect::<Vec<_>>();
         assert_eq!(bucket_counts, vec![1, 2, 3]);
+    }
+
+    /// One run of a repeated scalar field: `take` values packed into one
+    /// length-delimited chunk (possibly empty) or written one tag each.
+    #[derive(Clone, Copy, Debug)]
+    struct Run {
+        packed: bool,
+        take: usize,
+    }
+
+    fn runs() -> impl proptest::strategy::Strategy<Value = Vec<Run>> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            (any::<bool>(), 0usize..4).prop_map(|(packed, take)| Run { packed, take }),
+            0..8,
+        )
+    }
+
+    /// Append `values` (each already encoded for `scalar_wire_type`) as field
+    /// `field_num`, split into `runs`; values left over go into a final
+    /// packed chunk.
+    fn encode_runs(
+        buf: &mut ProtoBuffer,
+        field_num: u64,
+        scalar_wire_type: u64,
+        values: &[Vec<u8>],
+        runs: &[Run],
+    ) {
+        let mut rest = values;
+        let tail = Run {
+            packed: true,
+            take: values.len(),
+        };
+        for run in runs.iter().chain(std::iter::once(&tail)) {
+            let (now, later) = rest.split_at(run.take.min(rest.len()));
+            rest = later;
+            if run.packed {
+                let _ = buf.encode_field_tag(field_num, wire_types::LEN);
+                let _ = buf.encode_varint(now.iter().map(Vec::len).sum::<usize>() as u64);
+                for value in now {
+                    let _ = buf.extend_from_slice(value);
+                }
+            } else {
+                for value in now {
+                    let _ = buf.encode_field_tag(field_num, scalar_wire_type);
+                    let _ = buf.extend_from_slice(value);
+                }
+            }
+        }
+    }
+
+    fn varint_bytes(value: u64) -> Vec<u8> {
+        let mut buf = ProtoBuffer::default();
+        let _ = buf.encode_varint(value);
+        buf.as_ref().to_vec()
+    }
+
+    proptest::proptest! {
+        /// Scenario: histogram bucket_counts and explicit_bounds, and exponential histogram bucket
+        /// counts, split into runs mixing packed chunks (some empty) and expanded values.
+        /// Guarantees: the byte views read the same values, in order, as prost decodes.
+        #[test]
+        fn repeated_scalars_read_like_prost_across_mixed_encodings(
+            counts in proptest::collection::vec(proptest::prelude::any::<u64>(), 0..12),
+            bounds in proptest::collection::vec(-1.0e9f64..1.0e9, 0..12),
+            count_runs in runs(),
+            bound_runs in runs(),
+        ) {
+            use crate::proto::opentelemetry::metrics::v1::{
+                HistogramDataPoint, exponential_histogram_data_point::Buckets,
+            };
+
+            let mut buffer = ProtoBuffer::default();
+            let fixed: Vec<Vec<u8>> = counts.iter().map(|v| v.to_le_bytes().to_vec()).collect();
+            encode_runs(&mut buffer, HISTOGRAM_DP_BUCKET_COUNTS, wire_types::FIXED64, &fixed, &count_runs);
+            let doubles: Vec<Vec<u8>> = bounds.iter().map(|v| v.to_le_bytes().to_vec()).collect();
+            encode_runs(&mut buffer, HISTOGRAM_DP_EXPLICIT_BOUNDS, wire_types::FIXED64, &doubles, &bound_runs);
+            let expected = HistogramDataPoint::decode(buffer.as_ref()).expect("prost decodes");
+            let view = RawHistogramDataPoint {
+                byte_parser: ProtoBytesParser::new(buffer.as_ref()),
+            };
+            proptest::prop_assert_eq!(view.bucket_counts().collect::<Vec<_>>(), expected.bucket_counts);
+            proptest::prop_assert_eq!(view.explicit_bounds().collect::<Vec<_>>(), expected.explicit_bounds);
+
+            buffer.clear();
+            let varints: Vec<Vec<u8>> = counts.iter().map(|v| varint_bytes(*v)).collect();
+            encode_runs(&mut buffer, EXP_HISTOGRAM_BUCKET_BUCKET_COUNTS, wire_types::VARINT, &varints, &count_runs);
+            let expected = Buckets::decode(buffer.as_ref()).expect("prost decodes");
+            let view = RawBuckets {
+                byte_parser: ProtoBytesParser::new(buffer.as_ref()),
+            };
+            proptest::prop_assert_eq!(view.bucket_counts().collect::<Vec<_>>(), expected.bucket_counts);
+        }
     }
 }

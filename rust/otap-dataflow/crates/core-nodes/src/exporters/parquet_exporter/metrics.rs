@@ -42,4 +42,37 @@ pub struct ParquetExporterMetrics {
     /// File close/flush attempts that failed after the lower-level retry policy was exhausted.
     #[metric(unit = "{file}")]
     pub flush_failures: Counter<u64>,
+
+    /// OTLP requests dropped because their body's protobuf framing is broken.
+    #[metric(unit = "{message}")]
+    pub malformed_bodies: Counter<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otel_arrow_dfe_engine::context::ControllerContext;
+    use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
+
+    /// Scenario: one OTLP request is dropped for a malformed body and the IO metrics are
+    /// snapshotted.
+    /// Guarantees: the drop is counted as `otap.exporter.parquet.malformed.bodies`, apart from
+    /// the other failures.
+    #[test]
+    fn malformed_bodies_have_their_own_counter() {
+        let controller = ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline = controller.pipeline_context_with("grp".into(), "pipeline".into(), 0, 1, 0);
+        let mut metrics = ParquetExporterMetrics::register(&pipeline);
+        metrics.malformed_bodies.inc();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.descriptor().name, "otap.exporter.parquet");
+        let at = snapshot
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|metric| metric.name == "malformed.bodies")
+            .expect("a malformed.bodies metric");
+        assert_eq!(snapshot.get_metrics()[at].to_u64_lossy(), 1);
+    }
 }

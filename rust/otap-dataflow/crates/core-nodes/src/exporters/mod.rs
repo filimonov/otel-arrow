@@ -23,6 +23,14 @@ pub mod parquet_exporter;
 #[cfg(feature = "otap")]
 pub mod otap_exporter;
 
+/// Refusal of OTLP bodies whose framing is broken.
+#[cfg(any(feature = "file", feature = "otap", feature = "parquet"))]
+mod otlp_framing;
+
+/// Rate limit of the per-request refusal WARN lines.
+#[cfg(any(feature = "file", feature = "otap", feature = "parquet"))]
+mod log_gate;
+
 /// OTLP gRPC exporter.
 #[cfg(feature = "otlp")]
 pub mod otlp_grpc_exporter;

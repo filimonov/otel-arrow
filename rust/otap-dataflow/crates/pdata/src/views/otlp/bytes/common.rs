@@ -16,7 +16,7 @@ use crate::proto::consts::field_num::common::{
 };
 use crate::proto::consts::wire_types;
 use crate::views::otlp::bytes::decode::{
-    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_value_range,
+    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_range,
     from_option_nonzero_range_to_primitive, read_dropped_count, read_fixed64, read_len_delim,
     read_varint, to_nonzero_range,
 };
@@ -69,7 +69,7 @@ impl<'a> RawKeyValue<'a> {
             }
         };
 
-        let (start, end) = match field_value_range(self.buf, wire_types::LEN, next_pos) {
+        let (start, end) = match field_range(self.buf, tag, next_pos) {
             Some(range) => range,
             // invalid bytes in buffer: mark parsing exhausted so callers stop looping
             None => {
@@ -80,6 +80,11 @@ impl<'a> RawKeyValue<'a> {
         self.pos.set(end);
 
         let field = tag >> 3;
+        if tag & 7 != wire_types::LEN {
+            // Only `key` and `value` are read, both length-delimited; any
+            // other field has been stepped over by its own wire type.
+            return;
+        }
 
         match field {
             KEY_VALUE_KEY => self.key_range.set(to_nonzero_range(start, end)),
@@ -100,7 +105,10 @@ pub struct RawAnyValue<'a> {
     variant: Cell<Option<ValueType>>,
 
     // the offset in the buffer of the value. will be set to None, and will initialized to Some
-    // as we parse the buffer and determine the value start.
+    // as we parse the buffer and determine the value start. For `array_value` and
+    // `kvlist_value` it is the offset of the key of the first occurrence of the member's
+    // final run instead, because prost merges consecutive occurrences of one message-typed
+    // member and the view yields all of them (see [`MergedMember`]).
     value_offset: Cell<Option<usize>>,
 }
 
@@ -246,6 +254,10 @@ impl<'a> Iterator for AnyValueIter<'a> {
 
                 return Some(RawAnyValue::new(slice));
             }
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None
@@ -304,12 +316,12 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
     type KeyValue = RawKeyValue<'a>;
 
     type KeyValueIter<'kv>
-        = KeyValueIter<'a, KeyValuesListFieldOffsets>
+        = MergedMember<'a, KeyValueIter<'a, KeyValuesListFieldOffsets>>
     where
         Self: 'kv;
 
     type ArrayIter<'att>
-        = AnyValueIter<'a>
+        = MergedMember<'a, AnyValueIter<'a>>
     where
         Self: 'att;
 
@@ -318,27 +330,44 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
         match self.variant.get() {
             Some(variant_type) => variant_type,
             None => {
-                let variant_type = match read_varint(self.buf, 0) {
-                    Some((tag, pos)) => {
-                        let field = tag >> 3;
-                        self.value_offset.set(Some(pos));
-
-                        match field {
-                            ANY_VALUE_STRING_VALUE => ValueType::String,
-                            ANY_VALUE_BOOL_VALUE => ValueType::Bool,
-                            ANY_VALUE_INT_VALUE => ValueType::Int64,
-                            ANY_VALUE_DOUBLE_VALUE => ValueType::Double,
-                            ANY_VALUE_ARRAY_VALUE => ValueType::Array,
-                            ANY_VALUE_KVLIST_VALUE => ValueType::KeyValueList,
-                            ANY_VALUE_BYTES_VALUE => ValueType::Bytes,
-                            _ => {
-                                // treat unknown types as an empty value
-                                ValueType::Empty
-                            }
+                // Every field is scanned: an unknown field may precede the
+                // value, and a oneof set more than once reads as prost decodes
+                // it. The last member wins, except that a message-typed member
+                // (`array_value`, `kvlist_value`) following itself is merged
+                // into one run whose repeated contents are concatenated. A
+                // value with no member, or only unknown fields, is empty.
+                let mut variant_type = ValueType::Empty;
+                let mut pos = 0;
+                while pos < self.buf.len() {
+                    let Some((tag, next)) = read_varint(self.buf, pos) else {
+                        break;
+                    };
+                    let member = match (tag >> 3, tag & 7) {
+                        (ANY_VALUE_STRING_VALUE, wire_types::LEN) => Some(ValueType::String),
+                        (ANY_VALUE_BOOL_VALUE, wire_types::VARINT) => Some(ValueType::Bool),
+                        (ANY_VALUE_INT_VALUE, wire_types::VARINT) => Some(ValueType::Int64),
+                        (ANY_VALUE_DOUBLE_VALUE, wire_types::FIXED64) => Some(ValueType::Double),
+                        (ANY_VALUE_ARRAY_VALUE, wire_types::LEN) => Some(ValueType::Array),
+                        (ANY_VALUE_KVLIST_VALUE, wire_types::LEN) => Some(ValueType::KeyValueList),
+                        (ANY_VALUE_BYTES_VALUE, wire_types::LEN) => Some(ValueType::Bytes),
+                        _ => None,
+                    };
+                    if let Some(member) = member {
+                        let message_typed =
+                            matches!(member, ValueType::Array | ValueType::KeyValueList);
+                        if !(message_typed && member == variant_type) {
+                            // A new run: remember where its first key is for a
+                            // message-typed member, or the value itself.
+                            variant_type = member;
+                            self.value_offset
+                                .set(Some(if message_typed { pos } else { next }));
                         }
                     }
-                    None => ValueType::Empty,
-                };
+                    let Some((_, end)) = field_range(self.buf, tag, next) else {
+                        break;
+                    };
+                    pos = end;
+                }
 
                 self.variant.set(Some(variant_type));
                 variant_type
@@ -431,8 +460,11 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
                 .value_offset
                 .get()
                 .expect("expect to have been initialized");
-            let (slice, _) = read_len_delim(self.buf, value_offset)?;
-            Some(AnyValueIter { buf: slice, pos: 0 })
+            Some(MergedMember::new(
+                self.buf.get(value_offset..)?,
+                ANY_VALUE_ARRAY_VALUE,
+                open_array,
+            ))
         } else {
             None
         }
@@ -446,16 +478,89 @@ impl<'a> AnyValueView<'a> for RawAnyValue<'a> {
                 .value_offset
                 .get()
                 .expect("expect to have been initialized");
-            let (slice, _) = read_len_delim(self.buf, value_offset)?;
-            Some(KeyValueIter::new(
-                RepeatedFieldProtoBytesParser::from_byte_parser(
-                    &ProtoBytesParser::new(slice),
-                    KEY_VALUE_LIST_VALUES,
-                    wire_types::LEN,
-                ),
+            Some(MergedMember::new(
+                self.buf.get(value_offset..)?,
+                ANY_VALUE_KVLIST_VALUE,
+                open_kvlist,
             ))
         } else {
             None
+        }
+    }
+}
+
+/// The elements of one serialized `ArrayValue`.
+fn open_array(slice: &[u8]) -> AnyValueIter<'_> {
+    AnyValueIter { buf: slice, pos: 0 }
+}
+
+/// The key-values of one serialized `KeyValueList`. Like every
+/// `ProtoBytesParser`, the parser behind it allocates its shared state (one
+/// `Rc`) per occurrence.
+fn open_kvlist(slice: &[u8]) -> KeyValueIter<'_, KeyValuesListFieldOffsets> {
+    KeyValueIter::new(RepeatedFieldProtoBytesParser::from_byte_parser(
+        &ProtoBytesParser::new(slice),
+        KEY_VALUE_LIST_VALUES,
+        wire_types::LEN,
+    ))
+}
+
+/// Iterator over the repeated contents of every occurrence of one
+/// message-typed `AnyValue` member (`array_value` or `kvlist_value`) in a run,
+/// in order: what prost yields when it merges a member that follows itself.
+///
+/// `rest` starts at the key of the run's first occurrence; every later field
+/// in it is either another occurrence of the same member or a field that is
+/// not a member (unknown, or a member under another wire type), because any
+/// other member would have started a new run. Occurrences are found by
+/// scanning `rest` as the iteration reaches them, so no list of occurrences is
+/// kept. The keys and length prefixes of the run are read a second time here,
+/// after `value_type` has scanned the whole value once; each kvlist
+/// occurrence costs one `Rc` allocation (see [`open_kvlist`]). A repeated
+/// member is rare, and the common single occurrence costs one extra key
+/// read.
+pub struct MergedMember<'a, I> {
+    rest: &'a [u8],
+    pos: usize,
+    member: u64,
+    current: Option<I>,
+    open: fn(&'a [u8]) -> I,
+}
+
+impl<'a, I> MergedMember<'a, I> {
+    fn new(rest: &'a [u8], member: u64, open: fn(&'a [u8]) -> I) -> Self {
+        Self {
+            rest,
+            pos: 0,
+            member,
+            current: None,
+            open,
+        }
+    }
+}
+
+impl<'a, I: Iterator> Iterator for MergedMember<'a, I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.current.as_mut().and_then(Iterator::next) {
+                return Some(item);
+            }
+            // The current occurrence is exhausted: open the next one.
+            loop {
+                if self.pos >= self.rest.len() {
+                    self.current = None;
+                    return None;
+                }
+                let (tag, next_pos) = read_varint(self.rest, self.pos)?;
+                let (start, end) = field_range(self.rest, tag, next_pos)?;
+                self.pos = end;
+                if tag >> 3 == self.member && tag & 7 == wire_types::LEN {
+                    self.current = Some((self.open)(&self.rest[start..end]));
+                    break;
+                }
+            }
         }
     }
 }
@@ -578,5 +683,133 @@ mod test {
         let kv_view = RawKeyValue::new(protobuf.as_slice());
         let value = kv_view.value();
         assert!(value.is_none());
+    }
+
+    /// Read a serialized `AnyValue` through the byte view into the prost
+    /// type, recursively, so the view can be compared with prost's decoding.
+    fn read_through_view(
+        value: &super::RawAnyValue<'_>,
+    ) -> crate::proto::opentelemetry::common::v1::AnyValue {
+        use crate::proto::opentelemetry::common::v1::{
+            AnyValue, ArrayValue, KeyValue, KeyValueList, any_value::Value,
+        };
+        use otel_arrow_dfe_pdata_views::views::common::{AnyValueView, ValueType};
+        let string = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).expect("utf-8");
+        let value = match value.value_type() {
+            ValueType::Empty => None,
+            ValueType::String => Some(Value::StringValue(string(value.as_string().unwrap()))),
+            ValueType::Bool => Some(Value::BoolValue(value.as_bool().unwrap())),
+            ValueType::Int64 => Some(Value::IntValue(value.as_int64().unwrap())),
+            ValueType::Double => Some(Value::DoubleValue(value.as_double().unwrap())),
+            ValueType::Bytes => Some(Value::BytesValue(value.as_bytes().unwrap().to_vec())),
+            ValueType::Array => Some(Value::ArrayValue(ArrayValue {
+                values: value
+                    .as_array()
+                    .unwrap()
+                    .map(|v| read_through_view(&v))
+                    .collect(),
+            })),
+            ValueType::KeyValueList => Some(Value::KvlistValue(KeyValueList {
+                values: value
+                    .as_kvlist()
+                    .unwrap()
+                    .map(|kv| KeyValue {
+                        key: string(kv.key()),
+                        value: kv.value().map(|v| read_through_view(&v)),
+                    })
+                    .collect(),
+            })),
+        };
+        AnyValue { value }
+    }
+
+    /// Scenario: `AnyValue` bodies that set the oneof more than once: a
+    /// non-empty `array_value` then an empty one, two non-empty
+    /// `kvlist_value`s, an `array_value` then a `string_value`, an array, a
+    /// string and another array, two arrays with an unknown field between
+    /// them, a string then an array, and two `string_value`s.
+    /// Guarantees: the byte view reads each exactly as prost decodes it: a
+    /// message-typed member that follows itself is merged (its elements
+    /// concatenated, so a trailing empty occurrence loses nothing), any other
+    /// later member wins, and an unknown field does not break a run.
+    #[test]
+    fn repeated_any_value_members_read_as_prost_decodes_them() {
+        use prost::Message as _;
+        let len_field = |field: u32, payload: &[u8]| {
+            let mut out = Vec::new();
+            prost::encoding::encode_key(
+                field,
+                prost::encoding::WireType::LengthDelimited,
+                &mut out,
+            );
+            prost::encoding::encode_varint(payload.len() as u64, &mut out);
+            out.extend_from_slice(payload);
+            out
+        };
+        let string = |text: &[u8]| len_field(1, text);
+        let array = |elements: &[&[u8]]| {
+            let content: Vec<u8> = elements.iter().flat_map(|e| len_field(1, e)).collect();
+            len_field(5, &content)
+        };
+        let kvlist = |pairs: &[(&[u8], &[u8])]| {
+            let content: Vec<u8> = pairs
+                .iter()
+                .flat_map(|(k, v)| len_field(1, &[len_field(1, k), len_field(2, v)].concat()))
+                .collect();
+            len_field(6, &content)
+        };
+        let unknown = [0xf8, 0x01, 0x07];
+        let a = string(b"a");
+        let b = string(b"b");
+        let c = string(b"c");
+        let bodies: Vec<(&str, Vec<u8>, usize)> = vec![
+            (
+                "array then empty array",
+                [array(&[&a, &b]), array(&[])].concat(),
+                2,
+            ),
+            (
+                "two kvlists",
+                [kvlist(&[(b"k1", &a)]), kvlist(&[(b"k2", &b), (b"k3", &c)])].concat(),
+                3,
+            ),
+            (
+                "array then string",
+                [array(&[&a]), string(b"s")].concat(),
+                0,
+            ),
+            (
+                "array, string, array",
+                [array(&[&a]), string(b"s"), array(&[&b, &c])].concat(),
+                2,
+            ),
+            (
+                "arrays around an unknown field",
+                [array(&[&a]), unknown.to_vec(), array(&[&b])].concat(),
+                2,
+            ),
+            (
+                "string then array",
+                [string(b"s"), array(&[&a])].concat(),
+                1,
+            ),
+            ("two strings", [string(b"x"), string(b"y")].concat(), 0),
+        ];
+        for (name, body, elements) in bodies {
+            let prost_value = crate::proto::opentelemetry::common::v1::AnyValue::decode(&body[..])
+                .expect("prost decodes it");
+            let view_value = read_through_view(&super::RawAnyValue::new(&body));
+            assert_eq!(view_value, prost_value, "{name}");
+            let count = match &prost_value.value {
+                Some(crate::proto::opentelemetry::common::v1::any_value::Value::ArrayValue(v)) => {
+                    v.values.len()
+                }
+                Some(crate::proto::opentelemetry::common::v1::any_value::Value::KvlistValue(v)) => {
+                    v.values.len()
+                }
+                _ => 0,
+            };
+            assert_eq!(count, elements, "{name}");
+        }
     }
 }

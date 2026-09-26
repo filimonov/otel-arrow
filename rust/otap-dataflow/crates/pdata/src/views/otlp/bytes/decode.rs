@@ -8,55 +8,21 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 
+use super::validate::WireProblem;
 use crate::error::Error;
 use crate::proto::consts::wire_types;
 
 /// Validates the wire framing of one protobuf message without decoding nested messages.
-pub(super) fn validate_message_wire_format(buf: &[u8]) -> Result<(), Error> {
+pub(crate) fn validate_message_wire_format(buf: &[u8]) -> Result<(), Error> {
     let mut pos = 0;
     while pos < buf.len() {
-        let (tag, next) = read_varint(buf, pos).ok_or(Error::InvalidProtobufWireFormat)?;
-        if tag > u64::from(u32::MAX) {
-            return Err(Error::InvalidProtobufWireFormat);
-        }
-        let field_num = tag >> 3;
-        let wire_type = tag & 7;
-        if field_num == 0 {
-            return Err(Error::InvalidProtobufWireFormat);
-        }
-        pos = match wire_type {
-            wire_types::VARINT => {
-                let (_, next) = read_varint(buf, next).ok_or(Error::InvalidProtobufWireFormat)?;
-                next
-            }
-            wire_types::LEN => {
-                let (len, next) = read_varint(buf, next).ok_or(Error::InvalidProtobufWireFormat)?;
-                let end = next
-                    .checked_add(
-                        usize::try_from(len).map_err(|_| Error::InvalidProtobufWireFormat)?,
-                    )
-                    .ok_or(Error::InvalidProtobufWireFormat)?;
-                if end > buf.len() {
-                    return Err(Error::InvalidProtobufWireFormat);
-                }
-                end
-            }
-            wire_types::FIXED64 => checked_fixed_end(next, 8, buf.len())?,
-            wire_types::FIXED32 => checked_fixed_end(next, 4, buf.len())?,
-            _ => return Err(Error::InvalidProtobufWireFormat),
-        };
+        let (_, wire_type, next) =
+            read_key(buf, pos).map_err(|_| Error::InvalidProtobufWireFormat)?;
+        pos = value_range(buf, wire_type, next)
+            .map_err(|_| Error::InvalidProtobufWireFormat)?
+            .1;
     }
     Ok(())
-}
-
-fn checked_fixed_end(start: usize, width: usize, buffer_len: usize) -> Result<usize, Error> {
-    let end = start
-        .checked_add(width)
-        .ok_or(Error::InvalidProtobufWireFormat)?;
-    if end > buffer_len {
-        return Err(Error::InvalidProtobufWireFormat);
-    }
-    Ok(end)
 }
 
 /// Clones the parser, sharing the underlying buffer and interior-mutability state.
@@ -195,7 +161,7 @@ where
             let field = tag >> 3;
             let wire_type = tag & 7;
 
-            let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+            let (start, end) = field_range(self.buf, tag, next_pos)?;
             self.state.pos.set(end);
 
             // save the offset of the field we've encountered
@@ -227,36 +193,129 @@ where
     }
 }
 
-/// return the range of the positions in the byte slice containing values. The range is determined
-/// from the wire type. Returns `None` for truncated/invalid fields (out-of-range
-/// LEN payloads or fixed-width fields with too few bytes remaining) and for
-/// unknown wire types, so callers can treat malformed input as an absent field
-/// rather than producing an out-of-bounds range.
+/// The range of the field whose key `tag` ends at `pos`, as a message scanner
+/// needs it to step to the next field: the [`value_range`] of the value, and
+/// for an unknown group the range from just past its start key to just past
+/// its end key, found by [`skip_group`], so a balanced group never ends a
+/// scan early and hides the fields after it. Anything [`value_range`] or
+/// [`skip_group`] refuses is `None`, so callers treat malformed input as an
+/// absent field.
 #[inline]
-pub(crate) fn field_value_range(buf: &[u8], wire_type: u64, pos: usize) -> Option<(usize, usize)> {
-    let range = match wire_type {
+pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, usize)> {
+    match tag & 7 {
+        START_GROUP => {
+            let end = skip_group(buf, pos, tag >> 3, 1, pos).ok()?;
+            Some((pos, end))
+        }
+        wire_type => value_range(buf, wire_type, pos).ok(),
+    }
+}
+
+/// Wire type 3: the start of a group (proto2), carrying no length.
+pub(crate) const START_GROUP: u64 = 3;
+/// Wire type 4: the end of the group opened by the same field number.
+pub(crate) const END_GROUP: u64 = 4;
+
+/// Decode the field key at `pos`: its field number, its wire type and the
+/// position just past it. A key outside protobuf's 32-bit range, or with
+/// field number zero, is refused.
+#[inline]
+pub(crate) fn read_key(buf: &[u8], pos: usize) -> Result<(u64, u64, usize), WireProblem> {
+    let (tag, next) = read_varint(buf, pos).ok_or(WireProblem::TruncatedKey)?;
+    let field_num = tag >> 3;
+    if tag > u64::from(u32::MAX) || field_num == 0 {
+        return Err(WireProblem::InvalidKey);
+    }
+    Ok((field_num, tag & 7, next))
+}
+
+/// The byte range of the value of a field of `wire_type` whose key ends at
+/// `pos`, bounds-checked against `buf`. For a length-delimited field the
+/// range excludes the length prefix. Groups (wire types 3 and 4) are refused
+/// here, because skipping one needs its field number: see [`skip_group`].
+#[inline]
+pub(crate) fn value_range(
+    buf: &[u8],
+    wire_type: u64,
+    pos: usize,
+) -> Result<(usize, usize), WireProblem> {
+    match wire_type {
         wire_types::VARINT => {
-            // /// TODO this could maybe be read_variant bytes for faster perf
-            let (_, p) = read_varint(buf, pos)?;
-            (pos, p)
+            let (_, end) = read_varint(buf, pos).ok_or(WireProblem::TruncatedVarint)?;
+            Ok((pos, end))
         }
-
         wire_types::LEN => {
-            let (slice, end) = read_len_delim(buf, pos)?;
-            (end - slice.len(), end)
+            let (len, start) = read_varint(buf, pos).ok_or(WireProblem::TruncatedLength)?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| start.checked_add(len))
+                .filter(|&end| end <= buf.len())
+                .ok_or(WireProblem::LengthOverrun)?;
+            Ok((start, end))
         }
-        wire_types::FIXED64 => {
-            let (_, end) = read_fixed64(buf, pos)?;
-            (pos, end)
-        }
-        wire_types::FIXED32 => {
-            let (_, end) = read_fixed32(buf, pos)?;
-            (pos, end)
-        }
-        _ => return None,
-    };
+        wire_types::FIXED64 => fixed_range(buf, pos, 8),
+        wire_types::FIXED32 => fixed_range(buf, pos, 4),
+        _ => Err(WireProblem::UnsupportedWireType),
+    }
+}
 
-    Some(range)
+#[inline]
+fn fixed_range(buf: &[u8], pos: usize, width: usize) -> Result<(usize, usize), WireProblem> {
+    pos.checked_add(width)
+        .filter(|&end| end <= buf.len())
+        .map(|end| (pos, end))
+        .ok_or(WireProblem::TruncatedFixed)
+}
+
+/// Why [`skip_group`] could not skip a group; `at` is a position in the
+/// buffer it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipError {
+    /// The group's framing is broken.
+    Framing { problem: WireProblem, at: usize },
+    /// Groups nest deeper than
+    /// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`].
+    TooDeep { at: usize },
+}
+
+/// Skip the group of field `field_num` whose start key is at `group_at` and
+/// ends at `pos`, as prost skips an unknown group: every field inside is
+/// framed and skipped, nested groups are skipped the same way, and the group
+/// must close with an end key of its own field number before `buf` ends.
+/// `depth` is the nesting level of this group, counted against
+/// [`super::validate::MAX_ANY_VALUE_NESTING_DEPTH`], which bounds the
+/// recursion, together with whatever nesting the caller already holds.
+/// Returns the position just past the end key.
+///
+/// This is the one group skipper: the validator and the byte-view scanners
+/// both call it, so what the validator accepts the views can step over.
+pub(crate) fn skip_group(
+    buf: &[u8],
+    mut pos: usize,
+    field_num: u64,
+    depth: usize,
+    group_at: usize,
+) -> Result<usize, SkipError> {
+    if depth > super::validate::MAX_ANY_VALUE_NESTING_DEPTH {
+        return Err(SkipError::TooDeep { at: group_at });
+    }
+    loop {
+        if pos >= buf.len() {
+            return Err(SkipError::Framing {
+                problem: WireProblem::UnclosedGroup,
+                at: group_at,
+            });
+        }
+        let at = pos;
+        let fail = |problem| SkipError::Framing { problem, at };
+        let (num, wire_type, next) = read_key(buf, pos).map_err(fail)?;
+        pos = match wire_type {
+            END_GROUP if num == field_num => return Ok(next),
+            END_GROUP => return Err(fail(WireProblem::MismatchedEndGroup)),
+            START_GROUP => skip_group(buf, next, num, depth + 1, at)?,
+            _ => value_range(buf, wire_type, next).map_err(fail)?.1,
+        };
+    }
 }
 
 /// `RepeatedFieldProtoBytesParser` is an iterator over byte slices for some field (represented by
@@ -275,9 +334,16 @@ pub struct RepeatedFieldProtoBytesParser<'a, T: FieldRanges> {
     field_num: u64,
     expected_wire_type: u64,
 
+    /// A second wire type the field may use, for repeated scalars that mix packed and expanded
+    /// occurrences.
+    other_wire_type: Option<u64>,
+
     /// pointer to the next range (containing the serialized message) that the iterator will yield
     /// when `next` invoked
     next_range: Option<(usize, usize)>,
+
+    /// wire type of the occurrence at `next_range`
+    next_wire_type: u64,
 
     values_exhausted: bool,
 }
@@ -299,19 +365,15 @@ where
             state: other.state.clone(),
             field_num,
             expected_wire_type,
+            other_wire_type: None,
             next_range: None,
+            next_wire_type: expected_wire_type,
             values_exhausted: false,
         }
     }
-}
 
-impl<'a, T> Iterator for RepeatedFieldProtoBytesParser<'a, T>
-where
-    T: FieldRanges,
-{
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Yields the next occurrence of the field with the wire type it was written with.
+    fn next_occurrence(&mut self) -> Option<(&'a [u8], u64)> {
         if self.values_exhausted {
             return None;
         }
@@ -335,7 +397,7 @@ where
                     let field = tag >> 3;
                     let wire_type = tag & 7;
 
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+                    let (start, end) = field_range(self.buf, tag, next_pos)?;
 
                     // save the offset of the field we've encountered
                     self.state
@@ -353,6 +415,7 @@ where
 
         // this is the return value
         let slice = &self.buf[range.0..range.1];
+        let slice_wire_type = self.next_wire_type;
 
         // advance until until either we've found the next repeated value, or the end is reached
         loop {
@@ -365,9 +428,12 @@ where
             let (tag, next_pos) = read_varint(self.buf, range.1)?;
             let field = tag >> 3;
             let wire_type = tag & 7;
-            range = field_value_range(self.buf, wire_type, next_pos)?;
+            range = field_range(self.buf, tag, next_pos)?;
 
-            if field == self.field_num && wire_type == self.expected_wire_type {
+            if field == self.field_num
+                && (wire_type == self.expected_wire_type || Some(wire_type) == self.other_wire_type)
+            {
+                self.next_wire_type = wire_type;
                 break;
             }
 
@@ -381,7 +447,18 @@ where
         self.state.pos.set(range.1);
         self.next_range = Some(range);
 
-        Some(slice)
+        Some((slice, slice_wire_type))
+    }
+}
+
+impl<'a, T> Iterator for RepeatedFieldProtoBytesParser<'a, T>
+where
+    T: FieldRanges,
+{
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_occurrence().map(|(slice, _)| slice)
     }
 }
 
@@ -538,13 +615,9 @@ pub struct RepeatedPrimitiveIter<'a, T: RepeatedFieldEncodings, V, P> {
     // - the segments containing the packed fields (in case that the encoding is packed)
     field_iter: Option<RepeatedFieldProtoBytesParser<'a, T>>,
 
-    // this will be initialized lazily if the encoding is packed. one instance of the packed
-    // encoder (type P) wil be created for each segment of the buffer containing packed values
+    // the packed chunk being read, if the last occurrence was packed. one instance of the packed
+    // encoder (type P) is created for each segment of the buffer containing packed values
     packed_iter: Option<P>,
-
-    // flag for whether the field is packed or expanded. this will be initialized lazily
-    // as well once the encoding is determined
-    packed: bool,
 
     _pd: PhantomData<V>,
 }
@@ -565,8 +638,7 @@ where
             repeated_wire_type,
             _pd: PhantomData,
 
-            // following fields will be initialized lazily once encoding determined
-            packed: Default::default(),
+            // following fields will be initialized lazily once the first occurrence is found
             field_iter: None,
             packed_iter: None,
         }
@@ -586,18 +658,21 @@ where
             let range = self.state.field_ranges.get_field_range(self.field_num);
             match range {
                 Some(range) => {
-                    self.packed = self.state.field_ranges.is_packed(self.field_num);
+                    // each occurrence may be packed or expanded, whatever the first one was
+                    let first_wire_type = if self.state.field_ranges.is_packed(self.field_num) {
+                        wire_types::LEN
+                    } else {
+                        self.repeated_wire_type
+                    };
                     self.field_iter = Some(RepeatedFieldProtoBytesParser {
                         buf: self.buf,
                         state: self.state.clone(),
                         field_num: self.field_num,
                         next_range: Some(range),
+                        next_wire_type: first_wire_type,
                         values_exhausted: false,
-                        expected_wire_type: if self.packed {
-                            wire_types::LEN
-                        } else {
-                            self.repeated_wire_type
-                        },
+                        expected_wire_type: wire_types::LEN,
+                        other_wire_type: Some(self.repeated_wire_type),
                     });
                 }
                 None => {
@@ -612,7 +687,7 @@ where
                     let field = tag >> 3;
                     let wire_type = tag & 7;
 
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
+                    let (start, end) = field_range(self.buf, tag, next_pos)?;
 
                     // save the offset of the field we've encountered
                     self.state
@@ -627,26 +702,19 @@ where
         // safety: this will have been initialized already
         let field_iter = self.field_iter.as_mut().expect("field iter initialized");
 
-        if self.packed {
-            if self.packed_iter.is_none() {
-                let next_packed_slice = field_iter.next()?;
-                self.packed_iter = Some(P::new(next_packed_slice));
+        loop {
+            if let Some(val) = self.packed_iter.as_mut().and_then(Iterator::next) {
+                return Some(val);
             }
+            self.packed_iter = None;
 
-            let packed_iter = self.packed_iter.as_mut().expect("packed iter initialized");
-            match packed_iter.next() {
-                Some(val) => Some(val),
-                None => {
-                    // try to initialize a new packed iter for the next range
-                    let next_packed_slice = field_iter.next()?;
-                    let mut next_packed_iter = P::new(next_packed_slice);
-                    let result = next_packed_iter.next()?;
-                    self.packed_iter = Some(next_packed_iter);
-                    Some(result)
-                }
+            // packed chunks, empty ones included, and expanded values may interleave
+            let (slice, wire_type) = field_iter.next_occurrence()?;
+            if wire_type == wire_types::LEN {
+                self.packed_iter = Some(P::new(slice));
+            } else {
+                return P::decode_value(slice);
             }
-        } else {
-            field_iter.next().and_then(P::decode_value)
         }
     }
 }
@@ -684,7 +752,13 @@ where
     }
 }
 
-/// Decode variant at position in buffer
+/// Decode the varint at `pos` in `buf`, returning its value and the position
+/// just past it.
+///
+/// Returns `None` for a varint that runs past the end of `buf`, is longer
+/// than ten bytes, or whose tenth byte carries bits beyond the 64th (a tenth
+/// byte above `0x01`), as prost refuses them: such a varint does not encode a
+/// `u64`, and reading it modulo 2^64 would turn damage into a value.
 #[inline]
 #[must_use]
 pub fn read_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
@@ -698,6 +772,10 @@ pub fn read_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
         out |= ((byte & 0x7F) as u64) << shift;
 
         if byte < 0x80 {
+            // At shift 63 only the lowest bit still fits in a u64.
+            if shift == 63 && byte > 0x01 {
+                return None;
+            }
             return Some((out, pos));
         }
 
@@ -799,5 +877,33 @@ mod tests {
         assert_eq!(decode_sint32(1), -1);
         assert_eq!(decode_sint32(u32::MAX - 1), i32::MAX);
         assert_eq!(decode_sint32(u32::MAX), i32::MIN);
+    }
+
+    /// Scenario: ten-byte varints whose tenth byte is `0x01` (`u64::MAX`),
+    /// `0x02` (the 65th bit set) and `0x7f`, an eleven-byte varint, and the
+    /// same overflowing varint as the value of a top-level varint field.
+    /// Guarantees: the maximum `u64` decodes to itself in ten bytes, and every
+    /// varint carrying bits past the 64th is refused rather than read modulo
+    /// 2^64, as prost refuses it: `80 80 80 80 80 80 80 80 80 02` is not
+    /// zero.
+    #[test]
+    fn refuses_varints_that_overflow_u64() {
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(read_varint(&max, 0), Some((u64::MAX, 10)));
+        let mut overflow = [0x80; 10];
+        overflow[9] = 0x02;
+        assert_eq!(read_varint(&overflow, 0), None);
+        overflow[9] = 0x7f;
+        assert_eq!(read_varint(&overflow, 0), None);
+        let mut eleven = [0x80; 11];
+        eleven[10] = 0x00;
+        assert_eq!(read_varint(&eleven, 0), None);
+
+        let mut field = vec![0x08];
+        field.extend([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        assert!(matches!(
+            validate_message_wire_format(&field),
+            Err(Error::InvalidProtobufWireFormat)
+        ));
     }
 }

@@ -52,7 +52,7 @@ use crate::views::otlp::bytes::common::{
     KeyValueIter, RawAnyValue, RawInstrumentationScope, RawKeyValue,
 };
 use crate::views::otlp::bytes::decode::{
-    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser,
+    FieldRanges, ProtoBytesParser, RepeatedFieldProtoBytesParser, field_range,
     from_option_nonzero_range_to_primitive, read_dropped_count, read_len_delim, read_varint,
     to_nonzero_range, validate_message_wire_format,
 };
@@ -305,6 +305,10 @@ impl<'a> Iterator for ResourceLogsIter<'a> {
                     byte_parser: ProtoBytesParser::new(slice),
                 });
             }
+            // Step over any other field (unknown, or known with another wire
+            // type), so its value is never read as field keys.
+            let (_, end) = field_range(self.buf, tag, self.pos)?;
+            self.pos = end;
         }
 
         None

@@ -62,6 +62,9 @@ pub struct FileSignalMetrics {
     /// Bytes removed by successful append-tail recovery.
     #[metric(unit = "By")]
     pub tail_recovered_bytes: Counter<u64>,
+    /// OTLP requests refused because their body's protobuf framing is broken.
+    #[metric(unit = "{message}")]
+    pub malformed_bodies: Counter<u64>,
 }
 
 /// File I/O failures, partitioned by signal and bounded operation.
@@ -194,6 +197,33 @@ mod tests {
 
         assert!(exports.terminal_snapshots().is_empty());
         assert!(failures.terminal_snapshots().is_empty());
+    }
+
+    /// Scenario: one logs request is refused for a malformed OTLP body and the signal metrics are
+    /// handed off.
+    /// Guarantees: the refusal is counted as `exporter.file.malformed.bodies{signal=logs}`.
+    #[test]
+    fn malformed_bodies_are_counted_per_signal() {
+        let mut signals = FileSignalMetrics::register(&pipeline_context());
+        signals
+            .with(SignalAttributes {
+                signal: SignalType::Logs,
+            })
+            .malformed_bodies
+            .inc();
+
+        let snapshots = signals.terminal_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.descriptor().name, "exporter.file");
+        let at = snapshot
+            .descriptor()
+            .metrics
+            .iter()
+            .position(|metric| metric.name == "malformed.bodies")
+            .expect("a malformed.bodies metric");
+        assert_eq!(snapshot.get_metrics()[at].to_u64_lossy(), 1);
+        assert_eq!(snapshot.measurement_attribute_value("signal"), Some("logs"));
     }
 
     /// Scenario: File-operation enum values are rendered into metrics and events.

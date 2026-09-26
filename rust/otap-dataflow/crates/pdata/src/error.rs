@@ -150,6 +150,33 @@ pub enum Error {
     #[error("Invalid protobuf wire format")]
     InvalidProtobufWireFormat,
 
+    /// The framing of an OTLP request is broken at `offset`, a byte offset
+    /// from the start of the request, inside a message of type `message`.
+    #[error("Invalid protobuf wire format: {problem} in {message} at byte {offset}")]
+    InvalidOtlpWireFormat {
+        problem: crate::views::otlp::bytes::validate::WireProblem,
+        message: &'static str,
+        offset: usize,
+    },
+
+    /// An OTLP request nests `AnyValue` arrays and key-value lists deeper
+    /// than `limit` levels; `offset` is the byte offset of the field that
+    /// crosses the limit.
+    #[error("OTLP AnyValue nesting is deeper than {limit} levels at byte {offset}")]
+    OtlpNestingTooDeep { limit: usize, offset: usize },
+
+    /// A singular field (or a oneof) of an OTLP message occurs more than once
+    /// in one message; `offset` is the byte offset of the second occurrence.
+    #[error(
+        "OTLP {message}.{field} occurs more than once in one message at byte {offset}; \
+         the OTLP byte views would not read it as protobuf merges it"
+    )]
+    DuplicateOtlpField {
+        message: &'static str,
+        field: &'static str,
+        offset: usize,
+    },
+
     #[error("Log record not found")]
     LogRecordNotFound,
 

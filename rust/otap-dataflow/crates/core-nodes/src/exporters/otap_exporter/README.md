@@ -103,7 +103,8 @@ channel and is not duplicated by the exporter.
 | --- | --- | --- | --- |
 | `exporter.otap.failures.messages` | `{message}` | `signal`, `error.type` | Failed OTAP exports classified by actionable error type. |
 
-`error.type` is one of `payload_conversion`, `encoding`, `authentication`,
+`error.type` is one of `payload_conversion`, `malformed_body` (an OTLP
+request refused because its body's protobuf framing is broken), `encoding`, `authentication`,
 `authorization`, `timeout`, `throttled`, `unavailable`, `rejected`,
 `server_error`, `transport`, `internal`, `shutdown`, or `other`. Successful
 exports do not emit this metric.
@@ -134,6 +135,9 @@ unbounded telemetry state. Duration measurements are reported in seconds.
 | `otap_exporter.batch_status_failed` | `warn` | A returned OTAP batch status indicated failure. |
 | `otap_exporter.batch_status_unmatched` | `warn` | A returned OTAP batch status could not be matched to an in-flight batch. |
 | `otap_exporter.response_stream_failed` | `warn` | The OTAP response stream failed after connection. |
+| `otlp.malformed_body` | `warn` | An OTLP request whose protobuf framing is broken was nacked permanently; at most one line per second, `suppressed` counting the lines left out. |
+
+The check sees only a request that reaches this exporter as OTLP bytes: a node upstream that converts it to Arrow records (`batch`, `attributes`, `filter`, `transform`, `partition`, `log_sampling`, or `durable_buffer` with `otlp_handling: convert_to_arrow`) converts a damaged body leniently first, and this exporter then receives the partial or empty records.
 
 ## Limits
 
