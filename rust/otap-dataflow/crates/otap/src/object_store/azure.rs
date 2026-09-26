@@ -129,6 +129,7 @@ mod test {
         let storage = crate::object_store::StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container/telemetry"
                 .to_string(),
+            endpoint: None,
         };
 
         let store = crate::object_store::from_storage_type_with_retry_and_token_provider(
@@ -154,6 +155,54 @@ mod test {
             store_with_retry.is_ok(),
             "expected a store, got {store_with_retry:?}"
         );
+    }
+
+    /// Scenario: Azure storage names an explicit endpoint, as for Azurite or a
+    /// private endpoint, and a write is attempted where nothing listens.
+    /// Guarantees: The request goes to the configured endpoint, under the
+    /// account, container and prefix of `base_uri`, and never to the public
+    /// endpoint the account name would otherwise select.
+    #[tokio::test]
+    async fn azure_storage_sends_requests_to_the_configured_endpoint() {
+        crate::crypto::ensure_crypto_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
+        let storage = crate::object_store::StorageType::Azure {
+            base_uri: "https://devstoreaccount1.blob.core.windows.net/container/telemetry"
+                .to_string(),
+            endpoint: Some(format!("https://127.0.0.1:{port}/devstoreaccount1")),
+        };
+        let retry = crate::object_store::RetryOptions {
+            max_retries: 0,
+            init_backoff: std::time::Duration::from_millis(10),
+            max_backoff: std::time::Duration::from_millis(10),
+            backoff_base: 2.0,
+            retry_timeout: std::time::Duration::from_secs(5),
+        };
+        let store = crate::object_store::from_storage_type_with_retry_and_token_provider(
+            &storage,
+            Some(&retry),
+            Some(Box::new(TestTokenProvider::new(vec!["token1".to_string()]))),
+        )
+        .expect("an Azure store with an endpoint builds");
+
+        let error = object_store::ObjectStoreExt::put(
+            &store,
+            &object_store::path::Path::from("object"),
+            "body".into(),
+        )
+        .await
+        .expect_err("nothing listens on the endpoint");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&format!(
+                "https://127.0.0.1:{port}/devstoreaccount1/container/telemetry/object"
+            )),
+            "the request did not go to the configured endpoint: {rendered}"
+        );
+        assert!(!rendered.contains("blob.core.windows.net"), "{rendered}");
     }
 
     /// Scenario: The capability returns repeated and refreshed token values.

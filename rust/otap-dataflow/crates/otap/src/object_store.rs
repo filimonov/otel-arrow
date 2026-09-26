@@ -178,6 +178,14 @@ pub enum StorageType {
         /// - Fabric: `https://<account>.dfs.fabric.microsoft.com`
         /// - More: See [object_store::azure::MicrosoftAzureBuilder::with_url]
         base_uri: String,
+
+        /// Optional blob service endpoint that replaces the one derived from
+        /// the account in `base_uri`, for example a sovereign cloud, a
+        /// private endpoint, or the Azurite emulator
+        /// (`https://127.0.0.1:10000/devstoreaccount1`). `base_uri` still
+        /// names the account, the container and any prefix.
+        #[serde(default)]
+        endpoint: Option<String>,
     },
 
     /// AWS S3 storage
@@ -201,12 +209,44 @@ pub enum StorageType {
         /// Set to false for S3-compatible stores that require path-style.
         virtual_hosted_style_request: Option<bool>,
 
+        /// Whether requests are signed with SigV4 `UNSIGNED-PAYLOAD` instead
+        /// of a SHA-256 of every uploaded byte. Unset, `AWS_UNSIGNED_PAYLOAD`
+        /// decides, and without it the constructor's
+        /// [`UnsignedPayloadDefault`].
+        unsigned_payload: Option<bool>,
+
         /// The auth settings, see [cloud_auth::aws::AuthMethod]
         auth: cloud_auth::aws::AuthMethod,
     },
 }
 
+/// What an S3 store does when neither the storage section's
+/// `unsigned_payload` nor `AWS_UNSIGNED_PAYLOAD` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsignedPayloadDefault {
+    /// Every payload is signed.
+    Signed,
+    /// `UNSIGNED-PAYLOAD` unless a request can go over plain HTTP: the
+    /// endpoint resolved from the section and the environment is an
+    /// `http://` URL and HTTP is allowed.
+    OverTls,
+}
+
 impl StorageType {
+    /// The backend's name, for logs: `file`, `azure` or `s3`.
+    ///
+    /// Never any of the variant's fields, which may name credentials.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            #[cfg(feature = "azure")]
+            Self::Azure { .. } => "azure",
+            #[cfg(feature = "aws")]
+            Self::S3 { .. } => "s3",
+        }
+    }
+
     /// Whether this storage backend obtains credentials from a bearer token capability.
     #[must_use]
     pub const fn requires_bearer_token_provider(&self) -> bool {
@@ -307,14 +347,81 @@ pub fn from_storage_type_with_retry(
     from_storage_type_with_retry_and_token_provider(storage, retry, None)
 }
 
+/// The bearer token provider `storage` needs, taken from a node's bound
+/// capabilities, or `None` for a backend that obtains no bearer token.
+///
+/// Shared by every exporter that writes through an object store.
+pub fn required_token_provider(
+    storage: &StorageType,
+    capabilities: &otel_arrow_dfe_engine::capability::registry::Capabilities,
+) -> Result<Option<Box<dyn BearerTokenProvider>>, otel_arrow_dfe_config::error::Error> {
+    if !storage.requires_bearer_token_provider() {
+        return Ok(None);
+    }
+    capabilities
+        .require_shared::<otel_arrow_dfe_engine::capability::auth::bearer_token_provider::BearerTokenProvider>()
+        .map(Some)
+        .map_err(|e| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+            error: e.to_string(),
+        })
+}
+
+/// Build the object store an exporter writes through, reported as that
+/// exporter's configuration error when it cannot be built.
+///
+/// Retry settings apply only to cloud backends; given for local file
+/// storage they are validated and otherwise ignored, which is logged once
+/// here as `object_store.retry_ignored_for_file_storage` so every exporter
+/// reports it under one event name. `unsigned_payload` applies to S3 storage
+/// that leaves the option unset.
+pub fn exporter_store(
+    exporter: otel_arrow_dfe_engine::node::NodeId,
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+    unsigned_payload: UnsignedPayloadDefault,
+) -> Result<Arc<dyn ObjectStore>, otel_arrow_dfe_engine::error::Error> {
+    if retry.is_some() && matches!(storage, StorageType::File { .. }) {
+        otel_arrow_dfe_telemetry::otel_warn!(
+            "object_store.retry_ignored_for_file_storage",
+            exporter = %exporter.name,
+            message = "retry settings are not applied to local file storage (invalid values are still rejected)"
+        );
+    }
+    build_store(storage, retry, token_provider, unsigned_payload).map_err(|e| {
+        otel_arrow_dfe_engine::error::Error::ExporterError {
+            exporter,
+            kind: otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration,
+            error: format!("error initializing object store {e}"),
+            source_detail: otel_arrow_dfe_engine::error::format_error_sources(&e),
+        }
+    })
+}
+
 /// Fetch an object store and use the supplied bearer token provider for Azure storage.
 pub fn from_storage_type_with_retry_and_token_provider(
     storage: &StorageType,
     retry: Option<&RetryOptions>,
     token_provider: Option<Box<dyn BearerTokenProvider>>,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+    build_store(
+        storage,
+        retry,
+        token_provider,
+        UnsignedPayloadDefault::Signed,
+    )
+}
+
+fn build_store(
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    token_provider: Option<Box<dyn BearerTokenProvider>>,
+    unsigned_payload: UnsignedPayloadDefault,
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
     #[cfg(not(feature = "azure"))]
     let _ = token_provider;
+    #[cfg(not(feature = "aws"))]
+    let _ = unsigned_payload;
 
     if let Some(retry) = retry {
         retry.validate()?;
@@ -334,7 +441,7 @@ pub fn from_storage_type_with_retry_and_token_provider(
         }
 
         #[cfg(feature = "azure")]
-        StorageType::Azure { base_uri } => {
+        StorageType::Azure { base_uri, endpoint } => {
             use object_store::azure::MicrosoftAzureBuilder;
 
             let token_provider = token_provider.ok_or_else(|| object_store::Error::Generic {
@@ -346,6 +453,9 @@ pub fn from_storage_type_with_retry_and_token_provider(
             let mut builder = MicrosoftAzureBuilder::new()
                 .with_url(base_uri)
                 .with_credentials(Arc::new(credential_provider));
+            if let Some(endpoint) = endpoint {
+                builder = builder.with_endpoint(endpoint.clone());
+            }
             if let Some(retry) = retry {
                 builder = builder.with_retry(retry.to_object_store_retry_config()?);
             }
@@ -355,39 +465,112 @@ pub fn from_storage_type_with_retry_and_token_provider(
         }
 
         #[cfg(feature = "aws")]
-        StorageType::S3 {
-            base_uri,
-            region,
-            endpoint,
-            allow_http,
-            virtual_hosted_style_request,
-            auth,
-        } => {
-            use object_store::aws::AmazonS3Builder;
-
-            let mut builder = AmazonS3Builder::from_env().with_url(base_uri);
-
-            if let Some(region) = region {
-                builder = builder.with_region(region);
-            }
-            if let Some(endpoint) = endpoint {
-                builder = builder.with_endpoint(endpoint);
-            }
-            if let Some(allow) = allow_http {
-                builder = builder.with_allow_http(*allow);
-            }
-            if let Some(vhost) = virtual_hosted_style_request {
-                builder = builder.with_virtual_hosted_style_request(*vhost);
-            }
-            if let Some(retry) = retry {
-                builder = builder.with_retry(retry.to_object_store_retry_config()?);
-            }
-
-            builder = cloud_auth::aws::configure_builder(builder, auth);
-            let store = builder.build()?;
+        StorageType::S3 { base_uri, .. } => {
+            let store =
+                s3_builder(storage, retry, std::env::vars_os(), unsigned_payload)?.build()?;
             wrap_with_prefix(store, base_uri)
         }
     }
+}
+
+/// The S3 client builder for `storage` over the `AWS_*` variables of `env`,
+/// read as `AmazonS3Builder::from_env` reads the process environment, with
+/// `unsigned_default` applied only when neither the section nor `env` sets
+/// the option; another backend is an error.
+#[cfg(feature = "aws")]
+fn s3_builder(
+    storage: &StorageType,
+    retry: Option<&RetryOptions>,
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    unsigned_default: UnsignedPayloadDefault,
+) -> Result<object_store::aws::AmazonS3Builder, object_store::Error> {
+    use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+
+    let StorageType::S3 {
+        base_uri,
+        region,
+        endpoint,
+        allow_http,
+        virtual_hosted_style_request,
+        unsigned_payload,
+        auth,
+    } = storage
+    else {
+        return Err(object_store::Error::Generic {
+            store: "S3",
+            source: "not an S3 storage configuration".into(),
+        });
+    };
+    let mut builder = AmazonS3Builder::new();
+    let mut unsigned_from_env = false;
+    for (key, value) in env {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !key.starts_with("AWS_") {
+            continue;
+        }
+        if let Ok(config_key) = key.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() {
+            unsigned_from_env |= config_key == AmazonS3ConfigKey::UnsignedPayload;
+            builder = builder.with_config(config_key, value);
+        }
+    }
+    let mut builder = builder.with_url(base_uri);
+    if let Some(region) = region {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = endpoint {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if let Some(allow) = allow_http {
+        builder = builder.with_allow_http(*allow);
+    }
+    if let Some(vhost) = virtual_hosted_style_request {
+        builder = builder.with_virtual_hosted_style_request(*vhost);
+    }
+    match unsigned_payload {
+        Some(unsigned) => builder = builder.with_unsigned_payload(*unsigned),
+        None if !unsigned_from_env
+            && unsigned_default == UnsignedPayloadDefault::OverTls
+            && !s3_allows_plain_http(&builder) =>
+        {
+            builder = builder.with_unsigned_payload(true);
+        }
+        None => {}
+    }
+    if let Some(retry) = retry {
+        builder = builder.with_retry(retry.to_object_store_retry_config()?);
+    }
+    Ok(cloud_auth::aws::configure_builder(builder, auth))
+}
+
+/// Whether a client built by `builder` can send a request over plain HTTP:
+/// its endpoint (`AWS_ENDPOINT_URL_S3`, else the configured one) is an
+/// `http://` URL and HTTP is not refused. Without an endpoint the client
+/// talks to AWS over HTTPS.
+#[cfg(feature = "aws")]
+fn s3_allows_plain_http(builder: &object_store::aws::AmazonS3Builder) -> bool {
+    use object_store::ClientConfigKey;
+    use object_store::aws::AmazonS3ConfigKey;
+
+    let endpoint = builder
+        .get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint));
+    let plain = endpoint.is_some_and(|url| {
+        url.get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+    });
+    // object_store's own spellings of false; anything else it either accepts
+    // as true or refuses at build.
+    let refused = builder
+        .get_config_value(&AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp))
+        .is_some_and(|allow| {
+            matches!(
+                allow.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no" | "n"
+            )
+        });
+    plain && !refused
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -406,6 +589,50 @@ mod test {
     use url::Url;
 
     use super::*;
+
+    /// Scenario: an exporter resolves the token provider for local file
+    /// storage with no capability bound, then builds its store once with a
+    /// usable root and once with a root that does not exist.
+    /// Guarantees: file storage needs no bearer token capability, a usable
+    /// store is returned, and a store that cannot be built is reported as
+    /// that exporter's configuration error naming the object store, which
+    /// is the one mapping every object-store exporter shares.
+    #[test]
+    fn exporter_store_wiring_is_shared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = StorageType::File {
+            base_uri: dir.path().to_string_lossy().into_owned(),
+        };
+        let capabilities = otel_arrow_dfe_engine::capability::registry::Capabilities::empty();
+        assert!(
+            required_token_provider(&storage, &capabilities)
+                .expect("file storage needs no capability")
+                .is_none()
+        );
+        let id = || otel_arrow_dfe_engine::node::NodeId {
+            index: 0,
+            name: "exporter".into(),
+        };
+        assert!(exporter_store(id(), &storage, None, None, UnsignedPayloadDefault::Signed).is_ok());
+
+        let broken = StorageType::File {
+            base_uri: dir.path().join("missing").to_string_lossy().into_owned(),
+        };
+        match exporter_store(id(), &broken, None, None, UnsignedPayloadDefault::Signed) {
+            Err(otel_arrow_dfe_engine::error::Error::ExporterError { kind, error, .. }) => {
+                assert_eq!(
+                    kind,
+                    otel_arrow_dfe_engine::error::ExporterErrorKind::Configuration
+                );
+                assert!(
+                    error.starts_with("error initializing object store"),
+                    "{error}"
+                );
+            }
+            Err(other) => panic!("expected an exporter configuration error, got {other}"),
+            Ok(_) => panic!("a missing root cannot be opened"),
+        }
+    }
 
     #[test]
     fn retry_options_deserialize_duration_strings() {
@@ -695,6 +922,41 @@ mod test {
         assert!(from_storage_type(&storage).is_ok());
     }
 
+    /// Scenario: each storage backend compiled in is asked for its name.
+    /// Guarantees: the name is the lowercase backend (`file`, `azure`, `s3`)
+    /// and never carries a field of the variant, so a start event can name
+    /// the backend without risking a credential in the log.
+    #[test]
+    fn each_storage_backend_names_its_kind() {
+        let file = StorageType::File {
+            base_uri: "/tmp/secret-path".to_string(),
+        };
+        assert_eq!(file.kind(), "file");
+
+        #[cfg(feature = "azure")]
+        {
+            let azure = StorageType::Azure {
+                base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+                endpoint: None,
+            };
+            assert_eq!(azure.kind(), "azure");
+        }
+
+        #[cfg(feature = "aws")]
+        {
+            let s3 = StorageType::S3 {
+                base_uri: "s3://my-bucket/telemetry".to_string(),
+                region: None,
+                endpoint: None,
+                allow_http: None,
+                virtual_hosted_style_request: None,
+                unsigned_payload: None,
+                auth: cloud_auth::aws::AuthMethod::Default,
+            };
+            assert_eq!(s3.kind(), "s3");
+        }
+    }
+
     /// Scenario: Each supported storage backend is asked whether it needs a bearer token capability.
     /// Guarantees: Only Azure demands the binding, so file and S3 pipelines start without one.
     #[test]
@@ -708,6 +970,7 @@ mod test {
         {
             let azure = StorageType::Azure {
                 base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+                endpoint: None,
             };
             assert!(azure.requires_bearer_token_provider());
         }
@@ -720,6 +983,7 @@ mod test {
                 endpoint: None,
                 allow_http: None,
                 virtual_hosted_style_request: None,
+                unsigned_payload: None,
                 auth: cloud_auth::aws::AuthMethod::Default,
             };
             assert!(!s3.requires_bearer_token_provider());
@@ -734,6 +998,7 @@ mod test {
         crate::crypto::ensure_crypto_provider();
         let storage = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
         };
         assert!(from_storage_type(&storage).is_err());
     }
@@ -746,6 +1011,7 @@ mod test {
         crate::crypto::ensure_crypto_provider();
         let storage = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
         };
         let retry = valid_retry_options();
         assert!(from_storage_type_with_retry(&storage, Some(&retry)).is_err());
@@ -761,6 +1027,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -780,6 +1047,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -819,6 +1087,28 @@ mod test {
 
         let expected = StorageType::Azure {
             base_uri: "https://mystorageaccount.blob.core.windows.net/container".to_string(),
+            endpoint: None,
+        };
+        test_deserialize(&json, expected);
+    }
+
+    /// Scenario: Azure storage config names an explicit blob service endpoint.
+    /// Guarantees: The endpoint is kept beside the base URI, so an emulator or
+    /// private endpoint can be addressed without changing the account naming.
+    #[test]
+    #[cfg(feature = "azure")]
+    fn test_azure_config_with_endpoint() {
+        let json = json!({
+            "azure": {
+                "base_uri": "https://devstoreaccount1.blob.core.windows.net/container/otel",
+                "endpoint": "https://127.0.0.1:10000/devstoreaccount1"
+            }
+        })
+        .to_string();
+
+        let expected = StorageType::Azure {
+            base_uri: "https://devstoreaccount1.blob.core.windows.net/container/otel".to_string(),
+            endpoint: Some("https://127.0.0.1:10000/devstoreaccount1".to_string()),
         };
         test_deserialize(&json, expected);
     }
@@ -841,6 +1131,137 @@ mod test {
         assert!(serde_json::from_str::<StorageType>(&json).is_err());
     }
 
+    /// An S3 storage config for `base_uri` and `endpoint` with the given
+    /// `unsigned_payload`.
+    #[cfg(feature = "aws")]
+    fn s3(base_uri: &str, endpoint: Option<&str>, unsigned_payload: Option<bool>) -> StorageType {
+        StorageType::S3 {
+            base_uri: base_uri.to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: endpoint.map(str::to_string),
+            allow_http: Some(true),
+            virtual_hosted_style_request: None,
+            unsigned_payload,
+            auth: cloud_auth::aws::AuthMethod::Default,
+        }
+    }
+
+    /// Whether the S3 client `storage` builds over the environment `env`,
+    /// with `default` for an unset option, signs `UNSIGNED-PAYLOAD`.
+    #[cfg(feature = "aws")]
+    fn signs_unsigned_payload(
+        storage: &StorageType,
+        env: &[(&str, &str)],
+        default: UnsignedPayloadDefault,
+    ) -> bool {
+        use object_store::aws::AmazonS3ConfigKey;
+        let env = env.iter().map(|(k, v)| ((*k).into(), (*v).into()));
+        s3_builder(storage, None, env, default)
+            .expect("an S3 builder")
+            .get_config_value(&AmazonS3ConfigKey::UnsignedPayload)
+            .is_some_and(|v| v == "true")
+    }
+
+    /// Scenario: S3 storage configs that set `unsigned_payload` or leave it
+    /// unset, against AWS, an HTTPS endpoint and a plain HTTP endpoint, built
+    /// over an empty environment with each default.
+    /// Guarantees: the option parses; the signed default signs every payload
+    /// unless the option says otherwise, whatever the endpoint; the TLS
+    /// default turns an unset option on exactly when no request can go over
+    /// plain HTTP, whatever the scheme's case, and keeps an explicit value.
+    #[test]
+    #[cfg(feature = "aws")]
+    fn unsigned_payload_is_signed_unless_set_or_defaulted_over_tls() {
+        use UnsignedPayloadDefault::{OverTls, Signed};
+        let json = json!({
+            "s3": {
+                "base_uri": "s3://my-bucket/telemetry",
+                "unsigned_payload": false,
+                "auth": { "type": "default" }
+            }
+        })
+        .to_string();
+        let mut expected = s3("s3://my-bucket/telemetry", None, Some(false));
+        if let StorageType::S3 {
+            region, allow_http, ..
+        } = &mut expected
+        {
+            *region = None;
+            *allow_http = None;
+        }
+        test_deserialize(&json, expected);
+
+        let https = Some("https://s3.eu-west-1.amazonaws.com");
+        let http = Some("http://localhost:9000");
+        for endpoint in [None, https, http] {
+            let signs = |set| signs_unsigned_payload(&s3("s3://b", endpoint, set), &[], Signed);
+            assert!(!signs(None));
+            assert!(signs(Some(true)));
+            assert!(!signs(Some(false)));
+        }
+        let over_tls = |base: &str, endpoint, set| {
+            signs_unsigned_payload(&s3(base, endpoint, set), &[], OverTls)
+        };
+        assert!(over_tls("s3://b", None, None));
+        assert!(over_tls("s3://b", https, None));
+        assert!(over_tls("https://b.s3.amazonaws.com/p", None, None));
+        assert!(!over_tls("s3://b", http, None));
+        assert!(!over_tls("s3://b", Some("HTTP://minio:9000"), None));
+        assert!(!over_tls("s3://b", https, Some(false)));
+        assert!(over_tls("s3://b", http, Some(true)));
+        let mut refused = s3("s3://b", http, None);
+        if let StorageType::S3 { allow_http, .. } = &mut refused {
+            *allow_http = Some(false);
+        }
+        assert!(
+            signs_unsigned_payload(&refused, &[], OverTls),
+            "a client that refuses HTTP sends nothing in plaintext"
+        );
+    }
+
+    /// Scenario: an S3 storage section with `unsigned_payload`, the endpoint
+    /// and `allow_http` unset, built with the TLS default over an
+    /// environment that supplies a plain HTTP endpoint, an HTTPS one, or
+    /// `AWS_UNSIGNED_PAYLOAD`.
+    /// Guarantees: a plain HTTP endpoint from `AWS_ENDPOINT_URL` or
+    /// `AWS_ENDPOINT_URL_S3` keeps payloads signed, an HTTPS one does not,
+    /// and the operator's `AWS_UNSIGNED_PAYLOAD` wins over the default in
+    /// both directions.
+    #[test]
+    #[cfg(feature = "aws")]
+    fn unsigned_payload_default_follows_the_environment() {
+        let storage = {
+            let mut storage = s3("s3://b", None, None);
+            if let StorageType::S3 { allow_http, .. } = &mut storage {
+                *allow_http = None;
+            }
+            storage
+        };
+        let signs = |env: &[(&str, &str)]| {
+            signs_unsigned_payload(&storage, env, UnsignedPayloadDefault::OverTls)
+        };
+        assert!(!signs(&[
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+        ]));
+        assert!(!signs(&[
+            ("AWS_ENDPOINT_URL_S3", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+        ]));
+        assert!(!signs(&[("AWS_UNSIGNED_PAYLOAD", "false")]));
+        assert!(signs(&[("AWS_ENDPOINT_URL", "https://s3.example.com")]));
+        assert!(signs(&[
+            ("AWS_ENDPOINT_URL", "http://minio:9000"),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_UNSIGNED_PAYLOAD", "true"),
+        ]));
+        assert!(!signs_unsigned_payload(
+            &storage,
+            &[("AWS_ENDPOINT_URL", "https://s3.example.com")],
+            UnsignedPayloadDefault::Signed
+        ));
+    }
+
     #[test]
     #[cfg(feature = "aws")]
     fn test_s3_config_with_default_auth() {
@@ -860,6 +1281,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::Default,
         };
         test_deserialize(&json, expected);
@@ -891,6 +1313,7 @@ mod test {
             endpoint: Some("http://localhost:4566".to_string()),
             allow_http: Some(true),
             virtual_hosted_style_request: Some(false),
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::StaticCredentials {
                 access_key_id: "test".to_string(),
                 secret_access_key: "test".into(),
@@ -922,6 +1345,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::WebIdentity {
                 role_arn: Some("arn:aws:iam::123456789012:role/TestRole".to_string()),
                 token_file_path: Some("/var/run/secrets/token".to_string()),
@@ -953,6 +1377,7 @@ mod test {
             endpoint: None,
             allow_http: None,
             virtual_hosted_style_request: None,
+            unsigned_payload: None,
             auth: cloud_auth::aws::AuthMethod::AssumeRole {
                 role_arn: "arn:aws:iam::123456789012:role/CrossAccountRole".to_string(),
                 external_id: Some("my-external-id".to_string()),
