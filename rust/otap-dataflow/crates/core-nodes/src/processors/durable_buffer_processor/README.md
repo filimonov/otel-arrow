@@ -96,6 +96,17 @@ Each processor instance (one per CPU core) has its own isolated storage engine:
 3. **Forward**: Timer tick polls for finalized bundles, sends downstream
 4. **ACK/NACK**: On ACK, bundle marked complete; on NACK, deferred for retry
 5. **Cleanup**: Fully-consumed segments are deleted to reclaim disk space
+6. **Shutdown**: After the drain the buffer closes its outputs and records the
+   ACK/NACK of bundles still in flight until the shutdown deadline, persisting
+   them before the wait and then at most once per `poll_interval`; it then
+   persists them a last time and stops. The flush and drain end one second
+   before the deadline, and the final persist always gets at least one second,
+   so the buffer can stop up to one second after the deadline. A bundle
+   unacknowledged or unpersisted by then is replayed on the next start.
+   With bundles in flight the wait can last the whole deadline (60 s on
+   SIGTERM), longer than the Kubernetes default grace period of 30 s: set
+   `terminationGracePeriodSeconds` above the shutdown deadline, or a SIGKILL
+   during the wait replays what was acknowledged since the last persist
 
 ## Telemetry
 
