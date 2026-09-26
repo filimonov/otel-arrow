@@ -300,8 +300,7 @@ pub const DEFAULT_MAX_SERIES_PER_REQUEST: usize = 1_000_000;
 /// The completion token bytes one request's block worst case allows for.
 ///
 /// The token is the request's routing context, which grows with every node
-/// of the route that subscribes to the outcome; measured tokens hold 200 to
-/// 464 bytes. See [`check_token`].
+/// of the route that subscribes to the outcome. See [`check_token`].
 pub const TOKEN_ALLOWANCE_BYTES: usize = 4 << 10;
 
 /// Refuse a request whose completion token holds more than
@@ -515,9 +514,10 @@ impl LakeConfig {
     /// `Block::reserve` judges a request on exactly
     /// `P + T + sum_i (2 * (A_i - D_i) + F)`: P the request's values bytes
     /// and the merge-key bound of their rows, T its token, A_i a series'
-    /// extracted estimate and D_i its decoded attribute trees. That never exceeds `2 * E + T + S * F`, E the
-    /// request's extracted charge and S its number of series, which
-    /// [`LakeConfig::check_request_bound`] keeps within `max_block_bytes`.
+    /// extracted estimate and D_i its decoded attribute trees. That never
+    /// exceeds `2 * E + T + S * F`, E the request's extracted charge and S its
+    /// number of series, which [`LakeConfig::check_request_bound`] keeps
+    /// within `max_block_bytes`.
     #[must_use]
     pub fn series_row_fixed_bytes(&self, signal: crate::canonical::Signal) -> usize {
         crate::extract::series_row_charge(0, self.series_columns(signal))
@@ -561,8 +561,8 @@ impl LakeConfig {
     ///
     /// The `2 * E` term covers a request's values rows with their merge keys
     /// and its series rows at twice their extracted estimate, `S * F_max` the
-    /// fixed part of every series row, and T its completion token. `block_key` is the name the
-    /// caller's users write for `max_block_bytes`.
+    /// fixed part of every series row, and T its completion token.
+    /// `block_key` is the name the caller's users write for `max_block_bytes`.
     ///
     /// # Errors
     /// Returns an invalid-configuration error that names every term.

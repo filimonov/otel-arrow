@@ -33,8 +33,8 @@ use stages::Timing;
 
 use stages::{BenchConfig, Result, Stage, StageName};
 
-/// The group measurement time the brief configures. `SERIES_CRITERION_S`
-/// overrides the floor, which is how the retry path is exercised.
+/// The configured group measurement time. `SERIES_CRITERION_S` overrides
+/// the floor, which is how the retry path is exercised.
 const MEASUREMENT_TIME: Duration = Duration::from_secs(5);
 
 /// The configured measurement-time floor, or the environment's override.
@@ -68,7 +68,7 @@ fn criterion_home() -> PathBuf {
 /// also pays for the batched preparation, so a group spends
 /// `(prepare + run) / run` of its time for every unit it measures. The
 /// configured time is the floor: a layer whose preparation is negligible
-/// keeps exactly the brief's five seconds.
+/// keeps exactly [`MEASUREMENT_TIME`], and a minute is the cap.
 fn measurement_time(
     prepare: Timing,
     run: Timing,
@@ -79,8 +79,8 @@ fn measurement_time(
     let overhead = (prepare.wall_ns + run_ns) as f64 / run_ns as f64;
     // Half again what the ratio demands: the warm-up estimate, Criterion's
     // own per-iteration bookkeeping and the batch's drop all sit between
-    // the plan and the measured total, and a group that lands just under
-    // the required second would fail its sample gate.
+    // the scheduled and the measured total, and a group that lands just
+    // under the required second would fail its sample gate.
     let needed = minimum.as_secs_f64() * overhead * 1.5;
     let seconds = needed.max(configured.as_secs_f64());
     Duration::from_secs_f64(seconds.min(MEASUREMENT_TIME_CAP.as_secs_f64()))
@@ -206,22 +206,12 @@ fn main() -> Result<()> {
             let mut line = String::new();
             let _ = std::io::stdin().lock().read_line(&mut line)?;
         }
-        // Criterion sizes its iterations from a warm-up that includes the
-        // batched preparation, so a layer whose measured operation is much
-        // cheaper than its preparation would spend its measurement time
-        // preparing and time less than the required second of work. The
-        // group's measurement time is therefore scaled by the ratio this
-        // process just measured, with the configured five seconds as the
-        // floor and a minute as the cap.
-
         // A failure inside a timed routine is kept here and returned once
         // the group has finished, never timed as a success.
         let failure: RefCell<Option<Box<dyn std::error::Error>>> = RefCell::new(None);
-        // Criterion estimates its iteration count from a warm-up that also
-        // pays for the batched preparation, and that estimate is only
-        // approximate, so the group is run again with a longer measurement
-        // time until it has actually timed the required second of the
-        // stage's own work.
+        // The warm-up estimate is approximate (see `measurement_time`), so
+        // the group is run again with a longer measurement time until it has
+        // timed the required second of the stage's own work.
         let mut attempts = Vec::new();
         let mut function_id = cfg.workload_config_id.clone();
         for attempt in 0..GROUP_ATTEMPTS {

@@ -154,9 +154,8 @@ proptest! {
     }
 }
 
-/// The decoder this crate used before it decoded in one pass: ciborium's
-/// `Value` tree, converted afterwards. Kept as the oracle `decode_cbor` must
-/// agree with; `None` is any refusal.
+/// The reference decoder `decode_cbor` must agree with: ciborium's `Value`
+/// tree, converted afterwards; `None` is any refusal.
 fn reference_decode(bytes: &[u8], max_depth: usize) -> Option<Value> {
     fn convert(raw: ciborium::Value, depth_left: usize) -> Option<Value> {
         Some(match raw {
@@ -276,8 +275,8 @@ proptest! {
     }
 }
 
-/// The `render_v1` this crate used before it wrote JSON directly: a
-/// serde_json tree, printed. Kept as the oracle `map_string` must agree with.
+/// The reference `render_v1` `map_string` must agree with: a serde_json
+/// tree, printed.
 fn reference_render(v: &Value) -> serde_json::Value {
     use base64::Engine as _;
     use serde_json::Value as J;

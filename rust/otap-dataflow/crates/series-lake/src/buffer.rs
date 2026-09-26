@@ -475,8 +475,8 @@ impl Block {
                 })
                 .collect::<Result<Vec<_>>>()?;
             // Take the table out for the call so that `append_series` can borrow
-            // it mutably while `self.cfg` is read, then put it straight back --
-            // including on the error path, so the block stays well formed.
+            // it mutably while `self.cfg` is read, then put it straight back,
+            // on the error path too, so the block stays well formed.
             let mut table = self.tables.remove(&ds).unwrap_or_else(|| {
                 SortedTableBuffer::new(ds, SortSpec::series(), self.cfg.sorting.run_target_bytes)
             });

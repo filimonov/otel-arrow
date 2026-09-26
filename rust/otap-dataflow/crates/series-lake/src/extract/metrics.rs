@@ -511,12 +511,13 @@ pub(crate) fn extract_metrics(
         }
     }
 
-    // Exemplars are not part of the v1 format (FORMAT.md section 2). An explicit
-    // `metrics.exemplars: reject` refuses a request whose stored points carry
-    // any; otherwise, the default, the rows are counted as dropped. An exemplar of an exponential histogram point goes
-    // with that point, which the drop policy has already discarded, so it is
-    // counted but never refuses the request. Their own attribute payloads are
-    // ignored and not validated.
+    // Exemplars are not part of the v1 format (FORMAT.md section 2). An
+    // explicit `metrics.exemplars: reject` refuses a request whose stored
+    // points carry any; otherwise, the default, the rows are counted as
+    // dropped. An exemplar of an exponential histogram point goes with that
+    // point, which the drop policy has already discarded, so it is counted but
+    // never refuses the request. Their own attribute payloads are ignored and
+    // not validated.
     for pt in [
         ArrowPayloadType::NumberDpExemplars,
         ArrowPayloadType::HistogramDpExemplars,

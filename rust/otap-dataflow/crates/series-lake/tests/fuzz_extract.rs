@@ -361,13 +361,12 @@ proptest! {
 
 // ------------------------------------------------- deterministic regression
 //
-// The defect these pin down is fixed, but a fixed defect keeps its minimal
-// deterministic case. pdata's OTAP encoder omits a value column whose every entry
-// is that type's default, so a request of nothing but default values carries no
-// value column at all while the type tag still names the type. Reading that as
-// null made a series identity depend on how requests happened to be batched, and
-// collided with a genuinely null attribute. The property tests above would
-// rediscover it only by chance; these two do not.
+// pdata's OTAP encoder omits a value column whose every entry is that type's
+// default, so a request of nothing but default values carries no value column
+// at all while the type tag still names the type. Reading that as null would
+// make a series identity depend on how requests are batched, and collide with a
+// genuinely null attribute. The property tests above reach this case only by
+// chance; these two pin it.
 
 /// One log record carrying a single attribute `a` with the given value.
 fn one_attr(value: AnyValue) -> Vec<Attr> {

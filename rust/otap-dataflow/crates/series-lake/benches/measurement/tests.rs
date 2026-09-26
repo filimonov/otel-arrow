@@ -601,7 +601,7 @@ fn criterion_artifacts_are_read_per_attempt(root: &Path) -> Result<()> {
 // inspected for what a completed write means.
 // Guarantees: every upload, local write and sink result records that
 // completion is object-store visibility with verified bytes and not host
-// power-loss durability, so no reader can take it for a durability claim.
+// power-loss durability.
 fn store_stages_record_completion_semantics(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root.join("store"))?;
     let input = fixture_inputs(root)?.remove(0);

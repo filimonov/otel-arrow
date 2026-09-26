@@ -37,9 +37,8 @@ pub struct AttrTable {
 
 /// Fetch `name` from `batch` as `to`, or `None` when the column is absent.
 ///
-/// This is the single "bring this column to a plain type" helper of the
-/// crate; `extract` reuses it instead of defining its own. See [`readable`]
-/// for which columns are cast and which are kept as they are.
+/// See [`readable`] for which columns are cast and which are kept as they
+/// are.
 pub(crate) fn plain(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Option<ArrayRef>> {
     batch
         .column_by_name(name)

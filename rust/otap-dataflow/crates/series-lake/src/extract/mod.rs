@@ -32,10 +32,8 @@ use crate::value::{
     rendered_len,
 };
 
-/// The single "cast this batch column to a plain type" helper of the crate.
-///
-/// Re-exported from `attrs` so that `extract::logs` and `extract::metrics` share
-/// one copy instead of each defining its own `plain_col`.
+/// Cast a batch column to a plain type; re-exported from `attrs` for
+/// `extract::logs` and `extract::metrics`.
 pub(crate) use crate::attrs::plain;
 
 /// A typed denormalized value.
@@ -225,8 +223,8 @@ pub struct Extracted {
 ///
 /// Takes `&mut` because OTAP attribute batches carry quasi-delta encoded
 /// `parent_id` columns, which `decode_transport_optimized_ids` must decode
-/// before any `parent_id` is read. Decoding is
-/// idempotent, so a request whose ids are already plain is unaffected.
+/// before any `parent_id` is read. Decoding is idempotent, so a request
+/// whose ids are already plain is unaffected.
 ///
 /// `cfg.ingress.max_extracted_bytes` is enforced on the measured extracted
 /// output: see [`Budget`] for how row estimates are replaced by measurements.
