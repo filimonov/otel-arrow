@@ -1106,7 +1106,12 @@ written to object listed) back within 35 s after every event and holding for
 30 s before the next event's exposure (45 s before it starts); and, for a run
 of three hours or more, RSS p99 over the quiet samples (none from an event's
 start to 120 s after its end) of the last hour at most 1.15 times that of the
-second hour. Results go to `.measurement-artifacts/reference-alloy/canary/`
+second hour; with `--option expect_cache_pressure=true`, some boot's series
+cache reached `max_entries` and evicted. The cache holds one entry per
+series, is empty after every restart and misses once per hour for every live
+series, so a four-hour churn run with an engine restart every 20-40 minutes
+never fills 200k entries; a 45-minute run (1M distinct series in 45 minutes)
+does. Results go to `.measurement-artifacts/reference-alloy/canary/`
 of the main checkout.
 
 ## Environment variables

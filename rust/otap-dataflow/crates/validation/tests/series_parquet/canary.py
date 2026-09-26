@@ -701,6 +701,12 @@ class ChaosCase(ref.Case):
                   "cache_entries": int(exporter["series_cache"]["max_entries"])}
         resources = resource_checks(samples, limits)
         check("resources_within_bounds", resources["passed"], resources["problems"])
+        cache = cache_view(samples, input_s=None)
+        if self.options.get("expect_cache_pressure"):
+            check("cache_pressure", cache["evictions"] > 0
+                  and cache["entries_peak"] == limits["cache_entries"],
+                  f"evictions {cache['evictions']}, entries peak {cache['entries_peak']} "
+                  f"of {limits['cache_entries']}")
         input_s = (events["input_stopped"]["t"] - events["input_started"]["t"]) / 1e9
         points = [((wall - first_wall) / 1e9, rss) for wall, _boot, rss in self.sampler.rss]
         trend = rss_trend(points, executed, input_s)
