@@ -758,8 +758,14 @@ up to the reported abort failures times `retry.max_retries + 1`, and, once
 the evidence is kept and the case aborted every incomplete upload itself
 (`orphan_cleanup`), requires none left (`orphan_verdict`). Buffered, `duplicates_explained`
 accepts a duplicate stored before a restart and again after it, one of a
-request the producer resent because a kill cut off its acknowledgement, or
-one copied in a failed block.
+request the producer resent because a kill cut off its acknowledgement, one
+copied in a failed block, or one charged to the documented T10-F2 window: its
+request was sent once, acknowledged by the log within the buffer's 100 ms
+tick before a SIGKILL, and the next boot logged `quiver.wal.replay`; a kill
+takes at most as many requests as that boot replayed
+(`wal_window_attribution`, recorded as `replay.wal_window`).
+`rejudge-failures` applies it to a stored run from its archived ledger and
+engine logs.
 
 #### Network, DNS and acknowledgement faults
 

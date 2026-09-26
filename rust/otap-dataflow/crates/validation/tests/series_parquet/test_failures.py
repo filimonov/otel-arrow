@@ -14,6 +14,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
+import tarfile
 import tempfile
 import time
 import unittest
@@ -1520,6 +1522,100 @@ class ProcessCaseContracts(unittest.TestCase):
         verdict = {entry["check"]: entry["rejudged"] for entry in
                    faults.rejudge_fault_checks(network_run(uploads, 8), "/nonexistent")}
         self.assertEqual(verdict["orphaned_uploads_expected"], measurement.STATUS_FAILED)
+
+    # Scenario: after a buffered SIGKILL, a request acknowledged by the log
+    # 42 ms before the signal and never resent is stored twice, and the next
+    # boot logged quiver.wal.replay replayed_count=1 (T10-F2,
+    # kill_upload-buffered-rustfs r003); beside it, requests acknowledged
+    # 150 ms before a kill, resent by the producer, after a kill whose next
+    # boot replayed nothing, or more than the replay count.
+    # Guarantees: only the first kind is charged to the kill, at most as many
+    # requests per kill as its next boot replayed; the rest stay unattributed.
+    def test_wal_window_charges_only_once_sent_acks_just_before_a_kill(self):
+        self.assertEqual(faults.wal_replay_count(
+            "x otel-arrow-dfe-quiver::quiver.wal.replay: [replayed_count=1, stopped_at_"
+            "corruption=false] y\nquiver.wal.replay: [replayed=1]"), 1)
+        self.assertIsNone(faults.wal_replay_count("no replay here"))
+        kill = 10_000_000_000
+        kills = [{"ordinal": 1, "signal_ns": kill}, {"ordinal": 2, "signal_ns": 2 * kill}]
+
+        def request(ident, before_ms, attempts=1):
+            return {"request_id": ident, "records": 100, "attempts": attempts,
+                    "ack_ns": kill - int(before_ms * 1e6)}
+        window = faults.wal_window_attribution([request(461, 42.3)], kills, {1: 1, 2: None})
+        self.assertEqual(window["charged_records"], 100)
+        self.assertEqual(window["charged"]["1"][0]["before_kill_ms"], 42.3)
+        self.assertEqual(window["unattributed"], [])
+        for candidates, replays in (([request(1, 150.0)], {1: 1}),
+                                    ([request(1, 42.0, attempts=2)], {1: 1}),
+                                    ([request(1, 42.0)], {1: None}),
+                                    ([request(1, 42.0)], {1: 0})):
+            self.assertEqual(faults.wal_window_attribution(candidates, kills, replays)[
+                "charged_records"], 0, (candidates, replays))
+        both = faults.wal_window_attribution([request(1, 60.0), request(2, 10.0)], kills,
+                                             {1: 1})
+        self.assertEqual([item["request_id"] for item in both["charged"]["1"]], [2])
+        self.assertEqual([item["request_id"] for item in both["unattributed"]], [1])
+        replay = {"duplicated_records": 200, "duplicated_unattributed_records": 200,
+                  "replayed_records_count": 0}
+        self.assertFalse(faults.process_duplicates_verdict(replay, {}, both)[0])
+        self.assertTrue(faults.process_duplicates_verdict(
+            dict(replay, duplicated_unattributed_records=100), {}, both)[0])
+
+    # Scenario: a stored buffered kill_upload run failed duplicates_explained;
+    # its archive keeps the ledger (request 461 stored twice, sent once,
+    # acknowledged 42 ms before kill 1) and engine 2's log with a WAL replay.
+    # Guarantees: the re-judgement reads both and passes it; without the
+    # replay line, or without an archive, it does not.
+    def test_rejudge_charges_the_wal_window_from_the_archive(self):
+        kill = 476234395270171
+
+        def archive(directory, replay_line):
+            run = "failure-process-kill_upload-buffered-rustfs-c1-w5-r003"
+            ledger = Path(directory) / "ledger.sqlite"
+            connection = sqlite3.connect(ledger)
+            connection.executescript(
+                "CREATE TABLE requests (request_id INTEGER PRIMARY KEY, signal TEXT, "
+                "wire_sha256 TEXT, first_send_ns INTEGER, ack_ns INTEGER);"
+                "CREATE TABLE attempts (request_id INTEGER, ordinal INTEGER, start_ns INTEGER,"
+                " finish_ns INTEGER, outcome TEXT, detail TEXT);"
+                "CREATE TABLE records (record_id TEXT PRIMARY KEY, request_id INTEGER, "
+                "kind TEXT, expected_sha256 TEXT);"
+                "CREATE TABLE actual (record_id TEXT, signal TEXT, payload_sha256 TEXT);")
+            connection.execute("INSERT INTO requests VALUES (461, 'logs', 'h', ?, ?)",
+                               (kill - 50_000_000, kill - 42_300_000))
+            connection.execute("INSERT INTO attempts VALUES (461, 1, 0, 0, 'ok', NULL)")
+            for index in range(100):
+                connection.execute("INSERT INTO records VALUES (?, 461, 'logs', 'h')",
+                                   (f"r{index}",))
+                connection.executemany("INSERT INTO actual VALUES (?, 'logs', 'h')",
+                                       [(f"r{index}",), (f"r{index}",)])
+            connection.commit()
+            connection.close()
+            log = Path(directory) / "engine.log"
+            log.write_text(replay_line)
+            with tarfile.open(Path(directory) / f"{run}.tgz", "w:gz") as tar:
+                tar.add(ledger, arcname=f"{run}/ledger.sqlite")
+                tar.add(log, arcname=f"{run}/engine-2/engine.log")
+            return {"run_id": run, "config": {"requested": {"topology": "buffered"}},
+                    "checks": [measurement.check("duplicates_explained",
+                                                 measurement.CHECK_HARD,
+                                                 measurement.STATUS_FAILED)],
+                    "observations": {"fault": {
+                        "duplicates": {"failed_block_records_count": 0},
+                        "states": [{"state": "signalled_1", "monotonic_ns": kill}],
+                        "process": {"events": [{"ordinal": 1, "kind": "kill"}],
+                                    "replay": {"duplicated_records": 100,
+                                               "duplicated_unattributed_records": 100,
+                                               "replayed_records_count": 0}}}}}
+        for line, expected in (("quiver.wal.replay: [replayed_count=1, x]",
+                                measurement.STATUS_PASSED),
+                               ("no replay", measurement.STATUS_FAILED)):
+            with tempfile.TemporaryDirectory() as directory:
+                result = archive(directory, line)
+                verdict = faults.rejudge_wal_window(result, directory)
+                self.assertEqual(verdict[0]["rejudged"], expected, verdict)
+        self.assertIsNone(faults.rejudge_wal_window(result, "/nonexistent")[0]["rejudged"])
 
     # Scenario: stored process runs are re-judged: a graceful stop past the
     # cleanup cutoff, a multipart gate on logged bytes only, an expected

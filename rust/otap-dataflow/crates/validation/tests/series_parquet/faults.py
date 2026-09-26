@@ -47,7 +47,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import sqlite3
 import tarfile
+import tempfile
 import threading
 import time
 import unittest
@@ -4495,10 +4497,93 @@ def replay_analysis(ledger, rows, events, final_etags, failed_ids=(), *, buffere
             "LEFT JOIN (SELECT r.record_id FROM records r JOIN (SELECT request_id FROM attempts "
             "GROUP BY request_id HAVING count(*) > 1) t ON t.request_id = r.request_id) s "
             "ON s.record_id = d.record_id").fetchone()
+        unattributed = [
+            {"request_id": int(request), "records": int(records),
+             "ack_ns": None if ack is None else int(ack), "attempts": int(attempts)}
+            for request, records, ack, attempts in connection.execute(
+                "SELECT r.request_id, count(*), q.ack_ns, (SELECT count(*) FROM attempts a "
+                "WHERE a.request_id = r.request_id) FROM (SELECT record_id FROM file_rows "
+                "GROUP BY record_id HAVING count(*) > 1) d "
+                "JOIN records r ON r.record_id = d.record_id "
+                "JOIN requests q ON q.request_id = r.request_id "
+                "LEFT JOIN replayed_rows p ON p.record_id = d.record_id "
+                "LEFT JOIN failed_rows f ON f.record_id = d.record_id "
+                "WHERE p.record_id IS NULL AND f.record_id IS NULL "
+                "GROUP BY r.request_id ORDER BY r.request_id").fetchall()
+            if attempts <= 1]
         replayed_total = connection.execute("SELECT count(*) FROM replayed_rows").fetchone()[0]
     return {"events": report, "replayed_records_count": int(replayed_total),
             "duplicated_records": int(duplicated),
-            "duplicated_unattributed_records": int(outside)}
+            "duplicated_unattributed_records": int(outside),
+            "unattributed_requests": unattributed}
+
+
+# T10-F2: a SIGKILL can land after the durable buffer wrote a log-acknowledged
+# bundle into a segment but before the WAL cursor that retires it was made
+# durable; the next boot replays that WAL entry (`quiver.wal.replay`) and the
+# bundle is delivered twice although the producer never resent it. The window
+# is the buffer's tick (`poll_interval`, 100 ms by default), inside which an
+# acknowledgement may not yet be retired.
+WAL_REPLAY_WINDOW_NS = 100_000_000
+WAL_REPLAY = re.compile(r"quiver\.wal\.replay: \[replayed_count=(\d+)")
+
+
+def wal_replay_count(text):
+    """The WAL entries one engine boot replayed, from its log, or None when it
+    logged no replay."""
+    counts = [int(match[1]) for match in WAL_REPLAY.finditer(ANSI.sub("", text or ""))]
+    return sum(counts) if counts else None
+
+
+def process_duplicates_verdict(replay, duplicates, window) -> tuple:
+    """Buffered process duplicates: explained when every duplicated record was
+    replayed after a restart, resent, copied in a failed block, or charged to
+    a SIGKILL's WAL window (`wal_window_attribution`)."""
+    outside = max(0, replay["duplicated_unattributed_records"] - window["charged_records"])
+    return outside == 0, (
+        f"{outside} of {replay['duplicated_records']} duplicated records were neither "
+        f"stored again after a restart ({replay['replayed_records_count']} replayed), nor "
+        f"in a resent request ({(duplicates or {}).get('duplicated_in_resent_requests_records')}), "
+        f"nor copied in a failed block, nor in a request acknowledged within "
+        f"{window['window_ms']} ms before a SIGKILL whose next boot replayed its WAL "
+        f"({window['charged_records']} records: "
+        f"{ {k: [(r['request_id'], r['before_kill_ms']) for r in v] for k, v in window['charged'].items()} }; "
+        f"WAL replays by kill {window['replays']}; unattributed requests "
+        f"{[r['request_id'] for r in window['unattributed']][:10]})")
+
+
+def wal_window_attribution(candidates, kills, replays, window_ns=WAL_REPLAY_WINDOW_NS) -> dict:
+    """Charge duplicated requests to the documented T10-F2 window.
+
+    `candidates` are duplicated requests no other rule explains (not replayed
+    from a listed file, no copy in a failed block), with their log
+    acknowledgement instant and attempts; `kills` the SIGKILLs with their
+    signal instants (the ledger's monotonic clock); `replays` each kill's
+    `quiver.wal.replay` count logged by the next boot. A request is charged to
+    a kill when the producer sent it once, the log acknowledged it within
+    `window_ns` before the signal, and the next boot replayed WAL entries; a
+    kill takes at most as many requests as its next boot replayed (closest to
+    the signal first). Everything else stays unattributed.
+    """
+    charged = collections.defaultdict(list)
+    unattributed = []
+    for request in sorted(candidates, key=lambda item: -(item.get("ack_ns") or 0)):
+        kill = next((
+            kill for kill in kills
+            if request.get("attempts", 0) == 1 and request.get("ack_ns") is not None
+            and kill["signal_ns"] - window_ns <= request["ack_ns"] <= kill["signal_ns"]
+            and (replays.get(kill["ordinal"]) or 0) > len(charged[kill["ordinal"]])), None)
+        if kill is None:
+            unattributed.append(request)
+        else:
+            charged[kill["ordinal"]].append(dict(
+                request, before_kill_ms=round((kill["signal_ns"] - request["ack_ns"]) / 1e6, 3)))
+    return {"window_ms": window_ns / 1e6, "replays": {str(k): v for k, v in replays.items()},
+            "charged": {str(ordinal): requests for ordinal, requests in sorted(charged.items())},
+            "charged_records": sum(item["records"] for requests in charged.values()
+                                   for item in requests),
+            "unattributed": unattributed,
+            "unattributed_records": sum(item["records"] for item in unattributed)}
 
 
 def interrupted_requests(requests, instant_unix, *, key_part):
@@ -4920,12 +5005,19 @@ class ProcessCase(FaultCase):
         replay = record.get("replay")
         if not replay:
             return False, "the replay was not measured"
-        outside = replay["duplicated_unattributed_records"]
-        return outside == 0, (
-            f"{outside} of {replay['duplicated_records']} duplicated records were neither "
-            f"stored again after a restart ({replay['replayed_records_count']} replayed), nor "
-            f"in a resent request ({duplicates.get('duplicated_in_resent_requests_records')}), "
-            "nor copied in a failed block")
+        kills = [{"ordinal": event["ordinal"],
+                  "signal_ns": self.at(f"signalled_{event['ordinal']}")["monotonic_ns"]}
+                 for event in self.events if event["kind"] == "kill"]
+        replays = {}
+        for kill in kills:
+            following = self.engines[kill["ordinal"]] if kill["ordinal"] < len(
+                self.engines) else None
+            replays[kill["ordinal"]] = wal_replay_count(
+                Path(following.log.name).read_text(errors="replace")) if following else None
+        window = wal_window_attribution(replay.get("unattributed_requests") or [], kills,
+                                        replays)
+        replay["wal_window"] = window
+        return process_duplicates_verdict(replay, duplicates, window)
 
     def verdicts(self, record):
         """fault_observed and recovered, then PROCESS_CHECKS."""
@@ -7266,6 +7358,10 @@ FAULT_REJUDGE_RULES = {
     "the flush deadline after arming and before the fault was removed; process: a graceful "
     "stop within the shutdown deadline and the cleanup cutoff (graceful_exit_problem), and "
     "kill_upload's multipart gate on part bytes the store lists (ProcessCase.multipart_met)",
+    "duplicates_explained_process": "buffered process runs: a duplicated record is also "
+    "explained when its request was sent once, acknowledged by the log within the buffer's "
+    "100 ms tick before a SIGKILL, and the next boot logged quiver.wal.replay; each kill takes "
+    "at most as many requests as its next boot replayed (T10-F2, wal_window_attribution)",
     "orphaned_uploads_expected": "incomplete uploads other than those a killed engine left open "
     "(each listed under its key) number at most flush.abort_failures x (retry.max_retries + "
     "1): one counted failure is one failed write attempt, inside which the object store client "
@@ -7275,12 +7371,14 @@ FAULT_REJUDGE_RULES = {
 }
 
 
-def rejudge_process_checks(result) -> list:
+def rejudge_process_checks(result, archive_dir=None) -> list:
     """The process-case verdicts `rejudge_fault_checks` re-judges from a run file.
 
     fault_observed passes only when it passed as recorded and the stored
     events meet the graceful-stop and multipart-gate rules; the orphans are
-    judged again from the stored listing, expectations and cleanup.
+    judged again from the stored listing, expectations and cleanup. A
+    buffered run that failed duplicates_explained is judged again with the
+    T10-F2 WAL window (`rejudge_wal_window`) from its raw archive.
     """
     fault = result["observations"]["fault"]
     process = fault["process"]
@@ -7319,7 +7417,91 @@ def rejudge_process_checks(result) -> list:
         {"check": "orphaned_uploads_expected",
          "recorded": statuses.get("orphaned_uploads_expected"), "rejudged": status[passed],
          "reason": why},
-    ]
+    ] + rejudge_wal_window(result, archive_dir)
+
+
+def archived_members(archive_dir, run_id, suffixes) -> dict:
+    """The raw archive's members whose names end with one of `suffixes`, as
+    bytes by name, or None when there is no archive."""
+    path = Path(archive_dir) / f"{run_id}.tgz" if archive_dir else None
+    if path is None or not path.is_file():
+        return None
+    found = {}
+    with tarfile.open(path) as archive:
+        for member in archive.getmembers():
+            if member.isfile() and member.name.endswith(tuple(suffixes)):
+                found[member.name] = archive.extractfile(member).read()
+    return found
+
+
+def ledger_duplicated_requests(ledger_bytes) -> list:
+    """The ledger's requests with records stored more than once in the read-back
+    (`actual`), their acknowledgement instants and attempts."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "ledger.sqlite"
+        path.write_bytes(ledger_bytes)
+        connection = sqlite3.connect(path)
+        try:
+            return [{"request_id": int(request), "records": int(records),
+                     "ack_ns": None if ack is None else int(ack), "attempts": int(attempts)}
+                    for request, records, ack, attempts in connection.execute(
+                        "SELECT r.request_id, count(*), q.ack_ns, (SELECT count(*) FROM "
+                        "attempts a WHERE a.request_id = r.request_id) FROM (SELECT record_id "
+                        "FROM actual GROUP BY record_id HAVING count(*) > 1) d "
+                        "JOIN records r ON r.record_id = d.record_id "
+                        "JOIN requests q ON q.request_id = r.request_id "
+                        "GROUP BY r.request_id ORDER BY r.request_id").fetchall()]
+        finally:
+            connection.close()
+
+
+def rejudge_wal_window(result, archive_dir) -> list:
+    """duplicates_explained of a buffered process run, with the T10-F2 WAL window.
+
+    Only a run whose recorded duplicates had no other attribution to take away
+    (nothing replayed from a listed file, no failed block) is decidable from
+    its archive: its duplicated requests the producer sent once, read from the
+    archived ledger, are then exactly the unattributed ones, and each boot's
+    `quiver.wal.replay` count comes from its archived engine log.
+    """
+    fault = result["observations"]["fault"]
+    replay = (fault.get("process") or {}).get("replay") or {}
+    statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
+    recorded = statuses.get("duplicates_explained")
+    if ((result["config"].get("requested") or {}).get("topology") != "buffered"
+            or recorded == measurement.STATUS_PASSED or not replay):
+        return []
+    entry = {"check": "duplicates_explained", "recorded": recorded, "rejudged": None}
+    duplicates = fault.get("duplicates") or {}
+    if replay.get("replayed_records_count") or duplicates.get("failed_block_records_count"):
+        return [dict(entry, reason="duplicates were also replayed or in failed blocks; the "
+                     "archive cannot separate them")]
+    members = archived_members(archive_dir, result["run_id"], ("ledger.sqlite", "engine.log"))
+    ledger = next((data for name, data in (members or {}).items()
+                   if name.endswith("ledger.sqlite")), None)
+    if ledger is None:
+        return [dict(entry, reason="no archived ledger")]
+    candidates = [item for item in ledger_duplicated_requests(ledger) if item["attempts"] <= 1]
+    if sum(item["records"] for item in candidates) != replay.get(
+            "duplicated_unattributed_records"):
+        return [dict(entry, reason=f"the ledger's once-sent duplicates {candidates} do not "
+                     f"match the recorded unattributed count "
+                     f"{replay.get('duplicated_unattributed_records')}")]
+    states = {state["state"]: state for state in fault["states"]}
+    kills = [{"ordinal": event["ordinal"],
+              "signal_ns": states[f"signalled_{event['ordinal']}"]["monotonic_ns"]}
+             for event in fault["process"]["events"] if event["kind"] == "kill"]
+    logs = {name: data.decode(errors="replace") for name, data in members.items()
+            if name.endswith("engine.log")}
+    replays = {}
+    for kill in kills:
+        text = next((value for name, value in logs.items()
+                     if name.endswith(f"engine-{kill['ordinal'] + 1}/engine.log")), None)
+        replays[kill["ordinal"]] = wal_replay_count(text)
+    window = wal_window_attribution(candidates, kills, replays)
+    passed, why = process_duplicates_verdict(replay, duplicates, window)
+    return [dict(entry, rejudged=measurement.STATUS_PASSED if passed
+                 else measurement.STATUS_FAILED, reason=why, wal_window=window)]
 
 
 def archived_engine_log(archive_dir, run_id):
@@ -7342,7 +7524,7 @@ def rejudge_fault_checks(result, archive_dir) -> list:
     """
     fault = result["observations"]["fault"]
     if fault["fault"] in FAILURE_FAMILIES["process"]:
-        return rejudge_process_checks(result)
+        return rejudge_process_checks(result, archive_dir)
     buffered = result["config"]["requested"]["topology"] == "buffered"
     statuses = {entry["name"]: entry["status"] for entry in result["checks"]}
     verdicts = []
