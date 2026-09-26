@@ -288,3 +288,12 @@ holds the lease.
 8. **Codeowners** for the new `metadata.yaml` files (series-lake, series_parquet_exporter).
 9. **C4 change type.** Refusing with UNAVAILABLE instead of RESOURCE_EXHAUSTED changes what clients see on the wire: bug_fix or breaking?
 10. **series-lake changelog component**: `pipeline` or `pdata`.
+
+## User decisions (2026-09-26)
+
+1. Placement: keep the exporter where it is (core-nodes, behind its feature).
+2. jemalloc background_thread default: its own commit (C5b), not dropped.
+3. Tests on the clean branch: only tests CI runs in minutes -- the Rust crate tests and a trimmed E2E (local storage and MinIO, a few minutes in total); no measurement, soak, chaos or fault-matrix harness.
+4. C4 (receiver statuses): changelog `bug_fix` (OTLP-spec-conformant statuses; the old ones lost data or retried forever), with every status change and the per-connection wait listed in the subtext; revisit if maintainers ask.
+5. Codeowners and the changelog component for series-lake: the common-sense choice (mirror the neighbouring nodes/crates).
+Other open questions (otlp_framing bench, gen_golden.py, count_utf8_repairs placement, Alloy configs in configs/): the implementer decides by the same rule -- keep what the kept tests or docs need, drop the rest -- and lists each choice.
