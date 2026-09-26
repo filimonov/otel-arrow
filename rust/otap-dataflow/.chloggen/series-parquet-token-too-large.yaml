@@ -22,5 +22,5 @@ issues: [4128]
 subtext: |
   The token's size comes from the route, so a retry fails alike; behind
   durable_buffer it would be retried without end. The refusal happens at
-  ingress and names the allowance and the observed size. Measured tokens hold
-  200 to 464 bytes; a larger one means the route is too deep.
+  ingress and names the allowance and the observed size; a token over the
+  4KiB allowance means the route is too deep.
