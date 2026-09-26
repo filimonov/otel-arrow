@@ -1074,8 +1074,9 @@ SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 8-15,24-31 \
   Every six consecutive events hold each kind once; `min_gap_s` to
   `max_gap_s` (default 300-480) separate one event's end from the next start;
   none starts before `first_s` (600) or ends within `tail_s` (600) of the
-  input's end. `--schedule-only` prints the plan. Each event is logged at its
-  start and end with wall and monotonic time.
+  input's end. `--schedule-only` prints the plan; `--rejudge FILE` advances
+  a published result's event observation to the current rule. Each event is
+  logged at its start and end with wall and monotonic time.
 - Lines carry a series slot after their sequence number, and the one added
   Alloy stage (`canary.SITE_STAGE`, recorded in the result) copies it into
   `logger.name`, a series attribute of the shipped engine config. The slot is
@@ -1086,16 +1087,17 @@ SERIES_REQUIRE_DOCKER=1 SERIES_REQUIRE_FAULT_TOOLS=1 taskset -c 8-15,24-31 \
 - Every 10 s the sampler keeps RSS, the process high-water mark, jemalloc's
   allocated and resident totals (`MALLOC_CONF` prints them every GiB
   allocated), the exporter's metrics, WAL used and on disk, the buffer's queued
-  and in-flight items and the age of the newest values object listed; the
-  store is listed every 2 s.
+  and in-flight items and the age of the newest values object listed; RSS is
+  also read every second, for the trend; the store is listed every 2 s.
 - After the drain the read-back keeps its table in a DuckDB file and adds:
   every row's `logger.name` (latest descriptor) equals its line's slot, the
   slot equals the profile's, and each producer stored exactly the profile's
   distinct series.
 
 The hard checks add to the reference ones: every event observed (NGINX's
-access log shows the latency, the 503s or the 5xx of an outage; SIGTERM exits
-0 within the grace, SIGKILL -9; every Alloy restarted); every sample within
+access log shows the latency, the 503s, or the 5xx or abandoned (499)
+requests of an outage; SIGTERM exits 0 within the grace, SIGKILL -9; every
+Alloy restarted); every sample within
 `memory.budget`, `max_block_bytes`, `series_cache.max_entries` and the WAL
 cap, with the process high-water mark within 1.25 times the "Sizing"
 formula; duplicates charged per event and producer (a copy found in a failed
