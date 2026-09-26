@@ -1351,12 +1351,13 @@ async fn a_committed_upload_whose_abort_is_not_found_is_acknowledged() {
 }
 
 /// Scenario: a values multipart completion is applied by the store and then answers with a
-/// retryable error, on a store that also accepts the abort that follows.
-/// Guarantees: the found object acknowledges the block on its first attempt with no second
-/// upload, but an accepted abort does not prove this completion committed it: no late commit.
+/// retryable error, on a store that also accepts the abort that follows (MinIO answers 204).
+/// Guarantees: on the block's first attempt nothing else can have written its frozen names, so
+/// the found object is this completion's commit: the block is acknowledged with no second upload
+/// and counted as a late commit (`outcome=acknowledged`) with one INFO `late_commit` cleanup.
 #[tokio::test(flavor = "current_thread")]
-async fn a_found_object_whose_upload_still_aborts_is_not_a_late_commit() {
-    a_committed_upload_is_acknowledged(Fault::FailedComplete, false).await;
+async fn a_first_attempts_found_object_whose_abort_succeeds_is_a_late_commit() {
+    a_committed_upload_is_acknowledged(Fault::FailedComplete, true).await;
 }
 
 /// Drive one block through `fault`, a completion the store applies and whose

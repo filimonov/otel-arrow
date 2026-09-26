@@ -20,7 +20,8 @@ issues: [4128]
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
 subtext: |
-  flush.late_commits counts it when the abort that follows is answered
-  NotFound. When the HEAD finds no object the upload is aborted and the
-  completion's own error decides the retry under the same names; a HEAD that
-  fails otherwise aborts nothing and counts a possible orphan.
+  flush.late_commits counts it on the block's first attempt (MinIO accepts
+  the abort) or when the abort is answered NotFound. When the HEAD finds no
+  object the upload is aborted and the completion's own error decides the
+  retry under the same names; a HEAD that fails otherwise aborts nothing and
+  counts a possible orphan.

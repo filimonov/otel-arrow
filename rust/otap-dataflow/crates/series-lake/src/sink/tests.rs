@@ -1582,6 +1582,72 @@ async fn a_failed_abort_after_a_found_object_is_a_possible_orphan() {
     );
 }
 
+/// Store hooks whose values completion is applied but answers an error, the
+/// way a completion whose response is lost looks to the writer, and whose
+/// abort of the completed upload then succeeds, as MinIO answers it (204).
+#[derive(Debug)]
+struct AppliedCompletionAbortAccepted;
+
+/// The upload handed back by [`AppliedCompletionAbortAccepted`].
+#[derive(Debug)]
+struct AppliedCompletionUpload(Box<dyn MultipartUpload>);
+
+#[async_trait::async_trait]
+impl MultipartUpload for AppliedCompletionUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        self.0.put_part(data)
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let _ = self.0.complete().await?;
+        Err(injected())
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreHooks for AppliedCompletionAbortAccepted {
+    fn wrap_upload(
+        &self,
+        location: &Path,
+        inner: Box<dyn MultipartUpload>,
+    ) -> Box<dyn MultipartUpload> {
+        if !location.as_ref().contains("dataset=values") {
+            return inner;
+        }
+        Box::new(AppliedCompletionUpload(inner))
+    }
+}
+
+/// Scenario: on a block's first write attempt the values completion is
+/// applied, its response is lost, the probe finds the object and the store
+/// accepts the abort of the completed upload (MinIO).
+/// Guarantees: the object is this completion's commit (nothing else can have
+/// written a first attempt's frozen name), counted in `probed_commits`, and
+/// no orphan is reported. A later attempt keeps the earlier-attempt reading
+/// (`an_earlier_attempts_object_does_not_settle_the_current_upload`).
+#[tokio::test]
+async fn a_first_attempts_found_object_is_its_commit_when_the_abort_succeeds() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let cfg = upload_config();
+    let b = sealed_upload_block(&cfg);
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(HookStore::new(local(&dir), AppliedCompletionAbortAccepted));
+    let sink = Sink::new(store, cfg, naming("w", "boot"), tokio_timer);
+    let report = sink
+        .write_block(&b, &CancellationToken::new())
+        .await
+        .expect("the object exists, so the table is written");
+    assert_eq!(
+        report.probed_commits, 1,
+        "a first attempt's found object is its own commit"
+    );
+    assert!(report.possible_orphans.is_empty(), "{report:?}");
+}
+
 /// An object store whose HEAD requests fail with a retryable error, the way
 /// a store answers during an outage, delegating everything else.
 #[derive(Debug)]

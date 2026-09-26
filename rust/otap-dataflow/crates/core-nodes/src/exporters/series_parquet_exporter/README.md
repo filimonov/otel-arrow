@@ -563,7 +563,7 @@ deletes. Add a lifecycle rule that aborts incomplete multipart uploads
 | `ingest.failures{failure=backpressure}` (buffer) | Requests refused because the WAL is full. | any |
 | `flush.failures` (exporter), `retries.scheduled` (buffer) | Blocks the store did not take; the buffer retries them. | sustained |
 | `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
-| `flush.late_commits` | `outcome=stored`: a failed block's objects were found after all (its rows may be stored twice); `partial`: only some were; `unknown`: the probe could not tell; `acknowledged`: a lost completion response was probed and the block acknowledged. | `stored`, `partial` or `unknown`: any, for investigation |
+| `flush.late_commits` | `outcome=stored`: a failed block's objects were found after all (its rows may be stored twice); `partial`: only some were; `unknown`: the probe could not tell; `acknowledged`: a lost completion response was probed and the block acknowledged (on the block's first attempt whatever the abort answers, since nothing else can have written its frozen names; on a retry only when the abort is answered NotFound). | `stored`, `partial` or `unknown`: any, for investigation |
 | `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
 | `receiver.otlp.requests.rejected{error.type=concurrency_limit}` (receiver) | Requests refused UNAVAILABLE at `max_concurrent_requests`, rate limit or memory pressure; Alloy retries them. | sustained |

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -287,6 +288,8 @@ pub struct Block {
     /// The configuration the block was opened under, shared with every other
     /// block of the same writer; its limits decide every reservation.
     cfg: Arc<LakeConfig>,
+    /// Write attempts started on this block (see [`Block::begin_write_attempt`]).
+    write_attempts: AtomicU32,
 }
 
 impl Block {
@@ -304,7 +307,21 @@ impl Block {
             token_bytes: 0,
             emitted_at_us: None,
             cfg: cfg.into(),
+            write_attempts: AtomicU32::new(0),
         }
+    }
+
+    /// Count one more write attempt of this block and return its number, 1
+    /// for the first.
+    ///
+    /// Frozen file names carry the writer's boot id and the block's sequence
+    /// number, so before the first attempt no request of this process or any
+    /// other could have written them: an object found under one of them during
+    /// the first attempt was written by that attempt.
+    pub(crate) fn begin_write_attempt(&self) -> u32 {
+        self.write_attempts
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
     }
 
     fn spec_for(&self, ds: Dataset) -> SortSpec {

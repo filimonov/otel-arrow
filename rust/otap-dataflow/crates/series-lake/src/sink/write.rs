@@ -63,8 +63,8 @@ pub(super) struct TableWritten {
 
 /// How [`Sink::settle_completion`] left an unconfirmed completion.
 pub(super) enum Settled {
-    /// The object exists. `committed_here` when the abort showed this upload
-    /// was the one that committed it.
+    /// The object exists. `committed_here` when this upload committed it: the
+    /// block's first write attempt, or an abort answered `NotFound`.
     Found {
         committed_here: bool,
         orphan: Option<String>,
@@ -589,13 +589,18 @@ impl Sink {
     /// A HEAD of `path` decides whether the object exists. Only an answer,
     /// found or `NotFound`, allows the abort of the upload: any other HEAD
     /// failure leaves it alone, since the completion may still be applied.
-    /// A found object holds the block's frozen bytes, but an earlier attempt
-    /// may have written it; the abort then tells: `NotFound` means this
-    /// completion committed, success means the upload was still open.
+    /// A found object holds the block's frozen bytes. On the block's first
+    /// write attempt nothing else can have written it (see
+    /// [`Block::begin_write_attempt`](crate::buffer::Block::begin_write_attempt)),
+    /// so this completion committed it whatever the abort answers: some stores
+    /// (MinIO) accept the abort of a completed upload. On a later attempt an
+    /// earlier one may have written it, and the abort tells: `NotFound` means
+    /// this completion committed, success means the upload was still open.
     async fn settle_completion(
         &self,
         mut upload: Box<dyn object_store::MultipartUpload>,
         path: &Path,
+        first_attempt: bool,
         mut deadline: AbortTimer,
     ) -> Settled {
         let timed_out = || {
@@ -628,7 +633,7 @@ impl Sink {
             }),
         };
         let (committed_here, orphan) = match aborted {
-            Ok(()) => (false, None),
+            Ok(()) => (first_attempt, None),
             Err(object_store::Error::NotFound { .. }) => (true, None),
             Err(error) => (false, Some(error.to_string())),
         };
@@ -838,6 +843,7 @@ impl Sink {
         path: &Path,
         seq: u64,
         window_start_secs: i64,
+        first_attempt: bool,
         cancel: &CancellationToken,
     ) -> Result<TableWritten> {
         let runs: Vec<RecordBatch> = table.iter_snapshots().cloned().collect();
@@ -958,6 +964,7 @@ impl Sink {
                 .settle_completion(
                     upload,
                     path,
+                    first_attempt,
                     cleanup.take().unwrap_or_else(|| self.start_cleanup()),
                 )
                 .await
@@ -1004,6 +1011,7 @@ impl Sink {
         if cancel.is_cancelled() {
             return Err(Error::cancelled(None));
         }
+        let first_attempt = block.begin_write_attempt() == 1;
         let mut report = FlushReport::default();
         for (table, path) in block
             .tables()
@@ -1011,7 +1019,14 @@ impl Sink {
             .zip(self.planned_paths(block))
         {
             let written = self
-                .write_table(table, &path, block.seq, block.window_start_secs, cancel)
+                .write_table(
+                    table,
+                    &path,
+                    block.seq,
+                    block.window_start_secs,
+                    first_attempt,
+                    cancel,
+                )
                 .await?;
             report.probed_commits += usize::from(written.probed);
             report.possible_orphans.extend(written.orphan);
