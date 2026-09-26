@@ -1,0 +1,108 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+name: Series Parquet E2E
+on:
+  pull_request:
+    paths:
+      - "rust/otap-dataflow/crates/series-lake/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet_exporter/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/processors/durable_buffer_processor/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/receivers/otlp_receiver/**"
+      - "rust/otap-dataflow/crates/validation/tests/series_parquet/**"
+      - "rust/otap-dataflow/configs/series-parquet*"
+      - "rust/otap-dataflow/crates/engine/**"
+      - "rust/otap-dataflow/crates/pdata/**"
+      - "rust/otap-dataflow/crates/quiver/**"
+      - "rust/otap-dataflow/crates/otap/src/object_store.rs"
+      - "rust/otap-dataflow/crates/otap/src/object_store/**"
+      - "rust/otap-dataflow/crates/otap/src/otap_grpc.rs"
+      - "rust/otap-dataflow/crates/otap/src/otap_grpc/**"
+      - "rust/otap-dataflow/crates/otap/src/otlp_http.rs"
+      - "rust/otap-dataflow/crates/otap/src/*_layer.rs"
+      - "rust/otap-dataflow/src/main.rs"
+      - "rust/otap-dataflow/Cargo.toml"
+      - "rust/otap-dataflow/Cargo.lock"
+      - ".github/workflows/series-parquet-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rust/otap-dataflow/crates/series-lake/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/exporters/series_parquet_exporter/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/processors/durable_buffer_processor/**"
+      - "rust/otap-dataflow/crates/core-nodes/src/receivers/otlp_receiver/**"
+      - "rust/otap-dataflow/crates/validation/tests/series_parquet/**"
+      - "rust/otap-dataflow/configs/series-parquet*"
+      - "rust/otap-dataflow/crates/engine/**"
+      - "rust/otap-dataflow/crates/pdata/**"
+      - "rust/otap-dataflow/crates/quiver/**"
+      - "rust/otap-dataflow/crates/otap/src/object_store.rs"
+      - "rust/otap-dataflow/crates/otap/src/object_store/**"
+      - "rust/otap-dataflow/crates/otap/src/otap_grpc.rs"
+      - "rust/otap-dataflow/crates/otap/src/otap_grpc/**"
+      - "rust/otap-dataflow/crates/otap/src/otlp_http.rs"
+      - "rust/otap-dataflow/crates/otap/src/*_layer.rs"
+      - "rust/otap-dataflow/src/main.rs"
+      - "rust/otap-dataflow/Cargo.toml"
+      - "rust/otap-dataflow/Cargo.lock"
+      - ".github/workflows/series-parquet-e2e.yml"
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per pull request or ref; a new commit cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SERIES_REQUIRE_DOCKER: "1"
+  SERIES_MINIO_IMAGE: minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e # RELEASE.2025-04-22T22-12-26Z
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: rust/otap-dataflow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          save-if: false
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev clang cmake
+      - name: Pull the MinIO image
+        run: docker pull "$SERIES_MINIO_IMAGE"
+      - name: Install the Python dependencies
+        run: |
+          python3 -m venv /tmp/series-parquet-venv
+          /tmp/series-parquet-venv/bin/pip install --require-hashes \
+            -r crates/validation/tests/series_parquet/requirements.lock.txt
+      # The independent Python generator must reproduce every checked-in
+      # golden file byte for byte.
+      - name: Golden vectors regenerate unchanged
+        run: |
+          out="$(mktemp -d)"
+          /tmp/series-parquet-venv/bin/python3 crates/series-lake/tools/gen_golden.py "$out"
+          diff -ru crates/series-lake/tests/golden "$out"
+      - name: Build the engine
+        run: cargo build --locked -p otel-arrow-dfe --bin df_engine --features series-parquet,aws,durable-buffer
+      - name: End-to-end tests on local files and MinIO
+        run: |
+          /tmp/series-parquet-venv/bin/python3 -m unittest \
+            crates.validation.tests.series_parquet.test_e2e -v

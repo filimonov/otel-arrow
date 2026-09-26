@@ -19,6 +19,10 @@ pub mod topic_exporter;
 #[cfg(feature = "parquet")]
 pub mod parquet_exporter;
 
+/// Series/values Parquet exporter with durable acknowledgements.
+#[cfg(feature = "series-parquet")]
+pub mod series_parquet_exporter;
+
 /// OTAP exporter.
 #[cfg(feature = "otap")]
 pub mod otap_exporter;
@@ -28,7 +32,12 @@ pub mod otap_exporter;
 mod otlp_framing;
 
 /// Rate limit of the per-request refusal WARN lines.
-#[cfg(any(feature = "file", feature = "otap", feature = "parquet"))]
+#[cfg(any(
+    feature = "file",
+    feature = "otap",
+    feature = "parquet",
+    feature = "series-parquet"
+))]
 mod log_gate;
 
 /// OTLP gRPC exporter.
