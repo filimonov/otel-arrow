@@ -309,9 +309,8 @@ file named by `SERIES_LOG_PATH` (default `/var/log/app/app.log`), sets
 `service.name` from `SERIES_SERVICE_NAME` and `host.id` from
 `SERIES_PRODUCER_ID` or the hostname, and exports OTLP logs to the endpoint
 named by the `OTLP_ENDPOINT` environment variable, with a file-backed sending
-queue
-that splits exports at 2MiB; lines above 512KiB are truncated.
-Run it with `alloy run --stability.level=public-preview
+queue that splits exports at 2MiB; lines above 512KiB are truncated. Run it
+with `alloy run --stability.level=public-preview
 --storage.path=<persistent dir>`.
 
 ### `series-parquet-strict.alloy`
