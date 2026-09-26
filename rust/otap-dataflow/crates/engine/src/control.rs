@@ -352,6 +352,24 @@ pub enum NodeControlMsg<PData> {
         /// Human-readable reason for the shutdown.
         reason: String,
     },
+
+    /// Tells an exporter whose inbox announces draining (see
+    /// `ExporterInbox::announce_draining`) that the inbox has latched
+    /// `Shutdown` and now delivers only the pdata already buffered; the
+    /// `Shutdown` follows once that input is drained, at `deadline` at the
+    /// latest. Sent again when a later `Shutdown` moves the deadline earlier.
+    ShutdownDraining {
+        /// The shutdown deadline.
+        deadline: Instant,
+    },
+
+    /// The last message of a processor's completion phase (see
+    /// `awaits_completions` on the processor traits): no `Ack` or `Nack`
+    /// follows.
+    CompletionsEnded {
+        /// The shutdown deadline, the earliest any `Shutdown` gave.
+        deadline: Instant,
+    },
 }
 
 /// Runtime-control messages sent by nodes to the pipeline runtime for

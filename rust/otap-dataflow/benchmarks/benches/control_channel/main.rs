@@ -141,6 +141,8 @@ async fn consume_current_local(
             NodeControlMsg::DrainIngress { .. }
             | NodeControlMsg::MemoryPressureChanged { .. }
             | NodeControlMsg::Shutdown { .. }
+            | NodeControlMsg::ShutdownDraining { .. }
+            | NodeControlMsg::CompletionsEnded { .. }
             | NodeControlMsg::ResumeData { .. }
             | NodeControlMsg::Wakeup { .. } => {
                 panic!("unexpected message in benchmark current local receiver");
@@ -206,6 +208,8 @@ async fn consume_current_shared(
             NodeControlMsg::DrainIngress { .. }
             | NodeControlMsg::MemoryPressureChanged { .. }
             | NodeControlMsg::Shutdown { .. }
+            | NodeControlMsg::ShutdownDraining { .. }
+            | NodeControlMsg::CompletionsEnded { .. }
             | NodeControlMsg::ResumeData { .. }
             | NodeControlMsg::Wakeup { .. } => {
                 panic!("unexpected message in benchmark current shared receiver");

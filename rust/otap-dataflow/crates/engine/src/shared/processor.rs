@@ -117,6 +117,22 @@ pub trait Processor<PData> {
         true
     }
 
+    /// Until when this processor waits for the `Ack` or `Nack` of pdata it
+    /// has sent downstream; `None` when it expects none.
+    ///
+    /// Read once the processor has handled the `Shutdown` its inbox released,
+    /// and again after each completion. While it returns `Some`, the engine
+    /// closes the processor's outputs so the nodes downstream can finish, and
+    /// delivers `Ack` and `Nack` until the returned instant or the shutdown
+    /// deadline, whichever comes first; completions already queued then are
+    /// still delivered. It ends the phase with `CompletionsEnded`, which
+    /// carries the shutdown deadline, the earliest any `Shutdown` gave, and
+    /// which is delivered even when handling a completion failed. The
+    /// processor receives `Shutdown` once. Defaults to `None`.
+    fn awaits_completions(&self) -> Option<Instant> {
+        None
+    }
+
     /// Returns optional runtime services that this processor needs from the engine.
     ///
     /// This is the single source of truth for runtime wiring. For example,

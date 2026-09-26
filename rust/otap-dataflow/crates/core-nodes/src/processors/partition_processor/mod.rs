@@ -242,6 +242,8 @@ impl Processor<OtapPdata> for PartitionProcessor {
                 | NodeControlMsg::ResumeData { .. }
                 | NodeControlMsg::MemoryPressureChanged { .. }
                 | NodeControlMsg::DrainIngress { .. }
+                | NodeControlMsg::ShutdownDraining { .. }
+                | NodeControlMsg::CompletionsEnded { .. }
                 | NodeControlMsg::Shutdown { .. } => {
                     // Not handled - nothing to do
                 }

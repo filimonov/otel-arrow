@@ -701,7 +701,9 @@ impl Processor<OtapPdata> for RetryProcessor {
                 }
                 NodeControlMsg::Wakeup { .. } => Ok(()),
                 NodeControlMsg::MemoryPressureChanged { .. } => Ok(()),
-                NodeControlMsg::DrainIngress { .. } => Ok(()),
+                NodeControlMsg::DrainIngress { .. }
+                | NodeControlMsg::ShutdownDraining { .. }
+                | NodeControlMsg::CompletionsEnded { .. } => Ok(()),
                 NodeControlMsg::Shutdown { .. } => Ok(()),
             },
         }
