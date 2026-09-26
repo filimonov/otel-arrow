@@ -79,10 +79,9 @@ impl Window {
     ///
     /// A wake with the wall clock short of the boundary still rotates once one
     /// interval of monotonic time has passed since the last rotation, with no
-    /// drift tolerance: a slow clock costs one extra file set, while a
-    /// tolerance would let a backward step of that size hold a block past one
-    /// interval. The last boundary is kept, so the next block keeps the same,
-    /// floored window start.
+    /// drift tolerance, so a backward step never holds a block past one
+    /// interval and a slow clock costs one extra file set. The last boundary
+    /// is kept, so the next block keeps the same, floored window start.
     pub(super) fn wake(&mut self) -> bool {
         let nanos = self.wall.now_unix_nanos();
         let now = nanos_to_secs(nanos);

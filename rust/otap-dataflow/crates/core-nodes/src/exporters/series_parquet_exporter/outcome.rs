@@ -24,7 +24,7 @@ use std::fmt::{self, Display, Formatter};
 ///
 /// Also the `error.type` label of the `nacks` counter. `Ack` is never recorded
 /// there, and an untouched bucket is never reported. The nack variants are
-/// declared in the label order the counter has always reported.
+/// declared in the counter's label order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, AttributeEnum)]
 #[repr(usize)]
 pub(super) enum Outcome {
