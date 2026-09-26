@@ -107,10 +107,10 @@ this completion's commit whatever the abort answers (MinIO accepts the abort
 of a completed upload); on a retry only an abort answered `NotFound` shows
 this completion committed it. Either counts a late commit
 (`flush.late_commits{outcome=acknowledged}`, INFO
-`series_parquet.flush.cleanup`). An object that
-does not exist is aborted and the completion's own error decides the retry. A
-HEAD that fails otherwise leaves the upload alone, since the completion may
-still be applied, and counts it in `flush.abort_failures`.
+`series_parquet.flush.cleanup`). An object that does not exist is aborted and
+the completion's own error decides the retry. A HEAD that fails otherwise
+leaves the upload alone, since the completion may still be applied, and counts
+it in `flush.abort_failures`.
 
 A failed block can still leave its files behind: the store may finish an
 upload after the cancellation, or commit one and lose the response. After
@@ -157,15 +157,14 @@ an empty block:
 ```
 
 F_max is the larger F of the two signals, and 4KiB allows for the completion
-token (measured tokens hold 200 to 464 bytes). The token is the request's
-routing context, so its size comes from the route: a request whose token is
-larger is refused permanently at ingress (`nacks{error.type=token_too_large}`,
-naming the allowance and the observed size), since every retry would fail
-alike; remove subscribing nodes from the route to this exporter.
-`ingress.max_series_per_request`
-bounds the distinct series of one request, and extraction refuses a request as
-soon as it passes the limit (`nacks{error.type=too_many_series}`, a permanent
-refusal naming the count and the limit). Unset, it is the most series the
+token. The token is the request's routing context, so its size comes from the
+route: a request whose token is larger is refused permanently at ingress
+(`nacks{error.type=token_too_large}`, naming the allowance and the observed
+size), since every retry would fail alike; remove subscribing nodes from the
+route to this exporter. `ingress.max_series_per_request` bounds the distinct
+series of one request, and extraction refuses a request as soon as it passes
+the limit (`nacks{error.type=too_many_series}`, a permanent refusal naming the
+count and the limit). Unset, it is the most series the
 block budget holds, `(B - 2E - 4KiB) / F_max` with B `window.max_block_bytes`
 and E `ingress.max_extracted_bytes`: 1,393,826 at the defaults, and 1,328,997
 with the one denormalized column per signal of the shipped configurations. So
@@ -404,9 +403,9 @@ producer is acknowledged once its request is in the buffer's local WAL, and
 this exporter's acknowledgement goes to the buffer: an OK means "written to
 this host's WAL", not "readable in the lake" (see "Durability of the
 acknowledgement" under [Deploying with Alloy](#deploying-with-alloy) for what
-it survives). The producer notices a slow
-object store only when the WAL reaches its size cap; then, with
-`size_cap_policy: backpressure`, new requests get a retryable refusal.
+it survives). The producer notices a slow object store only when the WAL
+reaches its size cap; then, with `size_cap_policy: backpressure`, new requests
+get a retryable refusal.
 
 These losses happen after the WAL acknowledgement, so the producer never sees
 them; alert on each:
@@ -449,10 +448,10 @@ log files -> Alloy (file tail, batch 4000, file-backed queue)
 
 An OK to Alloy means the batch is written to the WAL, in tens of
 milliseconds; the buffer then retries every failed block until the store
-takes it. The strict
-alternative, `series-parquet-s3.yaml` with `series-parquet-strict.alloy`,
-answers only once the block is in the bucket (see "Attempt timeouts"). Each
-setting of both files carries its reason in a comment.
+takes it. The strict alternative, `series-parquet-s3.yaml` with
+`series-parquet-strict.alloy`, answers only once the block is in the bucket
+(see "Attempt timeouts"). Each setting of both files carries its reason in a
+comment.
 
 Run Alloy with `--stability.level=public-preview` (the file-backed sending
 queue) and `--storage.path` on a persistent volume: it holds the file
@@ -568,7 +567,7 @@ received; see "Limits".
 | `ingest.failures{failure=backpressure}` (buffer) | Requests refused because the WAL is full. | any |
 | `flush.failures` (exporter), `retries.scheduled` (buffer) | Blocks the store did not take; the buffer retries them. | sustained |
 | `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
-| `flush.late_commits` | `outcome=stored`: a failed block's objects were found after all (its rows may be stored twice); `partial`: only some were; `unknown`: the probe could not tell; `acknowledged`: a lost completion response was probed and the block acknowledged (on the block's first attempt whatever the abort answers, since nothing else can have written its frozen names; on a retry only when the abort is answered NotFound). | `stored`, `partial` or `unknown`: any, for investigation |
+| `flush.late_commits` | Objects a flush cleanup found that the write had not confirmed, by `outcome` (see [Telemetry](#telemetry)); `stored` means a nacked block's rows may be stored twice. | `stored`, `partial` or `unknown`: any, for investigation |
 | `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
 | `receiver.otlp.requests.rejected{error.type=concurrency_limit}` (receiver) | Requests refused UNAVAILABLE at `max_concurrent_requests`, rate limit or memory pressure; Alloy retries them. | sustained |
@@ -811,30 +810,17 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   `ingress.max_row_bytes` refuses the request, and decoded attributes count
   against the same `ingress.max_extracted_bytes` as the extracted rows.
 - A bucket lifecycle rule for incomplete multipart uploads (S3
-  `AbortIncompleteMultipartUpload`, for example after one day) is required.
-  The writer
-  aborts the upload of every failed or cancelled write, but an abort can fail,
-  a creation can fail without an answer that tells whether the upload exists,
-  and a completion still in flight may be applied after the abort;
-  `flush.abort_failures` counts the uploads the writer knows it may have left
-  behind and is the alert signal, but not a complete count: a
-  CreateMultipartUpload the client retries inside an attempt that then
-  succeeds can leave uploads (one per try the store received and answered
-  without its response reaching the writer) that nothing counts. The
-  lifecycle rule is the only guarantee against incomplete uploads. It counts
-  failed write attempts, not
-  uploads: within one attempt the object store client retries a
-  CreateMultipartUpload up to `retry.max_retries` times, and each try the
-  store received may create an upload whose id never reaches the writer, so
-  one counted failure can stand for up to `retry.max_retries + 1` incomplete
-  uploads (measured: 54 uploads behind 9 counted failures with
-  `max_retries: 5`). A CreateMultipartUpload that failed with a 5xx answer is
-  counted like one that got no answer, since the client reports both as the
-  same error. The
-  WARN event names the object key but not the upload id, which the object
-  store client does not expose; list the uploads of that key to find it. On a
-  versioned bucket, each retry that reached the store leaves a noncurrent
-  version.
+  `AbortIncompleteMultipartUpload`, for example after one day) is required and
+  is the only guarantee against incomplete uploads. The writer aborts the
+  upload of every failed or cancelled write, but an abort can fail, a creation
+  can fail without an answer that tells whether the upload exists, and a
+  completion still in flight may be applied after the abort.
+  `flush.abort_failures` is the alert signal but counts failed attempts, not
+  uploads (see [Telemetry](#telemetry); measured: 54 uploads behind 9 counted
+  failures with `max_retries: 5`). The WARN event names the object key but not
+  the upload id, which the object store client does not expose; list the
+  uploads of that key to find it. On a versioned bucket, each retry that
+  reached the store leaves a noncurrent version.
 - Writer limits (merge keys held during a merge, the average-based merge chunk,
   row-group upload bursts) are in the
   [series-lake README](../../../../series-lake/README.md#limitations-in-version-1),

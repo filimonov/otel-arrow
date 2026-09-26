@@ -49,20 +49,15 @@ a zero `sum` read as null, traces) are listed in
   this completion's commit (`FlushReport::probed_commits`) on the block's
   first write attempt whatever the abort answers, since nothing else can have
   written its frozen names, and on a retry when the abort is answered
-  `NotFound`. A HEAD that fails otherwise leaves the
-  upload alone and reports it as a possible orphan. A completion still in
-  flight may be applied after an abort. An abort that fails or
-  times out, and a CreateMultipartUpload that fails without a definite answer
-  (the store may hold an upload whose id the writer never received), are
-  reported as `TransientError::AbortFailed` naming the object key; the
-  leftovers are reclaimed by a bucket lifecycle rule, not by this crate. A
-  creation failure is classified from `object_store::Error`, where a 5xx
-  answer and a lost response are both `Generic`, so both count as possible
-  orphans. It is reported once per failed write, but the client retries the
-  creation up to `retry.max_retries` times inside it and each try may leave an
-  upload, so one report can stand for up to `retry.max_retries + 1`
-  incomplete uploads; the lifecycle rule is required. The upload id is not
-  reported: `MultipartUpload` does not expose it.
+  `NotFound`. A HEAD that fails otherwise leaves the upload alone and reports
+  it as a possible orphan; a completion still in flight may be applied after
+  an abort. An abort that fails or times out, and a CreateMultipartUpload that
+  fails without a definite answer (`object_store::Error::Generic`, which also
+  covers a 5xx), are reported as `TransientError::AbortFailed` naming the
+  object key, once per failed write although the client retries the creation
+  up to `retry.max_retries` times inside it. A bucket lifecycle rule reclaims
+  the leftovers and is required; the upload id is not reported, since
+  `MultipartUpload` does not expose it.
 - A merge holds the encoded sort keys of every row of the table it is
   merging, so sorting by a wide column such as `body` can hold close to a
   second copy of the table's payload. Extraction charges every values row
