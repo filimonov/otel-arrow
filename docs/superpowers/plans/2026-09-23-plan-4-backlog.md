@@ -542,6 +542,45 @@ buffered 144-152k bound by the WAL device).
   and series-lake/exporter stay one commit each (finer split at PR time).
   Source: clean-branch fix round report.
 
+- **P3-18 Leftovers of the second clean-branch review (2026-09-27).**
+  Why and done when, each:
+  - Extraction hot path (review #10): owned String/Value copies per
+    attribute in SipHash maps, and identity plus descriptor rebuilt for every
+    series before the cross-request cache is consulted. Done when profiled
+    and fixed or ruled out; folds into P1-3.
+  - One framing check for all exporters (review #11): stays P0-4. Today the
+    series_parquet README documents the permanent refusal of repeated
+    singular fields and the parquet changelog says it drops the request.
+  - Split the pdata repeated-scalar view fix from `validate_otlp_framing`
+    (the third part of the framing commit): the hunks interleave in
+    decode.rs. Done at PR time or dropped.
+  - durable_buffer shutdown tests use wall-clock bounds with 500 ms slack.
+    Done when they run on a simulated clock.
+  - Two shutdown-deadline latches (`PipelineShutdownDeadline` first-wins,
+    `TerminalMetricsDeadline` earliest) and the DST harness does not wire the
+    first. Done when unified or the DST harness covers both.
+  - The traces and metrics encoders still refuse exactly 65,536 items; the
+    logs encoder was fixed. Done when all three agree, with boundary tests.
+  - core-nodes dev-dependency forces otap `aws`. Done when about 26 test sites
+    are feature-gated and the dependency is narrowed.
+  - Windows CI now builds `series-parquet` but has never run it. Done when a
+    Windows run passes, or the feature is dropped from the Windows list.
+  - No metric shows what a WAL volume kept after a StatefulSet scale-down
+    holds. Done when a metric or a startup log names it.
+  - The deploy bundle enables the memory limiter (`source: auto`); its
+    page-cache accounting under WAL reads is not load-tested in a pod.
+  - Smaller review items: UTF-8 repair counted through a thread-local side
+    channel; one LogGate shared by all refusal outcomes and producers; the
+    exporter and lake duplicate config schema and byte-size parsers.
+  - Needs a name: one core-nodes test run (otlp_receiver, otlp_grpc_exporter,
+    otap_receiver) hung at 0% CPU for about 40 minutes and did not recur in
+    three reruns under a kill timeout.
+  - Not ours, on origin/main: two `cloud_auth::azure` tests fail with "no
+    rustls crypto provider"; rfcs/0002 (about lines 417-419) still describes
+    RESOURCE_EXHAUSTED and a weight-blind refusal without a retry hint.
+  Source: second 15-seat review of series-parquet-upstream and its fix round
+  (tip 3881ea9c6).
+
 ## Deferred features
 
 - **Live access to buffered data.** Why: `tail -f` and buffer inspection for
