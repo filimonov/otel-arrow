@@ -92,7 +92,7 @@ an ACK sent to the client, `refused` for a NACK sent to the client, and
 | `receiver.otap.rejections.batches` | `{batch}` | `error.type` | Number of OTAP batches rejected within admitted streams. |
 
 The OTAP receiver emits the bounded `error.type` values `memory_pressure`,
-`concurrency_limit`, and `invalid_request`. A stream refused for
+`concurrency_limit`, and `invalid_request`. A stream or batch refused for
 `memory_pressure` and a batch refused at `concurrency_limit` get UNAVAILABLE,
 a retryable status under the OTLP specification.
 

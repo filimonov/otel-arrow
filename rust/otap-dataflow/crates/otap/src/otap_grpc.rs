@@ -560,7 +560,7 @@ where
 
         tx.send(Ok(BatchStatus {
             batch_id,
-            status_code: StatusCode::ResourceExhausted as i32,
+            status_code: StatusCode::Unavailable as i32,
             status_message: "Process memory pressure".to_string(),
         }))
         .await
@@ -953,6 +953,74 @@ mod tests {
             Some("3000")
         );
         assert_eq!(metrics.calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// Scenario: hard memory pressure is active when an admitted stream hands a
+    /// batch to `accept_data`.
+    /// Guarantees: the batch is answered UNAVAILABLE, which OTLP clients retry,
+    /// counted once as a rejection, and never sent to the pipeline.
+    #[tokio::test]
+    async fn batch_memory_pressure_refusal_is_unavailable() {
+        use otel_arrow_dfe_engine::control::runtime_ctrl_msg_channel;
+        use otel_arrow_dfe_engine::shared::message::SharedSender;
+        use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_runtime_services};
+        use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
+        use std::collections::HashMap;
+
+        let state = MemoryPressureState::default();
+        state.configure(MemoryPressureBehaviorConfig {
+            retry_after_secs: 3,
+            fail_readiness_on_hard: true,
+            mode: MemoryLimiterMode::Enforce,
+        });
+        state.set_level_for_tests(MemoryPressureLevel::Hard);
+        let admission_state = SharedReceiverAdmissionState::from_process_state(&state);
+
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(1);
+        let mut senders = HashMap::new();
+        let _ = senders.insert("default".into(), SharedSender::mpsc(msg_tx));
+        let (ctrl_tx, _ctrl_rx) = runtime_ctrl_msg_channel(1);
+        let (_metrics_rx, metrics_reporter) = MetricsReporter::create_new_and_receiver(1);
+        let effect_handler = shared::EffectHandler::new(
+            test_node("otap_batch_memory_pressure"),
+            senders,
+            None,
+            ctrl_tx,
+            metrics_reporter,
+            test_pipeline_runtime_services(),
+        );
+        let counting = Arc::new(CountingReceiverRejectionMetrics::default());
+        let metrics: Arc<dyn OtapReceiverTelemetry> = counting.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let pending = accept_data::<Logs, _>(
+            OtapArrowRecords::Logs,
+            SignalType::Logs,
+            &mut Consumer::default(),
+            BatchArrowRecords {
+                batch_id: 7,
+                ..Default::default()
+            },
+            &effect_handler,
+            None,
+            &admission_state,
+            Some(&metrics),
+            &tx,
+            None,
+        )
+        .await
+        .expect("the refusal is sent");
+        assert!(pending.is_none());
+
+        let status = rx
+            .recv()
+            .await
+            .expect("a batch status")
+            .expect("an in-stream status");
+        assert_eq!(status.batch_id, 7);
+        assert_eq!(status.status_code, StatusCode::Unavailable as i32);
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 1);
+        assert!(msg_rx.try_recv().is_err(), "nothing reaches the pipeline");
     }
 }
 
