@@ -58,6 +58,7 @@ use otel_arrow_dfe_engine::message::{ExporterInbox, Message};
 use otel_arrow_dfe_engine::node::NodeId;
 use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_otap::OTAP_EXPORTER_FACTORIES;
+use otel_arrow_dfe_otap::log_gate::LogGate;
 use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
@@ -80,6 +81,8 @@ pub struct ParquetExporter {
     pdata_metrics: Option<MeasurementMetricSet<ExporterExportMetrics>>,
     io_metrics: Option<MetricSet<metrics::ParquetExporterMetrics>>,
     malformed: MalformedBodies,
+    /// The rate limit of the `parquet_exporter.conversion_failed` WARN.
+    conversion_log: LogGate,
 }
 
 /// Declares the Parquet exporter as a local exporter factory
@@ -125,6 +128,7 @@ impl ParquetExporter {
             pdata_metrics: None,
             io_metrics: None,
             malformed: MalformedBodies::unregistered(),
+            conversion_log: LogGate::new(),
         }
     }
 
@@ -148,6 +152,7 @@ impl ParquetExporter {
             pdata_metrics: Some(pdata_metrics),
             io_metrics: Some(io_metrics),
             malformed: MalformedBodies::register(&pipeline_ctx),
+            conversion_log: LogGate::new(),
         })
     }
 
@@ -327,8 +332,21 @@ impl Exporter<OtapPdata> for ParquetExporter {
                         continue;
                     }
 
-                    let mut otap_batch: OtapArrowRecords =
-                        payload.try_into_with_default().inspect_err(|_| {
+                    // The conversion is deterministic, so a request it refuses (more ids
+                    // than a u16 numbers, an id delta that overflows) is dropped, as a
+                    // malformed one is.
+                    let converted =
+                        TryIntoWithOptions::<OtapArrowRecords>::try_into_with_default(payload)
+                            .map_err(|e| e.to_string())
+                            .and_then(|mut batch: OtapArrowRecords| {
+                                batch
+                                    .decode_transport_optimized_ids()
+                                    .map(|()| batch)
+                                    .map_err(|e| e.to_string())
+                            });
+                    let otap_batch = match converted {
+                        Ok(otap_batch) => otap_batch,
+                        Err(error) => {
                             if let Some(metrics) = self.pdata_metrics.as_mut() {
                                 metrics
                                     .with(SignalOutcomeAttributes {
@@ -337,27 +355,17 @@ impl Exporter<OtapPdata> for ParquetExporter {
                                     })
                                     .record(export_start.elapsed());
                             }
-                        })?;
-
-                    // decode the transport optimized IDs before converting
-                    // to unvalidated parquet records
-                    otap_batch.decode_transport_optimized_ids().map_err(|e| {
-                        if let Some(metrics) = self.pdata_metrics.as_mut() {
-                            metrics
-                                .with(SignalOutcomeAttributes {
-                                    signal: signal_type,
-                                    outcome: Outcome::Failure,
-                                })
-                                .record(export_start.elapsed());
+                            if let Some(suppressed) = self.conversion_log.admit(Instant::now()) {
+                                otel_warn!(
+                                    "parquet_exporter.conversion_failed",
+                                    signal = ?signal_type,
+                                    error = %error,
+                                    suppressed = suppressed
+                                );
+                            }
+                            continue;
                         }
-                        let source_detail = format_error_sources(&e);
-                        Error::ExporterError {
-                            exporter: exporter_id.clone(),
-                            kind: ExporterErrorKind::Other,
-                            error: format!("Failed to decode transport optimized IDs: {e}"),
-                            source_detail,
-                        }
-                    })?;
+                    };
 
                     // convert to parquet-local records for unvalidated access
                     let mut otap_batch: records::OtapParquetRecords = otap_batch.into();
@@ -1097,6 +1105,19 @@ mod test {
             .expect("the encoded attribute value");
         inner[at + 1] = 0x05;
         let batches = write_otlp_logs(vec![outer, inner, vec![0x0a, 0x01, 0x0a], whole]);
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 3, "only the well-formed request is written");
+    }
+
+    /// Scenario: a well-framed OTLP logs request holding 65,537 empty
+    /// `ResourceLogs`, one more than the OTAP conversion's u16 ids can
+    /// number, then the well-formed request of three records.
+    /// Guarantees: the first is dropped, the exporter keeps running instead
+    /// of ending with an error, and exactly the three rows are written.
+    #[test]
+    fn a_request_the_conversion_refuses_is_dropped() {
+        let too_many = [0x0a, 0x00].repeat(65_537);
+        let batches = write_otlp_logs(vec![too_many, three_records()]);
         let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(rows, 3, "only the well-formed request is written");
     }
