@@ -142,6 +142,9 @@ class Engine:
         if not binary.is_file():
             raise AssertionError(f"build the feature-enabled engine first: {binary}")
         self.log = (self.root / f"engine-{self.admin_port}.log").open("w+")
+        # Without MALLOC_CONF, so the banner reports the compiled-in
+        # allocator configuration.
+        env = {k: v for k, v in os.environ.items() if k != "MALLOC_CONF"}
         self.process = subprocess.Popen(
             [
                 str(binary),
@@ -152,6 +155,7 @@ class Engine:
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,
+            env=env,
         )
         self.channel = grpc.insecure_channel(f"127.0.0.1:{self.grpc_port}")
         try:
@@ -593,7 +597,8 @@ class LocalFiles(unittest.TestCase, LakeAssertions):
     # local configuration, whose receiver waits for the exporter's result.
     # Guarantees: once every request is answered OK, before any shutdown,
     # each log body and metric point is in the lake exactly once and joins
-    # to its series row.
+    # to its series row; the engine, started without MALLOC_CONF, reports
+    # jemalloc with its background purging thread running.
     def test_acknowledged_requests_are_stored(self):
         with tempfile.TemporaryDirectory() as directory:
             lake = Path(directory) / "lake"
@@ -605,6 +610,11 @@ class LocalFiles(unittest.TestCase, LakeAssertions):
                 export_all(engine, bodies, metric_ids)
                 self.assert_lake(lake, bodies, metric_ids)
                 engine.shutdown()
+                self.assertIn(
+                    "Memory allocator: jemalloc, background_thread on",
+                    engine.engine_log(),
+                    "the engine runs without jemalloc's background purging thread",
+                )
 
 
 class AlloyConfigs(unittest.TestCase):

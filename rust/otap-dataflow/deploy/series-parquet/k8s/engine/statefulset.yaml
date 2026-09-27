@@ -47,10 +47,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            # jemalloc's background thread returns freed memory to the system
-            # between allocations.
-            - name: MALLOC_CONF
-              value: background_thread:true
           envFrom:
             - configMapRef:
                 name: series-parquet-site

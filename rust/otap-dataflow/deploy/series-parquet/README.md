@@ -69,7 +69,6 @@ docker run -d --name series-parquet --read-only --memory 7g \
   --add-host host.docker.internal:host-gateway \
   -e AWS_ENDPOINT_URL=http://host.docker.internal:9000 \
   -e AWS_ALLOW_HTTP=true -e AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
-  -e MALLOC_CONF=background_thread:true \
   -e POD_NAME=series-parquet-0 -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
   df_engine:series-parquet \
   --config /etc/series-parquet/engine.yaml --http-admin-bind 0.0.0.0:8080
@@ -77,9 +76,6 @@ docker run -d --name series-parquet --read-only --memory 7g \
 
 For AWS S3 leave out the four MinIO variables. Stop it with
 `docker stop -t 90`: the default 10 s is shorter than the shutdown.
-`MALLOC_CONF=background_thread:true`, which `k8s/engine/statefulset.yaml`
-sets too, starts jemalloc's background thread, which returns freed memory to
-the system between allocations.
 
 A container memory limit is required: Docker `--memory`, or
 `resources.limits.memory` in Kubernetes. The memory limiter in `engine.yaml`

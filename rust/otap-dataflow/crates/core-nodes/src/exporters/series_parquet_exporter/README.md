@@ -838,9 +838,8 @@ the term lasts for the WAL write rather than for the window, and the buffer
 adds the bundles it has handed to this exporter (see "Sizing" under
 [Deploying with Alloy](#deploying-with-alloy)).
 
-On glibc Linux, run the engine with `MALLOC_CONF=background_thread:true`, as
-the deployment example's image does, so jemalloc returns freed pages to the
-system in the background rather than only on allocation.
+On glibc Linux the engine runs jemalloc with its background purging thread
+(`background_thread on` at startup); `MALLOC_CONF` overrides it.
 
 ## The v1 acknowledgement contract
 
