@@ -49,10 +49,6 @@ mod worker;
 /// branches.
 const NOTIFY_BATCH: usize = 64;
 
-/// The OTLP receiver's inbound gRPC message limit when
-/// `max_decoding_message_size` is not set: tonic's 4MiB default.
-const RECEIVER_DEFAULT_MAX_DECODING_MESSAGE_SIZE: u32 = 4 * 1024 * 1024;
-
 /// Declares the series Parquet exporter as a local exporter factory.
 ///
 /// Unsafe code is temporarily used here to allow the use of the
@@ -288,11 +284,12 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
         otel_info,
         "series_parquet.receiver_limit.unverified",
         max_request_bytes = cfg.ingress.max_request_bytes,
-        receiver_default_bytes = RECEIVER_DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+        receiver_default_bytes =
+            otel_arrow_dfe_otap::otap_grpc::server_settings::DEFAULT_MAX_DECODING_MESSAGE_SIZE,
         message = "this exporter cannot see the upstream receiver's \
                    max_decoding_message_size; set it to at least \
                    ingress.max_request_bytes, or the receiver refuses larger requests \
-                   before they reach this exporter"
+                   with INVALID_ARGUMENT, which OTLP clients drop"
     );
     let parts = cfg.parts_per_block();
     if parts > lake::config::MAX_PARTS {

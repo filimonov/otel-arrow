@@ -245,8 +245,8 @@ spec:
       labels:
         severity: critical
       annotations:
-        summary: '{{ $labels.pod }}: requests above the receiver''s size limits refused'
-        runbook: A retry of the same batch fails again. Check that every producer splits exports at 2MiB (the Alloy sending_queue batch block).
+        summary: '{{ $labels.pod }}: requests above max_decoding_message_size refused INVALID_ARGUMENT'
+        runbook: The producer drops these batches. Check that every producer splits exports at 2MiB (the Alloy sending_queue batch block).
     - alert: SeriesParquetMemoryOverBudget
       expr: |
         max by (namespace, pod, otel_scope_core_id) (

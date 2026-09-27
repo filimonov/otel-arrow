@@ -88,8 +88,8 @@ groups:
                   timeout: 180s
                   max_concurrent_requests: 2048
                   # Equal to the exporter's ingress.max_request_bytes: the
-                  # receiver's 4MiB default refuses a larger request with
-                  # OUT_OF_RANGE, which OTLP clients retry without success.
+                  # receiver's 4MiB default answers a larger request with
+                  # INVALID_ARGUMENT, which OTLP clients drop.
                   max_decoding_message_size: 16MiB
           exporter:
             type: exporter:series_parquet

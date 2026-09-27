@@ -40,8 +40,7 @@ groups:
                   # Sized to the sum of num_consumers of every producer: a request past it gets UNAVAILABLE, which Alloy retries, slowing the producer.
                   max_concurrent_requests: 128
                   # Equal to the exporter's ingress.max_request_bytes and twice Alloy's 2MiB exports: a larger
-                  # request gets OUT_OF_RANGE, which Alloy retries without success. It bounds the buffer's memory
-                  # (max_in_flight).
+                  # request gets INVALID_ARGUMENT, which Alloy drops. It bounds the buffer's memory (max_in_flight).
                   max_decoding_message_size: 4MiB
           buffer:
             type: processor:durable_buffer

@@ -827,9 +827,8 @@ class Minio(unittest.TestCase, LakeAssertions):
                 wait_stored_at_least_once(store, directory, bodies, metric_ids, 90)
                 engine.shutdown()
 
-    # Scenario: the shipped buffered configuration on MinIO refuses a request
-    # above max_decoding_message_size with OUT_OF_RANGE, and takes a traces
-    # request, a metrics request
+    # Scenario: the shipped buffered configuration on MinIO takes a request
+    # above max_decoding_message_size, a traces request, a metrics request
     # with a summary point, an exemplar and a timestamp beyond i64
     # nanoseconds, a logs request with invalid UTF-8, and a logs request
     # while MinIO is paused past the flush deadline, which is stored once
@@ -848,7 +847,7 @@ class Minio(unittest.TestCase, LakeAssertions):
                 export_all(engine, ["families-ok"], [])
                 with self.assertRaises(grpc.RpcError) as refused:
                     engine.logs.Export(log_request("x" * (17 << 20)), timeout=30)
-                self.assertEqual(refused.exception.code(), grpc.StatusCode.OUT_OF_RANGE)
+                self.assertEqual(refused.exception.code(), grpc.StatusCode.INVALID_ARGUMENT)
                 engine.traces.Export(trace_request(), timeout=30)
                 engine.metrics.Export(altered_metric_request(), timeout=30)
                 export_raw_logs(engine, invalid_utf8_log_request())
@@ -879,6 +878,7 @@ class Minio(unittest.TestCase, LakeAssertions):
                 )
                 # Counters, each with a value above zero once provoked.
                 expected = [
+                    ("rejected_total", "receiver.otlp.requests", {"error_type": "payload_too_large"}),
                     ("resolved_total", "processor.durable_buffer.bundles", {"outcome": "permanently_rejected"}),
                     ("nacks_total", "exporter.series_parquet", {"error_type": "unsupported"}),
                     ("block_write_failures_total", "exporter.series_parquet", {"error_type": "deadline"}),

@@ -75,8 +75,7 @@ synchronous writes, when an ack must survive the host.
 | Content, schema or budget refusal | INVALID_ARGUMENT | fix the request |
 | Storage failure, flush deadline, shutdown, internal error | UNAVAILABLE | retry |
 | Receiver concurrency limit, rate limit or memory pressure | UNAVAILABLE | retry |
-| Message above the receiver's `max_decoding_message_size` | OUT_OF_RANGE, which OTLP clients retry and which never succeeds | split the batch or raise the limit |
-| Message above the receiver's rate-limit burst, under memory pressure | RESOURCE_EXHAUSTED without a retry delay, which OTLP clients do not retry | split the batch or raise the limit |
+| Message above the receiver's `max_decoding_message_size`, or above its rate-limit burst | INVALID_ARGUMENT | split the batch or raise the limit |
 | Producer-side timeout | DEADLINE_EXCEEDED | retry; may duplicate |
 
 Every nack's status message names the rule or limit that decided it and what
@@ -407,9 +406,9 @@ throughput at the receiver while `admission.closed` stays at zero.
 requests.
 
 The OTLP gRPC receiver refuses a message above its `max_decoding_message_size`,
-4MiB unless set, before the request reaches the pipeline, with OUT_OF_RANGE,
-which OTLP clients retry, so such a batch is resent until the producer gives
-up on it. Set it to
+4MiB unless set, with INVALID_ARGUMENT, which OTLP clients do not retry, so
+such a batch is dropped at the producer and counted in
+`receiver.otlp.requests.rejected{error.type=payload_too_large}`. Set it to
 `ingress.max_request_bytes`, as
 the shipped configurations do (16MiB in the strict ones, 4MiB in the buffered
 one, twice Alloy's 2MiB exports). The exporter cannot see the receiver's
@@ -631,7 +630,8 @@ received; see "Limits".
 | `receiver.otlp.requests.rejected{error.type=concurrency_limit}` (receiver) | Requests refused UNAVAILABLE at `max_concurrent_requests`; Alloy retries them. | sustained |
 | `receiver.otlp.requests.rejected{error.type=rate_limit}` (receiver) | Requests refused UNAVAILABLE by the receiver's rate limit; Alloy retries them. | sustained |
 | `receiver.otlp.requests.rejected{error.type=memory_pressure}` (receiver) | Requests refused UNAVAILABLE while the engine's memory limiter reports pressure; Alloy retries them. | sustained |
-| Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as INVALID_ARGUMENT, or retries past its limit). | any |
+| `receiver.otlp.requests.rejected{error.type=payload_too_large}` (receiver) | Messages above `max_decoding_message_size` or the rate-limit burst, refused INVALID_ARGUMENT and dropped by the producer. | any |
+| Alloy `otelcol_exporter_send_failed_log_records_total`, "Dropping data" log lines | Batches Alloy gave up on (a permanent status such as INVALID_ARGUMENT). | any |
 | Alloy `otelcol_exporter_enqueue_failed_log_records_total` | Records refused by a full queue; stays zero with `block_on_overflow`. | any |
 | Alloy `loki_process_truncated_fields_total{field="line"}` | Lines cut to 512KiB by the truncate stage. | any, for investigation |
 
