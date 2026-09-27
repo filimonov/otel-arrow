@@ -23,8 +23,10 @@
 //! - `AnyValue` arrays and key-value lists nest at most
 //!   [`MAX_ANY_VALUE_NESTING_DEPTH`] levels.
 //!
-//! A singular field or a oneof may occur more than once, as protobuf allows,
-//! so it is not checked. A known field with another wire type is refused, as prost refuses it;
+//! A singular field or a oneof may occur more than once, as protobuf allows:
+//! the byte views read it as prost decodes it (the last scalar or oneof
+//! member wins, the occurrences of a message merge), so it is not checked.
+//! A known field with another wire type is refused, as prost refuses it;
 //! protobuf-go would skip it as an unknown field instead.
 //!
 //! A field the schema does not know keeps protobuf skip semantics: its
@@ -1036,6 +1038,219 @@ mod tests {
         }
     }
 
+    /// Unknown content a newer or proto2 sender may put in any message: a
+    /// balanced group of field 31 holding a varint field and a nested group
+    /// of field 32, then field 31 as a length-delimited value whose bytes
+    /// look like a `resource_logs` / `values` / `key` field (`0a 00`), then
+    /// field 31 as a varint. No OTLP message defines field 31 or 32.
+    const UNKNOWN: &[u8] = &[
+        0xfb, 0x01, 0x08, 0x05, 0x83, 0x02, 0x84, 0x02, 0xfc, 0x01, // group 31
+        0xfa, 0x01, 0x02, 0x0a, 0x00, // field 31, LEN, `0a 00`
+        0xf8, 0x01, 0x0a, // field 31, varint
+    ];
+
+    /// Re-encode `buf`, a message of type `message`, with `UNKNOWN` placed
+    /// before its first field, and every sub-message the schema defines
+    /// inside it re-encoded the same way.
+    fn decorate(buf: &[u8], message: Message) -> Vec<u8> {
+        let mut out = UNKNOWN.to_vec();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            match message.field(field_num).kind {
+                Kind::Message(child) => {
+                    let inner = decorate(&buf[start..end], child);
+                    out.extend(len_field(field_num as u32, &inner));
+                }
+                _ => out.extend_from_slice(&buf[pos..end]),
+            }
+            pos = end;
+        }
+        out
+    }
+
+    /// Scenario: each full request, and the same with a balanced unknown group, a look-alike
+    /// unknown length-delimited field and an unknown varint before the first field of every
+    /// message.
+    /// Guarantees: the decorated request passes and converts to exactly the plain request's OTAP
+    /// records.
+    #[test]
+    fn unknown_content_before_known_fields_is_skipped_by_the_views() {
+        use crate::otap::OtapArrowRecords;
+        use crate::{OtapPayload, OtlpProtoBytes, TryIntoWithOptions};
+        use otel_arrow_dfe_config::SignalType;
+
+        let convert = |signal, body: Vec<u8>| {
+            let payload = OtapPayload::from(OtlpProtoBytes::new_from_bytes(signal, body));
+            let records: OtapArrowRecords = payload.try_into_with_default().expect("converts");
+            format!("{records:?}")
+        };
+        for ((root, body), signal) in
+            requests()
+                .into_iter()
+                .zip([SignalType::Logs, SignalType::Metrics, SignalType::Traces])
+        {
+            let decorated = decorate(&body, root);
+            assert!(decorated.len() > body.len() + 100, "{root:?}");
+            assert!(validate_request(&decorated, root).is_ok(), "{root:?}");
+            assert_eq!(
+                convert(signal, decorated),
+                convert(signal, body),
+                "{root:?}: the unknown content changed what the views read"
+            );
+        }
+    }
+
+    /// A field `num` of `wire_type` holding `value` (length prefix included
+    /// for `LEN`).
+    fn raw_field(num: u64, wire_type: u64, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint((num << 3) | wire_type, &mut out);
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// A value of `wire_type` other than `original` (length prefix included
+    /// for `LEN`), of the same length, so ids stay well-formed.
+    fn decoy(wire_type: u64, original: &[u8]) -> Vec<u8> {
+        match wire_type {
+            VARINT => vec![0x07],
+            FIXED64 => vec![0x11; 8],
+            FIXED32 => vec![0x22; 4],
+            LEN => {
+                let flipped: Vec<u8> = if original.is_empty() {
+                    b"d".to_vec()
+                } else {
+                    original.iter().map(|b| b ^ 0x01).collect()
+                };
+                let mut out = Vec::new();
+                encode_varint(flipped.len() as u64, &mut out);
+                out.extend(flipped);
+                out
+            }
+            other => unreachable!("wire type {other}"),
+        }
+    }
+
+    /// Content of a `child` message that sets one field to a decoy: an
+    /// integer for `AnyValue`, else its first singular scalar field.
+    fn decoy_message(child: Message) -> Vec<u8> {
+        if child == Message::AnyValue {
+            return vec![0x18, 0x07];
+        }
+        (1..64)
+            .find_map(|num| match child.field(num) {
+                Field {
+                    kind: Kind::Scalar(wire_type),
+                    singular: Some(Singular { oneof: None, .. }),
+                } => Some(raw_field(num, wire_type, &decoy(wire_type, &[]))),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Another member of the oneof field `num` of `message` belongs to.
+    fn other_member(message: Message, num: u64) -> Option<u64> {
+        let slot = message.field(num).singular?.oneof?;
+        (1..64).find(|&other| {
+            other != num
+                && matches!(message.field(other).singular, Some(s) if s.oneof == Some(slot))
+        })
+    }
+
+    /// Re-encode `buf`, a message of type `message`, with every occurrence of
+    /// field `target.1` in every `target.0` message written as two or three
+    /// occurrences; `variant` picks the arrangement: 0 puts a decoy (for a
+    /// oneof, another member) first and splits a message in two, 1 splits a
+    /// message around another oneof member or writes a scalar twice, 2 puts
+    /// the decoy last.
+    fn repeat(buf: &[u8], message: Message, target: (Message, u64), variant: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            let field = message.field(num);
+            let content = match field.kind {
+                Kind::Message(child) => repeat(&buf[start..end], child, target, variant),
+                _ => buf[start..end].to_vec(),
+            };
+            let original = match field.kind {
+                Kind::Message(_) => len_field(num as u32, &content),
+                _ => buf[pos..end].to_vec(),
+            };
+            pos = end;
+            if (message, num) != target {
+                out.extend(original);
+                continue;
+            }
+            let other = other_member(message, num);
+            match field.kind {
+                Kind::Message(child) => {
+                    let other_decoy = other.map(|other| match message.field(other).kind {
+                        Kind::Message(other_child) => {
+                            len_field(other as u32, &decoy_message(other_child))
+                        }
+                        _ => unreachable!("a message oneof has message members"),
+                    });
+                    let own_decoy = len_field(num as u32, &decoy_message(child));
+                    let cut = if content.is_empty() {
+                        0
+                    } else {
+                        let (_, wire, next) = read_key(&content, 0).expect("key");
+                        value_range(&content, wire, next).expect("value").1
+                    };
+                    let first = len_field(num as u32, &content[..cut]);
+                    let rest = len_field(num as u32, &content[cut..]);
+                    let decoy = other_decoy.unwrap_or(own_decoy);
+                    let parts = match variant {
+                        0 => vec![decoy, first, rest],
+                        1 => vec![first, decoy, rest],
+                        _ => vec![original, decoy],
+                    };
+                    out.extend(parts.concat());
+                }
+                Kind::Scalar(expected) => {
+                    let decoy = match other {
+                        Some(other) => match message.field(other).kind {
+                            Kind::Scalar(other_wire) => {
+                                raw_field(other, other_wire, &decoy(other_wire, &[]))
+                            }
+                            _ => unreachable!("a scalar oneof has scalar members"),
+                        },
+                        None => raw_field(num, expected, &decoy(expected, &content)),
+                    };
+                    let parts = match variant {
+                        0 => vec![decoy, original],
+                        1 => vec![original.clone(), original],
+                        _ => vec![original, decoy],
+                    };
+                    out.extend(parts.concat());
+                }
+                Kind::Packed(_) | Kind::Unknown => unreachable!("not singular"),
+            }
+        }
+        out
+    }
+
+    /// `body`, a request of type `root`, decoded by prost and encoded again:
+    /// every singular field once, as prost merged it.
+    fn prost_canonical(root: Message, body: &[u8]) -> Vec<u8> {
+        match root {
+            Message::ExportLogsServiceRequest => ExportLogsServiceRequest::decode(body)
+                .expect("prost decodes it")
+                .encode_to_vec(),
+            Message::ExportMetricsServiceRequest => ExportMetricsServiceRequest::decode(body)
+                .expect("prost decodes it")
+                .encode_to_vec(),
+            Message::ExportTraceServiceRequest => ExportTraceServiceRequest::decode(body)
+                .expect("prost decodes it")
+                .encode_to_vec(),
+            other => unreachable!("{other:?} is not a request root"),
+        }
+    }
+
     /// The OTAP records the byte views convert `body` into, as text.
     fn convert(root: Message, body: Vec<u8>) -> String {
         use crate::otap::OtapArrowRecords;
@@ -1049,6 +1264,76 @@ mod tests {
         let payload = OtapPayload::from(OtlpProtoBytes::new_from_bytes(signal, body));
         let records: OtapArrowRecords = payload.try_into_with_default().expect("converts");
         format!("{records:?}")
+    }
+
+    /// Every (message, field) pair of a singular field set in `buf`.
+    fn singular_fields(buf: &[u8], message: Message, found: &mut Vec<(Message, u64)>) {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (field_num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            let field = message.field(field_num);
+            if field.singular.is_some() && !found.contains(&(message, field_num)) {
+                found.push((message, field_num));
+            }
+            if let Kind::Message(child) = field.kind {
+                singular_fields(&buf[start..end], child, found);
+            }
+            pos = end;
+        }
+    }
+
+    /// Scenario: each singular field or oneof member of the full requests (118 cases over 26
+    /// message types) written as several occurrences in three arrangements: a decoy value or
+    /// another oneof member first and a message split in two, a message split around another
+    /// member or a scalar written twice, and the decoy last.
+    /// Guarantees: every body passes and the byte views convert it to exactly the OTAP records
+    /// of prost's own re-encoding of it: the last scalar and oneof member win, the occurrences of
+    /// a message are merged, and a oneof member merges only with its own final run.
+    #[test]
+    fn a_repeated_singular_field_reads_as_prost_decodes_it() {
+        let mut targets = Vec::new();
+        for (root, body) in requests() {
+            let mut found = Vec::new();
+            singular_fields(&body, root, &mut found);
+            for target in found {
+                for variant in 0..3 {
+                    let repeated = repeat(&body, root, target, variant);
+                    assert_ne!(repeated, body, "{target:?}/{variant}");
+                    assert!(
+                        validate_request(&repeated, root).is_ok(),
+                        "{target:?}/{variant}"
+                    );
+                    assert!(
+                        convert(root, repeated.clone())
+                            == convert(root, prost_canonical(root, &repeated)),
+                        "{target:?}/{variant}: the views read the repeats unlike prost"
+                    );
+                }
+                targets.push(target);
+            }
+        }
+        let messages: Vec<Message> = targets.iter().fold(Vec::new(), |mut all, (m, _)| {
+            if !all.contains(m) {
+                all.push(*m);
+            }
+            all
+        });
+        assert_eq!((targets.len(), messages.len()), (118, 26), "{messages:?}");
+        for (message, field) in [
+            (Message::ResourceLogs, 1),
+            (Message::ScopeSpans, 1),
+            (Message::LogRecord, 5),
+            (Message::Metric, 5),
+            (Message::NumberDataPoint, 4),
+            (Message::Exemplar, 3),
+            (Message::ExponentialHistogramDataPoint, 8),
+            (Message::ExponentialHistogramDataPoint, 9),
+            (Message::Span, 15),
+            (Message::KeyValue, 2),
+        ] {
+            assert!(targets.contains(&(message, field)), "{message:?}.{field}");
+        }
     }
 
     /// Scenario: every proper prefix of each full request, and each with one nested length byte
@@ -1178,6 +1463,61 @@ mod tests {
         assert!(validate_request(&wrap_buckets(&len_field(2, &[0x01, 0xac, 0x02])), root).is_ok());
         assert!(validate_request(&wrap_buckets(&[0x10, 0x01, 0x10, 0x02]), root).is_ok());
         assert!(validate_request(&wrap_buckets(&len_field(2, &[0x01, 0xac])), root).is_err());
+    }
+
+    /// Re-encode `buf`, a message of type `message`, with every packed
+    /// repeated scalar written as its first element expanded, an empty packed
+    /// chunk and the rest packed.
+    fn mix_packed(buf: &[u8], message: Message) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (num, wire_type, next) = read_key(buf, pos).expect("key");
+            let (start, end) = value_range(buf, wire_type, next).expect("value");
+            let value = &buf[start..end];
+            match message.field(num).kind {
+                Kind::Message(child) => {
+                    out.extend(len_field(num as u32, &mix_packed(value, child)))
+                }
+                Kind::Packed(element) if wire_type == LEN && !value.is_empty() => {
+                    let first = match element {
+                        FIXED64 => 8,
+                        _ => read_varint(value, 0).expect("element").1,
+                    };
+                    out.extend(raw_field(num, element, &value[..first]));
+                    out.extend(len_field(num as u32, &[]));
+                    out.extend(len_field(num as u32, &value[first..]));
+                }
+                _ => out.extend_from_slice(&buf[pos..end]),
+            }
+            pos = end;
+        }
+        out
+    }
+
+    /// Scenario: the full metrics request with every packed list (histogram bucket counts and
+    /// bounds, exponential bucket counts) split into an expanded first element, an empty packed
+    /// chunk and a packed rest; log bodies nesting 1, 2, 10 and 30 arrays and key-value lists.
+    /// Guarantees: the byte views convert each to exactly the OTAP records of prost's re-encoding.
+    #[test]
+    fn mixed_encodings_and_nesting_read_as_prost_decodes_them() {
+        let root = Message::ExportMetricsServiceRequest;
+        let body = metrics_request();
+        let mixed = mix_packed(&body, root);
+        assert!(mixed.len() > body.len(), "the request has packed lists");
+        assert_eq!(
+            convert(root, mixed.clone()),
+            convert(root, prost_canonical(root, &mixed))
+        );
+        let root = Message::ExportLogsServiceRequest;
+        for levels in [1, 2, 10, 30] {
+            let body = nested_body(levels);
+            assert_eq!(
+                convert(root, body.clone()),
+                convert(root, prost_canonical(root, &body)),
+                "{levels} levels"
+            );
+        }
     }
 
     /// A log body nesting `levels` arrays, the innermost holding a string.
