@@ -114,6 +114,12 @@ channel and is not duplicated by the exporter.
 | `exporter.exports.messages` | `{message}` | `signal`, `outcome` | Number of PData messages whose export reached a terminal outcome. |
 | `exporter.exports.duration` | `s` | `signal`, `outcome` | Time from dequeuing PData through the terminal Parquet write result, including conversion and partitioning. |
 
+#### `exporter.malformed_bodies`
+
+| Metric | Unit | Attributes | Description |
+| --- | --- | --- | --- |
+| `exporter.malformed_bodies.messages` | `{message}` | `signal` | OTLP requests dropped because their body's protobuf framing is broken; every exporter that checks framing reports it under this name. |
+
 #### `otap.exporter.parquet`
 
 | Metric | Unit | Description |
@@ -128,7 +134,9 @@ channel and is not duplicated by the exporter.
 
 | Event | Severity | Description |
 | --- | --- | --- |
-| *None* | N/A | No node-specific events are emitted. |
+| `otlp.malformed_body` | `warn` | An OTLP request whose protobuf framing is broken was dropped as a failed export; at most one line per second, `suppressed` counting the lines left out. |
+
+The check sees only a request that reaches this exporter as OTLP bytes: a node upstream that converts it to Arrow records (`batch`, `attributes`, `filter`, `transform`, `partition`, `log_sampling`, or `durable_buffer` with `otlp_handling: convert_to_arrow`) converts a damaged body leniently first, and this exporter then receives the partial or empty records.
 
 ## Limits
 
