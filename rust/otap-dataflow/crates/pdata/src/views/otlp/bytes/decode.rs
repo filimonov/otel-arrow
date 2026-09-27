@@ -3,7 +3,7 @@
 
 //! various types & helper functions for decoding serialized protobuf data
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -60,8 +60,9 @@ pub trait FieldRanges {
 
     /// Records the offset of a field that was encountered during parsing.
     ///
-    /// Called by the parser as it scans the buffer. The implementation may
-    /// choose to store only the first offset for repeated fields, or all offsets.
+    /// Called by the parser once per field occurrence, in buffer order. A singular field keeps
+    /// its last occurrence, as prost does; a repeated field keeps its first, where iteration
+    /// starts.
     fn set_field_range(&self, field_num: u64, wire_type: u64, start: usize, end: usize);
 }
 
@@ -115,9 +116,96 @@ pub struct ProtoBytesParser<'a, T: FieldRanges> {
     state: Rc<ParserState<T>>,
 }
 
+/// The scan state a parser, its clones and its repeated-field iterators share.
 struct ParserState<T> {
+    /// The scan frontier: every field before it has been recorded, once.
     pos: Cell<usize>,
     field_ranges: T,
+    /// One bit per field number below 64 recorded at least once.
+    seen: Cell<u64>,
+    /// One bit per field number below 64 recorded more than once.
+    repeated: Cell<u64>,
+    /// The merged occurrences of repeated singular message fields, see
+    /// [`ProtoBytesParser::message_field`].
+    merged: OnceCell<Box<Merged>>,
+}
+
+/// The concatenated occurrences of one singular message field, in a list
+/// that only grows, so the bytes live as long as the parser state.
+struct Merged {
+    field_num: u64,
+    bytes: Box<[u8]>,
+    next: OnceCell<Box<Merged>>,
+}
+
+/// The value range and key of the field whose key starts at `pos`, or `None`
+/// for a frame that cannot be read.
+#[inline]
+fn next_field(buf: &[u8], pos: usize) -> Option<(usize, usize, u64)> {
+    let (tag, next) = read_varint(buf, pos)?;
+    let (start, end) = field_range(buf, tag, next)?;
+    Some((start, end, tag))
+}
+
+impl<T: FieldRanges> ParserState<T> {
+    fn new() -> Self {
+        Self {
+            pos: Cell::new(0),
+            field_ranges: T::new(),
+            seen: Cell::new(0),
+            repeated: Cell::new(0),
+            merged: OnceCell::new(),
+        }
+    }
+
+    /// Record field `field_num` of `wire_type`, whose value is `start..end`,
+    /// and move the frontier past it; a field behind the frontier was
+    /// recorded before and is skipped.
+    #[inline]
+    fn record(&self, field_num: u64, wire_type: u64, start: usize, end: usize) {
+        if start < self.pos.get() {
+            return;
+        }
+        self.field_ranges
+            .set_field_range(field_num, wire_type, start, end);
+        if field_num < 64 {
+            let bit = 1u64 << field_num;
+            if self.seen.get() & bit != 0 {
+                self.repeated.set(self.repeated.get() | bit);
+            }
+            self.seen.set(self.seen.get() | bit);
+        }
+        self.pos.set(end);
+    }
+
+    /// Move the frontier over the next field of `buf`. Returns `false` at the
+    /// end of `buf`, and at a frame that cannot be read, which ends the scan:
+    /// what follows it reads as absent.
+    #[inline]
+    fn step(&self, buf: &[u8]) -> bool {
+        let pos = self.pos.get();
+        if pos >= buf.len() {
+            return false;
+        }
+        let Some((start, end, tag)) = next_field(buf, pos) else {
+            self.pos.set(buf.len());
+            return false;
+        };
+        self.record(tag >> 3, tag & 7, start, end);
+        true
+    }
+
+    /// Record every field of `buf`.
+    #[inline]
+    fn scan_to_end(&self, buf: &[u8]) {
+        while self.step(buf) {}
+    }
+
+    /// Whether field `field_num` was recorded more than once.
+    #[inline]
+    fn is_repeated(&self, field_num: u64) -> bool {
+        field_num < 64 && self.repeated.get() & (1 << field_num) != 0
+    }
 }
 
 impl<'a, T> ProtoBytesParser<'a, T>
@@ -129,100 +217,111 @@ where
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
             buf,
-            state: Rc::new(ParserState {
-                pos: Cell::new(0),
-                field_ranges: T::new(),
-            }),
+            state: Rc::new(ParserState::new()),
         }
     }
 
-    /// Advances the parser to the specified scalar field and returns its value as a byte slice,
-    /// if found. Parsing proceeds from the current position in the buffer.
+    /// Returns the value of the singular scalar field `field_num` as a byte slice, if present.
+    ///
+    /// The whole message is scanned first, so a field that occurs more than once reads as its
+    /// last occurrence, the one prost keeps.
     #[inline]
     #[must_use]
     pub fn advance_to_find_field(&self, field_num: u64) -> Option<&'a [u8]> {
-        // Check if the field offset is already cached before entering the parsing loop
-        if let Some((start, end)) = self.state.field_ranges.get_field_range(field_num) {
-            return Some(&self.buf[start..end]);
-        }
-
-        // Field offset is not yet known, so we need to parse the buffer
-        // This loop advances parsing by one field each iteration until either the field is found
-        // or the end of the buffer is reached.
-        loop {
-            let pos = self.state.pos.get();
-            if pos >= self.buf.len() {
-                // end of buffer reached, field not found
-                break;
-            }
-
-            // parse tag & advance
-            let (tag, next_pos) = read_varint(self.buf, pos)?;
-            let field = tag >> 3;
-            let wire_type = tag & 7;
-
-            let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
-            self.state.pos.set(end);
-
-            // save the offset of the field we've encountered
-            self.state
-                .field_ranges
-                .set_field_range(field, wire_type, start, end);
-
-            // Check if this is the field we're looking for
-            if field == field_num {
-                return Some(&self.buf[start..end]);
-            }
-        }
-
-        None
+        self.state.scan_to_end(self.buf);
+        let (start, end) = self.state.field_ranges.get_field_range(field_num)?;
+        Some(&self.buf[start..end])
     }
 
-    /// Advances the parser to find one of the fields specified in the `field_nums` argument.
-    /// If found, it returns the byte slice containing the value for this field and the
-    /// field number as a tuple.
+    /// Returns the value of the scalar oneof whose members are `field_nums`, and the member's
+    /// field number: the member that occurs last, as prost decodes it.
     #[must_use]
     pub fn advance_to_find_oneof(&self, field_nums: &[u64]) -> Option<(&'a [u8], u64)> {
-        for field_num in field_nums {
-            if let Some(buf) = self.advance_to_find_field(*field_num) {
-                return Some((buf, *field_num));
+        self.state.scan_to_end(self.buf);
+        field_nums
+            .iter()
+            .filter_map(|&num| Some((self.state.field_ranges.get_field_range(num)?, num)))
+            .max_by_key(|((start, _), _)| *start)
+            .map(|((start, end), num)| (&self.buf[start..end], num))
+    }
+
+    /// Returns the value of the singular message field `field_num`, if present.
+    ///
+    /// Protobuf merges the occurrences of a message field, which reads as one message holding
+    /// their concatenation; a field that occurs more than once is returned as that
+    /// concatenation, built once and kept as long as the parser.
+    #[must_use]
+    pub fn message_field(&self, field_num: u64) -> Option<&[u8]> {
+        let slice = self.advance_to_find_field(field_num)?;
+        if !self.state.is_repeated(field_num) {
+            return Some(slice);
+        }
+        Some(self.merged(field_num, &[field_num]))
+    }
+
+    /// Returns the value of the message-typed oneof whose members are `field_nums`, and the
+    /// member's field number: the member that occurs last, with its occurrences since any other
+    /// member last occurred merged as [`Self::message_field`] merges them, as prost decodes it.
+    #[must_use]
+    pub fn message_oneof(&self, field_nums: &[u64]) -> Option<(&[u8], u64)> {
+        let (slice, field_num) = self.advance_to_find_oneof(field_nums)?;
+        if !self.state.is_repeated(field_num) {
+            return Some((slice, field_num));
+        }
+        Some((self.merged(field_num, field_nums), field_num))
+    }
+
+    /// The concatenated length-delimited occurrences of `field_num` that follow the last
+    /// occurrence of any other of `members`.
+    fn merged(&self, field_num: u64, members: &[u64]) -> &[u8] {
+        let mut slot = &self.state.merged;
+        while let Some(merged) = slot.get() {
+            if merged.field_num == field_num {
+                return &merged.bytes;
+            }
+            slot = &merged.next;
+        }
+        let mut bytes = Vec::new();
+        let mut pos = 0;
+        while let Some((start, end, tag)) = next_field(self.buf, pos) {
+            pos = end;
+            if tag & 7 != wire_types::LEN {
+                continue;
+            }
+            if tag >> 3 == field_num {
+                bytes.extend_from_slice(&self.buf[start..end]);
+            } else if members.contains(&(tag >> 3)) {
+                bytes.clear();
             }
         }
-
-        None
+        &slot
+            .get_or_init(|| {
+                Box::new(Merged {
+                    field_num,
+                    bytes: bytes.into_boxed_slice(),
+                    next: OnceCell::new(),
+                })
+            })
+            .bytes
     }
 }
 
-/// return the range of the positions in the byte slice containing values. The range is determined
-/// from the wire type. Returns `None` for truncated/invalid fields (out-of-range
-/// LEN payloads or fixed-width fields with too few bytes remaining) and for
-/// unknown wire types, so callers can treat malformed input as an absent field
-/// rather than producing an out-of-bounds range.
+/// The range of the field whose key `tag` ends at `pos`, as a message scanner
+/// needs it to step to the next field: the [`value_range`] of the value, and
+/// for an unknown group the range from just past its start key to just past
+/// its end key, found by [`skip_group`], so a balanced group never ends a
+/// scan early and hides the fields after it. Anything [`value_range`] or
+/// [`skip_group`] refuses is `None`, so callers treat malformed input as an
+/// absent field.
 #[inline]
-pub(crate) fn field_value_range(buf: &[u8], wire_type: u64, pos: usize) -> Option<(usize, usize)> {
-    let range = match wire_type {
-        wire_types::VARINT => {
-            // /// TODO this could maybe be read_variant bytes for faster perf
-            let (_, p) = read_varint(buf, pos)?;
-            (pos, p)
+pub(crate) fn field_range(buf: &[u8], tag: u64, pos: usize) -> Option<(usize, usize)> {
+    match tag & 7 {
+        START_GROUP => {
+            let end = skip_group(buf, pos, tag >> 3, 1, pos).ok()?;
+            Some((pos, end))
         }
-
-        wire_types::LEN => {
-            let (slice, end) = read_len_delim(buf, pos)?;
-            (end - slice.len(), end)
-        }
-        wire_types::FIXED64 => {
-            let (_, end) = read_fixed64(buf, pos)?;
-            (pos, end)
-        }
-        wire_types::FIXED32 => {
-            let (_, end) = read_fixed32(buf, pos)?;
-            (pos, end)
-        }
-        _ => return None,
-    };
-
-    Some(range)
+        wire_type => value_range(buf, wire_type, pos).ok(),
+    }
 }
 
 /// Wire type 3: the start of a group (proto2), carrying no length.
@@ -301,8 +400,8 @@ pub(crate) enum SkipError {
 /// recursion, together with whatever nesting the caller already holds.
 /// Returns the position just past the end key.
 ///
-/// This is the one group skipper, so every scanner that steps over a group
-/// accepts the groups the validator accepts.
+/// This is the one group skipper: the validator and the byte-view scanners
+/// both call it, so what the validator accepts the views can step over.
 pub(crate) fn skip_group(
     buf: &[u8],
     mut pos: usize,
@@ -348,9 +447,16 @@ pub struct RepeatedFieldProtoBytesParser<'a, T: FieldRanges> {
     field_num: u64,
     expected_wire_type: u64,
 
+    /// A second wire type the field may use, for repeated scalars that mix packed and expanded
+    /// occurrences.
+    other_wire_type: Option<u64>,
+
     /// pointer to the next range (containing the serialized message) that the iterator will yield
     /// when `next` invoked
     next_range: Option<(usize, usize)>,
+
+    /// wire type of the occurrence at `next_range`
+    next_wire_type: u64,
 
     values_exhausted: bool,
 }
@@ -372,19 +478,15 @@ where
             state: other.state.clone(),
             field_num,
             expected_wire_type,
+            other_wire_type: None,
             next_range: None,
+            next_wire_type: expected_wire_type,
             values_exhausted: false,
         }
     }
-}
 
-impl<'a, T> Iterator for RepeatedFieldProtoBytesParser<'a, T>
-where
-    T: FieldRanges,
-{
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Yields the next occurrence of the field with the wire type it was written with.
+    fn next_occurrence(&mut self) -> Option<(&'a [u8], u64)> {
         if self.values_exhausted {
             return None;
         }
@@ -396,27 +498,9 @@ where
 
             match range {
                 Some(range) => self.next_range = Some(range),
-                None => {
-                    // advance
-                    let pos = self.state.pos.get();
-                    if pos >= self.buf.len() {
-                        // end of buffer, field not found
-                        return None;
-                    }
-
-                    let (tag, next_pos) = read_varint(self.buf, pos)?;
-                    let field = tag >> 3;
-                    let wire_type = tag & 7;
-
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
-
-                    // save the offset of the field we've encountered
-                    self.state
-                        .field_ranges
-                        .set_field_range(field, wire_type, start, end);
-
-                    self.state.pos.set(end)
-                }
+                // end of buffer, field not found
+                None if !self.state.step(self.buf) => return None,
+                None => {}
             }
         }
 
@@ -426,6 +510,7 @@ where
 
         // this is the return value
         let slice = &self.buf[range.0..range.1];
+        let slice_wire_type = self.next_wire_type;
 
         // advance until until either we've found the next repeated value, or the end is reached
         loop {
@@ -438,23 +523,31 @@ where
             let (tag, next_pos) = read_varint(self.buf, range.1)?;
             let field = tag >> 3;
             let wire_type = tag & 7;
-            range = field_value_range(self.buf, wire_type, next_pos)?;
+            range = field_range(self.buf, tag, next_pos)?;
+            self.state.record(field, wire_type, range.0, range.1);
 
-            if field == self.field_num && wire_type == self.expected_wire_type {
+            if field == self.field_num
+                && (wire_type == self.expected_wire_type || Some(wire_type) == self.other_wire_type)
+            {
+                self.next_wire_type = wire_type;
                 break;
             }
-
-            // save the offset of the field we've encountered
-            self.state
-                .field_ranges
-                .set_field_range(field, wire_type, range.0, range.1);
         }
 
-        // update pointers for continued parsing
-        self.state.pos.set(range.1);
         self.next_range = Some(range);
 
-        Some(slice)
+        Some((slice, slice_wire_type))
+    }
+}
+
+impl<'a, T> Iterator for RepeatedFieldProtoBytesParser<'a, T>
+where
+    T: FieldRanges,
+{
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_occurrence().map(|(slice, _)| slice)
     }
 }
 
@@ -611,13 +704,9 @@ pub struct RepeatedPrimitiveIter<'a, T: RepeatedFieldEncodings, V, P> {
     // - the segments containing the packed fields (in case that the encoding is packed)
     field_iter: Option<RepeatedFieldProtoBytesParser<'a, T>>,
 
-    // this will be initialized lazily if the encoding is packed. one instance of the packed
-    // encoder (type P) wil be created for each segment of the buffer containing packed values
+    // the packed chunk being read, if the last occurrence was packed. one instance of the packed
+    // encoder (type P) is created for each segment of the buffer containing packed values
     packed_iter: Option<P>,
-
-    // flag for whether the field is packed or expanded. this will be initialized lazily
-    // as well once the encoding is determined
-    packed: bool,
 
     _pd: PhantomData<V>,
 }
@@ -638,8 +727,7 @@ where
             repeated_wire_type,
             _pd: PhantomData,
 
-            // following fields will be initialized lazily once encoding determined
-            packed: Default::default(),
+            // following fields will be initialized lazily once the first occurrence is found
             field_iter: None,
             packed_iter: None,
         }
@@ -659,67 +747,45 @@ where
             let range = self.state.field_ranges.get_field_range(self.field_num);
             match range {
                 Some(range) => {
-                    self.packed = self.state.field_ranges.is_packed(self.field_num);
+                    // each occurrence may be packed or expanded, whatever the first one was
+                    let first_wire_type = if self.state.field_ranges.is_packed(self.field_num) {
+                        wire_types::LEN
+                    } else {
+                        self.repeated_wire_type
+                    };
                     self.field_iter = Some(RepeatedFieldProtoBytesParser {
                         buf: self.buf,
                         state: self.state.clone(),
                         field_num: self.field_num,
                         next_range: Some(range),
+                        next_wire_type: first_wire_type,
                         values_exhausted: false,
-                        expected_wire_type: if self.packed {
-                            wire_types::LEN
-                        } else {
-                            self.repeated_wire_type
-                        },
+                        expected_wire_type: wire_types::LEN,
+                        other_wire_type: Some(self.repeated_wire_type),
                     });
                 }
-                None => {
-                    // advance
-                    let pos = self.state.pos.get();
-                    if pos >= self.buf.len() {
-                        // end of buffer, field not found
-                        return None;
-                    }
-
-                    let (tag, next_pos) = read_varint(self.buf, pos)?;
-                    let field = tag >> 3;
-                    let wire_type = tag & 7;
-
-                    let (start, end) = field_value_range(self.buf, wire_type, next_pos)?;
-
-                    // save the offset of the field we've encountered
-                    self.state
-                        .field_ranges
-                        .set_field_range(field, wire_type, start, end);
-
-                    self.state.pos.set(end)
-                }
+                // end of buffer, field not found
+                None if !self.state.step(self.buf) => return None,
+                None => {}
             }
         }
 
         // safety: this will have been initialized already
         let field_iter = self.field_iter.as_mut().expect("field iter initialized");
 
-        if self.packed {
-            if self.packed_iter.is_none() {
-                let next_packed_slice = field_iter.next()?;
-                self.packed_iter = Some(P::new(next_packed_slice));
+        loop {
+            if let Some(val) = self.packed_iter.as_mut().and_then(Iterator::next) {
+                return Some(val);
             }
+            self.packed_iter = None;
 
-            let packed_iter = self.packed_iter.as_mut().expect("packed iter initialized");
-            match packed_iter.next() {
-                Some(val) => Some(val),
-                None => {
-                    // try to initialize a new packed iter for the next range
-                    let next_packed_slice = field_iter.next()?;
-                    let mut next_packed_iter = P::new(next_packed_slice);
-                    let result = next_packed_iter.next()?;
-                    self.packed_iter = Some(next_packed_iter);
-                    Some(result)
-                }
+            // packed chunks, empty ones included, and expanded values may interleave
+            let (slice, wire_type) = field_iter.next_occurrence()?;
+            if wire_type == wire_types::LEN {
+                self.packed_iter = Some(P::new(slice));
+            } else {
+                return P::decode_value(slice);
             }
-        } else {
-            field_iter.next().and_then(P::decode_value)
         }
     }
 }
