@@ -236,10 +236,21 @@ Attribute values are bounded: `signal` is `traces`, `metrics`, or `logs`;
   the configured burst is rejected as non-retryable while pressure gating is
   active: HTTP returns 413 without `Retry-After`, and gRPC sends negative retry
   pushback.
+- A request refused by the rate limit or hard memory pressure can succeed on
+  retry: HTTP returns 503 and gRPC returns `UNAVAILABLE`, which every OTLP
+  client retries, with `Retry-After` or a `google.rpc.RetryInfo` detail (also
+  sent as `grpc-retry-pushback-ms`) when the delay is known.
 - An exhausted receiver may reject before decompressed request weight is known.
-  This early HTTP 503 or gRPC `RESOURCE_EXHAUSTED` response has no retry hint.
-  Exact retry guidance or non-retryable oversized classification is available
+  This early HTTP 503 or gRPC `UNAVAILABLE` response carries a random retry
+  delay of 1 to 3 seconds, since the exact one is not known yet. Exact retry
+  guidance or non-retryable oversized classification is available
   only after the weighted admission point.
+- A gRPC request that finds no free wait-for-result slot is refused with
+  `UNAVAILABLE`, which every OTLP client retries, and counted as
+  `concurrency_limit`; OTLP/HTTP answers a request that finds no permit in
+  time 503. Both carry a random retry delay of 1 to 3 seconds, as `RetryInfo`
+  on gRPC and `Retry-After` on OTLP/HTTP, so clients refused together do not
+  retry together.
 - The conversion to OTAP records, wherever a pipeline runs it, takes at most
   65,536 attributed log records, spans or metrics per request, and as many
   scopes and resources; a larger request fails as a whole. Keep producer
