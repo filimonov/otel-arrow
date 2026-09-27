@@ -20,6 +20,6 @@ issues: [0]
 # characters and subtext to 300 characters.
 subtext: |
   OTLP/HTTP answers them and its concurrency refusals 503 with Retry-After
-  and code 14; an unknown delay is a random 1 to 3 s, and an OTAP stream
-  refused for memory pressure gets the same status. Migration: alerts or
+  and code 14; an unknown delay is a random 1 to 3 s. OTAP memory-pressure
+  refusals are UNAVAILABLE too (ArrowStatus 14, was 8). Migration: alerts or
   clients matching RESOURCE_EXHAUSTED from these receivers match UNAVAILABLE.

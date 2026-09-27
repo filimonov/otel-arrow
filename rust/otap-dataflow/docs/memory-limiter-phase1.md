@@ -310,7 +310,7 @@ receivers continue accepting requests regardless of pressure level.
 | OTLP HTTP | `503 Service Unavailable` with `Retry-After: <retry_after_secs>` header |
 | OTLP gRPC | `UNAVAILABLE` (retried by every OTLP client) with a `google.rpc.RetryInfo` delay and `grpc-retry-pushback-ms: <retry_ms>` metadata |
 | OTAP gRPC stream open / next-read boundary | `UNAVAILABLE` + `google.rpc.RetryInfo` + `grpc-retry-pushback-ms` before stream admission, and for already-open streams at the next read boundary |
-| OTAP gRPC per-batch | `ResourceExhausted` in the OTAP Arrow batch status (ArrowStatus code 8) |
+| OTAP gRPC per-batch | `UNAVAILABLE` in the OTAP Arrow batch status (ArrowStatus code 14) |
 | Syslog / CEF TCP | Accept then immediately drop new connections; close active connections mid-stream |
 | Syslog / CEF UDP | Drop incoming datagrams |
 <!-- markdownlint-enable MD013 -->
