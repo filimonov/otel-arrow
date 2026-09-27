@@ -363,7 +363,7 @@ permanently oversized request.
 
 An OTLP request larger than the configured `burst` can never fit the bucket
 while pressure gating is active. HTTP rejects it with 413 and no `Retry-After`;
-gRPC returns `RESOURCE_EXHAUSTED` with negative retry pushback. Configure
+gRPC returns `UNAVAILABLE` with a random 1 to 3 second retry delay. Configure
 `burst` at least as large as the largest request the receiver should accept
 during pressure.
 
