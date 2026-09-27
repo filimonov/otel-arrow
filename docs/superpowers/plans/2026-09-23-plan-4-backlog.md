@@ -1,6 +1,9 @@
 # Plan 4 backlog (series_parquet exporter)
 
-> Review documents cited here (umbrella, consistency, complexity and deslop reviews, the S3 compatibility note, the compaction and format chat) were removed from the tree on 2026-09-25 after every open item moved to the plan-4 backlog; they remain in git history.
+> Review documents cited here (umbrella, consistency, complexity and deslop
+> reviews, the S3 compatibility note, the compaction and format chat) were
+> removed from the tree on 2026-09-25 after every open item moved to the
+> plan-4 backlog; they remain in git history.
 
 Status: groomed backlog (2026-09-25), not a plan. Plan 4 is written from it
 after the plan-3 final report (Task 14).
@@ -32,15 +35,6 @@ durable_buffer deployment and are not in plan 3.
   counted and logged; a restart test through each processor stores no duplicate.
   Source: Task 12e item 5; umbrella review 2026-09-25, needs verification.
 
-- **P0-2 End-to-end freshness gauge.**
-  Why: operators alert today from external object checks and indirect signals;
-  no metric gives the age of the oldest record accepted by the receiver but not
-  yet in a values file.
-  Done when: durable_buffer exports an oldest-pending-age gauge, the operator
-  guide alerts on it combined with the exporter's `oldest_unacked.age` and on
-  WAL fill.
-  Source: backlog freshness contract (1), user review 2026-09-23; Task 12c F5.
-
 - **P0-3 Refuse permanently invalid requests before the WAL acknowledges them.**
   Why: a request the exporter will refuse permanently (framing, row size, too
   many series, unsupported) is acknowledged by the WAL and later dropped, and
@@ -61,30 +55,15 @@ durable_buffer deployment and are not in plan 3.
   removed; a damaged body through durable_buffer is refused in a test.
   Source: umbrella review 2026-09-25, minor issues.
 
-- **P0-5 Conversion failure in durable_buffer has no resolved outcome.**
-  Why: a bundle that fails conversion is rejected without
-  `resolved{outcome=...}` (durable_buffer_processor/mod.rs:1426-1430), so the
-  buffer's outcome totals do not add up.
-  Done when: the rejection increments `resolved` with its own outcome and a test
-  asserts it.
-  Source: Task 12 triage amendment.
-
-- **P0-6 OTAP Arrow receiver's own RESOURCE_EXHAUSTED.**
-  Why: Task 12d made the OTLP receiver's retryable refusals UNAVAILABLE, but the
-  OTAP Arrow receiver still answers RESOURCE_EXHAUSTED, which Alloy and other
-  OTLP clients without RetryInfo drop.
-  Done when: its concurrency refusals answer UNAVAILABLE, counted, as in the
-  OTLP receiver.
-  Source: Task 12d residual 7.
-
-- **P0-7 durable_buffer WAL per-write sync option.**
-  Why: an acknowledgement means written to the WAL and synced within about
-  100 ms, so a host crash or power loss can lose the last 100 ms; quiver
-  supports per-write sync (flush_interval 0) but durable_buffer does not expose
-  it, and its cost is unmeasured.
-  Done when: the option is exposed, its throughput cost is measured, and the
-  README "Durability of the acknowledgement" offers it next to strict mode.
-  Source: Task 12c fix round 1 F2.
+- **P0-8 Admit force-drained data during a graceful shutdown behind
+  durable_buffer.**
+  Why: bundles in the buffer's open segment or drained after Shutdown begins
+  are refused by series_parquet (NodeShutdown) and replayed on the next start,
+  so every graceful restart with fresh data defers that tail (nothing lost or
+  duplicated).
+  Done when: the exporter admits force-drained bundles within the deadline and
+  the buffered restart E2E stores them before exit.
+  Source: clean-branch fix round 2026-09-26 (E2E finding).
 
 ## P1: performance and scale toward 1M records/s
 
@@ -110,7 +89,6 @@ buffered 144-152k bound by the WAL device).
   (major milestone); Task 5 scaling; Task 3i deferred; fifth review 2026-09-23.
 
 ### Other P1 items
-
 
 - **P1-2 durable_buffer WAL throughput.**
   Why: the buffered topology is bound by the WAL device: about 2x the wire bytes
@@ -345,14 +323,11 @@ buffered 144-152k bound by the WAL device).
   accounting rebuilt on `retained_work` with a handle through PipelineContext
   (umbrella 8, consistency C2); pdata CBOR encoder recursion limit; flaky
   otel-arrow-dfe-telemetry log_tap hang, otlp_grpc_exporter test_otlp_exporter
-  and opamp AddrInUse; parquet exporter's silent `continue` on a malformed body;
-  whether object_store tracing events are routed (S3 throttling is otherwise
-  invisible); jemalloc `background_thread:true` A/B on a standard pipeline,
-  then its default hygiene (on for every glibc jemalloc build at main.rs ~136;
-  a println! bypasses tracing and reports the option, not the threads; no CI
-  assertion; benches differ): if kept, a structured `startup::system_info`
-  event, an E2E default-feature assertion and benches on the same malloc_conf;
-  if dropped, removed.
+  and opamp AddrInUse; whether object_store tracing events are routed (S3
+  throttling is otherwise invisible); the jemalloc `background_thread:true`
+  default, kept on glibc builds: the banner is still a println! that bypasses
+  tracing and benches differ, so a structured `startup::system_info` event, an
+  E2E default-feature assertion and benches on the same malloc_conf.
   Source: Tasks 5, 6; Task 12 triage amendment; umbrella review 2026-09-25;
   umbrella review 2026-09-23 major 7.
 
@@ -372,10 +347,9 @@ buffered 144-152k bound by the WAL device).
 
 - **P3-5 Exporter operability leftovers.**
   Why: some signals an operator needs are missing.
-  Done when: the start event logs base_uri, endpoint, resolved
-  `unsigned_payload` and retry timeout; the refusal log gate carries producer
-  identity per outcome; local-backend staging files (`<file>#N`) are documented
-  and reclaimed; the README notes versioned buckets and object lock; the
+  Done when: the start event logs base_uri, endpoint and retry timeout;
+  local-backend staging files (`<file>#N`) are documented and reclaimed; the
+  README notes object lock; the
   exporter README limits table and the lake config doc state what
   `ingress.max_request_bytes` measures (protobuf length for OTLP input,
   estimated Arrow bytes for OTAP input, so a batch or converting processor
@@ -399,10 +373,8 @@ buffered 144-152k bound by the WAL device).
   proptest asserting `!nack.permanent` over all ten faults; deterministic
   phase-2 cancellation between the last part and completion; `merge_key_bound`
   checked at compile time against arrow-row; wall-clock windows off llvm-cov;
-  the live fault matrix as a CI lane; an oracle proptest mixing gauge, sum and
-  histogram points in one request; `memory.accounted` back to baseline after
-  ack, nack and abandon (check tests/metrics.rs and sink/tests.rs first); an
-  exact-boundary admission test at 1,000,000,000 ns if absent.
+  the live fault matrix as a CI lane; an exact-boundary admission test at
+  1,000,000,000 ns if absent.
   Source: backlog tests; umbrella reviews 2026-09-23 and 2026-09-25, tests;
   Tasks 12a, 12b residuals.
 
@@ -445,40 +417,19 @@ buffered 144-152k bound by the WAL device).
 
 - **P3-12 Upstream PR logistics.**
   Why: the upstream branch must carry only the needed minimum.
-  Done when: plan 3 "After Task 14" is executed (de-slop, clean branch from
-  origin/main, one commit per PR) and these are settled with it: core-nodes vs
+  Done when: these are settled on the clean branch: core-nodes vs
   contrib-nodes placement with the maintainers; Python lane under tools/;
-  `#[non_exhaustive]` or changelog for `shutdown_completions` and
-  `StorageType::S3.unsigned_payload`; series-lake test scaffolding out of the
-  public API and benches out of the published crate; drive-by changes dropped;
-  parquet, file and otap READMEs document the framing refusal and the
-  `otlp.malformed_body` WARN; the parquet exporter event rename
-  `parquet.exporter.retry_ignored_for_file_storage` ->
-  `object_store.retry_ignored_for_file_storage` (5f0135e73) gets its own
-  `breaking` changelog entry naming both in the object_store commit. Opening
-  PRs remains the user's call.
+  drive-by changes dropped. Opening PRs remains the user's call.
   Source: plan 3 "After Task 14"; umbrella review 2026-09-25, minor issues and
   finding 6.
 
-- **P3-13 Engine settles contexts when a node task dies.**
-  Why: an AckToken has no Drop fallback, so if the exporter task panics or its
-  start future is dropped in a live process, held requests may stay undecided
-  and producers hang until their timeout.
-  Done when: a test or a recorded code reading states what the engine does and,
-  if contexts are dropped, the node failure nacks them retryably, with a README
-  line.
-  Source: umbrella review 2026-09-23, needs verification; plan 3 Task 3j.
-
-- **P3-14 durable_buffer directory ownership and dispatch docs.**
+- **P3-14 durable_buffer WAL directory lock.**
   Why: quiver takes no exclusive lock on `path/core_<id>` although the engine
   README says old and new runtimes overlap during live reconfiguration; the
-  buffer module doc (mod.rs ~27-38) and config.rs ~6-13 recommend
-  RoundRobin/Random/LeastLoaded, which no longer exist (one_of, broadcast); the
-  buffer README lacks the per-process directory rule, the no-migration drain
-  procedure on a core change and the per-core split of retention_size_cap.
+  buffer README now states that one process owns a path, but nothing enforces
+  it.
   Done when: quiver locks the WAL directory and refuses a second opener (or an
-  upstream issue is filed), the dispatch table is rewritten, and the buffer
-  README states the three rules.
+  upstream issue is filed).
   Source: docs/superpowers/parallel.md (user note 2026-09-25).
 
 - **P3-15 Count CreateMultipartUpload retries that leave uploads (F-A2).**
@@ -494,48 +445,26 @@ buffered 144-152k bound by the WAL device).
 
 - **P3-16 Minor findings of the clean-branch review (2026-09-26).**
   Why: none breaks delivery; each is a correctness or operability edge left
-  for later. Done when each is fixed or explicitly declined:
-  `unsigned_payload` default differs between the parquet and series_parquet
-  exporters for the same `storage.s3` section and nothing logs the effective
-  mode (keep signed when invalid certificates are allowed); `Retry-After: 1`
-  without jitter synchronizes OTLP/HTTP retries, and HTTP bodies still say
-  RESOURCE_EXHAUSTED where gRPC says UNAVAILABLE; the OTAP per-batch
-  memory-pressure status is still RESOURCE_EXHAUSTED; a write that commits
-  while `abandon` cancels it is nacked with no late-commit record; metrics
-  freeze during the shutdown drain (forward CollectTelemetry); the
+  for later. Done when each is fixed or explicitly declined: a write that
+  commits while `abandon` cancels it is nacked with no late-commit record;
+  metrics freeze during the shutdown drain (forward CollectTelemetry); the
   shutdown-completion protocol needs two agreeing opt-ins and exposes
   engine-only methods publicly, and `ShutdownCompletionRequirements::default()`
   has a zero reserve; series-lake models config errors as request refusals,
   keeps BlockFull/TooManyRequests in the permanent enum, exposes every module
-  and carries an unused second serde layer; FORMAT.md overstates series_id
-  comparability across writers and leaves metadata encodings and the boot_id
-  form unstated; a metric with no data oneof refuses the whole request; the
-  memory oversubscription warning ignores cgroup limits; refusal WARNs carry
-  no producer identity and late-commit log outcomes differ from metric
-  labels; the hot-series path derives identity before consulting the cache;
-  Alloy configs are validated by nothing and ship `tls { insecure = true }`;
-  the jemalloc test is compiled out of the --all-features job and startup
-  prints the allocator twice; durable_buffer shutdown mixes engine-clock and
-  std Instant; the Python lock and the workflow's system Python are unpinned;
-  validator invariants are enforced only by comments.
+  and carries an unused second serde layer; the hot-series path derives
+  identity before consulting the cache (see P3-18, P1-3); the jemalloc test is
+  compiled out of the --all-features job; validator invariants are enforced
+  only by comments.
   Source: clean-branch review 2026-09-26, "Minor issues".
 
-- **P0-8 Admit force-drained data during a graceful shutdown behind durable_buffer.**
-  Why: bundles in the buffer's open segment or drained after Shutdown begins
-  are refused by series_parquet (NodeShutdown) and replayed on the next start,
-  so every graceful restart with fresh data defers that tail (nothing lost or
-  duplicated). Done when the exporter admits force-drained bundles within the
-  deadline and the buffered restart E2E stores them before exit.
-  Source: clean-branch fix round 2026-09-26 (E2E finding).
 - **P3-17 Leftovers of the clean-branch fix round (2026-09-26).**
   Why and done when, each: progress persists in the completion phase are
   ack-driven only (add a timer so a kill cannot replay acks recorded less than
   poll_interval after the last persist); stalled durable_buffer storage threads
   are never reclaimed (bound or reclaim them); the engine's non-zero
   `final_reserve` path has no user after durable_buffer took a zero reserve
-  (keep or remove); pdata `remove_delta_encoding_from_column`
-  (otap/transform.rs ~136) adds without an overflow check (crafted OTAP ids
-  panic in debug, wrap in release: upstream fix); upstream READMEs list
+  (keep or remove); upstream READMEs list
   metric names with underscores where the code emits dots; prep APIs
   (RepeatedSingular::Refuse, OverTls, StorageType::kind,
   deserialize_required_usize, count_utf8_repairs) land before their first user
@@ -625,6 +554,68 @@ buffered 144-152k bound by the WAL device).
 - "Tested on S3-compatible stores" wording: adopted for the Task 14 report.
 - `part_bytes` validated against 5 GiB and 10,000 parts: series-lake
   src/config.rs ~478-481, 652.
+- P0-2 End-to-end freshness gauge: "feat(durable-buffer): export the age of
+  the oldest pending bundle"; the alerts on it, `oldest_unacked.age` and WAL
+  fill are in the series_parquet README and deploy/series-parquet/alerts
+  (clean branch, 2026-09-27).
+- P0-5 Conversion failure resolved outcome: "fix(durable-buffer): count
+  conversion failures as a resolved outcome" (clean branch, 2026-09-27).
+- P0-6 OTAP receiver RESOURCE_EXHAUSTED: "fix(otap-receiver): refuse batches
+  under memory pressure with UNAVAILABLE" and "fix(otlp-receiver): refuse with
+  retryable statuses and bound decoded messages" (stream refusals); the batch
+  concurrency refusal was already UNAVAILABLE (clean branch, 2026-09-27).
+- P0-7 durable_buffer WAL per-write sync option: declined by the user
+  (2026-09-26).
+- P3-2 parquet exporter's silent `continue` on a malformed body: now logged
+  and counted, "fix(exporters): refuse OTLP bodies with broken protobuf
+  framing"; jemalloc `background_thread` kept on glibc builds, the banner
+  reports the thread state once, with a test: "feat(engine): start jemalloc
+  with its background purging thread on glibc Linux" (clean branch,
+  2026-09-27).
+- P3-5 resolved `unsigned_payload` in the start event, producer id in refusal
+  WARNs, versioned-bucket note: "feat(series-parquet): add the series_parquet
+  exporter" (clean branch, 2026-09-27).
+- P3-7 mixed gauge/sum/histogram oracle proptest: "feat(series-lake): add the
+  series-lake crate"; `memory.accounted` back to baseline after ack, refusal
+  and abandon: "feat(series-parquet): add the series_parquet exporter" (clean
+  branch, 2026-09-27).
+- P3-12 clean branch cut from origin/main with one commit per PR, changelogs
+  for `shutdown_completions` and `unsigned_payload`, series-lake test clocks
+  behind the `testing` feature and no benches in the published crate,
+  parquet/file/otap READMEs on the framing refusal and `otlp.malformed_body`,
+  `breaking` changelog for the object_store event rename: "feat(otap): share
+  exporter object store wiring; add S3 unsigned_payload and Azure endpoint",
+  "fix(exporters): refuse OTLP bodies with broken protobuf framing",
+  "fix(engine): deliver completions after Shutdown and keep the pipeline
+  deadline" (clean branch, 2026-09-27).
+- P3-13 Engine settles contexts when a node task dies: "test(engine): record
+  what a producer sees when a node panics"; the whole core pipeline stops and
+  the producer sees its connection close, stated in
+  docs/configuration-model.md; nacking on node failure is not built (a
+  runtime change) (clean branch, 2026-09-27).
+- P3-14 dispatch docs and the three README rules (one process per WAL path,
+  no migration on a core change, per-core retention_size_cap):
+  "docs(durable-buffer): state the WAL directory, core count and dispatch
+  rules" (clean branch, 2026-09-27).
+- P3-16 `unsigned_payload` effective mode logged and signed with invalid
+  certificates (the per-exporter default is kept by design), FORMAT.md series_id
+  comparability, metadata encodings and boot_id form, metrics without data
+  skipped, cgroup-aware oversubscription warning, producer id in refusal
+  WARNs, late-commit log outcomes equal to metric labels, Alloy configs
+  validated in E2E with the plaintext `tls` and producer id documented in
+  configs/README.md: "feat(series-lake): add the series-lake crate",
+  "feat(series-parquet): add the series_parquet exporter"; jittered
+  Retry-After and code 14 in HTTP bodies: "fix(otlp-receiver): refuse with
+  retryable statuses and bound decoded messages"; OTAP per-batch memory
+  pressure: "fix(otap-receiver): refuse batches under memory pressure with
+  UNAVAILABLE"; allocator printed once: "feat(engine): start jemalloc with its
+  background purging thread on glibc Linux"; durable_buffer shutdown on the
+  engine clock: "fix(durable-buffer): record exporter acks sent during a
+  graceful shutdown"; hash-pinned Python lock and setup-python 3.14 in the
+  Series Parquet E2E workflow: "feat(series-parquet): add the series_parquet
+  exporter" (clean branch, 2026-09-27).
+- P3-17 pdata `remove_delta_encoding_from_column` overflow: "fix(pdata): refuse
+  delta-encoded ids that overflow" (clean branch, 2026-09-27).
 
 Merged duplicates: worker scaling 0.67 and flush off the ingest core into P1-1;
 bounded yielding into P1-1; streaming series_id and umbrella extraction costs
