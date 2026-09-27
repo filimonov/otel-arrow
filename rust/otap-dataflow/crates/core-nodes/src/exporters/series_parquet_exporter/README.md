@@ -419,9 +419,9 @@ setting and says so at startup, at INFO for the first worker of the process
 At-least-once begins when a request reaches this exporter: a producer queue
 overflow before that is lost and invisible here, so a file source should block
 on overflow. The reference Grafana Alloy producer is
-`configs/series-parquet.alloy`;
+[`configs/series-parquet.alloy`](../../../../../configs/series-parquet.alloy);
 its tuning is described in the
-configs README.
+[configs README](../../../../../configs/README.md#series-parquetalloy).
 
 ## Running behind durable_buffer
 
@@ -470,9 +470,9 @@ shards first and keep old `core_<id>` directories until they are empty.
 ## Deploying with Alloy
 
 The reference deployment is
-`configs/series-parquet-buffered.yaml`
+[`configs/series-parquet-buffered.yaml`](../../../../../configs/series-parquet-buffered.yaml)
 with Grafana Alloy running
-`configs/series-parquet.alloy`:
+[`configs/series-parquet.alloy`](../../../../../configs/series-parquet.alloy):
 
 ```text
 log files -> Alloy (file tail, batch 4000, file-backed queue)
