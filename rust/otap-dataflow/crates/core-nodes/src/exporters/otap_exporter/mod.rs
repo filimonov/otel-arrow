@@ -36,7 +36,7 @@ use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::ExporterFactory;
 use otel_arrow_dfe_engine::config::ExporterConfig;
 use otel_arrow_dfe_engine::context::PipelineContext;
-use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, NodeControlMsg};
+use otel_arrow_dfe_engine::control::{AckMsg, NackCause, NackMsg, NodeControlMsg};
 use otel_arrow_dfe_engine::error::{Error, ExporterErrorKind, format_error_sources};
 use otel_arrow_dfe_engine::exporter::ExporterWrapper;
 use otel_arrow_dfe_engine::local::exporter as local;
@@ -57,6 +57,7 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::{
     arrow_metrics_service_client::ArrowMetricsServiceClient,
     arrow_traces_service_client::ArrowTracesServiceClient,
 };
+use otel_arrow_dfe_pdata::{OtapPayload, PayloadData};
 use otel_arrow_dfe_telemetry::common_attributes::SignalAttributes;
 use otel_arrow_dfe_telemetry::error::Error as TelemetryError;
 use otel_arrow_dfe_telemetry::instrument::HistogramNormal;
@@ -755,6 +756,9 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                         }
 
                         let payload = pdata.take_payload();
+                        // OTLP bytes are kept (a reference count) so a refusal returns them.
+                        let original = matches!(payload.data(), PayloadData::OtlpBytes(_))
+                            .then(|| payload.clone());
                         let message: OtapArrowRecords = match payload.try_into_with_default() {
                             Ok(m) => m,
                             Err(e) => {
@@ -763,8 +767,20 @@ impl local::Exporter<OtapPdata> for OTAPExporter {
                                     OtapExporterErrorType::PayloadConversion,
                                     export_started_at.elapsed(),
                                 );
-                                effect_handler.notify_nack(NackMsg::new("payload conversion failed", pdata)).await?;
-                                return Err(e.into());
+                                // The conversion is deterministic, so a retry fails the same way.
+                                let (context, _) = pdata.into_parts();
+                                let refused = OtapPdata::new(
+                                    context,
+                                    original.unwrap_or_else(|| OtapPayload::empty(signal_type)),
+                                );
+                                effect_handler
+                                    .notify_nack(NackMsg::new_permanent_with_cause(
+                                        format!("payload conversion failed: {e}"),
+                                        refused,
+                                        NackCause::Refused,
+                                    ))
+                                    .await?;
+                                continue;
                             }
                         };
 
@@ -3158,6 +3174,45 @@ mod tests {
                 Decision::Ack(id) => panic!("{id}: a malformed body was acknowledged"),
             }
         }
+    }
+
+    /// Scenario: a well-framed OTLP logs request holding 65,537 empty
+    /// `ResourceLogs`, one more than the OTAP conversion's u16 ids can
+    /// number, followed by a valid request, with a destination that
+    /// acknowledges every batch.
+    /// Guarantees: the first is nacked permanently as `Refused` with its
+    /// original bytes, and the exporter keeps running: the second is sent and
+    /// acknowledged.
+    #[test]
+    fn a_request_the_conversion_refuses_is_nacked_permanently() {
+        let too_many = [0x0a, 0x00].repeat(65_537);
+        let (decisions, received) = export_otlp_logs(
+            vec![
+                (61, too_many.clone()),
+                (62, logs_body(b"INFO", b"payment accepted")),
+            ],
+            true,
+        );
+        match &decisions[..] {
+            [
+                Decision::Nack {
+                    id: 61,
+                    permanent: true,
+                    cause: NackCause::Refused,
+                    reason,
+                    refused,
+                },
+                Decision::Ack(62),
+            ] => {
+                assert!(reason.starts_with("payload conversion failed"), "{reason}");
+                assert!(
+                    refused == &too_many,
+                    "the nack must carry the original bytes"
+                );
+            }
+            other => panic!("unexpected decisions: {other:?}"),
+        }
+        assert_eq!(received.len(), 1);
     }
 
     /// Scenario: two well-formed OTLP logs requests reach the exporter with a

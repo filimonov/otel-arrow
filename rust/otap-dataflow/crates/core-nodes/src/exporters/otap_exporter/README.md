@@ -109,7 +109,9 @@ channel and is not duplicated by the exporter.
 | --- | --- | --- | --- |
 | `exporter.otap.failures.messages` | `{message}` | `signal`, `error.type` | Failed OTAP exports classified by actionable error type. |
 
-`error.type` is one of `payload_conversion`, `malformed_body` (an OTLP
+`error.type` is one of `payload_conversion` (a request the conversion to
+Arrow records refuses, such as one with more than 65,536 resources, scopes or
+records, nacked permanently), `malformed_body` (an OTLP
 request refused because its body's protobuf framing is broken), `encoding`, `authentication`,
 `authorization`, `timeout`, `throttled`, `unavailable`, `rejected`,
 `server_error`, `transport`, `internal`, `shutdown`, or `other`. Successful
