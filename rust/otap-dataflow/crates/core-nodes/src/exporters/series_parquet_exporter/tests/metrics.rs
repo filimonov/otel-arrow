@@ -549,9 +549,9 @@ fn memory_limit_prefers_a_lower_cgroup_limit() {
 }
 
 /// Scenario: a worker on more cores than any host has memory for with file storage, then one on
-/// a single core with S3 storage.
-/// Guarantees: the start event names the worker and its storage; the oversubscription WARN fires
-/// only for the first and says a durable_buffer's share is not in it.
+/// a single core with S3 storage that signs `UNSIGNED-PAYLOAD`.
+/// Guarantees: the start event names the worker and its effective `unsigned_payload`; the
+/// oversubscription WARN fires only for the first and says a durable_buffer's share is not in it.
 #[tokio::test(flavor = "current_thread")]
 async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
     let events = capture();
@@ -568,6 +568,7 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
         &super::super::Startup {
             storage: "file".to_owned(),
             num_cores: 1 << 20,
+            unsigned_payload: None,
             first_in_process: true,
         },
     );
@@ -583,6 +584,10 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
         Some(worker.boot_id.clone())
     );
     assert_eq!(field("storage"), Some(FieldValue::Str("file".into())));
+    assert_eq!(
+        field("unsigned_payload"),
+        Some(FieldValue::Str("not_applicable".into()))
+    );
     if super::super::process_memory_limit().is_some() {
         let warned = events.named("series_parquet.memory_budget.oversubscribed");
         assert_eq!(warned.len(), 1, "a million cores oversubscribe any host");
@@ -610,11 +615,16 @@ async fn start_up_announces_the_worker_and_warns_on_budgets_that_cannot_hold() {
         &super::super::Startup {
             storage: "s3".to_owned(),
             num_cores: 1,
+            unsigned_payload: Some(true),
             first_in_process: true,
         },
     );
     let start = events.named("series_parquet.start");
     assert_eq!(start.len(), 2);
+    assert_eq!(
+        start[1].fields.get("unsigned_payload"),
+        Some(&FieldValue::Str("on".into()))
+    );
     assert_eq!(
         events
             .named("series_parquet.memory_budget.oversubscribed")
@@ -646,6 +656,7 @@ async fn start_up_states_that_the_receiver_limit_is_not_visible() {
             &super::super::Startup {
                 storage: "file".to_owned(),
                 num_cores: 1,
+                unsigned_payload: None,
                 first_in_process,
             },
         );
@@ -687,6 +698,7 @@ async fn start_up_warns_when_a_block_could_exceed_the_multipart_part_limit() {
             &super::super::Startup {
                 storage: "file".to_owned(),
                 num_cores: 1,
+                unsigned_payload: None,
                 first_in_process: true,
             },
         );

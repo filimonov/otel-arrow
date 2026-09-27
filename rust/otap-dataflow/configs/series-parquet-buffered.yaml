@@ -103,6 +103,10 @@ groups:
                   endpoint: http://127.0.0.1:9000
                   allow_http: true
                   virtual_hosted_style_request: false
+                  # Payloads are signed. `unsigned_payload: true` skips the SHA-256
+                  # of every uploaded byte, which saves CPU, but leaves only TLS to
+                  # protect the bytes in transit: set it only with an https://
+                  # endpoint whose certificate is verified, never with this one.
                   auth:
                     type: static_credentials
                     access_key_id: "${env:SERIES_S3_ACCESS_KEY_ID}"

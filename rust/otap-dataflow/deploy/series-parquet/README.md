@@ -69,6 +69,7 @@ docker run -d --name series-parquet --read-only --memory 7g \
   --add-host host.docker.internal:host-gateway \
   -e AWS_ENDPOINT_URL=http://host.docker.internal:9000 \
   -e AWS_ALLOW_HTTP=true -e AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
+  -e AWS_UNSIGNED_PAYLOAD=false \
   -e MALLOC_CONF=background_thread:true \
   -e POD_NAME=series-parquet-0 -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
   df_engine:series-parquet \
@@ -133,9 +134,11 @@ Run the commands from this directory.
    `auth: {type: default}` reads both.
 
 3. **Config.** Edit `k8s/engine/site.env`: `SERIES_S3_BASE_URI` and
-   `AWS_REGION`. It ships the AWS S3 values (HTTPS); for a MinIO in the
-   cluster uncomment the three MinIO lines, which also allow plain HTTP.
-   Keep `engine.yaml` as it is unless the sizing below changes.
+   `AWS_REGION`. It ships the AWS S3 values (HTTPS) with
+   `AWS_UNSIGNED_PAYLOAD=true`, which skips the payload hash and relies on
+   TLS; for a MinIO in the cluster set it to `false` and uncomment the three
+   MinIO lines, which also allow plain HTTP. Keep `engine.yaml` as it is
+   unless the sizing below changes.
 
 4. **Engine.** Set the image (`kustomize edit set image
    df_engine=<registry>/df_engine:<tag>` in `k8s/engine`, or edit

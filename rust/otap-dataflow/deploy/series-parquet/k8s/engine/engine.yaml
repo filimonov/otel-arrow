@@ -72,6 +72,10 @@ groups:
                   # Region, endpoint, credentials and path style come from the
                   # AWS_* variables (site.env and the Secret) or IRSA.
                   auth: {type: default}
+                  # unsigned_payload comes from AWS_UNSIGNED_PAYLOAD (site.env):
+                  # true skips the SHA-256 of every uploaded byte and leaves only
+                  # TLS to protect the bytes, so site.env sets it for the https://
+                  # AWS endpoint and its plain-HTTP MinIO overlay sets false.
               # Store-level retries end below flush_retry_deadline, as startup requires.
               retry:
                 max_retries: 5

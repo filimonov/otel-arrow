@@ -339,9 +339,29 @@ Rules enforced at startup:
   denormalized column is refused when named `v`, `signal`, `dataset`,
   `date` or `hour`.
 
+S3 storage takes `unsigned_payload`: when true, requests are signed with SigV4
+`UNSIGNED-PAYLOAD` instead of a SHA-256 of every uploaded byte, which removes
+most of the upload CPU (102.5 instead of 376.4 ns per log record against
+MinIO). No other checksum is sent either, so only TLS protects the bytes in
+transit: set it only with an `https://` endpoint whose certificate is
+verified. The value in the storage section wins, then `AWS_UNSIGNED_PAYLOAD`;
+with neither set every payload is signed, as in every exporter that shares
+the S3 storage section. The shipped S3 configurations name a plain-HTTP
+loopback endpoint and leave it unset; the deployment example takes it from
+`AWS_UNSIGNED_PAYLOAD`, true for its HTTPS endpoint. The
+start event reports the effective value as `unsigned_payload`. Some
+S3-compatible stores and bucket policies refuse `UNSIGNED-PAYLOAD`; every
+upload then fails with HTTP 403 (`block.write_failures` rises, nothing is stored).
+Remove the setting for such a store.
+
 Azure storage takes `base_uri`
-(`https://<account>.blob.core.windows.net/<container>/<prefix>`). It has no
-credential fields:
+(`https://<account>.blob.core.windows.net/<container>/<prefix>`) and an
+optional `endpoint` that replaces the service URL the account implies, for a
+private endpoint or a sovereign cloud. With an `endpoint`, `base_uri` keeps
+that public-cloud form, since it only names the account, the container and
+the prefix; any other host fails at startup. The Azurite emulator works only
+when it serves HTTPS (`https://127.0.0.1:10000/devstoreaccount1`, Azurite
+started with a certificate). It has no credential fields:
 the node must bind `bearer_token_provider` to a token extension, such as
 `azure_identity_auth` (managed or workload identity) or
 `oauth2_client_auth`, and startup fails without that binding. The token must

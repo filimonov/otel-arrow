@@ -156,7 +156,7 @@ spec:
         severity: critical
       annotations:
         summary: '{{ $labels.pod }}: the store refuses blocks for good (for example HTTP 403)'
-        runbook: Check the credentials and the bucket policy (bucket/iam-policy.json); the buffer retries and the WAL fills.
+        runbook: Check the credentials, the bucket policy (bucket/iam-policy.json) and unsigned_payload; the buffer retries and the WAL fills.
     - alert: SeriesParquetExporterInternal
       expr: |
         sum by (namespace, pod) (increase(block_write_failures_total{job="series-parquet", otel_scope_name="exporter.series_parquet", error_type=~"encode|internal"}[10m])) > 0

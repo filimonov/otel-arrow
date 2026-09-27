@@ -138,6 +138,8 @@ impl Exporter<OtapPdata> for SeriesParquet {
             self.config.retry.as_ref(),
             self.token_provider.take(),
         )?;
+        let unsigned_payload =
+            otel_arrow_dfe_otap::object_store::s3_unsigned_payload(&self.config.storage);
         #[cfg(test)]
         let store = self.store_override.take().unwrap_or(store);
         let storage = self.config.storage.kind().to_owned();
@@ -152,6 +154,7 @@ impl Exporter<OtapPdata> for SeriesParquet {
             Startup {
                 storage,
                 num_cores: self.num_cores,
+                unsigned_payload,
                 first_in_process: !STARTED.swap(true, Ordering::Relaxed),
             },
         )
@@ -165,6 +168,8 @@ struct Startup {
     storage: String,
     /// Workers the engine runs, one per core.
     num_cores: usize,
+    /// Whether S3 requests sign `UNSIGNED-PAYLOAD`; `None` for other storage.
+    unsigned_payload: Option<bool>,
     /// Whether this is the process's first worker to start. Every worker of
     /// a process shares the configuration checks, so only the first logs
     /// their warnings at WARN, and the others at DEBUG.
@@ -221,8 +226,8 @@ fn writer_id_is_default(cfg: &lake::config::LakeConfig) -> bool {
     cfg.writer_id == lake::config::LakeConfig::default().writer_id
 }
 
-/// Emit the start event (writer id, boot id, storage, budget and the logs
-/// identity configuration), a warning when `writer_id`
+/// Emit the start event (writer id, boot id, storage, budget, S3 payload
+/// signing and the logs identity configuration), a warning when `writer_id`
 /// is left at its default, one when every core's memory budget together
 /// exceeds the memory this process may use, one when a file as large as a
 /// block could need more multipart parts than S3 allows, and a statement that
@@ -251,6 +256,11 @@ fn announce(worker: &worker::Worker, startup: &Startup) {
         storage = startup.storage.as_str(),
         num_cores = startup.num_cores,
         memory_budget_bytes = budget,
+        unsigned_payload = match startup.unsigned_payload {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "not_applicable",
+        },
         logs_identity_config = identity.as_str(),
         logs_identity_config_hash = identity_hash.as_str()
     );
@@ -330,6 +340,7 @@ async fn run(
         Startup {
             storage: "test".to_owned(),
             num_cores: 1,
+            unsigned_payload: None,
             first_in_process: false,
         },
     )
