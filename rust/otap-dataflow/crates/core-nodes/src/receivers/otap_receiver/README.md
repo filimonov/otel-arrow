@@ -92,7 +92,9 @@ an ACK sent to the client, `refused` for a NACK sent to the client, and
 | `receiver.otap.rejections.batches` | `{batch}` | `error.type` | Number of OTAP batches rejected within admitted streams. |
 
 The OTAP receiver emits the bounded `error.type` values `memory_pressure`,
-`concurrency_limit`, and `invalid_request`.
+`concurrency_limit`, and `invalid_request`. A stream refused for
+`memory_pressure` and a batch refused at `concurrency_limit` get UNAVAILABLE,
+a retryable status under the OTLP specification.
 
 Fatal gRPC serving failures are surfaced through component failure diagnostics,
 not a terminal-only metric that cannot be handed off on an error return.

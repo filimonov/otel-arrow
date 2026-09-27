@@ -308,8 +308,8 @@ receivers continue accepting requests regardless of pressure level.
 | Receiver | Hard-pressure behavior |
 | --- | --- |
 | OTLP HTTP | `503 Service Unavailable` with `Retry-After: <retry_after_secs>` header |
-| OTLP gRPC | `RESOURCE_EXHAUSTED` with `grpc-retry-pushback-ms: <retry_ms>` metadata |
-| OTAP gRPC stream open / next-read boundary | `RESOURCE_EXHAUSTED` + `grpc-retry-pushback-ms` before stream admission, and for already-open streams at the next read boundary |
+| OTLP gRPC | `UNAVAILABLE` (retried by every OTLP client) with a `google.rpc.RetryInfo` delay and `grpc-retry-pushback-ms: <retry_ms>` metadata |
+| OTAP gRPC stream open / next-read boundary | `UNAVAILABLE` + `google.rpc.RetryInfo` + `grpc-retry-pushback-ms` before stream admission, and for already-open streams at the next read boundary |
 | OTAP gRPC per-batch | `ResourceExhausted` in the OTAP Arrow batch status (ArrowStatus code 8) |
 | Syslog / CEF TCP | Accept then immediately drop new connections; close active connections mid-stream |
 | Syslog / CEF UDP | Drop incoming datagrams |
@@ -357,7 +357,7 @@ lockout behavior is acceptable.
 Once request weight is known, retryable rate-limit responses advertise the
 earliest whole-second bucket recovery delay for the refused weight. They do not
 reuse the memory limiter's sampling retry hint. Instance-wide fast refusal
-carries no retry guidance because request weight is unavailable at that
+carries a random 1 to 3 second delay because request weight is unknown at that
 boundary and the receiver cannot yet distinguish a transient refusal from a
 permanently oversized request.
 

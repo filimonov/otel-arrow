@@ -9,9 +9,11 @@ use otel_arrow_dfe_engine::memory_limiter::SharedReceiverAdmissionState;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tonic::{Code, Status, body::Body, metadata::MetadataMap};
+use std::time::Duration;
+use tonic::{Code, Status, body::Body};
 use tower::{Layer, Service};
 
+use crate::grpc_retry_info::status_with_retry_delay;
 use crate::otlp_metrics::{OtlpProtocol, OtlpReceiverMetrics};
 use otel_arrow_dfe_telemetry::common_attributes::ReceiverRejectionErrorType;
 
@@ -31,19 +33,16 @@ pub trait ReceiverRejectionMetrics: Send + Sync {
     }
 }
 
-/// Builds a gRPC `resource_exhausted` status with retry pushback metadata.
+/// Builds a retryable gRPC `unavailable` status carrying the configured retry delay.
+///
+/// UNAVAILABLE for the reason given in [`crate::grpc_retry_info`].
 #[must_use]
 pub fn grpc_memory_pressure_status(state: &SharedReceiverAdmissionState) -> Status {
-    let mut metadata = MetadataMap::new();
-    let retry_pushback_ms = u64::from(state.retry_after_secs().max(1)) * 1_000;
-    let _ = metadata.insert(
-        "grpc-retry-pushback-ms",
-        retry_pushback_ms
-            .to_string()
-            .parse()
-            .expect("retry pushback metadata should be valid ASCII"),
-    );
-    Status::with_metadata(Code::ResourceExhausted, "memory pressure", metadata)
+    status_with_retry_delay(
+        Code::Unavailable,
+        "memory pressure",
+        Duration::from_secs(u64::from(state.retry_after_secs().max(1))),
+    )
 }
 
 impl ReceiverRejectionMetrics for Mutex<OtlpReceiverMetrics> {
@@ -52,7 +51,7 @@ impl ReceiverRejectionMetrics for Mutex<OtlpReceiverMetrics> {
     }
 }
 
-/// Layer that fails fast with `resource_exhausted` before tonic decodes request bodies.
+/// Layer that fails fast with `unavailable` before tonic decodes request bodies.
 ///
 /// This is only enforced at `Hard` pressure. `Soft` remains advisory in the
 /// process-wide state machine for this Phase 1 implementation.
@@ -193,6 +192,33 @@ mod tests {
         }
     }
 
+    /// Scenario: the memory pressure status is built with a configured 7 s retry delay.
+    /// Guarantees: it is UNAVAILABLE carrying a 7 s `google.rpc.RetryInfo` detail.
+    #[test]
+    fn memory_pressure_status_carries_retry_info() {
+        let state = MemoryPressureState::default();
+        state.configure(MemoryPressureBehaviorConfig {
+            retry_after_secs: 7,
+            fail_readiness_on_hard: true,
+            mode: MemoryLimiterMode::Enforce,
+        });
+
+        let status =
+            grpc_memory_pressure_status(&SharedReceiverAdmissionState::from_process_state(&state));
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(
+            crate::grpc_retry_info::retry_delay(&status),
+            Some(prost_types::Duration {
+                seconds: 7,
+                nanos: 0
+            })
+        );
+    }
+
+    /// Scenario: hard memory pressure is active when a gRPC request reaches the layer.
+    /// Guarantees: the layer answers retryable UNAVAILABLE with the configured
+    /// pushback hint, without polling or calling the inner service.
     #[test]
     fn hard_pressure_short_circuits_before_inner_readiness_and_call() {
         let state = MemoryPressureState::default();
@@ -226,7 +252,7 @@ mod tests {
                 .headers()
                 .get("grpc-status")
                 .and_then(|v| v.to_str().ok()),
-            Some("8")
+            Some("14")
         );
         assert_eq!(
             response
