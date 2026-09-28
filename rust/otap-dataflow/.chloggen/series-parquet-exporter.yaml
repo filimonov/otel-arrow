@@ -21,5 +21,5 @@ issues: [0]
 subtext: |
   Build with --features series-parquet (plus aws for S3, azure for Azure). Use
   an OTLP receiver with wait_for_result and a 16MiB max_decoding_message_size;
-  delivery is at-least-once. Shutdown refuses the open block as retryable.
-  Routes whose completion token exceeds 4KiB are refused.
+  delivery is at-least-once. Shutdown writes queued requests the deadline
+  allows. Routes whose completion token exceeds 4KiB are refused.

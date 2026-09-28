@@ -298,10 +298,9 @@ The reference deployment for Grafana Alloy producers: the S3 pipeline with a
   under `/var/lib/otap/series-wal`, which gets its own device
 - Refuses with UNAVAILABLE while the WAL is at its 32GiB cap; the buffer
   retries failed blocks, so the exporter's flush deadline is 15s
-- A SIGTERM shutdown ends by the 60s deadline plus `upload.abort_timeout`,
-  65s in all; give the supervisor a longer grace period (90s in the deployment
-  example). What the buffer has not recorded as written stays in the WAL and
-  is sent after the restart
+- A SIGTERM drain ends by the 60s deadline plus `upload.abort_timeout`, 65s
+  in all; give the supervisor a longer grace period (90s in the deployment
+  example)
 
 Requires a binary built with `--features series-parquet,aws,durable-buffer`,
 an existing bucket with the same lifecycle rule, and the WAL directory. Metrics

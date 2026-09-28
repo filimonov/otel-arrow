@@ -211,61 +211,52 @@ after the writer gave up (FORMAT.md, "Partition lateness bound").
 ### Shutdown waits for the current window
 
 The engine shuts down receiver-first: the exporter is handed `Shutdown` once
-every node upstream has stopped sending, or at the shared deadline. A receiver
-with `wait_for_result: true` holds each response until its block is sealed,
+every receiver has drained, or at the shared deadline. A receiver with
+`wait_for_result: true` holds each response until its block is sealed,
 normally at the next window boundary, so a shutdown can spend up to one
-`window.interval` before the exporter's shutdown starts. With a window
-comparable to the deadline, the deadline expires first: the admin call
-returns HTTP 504 and the outstanding requests are nacked as retryable.
+`window.interval` before the exporter's drain starts. With a window comparable
+to the deadline, the deadline expires first: the admin call returns HTTP 504
+and the outstanding requests are nacked as retryable.
 
-### The shutdown
+### The drain
 
-Until the exporter is handed `Shutdown`, it works as usual: when the engine
-latches the exporter's Shutdown, it still hands over the requests already
-buffered in the input channel, which are admitted while admission is open and
-refused as retryable (`NodeShutdown`) at once while it is closed (a rotation
-waiting for the flush slot, a parked request, or no completion credit left).
+Until the exporter is handed its shutdown deadline, every block keeps its own
+retry deadline. When the engine latches the exporter's Shutdown, it still
+hands over the requests already buffered in the input channel: they are
+admitted until the deadline less `flush_retry_deadline` less 200ms, so the
+last block keeps one retry deadline to be written, and refused as retryable
+after that. Before that cut a drained request is admitted only while
+admission is open; one drained while it is closed (a rotation waiting for the
+flush slot, a parked request, or no completion credit left) is refused as
+retryable at once. The shutdown begins at the cut, or when the input is
+drained and the Shutdown released, whichever comes first. A later Shutdown
+with an earlier deadline moves the cut to 200ms before that deadline. From
+then on the exporter finishes only what it already holds, and stops writing
+200ms before the deadline, so its acknowledgements reach a durable buffer,
+which records them only until the deadline:
 
-The engine releases the Shutdown once the input channel is empty and closed,
-with the pipeline's deadline. When the channel closes while admission is
-closed, or without a Shutdown having been sent, the node is handed a
-Shutdown whose deadline is one second away instead. From the Shutdown on:
-
-- Admission ends. The parked request and every request of the ACTIVE block
-  are nacked as retryable with `NodeShutdown` at once; the ACTIVE block is not
-  written.
-- The FLUSHING block keeps its write and retries until the earlier of its own
-  deadline and 200ms before the shutdown deadline, with the backoff at its
-  200ms minimum. An attempt starts only before that cut, and one still running
-  there is cancelled and its requests nacked as retryable.
+- The parked request is nacked as retryable at once.
+- The FLUSHING block retries until the earlier of its own deadline and 200ms
+  before the shutdown deadline, with the backoff at its 200ms minimum. An
+  attempt starts only before that cut, and one still running there is
+  cancelled.
+- The ACTIVE block is sealed as soon as the flush slot frees and is written
+  under the same rules.
+- A request force-drained past the admission cut, whatever has not
+  finished by the cut, and whatever is still in the input channel at the cut
+  is nacked as retryable with `NodeShutdown`.
 - From the cut to the deadline the exporter delivers every decision, Acks
   first, waiting for room in the completion channel. A decision the channel
   has not taken by the deadline is counted as a delivery failure, an Ack also
-  in `notify.lost_acks`.
+  in `notify.lost_acks`; its producer times out and retries.
 
 The node returns as soon as it holds nothing, and at the latest by the
 deadline plus `upload.abort_timeout` (refused below 1s) plus the synchronous
 decision of the held requests, about 9ms for the 8,191 completions a worker
-can hold at the defaults. The same bound holds for the one-second Shutdown
-the engine synthesizes: a write that does not unwind can keep the node up to
-`upload.abort_timeout` (5s by default) past that second, while its
-completions are already decided. An operation already issued when the
-deadline cut its attempt may still complete at the store; its block is
-nacked, the cleanup reports its objects as `flush.late_commits{outcome=stored}`,
-and the retry may store those rows twice.
-
-The node upstream may have stopped by the time a decision reaches it, so a
-completion sent after the Shutdown can be lost. Nothing acknowledged is lost
-by that, and a request may be stored twice:
-
-- Behind `durable_buffer`, whatever the buffer has not recorded as
-  acknowledged stays in its WAL and is written after the restart: the ACTIVE
-  block's requests, and those of a block written during the shutdown whose
-  Ack arrived after the buffer stopped. At most that one block per worker is
-  stored twice.
-- In the strict deployment, the producer sees UNAVAILABLE, or its timeout
-  for a lost answer, and retries; a block written during the shutdown whose
-  answer was lost is stored again by the retry.
+can hold at the defaults. The bound is absolute, so the drain fits any
+deadline: a short one nacks more, a long one commits more. An operation
+already issued when the deadline cut its attempt may still complete at the
+store; its block is nacked, and the retry may store those rows twice.
 
 ### Granting a deadline
 
@@ -446,12 +437,12 @@ them; alert on each:
 - A damaged OTLP body that the conversion to Arrow records reads only in part
   is stored and acknowledged as the partial or empty batch it read.
 
-At a graceful shutdown this exporter refuses the requests its ACTIVE block
-holds and lets a write already in progress finish (see
-[The shutdown](#the-shutdown)). Everything the buffer has not recorded as
-acknowledged stays in the WAL and is written after the next start; a block
-written during the shutdown whose Ack arrived after the buffer stopped is
-written again then, so at most one block per worker is stored twice.
+At a graceful shutdown this exporter writes the requests it already holds, and
+the buffer records their acknowledgements. Bundles the buffer drains after the
+shutdown began, such as those still in its open segment, are admitted while
+the deadline leaves the last block one `flush_retry_deadline` and admission
+is open (see [The drain](#the-drain)), and refused as retryable otherwise;
+a refused bundle stays in the WAL and is stored once, after the next start.
 
 Freshness has no upper bound: with no backlog it is roughly the buffer's
 segment finalisation (up to 1s) and poll (100ms), the rest of this exporter's
@@ -647,7 +638,7 @@ RSS (0.47 GB median, 0.72 GB peak) and WAL (0.3 GB).
 | --- | --- | --- | --- |
 | Object store down | Nothing: acknowledgements continue from the WAL (p99 up to 2.5s while the worker also retries blocks). | The exporter fails each block after `flush_retry_deadline`; the buffer retries it until the store returns. Freshness grows with the outage and recovers within about 20s of the store's return. | 150s on MinIO and RustFS: no loss, no duplicates, no Alloy error; WAL peak 2.6 GB, RSS 1.9 GB held, 2.6 GB peak. |
 | WAL full (store down past the cap) | UNAVAILABLE; Alloy retries every 5s at most, its queue fills in about 3s and the tailer parks, so new lines wait in the log file. | Nothing is dropped while the file keeps them: a log rotation that removes an unread file before Alloy reaches it loses it. | 1GiB cap at 40k lines/s: full 53s after the store stopped (steady WAL 0.3 GB), refused for 90s, 384 UNAVAILABLE answers, no loss or duplicates, backlog drained 27s after the store returned. The shipped 32GiB absorbs about 34 minutes at 40k lines/s. |
-| Engine restart (SIGTERM) | UNAVAILABLE while no engine listens; Alloy retries. | The receiver drains; the exporter refuses its ACTIVE block and lets a write in progress finish (see [The shutdown](#the-shutdown)). What the buffer has not recorded as acknowledged stays in the WAL and is written after the restart; a block written during the shutdown may be written again then. | E2E `test_buffered_s3_shutdown_and_restart`: every line stored after the restart, none lost; the one block that may repeat is the only duplicate allowed. |
+| Engine restart (SIGTERM) | UNAVAILABLE while no engine listens; Alloy retries. | The receiver drains, the exporter writes its ACTIVE block, and the buffer records every acknowledgement before exiting; what is left stays in the WAL. | Exit in 0.16s with code 0, no duplicates, no loss. |
 | Engine SIGKILL | UNAVAILABLE until the new engine listens; the exports in flight are resent. | Everything acknowledged is in the WAL and is written after the restart. Duplicates: an export whose WAL write completed but whose answer was lost is stored twice (at most `num_consumers` exports per producer), and so are WAL entries acknowledged within the last 100ms, or a block committed within the last 100ms, since the WAL position and the acknowledgements are persisted on that tick. | 8 kills on MinIO and RustFS, mid-window, 0.4s after a block commit and during a flush: no loss; 4000 duplicate lines after one kill (one resent export), none after the other seven. A kill within 100ms of a commit was not produced. |
 | Alloy restart (`docker stop`, 10s grace) | Nothing. | Alloy saves its file positions and its queue on the way down. | All eight producers restarted: no loss, no duplicates. |
 | Alloy SIGKILL with a full queue (engine down) | Nothing. | The file-backed queue survives; lines read after the last saved position (every 10s) are read again. | No loss; 82,963 duplicate lines over eight producers (about 2s of input each). The same kill with the queue in memory lost 40,949 lines (4.4k to 5.7k per producer). |
@@ -742,7 +733,7 @@ collections is a counter.
 
 | Metric | Unit | Label | Values |
 | --- | --- | --- | --- |
-| `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests` |
+| `flushes` | `{flush}` | `reason` | `time`, `bytes`, `requests`, `shutdown` |
 | `block.write_failures` | `{block}` | `error.type` | `deadline`, `permanent_storage`, `cancelled`, `encode`, `internal` |
 | `nacks` | `{message}` | `error.type` | `storage`, `request_too_large`, `extracted_too_large`, `row_too_large`, `too_many_series`, `token_too_large`, `too_deep`, `invalid`, `unsupported`, `shutdown`, `internal` |
 | `rows.written`, `files.written` | `{row}`, `{file}` | `signal`, `dataset` | `logs`, `metrics`; `series`, `values` |
@@ -790,7 +781,7 @@ the window interval means the destination is the limit.
 | `series_parquet.notify.failed` | WARN | A completion the engine would not accept, at most one line per second with `suppressed` naming the lines left out; `notify.failures` counts every one. |
 | `series_parquet.inbox.failed` | WARN | The input channel failed. |
 | `series_parquet.shutdown` | INFO | The Shutdown control message arrived. |
-| `series_parquet.shutdown.cut` | WARN, INFO when nothing was held | The flush cut, 200ms before the shutdown deadline, decided what was still held: `held` (a block being written or an undelivered completion). An idle worker logs it at INFO. |
+| `series_parquet.shutdown.cut` | WARN, INFO when nothing was held | The flush cut, 200ms before the shutdown deadline, decided what was still held: `held` (a block, a parked request or an undelivered completion) and `refused` (requests still in the input channel, nacked as retryable). An idle worker whose sender stayed open logs it at INFO. |
 | `series_parquet.shutdown.deadline_exceeded` | WARN | The shutdown deadline elapsed with completions still undelivered; they are counted in `notify.failures`. |
 | `series_parquet.shutdown.complete` | INFO | The worker ended: `accepted`, `acked`, `nacked`, `abandoned`, `deadline_exceeded` (as the event above), `duration`. |
 

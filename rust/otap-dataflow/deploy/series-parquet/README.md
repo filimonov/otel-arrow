@@ -216,7 +216,7 @@ Run the commands from this directory.
   runs on it.
 - **Grace period 90 s.** SIGTERM grants the engine 60 s; the exporter needs up
   to `upload.abort_timeout` (5 s) more, and 90 s leaves a margin. What the
-  shutdown does not store stays in the WAL for the next start.
+  drain does not store stays in the WAL for the next start.
 - **Resources.** `core_allocation` is one worker. Memory is the README
   "Sizing" formula at the receiver's 4MiB request limit, 4.86 GB per worker
   with `max_in_flight` 640, times 1.25 for RSS: 6.1 GB, 81% of the 7Gi
@@ -269,13 +269,12 @@ it wait for the pipeline thread.
 
 ## Shutdown time
 
-At the Shutdown the exporter refuses its open block and waits only for a
-write already in progress: with the store frozen that write ends at the
-earlier of its `flush_retry_deadline` (15 s in the buffered configuration,
-60 s in the strict `series-parquet-s3.yaml`) and 200 ms before the 60 s
-deadline, and the exporter returns at most `upload.abort_timeout` later:
-65 s in the worst case, inside the 90 s grace period. This bound is derived
-from the configuration, not measured.
+Measured with the store frozen (`docker pause` of MinIO) and SIGTERM sent
+just after a window boundary started a flush: the buffered configuration
+exited after 39 s, bounded by the two blocks' `flush_retry_deadline` of 15 s
+each plus `upload.abort_timeout`, and the strict `series-parquet-s3.yaml`,
+whose `flush_retry_deadline` is 60 s, after 64 s, the 60 s deadline plus
+`upload.abort_timeout`. Both exited 0 inside the 90 s grace period.
 
 ## Trust boundary
 
@@ -332,8 +331,8 @@ rules watch; only Alloy's counters are accepted as absent.
    no refusals.
 3. **Graceful restart.** `kubectl delete pod series-parquet-0`: the log ends
    with `series_parquet.shutdown.complete` and `durable_buffer.shutdown.complete`,
-   the container exits 0, and after the restart no line is missing; the
-   block the exporter was writing at the shutdown may be stored twice.
+   the container exits 0, and after the restart the line count is still
+   exact.
 4. **Kill.** On the node, `pkill -KILL df_engine`: the pod restarts, the WAL
    replays, no acknowledged line is missing; up to `num_consumers` exports per
    producer may be stored twice.
@@ -350,11 +349,9 @@ rules watch; only Alloy's counters are accepted as absent.
 - An OK to the producer means the WAL has the request, not that it is synced:
   a host crash or power loss can lose about the last 100 ms of acknowledged
   requests. A process crash loses nothing.
-- At a graceful shutdown the exporter refuses the requests of its open block
-  instead of writing them; they stay in the WAL and are stored after the next
-  start, so a stopped pod's tail waits for its return. A block written during
-  the shutdown whose acknowledgement the buffer no longer records is stored
-  again then: at most one block per worker.
+- At a graceful shutdown, bundles the buffer drains after the shutdown began
+  are refused and stay in the WAL; they are stored after the next start, so
+  a stopped pod's tail waits for its return.
 - The failure measurements come from one worker at 40k lines/s; the soak
   evidence is single-worker too.
 - One worker takes about 100k lines/s behind the buffer (104k sustained on

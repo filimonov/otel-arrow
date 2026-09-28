@@ -353,7 +353,7 @@ async fn run_announced(
 }
 
 /// Emit the outcome of one shutdown: what the worker took in over its life,
-/// how it was decided, and how long the shutdown took.
+/// how it was decided, and how long the drain took.
 fn summarize(worker: &worker::Worker, since: Option<Instant>, deadline_exceeded: bool) {
     let outcomes = worker.notify.outcomes();
     let acked = outcomes[outcome::Outcome::Ack as usize];
@@ -371,27 +371,47 @@ fn summarize(worker: &worker::Worker, since: Option<Instant>, deadline_exceeded:
     );
 }
 
+/// Refuse, as `Worker::force_shutdown` does, every request the input channel
+/// already holds at the flush cut, without waiting for more, so none is
+/// dropped undecided with the inbox. Returns how many were refused.
+fn refuse_queued(worker: &mut worker::Worker, inbox: &mut ExporterInbox<OtapPdata>) -> usize {
+    use futures::FutureExt;
+
+    let mut refused = 0;
+    while let Some(Ok(message)) = inbox.recv_when(true).now_or_never() {
+        match message {
+            Message::PData(data) => {
+                worker.force_shutdown(data);
+                refused += 1;
+            }
+            Message::Control(NodeControlMsg::Shutdown { .. }) => break,
+            Message::Control(_) => {}
+        }
+    }
+    refused
+}
+
 /// Drive one worker until shutdown completes or its deadline elapses.
 ///
 /// The branches are ordered: the shutdown deadline first, so the node cancels
 /// on time under an always-ready boundary; then the window boundary, a
 /// resolved flush, completion delivery, the release of a decided block's
 /// flush slot, rotation, and only then a new message. `accept` is false while
-/// the ACTIVE block waits to be rotated; a request the engine force-drains
-/// past the closed gate after latching a Shutdown is refused with a retryable
-/// `NodeShutdown` nack (see `Notifier::force_shutdown`). The Shutdown itself
-/// refuses what the worker holds and lets a write in progress finish (see
-/// `Worker::shutdown`). The worker is borrowed so a test can inspect it after
-/// the loop returns.
+/// the ACTIVE block waits to be rotated. The inbox announces its shutdown
+/// latch with `ShutdownDraining`; the requests it still drains are admitted
+/// until the drain cut (see `Worker::drain`) and refused after it with a
+/// retryable `NodeShutdown` nack (see `Notifier::force_shutdown`). The worker
+/// is borrowed so a test can inspect it after the loop returns.
 async fn drive(
     worker: &mut worker::Worker,
     mut inbox: ExporterInbox<OtapPdata>,
 ) -> Result<TerminalState, Error> {
+    inbox.announce_draining();
     // The engine releases the Shutdown control message only once the upstream
     // channel is empty and closed, so its deadline here also means that no
     // request can arrive and that another receive would fail.
     let mut closed: Option<Instant> = None;
-    // When the Shutdown control message arrived, for the shutdown duration.
+    // When the Shutdown control message arrived, for the drain duration.
     let mut closed_at: Option<Instant> = None;
     let mut notify_turns = 0_usize;
     let mut notify_failures = LogGate::new();
@@ -408,6 +428,7 @@ async fn drive(
         let accept = worker.accept();
         worker.observe_admission(accept);
         let deadline = worker.deadline;
+        let drain_cut = worker.drain_cut();
         tokio::select! {
             biased;
 
@@ -420,12 +441,18 @@ async fn drive(
                     None => std::future::pending().await,
                 }
             } => {
-                // An idle worker reaches the cut on an ordinary shutdown with
-                // nothing to decide.
-                if worker.is_idle() {
-                    otel_info!("series_parquet.shutdown.cut", held = false);
+                // An idle worker whose sender is still open reaches the cut
+                // on an ordinary shutdown with nothing to decide.
+                let held = !worker.is_idle();
+                let refused = if closed.is_none() {
+                    refuse_queued(worker, &mut inbox)
                 } else {
-                    otel_warn!("series_parquet.shutdown.cut", held = true);
+                    0
+                };
+                if held || refused > 0 {
+                    otel_warn!("series_parquet.shutdown.cut", held = held, refused = refused);
+                } else {
+                    otel_info!("series_parquet.shutdown.cut", held = false, refused = 0);
                 }
                 let deadline_exceeded = worker.abandon().await;
                 if deadline_exceeded {
@@ -440,6 +467,18 @@ async fn drive(
                         .expect("the cut branch only fires with a deadline"),
                     worker.metric_snapshots(),
                 ));
+            }
+
+            // Past the drain cut the last block needs the rest of the time.
+            () = async {
+                match drain_cut {
+                    Some(cut) => otel_arrow_dfe_engine::clock::sleep_until(cut).await,
+                    None => std::future::pending().await,
+                }
+            }, if drain_cut.is_some() => {
+                if let Some(deadline) = worker.draining {
+                    worker.shutdown(deadline);
+                }
             }
 
             // The window boundary is the rotation trigger, so it is served
@@ -519,11 +558,29 @@ async fn drive(
             message = inbox.recv_when(accept), if closed.is_none() => {
                 notify_turns = 0;
                 match message {
-                    // The engine force-drains its buffered requests past a
-                    // closed gate once it has latched a Shutdown; the node
-                    // cannot take them, so they are refused retryably.
-                    Ok(Message::PData(data)) if !accept => worker.force_shutdown(data),
-                    Ok(Message::PData(data)) => worker.admit(data),
+                    Ok(Message::PData(data)) => {
+                        if worker.deadline.is_some()
+                            || (worker.draining.is_some() && !worker.admits_drained())
+                        {
+                            // Force-drained past what the node can still write:
+                            // refused at once.
+                            worker.force_shutdown(data);
+                        } else {
+                            worker.admit(data);
+                        }
+                    }
+                    Ok(Message::Control(NodeControlMsg::ShutdownDraining { deadline })) => {
+                        worker.drain(deadline);
+                        // Once the shutdown has begun, a tighter deadline
+                        // moves its cut at once (the earliest one wins).
+                        if worker.deadline.is_some()
+                            || worker
+                                .drain_cut()
+                                .is_some_and(|cut| otel_arrow_dfe_engine::clock::now() >= cut)
+                        {
+                            worker.shutdown(deadline);
+                        }
+                    }
                     Ok(Message::Control(NodeControlMsg::Shutdown { deadline, reason })) => {
                         otel_info!("series_parquet.shutdown", reason = reason);
                         closed = Some(deadline);

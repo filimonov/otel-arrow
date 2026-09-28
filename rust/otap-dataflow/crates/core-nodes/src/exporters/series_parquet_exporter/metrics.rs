@@ -134,6 +134,8 @@ pub(super) enum FlushReason {
     Bytes,
     /// The block reached its request budget.
     Requests,
+    /// The node is shutting down.
+    Shutdown,
 }
 
 /// The rotation trigger of one flush.
@@ -680,6 +682,7 @@ mod tests {
             (FlushReason::Time, "time"),
             (FlushReason::Bytes, "bytes"),
             (FlushReason::Requests, "requests"),
+            (FlushReason::Shutdown, "shutdown"),
         ] {
             metrics.flush.with(FlushAttrs { reason }).count.add(1);
             let snapshots = metrics.flush.terminal_snapshots();

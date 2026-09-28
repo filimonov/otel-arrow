@@ -63,6 +63,13 @@ groups:
               # it 3.25 GB live, 4.1 GB RSS. Carries 640 x 4000 lines / (15s + 5s)
               # = 128k lines/s, above the worker's ~100k/s.
               max_in_flight: 640
+              shutdown:
+                # Wait the whole 60s SIGTERM deadline for the exporter's answers: it
+                # decides every held request 200ms before the deadline (measured
+                # worst case with the store frozen: 39s), so an acknowledged block is
+                # not replayed. The buffer stops within a second after the deadline;
+                # the exporter by the deadline plus upload.abort_timeout, 65s in all.
+                await_acks: 60s
           exporter:
             type: exporter:series_parquet
             config:

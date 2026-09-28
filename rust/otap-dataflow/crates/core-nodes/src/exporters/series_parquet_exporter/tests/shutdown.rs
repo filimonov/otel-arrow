@@ -1,19 +1,18 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shutdown: the held requests refused at the Shutdown, the flush that may
-//! still finish before the deadline, and the release of both blocks.
+//! Shutdown: force-drained requests, the deadline and the release of
+//! both blocks.
 
 use super::super::worker::SHUTDOWN_COMPLETION_MARGIN;
 use super::support::*;
 
-/// Scenario: two requests buffered behind a Shutdown the engine latches and a third sent while
-/// the sender stays alive; the engine drains all three to the node, which holds them in its
-/// ACTIVE block, then the sender closes and the Shutdown is released.
-/// Guarantees: nothing is written; each request gets a retryable `NodeShutdown` nack only once
-/// the Shutdown is released, and `series_parquet.shutdown.complete` reports 3 admitted, 3 nacked.
+/// Scenario: two buffered requests and a third sent after shutdown latched, the sender alive
+/// throughout.
+/// Guarantees: each gets a retryable `NodeShutdown` nack, the node returns only after the channel
+/// closes, and `series_parquet.shutdown.complete` reports 0 admitted, 3 nacked.
 #[tokio::test(flavor = "current_thread")]
-async fn the_released_shutdown_nacks_every_request_the_active_block_holds() {
+async fn shutdown_decides_every_force_drained_request() {
     let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -29,7 +28,7 @@ async fn the_released_shutdown_nacks_every_request_the_active_block_holds() {
 
             // The engine latches this and releases it only once the upstream
             // pdata channel is both empty and closed, so the two requests
-            // below are drained to the node before it ever sees it.
+            // below are force-drained before the node ever sees it.
             control_tx
                 .send_async(NodeControlMsg::Shutdown {
                     deadline: clock::now() + Duration::from_secs(30),
@@ -45,13 +44,10 @@ async fn the_released_shutdown_nacks_every_request_the_active_block_holds() {
             }
 
             let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-            let mut config = worker_config();
-            // Far enough away that nothing but the shutdown can end the block.
-            config.window.interval = Duration::from_secs(600);
-            let store = Arc::new(object_store::memory::InMemory::new());
+            let config = worker_config();
             let node = tokio::task::spawn_local(super::super::run(
                 config.clone(),
-                store.clone(),
+                Arc::new(object_store::memory::InMemory::new()),
                 Arc::new(lake::clock::TestWallClock::new(0)),
                 inbox,
                 handler,
@@ -61,22 +57,21 @@ async fn the_released_shutdown_nacks_every_request_the_active_block_holds() {
                 )),
             ));
 
-            // The sender is still alive, so this request is drained to the
-            // node like the two before it.
+            for _ in 0..2 {
+                expect_shutdown_nack(&mut rx).await;
+            }
+
+            // The node is idle, but the sender is still alive, so this request
+            // must still be decided.
             pdata_tx
                 .send_async(logs_pdata())
                 .await
                 .expect("a late request enqueues");
-            // The row-less marker behind it proves all three are in the
-            // ACTIVE block, and that none is decided yet.
-            marker(&pdata_tx, &mut rx, 99).await;
+            expect_shutdown_nack(&mut rx).await;
 
             // Closing the upstream pdata channel releases the latched
             // shutdown; the control sender stays alive, as in the engine.
             drop(pdata_tx);
-            for _ in 0..3 {
-                expect_shutdown_nack(&mut rx).await;
-            }
             let terminal = tokio::time::timeout(Duration::from_secs(5), node)
                 .await
                 .expect("the node returns once the upstream channel closes")
@@ -91,92 +86,22 @@ async fn the_released_shutdown_nacks_every_request_the_active_block_holds() {
             assert_eq!(
                 terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
                 3,
-                "every held request is counted as a shutdown refusal"
+                "every force-drained request is counted as a shutdown refusal"
             );
             assert_eq!(
                 terminal_value(snapshots, "notify.failures", &[]),
                 0,
                 "the completion channel took all three immediately"
             );
-            // Only the row-less marker is acknowledged.
-            assert_eq!(terminal_value(snapshots, "acks", &[]), 1);
-            assert_eq!(
-                stored_files(&store).await,
-                0,
-                "the ACTIVE block is not written"
-            );
+            assert_eq!(terminal_value(snapshots, "acks", &[]), 0);
             let summary = events.named("series_parquet.shutdown.complete");
             assert_eq!(summary.len(), 1, "{summary:?}");
             let field = |name: &str| summary[0].fields.get(name).cloned();
-            assert_eq!(field("accepted"), Some(FieldValue::U64(4)));
-            assert_eq!(field("acked"), Some(FieldValue::U64(1)));
+            assert_eq!(field("accepted"), Some(FieldValue::U64(0)));
+            assert_eq!(field("acked"), Some(FieldValue::U64(0)));
             assert_eq!(field("nacked"), Some(FieldValue::U64(3)));
             assert_eq!(field("abandoned"), Some(FieldValue::U64(0)));
             assert_eq!(field("deadline_exceeded"), Some(FieldValue::Bool(false)));
-            drop(control_tx);
-            assert_no_more_completions(&mut rx);
-        })
-        .await;
-}
-
-/// Scenario: three requests held in the ACTIVE block when the upstream pdata channel closes
-/// without a Shutdown message, so the engine's inbox hands the node the Shutdown it synthesizes,
-/// with a deadline one second away.
-/// Guarantees: every held request gets a retryable `NodeShutdown` nack, nothing is written, and
-/// the node returns before that one-second deadline.
-#[tokio::test(flavor = "current_thread")]
-async fn a_closed_channel_shutdown_decides_every_held_request_within_its_second() {
-    let events = capture();
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let sim = clock::SimClock::new();
-            let _clock_guard = sim.install();
-            let (handler, mut rx) = effects(8);
-            let (pdata_tx, control_tx, inbox) = inbox(8);
-            let store = Arc::new(object_store::memory::InMemory::new());
-            let mut cfg = worker_config();
-            cfg.window.interval = Duration::from_secs(600);
-            let node = tokio::task::spawn_local(super::super::run(
-                cfg,
-                store.clone(),
-                Arc::new(lake::clock::TestWallClock::new(0)),
-                inbox,
-                handler,
-                None,
-            ));
-            for id in 1..=3 {
-                pdata_tx
-                    .send_async(logs_pdata_from(id))
-                    .await
-                    .expect("a request enqueues");
-            }
-            marker(&pdata_tx, &mut rx, 99).await;
-            let closed_at = clock::now();
-            drop(pdata_tx);
-
-            for _ in 0..3 {
-                expect_shutdown_nack(&mut rx).await;
-            }
-            let terminal = tokio::time::timeout(Duration::from_secs(5), node)
-                .await
-                .expect("the node returns")
-                .expect("the node task joins")
-                .expect("the node succeeds");
-            assert!(
-                clock::now() < closed_at + Duration::from_secs(1),
-                "the node returns inside the synthesized deadline"
-            );
-            assert_eq!(terminal.deadline(), closed_at + Duration::from_secs(1));
-            assert_eq!(
-                stored_files(&store).await,
-                0,
-                "the ACTIVE block is not written"
-            );
-            let shutdown = events.named("series_parquet.shutdown");
-            assert_eq!(
-                shutdown[0].fields.get("reason").map(FieldValue::text),
-                Some("pdata channel closed")
-            );
             drop(control_tx);
             assert_no_more_completions(&mut rx);
         })
@@ -309,15 +234,16 @@ async fn the_deadline_returns_only_once_the_flush_task_is_released() {
         .await;
 }
 
-/// Scenario: buffered pdata is force-drained past a closed admission gate after a Shutdown
-/// latches.
-/// Guarantees: the engine hands the request over although admission is closed, and the refusal
-/// the node answers it with is a retryable `NodeShutdown` nack, not a delivery failure.
+/// Scenario: buffered pdata is force-drained after a Shutdown latches, on an inbox that
+/// announces draining.
+/// Guarantees: the latched deadline arrives as `ShutdownDraining` before the forced request, and
+/// a refused forced request gets a retryable `NodeShutdown` nack, not a delivery failure.
 #[tokio::test(flavor = "current_thread")]
-async fn forced_pdata_past_a_closed_gate_is_retryably_nacked() {
+async fn forced_pdata_follows_the_draining_announcement_and_is_retryably_nacked() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let (pdata_tx, control_tx, mut inbox) = inbox(2);
+            inbox.announce_draining();
             let deadline = clock::now() + Duration::from_secs(1);
             pdata_tx
                 .send_async(logs_pdata())
@@ -331,6 +257,14 @@ async fn forced_pdata_past_a_closed_gate_is_retryably_nacked() {
                 .await
                 .expect("the shutdown enqueues");
 
+            assert!(
+                matches!(
+                    inbox.recv_when(false).await.expect("the announcement"),
+                    Message::Control(NodeControlMsg::ShutdownDraining { deadline: latched })
+                        if latched == deadline
+                ),
+                "the latched deadline is announced before the forced request"
+            );
             // Admission is closed, yet the buffered request is still handed
             // over: that is the force-drain the exporter has to decide.
             let data = match inbox.recv_when(false).await.expect("a forced request") {
@@ -340,7 +274,7 @@ async fn forced_pdata_past_a_closed_gate_is_retryably_nacked() {
 
             let (handler, mut rx) = effects(1);
             let mut notify = Notifier::new(handler, 2);
-            notify.force_shutdown(data);
+            notify.force_shutdown(data, 0);
             assert_eq!(
                 notify.failures(),
                 0,
@@ -362,8 +296,8 @@ async fn forced_pdata_past_a_closed_gate_is_retryably_nacked() {
 
 /// Scenario: the deadline elapses with a parked write, a populated ACTIVE block and a parked
 /// request.
-/// Guarantees: the parked request and the ACTIVE block are nacked at the Shutdown, the FLUSHING
-/// block at the deadline; nothing is left.
+/// Guarantees: the parked request is nacked at the latch, both blocks at the deadline; nothing is
+/// left.
 #[tokio::test(flavor = "current_thread")]
 async fn deadline_nacks_both_blocks_and_pending() {
     tokio::task::LocalSet::new()
@@ -404,13 +338,9 @@ async fn deadline_nacks_both_blocks_and_pending() {
             worker.shutdown(clock::now());
             assert!(
                 worker.pending.is_none(),
-                "the parked request is decided at the Shutdown"
+                "the parked request is decided when shutdown is latched"
             );
-            assert!(
-                worker.active.tokens.is_empty() && worker.active.data.is_empty(),
-                "the ACTIVE block is decided at the Shutdown, not written"
-            );
-            assert_eq!(worker.notify.len(), 2);
+            assert_eq!(worker.notify.len(), 1);
 
             let _ticker = ticking(&sim, Duration::from_millis(50));
             let _ = worker.abandon().await;
@@ -432,11 +362,10 @@ async fn deadline_nacks_both_blocks_and_pending() {
         .await;
 }
 
-/// Scenario: a Shutdown arrives with one block flushing and one open, and storage recovers early.
-/// Guarantees: the FLUSHING block is written and its four requests acknowledged; the open block
-/// is never written and its request gets a retryable `NodeShutdown` nack.
+/// Scenario: shutdown latches with one block flushing and one open, and storage recovers early.
+/// Guarantees: both blocks are written and acknowledged; nothing is nacked.
 #[tokio::test(flavor = "current_thread")]
-async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
+async fn shutdown_commits_both_blocks_before_deadline() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let store = fault_store();
@@ -470,8 +399,10 @@ async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
                 .send_async(logs_pdata())
                 .await
                 .expect("the request of the second block enqueues");
-            // The marker behind it in the same channel proves by its
-            // completion that the fifth is in the ACTIVE block.
+            // The inbox serves control before pdata, so the shutdown below
+            // would force-drain the fifth request; the marker behind it in the
+            // same channel proves by its completion that the fifth is in a
+            // block.
             marker(&pdata_tx, &mut rx, 99).await;
 
             control_tx
@@ -484,14 +415,12 @@ async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
             // Closing the upstream pdata channel releases the latched
             // Shutdown, as in the engine.
             drop(pdata_tx);
-            // The open block is refused as soon as the Shutdown is released.
-            expect_shutdown_nack(&mut rx).await;
-            // Storage heals, so the FLUSHING block reaches object storage
-            // inside the deadline.
+            // Storage heals, so both blocks can reach object storage inside
+            // the deadline.
             store.hooks().set(Fault::None);
             store.hooks().release.notify_waiters();
 
-            for _ in 0..4 {
+            for _ in 0..5 {
                 assert!(
                     matches!(
                         tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -509,13 +438,14 @@ async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
                 .expect("the node task joins")
                 .expect("the node succeeds");
             let snapshots = terminal.metrics();
-            // The four requests of the written block, plus the row-less marker.
-            assert_eq!(terminal_value(snapshots, "acks", &[]), 5);
+            // Five requests in two blocks, plus the row-less marker.
+            assert_eq!(terminal_value(snapshots, "acks", &[]), 6);
             assert_eq!(
                 terminal_value(snapshots, "nacks", &[("error.type", "shutdown")]),
-                1
+                0
             );
-            // One values file: the block the Shutdown found flushing.
+            // One values file per block: the block shutdown found flushing and
+            // the block it then rotated and flushed itself.
             let written: Vec<String> = store
                 .hooks()
                 .writes
@@ -525,11 +455,7 @@ async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
                 .map(|(path, _)| path.clone())
                 .filter(|path| path.contains("dataset=values/"))
                 .collect();
-            assert_eq!(
-                written.len(),
-                1,
-                "only the flushing block is written: {written:?}"
-            );
+            assert_eq!(written.len(), 2, "both blocks reached storage: {written:?}");
             drop(control_tx);
             assert_no_more_completions(&mut rx);
         })
@@ -540,12 +466,6 @@ async fn shutdown_writes_the_flushing_block_and_nacks_the_active_one() {
 /// fault and whose ACTIVE block holds request 5, run for `before` and then
 /// sent a Shutdown granting `grace`, with the upstream sender dropped so the
 /// engine releases it. Returns the node, its completions and the deadline.
-///
-/// The released Shutdown refuses request 5 at once, so every caller sees
-/// that refusal among the five completions. The window is long enough that
-/// no boundary closes admission meanwhile: the engine's inbox releases the
-/// Shutdown with its own deadline only to a node that still admits when the
-/// channel closes, and synthesizes a one-second one otherwise.
 async fn shutdown_while_both_blocks_wait(
     store: &Arc<FaultStore>,
     sim: &clock::SimClock,
@@ -564,10 +484,8 @@ async fn shutdown_while_both_blocks_wait(
 ) {
     let (handler, mut rx) = effects(16);
     let (pdata_tx, control_tx, inbox) = inbox(8);
-    let mut cfg = worker_config();
-    cfg.window.interval = Duration::from_secs(600);
     let node = tokio::task::spawn_local(super::super::run(
-        cfg,
+        worker_config(),
         store.clone(),
         Arc::new(lake::clock::TestWallClock::new(0)),
         inbox,
@@ -634,10 +552,10 @@ async fn completions_until(
 
 /// Scenario: the store fails for 23 s (backoff at 10 s) with a second block ACTIVE; a terminate
 /// grants 60 s and the store heals 32 s into it.
-/// Guarantees: the backoff drops to its minimum and the FLUSHING block is written: its four
-/// requests are acknowledged before the deadline, and the ACTIVE block's request is nacked.
+/// Guarantees: the backoff drops to its minimum, both blocks are written, and all five requests are
+/// acknowledged before the deadline.
 #[tokio::test(flavor = "current_thread")]
-async fn a_store_that_heals_inside_the_grace_commits_the_flushing_block() {
+async fn a_store_that_heals_inside_the_grace_commits_both_blocks() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let sim = clock::SimClock::new();
@@ -658,9 +576,9 @@ async fn a_store_that_heals_inside_the_grace_commits_the_flushing_block() {
 
             let got = completions_until(&sim, &mut rx, &node, deadline).await;
             assert_eq!(
-                acked_and_nacked_ids(got),
-                (vec![1, 2, 3, 4], vec![5]),
-                "the flushing block is acknowledged, the ACTIVE one refused"
+                acked_ids(got),
+                vec![1, 2, 3, 4, 5],
+                "both blocks are acknowledged"
             );
             assert_no_more_completions(&mut rx);
             assert!(clock::now() < deadline, "the drain ends inside the grace");
@@ -674,9 +592,8 @@ async fn a_store_that_heals_inside_the_grace_commits_the_flushing_block() {
 }
 
 /// Scenario: the same two blocks; the store never heals and the 30 s deadline comes first.
-/// Guarantees: the ACTIVE block's request is nacked `NodeShutdown` at the Shutdown, the FLUSHING
-/// block's at the completion margin before the deadline, and no write starts at or after that
-/// cut.
+/// Guarantees: every request is nacked `NodeShutdown` at the completion margin before the
+/// deadline, and no write starts at or after that cut.
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
     tokio::task::LocalSet::new()
@@ -697,21 +614,17 @@ async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
                 completions_until(&sim, &mut rx, &node, deadline + Duration::from_secs(10)).await;
             assert_eq!(got.len(), 5, "every request is decided");
             let cut = deadline - SHUTDOWN_COMPLETION_MARGIN;
-            for (at, message) in &got {
-                let id = match message {
+            for (at, message) in got {
+                assert!(at >= cut, "nacked at the cut, not before it");
+                assert!(at < deadline, "nacked before the deadline");
+                match message {
                     PipelineCompletionMsg::DeliverNack { nack } => {
-                        (*nack.refused).clone().into_parts().0.source_node()
+                        assert!(!nack.permanent);
+                        assert_eq!(nack.cause, NackCause::NodeShutdown);
                     }
                     other => panic!("expected a nack, got {other:?}"),
-                };
-                if id == Some(5) {
-                    assert!(*at < cut, "the ACTIVE block is refused at the Shutdown");
-                } else {
-                    assert!(*at >= cut, "nacked at the cut, not before it");
                 }
-                assert!(*at < deadline, "nacked before the deadline");
             }
-            assert_eq!(acked_and_nacked_ids(got), (vec![], vec![1, 2, 3, 4, 5]));
             let entered = store
                 .hooks()
                 .entered_at
@@ -736,43 +649,27 @@ async fn a_store_that_never_heals_is_nacked_retryable_at_the_deadline() {
         .await;
 }
 
-/// The sorted ids of the acks in `got` and of its retryable `NodeShutdown`
-/// nacks; any other completion fails the test.
-fn acked_and_nacked_ids(
-    got: Vec<(std::time::Instant, PipelineCompletionMsg<OtapPdata>)>,
-) -> (Vec<usize>, Vec<usize>) {
-    let (mut acked, mut nacked) = (Vec::new(), Vec::new());
-    for (_, message) in got {
-        match message {
-            PipelineCompletionMsg::DeliverAck { ack } => acked.push(
-                ack.accepted
-                    .into_parts()
-                    .0
-                    .source_node()
-                    .expect("a routed request"),
-            ),
-            PipelineCompletionMsg::DeliverNack { nack } => {
-                assert!(!nack.permanent);
-                assert_eq!(nack.cause, NackCause::NodeShutdown);
-                nacked.push(
-                    (*nack.refused)
-                        .into_parts()
-                        .0
-                        .source_node()
-                        .expect("a routed request"),
-                );
-            }
-        }
-    }
-    acked.sort_unstable();
-    nacked.sort_unstable();
-    (acked, nacked)
+/// The sorted ids of `got`, all of which must be acks.
+fn acked_ids(got: Vec<(std::time::Instant, PipelineCompletionMsg<OtapPdata>)>) -> Vec<usize> {
+    let mut ids: Vec<usize> = got
+        .into_iter()
+        .map(|(_, message)| match message {
+            PipelineCompletionMsg::DeliverAck { ack } => ack
+                .accepted
+                .into_parts()
+                .0
+                .source_node()
+                .expect("a routed request"),
+            other => panic!("expected an ack, got {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Scenario: every write fails fast; a terminate grants 30 s and the store heals 300 ms before the
 /// cut the completion margin leaves before the deadline.
-/// Guarantees: attempts keep starting until the cut, and the FLUSHING block's four requests are
-/// acknowledged; the ACTIVE block's request is nacked.
+/// Guarantees: attempts keep starting until the cut, and all five requests are acknowledged.
 #[tokio::test(flavor = "current_thread")]
 async fn a_store_that_heals_just_before_the_deadline_still_commits() {
     tokio::task::LocalSet::new()
@@ -799,7 +696,7 @@ async fn a_store_that_heals_just_before_the_deadline_still_commits() {
                 got.iter().all(|(at, _)| *at <= cut),
                 "decided by the cut before the deadline"
             );
-            assert_eq!(acked_and_nacked_ids(got), (vec![1, 2, 3, 4], vec![5]));
+            assert_eq!(acked_ids(got), vec![1, 2, 3, 4, 5]);
             let _ = node
                 .await
                 .expect("the node task joins")
@@ -811,8 +708,7 @@ async fn a_store_that_heals_just_before_the_deadline_still_commits() {
 }
 
 /// Scenario: a 30 s terminate latches during a 20 s failing attempt; the store heals meanwhile.
-/// Guarantees: the retry starts before the deadline and commits the FLUSHING block; the ACTIVE
-/// block's request is nacked.
+/// Guarantees: the retry and the ACTIVE block's attempt both start before the deadline and commit.
 #[tokio::test(flavor = "current_thread")]
 async fn a_slow_failure_does_not_stop_the_attempts_after_it() {
     tokio::task::LocalSet::new()
@@ -833,7 +729,7 @@ async fn a_slow_failure_does_not_stop_the_attempts_after_it() {
             store.hooks().set(Fault::None);
 
             let got = completions_until(&sim, &mut rx, &node, deadline).await;
-            assert_eq!(acked_and_nacked_ids(got), (vec![1, 2, 3, 4], vec![5]));
+            assert_eq!(acked_ids(got), vec![1, 2, 3, 4, 5]);
             let entered = store
                 .hooks()
                 .entered_at
@@ -1324,8 +1220,8 @@ async fn saturated_inbox_shutdown_stays_bounded() {
 }
 
 /// A worker whose one request (id 1) is FLUSHING in a parked write, with
-/// three requests (ids 2 to 4) force-drained into a completion channel that
-/// has room for one message and is never read, and then shut down.
+/// shutdown latched and three requests (ids 2 to 4) force-drained into a
+/// completion channel that has room for one message and is never read.
 ///
 /// One request per block makes the notifier's capacity two, so the flushing
 /// block's completion and two force-drained refusals are more than it holds.
@@ -1341,55 +1237,17 @@ async fn force_drained_past_a_held_block(
     worker.admit(logs_pdata_from(1));
     worker.rotate();
     store.hooks().entered.notified().await;
+    worker.shutdown(clock::now() + Duration::from_secs(30));
     for id in 2..=4 {
         worker.force_shutdown(logs_pdata_from(id));
     }
-    worker.shutdown(clock::now() + Duration::from_secs(30));
     (worker, rx)
 }
 
-/// Take `n` completions, sending the notifier's next one after each, and
-/// return the ids acknowledged and the ids refused with a retryable
-/// `NodeShutdown` nack, each sorted.
-async fn completions_while_sending(
-    worker: &mut Worker,
-    rx: &mut PipelineCompletionMsgReceiver<OtapPdata>,
-    n: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    let (mut acked, mut nacked) = (Vec::new(), Vec::new());
-    for _ in 0..n {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a completion arrives")
-            .expect("a completion arrives")
-        {
-            PipelineCompletionMsg::DeliverAck { ack } => {
-                acked.push(ack.accepted.into_parts().0.source_node().expect("an id"));
-            }
-            PipelineCompletionMsg::DeliverNack { nack } => {
-                assert!(!nack.permanent);
-                assert_eq!(nack.cause, NackCause::NodeShutdown);
-                nacked.push((*nack.refused).into_parts().0.source_node().expect("an id"));
-            }
-        }
-        if !worker.notify.is_empty() {
-            worker
-                .notify
-                .next()
-                .await
-                .expect("the next completion is sent");
-        }
-    }
-    acked.sort_unstable();
-    nacked.sort_unstable();
-    (acked, nacked)
-}
-
-/// Scenario: one request flushing in a parked write, three force-drained into a completion
-/// channel of one that is full after the first, then the write released and the channel read.
-/// Guarantees: no completion is destroyed while the channel may still gain room: request 1 is
-/// acknowledged, requests 2 to 4 each get a retryable `NodeShutdown` nack, and nothing is
-/// counted as a delivery failure.
+/// Scenario: one request flushing in a parked write, three force-drained into a channel of one,
+/// then the write released.
+/// Guarantees: the refusal that does not fit is counted, the block is acknowledged, and each
+/// request is decided once.
 #[tokio::test(flavor = "current_thread")]
 async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
     tokio::task::LocalSet::new()
@@ -1398,8 +1256,8 @@ async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
             let (mut worker, mut rx) = force_drained_past_a_held_block(&store).await;
             assert_eq!(
                 worker.notify.failures(),
-                0,
-                "a refusal past the bound waits for room instead of being dropped"
+                1,
+                "the refusal that does not fit is attempted once and counted"
             );
 
             store.hooks().set(Fault::None);
@@ -1413,24 +1271,25 @@ async fn force_drain_leaves_credit_for_a_block_whose_write_is_released() {
             worker.complete(done);
             drain_cleanup(&mut worker).await;
 
-            let (acked, nacked) = completions_while_sending(&mut worker, &mut rx, 4).await;
-            assert_eq!(acked, [1]);
-            assert_eq!(nacked, [2, 3, 4]);
+            // The channel took refusal 2; refusal 3 waits in the send slot and
+            // the ack of request 1 behind it.
+            expect_shutdown_nack(&mut rx).await;
+            worker.notify.next().await.expect("refusal 3 is sent");
+            expect_shutdown_nack(&mut rx).await;
+            worker.notify.next().await.expect("the ack is sent");
+            assert_eq!(expect_ack(&mut rx).await, Some(1));
             let outcomes = worker.notify.outcomes();
             assert_eq!(outcomes[Outcome::Shutdown as usize], 3);
             assert_eq!(outcomes[Outcome::Ack as usize], 1);
             assert_eq!(outcomes.iter().sum::<u64>(), 4);
-            assert_eq!(worker.notify.failures(), 0);
             assert!(worker.is_idle());
             assert_no_more_completions(&mut rx);
         })
         .await;
 }
 
-/// Scenario: the same setup, but the deadline fires while the write is parked, with the
-/// completion channel read while the worker delivers until the deadline.
-/// Guarantees: every request gets a retryable `NodeShutdown` nack, request 1's included, and none
-/// is counted as a delivery failure.
+/// Scenario: the same setup, but the deadline fires while the write is parked.
+/// Guarantees: no panic, undeliverable completions counted, each request decided once.
 #[tokio::test(flavor = "current_thread")]
 async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
     tokio::task::LocalSet::new()
@@ -1441,36 +1300,17 @@ async fn force_drain_leaves_credit_for_a_block_the_deadline_decides() {
             let (mut worker, mut rx) = force_drained_past_a_held_block(&store).await;
 
             let _ticker = ticking(&sim, Duration::from_millis(50));
-            let ((), nacked) = tokio::join!(
-                async {
-                    let _ = worker.abandon().await;
-                },
-                async {
-                    let mut nacked = Vec::new();
-                    for _ in 0..4 {
-                        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                            .await
-                            .expect("a completion arrives")
-                            .expect("a completion arrives")
-                        {
-                            PipelineCompletionMsg::DeliverNack { nack } => {
-                                assert_eq!(nack.cause, NackCause::NodeShutdown);
-                                nacked.push(
-                                    (*nack.refused).into_parts().0.source_node().expect("an id"),
-                                );
-                            }
-                            other => panic!("expected a nack, got {other:?}"),
-                        }
-                    }
-                    nacked.sort_unstable();
-                    nacked
-                }
-            );
-            assert_eq!(nacked, [1, 2, 3, 4]);
+            let _ = worker.abandon().await;
+
+            expect_shutdown_nack(&mut rx).await;
             let outcomes = worker.notify.outcomes();
             assert_eq!(outcomes[Outcome::Shutdown as usize], 4);
             assert_eq!(outcomes.iter().sum::<u64>(), 4);
-            assert_eq!(worker.notify.failures(), 0, "every decision was delivered");
+            assert_eq!(
+                worker.notify.failures(),
+                3,
+                "one delivered, three counted: every decision is accounted for"
+            );
             assert!(worker.is_idle());
             assert_no_more_completions(&mut rx);
         })
@@ -1558,6 +1398,69 @@ async fn blocked_completion_keeps_boundary_and_control_live() {
         .await;
 }
 
+/// Scenario: the inbox latches a Shutdown it cannot release yet and hands over a telemetry message.
+/// Guarantees: the node takes the latched deadline and seals and acknowledges its block.
+#[tokio::test(flavor = "current_thread")]
+async fn a_latched_deadline_starts_the_drain_before_the_shutdown_message() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(4);
+            let mut cfg = worker_config();
+            // Far enough away that nothing but the shutdown can seal a block.
+            cfg.window.interval = Duration::from_secs(600);
+            let node = tokio::task::spawn_local(super::super::run(
+                cfg,
+                store,
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            // Behind it in the same channel, so its completion proves the
+            // request before it is already in the ACTIVE block.
+            marker(&pdata_tx, &mut rx, 99).await;
+
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(30),
+                    reason: "latched".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            // The inbox holds that message back while `pdata_tx` is alive, so
+            // this is the only thing the node is handed after the latch.
+            let (_samples, metrics_reporter) =
+                otel_arrow_dfe_telemetry::reporter::MetricsReporter::create_new_and_receiver(8);
+            control_tx
+                .send_async(NodeControlMsg::CollectTelemetry { metrics_reporter })
+                .await
+                .expect("the telemetry control enqueues");
+
+            assert!(
+                matches!(
+                    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("the held block is sealed without its window ending")
+                        .expect("a completion arrives"),
+                    PipelineCompletionMsg::DeliverAck { .. }
+                ),
+                "the block the node was holding reached storage"
+            );
+            node.abort();
+            drop(pdata_tx);
+            drop(control_tx);
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
 /// Scenario: `drive` first polled with the deadline elapsed and a successful flush result already
 /// published.
 /// Guarantees: the block is acknowledged and its descriptors committed (see
@@ -1640,6 +1543,54 @@ async fn a_flush_ready_at_the_deadline_is_acknowledged_not_nacked() {
         .await;
 }
 
+/// Scenario: a request is buffered behind a Shutdown whose 120 s deadline
+/// leaves the last block one `flush_retry_deadline` (60 s) and the completion
+/// margin, and storage is healthy.
+/// Guarantees: the force-drained request is admitted and written, then
+/// acknowledged, instead of being refused as retryable.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_drained_before_the_cut_is_written() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let store = fault_store();
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let node = tokio::task::spawn_local(super::super::run(
+                worker_config(),
+                store.clone(),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline: clock::now() + Duration::from_secs(120),
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the request enqueues");
+            drop(pdata_tx);
+            assert_eq!(
+                expect_ack(&mut rx).await,
+                Some(7),
+                "the drained request is written"
+            );
+            let _terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("join")
+                .expect("the node shuts down cleanly");
+            drop(control_tx);
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
 /// Scenario: shutdown latches with a 10 s deadline while a block's write never
 /// returns, and the clock reaches the completion margin before the deadline.
 /// Guarantees: nothing is decided before `deadline - SHUTDOWN_COMPLETION_MARGIN`,
@@ -1712,19 +1663,163 @@ async fn held_requests_are_decided_the_completion_margin_before_the_deadline() {
         .await;
 }
 
-/// Scenario: a block of eight requests whose write has already published its
-/// successful result when the flush cut, `deadline - SHUTDOWN_COMPLETION_MARGIN`,
-/// is reached, while the completion channel holds only two and is read as the
-/// engine reads it. The write finishes before the cut, so the loop's biased
-/// cut branch finds the published result (`FlushJob::try_finish`); the case
-/// where the cut overtakes a write that has not yet published is
-/// `a_write_completing_at_the_cut_is_nacked_and_reported_if_stored`.
+/// Scenario: four requests in a parked write, a Shutdown with a 60 s deadline
+/// latched while the upstream sender stays open, then a second Shutdown with a
+/// 10 s deadline.
+/// Guarantees: the tighter deadline takes over at once: nothing is decided
+/// before `10 s - SHUTDOWN_COMPLETION_MARGIN` and every held request is decided
+/// at it, before the tighter deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tighter_shutdown_after_the_shutdown_began_moves_the_cut() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            let node = tokio::task::spawn_local(super::super::run(
+                cfg,
+                store.clone(),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+            for _ in 0..4 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request of the block enqueues");
+            }
+            store.hooks().entered.notified().await;
+            // With the default 60 s flush deadline the drain cut of a 60 s
+            // shutdown has already passed, so the shutdown begins at once.
+            for secs in [60, 10] {
+                control_tx
+                    .send_async(NodeControlMsg::Shutdown {
+                        deadline: clock::now() + Duration::from_secs(secs),
+                        reason: "test".to_owned(),
+                    })
+                    .await
+                    .expect("the shutdown enqueues");
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let deadline = clock::now() + Duration::from_secs(10);
+
+            sim.advance_to(deadline - SHUTDOWN_COMPLETION_MARGIN - Duration::from_millis(1));
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing is decided before the margin"
+            );
+
+            sim.advance_to(deadline - SHUTDOWN_COMPLETION_MARGIN);
+            for _ in 0..4 {
+                expect_shutdown_nack(&mut rx).await;
+            }
+            assert!(
+                clock::now() < deadline,
+                "decided before the tighter deadline"
+            );
+
+            let _ticker = ticking(&sim, Duration::from_millis(100));
+            let _terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("join")
+                .expect("the node shuts down cleanly");
+            drop(pdata_tx);
+            drop(control_tx);
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
+/// Scenario: a full block of four requests in a parked write, a latched
+/// Shutdown with the upstream sender open, and a fifth request sent just before
+/// the flush cut and not yet received when the cut fires.
+/// Guarantees: the request still in the input channel is refused with a
+/// retryable `NodeShutdown` nack like the held ones, not dropped undecided.
+#[tokio::test(flavor = "current_thread")]
+async fn a_request_still_in_the_channel_at_the_cut_is_nacked() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let sim = clock::SimClock::new();
+            let _clock_guard = sim.install();
+            let store = fault_store();
+            store.hooks().set(Fault::Park);
+            let (handler, mut rx) = effects(8);
+            let (pdata_tx, control_tx, inbox) = inbox(8);
+            let mut cfg = worker_config();
+            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
+            let node = tokio::task::spawn_local(super::super::run(
+                cfg,
+                store.clone(),
+                Arc::new(lake::clock::TestWallClock::new(0)),
+                inbox,
+                handler,
+                None,
+            ));
+            for _ in 0..4 {
+                pdata_tx
+                    .send_async(logs_pdata())
+                    .await
+                    .expect("a request of the block enqueues");
+            }
+            store.hooks().entered.notified().await;
+            let deadline = clock::now() + Duration::from_secs(10);
+            control_tx
+                .send_async(NodeControlMsg::Shutdown {
+                    deadline,
+                    reason: "test".to_owned(),
+                })
+                .await
+                .expect("the shutdown enqueues");
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+
+            // Queued and the clock moved in the same turn, so the node wakes
+            // with both the cut and the request ready, and the cut ranks first.
+            pdata_tx
+                .send_async(logs_pdata())
+                .await
+                .expect("the late request enqueues");
+            sim.advance_to(deadline - SHUTDOWN_COMPLETION_MARGIN);
+            for _ in 0..5 {
+                expect_shutdown_nack(&mut rx).await;
+            }
+
+            let _ticker = ticking(&sim, Duration::from_millis(100));
+            let _terminal = tokio::time::timeout(Duration::from_secs(5), node)
+                .await
+                .expect("the node returns")
+                .expect("join")
+                .expect("the node shuts down cleanly");
+            drop(pdata_tx);
+            drop(control_tx);
+            assert_no_more_completions(&mut rx);
+        })
+        .await;
+}
+
+/// Scenario: a block of eight requests whose write succeeds exactly at the
+/// flush cut, `deadline - SHUTDOWN_COMPLETION_MARGIN`, while the completion
+/// channel holds only two and is read as the engine reads it.
 /// Guarantees: every ack is delivered before the deadline and none is counted
 /// lost, so a durable buffer upstream records all of them and replays none;
 /// the cut is reported as such, not as an exceeded deadline, and the terminal
 /// state keeps the shutdown deadline, not the cut.
 #[tokio::test(flavor = "current_thread")]
-async fn acks_published_before_the_cut_outnumbering_the_channel_all_arrive() {
+async fn acks_published_at_the_cut_outnumbering_the_channel_all_arrive() {
     let events = capture();
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -1793,107 +1888,6 @@ async fn acks_published_before_the_cut_outnumbering_the_channel_all_arrive() {
             assert_eq!(
                 summary[0].fields.get("deadline_exceeded").cloned(),
                 Some(FieldValue::Bool(false))
-            );
-            drop(pdata_tx);
-            drop(control_tx);
-            assert_no_more_completions(&mut rx);
-        })
-        .await;
-}
-
-/// Scenario: a block of eight requests whose parked write is released in the
-/// same turn in which the flush cut, `deadline - SHUTDOWN_COMPLETION_MARGIN`,
-/// is reached, so the node loop's first poll finds both the cut and a write
-/// that has not yet published its result; the completion channel is read.
-/// Guarantees: the biased cut branch wins that race: every request gets a
-/// retryable `NodeShutdown` nack, none an ack, and none is lost; the write
-/// the cut overtook is then released within the cleanup bound, and if its
-/// objects reached the store the cleanup reports them as a `stored` late
-/// commit, so the retry that may store those rows twice is visible.
-#[tokio::test(flavor = "current_thread")]
-async fn a_write_completing_at_the_cut_is_nacked_and_reported_if_stored() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            const REQUESTS: usize = 8;
-            let sim = clock::SimClock::new();
-            let _clock_guard = sim.install();
-            let store = fault_store();
-            store.hooks().set(Fault::Park);
-            let (handler, mut rx) = effects(REQUESTS);
-            let (pdata_tx, control_tx, inbox) = inbox(2);
-            let wall = Arc::new(lake::clock::TestWallClock::new(0));
-            let mut cfg = worker_config_with_requests(REQUESTS);
-            cfg.lake.upload.abort_timeout = Duration::from_secs(1);
-            let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
-            let metrics = super::super::metrics::Metrics::register(&context, &cfg.lake);
-            let mut worker = Worker::new(cfg, store.clone(), wall, handler);
-            worker.metrics = Some(metrics);
-            for source in 0..REQUESTS {
-                worker.admit(logs_pdata_from(source));
-            }
-            worker.rotate();
-            store.hooks().entered.notified().await;
-
-            // The cut is now, and the write is released in the same turn,
-            // before the flush task can run again.
-            let deadline = clock::now() + SHUTDOWN_COMPLETION_MARGIN;
-            worker.shutdown(deadline);
-            store.hooks().set(Fault::None);
-            store.hooks().release.notify_waiters();
-            assert!(
-                !worker
-                    .flushing
-                    .as_ref()
-                    .is_some_and(|job| job.task_finished()),
-                "the write has not published its result when the loop starts"
-            );
-
-            let _ticker = ticking(&sim, Duration::from_millis(10));
-            let (terminal, nacked) = tokio::join!(super::super::drive(&mut worker, inbox), async {
-                let mut nacked = Vec::new();
-                while nacked.len() < REQUESTS {
-                    match tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                        .await
-                        .expect("a completion arrives")
-                        .expect("a completion arrives")
-                    {
-                        PipelineCompletionMsg::DeliverNack { nack } => {
-                            assert!(!nack.permanent);
-                            assert_eq!(nack.cause, NackCause::NodeShutdown);
-                            nacked
-                                .push((*nack.refused).into_parts().0.source_node().expect("an id"));
-                        }
-                        other => panic!("expected a nack, got {other:?}"),
-                    }
-                }
-                nacked.sort_unstable();
-                nacked
-            });
-            let terminal = terminal.expect("the loop returns");
-            assert_eq!(nacked, (0..REQUESTS).collect::<Vec<_>>());
-            assert_eq!(worker.notify.failures(), 0, "no completion is lost");
-            assert!(worker.is_idle(), "the overtaken write is released");
-            let stored = store
-                .hooks()
-                .writes
-                .lock()
-                .expect("writes lock")
-                .iter()
-                .any(|(path, _)| path.contains("dataset=values/"));
-            // A counter that never moved is not in the terminal handoff.
-            let reported = terminal.metrics().iter().any(|snapshot| {
-                snapshot
-                    .descriptor()
-                    .metrics
-                    .iter()
-                    .any(|m| m.name == "flush.late_commits")
-                    && snapshot
-                        .measurement_attributes()
-                        .any(|kv| kv == ("outcome", "stored"))
-            });
-            assert_eq!(
-                reported, stored,
-                "objects the overtaken write stored are reported as a late commit"
             );
             drop(pdata_tx);
             drop(control_tx);

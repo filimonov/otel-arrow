@@ -645,6 +645,7 @@ async fn rotation_causes_and_flush_reasons_are_labelled() {
                 (FlushReason::Requests, 3),
                 (FlushReason::Time, 0),
                 (FlushReason::Bytes, 0),
+                (FlushReason::Shutdown, 0),
             ] {
                 assert_eq!(
                     metrics.flush.get(FlushAttrs { reason }).count.get(),

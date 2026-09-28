@@ -54,8 +54,10 @@ const _: () = {
 };
 
 /// How long before the shutdown deadline the worker stops writing and
-/// decides everything it holds, so its completions are handed to the engine
-/// before the deadline, while the node still runs.
+/// decides everything it holds, so its completions reach the node upstream
+/// before the deadline: a durable buffer records them only until then, and
+/// each one takes a hop through the engine's completion dispatcher, which
+/// retries a full control channel every 5 ms.
 pub(super) const SHUTDOWN_COMPLETION_MARGIN: Duration = Duration::from_millis(200);
 
 /// Allocator, runtime and library overhead a worker is allowed beyond the
@@ -230,6 +232,9 @@ pub(super) struct Worker {
     /// The shutdown deadline itself, once shutdown has begun: the completions
     /// decided at [`Worker::deadline`] are delivered until then.
     pub(super) terminal: Option<Instant>,
+    /// The shutdown deadline the inbox announced while it drains buffered
+    /// requests, until shutdown begins (see [`Worker::drain`]).
+    pub(super) draining: Option<Instant>,
     /// The aligned window the ACTIVE block belongs to, and its boundary sleep.
     pub(super) window: Window,
     /// Source of wall-clock time for window alignment and seal stamps.
@@ -329,6 +334,7 @@ impl Worker {
             rotation_requested: false,
             deadline: None,
             terminal: None,
+            draining: None,
             window,
             wall,
             sink,
@@ -366,10 +372,12 @@ impl Worker {
             + usize::from(self.pending.is_some())
     }
 
-    /// Refuse one request force-drained past the closed admission gate (see
+    /// Refuse one request force-drained after shutdown was latched, without
+    /// taking the credit a held completion needs (see
     /// [`Notifier::force_shutdown`]).
     pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
-        self.notify.force_shutdown(data);
+        let held = self.held_tokens();
+        self.notify.force_shutdown(data, held);
     }
 
     /// Whether one more request may be admitted.
@@ -1120,18 +1128,40 @@ impl Worker {
         }
     }
 
-    /// Begin the shutdown for `deadline`: admission ends, the parked request
-    /// and every request of the ACTIVE block are refused with a retryable
-    /// `NodeShutdown` nack, and the ACTIVE block is dropped unwritten. A
-    /// FLUSHING block keeps its write, with its retries cut
-    /// [`SHUTDOWN_COMPLETION_MARGIN`] before the deadline (see
-    /// `FlushJob::cut_to`); the margin itself is left for delivering the
-    /// completions (see [`Worker::abandon`]).
+    /// Note that the inbox has latched Shutdown with `deadline` and now
+    /// drains the requests already buffered.
     ///
-    /// The engine releases the Shutdown only once no upstream sender remains,
-    /// or with a deadline of one second when the input channel closes on its
-    /// own, so a node upstream may no longer take a completion: whatever it
-    /// does not record, a durable buffer replays after a restart.
+    /// They are admitted as usual until [`Worker::drain_cut`], which leaves
+    /// the last block one `flush_retry_deadline` to be written; the caller
+    /// begins the shutdown at that cut or when the Shutdown is released,
+    /// whichever comes first.
+    pub(super) fn drain(&mut self, deadline: Instant) {
+        self.draining = Some(self.draining.map_or(deadline, |old| old.min(deadline)));
+    }
+
+    /// When a draining worker stops admitting and begins its shutdown.
+    pub(super) fn drain_cut(&self) -> Option<Instant> {
+        let deadline = self.draining.filter(|_| self.deadline.is_none())?;
+        Some(
+            deadline
+                .checked_sub(SHUTDOWN_COMPLETION_MARGIN + self.cfg.window.flush_retry_deadline)
+                .unwrap_or(deadline),
+        )
+    }
+
+    /// Whether a request force-drained after the latch is admitted rather
+    /// than refused: only before [`Worker::drain_cut`] and while admission is
+    /// open.
+    pub(super) fn admits_drained(&self) -> bool {
+        self.accept() && self.drain_cut().is_some_and(|cut| clock::now() < cut)
+    }
+
+    /// Begin the shutdown for `deadline`: the FLUSHING block's retries are
+    /// cut [`SHUTDOWN_COMPLETION_MARGIN`] before it, and the ACTIVE block is
+    /// sealed as soon as the flush slot frees, without waiting for its window,
+    /// and flushed under the same cut (see `FlushJob::cut_to`). The margin
+    /// itself is left for delivering the completions (see
+    /// [`Worker::abandon`]).
     ///
     /// The earliest deadline wins, so a second, tighter shutdown cannot extend
     /// the first.
@@ -1140,10 +1170,7 @@ impl Worker {
         if let Some(pending) = self.pending.take() {
             self.notify.push(pending.token, Outcome::Shutdown);
         }
-        // Neither is the ACTIVE block written: its requests are refused now,
-        // while the time left goes to the write already in progress.
-        self.fail_active(Outcome::Shutdown);
-        self.rotation_requested = false;
+        self.draining = None;
         let cut = deadline
             .checked_sub(SHUTDOWN_COMPLETION_MARGIN)
             .unwrap_or(deadline);
@@ -1153,6 +1180,8 @@ impl Worker {
         if let Some(job) = &self.flushing {
             job.cut_to(latched);
         }
+        self.reason = FlushReason::Shutdown;
+        self.rotation_requested = true;
     }
 
     /// Whether the worker owes nothing further.

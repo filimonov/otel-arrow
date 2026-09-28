@@ -257,10 +257,10 @@ fn producer() -> String {
     "host.id".into()
 }
 
-/// Shortest accepted `upload.abort_timeout`: the shutdown decides every
+/// Shortest accepted `upload.abort_timeout`: the shutdown drain decides every
 /// held request synchronously and then waits for cleanup only until the
 /// latched deadline plus this timeout, so the timeout must leave room for that
-/// decision (README.md, "The shutdown").
+/// decision (README.md, "The drain").
 const MIN_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Longest accepted `window.flush_retry_deadline` and `upload.abort_timeout`,

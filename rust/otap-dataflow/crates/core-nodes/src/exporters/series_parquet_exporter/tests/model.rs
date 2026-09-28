@@ -12,8 +12,8 @@ use std::collections::HashMap;
 /// One step the environment takes against the worker.
 #[derive(Debug, Clone)]
 enum Op {
-    /// A request arrives: admitted while the gate is open, and otherwise
-    /// left upstream.
+    /// A request arrives: admitted while the gate is open, force-drained once
+    /// shutdown is latched, and otherwise left upstream.
     Admit,
     /// The wall and engine clocks reach the next window boundary.
     Boundary,
@@ -238,9 +238,15 @@ impl Model {
     async fn apply(&mut self, op: &Op) {
         match *op {
             Op::Admit if !self.ended => {
-                if self.worker.accept() {
+                let latched = self.worker.deadline.is_some();
+                if latched || self.worker.accept() {
                     self.requests += 1;
-                    self.worker.admit(logs_pdata_from(self.requests));
+                    let data = logs_pdata_from(self.requests);
+                    if latched {
+                        self.worker.force_shutdown(data);
+                    } else {
+                        self.worker.admit(data);
+                    }
                 }
             }
             Op::Boundary => {

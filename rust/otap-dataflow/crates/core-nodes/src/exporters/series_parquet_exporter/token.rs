@@ -5,19 +5,20 @@
 //!
 //! [`AckToken`] is what the exporter keeps for an admitted request: its routing
 //! frames and signal type. [`Notifier`] delivers decided completions over the
-//! bounded engine channel with the ordinary `notify_ack` and `notify_nack`,
-//! keeping a send that waits for room across polls, so a cancelled `select`
-//! branch never drops a token.
+//! bounded engine channel: it reserves a slot first, keeping the reservation
+//! across polls, and picks the completion to send only once the slot is its
+//! own, so a cancelled `select` branch never drops a token and a completion
+//! waiting for room never holds a slot another would take first.
 
 use super::outcome::Outcome;
 use otel_arrow_dfe_config::SignalType;
-use otel_arrow_dfe_engine::ConsumerEffectHandlerExtension;
 use otel_arrow_dfe_engine::clock;
-use otel_arrow_dfe_engine::control::{AckMsg, NackMsg};
+use otel_arrow_dfe_engine::control::{AckMsg, NackMsg, nanos_since_birth};
+use otel_arrow_dfe_engine::effect_handler::CompletionPermit;
 use otel_arrow_dfe_engine::error::Error;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::metrics::ExporterExportMetrics;
-use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
+use otel_arrow_dfe_otap::pdata::{CompletionPermitExtension, Context, OtapPdata};
 use otel_arrow_dfe_pdata::OtapPayload;
 use otel_arrow_dfe_telemetry::common_attributes::{
     Outcome as ExportOutcome, SignalOutcomeAttributes,
@@ -38,6 +39,9 @@ pub(super) struct AckToken {
     signal: SignalType,
     /// When the exporter took ownership of the completion.
     received: Instant,
+    /// The return time the completion carries: [`nanos_since_birth`] when
+    /// it was decided, zero before.
+    decided_ns: u64,
     /// Fails a test that drops the token without deciding it.
     #[cfg(test)]
     bomb: DropBomb,
@@ -90,6 +94,7 @@ impl AckToken {
                 context,
                 signal,
                 received: clock::now(),
+                decided_ns: 0,
                 #[cfg(test)]
                 bomb: DropBomb,
             },
@@ -154,39 +159,27 @@ impl AckToken {
     }
 }
 
-/// A completion send that has been started but has not resolved: it owns
-/// the completion it is sending.
-type Sending = Pin<Box<dyn Future<Output = Result<(), Error>>>>;
+/// A reservation of a completion-channel slot that has been started but has
+/// not resolved.
+type Reserving = Pin<Box<dyn Future<Output = Result<CompletionPermit<OtapPdata>, Error>>>>;
 
-/// One decided completion waiting to be sent: the token, its outcome and,
-/// when the decision has something more specific to say than
+/// One decided completion waiting for the send slot: the token, its outcome
+/// and, when the decision has something more specific to say than
 /// [`Outcome::sentence`], the reason sentence the sender is told.
 ///
 /// The sentence is shared, because a failed block decides every one of its
 /// requests with the same one.
 type Queued = (AckToken, Outcome, Option<Rc<str>>);
 
-/// The completion being sent, with what the notifier still reports about it
-/// while the send owns it.
-struct InFlight {
-    /// The send, kept across polls once started.
-    send: Sending,
-    /// Whether it is an Ack, for [`Notifier::lost_acks`].
-    ack: bool,
-    /// When the exporter took ownership of the completion.
-    received: Instant,
-    /// The token's external bytes, see [`AckToken::external_bytes`].
-    external_bytes: usize,
-}
-
 /// Bounded queue of completions still to be delivered.
 pub(super) struct Notifier {
     /// Handle the completions are routed through.
     effects: EffectHandler<OtapPdata>,
-    /// Completions waiting for their send; the front one is sent next.
+    /// Completions waiting for a channel slot; the front one is sent in the
+    /// next slot reserved.
     queue: VecDeque<Queued>,
-    /// The send in progress, kept across polls once started.
-    in_flight: Option<InFlight>,
+    /// The reservation of the next slot, kept across polls once started.
+    reserving: Option<Reserving>,
     /// Maximum number of live completions: queued, and held by a block or
     /// the parking slot until they are pushed here.
     capacity: usize,
@@ -213,7 +206,7 @@ impl Notifier {
         Self {
             effects,
             queue: VecDeque::new(),
-            in_flight: None,
+            reserving: None,
             capacity,
             outcomes: [0; Outcome::ALL.len()],
             failures: 0,
@@ -223,7 +216,8 @@ impl Notifier {
         }
     }
 
-    /// Count one decision, once, when it is taken.
+    /// Count one decision, once, when it is taken, and stamp the token with
+    /// its return time.
     ///
     /// The shared export set records it by signal and by the engine-wide
     /// outcome class (`success` for an ack, `refused` for a rule the request
@@ -231,8 +225,9 @@ impl Notifier {
     /// from receipt to decision.
     ///
     /// Returns the token only when a node upstream waits for it; one that
-    /// nobody waits for is released here and never waits for a send.
-    fn decided(&mut self, token: AckToken, outcome: Outcome) -> Option<AckToken> {
+    /// nobody waits for is released here and never takes a slot.
+    fn decided(&mut self, mut token: AckToken, outcome: Outcome) -> Option<AckToken> {
+        token.decided_ns = nanos_since_birth();
         self.token_high_water = self.token_high_water.max(token.bytes());
         self.outcomes[outcome as usize] += 1;
         if let Some(exports) = &mut self.exports {
@@ -256,9 +251,9 @@ impl Notifier {
         }
     }
 
-    /// Live completions, the one being sent included.
+    /// Live completions.
     pub(super) fn len(&self) -> usize {
-        self.queue.len() + usize::from(self.in_flight.is_some())
+        self.queue.len()
     }
 
     /// Whether no completion is outstanding.
@@ -269,26 +264,18 @@ impl Notifier {
     /// Bytes the notifier keeps resident.
     ///
     /// Each token is charged by the queue cell it sits in plus its external
-    /// buffers; the one being sent by its external buffers.
+    /// buffers.
     pub(super) fn bytes(&self) -> usize {
         self.queue
             .iter()
             .map(|(token, _, _)| token.external_bytes())
             .sum::<usize>()
-            + self
-                .in_flight
-                .as_ref()
-                .map_or(0, |flight| flight.external_bytes)
             + self.queue.capacity() * size_of::<Queued>()
     }
 
     /// When the oldest outstanding completion was taken ownership of.
     pub(super) fn oldest(&self) -> Option<Instant> {
-        self.queue
-            .iter()
-            .map(|(token, _, _)| token.received)
-            .chain(self.in_flight.as_ref().map(|flight| flight.received))
-            .min()
+        self.queue.iter().map(|(token, _, _)| token.received).min()
     }
 
     /// Counters of pushed completions, indexed by [`Outcome`].
@@ -322,7 +309,7 @@ impl Notifier {
     ///
     /// `live` counts every completion the worker owes wherever it sits: here,
     /// or held by a block or the parking slot until it is pushed. Admission
-    /// stops one short of `capacity`, so a saturated worker still has a place
+    /// stops one short of `capacity`, so a saturated worker still has a slot
     /// for the first request [`Notifier::force_shutdown`] refuses.
     pub(super) fn has_credit(&self, live: usize) -> bool {
         live + 1 < self.capacity
@@ -332,10 +319,9 @@ impl Notifier {
     ///
     /// The worker owes at most `capacity` completions, counted while a block
     /// or the parking slot still held this one, so moving it here keeps the
-    /// queue within its bound. A push past the bound is queued all the same:
-    /// a completion is never destroyed while the channel may still gain
-    /// room; only [`Notifier::drain_now`], at the shutdown deadline, counts
-    /// what is left as lost.
+    /// queue within its bound. A push past the bound is attempted once
+    /// instead, exactly as [`Notifier::force_shutdown`] treats a refusal that
+    /// does not fit.
     pub(super) fn push(&mut self, token: AckToken, outcome: Outcome) {
         self.push_with(token, outcome, None);
     }
@@ -348,129 +334,163 @@ impl Notifier {
         let Some(token) = self.decided(token, outcome) else {
             return;
         };
-        self.queue.push_back((token, outcome, reason));
+        if self.len() < self.capacity {
+            self.queue.push_back((token, outcome, reason));
+        } else {
+            self.deliver_now(token, outcome, reason);
+        }
     }
 
-    /// The send one decided completion is delivered by: the engine's
-    /// ordinary `notify_ack` or `notify_nack`, which waits for room in the
-    /// completion channel.
+    /// The engine call one decided completion is delivered by, in a slot
+    /// already reserved.
     ///
-    /// Every delivery path goes through this, so a queued completion and a
-    /// completion abandoned at the shutdown deadline are reported
-    /// identically. The send runs outside tokio's cooperative budget, which
-    /// reports `Pending` after 128 operations in one task poll whatever room
-    /// the channel has.
+    /// Every delivery path goes through this, so a queued completion, a
+    /// completion abandoned at the shutdown deadline and a force-drained
+    /// refusal are reported identically. A reservation that failed releases
+    /// the token and is the delivery's error.
     ///
     /// The nack reason is a sentence, the decision's own or the outcome's
     /// default, because it is the status message the producer sees; the
     /// outcome's machine token stays the metric label.
-    fn start(&self, (token, outcome, reason): Queued) -> InFlight {
-        let received = token.received;
-        let external_bytes = token.external_bytes();
+    fn delivery(
+        reserved: Result<CompletionPermit<OtapPdata>, Error>,
+        token: AckToken,
+        outcome: Outcome,
+        reason: Option<Rc<str>>,
+    ) -> Result<(), Error> {
+        let decided_ns = token.decided_ns;
         let data = token.pdata();
-        let effects = self.effects.clone();
-        let send = Box::pin(tokio::task::coop::unconstrained(async move {
-            let Some(cause) = outcome.nack_cause() else {
-                return effects.notify_ack(AckMsg::new(data)).await;
-            };
-            let sentence = reason.as_deref().unwrap_or(outcome.sentence()).to_owned();
-            let nack = if outcome.refused() {
-                NackMsg::new_permanent_with_cause(sentence, data, cause)
-            } else {
-                NackMsg::new_with_cause(sentence, data, cause)
-            };
-            effects.notify_nack(nack).await
-        }));
-        InFlight {
-            send,
-            ack: outcome == Outcome::Ack,
-            received,
-            external_bytes,
-        }
+        let permit = reserved?;
+        let Some(cause) = outcome.nack_cause() else {
+            return permit.notify_ack(AckMsg::new(data), decided_ns);
+        };
+        let sentence = reason.as_deref().unwrap_or(outcome.sentence()).to_owned();
+        let nack = if outcome.refused() {
+            NackMsg::new_permanent_with_cause(sentence, data, cause)
+        } else {
+            NackMsg::new_with_cause(sentence, data, cause)
+        };
+        permit.notify_nack(nack, decided_ns)
     }
 
-    /// Send the completion at the front of the queue.
-    ///
-    /// Cancellation safe: the send is kept across polls, so a cancelled
-    /// `select` branch never loses the completion it carries, and the next
-    /// call resumes it. With nothing outstanding this never resolves, which
-    /// lets the caller use it as an idle `select` branch.
-    pub(super) async fn next(&mut self) -> Result<(), Error> {
-        if self.in_flight.is_none() {
-            let Some(front) = self.queue.pop_front() else {
-                return pending().await;
-            };
-            self.in_flight = Some(self.start(front));
-        }
-        let flight = self.in_flight.as_mut().expect("a send is in flight");
-        let result = flight.send.as_mut().await;
-        let flight = self.in_flight.take().expect("a send is in flight");
+    /// Deliver one completion in `reserved`, counting a failure.
+    fn deliver(
+        &mut self,
+        reserved: Result<CompletionPermit<OtapPdata>, Error>,
+        (token, outcome, reason): Queued,
+    ) -> Result<(), Error> {
+        let result = Self::delivery(reserved, token, outcome, reason);
         if result.is_err() {
-            self.lost(flight.ack);
+            self.lost(outcome == Outcome::Ack);
         }
         result
     }
 
-    /// Refuse one request the engine force-drained past the closed admission
-    /// gate, with a retryable `NodeShutdown` nack.
+    /// Reserve a slot, then send the completion at the front of the queue in
+    /// it.
     ///
-    /// Once the engine latches a Shutdown it hands an exporter the requests
-    /// still buffered in its input channel whether admission is open or not,
-    /// possibly many within one poll. The refusal is sent at once when
-    /// nothing is outstanding and the channel has room, and otherwise waits
-    /// for its turn behind what is queued, past `capacity` if need be: the
-    /// engine hands over at most what its input channel buffers, and a
-    /// refusal is never destroyed while the channel may still gain room
-    /// before the deadline. Admission stays closed meanwhile (see
-    /// [`Notifier::has_credit`]), so a held block's credit is not taken.
-    pub(super) fn force_shutdown(&mut self, data: OtapPdata) {
+    /// Cancellation safe: the reservation is kept across polls and holds no
+    /// token, and the completion is chosen only once the slot is reserved, so
+    /// a cancelled `select` branch never loses one and the queue's order,
+    /// Acks first after [`Notifier::acks_first`], decides which completion
+    /// the next slot goes to. With nothing outstanding this never resolves,
+    /// which lets the caller use it as an idle `select` branch.
+    ///
+    /// The reservation is outside tokio's cooperative budget, which reports
+    /// `Pending` after 128 operations in one task poll whatever room the
+    /// channel has.
+    pub(super) async fn next(&mut self) -> Result<(), Error> {
+        if self.queue.is_empty() {
+            return pending().await;
+        }
+        let reserved = self.reserving().as_mut().await;
+        self.reserving = None;
+        let front = self.queue.pop_front().expect("the queue was not empty");
+        self.deliver(reserved, front)
+    }
+
+    /// The reservation in progress, started if there is none.
+    fn reserving(&mut self) -> &mut Reserving {
+        let effects = self.effects.clone();
+        self.reserving.get_or_insert_with(|| {
+            Box::pin(tokio::task::coop::unconstrained(async move {
+                effects.reserve_completion().await
+            }))
+        })
+    }
+
+    /// A slot reserved at once, if the channel has room now.
+    ///
+    /// A reservation still waiting is kept only for a queued completion, so
+    /// the notifier never holds a slot it has nothing to send in.
+    fn reserve_now(&mut self) -> Option<Result<CompletionPermit<OtapPdata>, Error>> {
         use futures::FutureExt;
 
+        let reserved = self.reserving().as_mut().now_or_never();
+        if reserved.is_some() || self.queue.is_empty() {
+            self.reserving = None;
+        }
+        reserved
+    }
+
+    /// Refuse one force-drained request with a retryable `NodeShutdown` nack.
+    ///
+    /// Called after shutdown is latched, possibly many times within one poll.
+    /// `held` counts the completions the caller still owes outside the
+    /// notifier. The refusal takes a queue place only while it and every held
+    /// completion fit in `capacity`: it is sent at once when nothing is
+    /// queued and the channel has room, and otherwise it is queued. A refusal
+    /// that does not fit is attempted once and, if the channel is full,
+    /// counted as a delivery failure, so force-drain never takes a held
+    /// block's credit, never grows without bound and never stalls.
+    pub(super) fn force_shutdown(&mut self, data: OtapPdata, held: usize) {
         let (token, payload) = AckToken::split(data);
         drop(payload);
         let Some(token) = self.decided(token, Outcome::Shutdown) else {
             return;
         };
-        let queued = (token, Outcome::Shutdown, None);
-        if !self.is_empty() {
-            self.queue.push_back(queued);
+        if self.len() + held >= self.capacity {
+            self.deliver_now(token, Outcome::Shutdown, None);
             return;
         }
-        let mut flight = self.start(queued);
-        match flight.send.as_mut().now_or_never() {
-            Some(Ok(())) => {}
-            Some(Err(_)) => self.lost(false),
-            None => self.in_flight = Some(flight),
+        if self.queue.is_empty()
+            && let Some(reserved) = self.reserve_now()
+        {
+            let _ = self.deliver(reserved, (token, Outcome::Shutdown, None));
+            return;
         }
+        self.queue.push_back((token, Outcome::Shutdown, None));
     }
 
-    /// Poll `flight` once, counting it lost unless the engine took it: a
-    /// send that would wait for room is dropped with its completion.
-    fn finish_now(&mut self, mut flight: InFlight) {
-        use futures::FutureExt;
-
-        match flight.send.as_mut().now_or_never() {
-            Some(Ok(())) => {}
-            Some(Err(_)) | None => self.lost(flight.ack),
-        }
-    }
-
-    /// Attempt one completion immediately, counting a send that would wait.
+    /// Attempt one completion immediately, counting a send that would block.
     ///
-    /// Used only for the completions left at the shutdown deadline. The token
-    /// is released either way, so the request ends decided or counted as a
-    /// delivery failure, never silently dropped.
-    fn deliver_now(&mut self, queued: Queued) {
-        let flight = self.start(queued);
-        self.finish_now(flight);
+    /// Used only on the paths that must not park a token: a completion past
+    /// the queue bound and the completions abandoned once the shutdown
+    /// deadline has elapsed. The token is released either way, so the
+    /// request ends decided or counted as a delivery failure, never silently
+    /// dropped. The attempt is outside the cooperative budget, so a full
+    /// completion channel is the only reason it can fail to be taken.
+    fn deliver_now(&mut self, token: AckToken, outcome: Outcome, reason: Option<Rc<str>>) {
+        match self.reserve_now() {
+            Some(reserved) => {
+                let _ = self.deliver(reserved, (token, outcome, reason));
+            }
+            None => {
+                drop(token.pdata());
+                self.lost(outcome == Outcome::Ack);
+            }
+        }
     }
 
     /// Deliver every outstanding completion, Acks first, waiting for room in
     /// the completion channel, until none is left or `until` has elapsed.
     /// Returns whether none is left.
     ///
-    /// Called once the worker has decided everything at the flush cut. What
-    /// is left at `until` is for [`Notifier::drain_now`].
+    /// Called once the worker has decided everything at the flush cut, so the
+    /// completions a successful block published there reach the node
+    /// upstream while it still records them, however many more there are
+    /// than the channel holds. What is left at `until` is for
+    /// [`Notifier::drain_now`].
     pub(super) async fn deliver_until(&mut self, until: Instant) -> bool {
         self.acks_first();
         let deadline = clock::sleep_until(until);
@@ -486,10 +506,9 @@ impl Notifier {
         true
     }
 
-    /// Put the queued Acks ahead of every other queued completion, so they
-    /// are sent next: a lost Ack would store a written block again. The
-    /// other completions keep their order and are only delayed; a send
-    /// already in flight stays first.
+    /// Put the queued Acks ahead of every other completion, so the next
+    /// slots reserved go to them: a lost Ack would store a written block
+    /// again. The other completions keep their order and are only delayed.
     fn acks_first(&mut self) {
         let (acks, others): (VecDeque<Queued>, VecDeque<Queued>) = self
             .queue
@@ -502,18 +521,19 @@ impl Notifier {
     /// Attempt every outstanding completion once, without blocking.
     ///
     /// Called when the node is about to return at its shutdown deadline, after
-    /// [`Notifier::deliver_until`] when a deadline was set. Whatever the
-    /// engine cannot take immediately is counted as a delivery failure and
-    /// released, so the node leaves nothing undecided and still returns
-    /// within its deadline. Acks go first (see [`Notifier::acks_first`]).
+    /// [`Notifier::deliver_until`] when a deadline was set. Whatever the engine cannot take immediately is counted as a
+    /// delivery failure and released, so the node leaves nothing undecided and
+    /// still returns within its deadline. Acks go first (see
+    /// [`Notifier::acks_first`]), so a completion channel with room for only
+    /// some takes those whose loss would store a written block again. Every attempt is outside the cooperative budget,
+    /// so a completion channel with room takes them all.
     pub(super) fn drain_now(&mut self) {
         self.acks_first();
-        if let Some(flight) = self.in_flight.take() {
-            self.finish_now(flight);
-        }
         for queued in std::mem::take(&mut self.queue) {
-            self.deliver_now(queued);
+            let (token, outcome, reason) = queued;
+            self.deliver_now(token, outcome, reason);
         }
+        self.reserving = None;
     }
 }
 
@@ -563,10 +583,10 @@ mod tests {
         token.discard();
     }
 
-    /// Scenario: a token waits in the queue, then in a send that waits for
-    /// room in a full channel.
+    /// Scenario: a token waits in the queue while its slot is reserved in a
+    /// full channel.
     /// Guarantees: queue storage and external buffers are each charged once,
-    /// before and while the send owns the token.
+    /// before and while the slot is reserved: the reservation holds no token.
     #[tokio::test(flavor = "current_thread")]
     async fn notifier_bytes_do_not_double_count_inline_tokens() {
         let (handler, _rx) = effects(1);
@@ -589,7 +609,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(notify.in_flight.is_some(), "the send waits for room");
+        assert!(notify.reserving.is_some(), "a slot is being reserved");
         assert_eq!(notify.bytes(), queue + external);
     }
 
@@ -637,6 +657,48 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
+    /// Scenario: three force-drained refusals against a channel with room for one and a notifier
+    /// bound of one.
+    /// Guarantees: the first is delivered, the second waits in the send slot, only the third is
+    /// counted as a delivery failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_shutdown_refusals_wait_in_the_bound_then_fail() {
+        let (handler, mut rx) = effects(1);
+        let mut notify = Notifier::new(handler, 1);
+
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.failures(), 0);
+        assert!(notify.is_empty());
+
+        // The channel now holds the first refusal, so the second cannot be
+        // handed over without blocking: it keeps the send slot.
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.failures(), 0);
+        assert_eq!(notify.len(), 1);
+
+        // The notifier is at its bound of one, so the third is attempted
+        // once, finds the channel full and is counted.
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.failures(), 1);
+        assert_eq!(notify.len(), 1);
+        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 3);
+
+        for _ in 0..2 {
+            match rx.recv().await.expect("shutdown refusal") {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert!(!nack.permanent);
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            if !notify.is_empty() {
+                notify.next().await.expect("the waiting refusal is sent");
+            }
+        }
+        assert!(notify.is_empty());
+        assert_no_more_completions(&mut rx);
+    }
+
     /// Scenario: 300 completions, more than tokio's cooperative budget, drained at the deadline
     /// into a channel with room.
     /// Guarantees: all are delivered and none is counted as a failure.
@@ -658,6 +720,32 @@ mod tests {
             assert!(matches!(message, PipelineCompletionMsg::DeliverNack { .. }));
             delivered += 1;
         }
+        assert_eq!(delivered, N);
+        assert_no_more_completions(&mut rx);
+    }
+
+    /// Scenario: 300 force-drained requests within one task poll, with room in the channel.
+    /// Guarantees: each gets a delivered retryable `NodeShutdown` nack.
+    #[tokio::test(flavor = "current_thread")]
+    async fn force_drained_refusals_beyond_the_coop_budget_are_all_delivered() {
+        const N: usize = 300;
+        let (handler, mut rx) = effects(N);
+        let mut notify = Notifier::new(handler, 8);
+        for _ in 0..N {
+            notify.force_shutdown(empty_pdata(), 0);
+        }
+        assert_eq!(notify.failures(), 0);
+        let mut delivered = 0;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                PipelineCompletionMsg::DeliverNack { nack } => {
+                    assert_eq!(nack.cause, NackCause::NodeShutdown);
+                }
+                other => panic!("expected a nack, got {other:?}"),
+            }
+            delivered += 1;
+        }
+        assert_eq!(delivered + notify.len(), N);
         assert_eq!(delivered, N);
         assert_no_more_completions(&mut rx);
     }
@@ -716,17 +804,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(notify.in_flight.is_some());
+        assert!(notify.reserving.is_some());
         assert_eq!(notify.len(), 2);
         assert_eq!(notify.oldest(), Some(blocked_received));
     }
 
-    /// Scenario: normal completions up to one short of capacity, then two force-drained refusals
-    /// into a completion channel with room for one.
-    /// Guarantees: the last place takes the first refusal; the second waits past the bound
-    /// instead of being dropped, and is delivered once the channel gains room.
+    /// Scenario: normal completions up to one short of capacity, then two force-drained refusals.
+    /// Guarantees: the last slot takes the first refusal; the second is attempted once, not queued.
     #[tokio::test(flavor = "current_thread")]
-    async fn the_last_completion_place_is_left_for_a_forced_refusal() {
+    async fn the_last_completion_slot_is_left_for_a_forced_refusal() {
         // Capacity 4 stands for 2N with N = 2; the cap on normal live
         // completions is therefore 3.
         let (handler, mut rx) = effects(1);
@@ -741,104 +827,24 @@ mod tests {
         assert_eq!(notify.len(), 3);
         assert!(!notify.has_credit(notify.len()));
 
-        notify.force_shutdown(empty_pdata());
-        assert_eq!(notify.len(), 4, "the last place takes the refusal");
-        notify.force_shutdown(empty_pdata());
-        assert_eq!(
-            notify.len(),
-            5,
-            "a refusal past the bound waits, not dropped"
-        );
-        assert_eq!(notify.failures(), 0);
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.len(), 4, "the last slot takes the refusal");
+        notify.force_shutdown(empty_pdata(), 0);
+        assert_eq!(notify.len(), 4, "a refusal past the bound is not queued");
+        assert_eq!(notify.failures(), 0, "the channel had room for it");
         assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 2);
-        let mut delivered = 0;
-        while !notify.is_empty() {
-            if rx.try_recv().is_ok() {
-                delivered += 1;
-            }
-            notify.next().await.expect("the next completion is sent");
-        }
-        while rx.try_recv().is_ok() {
-            delivered += 1;
-        }
-        assert_eq!(delivered, 5, "every completion is delivered");
-        assert_eq!(notify.failures(), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PipelineCompletionMsg::DeliverNack { .. })
+        ));
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: three force-drained refusals against a channel with room for one and a notifier
-    /// bound of one.
-    /// Guarantees: the first is delivered, the second waits in its send and the third behind it,
-    /// past the bound; all three arrive once the channel is read, none counted as a failure.
+    /// Scenario: pushes past the notifier's bound, with the channel open and then full.
+    /// Guarantees: no panic and no queue growth: delivered at once or counted as a delivery
+    /// failure.
     #[tokio::test(flavor = "current_thread")]
-    async fn forced_shutdown_refusals_wait_in_the_bound_then_fail() {
-        let (handler, mut rx) = effects(1);
-        let mut notify = Notifier::new(handler, 1);
-
-        notify.force_shutdown(empty_pdata());
-        assert_eq!(notify.failures(), 0);
-        assert!(notify.is_empty());
-
-        // The channel now holds the first refusal, so the second cannot be
-        // handed over without waiting: its send waits for room.
-        notify.force_shutdown(empty_pdata());
-        assert_eq!(notify.failures(), 0);
-        assert_eq!(notify.len(), 1);
-
-        // The notifier is at its bound of one, yet the third waits behind
-        // the second rather than being dropped while the channel is full.
-        notify.force_shutdown(empty_pdata());
-        assert_eq!(notify.failures(), 0);
-        assert_eq!(notify.len(), 2);
-        assert_eq!(notify.outcomes()[Outcome::Shutdown as usize], 3);
-
-        for _ in 0..3 {
-            match rx.recv().await.expect("shutdown refusal") {
-                PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert!(!nack.permanent);
-                    assert_eq!(nack.cause, NackCause::NodeShutdown);
-                }
-                other => panic!("expected a nack, got {other:?}"),
-            }
-            if !notify.is_empty() {
-                notify.next().await.expect("the waiting refusal is sent");
-            }
-        }
-        assert!(notify.is_empty());
-        assert_no_more_completions(&mut rx);
-    }
-
-    /// Scenario: 300 force-drained requests within one task poll, with room in the channel.
-    /// Guarantees: each gets a delivered retryable `NodeShutdown` nack.
-    #[tokio::test(flavor = "current_thread")]
-    async fn force_drained_refusals_beyond_the_coop_budget_are_all_delivered() {
-        const N: usize = 300;
-        let (handler, mut rx) = effects(N);
-        let mut notify = Notifier::new(handler, 8);
-        for _ in 0..N {
-            notify.force_shutdown(empty_pdata());
-        }
-        assert_eq!(notify.failures(), 0);
-        let mut delivered = 0;
-        while let Ok(message) = rx.try_recv() {
-            match message {
-                PipelineCompletionMsg::DeliverNack { nack } => {
-                    assert_eq!(nack.cause, NackCause::NodeShutdown);
-                }
-                other => panic!("expected a nack, got {other:?}"),
-            }
-            delivered += 1;
-        }
-        assert_eq!(delivered + notify.len(), N);
-        assert_eq!(delivered, N);
-        assert_no_more_completions(&mut rx);
-    }
-
-    /// Scenario: pushes past the notifier's bound into a completion channel with room for one.
-    /// Guarantees: no panic and no completion destroyed: the ones past the bound wait in the
-    /// queue and all three are delivered, in order, once the channel is read.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_push_past_the_bound_waits_instead_of_being_dropped() {
+    async fn a_push_past_the_bound_is_delivered_at_once_not_asserted() {
         let (handler, mut rx) = effects(1);
         let mut notify = Notifier::new(handler, 1);
         for outcome in [Outcome::Ack, Outcome::Shutdown, Outcome::Storage] {
@@ -846,17 +852,13 @@ mod tests {
             drop(payload);
             notify.push(token, outcome);
         }
-        assert_eq!(notify.len(), 3, "every push waits for its send");
-        assert_eq!(notify.failures(), 0);
-        let mut kinds = Vec::new();
-        while !notify.is_empty() {
-            notify.next().await.expect("the next completion is sent");
-            kinds.push(matches!(
-                rx.try_recv().expect("a completion"),
-                PipelineCompletionMsg::DeliverAck { .. }
-            ));
-        }
-        assert_eq!(kinds, [true, false, false]);
+        assert_eq!(notify.len(), 1, "only the first push is queued");
+        assert_eq!(notify.failures(), 1, "the third found the channel full");
+        assert_eq!(notify.outcomes().iter().sum::<u64>(), 3);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PipelineCompletionMsg::DeliverNack { .. })
+        ));
         assert_no_more_completions(&mut rx);
     }
 
@@ -925,13 +927,13 @@ mod tests {
         assert_no_more_completions(&mut rx);
     }
 
-    /// Scenario: a refusal's send waits for room in a full completion
-    /// channel when an Ack is decided; then the channel drains, with room for
-    /// both before the delivery deadline.
-    /// Guarantees: the send in flight keeps its place and the Ack follows it:
-    /// both arrive, and nothing is lost.
+    /// Scenario: a refusal waits for a slot in a full completion channel when
+    /// an Ack is decided; then the channel drains, with room for both before
+    /// the delivery deadline.
+    /// Guarantees: the Ack takes the first slot and the refusal the next:
+    /// both arrive, Ack first, and nothing is lost.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_send_in_flight_keeps_its_place_ahead_of_a_later_ack() {
+    async fn a_waiting_refusal_yields_the_next_slot_to_an_ack() {
         use futures::FutureExt;
 
         let sim = clock::SimClock::new();
@@ -968,11 +970,7 @@ mod tests {
             .iter()
             .map(|msg| matches!(msg, PipelineCompletionMsg::DeliverAck { .. }))
             .collect();
-        assert_eq!(
-            kinds,
-            [true, false, true],
-            "the refusal in flight, then the Ack"
-        );
+        assert_eq!(kinds, [true, true, false], "Acks, then the refusal");
         assert_eq!(notify.failures(), 0);
         assert!(notify.is_empty());
         assert_no_more_completions(&mut rx);
@@ -981,7 +979,7 @@ mod tests {
     /// Scenario: a full completion channel nobody reads, then an Ack pushed
     /// and a refusal force-drained for requests whose context has no routing
     /// frame, so no node upstream waits for their completions.
-    /// Guarantees: both are decided and counted without waiting for room:
+    /// Guarantees: both are decided and counted without waiting for a slot:
     /// nothing is queued, and none is counted as a delivery failure.
     #[tokio::test(flavor = "current_thread")]
     async fn a_completion_nobody_waits_for_never_waits_for_a_slot() {
@@ -1001,8 +999,8 @@ mod tests {
         let (token, payload) = AckToken::split(unrouted());
         drop(payload);
         notify.push(token, Outcome::Ack);
-        notify.force_shutdown(unrouted());
-        assert!(notify.is_empty(), "nothing waits for room");
+        notify.force_shutdown(unrouted(), 0);
+        assert!(notify.is_empty(), "nothing waits for a slot");
         notify.drain_now();
         assert_eq!(notify.failures(), 0);
         assert_eq!(notify.outcomes()[Outcome::Ack as usize], 2);
@@ -1011,6 +1009,54 @@ mod tests {
             rx.try_recv(),
             Ok(PipelineCompletionMsg::DeliverAck { .. })
         ));
+        assert_no_more_completions(&mut rx);
+    }
+
+    /// Scenario: an Ack for a route that measures completion time is decided
+    /// while the completion channel is full, and sent 100 ms later once a
+    /// slot frees.
+    /// Guarantees: its return time is the moment it was decided, as a send
+    /// that waits for the channel stamps it, not the moment the slot freed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_completion_waiting_for_a_slot_keeps_its_decision_time() {
+        use futures::FutureExt;
+        use otel_arrow_dfe_engine::Interests;
+        use otel_arrow_dfe_engine::control::{CallData, nanos_since_birth};
+
+        let sim = clock::SimClock::new();
+        let _clock_guard = sim.install();
+        let (handler, mut rx) = effects(1);
+        let mut notify = Notifier::new(handler, 4);
+        let (token, payload) = AckToken::split(empty_pdata());
+        drop(payload);
+        notify.push(token, Outcome::Ack);
+        assert!(
+            notify.next().now_or_never().is_some(),
+            "the first Ack fills the channel"
+        );
+
+        let timed = empty_pdata().test_subscribe_to(
+            Interests::ACKS | Interests::NODE_COMPLETION_DURATION,
+            CallData::default(),
+            3,
+        );
+        let (token, payload) = AckToken::split(timed);
+        drop(payload);
+        let decided = nanos_since_birth();
+        notify.push(token, Outcome::Ack);
+        assert!(
+            notify.next().now_or_never().is_none(),
+            "the Ack waits for a slot"
+        );
+        sim.advance(Duration::from_millis(100));
+        let _first = rx.try_recv().expect("the first Ack");
+        notify.next().await.expect("the Ack is sent");
+        match rx.try_recv() {
+            Ok(PipelineCompletionMsg::DeliverAck { ack }) => {
+                assert_eq!(ack.unwind.return_time_ns, decided);
+            }
+            other => panic!("expected an ack, got {other:?}"),
+        }
         assert_no_more_completions(&mut rx);
     }
 }

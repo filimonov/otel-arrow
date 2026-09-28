@@ -458,7 +458,7 @@ async fn admission_closure_is_visible_in_metrics() {
     );
 }
 
-/// Scenario: a refused traces request and a logs request the ACTIVE block holds at shutdown.
+/// Scenario: a refused traces request and a force-drained logs request at shutdown.
 /// Guarantees: `exporter.exports` records `refused` and `failure` once each and is in the terminal
 /// snapshots.
 #[tokio::test(flavor = "current_thread")]
@@ -479,8 +479,8 @@ async fn decisions_are_recorded_in_the_shared_export_metrics() {
     let mut traces = Context::default();
     traces.set_source_node(7);
     worker.admit(OtapPdata::new(traces, traces_payload()));
-    worker.admit(logs_pdata());
     worker.shutdown(clock::now() + Duration::from_secs(30));
+    worker.force_shutdown(logs_pdata());
 
     let snapshots = worker.metric_snapshots();
     let exports = |signal: &str, outcome: &str| {

@@ -708,10 +708,6 @@ class Minio(unittest.TestCase, LakeAssertions):
                         except grpc.RpcError as error:
                             self.assertIn(error.code(), retryable, f"{key}: {error}")
                             refused.append(key)
-            self.assertTrue(
-                refused_bodies or refused_metrics,
-                "a request in the open block is refused, not written, at the shutdown",
-            )
             with Engine(directory, name, store.storage) as engine:
                 export_all(engine, refused_bodies, refused_metrics)
                 engine.shutdown()
@@ -722,11 +718,10 @@ class Minio(unittest.TestCase, LakeAssertions):
     # shut down gracefully once the buffer has handed every request to the
     # exporter's open block; a second engine then starts on the same buffer
     # directory, takes one more logs request and stores it.
-    # Guarantees: the shutdown refuses the open block instead of writing it,
-    # so nothing of it is in the bucket; the requests stay in the WAL, and
-    # after the restart the lake holds every request, the new one included,
-    # exactly once: nothing is lost, and the tail is written after the
-    # restart.
+    # Guarantees: the graceful shutdown writes the open block and records its
+    # acknowledgements, so the lake holds every request exactly once, and the
+    # restart replays none of them: the objects it adds hold only the new
+    # request.
     def test_buffered_s3_shutdown_and_restart(self):
         with MinioStore() as store, tempfile.TemporaryDirectory() as directory:
             wal = Path(directory) / "wal"
@@ -746,20 +741,42 @@ class Minio(unittest.TestCase, LakeAssertions):
                     "the buffer to hand every request to the exporter",
                 )
                 engine.shutdown()
-            self.assertFalse(
-                [key for key in store.keys() if "/dataset=values/" in key],
-                "the shutdown wrote the open block",
-            )
+            shut_down = Path(directory) / "shut-down"
+            store.download(shut_down)
+            self.assert_lake(shut_down, bodies, metric_ids)
+            before = store.keys()
 
+            # The buffer delivers in WAL order, so a bundle replayed from the
+            # first run would reach the store no later than this request.
             probe = "buffered-after-restart"
+            values = "/signal=logs/dataset=values/"
             with Engine(directory, name, store.storage, buffer_path=wal) as engine:
                 export_all(engine, [probe], [])
-                wait_stored_at_least_once(
-                    store, directory, bodies + [probe], metric_ids, 90
+                wait_for(
+                    lambda: any(values in key for key in store.keys() - before),
+                    60,
+                    "the restarted engine to store its request",
                 )
                 engine.shutdown()
+            after = store.keys()
+            self.assertLessEqual(before, after, "an object of the first run is gone")
+            added = after - before
+            self.assertFalse(
+                [key for key in added if "/signal=metrics/dataset=values/" in key],
+                "the restart stored metric points again",
+            )
             downloaded = Path(directory) / "downloaded"
             store.download(downloaded)
+            added_values = [
+                str(downloaded / key.removeprefix("otel/"))
+                for key in added
+                if values in key
+            ]
+            with duckdb.connect() as db:
+                stored = db.execute(
+                    "SELECT body FROM read_parquet(?)", [added_values]
+                ).fetchall()
+            self.assertEqual(stored, [(probe,)], "the restart replayed a request")
             self.assert_lake(downloaded, bodies + [probe], metric_ids)
 
     # Scenario: the shipped buffered configuration on MinIO, with a 30 s

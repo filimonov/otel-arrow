@@ -16,8 +16,8 @@ the lake back with DuckDB:
 - `Minio.test_buffered_s3_shutdown_and_restart`: `series-parquet-buffered.yaml`
   (durable_buffer in front of the exporter) on MinIO, shut down gracefully
   while the exporter holds every request in its open block, which the shutdown
-  refuses instead of writing; a restart on the same buffer directory writes
-  them from the WAL with one new request, each exactly once.
+  writes; a restart on the same buffer directory stores one new request and
+  replays nothing.
 - `Minio.test_buffered_s3_sigkill_replays` and
   `Minio.test_buffered_s3_sigkill_during_paused_write`: the same configuration
   SIGKILLed while the exporter holds every acknowledged request in its open

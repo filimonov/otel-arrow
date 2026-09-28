@@ -22,10 +22,9 @@
 # to start while either is unset.
 #
 # Shutdown: SIGTERM grants a 60s deadline. The exporter returns by the
-# deadline plus upload.abort_timeout (exporter README, "The shutdown"),
-# whatever the window and retry settings; what the buffer has not recorded as
-# written stays in the WAL and is sent after the restart, so at most one block
-# per worker is stored twice. A supervisor's grace period must exceed that.
+# deadline plus upload.abort_timeout (exporter README, "The drain"), whatever
+# the window and retry settings; what it has not written stays in the WAL and
+# is sent after the restart. A supervisor's grace period must exceed that.
 #
 # The bucket needs a lifecycle rule that aborts incomplete multipart uploads
 # (AbortIncompleteMultipartUpload, for example after one day): an upload a
@@ -93,6 +92,13 @@ groups:
               # it 3.25 GB live, 4.1 GB RSS. Carries 640 x 4000 lines / (15s + 5s)
               # = 128k lines/s, above the worker's ~100k/s.
               max_in_flight: 640
+              shutdown:
+                # Wait the whole 60s SIGTERM deadline for the exporter's answers: it
+                # decides every held request 200ms before the deadline (measured
+                # worst case with the store frozen: 39s), so an acknowledged block is
+                # not replayed. The buffer stops within a second after the deadline;
+                # the exporter by the deadline plus upload.abort_timeout, 65s in all.
+                await_acks: 60s
           exporter:
             type: exporter:series_parquet
             config:
