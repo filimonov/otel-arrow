@@ -35,7 +35,9 @@
 
 use crate::Interests;
 use crate::control::{AckMsg, NackMsg};
-use crate::effect_handler::{EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle};
+use crate::effect_handler::{
+    CompletionPermit, EffectHandlerCore, TelemetryTimerCancelHandle, TimerCancelHandle,
+};
 use crate::error::Error;
 use crate::message::ExporterInbox;
 use crate::node::NodeId;
@@ -151,6 +153,15 @@ impl<PData> EffectHandler<PData> {
     /// informational messages without blocking the async runtime.
     pub async fn info(&self, message: &str) {
         self.core.info(message).await;
+    }
+
+    /// Reserve a slot in the pipeline-completion channel, waiting for room.
+    ///
+    /// An exporter that orders the completions it owes decides which one to
+    /// send only once the slot is its own, so none is held by a send still
+    /// waiting for room. Cancel safe: dropping the future gives the place up.
+    pub async fn reserve_completion(&self) -> Result<CompletionPermit<PData>, Error> {
+        self.core.reserve_completion().await
     }
 
     /// Starts a cancellable periodic timer that emits TimerTick on the control channel.

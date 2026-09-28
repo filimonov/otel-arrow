@@ -21,4 +21,5 @@ issues: [0]
 subtext: |
   For a node that parks requests across slow I/O: it drops the transport
   headers and authorization entries it no longer needs and can charge the
-  rest against its memory budget.
+  rest against its memory budget. An exporter can reserve a completion slot
+  (reserve_completion) and pick the Ack or Nack to send once it has one.
