@@ -234,10 +234,10 @@ groups:
 
       - alert: SeriesParquetDroppedAfterAck
         expr: |
-          sum by (namespace, pod, outcome) (increase(resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome="permanently_rejected"}[10m])) > 0
+          sum by (namespace, pod, outcome) (increase(resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"}[10m])) > 0
           or sum by (namespace, pod, outcome) (
-            resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome="permanently_rejected"} > 0
-            unless resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome="permanently_rejected"} offset 10m
+            resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"} > 0
+            unless resolved_total{job="series-parquet", otel_scope_name="processor.durable_buffer.bundles", outcome=~"permanently_rejected|conversion_failed"} offset 10m
           )
         labels:
           severity: critical

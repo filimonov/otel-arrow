@@ -626,7 +626,7 @@ received; see "Limits".
 | `notify.failures`, `notify.lost_acks` | Completions the engine would not accept: the buffer keeps the bundle in flight until a restart replays it, and a strict producer resends after its timeout. A lost Ack stores a written block again. | any |
 | `flush.abort_failures` | Multipart uploads possibly left to the lifecycle rule. | any |
 | `flush.late_commits` | Objects a flush cleanup found that the write had not confirmed, by `outcome` (see [Telemetry](#telemetry)); `stored` means a nacked block's rows may be stored twice. | `stored`, `partial` or `unknown`: any, for investigation |
-| `resolved{outcome=permanently_rejected}` (buffer) | Data dropped after the WAL acknowledgement. | any |
+| `resolved{outcome=permanently_rejected\|conversion_failed}` (buffer) | Data dropped after the WAL acknowledgement. | any |
 | `loss.bundles`, `loss.items` (buffer) | Dropped by `drop_oldest` or expired by `max_age`, when set. | any |
 | `receiver.otlp.requests.rejected{error.type=concurrency_limit}` (receiver) | Requests refused UNAVAILABLE at `max_concurrent_requests`; Alloy retries them. | sustained |
 | `receiver.otlp.requests.rejected{error.type=rate_limit}` (receiver) | Requests refused UNAVAILABLE by the receiver's rate limit; Alloy retries them. | sustained |
