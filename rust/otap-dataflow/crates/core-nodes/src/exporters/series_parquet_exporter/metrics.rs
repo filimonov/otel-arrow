@@ -9,6 +9,7 @@
 //! collection, observed counters republish a total the worker keeps, and
 //! gauges report the state at the moment of sampling.
 
+use super::super::otlp_framing::MalformedBodies;
 use super::outcome::{Outcome, WriteFailure};
 use otel_arrow_dfe_config::SignalType;
 use otel_arrow_dfe_engine::context::PipelineContext;
@@ -418,6 +419,9 @@ pub(super) struct Metrics {
     pub dropped: MeasurementMetricSet<DroppedMetrics>,
     /// Dropped exemplars, by signal.
     pub exemplars: MeasurementMetricSet<ExemplarMetrics>,
+    /// Requests refused for a broken OTLP body, by signal, under the name
+    /// every exporter shares.
+    pub malformed: MalformedBodies,
     /// One set per configured denormalized column.
     columns: BTreeMap<String, MetricSet<ColumnMetrics>>,
     /// The shared `exporter.exports` set every exporter registers, so this
@@ -465,6 +469,7 @@ impl Metrics {
             emitted: EmittedMetrics::register(ctx),
             dropped: DroppedMetrics::register(ctx),
             exemplars: ExemplarMetrics::register(ctx),
+            malformed: MalformedBodies::register(ctx),
             columns,
             exports: Some(ExporterExportMetrics::register(ctx)),
         }
@@ -536,6 +541,7 @@ impl Metrics {
         let _ = reporter.report_measurement(&mut self.emitted);
         let _ = reporter.report_measurement(&mut self.dropped);
         let _ = reporter.report_measurement(&mut self.exemplars);
+        self.malformed.report(reporter);
         for metrics in self.columns.values_mut() {
             let _ = reporter.report(metrics);
         }
@@ -555,6 +561,7 @@ impl Metrics {
         out.extend(self.emitted.terminal_snapshots());
         out.extend(self.dropped.terminal_snapshots());
         out.extend(self.exemplars.terminal_snapshots());
+        out.extend(self.malformed.terminal_snapshots());
         for metrics in self.columns.values_mut() {
             out.extend(metrics.terminal_snapshots());
         }

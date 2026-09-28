@@ -28,7 +28,12 @@ pub mod series_parquet_exporter;
 pub mod otap_exporter;
 
 /// Refusal of OTLP bodies whose framing is broken.
-#[cfg(any(feature = "file", feature = "otap", feature = "parquet"))]
+#[cfg(any(
+    feature = "file",
+    feature = "otap",
+    feature = "parquet",
+    feature = "series-parquet"
+))]
 mod otlp_framing;
 
 /// OTLP gRPC exporter.

@@ -83,7 +83,7 @@ groups:
               # A full WAL refuses new requests with UNAVAILABLE; producers retry and keep their data.
               size_cap_policy: backpressure
               # No max_age: expiry drops acknowledged data, counted in loss.*{reason=expired}.
-              # The exporter converts the OTLP bytes itself; the buffer stores them as received.
+              # The exporter checks the framing of OTLP bytes, which Arrow conversion would bypass.
               otlp_handling: pass_through
               # Bundles held in memory until their block commits. Per worker at most
               # memory.budget + max_in_flight x 4MiB + 128 receiver slots x 4MiB

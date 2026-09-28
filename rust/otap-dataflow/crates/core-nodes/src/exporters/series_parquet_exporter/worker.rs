@@ -28,11 +28,18 @@ use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::log_gate::LogGate;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
-use otel_arrow_dfe_pdata::{OtapPayload, TryIntoWithOptions};
+use otel_arrow_dfe_pdata::{OtapPayload, OtlpProtoBytes, PayloadData, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// The framing walk bounds value nesting on its own; it must never refuse a
+// body that the deepest accepted `ingress.max_nesting_depth` would accept.
+const _: () = assert!(
+    lake::config::MAX_NESTING_DEPTH
+        <= otel_arrow_dfe_pdata::views::otlp::bytes::validate::MAX_ANY_VALUE_NESTING_DEPTH
+);
 
 /// Bytes charged per bounded descriptor cache entry.
 ///
@@ -156,6 +163,9 @@ pub(super) enum Prepared {
     /// [`lake::extract::PRODUCER_ID_LOG_BYTES`], when its records were
     /// converted far enough to tell.
     Failed(AckToken, lake::Error, Option<String>),
+    /// The request's OTLP body failed the framing check every exporter
+    /// shares; decided like `Failed`, and counted under the shared name.
+    Malformed(AckToken, lake::Error),
 }
 
 #[cfg(test)]
@@ -164,7 +174,7 @@ impl Prepared {
     pub(super) fn discard(self) {
         match self {
             Prepared::Ready(pending) => pending.token.discard(),
-            Prepared::Failed(token, _, _) => token.discard(),
+            Prepared::Failed(token, _, _) | Prepared::Malformed(token, _) => token.discard(),
         }
     }
 }
@@ -412,6 +422,11 @@ impl Worker {
                 None,
             );
         }
+        if let Err(error) =
+            Self::check_wire_format(&payload, self.cfg.lake.ingress.max_nesting_depth)
+        {
+            return Prepared::Malformed(token, error);
+        }
         let extracted = match self.extract(payload) {
             Ok(extracted) => extracted,
             Err((error, producer)) => return Prepared::Failed(token, error, producer),
@@ -420,6 +435,32 @@ impl Worker {
             extracted,
             token,
             admission_secs: nanos_to_secs(self.wall.now_unix_nanos()),
+        })
+    }
+
+    /// Refuse an OTLP body whose protobuf framing is broken at any depth, by
+    /// the check every exporter shares (see `otlp_framing::check`).
+    ///
+    /// A body nesting values deeper than the walk's own bound is deeper than
+    /// any `ingress.max_nesting_depth` too, so it is refused as that limit
+    /// refuses it, `max_nesting_depth` being the configured one. Arrow records
+    /// have no wire framing; the conversion and the extraction validate them.
+    fn check_wire_format(payload: &OtapPayload, max_nesting_depth: usize) -> lake::Result<()> {
+        let PayloadData::OtlpBytes(bytes) = payload.data() else {
+            return Ok(());
+        };
+        let signal = match bytes {
+            OtlpProtoBytes::ExportLogsRequest(_) => "logs",
+            OtlpProtoBytes::ExportMetricsRequest(_) => "metrics",
+            // Traces are decided by the signal check before this runs, so
+            // there is no body to walk here.
+            OtlpProtoBytes::ExportTracesRequest(_) => return Ok(()),
+        };
+        super::super::otlp_framing::check(payload).map_err(|error| match error {
+            otel_arrow_dfe_pdata::error::Error::OtlpNestingTooDeep { .. } => {
+                lake::Error::Refused(lake::RefuseReason::TooDeep(max_nesting_depth))
+            }
+            error => lake::Error::invalid(format!("malformed OTLP {signal} body: {error}")),
         })
     }
 
@@ -467,6 +508,13 @@ impl Worker {
             Prepared::Failed(token, error, producer) => {
                 self.token_high_water = self.token_high_water.max(token.bytes());
                 self.refuse(token, &error, |_| producer);
+            }
+            Prepared::Malformed(token, error) => {
+                self.token_high_water = self.token_high_water.max(token.bytes());
+                if let Some(metrics) = &mut self.metrics {
+                    metrics.malformed.count(token.signal());
+                }
+                self.refuse(token, &error, |_| None);
             }
         }
     }

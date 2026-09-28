@@ -437,14 +437,15 @@ get a retryable refusal.
 These losses happen after the WAL acknowledgement, so the producer never sees
 them; alert on each:
 
-- A permanent refusal by this exporter (an undecodable OTLP body, a request
-  over an ingress budget or `ingress.max_series_per_request`, traces, or an
+- A permanent refusal by this exporter (a damaged OTLP body, a request over an
+  ingress budget or `ingress.max_series_per_request`, traces, or an
   unsupported point kind under `unsupported: reject`) drops the bundle, counted
   in the buffer's `resolved{outcome="permanently_rejected"}`.
 - `size_cap_policy: drop_oldest` evicts, and `max_age` expires, acknowledged
   data.
-- A damaged OTLP body that the conversion to Arrow records reads only in part
-  is stored and acknowledged as the partial or empty batch it read.
+- With `otlp_handling: convert_to_arrow`, or batching in the OTAP format, this
+  exporter receives Arrow records no framing check has seen, so a damaged OTLP
+  body is stored and acknowledged as a partial or empty batch.
 
 At a graceful shutdown this exporter refuses the requests its ACTIVE block
 holds and lets a write already in progress finish (see
@@ -758,7 +759,10 @@ included) and `ingress.max_row_bytes` (one row, attribute value or CBOR cell);
 4KiB completion-token allowance, and `too_deep` `ingress.max_nesting_depth`. The
 `column` label is fixed by configuration, so no request can add a label value.
 The node also registers the shared `exporter.exports` set (`messages`,
-`duration`; labels `signal` and `outcome`: `success`, `refused`, `failure`).
+`duration`; labels `signal` and `outcome`: `success`, `refused`, `failure`) and
+`exporter.malformed_bodies.messages{signal}`, which counts the requests refused
+for broken protobuf framing (`nacks{error.type=invalid}` or `too_deep`) under
+the name every exporter that checks framing shares.
 
 `series.emitted{reason=rotation}` rising means early rotations re-emit
 descriptors: raise `window.max_block_bytes` or `window.max_requests_per_block`.
@@ -779,7 +783,7 @@ the window interval means the destination is the limit.
 | `series_parquet.upload.parts_exceed_limit` | WARN for the first worker of the process, DEBUG after | At start, when a file of `window.max_block_bytes` would need more than 10,000 parts of `upload.part_bytes`: `max_block_bytes`, `part_bytes`, `parts`, `max_parts`. |
 | `series_parquet.receiver_limit.unverified` | INFO for the first worker of the process, DEBUG after | At start: the upstream receiver's `max_decoding_message_size` is not visible to the exporter and must reach `max_request_bytes`; `receiver_default_bytes` is the receiver's 4MiB default. |
 | `series_parquet.payload.not_returned` | WARN, once per process | The first request whose route asks for its payload back with a nack, such as through `processor:retry`, which cannot retry through this exporter. |
-| `series_parquet.request.failed` | WARN | A refusal, at most one line per second for each `outcome`, so a flood of one kind does not hide another: `outcome`, `signal`, `reason`, `error`, `suppressed` (lines of that outcome left out since the last), the size fields of a size refusal, and `producer_id`, the first value of `producer_id_attribute` in the request cut to 128 bytes with control and format characters escaped (`\n`, `\u{1b}`, `\u{202e}`), when the request was converted far enough to read it (not for a refusal by size or signal). The id is the sender's own claim, not an authenticated identity. |
+| `series_parquet.request.failed` | WARN | A refusal, at most one line per second for each `outcome`, so a flood of one kind does not hide another: `outcome`, `signal`, `reason`, `error`, `suppressed` (lines of that outcome left out since the last), the size fields of a size refusal, and `producer_id`, the first value of `producer_id_attribute` in the request cut to 128 bytes with control and format characters escaped (`\n`, `\u{1b}`, `\u{202e}`), when the request was converted far enough to read it (not for a refusal by size, signal or framing). The id is the sender's own claim, not an authenticated identity. |
 | `series_parquet.flush.attempt` | DEBUG, INFO on a retry | Before each write attempt: `seq`, `attempt`, `file`, `objects`, `deadline_remaining`. |
 | `series_parquet.flush.attempt_failed` | WARN | After each failed write attempt: `seq`, `attempt`, `file`, `retryable`, `deadline_remaining`, `error`. |
 | `series_parquet.block.committed` | INFO | A block is durable: `window_start`, `seq`, `path`, `files`, `requests`, `bytes`, `attempts`, `duration`. |
@@ -900,12 +904,21 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   attribute keys, excessive nesting, invalid histogram list lengths and counts
   above `INT64_MAX` refuse the whole request; duplicate keys are checked in
   the resource, scope, log record and supported point attributes.
-- An OTLP body is read by the engine's conversion to Arrow records, without a
-  separate check of its protobuf framing: a body the conversion cannot decode
-  is refused as `invalid`, and one it reads only in part is stored as the
-  records it read. Invalid UTF-8 inside an array or key-value list value is
-  refused as undecodable. Nesting beyond `ingress.max_nesting_depth` is
-  refused after conversion.
+- An OTLP body's protobuf framing is checked before conversion, into every
+  nested message, by the check the file, parquet and otap exporters share, so
+  damage at any depth refuses the request as `invalid`. prost's decoding rules
+  apply: a singular field or oneof that occurs more than once is read as
+  prost reads it (the last value or oneof member wins, the occurrences of a
+  message are merged), and a known field with another wire type is refused
+  (protobuf-go would skip it). Invalid UTF-8 inside an array or key-value list
+  value is refused as undecodable. Nesting deeper than 256 levels is refused
+  by the same walk, and nesting beyond `ingress.max_nesting_depth` after
+  conversion. The check sees only requests that arrive as OTLP bytes: a node
+  upstream that converts to Arrow records (`batch`, `attributes`, `filter`,
+  `transform`, `partition`, `log_sampling`, or `durable_buffer` with
+  `otlp_handling: convert_to_arrow`)
+  converts a damaged body leniently first, and its partial or empty records
+  are stored.
 - The conversion to OTAP records numbers the log records or metrics of a
   request, and its scopes and resources, with 16-bit ids, so keep producer
   batches below 65,536 records: the shipped Alloy configurations cap every
