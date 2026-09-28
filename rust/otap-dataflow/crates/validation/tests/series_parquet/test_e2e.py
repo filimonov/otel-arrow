@@ -885,6 +885,7 @@ class Minio(unittest.TestCase, LakeAssertions):
                     ("retries_scheduled_total", "processor.durable_buffer", {}),
                     ("dropped_unsupported_total", "exporter.series_parquet", {"kind": "summary"}),
                     ("dropped_exemplars_total", "exporter.series_parquet", {"signal": "metrics"}),
+                    ("repaired_invalid_utf8_total", "exporter.series_parquet", {"signal": "logs"}),
                     ("timestamp_out_of_range_total", "exporter.series_parquet", {}),
                 ]
 

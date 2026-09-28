@@ -27,6 +27,7 @@ use otel_arrow_dfe_engine::clock;
 use otel_arrow_dfe_engine::local::exporter::EffectHandler;
 use otel_arrow_dfe_otap::log_gate::LogGate;
 use otel_arrow_dfe_otap::pdata::OtapPdata;
+use otel_arrow_dfe_pdata::encode::count_utf8_repairs;
 use otel_arrow_dfe_pdata::otap::OtapArrowRecords;
 use otel_arrow_dfe_pdata::{OtapPayload, TryIntoWithOptions};
 use otel_arrow_dfe_series_lake as lake;
@@ -141,6 +142,9 @@ pub(super) struct Pending {
     pub(super) token: AckToken,
     /// Wall-clock second the request was prepared at, for window alignment.
     pub(super) admission_secs: i64,
+    /// String values the conversion stored with U+FFFD in place of invalid
+    /// UTF-8.
+    pub(super) utf8_repairs: u64,
 }
 
 /// What preparing one request produced.
@@ -412,7 +416,7 @@ impl Worker {
                 None,
             );
         }
-        let extracted = match self.extract(payload) {
+        let (extracted, utf8_repairs) = match self.extract(payload) {
             Ok(extracted) => extracted,
             Err((error, producer)) => return Prepared::Failed(token, error, producer),
         };
@@ -420,16 +424,22 @@ impl Worker {
             extracted,
             token,
             admission_secs: nanos_to_secs(self.wall.now_unix_nanos()),
+            utf8_repairs,
         })
     }
 
-    /// Convert one payload and extract its rows, dropping the conversion. A
-    /// failed extraction returns the request's producer id with its error,
-    /// when the conversion got far enough to read it.
+    /// Convert one payload and extract its rows, dropping the conversion;
+    /// also returns how many string values the conversion repaired. A failed
+    /// extraction returns the request's producer id with its error, when the
+    /// conversion got far enough to read it.
     ///
     /// Split out so the conversion's record batches are dropped with the call.
-    fn extract(&self, payload: OtapPayload) -> Result<Extracted, (lake::Error, Option<String>)> {
-        let records: Result<OtapArrowRecords, _> = payload.try_into_with_default();
+    fn extract(
+        &self,
+        payload: OtapPayload,
+    ) -> Result<(Extracted, u64), (lake::Error, Option<String>)> {
+        let (records, repaired): (Result<OtapArrowRecords, _>, u64) =
+            count_utf8_repairs(|| payload.try_into_with_default());
         let mut records = records.map_err(|e| {
             (
                 lake::Error::invalid(format!("undecodable pdata: {e}")),
@@ -437,7 +447,7 @@ impl Worker {
             )
         })?;
         match lake::extract::extract(&mut records, &self.cfg.lake) {
-            Ok(extracted) => Ok(extracted),
+            Ok(extracted) => Ok((extracted, repaired)),
             Err(error) => Err((
                 error,
                 lake::extract::producer_id_of(&records, &self.cfg.lake),
@@ -461,6 +471,7 @@ impl Worker {
                 // reported can be counted twice.
                 if let Some(metrics) = &mut self.metrics {
                     metrics.extracted(&pending.extracted.stats);
+                    metrics.repaired(pending.token.signal(), pending.utf8_repairs);
                 }
                 self.offer(pending);
             }

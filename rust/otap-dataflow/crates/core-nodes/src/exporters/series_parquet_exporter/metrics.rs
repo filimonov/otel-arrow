@@ -378,6 +378,17 @@ pub(super) struct ExemplarMetrics {
     pub dropped_exemplars: Counter<u64>,
 }
 
+/// String values stored with U+FFFD in place of invalid UTF-8, split by
+/// signal.
+#[metric_set(name = "exporter.series_parquet", measurement_attributes = SignalAttrs)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct RepairedMetrics {
+    /// String values of admitted requests the OTLP conversion repaired; a
+    /// dictionary value counts once per row that references it.
+    #[metric(name = "repaired.invalid_utf8", unit = "{value}")]
+    pub invalid_utf8: Counter<u64>,
+}
+
 /// One configured denormalized physical column.
 ///
 /// A registration attribute: one metric set is registered per configured
@@ -418,6 +429,8 @@ pub(super) struct Metrics {
     pub dropped: MeasurementMetricSet<DroppedMetrics>,
     /// Dropped exemplars, by signal.
     pub exemplars: MeasurementMetricSet<ExemplarMetrics>,
+    /// Repaired invalid UTF-8 string values, by signal.
+    pub repaired: MeasurementMetricSet<RepairedMetrics>,
     /// One set per configured denormalized column.
     columns: BTreeMap<String, MetricSet<ColumnMetrics>>,
     /// The shared `exporter.exports` set every exporter registers, so this
@@ -465,6 +478,7 @@ impl Metrics {
             emitted: EmittedMetrics::register(ctx),
             dropped: DroppedMetrics::register(ctx),
             exemplars: ExemplarMetrics::register(ctx),
+            repaired: RepairedMetrics::register(ctx),
             columns,
             exports: Some(ExporterExportMetrics::register(ctx)),
         }
@@ -522,6 +536,17 @@ impl Metrics {
             .add(1);
     }
 
+    /// Record the string values the conversion of one admitted request of
+    /// `signal` repaired; called with [`Metrics::extracted`].
+    pub(super) fn repaired(&mut self, signal: SignalType, count: u64) {
+        if count != 0 {
+            self.repaired
+                .with(SignalAttrs { signal })
+                .invalid_utf8
+                .add(count);
+        }
+    }
+
     /// Hand every set to the collector on a `CollectTelemetry` message.
     pub(super) fn report(&mut self, reporter: &mut MetricsReporter) {
         if let Some(exports) = &mut self.exports {
@@ -536,6 +561,7 @@ impl Metrics {
         let _ = reporter.report_measurement(&mut self.emitted);
         let _ = reporter.report_measurement(&mut self.dropped);
         let _ = reporter.report_measurement(&mut self.exemplars);
+        let _ = reporter.report_measurement(&mut self.repaired);
         for metrics in self.columns.values_mut() {
             let _ = reporter.report(metrics);
         }
@@ -555,6 +581,7 @@ impl Metrics {
         out.extend(self.emitted.terminal_snapshots());
         out.extend(self.dropped.terminal_snapshots());
         out.extend(self.exemplars.terminal_snapshots());
+        out.extend(self.repaired.terminal_snapshots());
         for metrics in self.columns.values_mut() {
             out.extend(metrics.terminal_snapshots());
         }
@@ -827,6 +854,17 @@ mod tests {
             &[("dropped.exemplars", "{exemplar}")],
             &[("signal", "metrics")],
         );
+
+        for (signal, label) in [(SignalType::Logs, "logs"), (SignalType::Metrics, "metrics")] {
+            metrics.repaired(signal, 1);
+            let snapshots = metrics.repaired.terminal_snapshots();
+            assert_eq!(snapshots.len(), 1);
+            assert_schema(
+                &snapshots[0],
+                &[("repaired.invalid_utf8", "{value}")],
+                &[("signal", label)],
+            );
+        }
 
         assert_eq!(
             metrics

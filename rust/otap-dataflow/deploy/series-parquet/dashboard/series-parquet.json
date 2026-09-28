@@ -1004,6 +1004,15 @@
         },
         {
           "refId": "D",
+          "expr": "sum by (pod, signal) (rate(repaired_invalid_utf8_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{pod}} invalid UTF-8 repaired ({{signal}})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "E",
           "expr": "sum by (pod, column) (rate(denormalize_type_mismatch_total{otel_scope_name=\"exporter.series_parquet\",job=\"series-parquet\",pod=~\"$pod\"}[$__rate_interval])) > 0",
           "legendFormat": "{{pod}} type mismatch {{column}}",
           "datasource": {

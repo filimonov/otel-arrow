@@ -608,6 +608,45 @@ async fn invalid_utf8_in_a_log_body_is_stored_replaced() {
     }
 }
 
+/// Scenario: the repaired log body, then a well-formed logs request, with telemetry.
+/// Guarantees: `repaired.invalid_utf8{signal=logs}` counts one; the `metrics` bucket is untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn a_repaired_log_body_is_counted_by_signal() {
+    let (context, _registry) = otel_arrow_dfe_engine::testing::test_pipeline_ctx();
+    let (handler, _rx) = effects(4);
+    let mut worker = Worker::new(
+        worker_config(),
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(lake::clock::TestWallClock::new(0)),
+        handler,
+    );
+    worker.metrics = Some(super::super::metrics::Metrics::register(
+        &context,
+        &worker.cfg.lake,
+    ));
+    worker.admit(invalid_utf8_body_pdata());
+    worker.admit(logs_pdata());
+    assert_eq!(worker.active.tokens.len(), 2, "both requests are admitted");
+    let metrics = worker.metrics.as_ref().expect("registered");
+    let repaired = |signal| super::super::metrics::SignalAttrs { signal };
+    assert_eq!(
+        metrics
+            .repaired
+            .get(repaired(SignalType::Logs))
+            .invalid_utf8
+            .get(),
+        1
+    );
+    assert_eq!(
+        metrics
+            .repaired
+            .get(repaired(SignalType::Metrics))
+            .invalid_utf8
+            .get(),
+        0
+    );
+}
+
 /// Scenario: an array and a key-value list attribute value holding a string with `0xc3`.
 /// Guarantees: each is refused permanently as undecodable.
 #[tokio::test(flavor = "current_thread")]

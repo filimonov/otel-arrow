@@ -749,6 +749,7 @@ collections is a counter.
 | `series.emitted` | `{row}` | `reason` | `new`, `partition`, `rotation` |
 | `dropped.unsupported` | `{row}` | `kind` | `exp_histogram`, `summary`, `empty` (one per metric without data) |
 | `dropped.exemplars` | `{exemplar}` | `signal` | `metrics` |
+| `repaired.invalid_utf8` | `{value}` | `signal` | `logs`, `metrics` |
 | `denormalize.type_mismatch` | `{value}` | `column` | one configured physical column name |
 
 The `*_too_large` values of `nacks` name `ingress.max_request_bytes`,
@@ -861,8 +862,8 @@ exactly as sent.
   `metrics.exemplars: drop`; with `reject` such a request is refused as a
   whole (INVALID_ARGUMENT, or behind the buffer a permanent drop counted in
   `resolved{outcome=permanently_rejected}`). These alterations are counted:
-  `timestamp.out_of_range`, `dropped.unsupported{kind}`, `dropped.exemplars`
-  and `denormalize.type_mismatch{column}`;
+  `timestamp.out_of_range`, `dropped.unsupported{kind}`, `dropped.exemplars`,
+  `repaired.invalid_utf8{signal}` and `denormalize.type_mismatch{column}`;
   the ones the table below marks "no counter" are not. The deployment
   example alerts on the counters with
   `SeriesParquetDataAlteredOnStore` (info) and shows them in its dashboard.
@@ -883,7 +884,7 @@ durable_buffer".
 | The type of a log body that is not a string | The body rendered to JSON text, so `"42"` and `42` read the same; a bytes body is a quoted base64 string. | Documented; no counter |
 | An optional metrics value, such as a histogram `sum`, `min` or `max`, that is exactly zero in every point of a request | Null: the OTAP transport omits a column whose every entry in a request is the type default. | Documented; no counter |
 | A timestamp of zero, or one that does not fit `i64` nanoseconds | Null in both timestamp columns. | `timestamp.out_of_range` for the ones that do not fit |
-| Invalid UTF-8 in a top-level string value | The value with U+FFFD, so strings that differ only in invalid bytes share a series id. | Documented; no counter |
+| Invalid UTF-8 in a top-level string value | The value with U+FFFD, so strings that differ only in invalid bytes share a series id. | `repaired.invalid_utf8{signal}` |
 | A denormalized attribute of the wrong type | Null in its typed column; the attribute stays in its map and in the identity. | `denormalize.type_mismatch{column}` |
 | Metric metadata attributes | Nothing: they are never read or validated. | Documented; no counter |
 | `dropped_attributes_count` of a resource, a scope, a log record or a point | Nothing: no dataset has a column for it. | Documented; no counter |
