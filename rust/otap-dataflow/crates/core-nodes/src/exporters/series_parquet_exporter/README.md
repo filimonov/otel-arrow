@@ -919,10 +919,10 @@ new partition or an early rotation writes it again (`series.emitted{reason}`).
   `otlp_handling: convert_to_arrow`)
   converts a damaged body leniently first, and its partial or empty records
   are stored.
-- The conversion to OTAP records numbers the log records or metrics of a
-  request, and its scopes and resources, with 16-bit ids, so keep producer
-  batches below 65,536 records: the shipped Alloy configurations cap every
-  batch at 4,000 (`send_batch_max_size`).
+- The conversion to OTAP records takes at most 65,536 attributed log records
+  or metrics per request, and as many scopes and resources; a larger request
+  is refused whole, permanently. Keep producer batches within it: the shipped
+  Alloy configurations cap every batch at 4,000 (`send_batch_max_size`).
 - Dictionary-encoded columns are read through their dictionary. Every
   attribute key and value is charged as it is read: one longer than
   `ingress.max_row_bytes` refuses the request, and decoded attributes count

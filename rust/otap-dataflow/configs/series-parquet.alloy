@@ -68,7 +68,7 @@ otelcol.processor.transform "series" {
 //
 // send_batch_max_size also keeps every request below 65,536 records: the
 // engine's conversion to Arrow records numbers a request's log records with
-// 16-bit ids.
+// 16-bit ids and refuses a larger request whole.
 otelcol.processor.batch "series" {
   send_batch_size     = 4000
   send_batch_max_size = 4000
